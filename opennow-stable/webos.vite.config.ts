@@ -14,7 +14,7 @@ export default defineConfig({
   build: {
     outDir: "../../dist-webos",
     emptyOutDir: true,
-    target: "es2019",
+    target: "es2020",
     modulePreload: {
       polyfill: false,
     },

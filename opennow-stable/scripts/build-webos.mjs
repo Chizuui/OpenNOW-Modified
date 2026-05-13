@@ -37,7 +37,7 @@ await esbuild({
   bundle: true,
   platform: "node",
   format: "cjs",
-  target: "es2019",
+  target: "node18",
   sourcemap: false,
   external: ["webos-service"],
   logLevel: "info",
