@@ -537,6 +537,8 @@
       "enablePromptEsc": "취소하다",
       "reportOnGithubIssues": "GitHub 문제 보고",
       "reportOnDiscord": "불화에 대한 보고",
+      "showNativeStreamerStats": "Show Native Streamer Stats",
+      "showNativeStreamerStatsHint": "Display the native streamer's own diagnostics overlay during native sessions.",
       "streamerStatus": "스트리머 상태",
       "checkNativeStreamer": "네이티브 스트리머 확인",
       "gstreamerReady": "GStreamer 준비",
