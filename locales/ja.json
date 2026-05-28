@@ -537,6 +537,8 @@
       "enablePromptEsc": "キャンセル",
       "reportOnGithubIssues": "GitHub の問題に関するレポート",
       "reportOnDiscord": "Discordに関するレポート",
+      "showNativeStreamerStats": "Show Native Streamer Stats",
+      "showNativeStreamerStatsHint": "Display the native streamer's own diagnostics overlay during native sessions.",
       "streamerStatus": "ストリーマーステータス",
       "checkNativeStreamer": "ネイティブストリーマーを確認する",
       "gstreamerReady": "GStreamer 対応",
