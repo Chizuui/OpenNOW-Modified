@@ -111,6 +111,8 @@ export interface Settings {
   favoriteGameIds: string[];
   /** Enable the live elapsed session counter */
   sessionCounterEnabled: boolean;
+  /** Also show the session-limit countdown in the stats overlay while streaming */
+  showSessionTimeRemainingInStatsOverlay: boolean;
   /** Window width */
   windowWidth: number;
   /** Window height */
@@ -196,6 +198,7 @@ const DEFAULT_SETTINGS: Settings = {
   autoFullScreen: false,
   favoriteGameIds: [],
   sessionCounterEnabled: false,
+  showSessionTimeRemainingInStatsOverlay: false,
   sessionClockShowEveryMinutes: 60,
   sessionClockShowDurationSeconds: 30,
   windowWidth: 1400,
@@ -251,6 +254,12 @@ export class SettingsManager {
       // Migrate legacy boolean accelerator setting to percentage slider.
       if (typeof (parsed as { mouseAcceleration?: unknown }).mouseAcceleration === "boolean") {
         merged.mouseAcceleration = (parsed as { mouseAcceleration?: boolean }).mouseAcceleration ? 100 : 1;
+        migrated = true;
+      }
+
+      const legacySessionTimeDisplay = (parsed as { sessionTimeRemainingDisplay?: unknown }).sessionTimeRemainingDisplay;
+      if (legacySessionTimeDisplay === "stats" || legacySessionTimeDisplay === "both") {
+        merged.showSessionTimeRemainingInStatsOverlay = true;
         migrated = true;
       }
 

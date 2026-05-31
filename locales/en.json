@@ -511,6 +511,8 @@
       "discordRichPresenceHint": "Show the game you are streaming as your Discord activity, including elapsed time.",
       "posterSize": "Poster Size",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "Session Elapsed Counter",
       "sessionElapsedCounterHint": "Enable or disable the live session elapsed counter while streaming.",
       "sessionTimerReappear": "Session Timer Reappear",

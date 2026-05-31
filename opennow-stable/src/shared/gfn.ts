@@ -129,7 +129,6 @@ export function colorQualityIs10Bit(cq: ColorQuality): boolean {
 }
 
 export type AppAccentColor = "green" | "blue" | "violet" | "amber" | "rose";
-
 export type MicrophoneMode = "disabled" | "push-to-talk" | "voice-activity";
 export type AspectRatio = "16:9" | "16:10" | "21:9" | "32:9";
 export type RuntimePlatform =
@@ -291,6 +290,8 @@ export interface Settings {
   autoFullScreen: boolean;
   favoriteGameIds: string[];
   sessionCounterEnabled: boolean;
+  /** Also show the session-limit countdown in the stats overlay while streaming */
+  showSessionTimeRemainingInStatsOverlay: boolean;
   sessionClockShowEveryMinutes: number;
   sessionClockShowDurationSeconds: number;
   windowWidth: number;
