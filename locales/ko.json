@@ -310,6 +310,7 @@
       "jitterBuffer": "JB = 지터 버퍼 지연",
       "packetLoss": "패킷 손실 비율",
       "packetLossValue": "{{value}}% 손실",
+      "timeRemainingShort": "Left",
       "inputQueuePressure": "입력 큐 압력(버퍼링된 바이트 및 지연된 플러시)",
       "inputChannelState": "부분적으로 신뢰할 수 있는 입력 채널 상태 및 대기 중인 바이트",
       "mouseFlushCadence": "마우스 플러시 케이던스 및 패킷 속도"
@@ -364,7 +365,11 @@
   },
   "sidebar": {
     "title": "사이드바",
-    "closeSettings": "설정 닫기"
+    "closeSettings": "설정 닫기",
+    "sessionTimeRemaining": "Session Time Left",
+    "sessionTimeRemainingTitle": "Session time remaining",
+    "showSessionTimeRemainingInStatsOverlay": "Show session time remaining in stats overlay",
+    "statsOverlay": "Stats overlay"
   },
   "settings": {
     "title": "설정",
@@ -511,6 +516,8 @@
       "discordRichPresenceHint": "경과 시간을 포함하여 스트리밍 중인 게임을 Discord 활동으로 표시합니다.",
       "posterSize": "포스터 크기",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "세션 경과 카운터",
       "sessionElapsedCounterHint": "스트리밍하는 동안 라이브 세션 경과 카운터를 활성화하거나 비활성화합니다.",
       "sessionTimerReappear": "세션 타이머가 다시 나타납니다.",
