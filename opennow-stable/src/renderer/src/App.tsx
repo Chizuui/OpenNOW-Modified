@@ -3292,9 +3292,10 @@ export function App(): JSX.Element {
 
             try {
               const text = await readStreamClipboardText();
-              if (text && client.sendText(text) > 0) {
-                return;
+              if (text) {
+                client.sendText(text);
               }
+              return;
             } catch (error) {
               console.warn("Clipboard read failed, falling back to paste shortcut:", error);
             }

@@ -3012,15 +3012,12 @@ export class GfnWebRtcClient {
 
     let sent = 0;
     const maxChars = 4096;
-    const keys = [...text.slice(0, maxChars)].map((char) => mapTextCharToKeySpec(char, this.keyboardLayout));
-    if (keys.some((key) => key === null)) {
-      return 0;
-    }
-
-    for (const key of keys) {
+    for (const char of text.slice(0, maxChars)) {
+      const key = mapTextCharToKeySpec(char, this.keyboardLayout);
       if (!key) {
-        return 0;
+        continue;
       }
+
       if (key.shift) {
         this.sendKeyPacket(codeMap.ShiftLeft.vk, codeMap.ShiftLeft.scancode, 0x01, true);
       }
