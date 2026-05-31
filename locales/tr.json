@@ -310,6 +310,7 @@
       "jitterBuffer": "JB = titreşim arabelleği gecikmesi",
       "packetLoss": "Paket kaybı yüzdesi",
       "packetLossValue": "%{{value}} kayıp",
+      "timeRemainingShort": "Left",
       "inputQueuePressure": "Giriş kuyruğu basıncı (arabelleğe alınmış baytlar ve gecikmeli temizleme)",
       "inputChannelState": "Kısmen güvenilir giriş kanalı durumu ve sıraya alınmış baytlar",
       "mouseFlushCadence": "Fare yıkama temposu ve paket hızı"
@@ -364,7 +365,11 @@
   },
   "sidebar": {
     "title": "Kenar çubuğu",
-    "closeSettings": "Ayarları kapat"
+    "closeSettings": "Ayarları kapat",
+    "sessionTimeRemaining": "Session Time Left",
+    "sessionTimeRemainingTitle": "Session time remaining",
+    "showSessionTimeRemainingInStatsOverlay": "Show session time remaining in stats overlay",
+    "statsOverlay": "Stats overlay"
   },
   "settings": {
     "title": "Ayarlar",
@@ -511,6 +516,8 @@
       "discordRichPresenceHint": "Yayınladığınız oyunu, geçen süre de dahil olmak üzere Discord etkinliğiniz olarak gösterin.",
       "posterSize": "Poster Boyutu",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "Geçen Oturum Sayacı",
       "sessionElapsedCounterHint": "Akış sırasında geçen canlı oturum sayacını etkinleştirin veya devre dışı bırakın.",
       "sessionTimerReappear": "Oturum Zamanlayıcısı Yeniden Görünüyor",
