@@ -135,6 +135,11 @@ const ICE_DISCONNECTED_RECOVERY_GRACE_MS = 7000;
 
 const isMac = navigator.platform.toLowerCase().includes("mac");
 
+function isExpectedNativeSessionClose(reason: string): boolean {
+  const normalized = reason.trim().toLowerCase();
+  return normalized === "socket closed" || normalized === "signaling disconnected: socket closed";
+}
+
 const DEFAULT_SHORTCUTS = {
   shortcutToggleStats: "F3",
   shortcutTogglePointerLock: "F8",
@@ -325,6 +330,11 @@ export function App(): JSX.Element {
   const codecStartupTestAttemptedRef = useRef(false);
   const navbarSessionActionInFlightRef = useRef<"resume" | "terminate" | null>(null);
   const nativeStreamingRef = useRef(false);
+  const streamingGameRef = useRef<GameInfo | null>(null);
+
+  useEffect(() => {
+    streamingGameRef.current = streamingGame;
+  }, [streamingGame]);
 
   const resetStatsOverlayToPreference = useCallback((): void => {
     setShowStatsOverlay(settings.showStatsOnLaunch);
@@ -2248,6 +2258,19 @@ export function App(): JSX.Element {
     buildCurrentStreamSettings,
   ]);
 
+  const handleExpectedNativeSessionClose = useCallback((reason: string): void => {
+    console.log("[Recovery] Treating native signaling close as ended session:", reason);
+    const activeGameId = streamingGameRef.current?.id;
+    if (activeGameId) {
+      endPlaytimeSession(activeGameId);
+    }
+    clientRef.current?.dispose();
+    clientRef.current = null;
+    launchInFlightRef.current = false;
+    resetLaunchRuntime();
+    void refreshNavbarActiveSession();
+  }, [endPlaytimeSession, refreshNavbarActiveSession, resetLaunchRuntime]);
+
   // Signaling events
   useEffect(() => {
     const ensureWebRtcClient = (): GfnWebRtcClient | null => {
@@ -2465,6 +2488,10 @@ export function App(): JSX.Element {
             console.log("[Recovery] Ignoring native streamer stop during app shutdown");
             return;
           }
+          if (streamStatusRef.current === "streaming" && isExpectedNativeSessionClose(reason)) {
+            handleExpectedNativeSessionClose(reason);
+            return;
+          }
           if (
             signalingRecoveryRef.current.explicitShutdown
             || !RECOVERABLE_STREAM_STATUSES.includes(streamStatusRef.current)
@@ -2506,6 +2533,14 @@ export function App(): JSX.Element {
         } else if (event.type === "disconnected") {
           if (appUnloadingRef.current) {
             console.log("[Recovery] Ignoring signaling disconnect during app shutdown");
+            return;
+          }
+          if (
+            nativeStreamingRef.current
+            && streamStatusRef.current === "streaming"
+            && isExpectedNativeSessionClose(event.reason)
+          ) {
+            handleExpectedNativeSessionClose(event.reason);
             return;
           }
           const iceState = latestIceConnectionStateRef.current;
@@ -2599,7 +2634,7 @@ export function App(): JSX.Element {
     });
 
     return () => unsubscribe();
-  }, [attemptSessionRecovery, diagnosticsStore, handleControllerMetaToggle, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
+  }, [attemptSessionRecovery, diagnosticsStore, handleControllerMetaToggle, handleExpectedNativeSessionClose, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
 
   // Play game handler
   const handlePlayGame = useCallback(async (game: GameInfo, options?: { bypassGuards?: boolean; streamingBaseUrl?: string }) => {
