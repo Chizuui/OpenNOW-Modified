@@ -310,6 +310,7 @@
       "jitterBuffer": "JB = 抖动缓冲延迟",
       "packetLoss": "丢包率",
       "packetLossValue": "{{value}}% 损失",
+      "timeRemainingShort": "Left",
       "inputQueuePressure": "输入队列压力（缓冲字节和延迟刷新）",
       "inputChannelState": "部分可靠的输入通道状态和排队字节",
       "mouseFlushCadence": "鼠标刷新节奏和数据包速率"
@@ -364,7 +365,11 @@
   },
   "sidebar": {
     "title": "侧边栏",
-    "closeSettings": "关闭设置"
+    "closeSettings": "关闭设置",
+    "sessionTimeRemaining": "Session Time Left",
+    "sessionTimeRemainingTitle": "Session time remaining",
+    "showSessionTimeRemainingInStatsOverlay": "Show session time remaining in stats overlay",
+    "statsOverlay": "Stats overlay"
   },
   "settings": {
     "title": "设置",
@@ -511,6 +516,8 @@
       "discordRichPresenceHint": "显示您正在流式传输的游戏作为您的 Discord 活动，包括已用时间。",
       "posterSize": "海报尺寸",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "会话已用计数器",
       "sessionElapsedCounterHint": "流式传输时启用或禁用实时会话已用计数器。",
       "sessionTimerReappear": "会话计时器重新出现",
