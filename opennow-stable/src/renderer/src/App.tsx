@@ -180,6 +180,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+async function readStreamClipboardText(): Promise<string> {
+  try {
+    const browserClipboard = navigator.clipboard;
+    if (browserClipboard?.readText) {
+      const text = await browserClipboard.readText();
+      if (text) {
+        return text;
+      }
+    }
+  } catch {
+    // Electron main-process clipboard is the reliable fallback on Linux.
+  }
+
+  return window.openNow.readClipboardText();
+}
+
 export function App(): JSX.Element {
   const { locale, t } = useTranslation();
 
@@ -2140,6 +2156,7 @@ export function App(): JSX.Element {
         microphoneDeviceId: settings.microphoneDeviceId || undefined,
         mouseSensitivity: settings.mouseSensitivity,
         mouseAcceleration: settings.mouseAcceleration,
+        keyboardLayout: settings.keyboardLayout,
         onLog: (line: string) => console.log(`[WebRTC] ${line}`),
         onStats: (stats) => diagnosticsStore.set(stats),
         onTimeWarning: (warning) => {
@@ -3274,10 +3291,11 @@ export function App(): JSX.Element {
             if (!client) return;
 
             try {
-              const text = await navigator.clipboard.readText();
-              if (text && client.sendText(text) > 0) {
-                return;
+              const text = await readStreamClipboardText();
+              if (text) {
+                client.sendText(text);
               }
+              return;
             } catch (error) {
               console.warn("Clipboard read failed, falling back to paste shortcut:", error);
             }
