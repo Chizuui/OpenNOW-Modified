@@ -3257,6 +3257,10 @@ body,
   flex: 1;
 }
 
+.home-page .game-card-image-wrapper {
+  padding-top: var(--game-aspect, 56.25%);
+}
+
 .game-card-image {
   position: absolute;
   inset: 0;
