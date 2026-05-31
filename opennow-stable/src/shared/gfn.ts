@@ -1089,6 +1089,8 @@ export interface OpenNowApi {
   togglePointerLock(): Promise<void>;
   /** Notify main process that pointer lock state changed (active = true/false) */
   notifyPointerLockChange(active: boolean): void;
+  /** Read plain text from the OS clipboard through Electron main process */
+  readClipboardText(): Promise<string>;
   getSettings(): Promise<Settings>;
   setSetting<K extends keyof Settings>(key: K, value: Settings[K]): Promise<void>;
   resetSettings(): Promise<Settings>;
