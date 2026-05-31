@@ -109,7 +109,7 @@ function getAppStyle(posterSizeScale: number): AppStyle {
 }
 
 function isNvidiaProvider(provider: LoginProvider | null | undefined): boolean {
-  return provider?.code.trim().toUpperCase() === "NVIDIA";
+  return (provider?.code ?? "").trim().toUpperCase() === "NVIDIA";
 }
 
 const SESSION_READY_POLL_INTERVAL_MS = 2000;
