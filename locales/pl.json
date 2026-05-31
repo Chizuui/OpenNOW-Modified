@@ -310,6 +310,7 @@
       "jitterBuffer": "JB = opóźnienie bufora jitter",
       "packetLoss": "Procent straty pakietów",
       "packetLossValue": "{{value}}% straty",
+      "timeRemainingShort": "Left",
       "inputQueuePressure": "Ciśnienie w kolejce wejściowej (buforowane bajty i spłukiwanie opóźnione)",
       "inputChannelState": "Częściowo niezawodny stan kanału wejściowego i kolejki bajtów",
       "mouseFlushCadence": "Częstotliwość odświeżania myszy i częstotliwość pakietów"
@@ -364,7 +365,11 @@
   },
   "sidebar": {
     "title": "Panel boczny",
-    "closeSettings": "Zamknij ustawienia"
+    "closeSettings": "Zamknij ustawienia",
+    "sessionTimeRemaining": "Session Time Left",
+    "sessionTimeRemainingTitle": "Session time remaining",
+    "showSessionTimeRemainingInStatsOverlay": "Show session time remaining in stats overlay",
+    "statsOverlay": "Stats overlay"
   },
   "settings": {
     "title": "Ustawienia",
@@ -511,6 +516,8 @@
       "discordRichPresenceHint": "Pokazuj grę, którą streamujesz, jako aktywność na Discordzie, wraz z czasem trwania.",
       "posterSize": "Rozmiar plakatu",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "Licznik upłynięcia sesji",
       "sessionElapsedCounterHint": "Włącz lub wyłącz licznik czasu trwania sesji podczas streamingu.",
       "sessionTimerReappear": "Pokazywanie ponowne licznika sesji",
