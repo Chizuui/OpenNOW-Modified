@@ -310,6 +310,7 @@
       "jitterBuffer": "JB = jitterbuffervertraging",
       "packetLoss": "Percentage pakketverlies",
       "packetLossValue": "{{value}}% verlies",
+      "timeRemainingShort": "Left",
       "inputQueuePressure": "Invoerwachtrijdruk (gebufferde bytes en vertraagde flush)",
       "inputChannelState": "Gedeeltelijk betrouwbare status van het ingangskanaal en bytes in de wachtrij",
       "mouseFlushCadence": "Muisspoelcadans en pakketsnelheid"
@@ -364,7 +365,11 @@
   },
   "sidebar": {
     "title": "Zijbalk",
-    "closeSettings": "Instellingen sluiten"
+    "closeSettings": "Instellingen sluiten",
+    "sessionTimeRemaining": "Session Time Left",
+    "sessionTimeRemainingTitle": "Session time remaining",
+    "showSessionTimeRemainingInStatsOverlay": "Show session time remaining in stats overlay",
+    "statsOverlay": "Stats overlay"
   },
   "settings": {
     "title": "Instellingen",
@@ -511,6 +516,8 @@
       "discordRichPresenceHint": "Toon de game die je streamt als je Discord-activiteit, inclusief de verstreken tijd.",
       "posterSize": "Posterformaat",
       "posterSizeHint": "Adjusts game posters in real time across the library.",
+      "showSessionTimeRemainingInStatsOverlay": "Session Time in Stats Overlay",
+      "showSessionTimeRemainingInStatsOverlayHint": "The session countdown appears in the in-stream sidebar by default. Enable this to also show it in the stats overlay.",
       "sessionElapsedCounter": "Teller voor verstreken sessie",
       "sessionElapsedCounterHint": "Schakel de verstreken livesessieteller in of uit tijdens het streamen.",
       "sessionTimerReappear": "Sessietimer verschijnt opnieuw",
