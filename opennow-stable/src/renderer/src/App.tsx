@@ -220,6 +220,7 @@ export function App(): JSX.Element {
 
   // Navigation
   const [currentPage, setCurrentPage] = useState<AppPage>("home");
+  const [pageBeforeSettings, setPageBeforeSettings] = useState<AppPage>("home");
   const [sessionFullscreen, setSessionFullscreenState] = useState(false);
 
   // Games State
@@ -3580,8 +3581,25 @@ export function App(): JSX.Element {
     const pages: AppPage[] = ["library", "home", "settings"];
     const currentIndex = Math.max(0, pages.indexOf(currentPage));
     const nextIndex = (currentIndex + direction + pages.length) % pages.length;
-    setCurrentPage(pages[nextIndex]);
+    const nextPage = pages[nextIndex];
+    if (nextPage === "settings" && currentPage !== "settings") {
+      setPageBeforeSettings(currentPage);
+    }
+    setCurrentPage(nextPage);
   }, [currentPage]);
+
+  const handleNavigate = useCallback((page: AppPage): void => {
+    if (page === "settings" && currentPage !== "settings") {
+      setPageBeforeSettings(currentPage);
+    }
+    setCurrentPage(page);
+  }, [currentPage]);
+
+  const handleCloseSettings = useCallback((): void => {
+    setCurrentPage(pageBeforeSettings);
+  }, [pageBeforeSettings]);
+
+  const mainPage: AppPage = currentPage === "settings" ? pageBeforeSettings : currentPage;
 
   // Show login screen if not authenticated
   if (!authSession) {
@@ -3730,7 +3748,7 @@ export function App(): JSX.Element {
       )}
       <Navbar
         currentPage={currentPage}
-        onNavigate={setCurrentPage}
+        onNavigate={handleNavigate}
         user={authSession.user}
         subscription={subscriptionInfo}
         activeSession={navbarActiveSession}
@@ -3754,7 +3772,7 @@ export function App(): JSX.Element {
       />
 
       <main className="main-content">
-        {currentPage === "home" && (
+        {mainPage === "home" && (
           <HomePage
             games={filteredGames}
             searchQuery={searchQuery}
@@ -3785,7 +3803,7 @@ export function App(): JSX.Element {
           />
         )}
 
-        {currentPage === "library" && (
+        {mainPage === "library" && (
           <LibraryPage
             games={filteredLibraryGames}
             searchQuery={searchQuery}
@@ -3809,17 +3827,18 @@ export function App(): JSX.Element {
           />
         )}
 
-        {currentPage === "settings" && (
-          <SettingsPage
-            settings={settings}
-            regions={regions}
-            codecResults={codecResults}
-            codecTesting={codecTesting}
-            onRunCodecTest={runCodecTest}
-            onSettingChange={updateSetting}
-          />
-        )}
       </main>
+      {currentPage === "settings" && (
+        <SettingsPage
+          settings={settings}
+          regions={regions}
+          codecResults={codecResults}
+          codecTesting={codecTesting}
+          onRunCodecTest={runCodecTest}
+          onSettingChange={updateSetting}
+          onClose={handleCloseSettings}
+        />
+      )}
       {logoutConfirmModal}
       {removeAccountConfirmModal}
       {queueModalGame && streamStatus === "idle" && (
