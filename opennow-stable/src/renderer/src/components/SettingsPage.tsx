@@ -10,6 +10,8 @@ import type {
   ColorQuality,
   AspectRatio,
   EntitledResolution,
+  SubscriptionInfo,
+  PersistentStorageLocation,
   VideoAccelerationPreference,
   MicrophoneMode,
   PingResult,
@@ -64,9 +66,11 @@ type SettingsNavGroup = {
 };
 
 type ThanksLoadState = "idle" | "loading" | "loaded" | "error";
+type StorageResetState = "idle" | "resetting" | "success" | "error";
 
-type SettingsSectionId = "stream" | "native-streamer" | "game" | "audio" | "input" | "interface" | "about" | "thanks";
+type SettingsSectionId = "account" | "stream" | "native-streamer" | "game" | "audio" | "input" | "interface" | "about" | "thanks";
 type SettingsSearchScopeId =
+  | "account-storage"
   | "stream-region"
   | "stream-video"
   | "stream-codec-diagnostics"
@@ -79,6 +83,22 @@ type SettingsSearchScopeId =
   | "thanks";
 
 const SETTINGS_SCOPE_SEARCH_TERMS: Record<SettingsSearchScopeId, readonly string[]> = {
+  "account-storage": [
+    "account",
+    "subscription",
+    "storage",
+    "persistent storage",
+    "cloud storage",
+    "install to play",
+    "reset storage",
+    "storage reset",
+    "region",
+    "data",
+    "games",
+    "downloads",
+    "available",
+    "used",
+  ],
   "stream-region": [
     "stream",
     "region",
@@ -566,6 +586,16 @@ function formatBytes(value: number): string {
   return `${size.toFixed(digits)} ${units[unitIndex]}`;
 }
 
+function formatStorageGb(value: number | undefined): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  const rounded = Math.round(value * 10) / 10;
+  const display = Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1);
+  return `${display} GB`;
+}
+
 function formatUpdaterTimestamp(value?: number): string | null {
   if (!value) return null;
   try {
@@ -743,7 +773,14 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
 
   // Dynamic entitled resolutions from MES API
   const [entitledResolutions, setEntitledResolutions] = useState<EntitledResolution[]>([]);
+  const [subscriptionInfo, setSubscriptionInfo] = useState<SubscriptionInfo | null>(null);
   const [subscriptionLoading, setSubscriptionLoading] = useState(true);
+  const [storageLocations, setStorageLocations] = useState<PersistentStorageLocation[]>([]);
+  const [storageLocationsLoading, setStorageLocationsLoading] = useState(false);
+  const [storageLocationsError, setStorageLocationsError] = useState<string | null>(null);
+  const [selectedStorageRegion, setSelectedStorageRegion] = useState<string | null>(null);
+  const [storageResetState, setStorageResetState] = useState<StorageResetState>("idle");
+  const [storageResetMessage, setStorageResetMessage] = useState<string | null>(null);
 
   useEffect(() => {
     setToggleStatsInput(settings.shortcutToggleStats);
@@ -834,49 +871,92 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
     }
   }, [activeSection, refreshNativeStreamerStatus, settingsSearch.length]);
 
-  // Fetch subscription data (cached per account; reload only when account changes)
+  const loadSubscriptionData = useCallback(async (isCancelled: () => boolean = () => false): Promise<void> => {
+    setSubscriptionLoading(true);
+
+    try {
+      const sessionResult = await window.openNow.getAuthSession();
+      const session = sessionResult.session;
+      if (!session || isCancelled()) {
+        setEntitledResolutions([]);
+        setSubscriptionInfo(null);
+        setStorageLocations([]);
+        setStorageLocationsError(null);
+        setStorageLocationsLoading(false);
+        return;
+      }
+
+      const userId = session.user.userId;
+      const cached = loadCachedEntitledResolutions();
+      if (cached && cached.userId === userId && !isCancelled()) {
+        setEntitledResolutions(cached.entitledResolutions);
+      }
+
+      const sub = await window.openNow.fetchSubscription({
+        userId,
+      });
+
+      if (!isCancelled()) {
+        setSubscriptionInfo(sub);
+        setEntitledResolutions(sub.entitledResolutions);
+        saveCachedEntitledResolutions({
+          userId,
+          entitledResolutions: sub.entitledResolutions,
+        });
+      }
+
+      if (isCancelled()) {
+        return;
+      }
+
+      if (!sub.storageAddon) {
+        setStorageLocations([]);
+        setStorageLocationsError(null);
+        setStorageLocationsLoading(false);
+        return;
+      }
+
+      setStorageLocationsLoading(true);
+      setStorageLocationsError(null);
+      try {
+        const locationsResult = await window.openNow.fetchPersistentStorageLocations({
+          serverRegionId: sub.serverRegionId,
+          currentRegionCode: sub.storageAddon.regionCode,
+          currentRegionName: sub.storageAddon.regionName,
+        });
+        if (!isCancelled()) {
+          setStorageLocations(locationsResult.locations);
+        }
+      } catch (error) {
+        console.warn("[Settings] Failed to fetch persistent storage locations:", error);
+        if (!isCancelled()) {
+          setStorageLocations([]);
+          setStorageLocationsError(t("settings.persistentStorage.locationsFailed"));
+        }
+      } finally {
+        if (!isCancelled()) {
+          setStorageLocationsLoading(false);
+        }
+      }
+    } catch (err) {
+      console.warn("Failed to fetch subscription for settings:", err);
+      if (!isCancelled()) {
+        setSubscriptionInfo(null);
+        setStorageLocations([]);
+        setStorageLocationsError(null);
+        setStorageLocationsLoading(false);
+      }
+    } finally {
+      if (!isCancelled()) setSubscriptionLoading(false);
+    }
+  }, [t]);
+
+  // Fetch subscription data for dynamic stream presets and persistent storage state.
   useEffect(() => {
     let cancelled = false;
-
-    async function load(): Promise<void> {
-      try {
-        const sessionResult = await window.openNow.getAuthSession();
-        const session = sessionResult.session;
-        if (!session || cancelled) {
-          setEntitledResolutions([]);
-          setSubscriptionLoading(false);
-          return;
-        }
-
-        const userId = session.user.userId;
-        const cached = loadCachedEntitledResolutions();
-        if (cached && cached.userId === userId) {
-          setEntitledResolutions(cached.entitledResolutions);
-          setSubscriptionLoading(false);
-          return;
-        }
-
-        const sub = await window.openNow.fetchSubscription({
-          userId,
-        });
-
-        if (!cancelled) {
-          setEntitledResolutions(sub.entitledResolutions);
-          saveCachedEntitledResolutions({
-            userId,
-            entitledResolutions: sub.entitledResolutions,
-          });
-        }
-      } catch (err) {
-        console.warn("Failed to fetch subscription for settings:", err);
-      } finally {
-        if (!cancelled) setSubscriptionLoading(false);
-      }
-    }
-
-    load();
+    void loadSubscriptionData(() => cancelled);
     return () => { cancelled = true; };
-  }, []);
+  }, [loadSubscriptionData]);
 
   const hasDynamic = entitledResolutions.length > 0;
 
@@ -901,6 +981,102 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
     ? `${formatBytes(updaterState.progress.bytesPerSecond)}/s`
     : null;
   const updaterBadgeLabel = useMemo(() => getUpdaterBadgeLabel(updaterState), [updaterState]);
+  const persistentStorage = subscriptionInfo?.storageAddon;
+  const persistentStorageSizeGb = typeof persistentStorage?.sizeGb === "number" ? persistentStorage.sizeGb : null;
+  const persistentStorageUsedGb = typeof persistentStorage?.usedGb === "number" ? persistentStorage.usedGb : null;
+  const persistentStorageRemainingGb =
+    persistentStorageSizeGb !== null && persistentStorageUsedGb !== null
+      ? Math.max(0, persistentStorageSizeGb - persistentStorageUsedGb)
+      : null;
+  const persistentStorageUsagePercent =
+    persistentStorageSizeGb !== null && persistentStorageSizeGb > 0 && persistentStorageUsedGb !== null
+      ? Math.max(0, Math.min(100, (persistentStorageUsedGb / persistentStorageSizeGb) * 100))
+      : null;
+  const persistentStorageSizeLabel = formatStorageGb(persistentStorage?.sizeGb);
+  const persistentStorageUsedLabel = formatStorageGb(persistentStorage?.usedGb);
+  const persistentStorageRemainingLabel = formatStorageGb(persistentStorageRemainingGb ?? undefined);
+  const persistentStorageUsageLabel = persistentStorage
+    ? persistentStorageUsedLabel && persistentStorageSizeLabel
+      ? t("settings.persistentStorage.usage", {
+        used: persistentStorageUsedLabel,
+        total: persistentStorageSizeLabel,
+      })
+      : t("settings.persistentStorage.usageUnavailable")
+    : subscriptionLoading
+      ? t("app.status.loading")
+      : t("settings.persistentStorage.notDetected");
+  const persistentStorageRegionLabel =
+    persistentStorage?.regionName ??
+    persistentStorage?.regionCode ??
+    (persistentStorage ? t("settings.persistentStorage.regionUnavailable") : null);
+  const persistentStorageDetails = [
+    persistentStorageRegionLabel
+      ? t("settings.persistentStorage.region", { region: persistentStorageRegionLabel })
+      : null,
+    persistentStorageRemainingLabel
+      ? t("settings.persistentStorage.remaining", { value: persistentStorageRemainingLabel })
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  const currentStorageLocationOptionLabel = persistentStorageRegionLabel
+    ? t("settings.persistentStorage.currentLocationOption", { region: persistentStorageRegionLabel })
+    : t("settings.persistentStorage.currentLocationUnavailable");
+  const storageLocationOptions = storageLocations.filter(
+    (location) => location.code !== persistentStorage?.regionCode,
+  );
+  const selectedStorageLocation = selectedStorageRegion
+    ? storageLocations.find((location) => location.code === selectedStorageRegion)
+    : null;
+  const storageResetTargetLabel =
+    selectedStorageLocation?.name ??
+    (selectedStorageRegion && selectedStorageRegion.trim().length > 0 ? selectedStorageRegion : null) ??
+    persistentStorageRegionLabel ??
+    t("settings.persistentStorage.regionUnavailable");
+  const storageResetTargetHint = selectedStorageRegion
+    ? t("settings.persistentStorage.resetWillMoveLocation", { region: storageResetTargetLabel })
+    : t("settings.persistentStorage.resetWillKeepLocation", { region: storageResetTargetLabel });
+
+  useEffect(() => {
+    setSelectedStorageRegion(null);
+  }, [persistentStorage?.regionCode]);
+
+  useEffect(() => {
+    if (
+      selectedStorageRegion &&
+      storageLocations.length > 0 &&
+      !storageLocations.some((location) => location.code === selectedStorageRegion)
+    ) {
+      setSelectedStorageRegion(null);
+    }
+  }, [selectedStorageRegion, storageLocations]);
+
+  const handleResetPersistentStorage = useCallback(async (): Promise<void> => {
+    if (!persistentStorage || storageResetState === "resetting") {
+      return;
+    }
+
+    if (!window.confirm(t("settings.persistentStorage.resetConfirm", { region: storageResetTargetLabel }))) {
+      return;
+    }
+
+    setStorageResetState("resetting");
+    setStorageResetMessage(null);
+
+    try {
+      await window.openNow.resetPersistentStorage({ storageRegion: selectedStorageRegion ?? null });
+      setStorageResetState("success");
+      setStorageResetMessage(t("settings.persistentStorage.resetSuccess"));
+      setSelectedStorageRegion(null);
+      await loadSubscriptionData();
+    } catch (error) {
+      console.error("[Settings] Failed to reset persistent storage:", error);
+      setStorageResetState("error");
+      setStorageResetMessage(
+        error instanceof Error && error.message
+          ? error.message
+          : t("settings.persistentStorage.resetFailed"),
+      );
+    }
+  }, [loadSubscriptionData, persistentStorage, selectedStorageRegion, storageResetState, storageResetTargetLabel, t]);
 
   const selectedResolutionLabel = useMemo(() => {
     if (hasDynamic) {
@@ -1779,6 +1955,8 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
     return searchTokens.every((token) => searchableWords.some((word) => tokenMatchesWord(token, word)));
   };
 
+  const showAccountStorage = showAll ? scopeMatchesSearch("account-storage") : activeSection === "account";
+  const showAccount = showAccountStorage;
   const showStreamRegion = showAll ? scopeMatchesSearch("stream-region") : activeSection === "stream";
   const showStreamVideo = showAll ? scopeMatchesSearch("stream-video") : activeSection === "stream";
   const showStreamCodecDiagnostics = showAll ? scopeMatchesSearch("stream-codec-diagnostics") : activeSection === "stream";
@@ -1790,10 +1968,16 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
   const showInterface = showAll ? scopeMatchesSearch("interface") : activeSection === "interface";
   const showAbout = showAll ? scopeMatchesSearch("about") : activeSection === "about";
   const showThanks = showAll ? scopeMatchesSearch("thanks") : activeSection === "thanks";
-  const hasAnySearchMatches = showStream || showNativeStreamer || showGame || showAudio || showInput || showInterface || showAbout || showThanks;
+  const hasAnySearchMatches = showAccount || showStream || showNativeStreamer || showGame || showAudio || showInput || showInterface || showAbout || showThanks;
   const shouldRenderSettingsSections = showAll || activeSection !== "thanks";
 
   const settingsNavGroups = useMemo<SettingsNavGroup[]>(() => [
+    {
+      label: "Account",
+      items: [
+        { id: "account", label: t("settings.sections.account"), icon: <Users size={15} /> },
+      ],
+    },
     {
       label: "Streaming",
       items: [
@@ -1930,6 +2114,137 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
             {showThanks && thanksTabContent}
             {shouldRenderSettingsSections && (
               <>
+            {showAccount && (
+              <section className="settings-section settings-storage-section">
+                {showAll && <div className="settings-section-context">{t("settings.sections.account")}</div>}
+                <div className="settings-section-header settings-section-header--with-copy">
+                  <HardDrive size={18} />
+                  <div>
+                    <h2>{t("settings.persistentStorage.title")}</h2>
+                    <p className="settings-section-subtitle">{t("settings.persistentStorage.description")}</p>
+                  </div>
+                </div>
+                <div className="settings-storage-card">
+                  <div className="settings-storage-summary">
+                    <div className="settings-storage-headline">
+                      <HardDrive size={18} />
+                      {persistentStorage ? (
+                        persistentStorageUsedLabel && persistentStorageSizeLabel ? (
+                          <span>
+                            <strong>{persistentStorageUsedLabel}</strong>{" "}
+                            {t("settings.persistentStorage.usedOutOf", { total: persistentStorageSizeLabel })}
+                          </span>
+                        ) : (
+                          <span>{t("settings.persistentStorage.usageUnavailable")}</span>
+                        )
+                      ) : (
+                        <span>{persistentStorageUsageLabel}</span>
+                      )}
+                    </div>
+                    {persistentStorage ? (
+                      <span className="settings-inline-badge settings-inline-badge--codec settings-inline-badge--codec-gpu">
+                        {t("settings.persistentStorage.detected")}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {persistentStorageUsagePercent !== null ? (
+                    <div
+                      className="settings-storage-meter"
+                      role="progressbar"
+                      aria-label={t("settings.persistentStorage.meterLabel")}
+                      aria-valuemin={0}
+                      aria-valuemax={persistentStorageSizeGb ?? 100}
+                      aria-valuenow={persistentStorageUsedGb ?? 0}
+                    >
+                      <div
+                        className="settings-storage-meter-used"
+                        style={{ width: `${persistentStorageUsagePercent}%` }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="settings-storage-meter settings-storage-meter--empty" />
+                  )}
+
+                  <div className="settings-storage-legend">
+                    <span>
+                      <span className="settings-storage-legend-dot settings-storage-legend-dot--used" />
+                      {persistentStorageUsedLabel
+                        ? t("settings.persistentStorage.usedLegend", { value: persistentStorageUsedLabel })
+                        : t("settings.persistentStorage.usedLegendUnavailable")}
+                    </span>
+                    <span>
+                      <span className="settings-storage-legend-dot settings-storage-legend-dot--available" />
+                      {persistentStorageRemainingLabel
+                        ? t("settings.persistentStorage.availableLegend", { value: persistentStorageRemainingLabel })
+                        : t("settings.persistentStorage.availableLegendUnavailable")}
+                    </span>
+                  </div>
+
+                  <div className="settings-storage-location-control">
+                    <label className="settings-storage-location-copy" htmlFor="persistent-storage-reset-region">
+                      <span>{t("settings.persistentStorage.locationTitle")}</span>
+                      <span>{storageResetTargetHint}</span>
+                      {storageLocationsLoading ? (
+                        <span>{t("settings.persistentStorage.locationsLoading")}</span>
+                      ) : storageLocationsError ? (
+                        <span className="settings-storage-message settings-storage-message--error">{storageLocationsError}</span>
+                      ) : null}
+                    </label>
+                    <select
+                      id="persistent-storage-reset-region"
+                      className="settings-storage-select"
+                      value={selectedStorageRegion ?? ""}
+                      disabled={!persistentStorage || storageLocationsLoading || storageResetState === "resetting"}
+                      onChange={(event) => {
+                        const value = event.target.value.trim();
+                        setSelectedStorageRegion(value.length > 0 ? value : null);
+                      }}
+                    >
+                      <option value="">{currentStorageLocationOptionLabel}</option>
+                      {storageLocationOptions.map((location) => (
+                        <option key={location.code} value={location.code} disabled={!location.isAvailable}>
+                          {location.name}
+                          {location.isRecommended ? ` (${t("settings.persistentStorage.recommended")})` : ""}
+                          {!location.isAvailable ? ` (${t("settings.persistentStorage.unavailable")})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="settings-storage-footer">
+                    <div className="settings-storage-meta">
+                      {persistentStorageDetails.length > 0 ? (
+                        <span>{persistentStorageDetails.join(" / ")}</span>
+                      ) : null}
+                      <span>{t("settings.persistentStorage.resetHint")}</span>
+                      {storageResetMessage ? (
+                        <span className={`settings-storage-message settings-storage-message--${storageResetState}`}>
+                          {storageResetMessage}
+                        </span>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-delete-cache-btn settings-storage-reset-btn"
+                      disabled={!persistentStorage || subscriptionLoading || storageResetState === "resetting"}
+                      onClick={() => {
+                        void handleResetPersistentStorage();
+                      }}
+                    >
+                      {storageResetState === "resetting" ? (
+                        <Loader size={16} className="spin" />
+                      ) : (
+                        <Trash2 size={16} />
+                      )}
+                      {storageResetState === "resetting"
+                        ? t("settings.persistentStorage.resetting")
+                        : t("settings.persistentStorage.resetStorage")}
+                    </button>
+                  </div>
+                </div>
+              </section>
+            )}
             {/* ═══ STREAM ════════════════════════════════════ */}
             {showStream && (
               <>
