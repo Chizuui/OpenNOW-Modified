@@ -317,7 +317,7 @@
       "collapse": "Hide detailed stats",
       "live": "Live",
       "sync": "Sync",
-      "network": "RTT",
+      "rtt": "RTT",
       "bitrateShort": "Bit",
       "bitratePerformance": "Actual receive bitrate compared with the negotiated target",
       "showAdvanced": "Advanced diagnostics",
