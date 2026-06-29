@@ -447,9 +447,12 @@
       "unavailable": "Unavailable",
       "resetHint": "Deletes all installed games and persistent data from NVIDIA cloud storage. Choose a different location first if you want reset to move storage.",
       "resetConfirm": "Reset Persistent Storage in {{region}}? This will delete all installed games and persistent data from NVIDIA cloud storage. This action cannot be undone.",
+      "openManager": "Open NVIDIA",
+      "openManagerFailed": "Failed to open NVIDIA Storage Manager.",
       "resetStorage": "Reset Storage",
       "resetting": "Resetting...",
       "resetSuccess": "Persistent Storage reset complete.",
+      "resetRequiresBrowser": "NVIDIA requires its web account session for this reset. Open NVIDIA Storage Manager in your browser to reset or move Persistent Storage.",
       "resetFailed": "Failed to reset Persistent Storage. Please try again."
     },
     "accountConnections": {

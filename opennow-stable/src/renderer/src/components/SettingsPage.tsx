@@ -222,6 +222,8 @@ const SETTINGS_SCOPE_SEARCH_TERMS: Record<SettingsSearchScopeId, readonly string
 const POSTER_SIZE_MIN = 75;
 const POSTER_SIZE_MAX = 135;
 const POSTER_SIZE_STEP = 5;
+const NVIDIA_STORAGE_MANAGER_URL = "https://www.nvidia.com/en-us/account/gfn/manage-storage/";
+const STORAGE_WEB_SESSION_REQUIRED_MARKER = "NVIDIA's storage reset API requires the NVIDIA web account session";
 
 const codecOptions: VideoCodec[] = [...USER_FACING_VIDEO_CODEC_OPTIONS];
 
@@ -1104,6 +1106,16 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
     }
   }, [selectedStorageRegion, storageLocations]);
 
+  const handleOpenPersistentStorageManager = useCallback(async (): Promise<void> => {
+    try {
+      await window.openNow.openExternalUrl(NVIDIA_STORAGE_MANAGER_URL);
+    } catch (error) {
+      console.error("[Settings] Failed to open NVIDIA Storage Manager:", error);
+      setStorageResetState("error");
+      setStorageResetMessage(t("settings.persistentStorage.openManagerFailed"));
+    }
+  }, [t]);
+
   const handleResetPersistentStorage = useCallback(async (): Promise<void> => {
     if (!persistentStorage || storageResetState === "resetting") {
       return;
@@ -1124,11 +1136,12 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
       await loadSubscriptionData();
     } catch (error) {
       console.error("[Settings] Failed to reset persistent storage:", error);
+      const errorMessage = error instanceof Error && error.message ? error.message : "";
       setStorageResetState("error");
       setStorageResetMessage(
-        error instanceof Error && error.message
-          ? error.message
-          : t("settings.persistentStorage.resetFailed"),
+        errorMessage.includes(STORAGE_WEB_SESSION_REQUIRED_MARKER)
+          ? t("settings.persistentStorage.resetRequiresBrowser")
+          : errorMessage || t("settings.persistentStorage.resetFailed"),
       );
     }
   }, [loadSubscriptionData, persistentStorage, selectedStorageRegion, storageResetState, storageResetTargetLabel, t]);
@@ -2452,23 +2465,35 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
                         </span>
                       ) : null}
                     </div>
-                    <button
-                      type="button"
-                      className="settings-delete-cache-btn settings-storage-reset-btn"
-                      disabled={!persistentStorage || subscriptionLoading || storageResetState === "resetting"}
-                      onClick={() => {
-                        void handleResetPersistentStorage();
-                      }}
-                    >
-                      {storageResetState === "resetting" ? (
-                        <Loader size={16} className="spin" />
-                      ) : (
-                        <Trash2 size={16} />
-                      )}
-                      {storageResetState === "resetting"
-                        ? t("settings.persistentStorage.resetting")
-                        : t("settings.persistentStorage.resetStorage")}
-                    </button>
+                    <div className="settings-storage-actions">
+                      <button
+                        type="button"
+                        className="settings-export-logs-btn settings-storage-manager-btn"
+                        onClick={() => {
+                          void handleOpenPersistentStorageManager();
+                        }}
+                      >
+                        <ExternalLink size={16} />
+                        {t("settings.persistentStorage.openManager")}
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-delete-cache-btn settings-storage-reset-btn"
+                        disabled={!persistentStorage || subscriptionLoading || storageResetState === "resetting"}
+                        onClick={() => {
+                          void handleResetPersistentStorage();
+                        }}
+                      >
+                        {storageResetState === "resetting" ? (
+                          <Loader size={16} className="spin" />
+                        ) : (
+                          <Trash2 size={16} />
+                        )}
+                        {storageResetState === "resetting"
+                          ? t("settings.persistentStorage.resetting")
+                          : t("settings.persistentStorage.resetStorage")}
+                      </button>
+                    </div>
                   </div>
                 </div>
               </section>
