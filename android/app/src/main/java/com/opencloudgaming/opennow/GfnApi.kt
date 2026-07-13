@@ -304,7 +304,7 @@ internal fun buildMinimalClaimRequestBody(
             put("clientVersion", "30.0")
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
-            put("clientPlatformName", "browser")
+            put("clientPlatformName", "windows")
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
@@ -324,14 +324,14 @@ internal fun buildMinimalClaimRequestBody(
             put("parentSessionId", JsonNull)
             put("appId", appId.toIntOrNull() ?: 0)
             put("streamerVersion", 1)
-            put("appLaunchMode", 2)
+            put("appLaunchMode", 1)
             put("sdkVersion", "1.0")
             put("enhancedStreamMode", 1)
             put("useOps", true)
             put("clientDisplayHdrCapabilities", if (profile?.hdrEnabled == true) hdrCapabilitiesJson() else JsonNull)
             put("accountLinked", true)
             put("partnerCustomData", "")
-            put("enablePersistingInGameSettings", false)
+            put("enablePersistingInGameSettings", true)
             put("secureRTSPSupported", false)
             put("userAge", 26)
             if (settings != null && profile != null) {
@@ -560,18 +560,18 @@ private fun cloudMatchHeaders(
     includeOrigin: Boolean,
 ): Headers =
     Headers.Builder()
-        .add("User-Agent", GFN_BROWSER_USER_AGENT)
+        .add("User-Agent", GFN_USER_AGENT)
         .add("Authorization", gfnJwtAuthorization(token))
         .add("Content-Type", "application/json")
         .add("nv-browser-type", "CHROME")
         .add("nv-client-id", clientId)
-        .add("nv-client-streamer", "WEBRTC")
-        .add("nv-client-type", "BROWSER")
-        .add("nv-client-version", GFN_BROWSER_CLIENT_VERSION)
+        .add("nv-client-streamer", "NVIDIA-CLASSIC")
+        .add("nv-client-type", "NATIVE")
+        .add("nv-client-version", GFN_CLIENT_VERSION)
         .add("nv-device-make", "UNKNOWN")
         .add("nv-device-model", "UNKNOWN")
-        .add("nv-device-os", "ANDROID")
-        .add("nv-device-type", "PHONE")
+        .add("nv-device-os", "WINDOWS")
+        .add("nv-device-type", "DESKTOP")
         .add("x-device-id", deviceId)
         .apply {
             if (includeOrigin) {
@@ -2385,7 +2385,7 @@ class GfnSessionRepository(
                 put("clientVersion", "30.0")
                 put("sdkVersion", "1.0")
                 put("streamerVersion", 1)
-                put("clientPlatformName", "browser")
+                put("clientPlatformName", "windows")
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
                 }
@@ -2398,11 +2398,11 @@ class GfnSessionRepository(
                 put("remoteControllersBitmap", 0)
                 put("clientTimezoneOffset", java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()))
                 put("enhancedStreamMode", 1)
-                put("appLaunchMode", 2)
+                put("appLaunchMode", 1)
                 put("secureRTSPSupported", false)
                 put("partnerCustomData", "")
                 put("accountLinked", accountLinked)
-                put("enablePersistingInGameSettings", false)
+                put("enablePersistingInGameSettings", true)
                 put("userAge", 26)
                 put("requestedStreamingFeatures", requestedStreamingFeatures(settings, profile))
             }
