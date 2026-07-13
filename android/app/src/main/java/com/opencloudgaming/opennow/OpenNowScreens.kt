@@ -5103,6 +5103,10 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad) {
         NativeStreamInputRouter.setTouchMouseEnabled(streamReady && touchInputEnabled && state.settings.androidTouch.mousePad)
     }
+    LaunchedEffect(state.settings.androidTouch.mouseDirectClick) {
+        NativeStreamInputRouter.setMouseDirectClick(state.settings.androidTouch.mouseDirectClick)
+    }
+
     LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen, touchControlsVisible) {
         NativeStreamInputRouter.setCaptureAllTouch(
             streamReady &&
@@ -5147,11 +5151,11 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 resolutionMismatchStats += 1
                 if (resolutionMismatchStats >= 3 && !resolutionMismatchRestartRequested) {
                     resolutionMismatchRestartRequested = true
-                    client.stop()
                     viewModel.restartStreamForResolutionMismatch(
                         actualResolution = mismatch.actualResolution,
                         expectedResolution = mismatch.expectedResolution,
                     )
+                    client.stop()
                 }
             }
         }
@@ -5218,8 +5222,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 val doneButtonTone = playButtonTone
                 Box(
                     Modifier
-                        .align(Alignment.Center)
-                        .zIndex(999f),
+                        .align(Alignment.Center),
                     contentAlignment = Alignment.Center,
                 ) {
                     Button(
@@ -5375,6 +5378,13 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         viewModel.updateSettings(
                             state.settings.copy(
                                 androidTouch = state.settings.androidTouch.copy(mousePad = !state.settings.androidTouch.mousePad),
+                            ),
+                        )
+                    },
+                    onMouseDirectClickToggle = {
+                        viewModel.updateSettings(
+                            state.settings.copy(
+                                androidTouch = state.settings.androidTouch.copy(mouseDirectClick = !state.settings.androidTouch.mouseDirectClick),
                             ),
                         )
                     },
@@ -5626,6 +5636,12 @@ private fun StreamVideoSurface(
     ) {
         zoomScale = 1f
         zoomOffset = Offset.Zero
+    }
+    LaunchedEffect(stretchToFill) {
+        NativeStreamInputRouter.setStretchToFill(stretchToFill)
+    }
+    LaunchedEffect(streamAspectRatio) {
+        NativeStreamInputRouter.setRenderingAspectRatio(streamAspectRatio)
     }
     DisposableEffect(client, rootView, pointerRootView, hideExternalMousePointer) {
         pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
@@ -6375,6 +6391,7 @@ private fun StreamControlsPanel(
     onExit: () -> Unit,
     onTouchControlsToggle: () -> Unit,
     onMousePadToggle: () -> Unit,
+    onMouseDirectClickToggle: () -> Unit,
     onSharpeningToggle: () -> Unit,
     onSharpeningAmountChange: (Float) -> Unit,
     onStretchToFillToggle: () -> Unit,
@@ -6559,6 +6576,14 @@ private fun StreamControlsPanel(
                     StreamControlSwitch("Finger mouse", if (settings.androidTouch.mousePad) "On" else "Off", settings.androidTouch.mousePad) {
                         onButtonTone()
                         onMousePadToggle()
+                    }
+                    if (settings.androidTouch.mousePad) {
+                        Box(Modifier.padding(start = 24.dp)) {
+                            StreamControlSwitch("Direct click", if (settings.androidTouch.mouseDirectClick) "On" else "Off", settings.androidTouch.mouseDirectClick) {
+                                onButtonTone()
+                                onMouseDirectClickToggle()
+                            }
+                        }
                     }
                     StreamControlSwitch("Touch controller", if (touchControlsVisible) "Visible" else "Hidden", touchControlsVisible) {
                         onButtonTone()
@@ -7150,6 +7175,7 @@ private fun StreamExitConfirmation(
                 .fillMaxWidth(),
             shape = RoundedCornerShape(20.dp),
             color = Panel.copy(alpha = 0.95f),
+            contentColor = TextPrimary,
             tonalElevation = 8.dp,
         ) {
             Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -8582,7 +8608,7 @@ private fun BoxScope.LandscapeTouchControls(
 ) {
     val controlScale = buttonScale * layoutScale
     val topControlClearance = landscapeTouchTopControlClearanceDp(viewportHeight.value, controlScale).dp
-    Box(Modifier.fillMaxSize().padding(horizontal = 48.dp, vertical = 24.dp)) {
+    Box(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 24.dp)) {
         TouchControlGroup(
             id = "landscape-lt",
             layoutEditing = layoutEditing,
@@ -9224,18 +9250,51 @@ private fun FilterMenu(
         ) {
             Text(if (selectedIds.isEmpty()) "Filters" else "Filters ${selectedIds.size}", maxLines = 1, style = MaterialTheme.typography.labelMedium)
         }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            options.forEach { option ->
-                DropdownMenuItem(
-                    text = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(if (option.id in selectedIds) "✓" else "", modifier = Modifier.width(24.dp))
-                            Text(option.label)
+        if (expanded) {
+            AlertDialog(
+                onDismissRequest = { expanded = false },
+                title = {
+                    Text(
+                        "Filters",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TextPrimary,
+                    )
+                },
+                text = {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxHeight(0.6f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(options) { option ->
+                            val isSelected = option.id in selectedIds
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onToggle(option.id) }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = isSelected,
+                                    onCheckedChange = null
+                                )
+                                Spacer(Modifier.width(12.dp))
+                                Text(
+                                    option.label,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = TextPrimary
+                                )
+                            }
                         }
-                    },
-                    onClick = { onToggle(option.id) },
-                )
-            }
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = { expanded = false }) {
+                        Text("Done")
+                    }
+                }
+            )
         }
     }
 }
