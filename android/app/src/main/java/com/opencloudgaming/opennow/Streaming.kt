@@ -796,14 +796,15 @@ object NativeStreamInputRouter {
         nativeUiTouchPointerIds.isNotEmpty()
 
     fun shouldForwardTouchBeforeViews(event: MotionEvent, width: Int, height: Int): Boolean {
+        val isDirectClick = mouseDirectClick && event.isExternalMousePointerEvent()
         if (
             client == null ||
             streamUiActive ||
-            !touchMouseEnabled ||
+            !(touchMouseEnabled || isDirectClick) ||
             !captureAllTouch ||
             width <= 0 ||
             height <= 0 ||
-            !event.isFingerTouchEvent()
+            !(event.isFingerTouchEvent() || isDirectClick)
         ) {
             return false
         }
@@ -819,11 +820,12 @@ object NativeStreamInputRouter {
     fun dispatchTouch(event: MotionEvent, width: Int, height: Int): Boolean {
         val current = client ?: return false
         if (streamUiActive) return false
-        if (!event.isFingerTouchEvent()) return false
+        val isDirectClick = mouseDirectClick && event.isExternalMousePointerEvent()
+        if (!event.isFingerTouchEvent() && !isDirectClick) return false
         updateNativeUiTouchPointers(event, width, height)
         return touchMouseState.handle(
             event = event,
-            enabled = touchMouseEnabled && width > 0 && height > 0,
+            enabled = (touchMouseEnabled || isDirectClick) && width > 0 && height > 0,
             client = current,
             ignoredPointerIds = nativeUiTouchPointerIds,
             directClick = mouseDirectClick,
@@ -837,6 +839,7 @@ object NativeStreamInputRouter {
     fun dispatchExternalMouseTouch(event: MotionEvent, width: Int, height: Int): Boolean {
         if (streamUiActive) return false
         if (!event.isExternalMousePointerEvent()) return false
+        if (mouseDirectClick) return false // Handled in dispatchTouch instead
         if (shouldPassTouchToNativeUi(event, width, height)) return false
         return client?.dispatchMotion(event) == true
     }
@@ -1862,8 +1865,8 @@ private class TouchMouseState {
 
                         if (idx != 0 || idy != 0) {
                             client.sendRawMouseMove(idx, idy)
-                            virtualCursorX += idx
-                            virtualCursorY += idy
+                            virtualCursorX = (virtualCursorX + idx).coerceIn(0f, streamWidth.toFloat())
+                            virtualCursorY = (virtualCursorY + idy).coerceIn(0f, streamHeight.toFloat())
                         }
 
                         client.setTouchMouseButton(true)
@@ -1889,8 +1892,8 @@ private class TouchMouseState {
 
                             if (idx != 0 || idy != 0) {
                                 client.sendRawMouseMove(idx, idy)
-                                virtualCursorX += idx
-                                virtualCursorY += idy
+                                virtualCursorX = (virtualCursorX + idx).coerceIn(0f, streamWidth.toFloat())
+                                virtualCursorY = (virtualCursorY + idy).coerceIn(0f, streamHeight.toFloat())
                             }
                         }
                     }

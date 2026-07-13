@@ -2320,7 +2320,7 @@ private fun ActiveSessionResumeCard(
                     .clip(RoundedCornerShape(10.dp)),
             )
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Resume cloud session", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Resume cloud session", color = TextPrimary, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
                     game?.title ?: "App ${active.appId}",
                     color = TextMuted,
@@ -5199,6 +5199,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     streamSettings = launchStreamSettings,
                     style = state.settings.streamStatsStyle,
                     metrics = state.settings.streamStatsMetrics,
+                    serverLocation = session.zone,
                     modifier = Modifier.align(statsAlignment),
                 )
             }
@@ -6725,6 +6726,10 @@ private fun StatusBarSettingsPage(
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(codec = !metrics.codec))
                 }
+                StatusBarMetricSwitch("Server", metrics.location, Modifier.width(itemWidth)) {
+                    onButtonTone()
+                    onStatsMetricsChange(metrics.copy(location = !metrics.location))
+                }
             }
         }
     }
@@ -6934,6 +6939,7 @@ private fun StreamStatsPill(
     streamSettings: StreamSettings,
     style: StreamStatsStyle,
     metrics: StreamStatsMetrics,
+    serverLocation: String?,
     modifier: Modifier = Modifier,
 ) {
     if (metrics.enabledCount() == 0) return
@@ -6950,7 +6956,7 @@ private fun StreamStatsPill(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus)
+                StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus, serverLocation)
             }
         } else {
             FlowRow(
@@ -6959,7 +6965,7 @@ private fun StreamStatsPill(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus)
+                StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus, serverLocation)
             }
         }
     }
@@ -6971,6 +6977,7 @@ private fun StreamStatsMetricItems(
     streamSettings: StreamSettings,
     metrics: StreamStatsMetrics,
     deviceStatus: CompactStreamDeviceStatus,
+    serverLocation: String?,
 ) {
     if (metrics.fps) {
         StreamStatsText("FPS ${streamStats.fps?.toString() ?: streamSettings.fps}")
@@ -6995,6 +7002,10 @@ private fun StreamStatsMetricItems(
     }
     if (metrics.codec) {
         StreamStatsText(streamStats.codec?.takeIf { it.isNotBlank() } ?: streamSettings.codec.name)
+    }
+    if (metrics.location && !serverLocation.isNullOrBlank()) {
+        val displayName = serverLocation.removePrefix("NPA-").removePrefix("NP-").uppercase()
+        StreamStatsText(displayName)
     }
 }
 
@@ -7998,6 +8009,7 @@ private fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
         )
         Text(
             game?.title ?: "Starting stream",
+            color = TextPrimary,
             style = if (compact) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
             maxLines = 1,
@@ -8076,6 +8088,7 @@ private fun MinimizedQueueDock(
             Column(Modifier.weight(1f)) {
                 Text(
                     state.streamGame?.title ?: "Starting stream",
+                    color = TextPrimary,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

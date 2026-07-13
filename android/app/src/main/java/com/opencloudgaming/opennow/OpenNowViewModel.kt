@@ -195,6 +195,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
 
     private var gamesJob: Job? = null
     private var launchJob: Job? = null
+    private var activeSubscriptionJob: Job? = null
     private var pendingActiveSessionLaunch: PendingActiveSessionLaunch? = null
     private var loginJob: Job? = null
     private var androidUpdateJob: Job? = null
@@ -1031,6 +1032,8 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 recordDebugEvent("launch", "Play request ignored without an auth session game=${game.title}")
                 return@launch
             }
+            // Wait for active subscription fetch to finish so we have accurate membership info to allow resolutions
+            activeSubscriptionJob?.join()
             val returnPage = state.value.page.takeUnless { it == AppPage.Stream } ?: state.value.streamReturnPage ?: AppPage.Home
             if (!skipPrintedWaste && streamingBaseUrlOverride == null && shouldUsePrintedWasteQueue(auth)) {
                 recordDebugEvent("queue", "Opening PrintedWaste selector game=${game.title}")
@@ -1851,6 +1854,11 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         val currentSettings = initial.activeStreamSettings ?: effectiveStreamSettings()
+        val actualAspect = streamAspectRatioForResolution(actualResolution) ?: currentSettings.aspectRatio
+        val targetSettings = currentSettings.copy(
+            resolution = actualResolution,
+            aspectRatio = actualAspect,
+        )
         val restartKey = listOf(
             initial.streamGame?.id ?: initial.activeSession?.appId?.toString() ?: initial.streamSession?.sessionId.orEmpty(),
             streamSettingsSessionSignature(currentSettings),
@@ -1885,7 +1893,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 it.copy(
                     streamSession = null,
                     activeSession = null,
-                    activeStreamSettings = currentSettings,
+                    activeStreamSettings = targetSettings,
                     streamStatus = "queue",
                     launchPhase = "Restarting at requested resolution",
                     page = AppPage.Stream,
@@ -1920,17 +1928,17 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     appId = launchAppId,
                     internalTitle = game?.title ?: "Cloud session",
                     zone = previousSession?.zone?.takeIf { it.isNotBlank() } ?: "prod",
-                    settings = currentSettings,
+                    settings = targetSettings,
                     accountLinked = game?.let { shouldSendAccountLinked(it, selectedVariant) } ?: true,
                 )
                 recordDebugEvent("recovery", "Created requested-resolution session ${created.debugSummary()}")
-                pollUntilReady(token, created, currentSettings)
+                pollUntilReady(token, created, targetSettings)
             }.onSuccess { readySession ->
                 recordDebugEvent("recovery", "Requested-resolution session ready ${readySession.debugSummary()}")
                 _state.update {
                     it.copy(
                         streamSession = readySession,
-                        activeStreamSettings = currentSettings,
+                        activeStreamSettings = targetSettings,
                         streamStatus = "connecting",
                         launchPhase = "Connecting requested-resolution stream",
                         streamLaunchMinimized = false,
@@ -2244,6 +2252,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }
+        activeSubscriptionJob = subscriptionJob
         val accountConnectorsJob = viewModelScope.launch {
             _state.update { it.copy(loadingAccountConnectors = true) }
             val connectors = runCatching { accountConnectorRepository.fetchConnectors(token) }.getOrDefault(emptyList())

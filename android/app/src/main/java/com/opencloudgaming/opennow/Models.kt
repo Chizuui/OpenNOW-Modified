@@ -96,8 +96,9 @@ data class StreamStatsMetrics(
     val connection: Boolean = true,
     val resolution: Boolean = false,
     val codec: Boolean = false,
+    val location: Boolean = true,
 ) {
-    fun enabledCount(): Int = listOf(fps, ping, bitrate, battery, connection, resolution, codec).count { it }
+    fun enabledCount(): Int = listOf(fps, ping, bitrate, battery, connection, resolution, codec, location).count { it }
 }
 
 @Serializable
