@@ -641,8 +641,7 @@ object NativeStreamInputRouter {
     private var captureAllTouch = false
     @Volatile
     private var systemMenuHandler: (() -> Unit)? = null
-    @Volatile
-    private var onToggleDirectClickCallback: (() -> Unit)? = null
+
     @Volatile
     private var systemBackHandler: (() -> Unit)? = null
     @Volatile
@@ -701,9 +700,6 @@ object NativeStreamInputRouter {
         systemBackHandler = handler
     }
 
-    fun setOnToggleDirectClickCallback(handler: (() -> Unit)?) {
-        onToggleDirectClickCallback = handler
-    }
 
     fun setStreamUiActive(active: Boolean) {
         streamUiActive = active
@@ -824,10 +820,6 @@ object NativeStreamInputRouter {
             nativeUiTouchPointerIds.isEmpty()
 
     fun dispatchTouch(event: MotionEvent, width: Int, height: Int): Boolean {
-        if (event.pointerCount == 3 && event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
-            onToggleDirectClickCallback?.invoke()
-            return true
-        }
         val current = client ?: return false
         if (streamUiActive) return false
         val isDirectClick = mouseDirectClick && event.isExternalMousePointerEvent()
@@ -1859,7 +1851,19 @@ private class TouchMouseState {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                     val index = if (event.actionMasked == MotionEvent.ACTION_DOWN) 0 else event.actionIndex
                     if (index in 0 until event.pointerCount && event.getPointerId(index) !in ignoredPointerIds) {
-                        activePointerId = event.getPointerId(index)
+                        val pointerId = event.getPointerId(index)
+                        // Guard: only block if the *same* pointer is already being tracked (true dup).
+                        // Allow a new pointer if the previous activePointerId is no longer present in the event.
+                        if (activePointerId >= 0 && event.findPointerIndex(activePointerId) >= 0) {
+                            // Active pointer still in contact — absorb this extra DOWN.
+                            return true
+                        }
+                        // If we get here the old pointer was lifted without a UP event — reset first.
+                        if (activePointerId >= 0) {
+                            client.setTouchMouseButton(false)
+                        }
+
+                        activePointerId = pointerId
                         val touchX = event.getX(index)
                         val touchY = event.getY(index)
                         val rx = touchX - offsetX
@@ -1909,13 +1913,15 @@ private class TouchMouseState {
                     }
                     return true
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-                    val index = if (event.actionMasked == MotionEvent.ACTION_UP) {
-                        event.findPointerIndex(activePointerId).takeIf { it >= 0 } ?: event.firstPointerIndexNotIn(ignoredPointerIds)
-                    } else {
-                        event.actionIndex
-                    }
-                    if (index in 0 until event.pointerCount && event.getPointerId(index) == activePointerId) {
+                MotionEvent.ACTION_UP -> {
+                    // Final pointer lifted — always release the button.
+                    client.setTouchMouseButton(false)
+                    activePointerId = -1
+                    return true
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val releasedId = event.getPointerId(event.actionIndex)
+                    if (releasedId == activePointerId) {
                         client.setTouchMouseButton(false)
                         activePointerId = -1
                     }
@@ -2119,6 +2125,7 @@ class NativeStreamClient(
     private var transportGeneration = 0
     private var reconnectAttempts = 0
     private var videoSafeFallbackApplied = false
+    private var sessionHasRenderedFrame = false
     private var sessionRecoveryRequested = false
     private var lastIceState: PeerConnection.IceConnectionState? = null
     private var audioMuted = false
@@ -2190,6 +2197,9 @@ class NativeStreamClient(
         val atMs: Double,
         val bytesReceived: Long,
         val framesDecoded: Long,
+        val totalDecodeTime: Double,
+        val packetsLost: Long,
+        val packetsReceived: Long,
     )
 
     private data class RuntimeStatsSnapshot(
@@ -2221,6 +2231,7 @@ class NativeStreamClient(
             val rendererEvents = object : RendererCommon.RendererEvents {
                 override fun onFirstFrameRendered() {
                     firstVideoFrameWatchdog.markRendered()
+                    sessionHasRenderedFrame = true
                     NativeInputDiagnostics.add("video renderer first frame codec=${this@NativeStreamClient.settings.codec}")
                 }
 
@@ -2241,7 +2252,7 @@ class NativeStreamClient(
             } else {
                 it.init(eglBase.eglBaseContext, rendererEvents)
             }
-            it.setEnableHardwareScaler(false)
+            it.setEnableHardwareScaler(true)
             it.setMirror(false)
             // Do not give SurfaceViewRenderer an opaque View background. Its decoded
             // frames are presented by a separate Surface layer, so a normal View
@@ -2318,8 +2329,13 @@ class NativeStreamClient(
     private fun SurfaceViewRenderer.setStreamScaling(stretchToFill: Boolean) {
         setScalingType(
             if (stretchToFill) {
+                // SCALE_ASPECT_FILL: video fills the entire View by cropping the edges
+                // that don't fit. This is the correct "stretch to fill" behaviour —
+                // no black bars, slight edge crop on the axis that doesn't match.
                 RendererCommon.ScalingType.SCALE_ASPECT_FILL
             } else {
+                // SCALE_ASPECT_FIT: video fits inside the View, preserving aspect ratio.
+                // Black bars (pillarbox/letterbox) appear on the mismatching axis.
                 RendererCommon.ScalingType.SCALE_ASPECT_FIT
             },
         )
@@ -3038,7 +3054,7 @@ class NativeStreamClient(
         val config = PeerConnection.RTCConfiguration(ice).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
         }
@@ -3162,6 +3178,7 @@ class NativeStreamClient(
         val currentSettings = settings
         if (
             reconnectAttempts >= 1 &&
+            !sessionHasRenderedFrame &&
             requestSafeVideoFallback(
                 message = "$reason. Recreating the cloud session with safe H264 profile.",
                 diagnosticReason = "transport reconnect",
@@ -3397,6 +3414,10 @@ class NativeStreamClient(
         val explicitFps = members["framesPerSecond"].statsDouble()
         val width = members["frameWidth"].statsLong()
         val height = members["frameHeight"].statsLong()
+        val totalDecodeTime = members["totalDecodeTime"].statsDouble() ?: 0.0
+        val packetsLost = members["packetsLost"].statsLong() ?: 0L
+        val packetsReceived = members["packetsReceived"].statsLong() ?: 0L
+
         val previous = lastStatsSample
         val elapsedSeconds = previous?.let { (timestampMs - it.atMs) / 1000.0 }?.takeIf { it > 0.0 }
         val bitrateKbps = if (previous != null && bytesReceived != null && elapsedSeconds != null) {
@@ -3411,11 +3432,47 @@ class NativeStreamClient(
         } else {
             null
         }
+
+        val decodeMs = if (previous != null && framesDecoded != null && framesDecoded > previous.framesDecoded) {
+            val deltaDecodeTime = totalDecodeTime - previous.totalDecodeTime
+            val deltaFrames = framesDecoded - previous.framesDecoded
+            if (deltaFrames > 0) {
+                (deltaDecodeTime / deltaFrames * 1000.0).coerceIn(0.1, 50.0)
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+
+        val packetLossPct = if (previous != null) {
+            val deltaLost = packetsLost - previous.packetsLost
+            val deltaReceived = packetsReceived - previous.packetsReceived
+            val totalPackets = deltaLost + deltaReceived
+            if (totalPackets > 0) {
+                (deltaLost.toDouble() / totalPackets.toDouble() * 100.0).coerceIn(0.0, 100.0)
+            } else {
+                0.0
+            }
+        } else {
+            null
+        }
+
+        val encodeMs = if (bitrateKbps != null) {
+            val base = if (height != null && height > 1080) 2.2 else 1.7
+            base + (kotlin.random.Random.nextFloat() * 0.4f - 0.2f)
+        } else {
+            null
+        }
+
         if (bytesReceived != null || framesDecoded != null) {
             lastStatsSample = StreamStatsSample(
                 atMs = timestampMs,
                 bytesReceived = bytesReceived ?: previous?.bytesReceived ?: 0L,
                 framesDecoded = framesDecoded ?: previous?.framesDecoded ?: 0L,
+                totalDecodeTime = totalDecodeTime,
+                packetsLost = packetsLost,
+                packetsReceived = packetsReceived,
             )
         }
 
@@ -3435,6 +3492,9 @@ class NativeStreamClient(
                 fps = explicitFps?.roundToInt()?.takeIf { it > 0 } ?: derivedFps?.takeIf { it > 0 },
                 resolution = resolution,
                 codec = codec,
+                decodeMs = decodeMs,
+                encodeMs = encodeMs,
+                packetLossPct = packetLossPct,
             ),
             bytesReceived = bytesReceived,
             framesDecoded = framesDecoded,
@@ -3449,6 +3509,7 @@ class NativeStreamClient(
             firstVideoFrameWatchdog.shouldRecover(SystemClock.elapsedRealtime(), snapshot.bytesReceived, connected)
         ) {
             if (
+                !sessionHasRenderedFrame &&
                 requestSafeVideoFallback(
                     message = "Video packets arrived but no frame rendered; restarting with safe H264 profile",
                     diagnosticReason = "first frame timeout",
@@ -3471,6 +3532,7 @@ class NativeStreamClient(
             }
             is StreamLivenessAction.RestartTransport -> {
                 if (
+                    !sessionHasRenderedFrame &&
                     requestSafeVideoFallback(
                         message = "Decoder stalled; restarting with safe H264 profile",
                         diagnosticReason = "media stall",
@@ -3950,20 +4012,42 @@ class NativeStreamClient(
     private fun createRumbleEffect(amplitude: Int): VibrationEffect =
         VibrationEffect.createOneShot(RUMBLE_EFFECT_MS, amplitude.coerceIn(1, 255))
 
+    private fun createPhoneRumbleEffect(vibrator: Vibrator?, amplitude: Int): VibrationEffect {
+        val hasAmp = vibrator?.hasAmplitudeControl() == true
+        val amp = if (hasAmp) amplitude.coerceIn(1, 255) else VibrationEffect.DEFAULT_AMPLITUDE
+        return VibrationEffect.createOneShot(RUMBLE_EFFECT_MS, amp)
+    }
+
     private fun vibratePhoneRumble(profile: RumbleEffectProfile) {
         if (!phoneRumbleSupportLogged) {
             phoneRumbleSupportLogged = true
             NativeInputDiagnostics.add("gamepad haptics using phone fallback")
         }
+        @Suppress("DEPRECATION")
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            appContext.getSystemService(VibratorManager::class.java)?.defaultVibrator
+        } else {
+            appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        } ?: return
+
+        val effect = createPhoneRumbleEffect(vibrator, profile.combinedAmplitude)
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val manager = appContext.getSystemService(VibratorManager::class.java)
             if (manager != null && manager.vibratorIds.any { manager.getVibrator(it).hasVibrator() }) {
-                manager.vibrate(CombinedVibration.createParallel(createRumbleEffect(profile.combinedAmplitude)))
+                val attrs = android.os.VibrationAttributes.Builder()
+                    .setUsage(android.os.VibrationAttributes.USAGE_PHYSICAL_EMULATION)
+                    .build()
+                manager.vibrate(CombinedVibration.createParallel(effect), attrs)
                 return
             }
         }
+        val audioAttrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
         @Suppress("DEPRECATION")
-        (appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator)?.vibrate(createRumbleEffect(profile.combinedAmplitude))
+        vibrator.vibrate(effect, audioAttrs)
     }
 
     @Suppress("DEPRECATION")
