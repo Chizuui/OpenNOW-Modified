@@ -5123,6 +5123,20 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             NativeStreamInputRouter.setCaptureAllTouch(false)
         }
     }
+    DisposableEffect(state.settings.androidTouch.mouseDirectClick) {
+        NativeStreamInputRouter.setOnToggleDirectClickCallback {
+            val nextDirect = !state.settings.androidTouch.mouseDirectClick
+            viewModel.updateSettings(
+                state.settings.copy(
+                    androidTouch = state.settings.androidTouch.copy(mouseDirectClick = nextDirect)
+                )
+            )
+            Toast.makeText(context, "Direct Click: " + if (nextDirect) "Enabled" else "Disabled", Toast.LENGTH_SHORT).show()
+        }
+        onDispose {
+            NativeStreamInputRouter.setOnToggleDirectClickCallback(null)
+        }
+    }
     LaunchedEffect(state.settings.phoneRumbleFallback) {
         client.updateHapticsSettings(state.settings.phoneRumbleFallback)
     }
@@ -6983,7 +6997,14 @@ private fun StreamStatsMetricItems(
         StreamStatsText("FPS ${streamStats.fps?.toString() ?: streamSettings.fps}")
     }
     if (metrics.ping) {
-        StreamStatsText("Ping ${streamStats.pingMs?.let { "${it}ms" } ?: "--"}")
+        val ping = streamStats.pingMs
+        val color = when {
+            ping == null -> TextPrimary
+            ping >= 100 -> Color(0xffff4f4f) // Bright red
+            ping >= 50 -> Color(0xffffa500) // Orange
+            else -> TextPrimary
+        }
+        StreamStatsText("Ping ${ping?.let { "${it}ms" } ?: "--"}", color = color)
     }
     if (metrics.bitrate) {
         StreamStatsText(formatRuntimeBitrate(streamStats.bitrateKbps))
@@ -7010,10 +7031,10 @@ private fun StreamStatsMetricItems(
 }
 
 @Composable
-private fun StreamStatsText(value: String) {
+private fun StreamStatsText(value: String, color: Color = TextPrimary) {
     Text(
         value,
-        color = TextPrimary,
+        color = color,
         style = MaterialTheme.typography.labelSmall,
         fontWeight = FontWeight.SemiBold,
         maxLines = 1,

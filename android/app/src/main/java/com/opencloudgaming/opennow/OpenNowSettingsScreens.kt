@@ -480,7 +480,16 @@ private fun SettingsContent(
                     val fps = it.roundToInt().coerceIn(30, maxFps)
                     viewModel.updateStreamSettings { s -> s.copy(fps = fps) }
                 }
-                NumberSlider(stringResource(R.string.settings_bitrate), settings.stream.maxBitrateMbps.toFloat(), 1f, 150f, 1f) {
+                NumberSlider(
+                    label = stringResource(R.string.settings_bitrate),
+                    value = settings.stream.maxBitrateMbps.toFloat(),
+                    min = 1f,
+                    max = 150f,
+                    step = 1f,
+                    descriptionProvider = { mbps ->
+                        "Est. data usage: %.1f GB/hour".format((mbps * 3600f) / (8f * 1000f))
+                    }
+                ) {
                     viewModel.updateStreamSettings { s -> s.copy(maxBitrateMbps = it.roundToInt()) }
                 }
                 val comingSoonLabel = stringResource(R.string.option_coming_soon)
