@@ -5141,6 +5141,13 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     LaunchedEffect(state.settings.phoneRumbleFallback) {
         client.updateHapticsSettings(state.settings.phoneRumbleFallback)
     }
+    LaunchedEffect(state.settings.controllerMouseAssist) {
+        client.updateControllerMouseAssistAutoArm(state.settings.controllerMouseAssist)
+    }
+    val isTv = remember(context) { context.packageManager.hasSystemFeature("android.software.leanback") }
+    LaunchedEffect(streamReady, isTv) {
+        NativeStreamInputRouter.setIsTv(isTv)
+    }
     LaunchedEffect(session?.sessionId, session?.status, streamReady, launchStreamSettings) {
         if (session != null && streamReady) {
             client.start(session, launchStreamSettings)
@@ -5362,6 +5369,9 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     },
                     onStatsMetricsChange = { metrics ->
                         viewModel.updateSettings(state.settings.copy(streamStatsMetrics = metrics))
+                    },
+                    onControllerMouseAssistToggle = {
+                        viewModel.updateSettings(state.settings.copy(controllerMouseAssist = !state.settings.controllerMouseAssist))
                     },
                     onPhoneRumbleFallbackToggle = {
                         viewModel.updateSettings(state.settings.copy(phoneRumbleFallback = !state.settings.phoneRumbleFallback))
@@ -6481,6 +6491,7 @@ private fun StreamControlsPanel(
     onStatsStyleCycle: () -> Unit,
     onStatsPositionCycle: () -> Unit,
     onStatsMetricsChange: (StreamStatsMetrics) -> Unit,
+    onControllerMouseAssistToggle: () -> Unit,
     onPhoneRumbleFallbackToggle: () -> Unit,
     onTouchLayoutEditingToggle: () -> Unit,
     onKeyboardOpen: () -> Unit,
@@ -6699,6 +6710,10 @@ private fun StreamControlsPanel(
                             onButtonTone()
                             onToggleTouchControllerStyle()
                         }
+                    }
+                    StreamControlSwitch("Controller mouse", if (settings.controllerMouseAssist) "On" else "Off", settings.controllerMouseAssist) {
+                        onButtonTone()
+                        onControllerMouseAssistToggle()
                     }
                     StreamControlSwitch("Phone rumble fallback", if (settings.phoneRumbleFallback) "On" else "Off", settings.phoneRumbleFallback) {
                         onButtonTone()

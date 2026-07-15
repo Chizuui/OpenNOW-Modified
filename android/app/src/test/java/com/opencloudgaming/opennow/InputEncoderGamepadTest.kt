@@ -124,7 +124,7 @@ class InputEncoderGamepadTest {
     @Test
     fun doesNotMapGameplayButtonsToControllerMouseAssist() {
         assertNull(AndroidControllerMouseAssist.mouseButtonForGamepad(GamepadButtonMapping.RIGHT_THUMB))
-        assertNull(AndroidControllerMouseAssist.mouseButtonForGamepad(GamepadButtonMapping.A))
+        assertEquals(1, AndroidControllerMouseAssist.mouseButtonForGamepad(GamepadButtonMapping.A))
         assertNull(AndroidControllerMouseAssist.mouseButtonForGamepad(GamepadButtonMapping.B))
         assertNull(AndroidControllerMouseAssist.mouseButtonForTrigger(left = true))
         assertNull(AndroidControllerMouseAssist.mouseButtonForTrigger(left = false))

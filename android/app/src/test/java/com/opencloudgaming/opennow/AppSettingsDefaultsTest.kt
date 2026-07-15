@@ -49,6 +49,7 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.analyticsConsentAsked)
         assertTrue(settings.analyticsOptOut)
         assertFalse(settings.analyticsSharingEnabled)
+        assertFalse(settings.controllerMouseAssist)
     }
 
     @Test
