@@ -18,7 +18,10 @@ class AppSettingsDefaultsTest {
         assertTrue(metrics.connection)
         assertFalse(metrics.resolution)
         assertFalse(metrics.codec)
-        assertEquals(3, metrics.enabledCount())
+        assertTrue(metrics.location)
+        assertTrue(metrics.latency)
+        assertTrue(metrics.packetLoss)
+        assertEquals(6, metrics.enabledCount())
     }
 
     @Test

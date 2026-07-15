@@ -126,6 +126,19 @@ object CodecProbe {
             val nativeDecoderAvailable = runCatching { NativeCodecProbe.nativeDecoderAvailable(mime) }.getOrNull()
             val preferredDecoder = decoders.firstOrNull(::isHardwareCodec) ?: decoders.firstOrNull()
             val preferredEncoder = encoders.firstOrNull(::isHardwareCodec) ?: encoders.firstOrNull()
+
+            val (maxWidth, maxHeight) = preferredDecoder?.let { decoder ->
+                runCatching {
+                    val capabilities = decoder.getCapabilitiesForType(mime)
+                    val videoCapabilities = capabilities.videoCapabilities
+                    if (videoCapabilities != null) {
+                        videoCapabilities.supportedWidths.upper to videoCapabilities.supportedHeights.upper
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+            } ?: (null to null)
+
             CodecCapability(
                 codec = codec,
                 decoderAvailable = decoders.isNotEmpty(),
@@ -140,6 +153,8 @@ object CodecProbe {
                 webRtcHardwareDecoderAvailable = webRtc?.hardwareDecoderAvailable,
                 webRtcDecoderName = webRtc?.decoderName,
                 webRtcCodecProfiles = webRtc?.profiles.orEmpty(),
+                maxSupportedWidth = maxWidth,
+                maxSupportedHeight = maxHeight,
             )
         }
         return RuntimeCodecReport(

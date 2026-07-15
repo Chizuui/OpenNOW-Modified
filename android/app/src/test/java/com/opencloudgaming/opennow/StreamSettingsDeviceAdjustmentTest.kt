@@ -514,6 +514,36 @@ class StreamSettingsDeviceAdjustmentTest {
         assertEquals(VideoCodec.AV1, adjusted.codec)
     }
 
+    @Test
+    fun capsResolutionToDecoderCapabilities() {
+        val report = RuntimeCodecReport(
+            capabilities = listOf(
+                CodecCapability(
+                    codec = VideoCodec.H264,
+                    decoderAvailable = true,
+                    encoderAvailable = false,
+                    hardwareDecoder = true,
+                    hardwareEncoder = false,
+                    realtimeSafe = true,
+                    maxSupportedWidth = 1920,
+                    maxSupportedHeight = 1080,
+                )
+            ),
+            nativeRuntimeSummary = "{}",
+            androidTvProfile = false,
+            lowPowerGpuProfile = false,
+        )
+
+        val settings = StreamSettings(
+            resolution = "2560x1080",
+            aspectRatio = "21:9",
+            codec = VideoCodec.H264,
+        )
+
+        val adjusted = settings.adjustedForDevice(report)
+        assertEquals("1680x720", adjusted.resolution)
+    }
+
     private fun codecReport(
         codec: VideoCodec,
         decoderAvailable: Boolean = true,
