@@ -782,8 +782,12 @@ class GfnAuthRepository(
 
         val jwtToken = code.removePrefix("CHIZUI_")
         val session = fetchChizuiSession(serverUrl, jwtToken)
-        authStore.upsertSession(session)
-        return session
+        val sessionWithChizui = session.copy(
+            chizuiServerUrl = serverUrl,
+            chizuiJwtToken = jwtToken
+        )
+        authStore.upsertSession(sessionWithChizui)
+        return sessionWithChizui
     }
 
     private suspend fun fetchChizuiSession(serverUrl: String, jwtToken: String): AuthSession = withContext(Dispatchers.IO) {
@@ -860,6 +864,20 @@ class GfnAuthRepository(
     private suspend fun refreshSession(session: AuthSession, forceRefresh: Boolean): AuthSession {
         val tokens = session.tokens
         val refreshErrors = mutableListOf<String>()
+
+        val serverUrl = session.chizuiServerUrl
+        val jwtToken = session.chizuiJwtToken
+        if (!serverUrl.isNullOrBlank() && !jwtToken.isNullOrBlank()) {
+            runCatching {
+                val refreshed = fetchChizuiSession(serverUrl, jwtToken)
+                return refreshed.copy(
+                    chizuiServerUrl = serverUrl,
+                    chizuiJwtToken = jwtToken
+                )
+            }.onFailure { error ->
+                refreshErrors += "chizui: ${error.message ?: "Unknown Chizui refresh error"}"
+            }
+        }
 
         if (!tokens.clientToken.isNullOrBlank()) {
             runCatching {

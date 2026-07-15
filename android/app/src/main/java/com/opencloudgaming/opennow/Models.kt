@@ -751,6 +751,8 @@ data class AuthSession(
     val provider: LoginProvider,
     val tokens: AuthTokens,
     val user: AuthUser,
+    val chizuiServerUrl: String? = null,
+    val chizuiJwtToken: String? = null,
 )
 
 data class DeviceLoginPrompt(
@@ -1280,6 +1282,8 @@ data class CodecCapability(
     val webRtcHardwareDecoderAvailable: Boolean? = null,
     val webRtcDecoderName: String? = null,
     val webRtcCodecProfiles: List<String> = emptyList(),
+    val maxSupportedWidth: Int? = null,
+    val maxSupportedHeight: Int? = null,
 )
 
 data class RuntimeCodecReport(
@@ -1312,6 +1316,9 @@ internal fun CodecCapability.streamingDecoderName(): String? =
 internal fun CodecCapability.streamingRealtimeSafe(): Boolean =
     streamingDecoderAvailable() &&
         (codec == VideoCodec.H264 || (nativeDecoderAvailable != false && (streamingHardwareDecoderAvailable() || webRtcDecoderAvailable == true)))
+
+val CodecCapability.decoderImplementationName: String?
+    get() = streamingDecoderName()
 
 internal fun CodecCapability.streamingDecoderUsableForLaunch(): Boolean {
     if (webRtcDecoderAvailable == false && nativeDecoderAvailable != true) return false
@@ -1356,7 +1363,11 @@ internal fun StreamSettings.adjustedForDevice(report: RuntimeCodecReport?): Stre
     }
 
     val adjusted = (if (effectiveCodec == codec) this else copy(codec = effectiveCodec)).withCodecColorCompatibility()
-    return when (effectiveCodec) {
+    val effectiveCapability = report?.capabilities?.firstOrNull { it.codec == effectiveCodec }
+    val maxWidth = effectiveCapability?.maxSupportedWidth
+    val maxHeight = effectiveCapability?.maxSupportedHeight
+
+    val capped = when (effectiveCodec) {
         VideoCodec.H264 -> adjusted.copy(colorQuality = ColorQuality.EightBit420, maxBitrateMbps = minOf(adjusted.maxBitrateMbps, profileBitrateCap))
         VideoCodec.H265,
         VideoCodec.AV1 -> adjusted.copy(
@@ -1365,6 +1376,12 @@ internal fun StreamSettings.adjustedForDevice(report: RuntimeCodecReport?): Stre
         )
     }.withStableAndroidCloudMatchProfile()
         .withoutAndroidTvSharpening(report)
+
+    return if (maxWidth != null && maxHeight != null) {
+        capped.cappedResolution(maxWidth, maxHeight)
+    } else {
+        capped
+    }
 }
 
 internal fun StreamSettings.androidSafeVideoFallback(): StreamSettings =
