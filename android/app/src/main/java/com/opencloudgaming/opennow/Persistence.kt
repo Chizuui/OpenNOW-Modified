@@ -325,6 +325,7 @@ class SettingsStore(context: Context) {
             tvSafeAreaPaddingDp = tvSafeAreaPaddingDp.coerceIn(0f, 72f),
             controllerUiSounds = controllerUiSounds,
             autoFullScreen = true,
+            chizuiLoginUrl = chizuiLoginUrl.trim(),
         )
     }
 }

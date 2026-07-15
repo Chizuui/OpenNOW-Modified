@@ -645,6 +645,16 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     },
                 )
             }
+            Button(
+                onClick = { viewModel.loginWithChizui() },
+                enabled = !normalLoginBusy,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.tertiary,
+                    contentColor = MaterialTheme.colorScheme.onTertiary
+                )
+            ) {
+                Text("Sign in with ChizuiLogin")
+            }
             if (!tvLogin && deviceCodeLoginAvailable) {
                 TextButton(onClick = { viewModel.loginWithCode() }, enabled = !normalLoginBusy) {
                     Text("Use code sign-in")

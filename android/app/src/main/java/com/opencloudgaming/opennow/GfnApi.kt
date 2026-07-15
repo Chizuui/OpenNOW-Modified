@@ -14,6 +14,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -758,6 +759,53 @@ class GfnAuthRepository(
         if (!params.containsKey("code") && !params.containsKey("error")) return false
         externalOAuthRedirects.trySend(params)
         return true
+    }
+
+    suspend fun loginWithChizui(serverUrl: String): AuthSession {
+        drainExternalOAuthRedirects()
+        val callbackServers = openAvailableCallbackServers()
+        val port = callbackServers.port
+        val oauthUrl = "${serverUrl.trimEnd('/')}/?callback_port=$port"
+        val code = coroutineScope {
+            val codeDeferred = async(Dispatchers.IO) { waitForAuthorizationCode(callbackServers) }
+            val customTabs = CustomTabsIntent.Builder().build()
+            customTabs.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            runCatching {
+                customTabs.launchUrl(context, Uri.parse(oauthUrl))
+            }.onFailure {
+                codeDeferred.cancel()
+                callbackServers.close()
+                throw it
+            }
+            codeDeferred.await()
+        }
+
+        val jwtToken = code.removePrefix("CHIZUI_")
+        val session = fetchChizuiSession(serverUrl, jwtToken)
+        authStore.upsertSession(session)
+        return session
+    }
+
+    private suspend fun fetchChizuiSession(serverUrl: String, jwtToken: String): AuthSession = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("${serverUrl.trimEnd('/')}/api/gfn/tokens")
+            .header("Authorization", "Bearer $jwtToken")
+            .get()
+            .build()
+        val (status, body) = http.awaitText(request)
+        if (status != 200) {
+            val errMessage = runCatching {
+                OpenNowJson.decodeFromString<ChizuiErrorResponse>(body).error
+            }.getOrNull() ?: "HTTP error $status"
+            throw IllegalStateException(errMessage)
+        }
+        val response = runCatching {
+            OpenNowJson.decodeFromString<ChizuiTokenResponse>(body)
+        }.getOrElse {
+            throw IllegalStateException("Failed to parse ChizuiLogin session response")
+        }
+        val data = response.data ?: throw IllegalStateException(response.error ?: "Session tokens not found on server")
+        data
     }
 
     suspend fun loginWithDeviceCode(provider: LoginProvider, onPrompt: suspend (DeviceLoginPrompt) -> Unit): AuthSession {
@@ -2749,3 +2797,16 @@ suspend fun fetchDynamicRegions(
 
 private fun String.normalizedTitleKey(): String = trim().lowercase(Locale.US).replace(Regex("[^a-z0-9]+"), " ").trim()
 private fun String.isNumeric(): Boolean = all(Char::isDigit)
+
+@Serializable
+private data class ChizuiTokenResponse(
+    val status: String,
+    val data: AuthSession? = null,
+    val error: String? = null
+)
+
+@Serializable
+private data class ChizuiErrorResponse(
+    val error: String
+)
+

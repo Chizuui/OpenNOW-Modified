@@ -278,6 +278,7 @@ data class AppSettings(
     val analyticsOptOut: Boolean = true,
     val analyticsConsentAsked: Boolean = false,
     val allowEscapeToExitFullscreen: Boolean = false,
+    val chizuiLoginUrl: String = "https://gfn.chizui.dev",
 )
 
 internal val AppSettings.analyticsSharingEnabled: Boolean

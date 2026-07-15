@@ -55,7 +55,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.opencloudgaming.opennow"
+        applicationId = "com.opencloudgaming.opennow.chizui"
         minSdk = 24
         targetSdk = 36
         versionCode = 37
@@ -78,6 +78,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("debug") // LOCAL TESTING ONLY - do not push
             buildConfigField("boolean", "APK_UPDATES_SUPPORTED", (!buildingPlayReleaseBundle).toString())
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
