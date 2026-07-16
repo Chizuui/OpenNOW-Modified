@@ -5142,8 +5142,10 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     LaunchedEffect(state.settings.phoneRumbleFallback) {
         client.updateHapticsSettings(state.settings.phoneRumbleFallback)
     }
-    LaunchedEffect(state.settings.controllerMouseAssist) {
-        client.updateControllerMouseAssistAutoArm(state.settings.controllerMouseAssist)
+    LaunchedEffect(state.settings.controllerMouseAssist, touchControlsVisible) {
+        if (!touchControlsVisible) {
+            client.updateControllerMouseAssistAutoArm(state.settings.controllerMouseAssist)
+        }
     }
     val isTv = remember(context) { context.packageManager.hasSystemFeature("android.software.leanback") }
     LaunchedEffect(streamReady, isTv) {
@@ -5372,7 +5374,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         viewModel.updateSettings(state.settings.copy(streamStatsMetrics = metrics))
                     },
                     onControllerMouseAssistToggle = {
-                        viewModel.updateSettings(state.settings.copy(controllerMouseAssist = !state.settings.controllerMouseAssist))
+                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(mouseDirectClick = !state.settings.androidTouch.mouseDirectClick)))
                     },
                     onPhoneRumbleFallbackToggle = {
                         viewModel.updateSettings(state.settings.copy(phoneRumbleFallback = !state.settings.phoneRumbleFallback))
@@ -9151,54 +9153,52 @@ private fun VirtualStick(
     Box(
         Modifier
             .size(diameter)
-            .clip(CircleShape)
-            .background(Color.Transparent)
-            .border(1.dp, Color.White.copy(alpha = opacity * 0.3f), CircleShape)
             .pointerInput(client, onChange) {
-                awaitPointerEventScope {
-                    var trackedPointerId: PointerId? = null
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val maxRadius = min(size.width, size.height) * 0.34f
-                        val change = trackedPointerId?.let { id ->
-                            event.changes.firstOrNull { it.id == id }
-                        }
-                        if (change != null) {
-                            if (change.pressed) {
-                                val center = Offset(size.width / 2f, size.height / 2f)
-                                val clamped = clampStickOffset(change.position - center, maxRadius)
-                                onChange(
-                                    (clamped.x / maxRadius).coerceIn(-1f, 1f),
-                                    (clamped.y / maxRadius).coerceIn(-1f, 1f),
-                                )
-                                knobOffset = clamped
-                                change.consume()
+                try {
+                    awaitPointerEventScope {
+                        var trackedPointerId: PointerId? = null
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val maxRadius = min(size.width, size.height) * 0.34f
+                            val center = Offset(size.width / 2f, size.height / 2f)
+
+                            val pressedChanges = event.changes.filter { it.pressed }
+                            if (pressedChanges.isNotEmpty()) {
+                                val activeChange = pressedChanges.firstOrNull { it.id == trackedPointerId }
+                                    ?: pressedChanges.firstOrNull {
+                                        it.position.x >= 0f && it.position.x <= size.width &&
+                                        it.position.y >= 0f && it.position.y <= size.height
+                                    }
+
+                                if (activeChange != null) {
+                                    trackedPointerId = activeChange.id
+                                    val clamped = clampStickOffset(activeChange.position - center, maxRadius)
+                                    onChange(
+                                        (clamped.x / maxRadius).coerceIn(-1f, 1f),
+                                        (clamped.y / maxRadius).coerceIn(-1f, 1f),
+                                    )
+                                    knobOffset = clamped
+                                    activeChange.consume()
+                                } else if (trackedPointerId != null && pressedChanges.none { it.id == trackedPointerId }) {
+                                    onChange(0f, 0f)
+                                    knobOffset = Offset.Zero
+                                    trackedPointerId = null
+                                }
                             } else {
-                                onChange(0f, 0f)
-                                knobOffset = Offset.Zero
-                                trackedPointerId = null
-                            }
-                        } else {
-                            val newChange = event.changes.firstOrNull { it.pressed }
-                            if (newChange != null) {
-                                trackedPointerId = newChange.id
-                                val center = Offset(size.width / 2f, size.height / 2f)
-                                val clamped = clampStickOffset(newChange.position - center, maxRadius)
-                                onChange(
-                                    (clamped.x / maxRadius).coerceIn(-1f, 1f),
-                                    (clamped.y / maxRadius).coerceIn(-1f, 1f),
-                                )
-                                knobOffset = clamped
-                                newChange.consume()
-                            } else if (trackedPointerId != null) {
                                 onChange(0f, 0f)
                                 knobOffset = Offset.Zero
                                 trackedPointerId = null
                             }
                         }
                     }
+                } finally {
+                    onChange(0f, 0f)
+                    knobOffset = Offset.Zero
                 }
-            },
+            }
+            .clip(CircleShape)
+            .background(Color.Transparent)
+            .border(1.dp, Color.White.copy(alpha = opacity * 0.3f), CircleShape),
         contentAlignment = Alignment.Center,
     ) {
         val knobBackground = if (style == TouchControllerStyle.V2) {

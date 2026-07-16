@@ -2394,6 +2394,10 @@ class NativeStreamClient(
     }
 
     fun start(session: SessionInfo, settings: StreamSettings) {
+        val isNewSession = this.session?.sessionId != session.sessionId
+        if (isNewSession) {
+            inputEncoder.resetGamepadSequences()
+        }
         this.session = session
         this.settings = settings
         transportGeneration += 1
@@ -2408,7 +2412,7 @@ class NativeStreamClient(
         closeTransport(clearInputState = false)
         armControllerMouseAssistForSession()
         recordStreamDiagnostic(
-            "start session=${streamDiagnosticId(session.sessionId)} status=${session.status} server=${session.serverIp.take(96)} signaling=${signalingUrlForDiagnostics(session.signalingUrl, session.sessionId)} settings=${settings.resolution}/${settings.fps}/${settings.codec} bitrate=${settings.maxBitrateMbps}",
+            "start session=${streamDiagnosticId(session.sessionId)} status=${session.status} server=${session.serverIp.take(96)} signaling=${signalingUrlForDiagnostics(session.signalingUrl, session.sessionId)} settings=${settings.resolution}/${settings.fps}/${settings.codec} bitrate=${settings.maxBitrateMbps} newSession=$isNewSession",
         )
         startTransport(session, settings, transportGeneration)
     }
@@ -2478,7 +2482,6 @@ class NativeStreamClient(
         externalMouseAbsoluteJumpLogged = false
         hardwareKeyboardEventLogged = false
         physicalGamepadAxisLogged = false
-        inputEncoder.resetGamepadSequences()
         for (i in 0 until GAMEPAD_MAX_CONTROLLERS) {
             lastSentGamepadStates[i] = SentGamepadState()
         }
@@ -2812,23 +2815,19 @@ class NativeStreamClient(
     }
 
     fun setVirtualLeftStick(x: Float, y: Float) {
-        val scale = radialDeadzoneScale(x, y, deadzone = 0.08f)
-        val normalizedX = x * scale
-        val normalizedY = y * scale
-        virtualLeftStickActive = normalizedX != 0f || normalizedY != 0f
-        virtualLeftStickX = normalizeToInt16(normalizedX)
-        virtualLeftStickY = normalizeToInt16(-normalizedY)
+        virtualLeftStickActive = x != 0f || y != 0f
+        virtualLeftStickX = normalizeToInt16(x)
+        virtualLeftStickY = normalizeToInt16(-y)
+        NativeInputDiagnostics.add("setVirtualLeftStick x=$x y=$y active=$virtualLeftStickActive val=$virtualLeftStickX,$virtualLeftStickY")
         sendCurrentGamepadState()
     }
 
     fun setVirtualRightStick(x: Float, y: Float) {
-        val scale = radialDeadzoneScale(x, y, deadzone = 0.08f)
-        val normalizedX = x * scale
-        val normalizedY = y * scale
-        virtualRightStickActive = normalizedX != 0f || normalizedY != 0f
-        virtualRightStickX = normalizeToInt16(normalizedX)
-        virtualRightStickY = normalizeToInt16(-normalizedY)
-        val mouseSent = sendControllerMouseMove(normalizedX, normalizedY)
+        virtualRightStickActive = x != 0f || y != 0f
+        virtualRightStickX = normalizeToInt16(x)
+        virtualRightStickY = normalizeToInt16(-y)
+        val mouseSent = sendControllerMouseMove(x, y)
+        NativeInputDiagnostics.add("setVirtualRightStick x=$x y=$y active=$virtualRightStickActive val=$virtualRightStickX,$virtualRightStickY mouse=$mouseSent")
         if (!mouseSent) {
             sendCurrentGamepadState()
         }
@@ -3405,6 +3404,7 @@ class NativeStreamClient(
         gamepadKeepaliveJob?.cancel()
         gamepadKeepaliveJob = scope.launch {
             var connectedScanCountdown = 0
+            var idleSendCount = 5
             primeConnectedGamepadState(reason = "keepalive start")
             while (true) {
                 delay(100L)
@@ -3414,6 +3414,10 @@ class NativeStreamClient(
                     refreshConnectedPhysicalControllers()
                 }
                 if (hasAnyControllerState()) {
+                    idleSendCount = 5
+                    sendCurrentGamepadState(force = true)
+                } else if (idleSendCount > 0) {
+                    idleSendCount -= 1
                     sendCurrentGamepadState(force = true)
                 }
                 updateHapticsAdvertisement()
@@ -3760,26 +3764,15 @@ class NativeStreamClient(
     }
 
     private fun sendControllerMouseMove(stickX: Float, stickY: Float): Boolean {
-        if (!controllerMouseAssistActive) return false
-        val delta = AndroidControllerMouseAssist.mouseDelta(stickX, stickY) ?: return false
-        val sent = sendTouchMouseMove(delta.dx, delta.dy)
-        if (sent && !controllerMouseMoveLogged) {
-            controllerMouseMoveLogged = true
-            NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} auto=$controllerMouseAssistAutoArmed")
-        }
-        return sent
+        return false
     }
 
     private fun handleControllerMouseButton(buttonMask: Int, pressed: Boolean): Boolean {
-        if (!controllerMouseAssistActive) return false
-        val mouseButton = AndroidControllerMouseAssist.mouseButtonForGamepad(buttonMask) ?: return false
-        return setControllerMouseButton(mouseButton, pressed)
+        return false
     }
 
     private fun handleControllerMouseTrigger(left: Boolean, pressed: Boolean): Boolean {
-        if (!controllerMouseAssistActive) return false
-        val mouseButton = AndroidControllerMouseAssist.mouseButtonForTrigger(left) ?: return false
-        return setControllerMouseButton(mouseButton, pressed)
+        return false
     }
 
     private fun sendCurrentGamepadState(controllerId: Int = activeControllerId, force: Boolean = false): Boolean {
@@ -3810,6 +3803,7 @@ class NativeStreamClient(
         }
 
         val partiallyReliable = canSendGamepadPartiallyReliable(controllerId)
+        NativeInputDiagnostics.add("sendCurrentGamepadState buttons=$buttons LX=$leftStickX LY=$leftStickY RX=$rightStickX RY=$rightStickY force=$force partial=$partiallyReliable")
         val packet = inputEncoder.encodeGamepadState(
             controllerId = controllerId,
             buttons = buttons,
@@ -3945,8 +3939,7 @@ class NativeStreamClient(
 
     private fun primeConnectedGamepadState(reason: String) {
         refreshConnectedPhysicalControllers()
-        if (!hasAnyControllerState()) return
-        val sent = sendCurrentGamepadState()
+        val sent = sendCurrentGamepadState(force = true)
         NativeInputDiagnostics.add(
             "gamepad state prime reason=$reason sent=$sent connected=$physicalControllerConnected active=$physicalControllerActive slot=$activeControllerId reliable=${reliableInput?.state()} partial=${partiallyReliableInput?.state()}",
         )

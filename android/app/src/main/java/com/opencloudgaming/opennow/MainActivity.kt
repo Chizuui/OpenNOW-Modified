@@ -156,7 +156,7 @@ class MainActivity : ComponentActivity() {
                 NativeInputDiagnostics.add("activity touch forwardBeforeViews size=${decorView.width}x${decorView.height}")
             }
             val forwarded = NativeStreamInputRouter.dispatchTouch(event, decorView.width, decorView.height)
-            if (NativeStreamInputRouter.shouldCaptureTouchBeforeViews(event, decorView.width, decorView.height) && forwarded) {
+            if (forwarded) {
                 return true
             }
         }
