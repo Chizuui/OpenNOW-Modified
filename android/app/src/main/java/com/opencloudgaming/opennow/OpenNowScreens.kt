@@ -6534,9 +6534,11 @@ private fun StreamControlsPanel(
     BackHandler(enabled = statusBarOptionsOpen) {
         statusBarOptionsOpen = false
     }
-    LaunchedEffect(Unit) {
-        delay(80)
-        runCatching { doneFocusRequester.requestFocus() }
+    LaunchedEffect(statusBarOptionsOpen) {
+        if (!statusBarOptionsOpen) {
+            delay(120)
+            runCatching { doneFocusRequester.requestFocus() }
+        }
     }
     Surface(
         modifier = Modifier
