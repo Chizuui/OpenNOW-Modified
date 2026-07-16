@@ -1040,6 +1040,13 @@ private fun MainShell(
     var settingsSearchQuery by remember { mutableStateOf("") }
     var settingsDetailRouteOpen by remember { mutableStateOf(false) }
     var settingsBackRequestToken by remember { mutableStateOf(0) }
+    val navFirstItemFocusRequester = remember { FocusRequester() }
+    LaunchedEffect(inStream) {
+        if (!inStream && tvProfile) {
+            delay(150)
+            runCatching { navFirstItemFocusRequester.requestFocus() }
+        }
+    }
     val navigationToneEnabled = state.settings.controllerUiSounds && !inStream
     val showMinimizedQueueDock = state.streamLaunchMinimized && shouldShowQueueLaunchStatus(state)
     DisposableEffect(navAudioController) {
@@ -1192,6 +1199,7 @@ private fun MainShell(
                             },
                             onSearch = { revealSearch(it) },
                             onSettingsBack = { settingsBackRequestToken += 1 },
+                            firstItemFocusRequester = navFirstItemFocusRequester,
                         )
                     }
                     Column(
@@ -1351,6 +1359,7 @@ private fun AppNavigationRail(
     onNavigate: (AppPage) -> Unit,
     onSearch: (SearchTarget) -> Unit,
     onSettingsBack: () -> Unit,
+    firstItemFocusRequester: FocusRequester? = null,
 ) {
     Box(
         modifier = Modifier
@@ -1397,6 +1406,7 @@ private fun AppNavigationRail(
                         onClick = { onNavigate(AppPage.Home) },
                         iconRes = R.drawable.ic_tab_store,
                         label = stringResource(R.string.nav_store),
+                        modifier = if (firstItemFocusRequester != null) Modifier.focusRequester(firstItemFocusRequester) else Modifier,
                         iconSize = if (largeIcons) 30.dp else 24.dp,
                     )
                     AppNavigationRailItem(
@@ -1453,13 +1463,20 @@ private fun AppNavigationRail(
 }
 
 @Composable
-private fun AppNavigationRailItem(selected: Boolean, onClick: () -> Unit, iconRes: Int, label: String, iconSize: Dp = 24.dp) {
+private fun AppNavigationRailItem(
+    selected: Boolean,
+    onClick: () -> Unit,
+    iconRes: Int,
+    label: String,
+    modifier: Modifier = Modifier,
+    iconSize: Dp = 24.dp
+) {
     var focused by remember { mutableStateOf(false) }
     val accent = MaterialTheme.colorScheme.primary
     NavigationRailItem(
         selected = selected,
         onClick = onClick,
-        modifier = Modifier
+        modifier = modifier
             .onFocusChanged { focused = it.isFocused }
             .then(
                 if (focused) Modifier.border(2.dp, accent, RoundedCornerShape(12.dp)) else Modifier
