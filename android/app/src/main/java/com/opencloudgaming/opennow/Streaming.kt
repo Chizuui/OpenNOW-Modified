@@ -1080,9 +1080,23 @@ object NativeStreamInputRouter {
                     nativeUiTouchPointerIds += event.getPointerId(index)
                 }
             }
+        }
+        uiTouchPassthroughActive = nativeUiTouchPointerIds.isNotEmpty()
+    }
+
+    fun postDispatchTouch(event: MotionEvent) {
+        if (!event.isFingerTouchEvent()) return
+        when (event.actionMasked) {
+            MotionEvent.ACTION_POINTER_UP -> {
+                val index = event.actionIndex
+                if (index in 0 until event.pointerCount) {
+                    nativeUiTouchPointerIds.remove(event.getPointerId(index))
+                }
+            }
             MotionEvent.ACTION_UP,
-            MotionEvent.ACTION_CANCEL,
-            -> nativeUiTouchPointerIds.clear()
+            MotionEvent.ACTION_CANCEL -> {
+                nativeUiTouchPointerIds.clear()
+            }
         }
         uiTouchPassthroughActive = nativeUiTouchPointerIds.isNotEmpty()
     }

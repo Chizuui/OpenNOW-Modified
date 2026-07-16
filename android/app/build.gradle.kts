@@ -58,8 +58,8 @@ android {
         applicationId = "com.opencloudgaming.opennow.chizui"
         minSdk = 24
         targetSdk = 36
-        versionCode = 37
-        versionName = "0.8.2"
+        versionCode = 39
+        versionName = "0.8.4"
 
         buildConfigField("String", "POSTHOG_PROJECT_TOKEN", buildConfigString(postHogProjectToken))
         buildConfigField("String", "POSTHOG_HOST", buildConfigString(postHogHost))

@@ -9115,12 +9115,13 @@ private fun VirtualStick(
     diameter: androidx.compose.ui.unit.Dp,
     onChange: (Float, Float) -> Unit,
 ) {
+    val currentOnChange by rememberUpdatedState(onChange)
     var knobOffset by remember { mutableStateOf(Offset.Zero) }
     val style = LocalTouchControllerStyle.current
 
-    DisposableEffect(client, onChange) {
+    DisposableEffect(client) {
         onDispose {
-            onChange(0f, 0f)
+            currentOnChange(0f, 0f)
         }
     }
 
@@ -9130,7 +9131,7 @@ private fun VirtualStick(
             .clip(CircleShape)
             .background(Color.Transparent)
             .border(1.dp, Color.White.copy(alpha = opacity * 0.3f), CircleShape)
-            .pointerInput(client, onChange) {
+            .pointerInput(client) {
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Initial)
@@ -9138,14 +9139,14 @@ private fun VirtualStick(
                         val maxRadius = min(size.width, size.height) * 0.34f
                         if (change == null) {
                             if (knobOffset != Offset.Zero) {
-                                onChange(0f, 0f)
+                                currentOnChange(0f, 0f)
                                 knobOffset = Offset.Zero
                             }
                             continue
                         }
                         val center = Offset(size.width / 2f, size.height / 2f)
                         val clamped = clampStickOffset(change.position - center, maxRadius)
-                        onChange(
+                        currentOnChange(
                             (clamped.x / maxRadius).coerceIn(-1f, 1f),
                             (clamped.y / maxRadius).coerceIn(-1f, 1f),
                         )
