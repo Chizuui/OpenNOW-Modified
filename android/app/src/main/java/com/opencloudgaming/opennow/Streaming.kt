@@ -22,6 +22,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -2137,6 +2139,12 @@ class NativeStreamClient(
     private val appContext = context.applicationContext
     private val eglBase: EglBase = EglBase.create()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val inputExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "opennow-input-sender").apply {
+            priority = Thread.MAX_PRIORITY
+        }
+    }
+    private val inputScope = CoroutineScope(SupervisorJob() + inputExecutor.asCoroutineDispatcher())
     private val inputEncoder = InputEncoder()
     private val audioDeviceModule: AudioDeviceModule =
         JavaAudioDeviceModule.builder(appContext)
@@ -2436,6 +2444,8 @@ class NativeStreamClient(
 
     fun release() {
         stop()
+        inputScope.cancel()
+        inputExecutor.shutdown()
         renderer?.let { activeRenderer ->
             releaseRendererInternal(activeRenderer)
         }
@@ -3853,7 +3863,15 @@ class NativeStreamClient(
             }
             return false
         }
-        return channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), true))
+        if (channel.bufferedAmount() > 65536) {
+            return false
+        }
+        inputScope.launch {
+            runCatching {
+                channel.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap(bytes), true))
+            }
+        }
+        return true
     }
 
     private fun refreshConnectedPhysicalControllers() {
