@@ -6908,6 +6908,14 @@ private fun StreamPanelSection(title: String, content: @Composable ColumnScope.(
 
 @Composable
 private fun StreamControlSwitch(label: String, value: String, checked: Boolean, onClick: () -> Unit) {
+    val view = LocalView.current
+    DisposableEffect(view) {
+        val original = view.isSoundEffectsEnabled
+        view.isSoundEffectsEnabled = false
+        onDispose {
+            view.isSoundEffectsEnabled = original
+        }
+    }
     Row(
         Modifier
             .fillMaxWidth()
