@@ -535,13 +535,13 @@ class StreamSettingsDeviceAdjustmentTest {
         )
 
         val settings = StreamSettings(
-            resolution = "2560x1080",
+            resolution = "3440x1440",
             aspectRatio = "21:9",
             codec = VideoCodec.H264,
         )
 
         val adjusted = settings.adjustedForDevice(report)
-        assertEquals("1680x720", adjusted.resolution)
+        assertEquals("2560x1080", adjusted.resolution)
     }
 
     private fun codecReport(
