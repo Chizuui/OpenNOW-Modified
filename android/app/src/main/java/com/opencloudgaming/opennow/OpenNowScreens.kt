@@ -4829,10 +4829,18 @@ private fun StoreLaunchOptionsColumn(
                 )
             }
         }
+        var checkFocused by remember { mutableStateOf(false) }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(14.dp))
+                .onFocusChanged { checkFocused = it.isFocused }
+                .background(if (checkFocused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+                .border(
+                    width = 1.dp,
+                    color = if (checkFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                    shape = RoundedCornerShape(14.dp)
+                )
                 .clickable { onRememberDefaultStoreChange(!rememberDefaultStore) }
                 .padding(vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -4881,12 +4889,19 @@ private fun StoreLaunchVariantRow(
     onClick: () -> Unit,
 ) {
     val badge = launcherBadgeForStoreKey(splitGameStoreKeys(variant.store).firstOrNull())
+    var focused by remember { mutableStateOf(false) }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .onFocusChanged { focused = it.isFocused }
+            .border(
+                width = 2.dp,
+                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                shape = RoundedCornerShape(14.dp)
+            )
             .clickable { onClick() },
         shape = RoundedCornerShape(14.dp),
-        color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else PanelAlt,
+        color = if (focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.28f) else if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else PanelAlt,
         contentColor = TextPrimary,
     ) {
         Row(
@@ -9863,11 +9878,20 @@ private fun FilterMenu(
                     ) {
                         items(options) { option ->
                             val isSelected = option.id in selectedIds
+                            var rowFocused by remember { mutableStateOf(false) }
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .onFocusChanged { rowFocused = it.isFocused }
+                                    .background(if (rowFocused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (rowFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
                                     .clickable { onToggle(option.id) }
-                                    .padding(vertical = 6.dp),
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Checkbox(
@@ -10096,11 +10120,13 @@ private fun PrintedWasteOptionsColumn(
                     RecommendedPrintedWasteCard(it)
                 }
             }
+            var listFocused by remember { mutableStateOf(false) }
             LazyColumn(
                 state = zoneListState,
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(zoneListFocusRequester)
+                    .onFocusChanged { listFocused = it.isFocused }
                     .onPreviewKeyEvent { event ->
                         if (isTvActivateKey(event)) {
                             if (selectedZone != null) {
@@ -10138,9 +10164,11 @@ private fun PrintedWasteOptionsColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(zones, key = { it.zoneId }) { zoneOption ->
+                    val isCurrent = zoneOption.zoneId == selectedZoneId
                     PrintedWasteZoneRow(
                         zoneOption = zoneOption,
-                        selected = zoneOption.zoneId == selectedZoneId,
+                        selected = isCurrent,
+                        focused = isCurrent && listFocused,
                         onClick = { onSelectZone(zoneOption.zoneId) },
                     )
                 }
@@ -10190,6 +10218,7 @@ private fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
 private fun PrintedWasteZoneRow(
     zoneOption: PrintedWasteZoneOption,
     selected: Boolean,
+    focused: Boolean,
     onClick: () -> Unit,
 ) {
     val zone = zoneOption.zone
@@ -10197,9 +10226,14 @@ private fun PrintedWasteZoneRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
+            .border(
+                width = 2.dp,
+                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                shape = RoundedCornerShape(12.dp)
+            )
             .clickable { onClick() },
         shape = RoundedCornerShape(12.dp),
-        color = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else PanelAlt,
+        color = if (focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.28f) else if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else PanelAlt,
         tonalElevation = if (selected) 2.dp else 0.dp,
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
