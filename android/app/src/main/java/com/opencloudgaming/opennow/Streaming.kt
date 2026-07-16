@@ -2757,6 +2757,7 @@ class NativeStreamClient(
         controllerMouseAssistAutoArmed = autoArmed && active
         controllerMouseMoveLogged = false
         NativeInputDiagnostics.add("controller mouse assist ${if (active) "enabled" else "disabled"} auto=$controllerMouseAssistAutoArmed")
+        sendCurrentGamepadState(force = true)
     }
 
     private fun releaseControllerMouseButtons() {
@@ -3413,7 +3414,7 @@ class NativeStreamClient(
                     refreshConnectedPhysicalControllers()
                 }
                 if (hasAnyControllerState()) {
-                    sendCurrentGamepadState()
+                    sendCurrentGamepadState(force = true)
                 }
                 updateHapticsAdvertisement()
             }
@@ -3781,7 +3782,7 @@ class NativeStreamClient(
         return setControllerMouseButton(mouseButton, pressed)
     }
 
-    private fun sendCurrentGamepadState(controllerId: Int = activeControllerId): Boolean {
+    private fun sendCurrentGamepadState(controllerId: Int = activeControllerId, force: Boolean = false): Boolean {
         val buttons = physicalButtons or physicalHatButtons or virtualButtons
         val leftTrigger = max(lastLeftTrigger, virtualLeftTrigger)
         val rightTrigger = max(lastRightTrigger, virtualRightTrigger)
@@ -3804,7 +3805,7 @@ class NativeStreamClient(
             bitmap = bitmap
         )
 
-        if (currentState == lastState) {
+        if (!force && currentState == lastState) {
             return false
         }
 
