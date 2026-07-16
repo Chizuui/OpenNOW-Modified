@@ -127,11 +127,21 @@ object CodecProbe {
             val preferredDecoder = decoders.firstOrNull(::isHardwareCodec) ?: decoders.firstOrNull()
             val preferredEncoder = encoders.firstOrNull(::isHardwareCodec) ?: encoders.firstOrNull()
 
+            val maxFpsMap = mutableMapOf<String, Int>()
             val (maxWidth, maxHeight) = preferredDecoder?.let { decoder ->
                 runCatching {
                     val capabilities = decoder.getCapabilitiesForType(mime)
                     val videoCapabilities = capabilities.videoCapabilities
                     if (videoCapabilities != null) {
+                        for (option in STREAM_RESOLUTION_OPTIONS) {
+                            val pixels = option.value.split("x")
+                            val w = pixels.getOrNull(0)?.toIntOrNull()
+                            val h = pixels.getOrNull(1)?.toIntOrNull()
+                            if (w != null && h != null && videoCapabilities.isSizeSupported(w, h)) {
+                                val fpsRange = videoCapabilities.getSupportedFrameRatesFor(w, h)
+                                maxFpsMap[option.value] = fpsRange.upper.toInt()
+                            }
+                        }
                         videoCapabilities.supportedWidths.upper to videoCapabilities.supportedHeights.upper
                     } else {
                         null
@@ -155,6 +165,7 @@ object CodecProbe {
                 webRtcCodecProfiles = webRtc?.profiles.orEmpty(),
                 maxSupportedWidth = maxWidth,
                 maxSupportedHeight = maxHeight,
+                maxFpsByResolution = maxFpsMap,
             )
         }
         return RuntimeCodecReport(

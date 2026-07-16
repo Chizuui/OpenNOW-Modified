@@ -423,7 +423,7 @@ internal fun streamSettingsSessionSignature(settings: StreamSettings): String {
     ).joinToString(";")
 }
 
-private data class StreamResolutionOption(
+internal data class StreamResolutionOption(
     val value: String,
     val aspectRatio: String,
     val tier: String,
@@ -598,7 +598,7 @@ private fun customResolutionAllowedForPlan(
         pixels <= availableChoices.maxOf { it.width * it.height }
 }
 
-private val STREAM_RESOLUTION_OPTIONS = listOf(
+internal val STREAM_RESOLUTION_OPTIONS = listOf(
     StreamResolutionOption("1280x720", "16:9", "720"),
     StreamResolutionOption("1366x768", "16:9", "768"),
     StreamResolutionOption("1600x900", "16:9", "900"),
@@ -1296,6 +1296,7 @@ data class CodecCapability(
     val webRtcCodecProfiles: List<String> = emptyList(),
     val maxSupportedWidth: Int? = null,
     val maxSupportedHeight: Int? = null,
+    val maxFpsByResolution: Map<String, Int> = emptyMap(),
 )
 
 data class RuntimeCodecReport(
@@ -1389,11 +1390,14 @@ internal fun StreamSettings.adjustedForDevice(report: RuntimeCodecReport?): Stre
     }.withStableAndroidCloudMatchProfile()
         .withoutAndroidTvSharpening(report)
 
-    return if (maxWidth != null && maxHeight != null) {
+    val capabilityCap = if (maxWidth != null && maxHeight != null) {
         capped.cappedResolution(maxWidth, maxHeight, strict = false)
     } else {
         capped
     }
+
+    val maxSupportedFps = effectiveCapability?.maxFpsByResolution?.get(capabilityCap.resolution) ?: 360
+    return capabilityCap.copy(fps = minOf(capabilityCap.fps, maxSupportedFps))
 }
 
 internal fun StreamSettings.androidSafeVideoFallback(): StreamSettings =

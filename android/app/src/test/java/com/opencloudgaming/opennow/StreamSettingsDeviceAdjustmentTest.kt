@@ -544,6 +544,34 @@ class StreamSettingsDeviceAdjustmentTest {
         assertEquals("2560x1080", adjusted.resolution)
     }
 
+    @Test
+    fun testAdjustedForDeviceCapsFpsBasedOnResolutionCapabilities() {
+        val report = codecReport(
+            codec = VideoCodec.H265,
+            hardwareDecoder = true,
+            realtimeSafe = true,
+            webRtcDecoderAvailable = true,
+            webRtcHardwareDecoderAvailable = true,
+            maxSupportedWidth = 3840,
+            maxSupportedHeight = 2160,
+            maxFpsByResolution = mapOf(
+                "3456x2160" to 60,
+                "2560x1600" to 120,
+            )
+        )
+
+        val settings = StreamSettings(
+            resolution = "3456x2160",
+            aspectRatio = "16:10",
+            fps = 120,
+            codec = VideoCodec.H265,
+        )
+
+        val adjusted = settings.adjustedForDevice(report)
+        assertEquals("3456x2160", adjusted.resolution)
+        assertEquals(60, adjusted.fps)
+    }
+
     private fun codecReport(
         codec: VideoCodec,
         decoderAvailable: Boolean = true,
@@ -554,6 +582,9 @@ class StreamSettingsDeviceAdjustmentTest {
         nativeDecoderAvailable: Boolean? = null,
         webRtcDecoderAvailable: Boolean? = null,
         webRtcHardwareDecoderAvailable: Boolean? = null,
+        maxSupportedWidth: Int? = null,
+        maxSupportedHeight: Int? = null,
+        maxFpsByResolution: Map<String, Int> = emptyMap(),
     ): RuntimeCodecReport =
         RuntimeCodecReport(
             capabilities = listOf(
@@ -567,6 +598,9 @@ class StreamSettingsDeviceAdjustmentTest {
                     nativeDecoderAvailable = nativeDecoderAvailable,
                     webRtcDecoderAvailable = webRtcDecoderAvailable,
                     webRtcHardwareDecoderAvailable = webRtcHardwareDecoderAvailable,
+                    maxSupportedWidth = maxSupportedWidth,
+                    maxSupportedHeight = maxSupportedHeight,
+                    maxFpsByResolution = maxFpsByResolution,
                 ),
             ),
             nativeRuntimeSummary = "{}",
