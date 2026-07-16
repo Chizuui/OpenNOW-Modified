@@ -3648,14 +3648,21 @@ class NativeStreamClient(
                     "rx=${raw.rx.formatAxis()} ry=${raw.ry.formatAxis()} hatX=${raw.hatX.formatAxis()} hatY=${raw.hatY.formatAxis()}",
             )
         }
-        val lt = max(
-            max(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), normalizeTriggerAxis(event.getAxisValue(MotionEvent.AXIS_BRAKE))),
-            if (physicalLeftTriggerButtonPressed) 1f else 0f,
-        )
-        val rt = max(
-            max(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), normalizeTriggerAxis(event.getAxisValue(MotionEvent.AXIS_GAS))),
-            if (physicalRightTriggerButtonPressed) 1f else 0f,
-        )
+        val hasAnalogL = event.device?.getMotionRange(MotionEvent.AXIS_LTRIGGER) != null ||
+                         event.device?.getMotionRange(MotionEvent.AXIS_BRAKE) != null
+        val lt = if (hasAnalogL) {
+            max(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), normalizeTriggerAxis(event.getAxisValue(MotionEvent.AXIS_BRAKE)))
+        } else {
+            if (physicalLeftTriggerButtonPressed) 1f else 0f
+        }
+
+        val hasAnalogR = event.device?.getMotionRange(MotionEvent.AXIS_RTRIGGER) != null ||
+                         event.device?.getMotionRange(MotionEvent.AXIS_GAS) != null
+        val rt = if (hasAnalogR) {
+            max(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), normalizeTriggerAxis(event.getAxisValue(MotionEvent.AXIS_GAS)))
+        } else {
+            if (physicalRightTriggerButtonPressed) 1f else 0f
+        }
         val leftScale = radialDeadzoneScale(axes.leftX, axes.leftY)
         val rightScale = radialDeadzoneScale(axes.rightX, axes.rightY)
         val leftX = axes.leftX * leftScale
@@ -3709,12 +3716,20 @@ class NativeStreamClient(
                 physicalControllerConnected = true
                 physicalControllerActive = true
                 physicalLeftTriggerButtonPressed = pressed
-                lastLeftTrigger = if (pressed) 255 else 0
+                val hasAnalogTrigger = event.device?.getMotionRange(MotionEvent.AXIS_LTRIGGER) != null ||
+                                       event.device?.getMotionRange(MotionEvent.AXIS_BRAKE) != null
+                if (!hasAnalogTrigger) {
+                    lastLeftTrigger = if (pressed) 255 else 0
+                }
                 val mouseSent = handleControllerMouseTrigger(left = true, pressed = pressed)
                 if (mouseSent) {
                     return true
                 }
-                return sendCurrentGamepadState(controllerId = activeControllerId)
+                return if (!hasAnalogTrigger) {
+                    sendCurrentGamepadState(controllerId = activeControllerId)
+                } else {
+                    true
+                }
             }
             KeyEvent.KEYCODE_BUTTON_R2 -> {
                 activeControllerId = controllerIdFor(event)
@@ -3724,12 +3739,20 @@ class NativeStreamClient(
                 physicalControllerConnected = true
                 physicalControllerActive = true
                 physicalRightTriggerButtonPressed = pressed
-                lastRightTrigger = if (pressed) 255 else 0
+                val hasAnalogTrigger = event.device?.getMotionRange(MotionEvent.AXIS_RTRIGGER) != null ||
+                                       event.device?.getMotionRange(MotionEvent.AXIS_GAS) != null
+                if (!hasAnalogTrigger) {
+                    lastRightTrigger = if (pressed) 255 else 0
+                }
                 val mouseSent = handleControllerMouseTrigger(left = false, pressed = pressed)
                 if (mouseSent) {
                     return true
                 }
-                return sendCurrentGamepadState(controllerId = activeControllerId)
+                return if (!hasAnalogTrigger) {
+                    sendCurrentGamepadState(controllerId = activeControllerId)
+                } else {
+                    true
+                }
             }
         }
         return false
