@@ -645,6 +645,12 @@ object NativeStreamInputRouter {
     @Volatile
     private var client: NativeStreamClient? = null
     @Volatile
+    private var androidTvProfile = false
+
+    fun setAndroidTvProfile(enabled: Boolean) {
+        androidTvProfile = enabled
+    }
+    @Volatile
     private var touchMouseEnabled = false
     @Volatile
     private var mouseDirectClick = false
@@ -916,13 +922,14 @@ object NativeStreamInputRouter {
             keyCode = keyCode,
             controllerInputDevice = isControllerInputDevice(),
             hardwareKeyboardSource = isHardwareKeyboardSource(),
+            androidTv = androidTvProfile,
         )
 
     fun shouldOpenStreamSystemMenuKey(keyCode: Int, controllerInputDevice: Boolean): Boolean =
         keyCode == KeyEvent.KEYCODE_MENU && !controllerInputDevice
 
-    fun shouldHandleStreamExitKey(keyCode: Int, controllerInputDevice: Boolean, hardwareKeyboardSource: Boolean): Boolean =
-        (keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice) ||
+    fun shouldHandleStreamExitKey(keyCode: Int, controllerInputDevice: Boolean, hardwareKeyboardSource: Boolean, androidTv: Boolean = false): Boolean =
+        (keyCode == KeyEvent.KEYCODE_BACK && (!controllerInputDevice || androidTv)) ||
             (keyCode == KeyEvent.KEYCODE_ESCAPE && !hardwareKeyboardSource)
 
     private fun KeyEvent.isControllerInputDevice(): Boolean =

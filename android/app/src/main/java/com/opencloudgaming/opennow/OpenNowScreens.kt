@@ -5024,6 +5024,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     DisposableEffect(Unit) {
         val decor = activity?.window?.decorView
         NativeStreamInputRouter.attach(client)
+        NativeStreamInputRouter.setAndroidTvProfile(tvProfile)
         onDispose {
             if (Build.VERSION.SDK_INT >= 26) {
                 decor?.releasePointerCapture()
@@ -5032,6 +5033,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             NativeStreamInputRouter.clearStreamPanelTouchPassthroughBounds()
             NativeStreamInputRouter.setSystemMenuHandler(null)
             NativeStreamInputRouter.setSystemBackHandler(null)
+            NativeStreamInputRouter.setAndroidTvProfile(false)
             NativeStreamInputRouter.setStreamUiActive(false)
             NativeStreamInputRouter.detach(client)
             client.release()
