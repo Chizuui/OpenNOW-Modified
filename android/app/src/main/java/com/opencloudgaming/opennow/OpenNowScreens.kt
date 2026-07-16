@@ -3800,6 +3800,7 @@ private fun GameDetailsSheet(
     LaunchedEffect(game.id) {
         runCatching { playFocusRequester.requestFocus() }
     }
+    BackHandler(onBack = onDismiss)
     Box(
         Modifier
             .fillMaxSize()
@@ -4229,13 +4230,23 @@ private fun variantDetailsText(variant: GameVariant): String =
 
 @Composable
 private fun ImageCloseButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    var focused by remember { mutableStateOf(false) }
+    val accent = MaterialTheme.colorScheme.primary
     Surface(
-        modifier = modifier.size(44.dp),
+        modifier = modifier
+            .size(44.dp)
+            .onFocusChanged { focused = it.isFocused }
+            .border(
+                width = 2.dp,
+                color = if (focused) accent else Color.Transparent,
+                shape = CircleShape
+            )
+            .clickable(onClick = onClick),
         shape = CircleShape,
         color = Color.Black.copy(alpha = 0.58f),
         tonalElevation = 3.dp,
     ) {
-        IconButton(onClick = onClick) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Icon(
                 painter = painterResource(R.drawable.ic_clear),
                 contentDescription = stringResource(R.string.action_cancel),
@@ -4467,10 +4478,21 @@ private fun GameGenreChips(game: GameInfo, compact: Boolean) {
 private fun GameDescriptionDisclosure(description: String?, compact: Boolean) {
     var expanded by remember(description) { mutableStateOf(true) }
     val text = description?.takeIf { it.isNotBlank() } ?: "No description is available for this game yet."
+    var focused by remember { mutableStateOf(false) }
+    val accent = MaterialTheme.colorScheme.primary
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(if (compact) 12.dp else 14.dp))
+            .onFocusChanged { focused = it.isFocused }
+            .border(
+                width = 1.dp,
+                color = if (focused) accent else Color.Transparent,
+                shape = RoundedCornerShape(if (compact) 12.dp else 14.dp)
+            )
+            .clickable { expanded = !expanded },
         shape = RoundedCornerShape(if (compact) 12.dp else 14.dp),
-        color = PanelAlt,
+        color = if (focused) PanelAlt.copy(alpha = 0.85f) else PanelAlt,
         tonalElevation = 0.dp,
     ) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = if (compact) 8.dp else 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
