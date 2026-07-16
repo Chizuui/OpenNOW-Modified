@@ -33,7 +33,6 @@ private const val CATALOG_CACHE_TTL_MS = 12L * 60L * 60L * 1000L
 private const val QUEUED_GAME_LIMIT = 24
 // Keys that must never be written to the external (potentially world-readable) file.
 private val SENSITIVE_KEYS = setOf(KEY_AUTH, KEY_DEVICE_ID)
-private val AUTH_STORE_LOCK = Any()
 
 class ExternalPrefs private constructor(context: Context, val name: String) {
     private val primaryFile: File
@@ -379,27 +378,23 @@ class AuthStore(context: Context) {
         return runCatching { OpenNowJson.decodeFromString<PersistedAuthState>(raw) }.getOrElse { PersistedAuthState() }
     }
 
-    fun reload(): PersistedAuthState = synchronized(AUTH_STORE_LOCK) {
-        load().also { latest -> _state.value = latest }
-    }
-
-    fun save(next: PersistedAuthState) = synchronized(AUTH_STORE_LOCK) {
+    fun save(next: PersistedAuthState) {
         sharedPrefs.edit().putString(KEY_AUTH, OpenNowJson.encodeToString(next)).commit()
         _state.value = next
     }
 
-    fun activeSession(): AuthSession? = synchronized(AUTH_STORE_LOCK) {
+    fun activeSession(): AuthSession? {
         val state = _state.value
-        state.sessions.firstOrNull { it.user.userId == state.activeUserId } ?: state.sessions.firstOrNull()
+        return state.sessions.firstOrNull { it.user.userId == state.activeUserId } ?: state.sessions.firstOrNull()
     }
 
-    fun setActiveSession(userId: String) = synchronized(AUTH_STORE_LOCK) {
+    fun setActiveSession(userId: String) {
         val current = _state.value
-        val session = current.sessions.firstOrNull { it.user.userId == userId } ?: return@synchronized
+        val session = current.sessions.firstOrNull { it.user.userId == userId } ?: return
         save(current.copy(activeUserId = session.user.userId, selectedProvider = session.provider))
     }
 
-    fun upsertSession(session: AuthSession) = synchronized(AUTH_STORE_LOCK) {
+    fun upsertSession(session: AuthSession) {
         val current = _state.value
         val sessions = buildList {
             add(session)
@@ -414,24 +409,13 @@ class AuthStore(context: Context) {
         )
     }
 
-    fun updateSessionIfUnchanged(expected: AuthSession, updated: AuthSession): Boolean = synchronized(AUTH_STORE_LOCK) {
-        val current = _state.value
-        val existing = current.sessions.firstOrNull { it.user.userId == expected.user.userId }
-        if (existing != expected) return@synchronized false
-        val sessions = current.sessions.map { session ->
-            if (session.user.userId == expected.user.userId) updated else session
-        }
-        save(current.copy(sessions = sessions))
-        true
-    }
-
-    fun removeSession(userId: String) = synchronized(AUTH_STORE_LOCK) {
+    fun removeSession(userId: String) {
         val current = _state.value
         val sessions = current.sessions.filterNot { it.user.userId == userId }
         save(current.copy(sessions = sessions, activeUserId = sessions.firstOrNull()?.user?.userId))
     }
 
-    fun clear() = synchronized(AUTH_STORE_LOCK) {
+    fun clear() {
         save(PersistedAuthState())
     }
 

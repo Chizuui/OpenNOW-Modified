@@ -12,8 +12,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.Serializable
@@ -122,9 +120,8 @@ private const val OAUTH_CALLBACK_TIMEOUT_MS = 120_000L
 private const val OAUTH_CALLBACK_PROBE_TIMEOUT_MS = 2_000
 private const val OAUTH_CALLBACK_PROBE_PATH = "/opennow-callback-probe"
 private const val DEVICE_CODE_MIN_POLL_INTERVAL_SECONDS = 5
-internal const val TOKEN_REFRESH_WINDOW_MS = 10 * 60 * 1000L
-internal const val CLIENT_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000L
-private val AUTH_RESTORE_MUTEX = Mutex()
+private const val TOKEN_REFRESH_WINDOW_MS = 10 * 60 * 1000L
+private const val CLIENT_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000L
 private val READY_SESSION_STATUSES = setOf(2, 3)
 private const val INVALID_SESSION_PROXY_MESSAGE =
     "Invalid session proxy URL. Use http://host:port, https://host:port, socks4://host:port, or socks5://host:port."
@@ -694,41 +691,26 @@ class GfnAuthRepository(
         return providers.ifEmpty { listOf(defaultProvider()) }
     }
 
-    suspend fun restore(
-        forceRefresh: Boolean = false,
-        throwOnRefreshFailure: Boolean = forceRefresh,
-        removeExpiredSessionOnFailure: Boolean = true,
-    ): AuthSession? =
-        AUTH_RESTORE_MUTEX.withLock {
-            authStore.reload()
-            val restored = authStore.activeSession() ?: return@withLock null
-            var session = restored
-            if (session.tokens.clientToken.isNullOrBlank() || isNearExpiry(session.tokens.clientTokenExpiresAt, CLIENT_TOKEN_REFRESH_WINDOW_MS)) {
-                val withClientToken = runCatching { ensureClientToken(session.tokens) }.getOrElse { session.tokens }
-                if (withClientToken != session.tokens) {
-                    val updatedSession = session.copy(tokens = withClientToken)
-                    if (!authStore.updateSessionIfUnchanged(session, updatedSession)) {
-                        return@withLock authStore.activeSession()
-                    }
-                    session = updatedSession
-                }
+    suspend fun restore(forceRefresh: Boolean = false): AuthSession? {
+        val restored = authStore.activeSession() ?: return null
+        var session = restored
+        if (session.tokens.clientToken.isNullOrBlank() || isNearExpiry(session.tokens.clientTokenExpiresAt, CLIENT_TOKEN_REFRESH_WINDOW_MS)) {
+            val withClientToken = runCatching { ensureClientToken(session.tokens) }.getOrElse { session.tokens }
+            if (withClientToken != session.tokens) {
+                session = session.copy(tokens = withClientToken)
+                authStore.upsertSession(session)
             }
-
-            val refreshed = if (forceRefresh || isNearExpiry(session.tokens.expiresAt, TOKEN_REFRESH_WINDOW_MS)) {
-                refreshSession(
-                    session = session,
-                    forceRefresh = forceRefresh || throwOnRefreshFailure,
-                    removeExpiredSessionOnFailure = removeExpiredSessionOnFailure,
-                )
-            } else {
-                session
-            }
-
-            if (refreshed != session && !authStore.updateSessionIfUnchanged(session, refreshed)) {
-                return@withLock authStore.activeSession()
-            }
-            refreshed
         }
+
+        val refreshed = if (forceRefresh || isNearExpiry(session.tokens.expiresAt, TOKEN_REFRESH_WINDOW_MS)) {
+            refreshSession(session, forceRefresh)
+        } else {
+            session
+        }
+
+        authStore.upsertSession(refreshed)
+        return refreshed
+    }
 
     suspend fun login(
         provider: LoginProvider,
@@ -879,11 +861,7 @@ class GfnAuthRepository(
         )
     }
 
-    private suspend fun refreshSession(
-        session: AuthSession,
-        forceRefresh: Boolean,
-        removeExpiredSessionOnFailure: Boolean = true,
-    ): AuthSession {
+    private suspend fun refreshSession(session: AuthSession, forceRefresh: Boolean): AuthSession {
         val tokens = session.tokens
         val refreshErrors = mutableListOf<String>()
 
@@ -923,18 +901,14 @@ class GfnAuthRepository(
         val hasRefreshMechanism = !tokens.clientToken.isNullOrBlank() || !tokens.refreshToken.isNullOrBlank()
         if (!hasRefreshMechanism) {
             if (isExpired(tokens.expiresAt)) {
-                if (removeExpiredSessionOnFailure) {
-                    authStore.removeSession(session.user.userId)
-                }
+                authStore.removeSession(session.user.userId)
                 error("Saved session expired and has no refresh mechanism. Please log in again.")
             }
             return session
         }
 
         if (isExpired(tokens.expiresAt)) {
-            if (removeExpiredSessionOnFailure) {
-                authStore.removeSession(session.user.userId)
-            }
+            authStore.removeSession(session.user.userId)
             val detail = refreshErrors.takeIf { it.isNotEmpty() }?.joinToString(" | ")
             error("Token refresh failed and the saved session expired. Please log in again.${detail?.let { " $it" }.orEmpty()}")
         }

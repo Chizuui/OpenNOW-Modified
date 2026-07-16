@@ -87,7 +87,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        viewModel.refreshAuthSessionIfNeeded()
         viewModel.setAndroidPictureInPictureActive(isInPictureInPictureMode)
         if (streamSystemUiActive) {
             applyStreamSystemUi(true, force = true)
