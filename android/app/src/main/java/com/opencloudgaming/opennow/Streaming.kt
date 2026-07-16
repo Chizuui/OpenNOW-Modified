@@ -1238,6 +1238,17 @@ internal data class ControllerMouseDelta(
     val dy: Int,
 )
 
+internal data class SentGamepadState(
+    val buttons: Int = 0,
+    val leftTrigger: Int = 0,
+    val rightTrigger: Int = 0,
+    val leftStickX: Int = 0,
+    val leftStickY: Int = 0,
+    val rightStickX: Int = 0,
+    val rightStickY: Int = 0,
+    val bitmap: Int = 0,
+)
+
 internal object AndroidControllerMouseAssist {
     fun mouseDelta(stickX: Float, stickY: Float): ControllerMouseDelta? {
         val x = stickX.coerceIn(-1f, 1f)
@@ -2201,6 +2212,7 @@ class NativeStreamClient(
     private val textSendMutex = Mutex()
     private var guideAutoReleaseJob: Job? = null
     private val lastRumbleEffectAtMs = LongArray(GAMEPAD_MAX_CONTROLLERS)
+    private val lastSentGamepadStates = Array(GAMEPAD_MAX_CONTROLLERS) { SentGamepadState() }
     private val hapticsSupportLogged = BooleanArray(GAMEPAD_MAX_CONTROLLERS)
     private var lastHapticsWarningAtMs = 0L
     private var lastHapticsAdvertisementAtMs = 0L
@@ -2467,6 +2479,9 @@ class NativeStreamClient(
         hardwareKeyboardEventLogged = false
         physicalGamepadAxisLogged = false
         inputEncoder.resetGamepadSequences()
+        for (i in 0 until GAMEPAD_MAX_CONTROLLERS) {
+            lastSentGamepadStates[i] = SentGamepadState()
+        }
     }
 
     fun dispatchKey(event: KeyEvent): Boolean {
@@ -3744,20 +3759,50 @@ class NativeStreamClient(
     }
 
     private fun sendCurrentGamepadState(controllerId: Int = activeControllerId): Boolean {
+        val buttons = physicalButtons or physicalHatButtons or virtualButtons
+        val leftTrigger = max(lastLeftTrigger, virtualLeftTrigger)
+        val rightTrigger = max(lastRightTrigger, virtualRightTrigger)
+        val leftStickX = effectiveLeftStickX()
+        val leftStickY = effectiveLeftStickY()
+        val rightStickX = effectiveRightStickX()
+        val rightStickY = effectiveRightStickY()
+        val bitmap = currentGamepadBitmap(controllerId)
+
+        val idx = controllerId.coerceIn(0, GAMEPAD_MAX_CONTROLLERS - 1)
+        val lastState = lastSentGamepadStates[idx]
+        val currentState = SentGamepadState(
+            buttons = buttons,
+            leftTrigger = leftTrigger,
+            rightTrigger = rightTrigger,
+            leftStickX = leftStickX,
+            leftStickY = leftStickY,
+            rightStickX = rightStickX,
+            rightStickY = rightStickY,
+            bitmap = bitmap
+        )
+
+        if (currentState == lastState) {
+            return false
+        }
+
         val partiallyReliable = canSendGamepadPartiallyReliable(controllerId)
         val packet = inputEncoder.encodeGamepadState(
             controllerId = controllerId,
-            buttons = physicalButtons or physicalHatButtons or virtualButtons,
-            leftTrigger = max(lastLeftTrigger, virtualLeftTrigger),
-            rightTrigger = max(lastRightTrigger, virtualRightTrigger),
-            leftStickX = effectiveLeftStickX(),
-            leftStickY = effectiveLeftStickY(),
-            rightStickX = effectiveRightStickX(),
-            rightStickY = effectiveRightStickY(),
-            bitmap = currentGamepadBitmap(controllerId),
+            buttons = buttons,
+            leftTrigger = leftTrigger,
+            rightTrigger = rightTrigger,
+            leftStickX = leftStickX,
+            leftStickY = leftStickY,
+            rightStickX = rightStickX,
+            rightStickY = rightStickY,
+            bitmap = bitmap,
             partiallyReliable = partiallyReliable,
         )
-        return sendInput(packet, partiallyReliable = partiallyReliable, fallbackToReliable = !partiallyReliable)
+        val sent = sendInput(packet, partiallyReliable = partiallyReliable, fallbackToReliable = !partiallyReliable)
+        if (sent) {
+            lastSentGamepadStates[idx] = currentState
+        }
+        return sent
     }
 
     private fun updateGuideAutoRelease(mask: Int, pressed: Boolean, controllerId: Int) {
