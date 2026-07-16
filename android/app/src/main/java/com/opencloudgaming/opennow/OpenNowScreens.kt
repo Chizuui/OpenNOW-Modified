@@ -182,6 +182,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -9147,25 +9148,46 @@ private fun VirtualStick(
             .border(1.dp, Color.White.copy(alpha = opacity * 0.3f), CircleShape)
             .pointerInput(client, onChange) {
                 awaitPointerEventScope {
+                    var trackedPointerId: PointerId? = null
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.pressed }
                         val maxRadius = min(size.width, size.height) * 0.34f
-                        if (change == null) {
-                            if (knobOffset != Offset.Zero) {
+                        val change = trackedPointerId?.let { id ->
+                            event.changes.firstOrNull { it.id == id }
+                        }
+                        if (change != null) {
+                            if (change.pressed) {
+                                val center = Offset(size.width / 2f, size.height / 2f)
+                                val clamped = clampStickOffset(change.position - center, maxRadius)
+                                onChange(
+                                    (clamped.x / maxRadius).coerceIn(-1f, 1f),
+                                    (clamped.y / maxRadius).coerceIn(-1f, 1f),
+                                )
+                                knobOffset = clamped
+                                change.consume()
+                            } else {
                                 onChange(0f, 0f)
                                 knobOffset = Offset.Zero
+                                trackedPointerId = null
                             }
-                            continue
+                        } else {
+                            val newChange = event.changes.firstOrNull { it.pressed }
+                            if (newChange != null) {
+                                trackedPointerId = newChange.id
+                                val center = Offset(size.width / 2f, size.height / 2f)
+                                val clamped = clampStickOffset(newChange.position - center, maxRadius)
+                                onChange(
+                                    (clamped.x / maxRadius).coerceIn(-1f, 1f),
+                                    (clamped.y / maxRadius).coerceIn(-1f, 1f),
+                                )
+                                knobOffset = clamped
+                                newChange.consume()
+                            } else if (trackedPointerId != null) {
+                                onChange(0f, 0f)
+                                knobOffset = Offset.Zero
+                                trackedPointerId = null
+                            }
                         }
-                        val center = Offset(size.width / 2f, size.height / 2f)
-                        val clamped = clampStickOffset(change.position - center, maxRadius)
-                        onChange(
-                            (clamped.x / maxRadius).coerceIn(-1f, 1f),
-                            (clamped.y / maxRadius).coerceIn(-1f, 1f),
-                        )
-                        knobOffset = clamped
-                        change.consume()
                     }
                 }
             },
