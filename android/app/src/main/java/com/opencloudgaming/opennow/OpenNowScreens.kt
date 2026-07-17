@@ -2122,6 +2122,41 @@ internal fun handleVerticalDpadFocusMove(event: androidx.compose.ui.input.key.Ke
     return focusManager.moveFocus(direction)
 }
 
+/**
+ * Key event handler for Compose Sliders when navigated by TV remote or D-pad controller.
+ * - D-pad Up/Down  → moves focus to the next/previous focusable element.
+ * - D-pad Left     → decrements the slider value by [step], clamped to [min].
+ * - D-pad Right    → increments the slider value by [step], clamped to [max].
+ * Returns true when the event is consumed (Left/Right) so that Compose does not
+ * move focus sideways instead of changing the value.
+ */
+internal fun handleSliderDpadInput(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    value: Float,
+    min: Float,
+    max: Float,
+    step: Float,
+    focusManager: FocusManager,
+    onValueAdjusted: (Float) -> Unit,
+): Boolean {
+    if (event.type != KeyEventType.KeyDown) return false
+    return when (event.key) {
+        Key.DirectionUp -> focusManager.moveFocus(FocusDirection.Up)
+        Key.DirectionDown -> focusManager.moveFocus(FocusDirection.Down)
+        Key.DirectionLeft -> {
+            val newValue = (value - step).coerceIn(min, max)
+            onValueAdjusted(newValue)
+            true
+        }
+        Key.DirectionRight -> {
+            val newValue = (value + step).coerceIn(min, max)
+            onValueAdjusted(newValue)
+            true
+        }
+        else -> false
+    }
+}
+
 internal fun isTvActivateKey(event: androidx.compose.ui.input.key.KeyEvent): Boolean =
     event.type == KeyEventType.KeyUp &&
         event.key in setOf(
@@ -7724,7 +7759,12 @@ private fun CompactSlider(label: String, value: Float, min: Float, max: Float, o
         Slider(
             modifier = Modifier
                 .onFocusChanged { focused = it.isFocused }
-                .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
+                .onPreviewKeyEvent {
+                    handleSliderDpadInput(it, local, min, max, 0.05f, focusManager) { newVal ->
+                        local = newVal
+                        onChange(newVal)
+                    }
+                },
             value = local,
             onValueChange = {
                 local = it.coerceIn(min, max)
@@ -7759,7 +7799,12 @@ private fun CompactDpSlider(label: String, value: Float, min: Float, max: Float,
         Slider(
             modifier = Modifier
                 .onFocusChanged { focused = it.isFocused }
-                .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
+                .onPreviewKeyEvent {
+                    handleSliderDpadInput(it, local, min, max, 2f, focusManager) { newVal ->
+                        local = newVal
+                        onChange(newVal)
+                    }
+                },
             value = local,
             onValueChange = {
                 local = it.coerceIn(min, max)

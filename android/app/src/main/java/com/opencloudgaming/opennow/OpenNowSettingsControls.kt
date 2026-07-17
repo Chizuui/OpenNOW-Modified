@@ -213,7 +213,12 @@ internal fun NumberSlider(
             Text(if (step < 1f) "%.2f".format(local) else local.roundToInt().toString(), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Slider(
-            modifier = Modifier.onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
+            modifier = Modifier.onPreviewKeyEvent {
+                handleSliderDpadInput(it, local, min, max, step, focusManager) { newVal ->
+                    local = ((newVal / step).roundToInt() * step).coerceIn(min, max)
+                    onChange(local)
+                }
+            },
             value = local,
             onValueChange = { local = ((it / step).roundToInt() * step).coerceIn(min, max) },
             onValueChangeFinished = { onChange(local) },
