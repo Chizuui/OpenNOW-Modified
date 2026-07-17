@@ -2138,8 +2138,20 @@ private class TouchMouseState {
                     if (index in 0 until event.pointerCount && event.getPointerId(index) !in ignoredPointerIds) {
                         beginPointer(event, index)
                     }
-                } else if (event.pointerCount == 2) {
-                    twoFingerTapCandidate = true
+                } else {
+                    val newIndex = event.actionIndex
+                    val newPointerId = if (newIndex in 0 until event.pointerCount) event.getPointerId(newIndex) else -1
+                    if (newPointerId >= 0 && newPointerId !in ignoredPointerIds) {
+                        var nonIgnoredCount = 0
+                        for (i in 0 until event.pointerCount) {
+                            if (event.getPointerId(i) !in ignoredPointerIds) {
+                                nonIgnoredCount++
+                            }
+                        }
+                        if (nonIgnoredCount == 2) {
+                            twoFingerTapCandidate = true
+                        }
+                    }
                 }
                 return true
             }

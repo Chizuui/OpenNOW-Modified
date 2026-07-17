@@ -474,19 +474,19 @@ private fun SettingsContent(
                         )
                     }
                 }
-                SettingSwitch(stringResource(R.string.settings_stretch_stream_to_fill), settings.stretchStreamToFill) { enabled ->
-                    viewModel.updateSettings(
-                        settings.copy(
-                            stretchStreamToFill = enabled,
-                            stretchStreamToZoom = if (enabled) false else settings.stretchStreamToZoom
-                        )
-                    )
-                }
-                SettingSwitch(stringResource(R.string.settings_stretch_stream_to_zoom), settings.stretchStreamToZoom) { enabled ->
+                SettingSwitch(stringResource(R.string.settings_stretch_stream_to_fill), settings.stretchStreamToZoom) { enabled ->
                     viewModel.updateSettings(
                         settings.copy(
                             stretchStreamToZoom = enabled,
                             stretchStreamToFill = if (enabled) false else settings.stretchStreamToFill
+                        )
+                    )
+                }
+                SettingSwitch(stringResource(R.string.settings_stretch_stream_to_zoom), settings.stretchStreamToFill) { enabled ->
+                    viewModel.updateSettings(
+                        settings.copy(
+                            stretchStreamToFill = enabled,
+                            stretchStreamToZoom = if (enabled) false else settings.stretchStreamToZoom
                         )
                     )
                 }
