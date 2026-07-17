@@ -2616,7 +2616,8 @@ class NativeStreamClient(
     private fun startControllerMouseLoop() {
         controllerMouseLoopJob?.cancel()
         controllerMouseLoopJob = scope.launch {
-            while (controllerMouseLoopJob?.isActive == true) {
+            val currentJob = coroutineContext[Job]
+            while (currentJob?.isActive == true) {
                 // Poll/send mouse updates at 60Hz (approx 16ms delay)
                 delay(16L)
                 if (controllerMouseEmulationActive) {
