@@ -1974,6 +1974,7 @@ private class TouchMouseState {
     private var virtualCursorX = 0f
     private var virtualCursorY = 0f
     private var virtualCursorInitialized = false
+    private var twoFingerTapCandidate = false
 
     fun reset(client: NativeStreamClient?) {
         if (selecting) client?.setTouchMouseButton(false)
@@ -1981,6 +1982,7 @@ private class TouchMouseState {
         selecting = false
         doubleTapDragCandidate = false
         virtualCursorInitialized = false
+        twoFingerTapCandidate = false
     }
 
     fun handle(
@@ -2127,6 +2129,7 @@ private class TouchMouseState {
                     return false
                 }
                 beginPointer(event, 0)
+                twoFingerTapCandidate = false
                 return true
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
@@ -2135,6 +2138,8 @@ private class TouchMouseState {
                     if (index in 0 until event.pointerCount && event.getPointerId(index) !in ignoredPointerIds) {
                         beginPointer(event, index)
                     }
+                } else if (event.pointerCount == 2) {
+                    twoFingerTapCandidate = true
                 }
                 return true
             }
@@ -2218,12 +2223,18 @@ private class TouchMouseState {
             return
         }
         if (wasTap) {
-            NativeInputDiagnostics.add("touch tap click dx=${tapDistanceX.roundToInt()} dy=${tapDistanceY.roundToInt()}")
-            client.sendTouchMouseClick()
+            if (twoFingerTapCandidate) {
+                NativeInputDiagnostics.add("touch 2-finger tap right click dx=${tapDistanceX.roundToInt()} dy=${tapDistanceY.roundToInt()}")
+                client.sendTouchMouseRightClick()
+            } else {
+                NativeInputDiagnostics.add("touch tap click dx=${tapDistanceX.roundToInt()} dy=${tapDistanceY.roundToInt()}")
+                client.sendTouchMouseClick()
+            }
             lastTapTimeMs = event.eventTime
             lastTapX = x
             lastTapY = y
         }
+        twoFingerTapCandidate = false
     }
 
     private fun MotionEvent.firstPointerIndexNotIn(ignoredPointerIds: Set<Int>): Int {
@@ -2897,6 +2908,14 @@ class NativeStreamClient(
         }
     }
 
+    fun sendTouchMouseRightClick() {
+        scope.launch {
+            if (!sendMouseButton(button = 3, pressed = true, source = "touch mouse right click")) return@launch
+            delay(160L)
+            sendMouseButton(button = 3, pressed = false, source = "touch mouse right click")
+        }
+    }
+
     fun sendKeyCode(keyCode: Int) {
         val down = KeyEvent(SystemClock.uptimeMillis(), SystemClock.uptimeMillis(), KeyEvent.ACTION_DOWN, keyCode, 0)
         val up = KeyEvent(SystemClock.uptimeMillis(), SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, 0)
@@ -3027,10 +3046,13 @@ class NativeStreamClient(
     }
 
     fun setVirtualButton(buttonMask: Int, pressed: Boolean) {
-        // When left-stick mouse emulation is active, intercept the A button as a left mouse click.
-        if (controllerMouseEmulationActive && buttonMask == GamepadButtonMapping.A) {
-            setControllerMouseButton(1, pressed)
-            return
+        // When left-stick mouse emulation is active, intercept A (left click) and B (right click).
+        if (controllerMouseEmulationActive) {
+            val mouseButton = AndroidControllerMouseAssist.mouseButtonForGamepad(buttonMask)
+            if (mouseButton != null) {
+                setControllerMouseButton(mouseButton, pressed)
+                return
+            }
         }
         virtualButtons = if (pressed) virtualButtons or buttonMask else virtualButtons and buttonMask.inv()
         val steamOverlayChordActivated = virtualSteamOverlayChord.update(virtualButtons)
