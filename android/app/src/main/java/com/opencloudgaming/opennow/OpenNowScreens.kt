@@ -7157,6 +7157,9 @@ private fun StreamControlsPanel(
     val doneFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     var statusBarOptionsOpen by remember { mutableStateOf(false) }
+    var keyboardFocused by remember { mutableStateOf(false) }
+    var exitFocused by remember { mutableStateOf(false) }
+    var doneFocused by remember { mutableStateOf(false) }
     BackHandler(enabled = statusBarOptionsOpen) {
         statusBarOptionsOpen = false
     }
@@ -7218,6 +7221,13 @@ private fun StreamControlsPanel(
                             onButtonTone()
                             onKeyboardOpen()
                         },
+                        modifier = Modifier
+                            .onFocusChanged { keyboardFocused = it.isFocused }
+                            .border(
+                                width = 1.dp,
+                                color = if (keyboardFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                shape = ButtonDefaults.outlinedShape
+                            ),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                     ) {
                         Icon(
@@ -7232,6 +7242,13 @@ private fun StreamControlsPanel(
                             onButtonTone()
                             onExit()
                         },
+                        modifier = Modifier
+                            .onFocusChanged { exitFocused = it.isFocused }
+                            .border(
+                                width = 1.dp,
+                                color = if (exitFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                shape = ButtonDefaults.outlinedShape
+                            ),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                     ) {
                         Text("Exit")
@@ -7240,7 +7257,14 @@ private fun StreamControlsPanel(
                         onButtonTone()
                         onClose()
                     }
-                    val doneModifier = Modifier.focusRequester(doneFocusRequester)
+                    val doneModifier = Modifier
+                        .focusRequester(doneFocusRequester)
+                        .onFocusChanged { doneFocused = it.isFocused }
+                        .border(
+                            width = 1.dp,
+                            color = if (doneFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                            shape = ButtonDefaults.outlinedShape
+                        )
                     if (highlightDone) {
                         Button(
                             onClick = doneAction,
@@ -7604,11 +7628,18 @@ private fun StreamControlSwitch(label: String, value: String, checked: Boolean, 
 
 @Composable
 private fun StreamControlNavigation(label: String, value: String, onClick: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = 0.06f))
+            .onFocusChanged { focused = it.isFocused }
+            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
+            .border(
+                width = 1.dp,
+                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                shape = RoundedCornerShape(12.dp)
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,

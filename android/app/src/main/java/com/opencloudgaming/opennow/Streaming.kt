@@ -993,7 +993,7 @@ object NativeStreamInputRouter {
         keyCode == KeyEvent.KEYCODE_MENU && !controllerInputDevice
 
     fun shouldHandleStreamExitKey(keyCode: Int, controllerInputDevice: Boolean, hardwareKeyboardSource: Boolean): Boolean =
-        (keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice) ||
+        keyCode == KeyEvent.KEYCODE_BACK ||
             (keyCode == KeyEvent.KEYCODE_ESCAPE && !hardwareKeyboardSource)
 
     private fun KeyEvent.isControllerInputDevice(): Boolean =
