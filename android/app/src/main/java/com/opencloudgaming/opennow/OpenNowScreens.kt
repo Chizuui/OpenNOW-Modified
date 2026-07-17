@@ -7410,14 +7410,6 @@ private fun StreamControlsPanel(
                             onButtonTone()
                             onControllerMouseAssistToggle()
                         }
-                        StreamControlSwitch(
-                            "Mouse mode (Left stick)",
-                            if (controllerMouseEmulationEnabled) "L stick moves · A clicks" else "Off",
-                            controllerMouseEmulationEnabled,
-                        ) {
-                            onButtonTone()
-                            onControllerMouseEmulationToggle()
-                        }
                     } else {
                         StreamControlSwitch("Finger mouse", if (settings.androidTouch.mousePad) "On" else "Off", settings.androidTouch.mousePad) {
                             onButtonTone()
@@ -7445,6 +7437,16 @@ private fun StreamControlsPanel(
                             onButtonTone()
                             onPhoneRumbleFallbackToggle()
                         }
+                    }
+                    // Mouse mode (Left stick): shown for all profiles — works with both physical
+                    // gamepad and touch controller.
+                    StreamControlSwitch(
+                        "Mouse mode (Left stick)",
+                        if (controllerMouseEmulationEnabled) "L stick moves · A clicks" else "Off",
+                        controllerMouseEmulationEnabled,
+                    ) {
+                        onButtonTone()
+                        onControllerMouseEmulationToggle()
                     }
                 }
             }

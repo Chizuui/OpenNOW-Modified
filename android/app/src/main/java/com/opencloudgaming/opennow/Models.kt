@@ -277,6 +277,7 @@ data class AppSettings(
     val hideServerSelector: Boolean = false,
     val controllerMode: Boolean = false,
     val controllerUiSounds: Boolean = true,
+    val controllerMouseEmulation: Boolean = false,
     val controllerBackgroundAnimations: Boolean = true,
     val controllerThemeStyle: String = "aurora",
     val controllerThemeColor: ControllerThemeRgb = ControllerThemeRgb(),

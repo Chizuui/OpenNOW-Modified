@@ -641,6 +641,11 @@ private fun SettingsContent(
                 }
                 SettingSwitch("Clipboard paste", settings.clipboardPaste) { enabled -> viewModel.updateSettings(settings.copy(clipboardPaste = enabled)) }
                 SettingSwitch("Phone rumble fallback", settings.phoneRumbleFallback) { enabled -> viewModel.updateSettings(settings.copy(phoneRumbleFallback = enabled)) }
+                SettingSwitch(
+                    label = "Mouse mode (Left stick)",
+                    checked = settings.controllerMouseEmulation,
+                    description = "Toggle in Stream Controls per session. Left stick moves the cursor, A button clicks.",
+                ) { enabled -> viewModel.updateSettings(settings.copy(controllerMouseEmulation = enabled)) }
                 SettingSwitch("Touch controls", settings.androidTouch.enabled) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(enabled = enabled))) }
                 val touchStyleOptions = listOf(
                     SettingsChoiceOption(TouchControllerStyle.V1.name, "V1 (Solid)"),

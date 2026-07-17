@@ -2582,9 +2582,13 @@ class NativeStreamClient(
                 controllerMouseLeftButtonDown = false
                 sendMouseButton(button = 1, pressed = false, source = "controller mouse emulation")
             }
-            // Explicitly zero left-stick memory so the game doesn't receive stale deflection.
+            // Zero both physical and virtual left-stick memory so neither controller path
+            // delivers stale deflection to the game after mode is disabled.
             lastLeftStickX = 0
             lastLeftStickY = 0
+            virtualLeftStickActive = false
+            virtualLeftStickX = 0
+            virtualLeftStickY = 0
         }
         controllerMouseEmulationActive = enabled
         // Push a fresh gamepad state immediately so the zeroed stick is sent before any next frame.
@@ -3022,6 +3026,11 @@ class NativeStreamClient(
     }
 
     fun setVirtualButton(buttonMask: Int, pressed: Boolean) {
+        // When left-stick mouse emulation is active, intercept the A button as a left mouse click.
+        if (controllerMouseEmulationActive && buttonMask == GamepadButtonMapping.A) {
+            setControllerMouseButton(1, pressed)
+            return
+        }
         virtualButtons = if (pressed) virtualButtons or buttonMask else virtualButtons and buttonMask.inv()
         val steamOverlayChordActivated = virtualSteamOverlayChord.update(virtualButtons)
         sendCurrentGamepadState()
@@ -3062,6 +3071,16 @@ class NativeStreamClient(
         val scale = radialDeadzoneScale(x, y, deadzone = 0.08f)
         val normalizedX = x * scale
         val normalizedY = y * scale
+        if (controllerMouseEmulationActive) {
+            // Redirect left-stick input to mouse movement; keep virtual stick zeroed so the game
+            // receives no stick deflection from the touch controller either.
+            sendControllerMouseMove(normalizedX, normalizedY)
+            virtualLeftStickActive = false
+            virtualLeftStickX = 0
+            virtualLeftStickY = 0
+            sendCurrentGamepadState()
+            return
+        }
         virtualLeftStickActive = normalizedX != 0f || normalizedY != 0f
         virtualLeftStickX = normalizeToInt16(normalizedX)
         virtualLeftStickY = normalizeToInt16(-normalizedY)
