@@ -2353,6 +2353,7 @@ class NativeStreamClient(
     private var controllerMouseAutoArmOnStart = false
     private var controllerMouseAssistActive = false
     private var controllerMouseAssistAutoArmed = false
+    private var controllerMouseEmulationActive = false
     private var controllerMouseMoveLogged = false
     private var controllerMouseLeftButtonDown = false
     private var controllerMouseRightButtonDown = false
@@ -2573,6 +2574,24 @@ class NativeStreamClient(
         setControllerMouseAssistActive(enabled)
     }
 
+    fun setControllerMouseEmulationActive(enabled: Boolean) {
+        if (controllerMouseEmulationActive == enabled) return
+        if (!enabled) {
+            // Release any held left-click so mouse state stays clean.
+            if (controllerMouseLeftButtonDown) {
+                controllerMouseLeftButtonDown = false
+                sendMouseButton(button = 1, pressed = false, source = "controller mouse emulation")
+            }
+            // Explicitly zero left-stick memory so the game doesn't receive stale deflection.
+            lastLeftStickX = 0
+            lastLeftStickY = 0
+        }
+        controllerMouseEmulationActive = enabled
+        // Push a fresh gamepad state immediately so the zeroed stick is sent before any next frame.
+        sendCurrentGamepadState()
+        NativeInputDiagnostics.add("controller mouse emulation ${if (enabled) "enabled" else "disabled"}")
+    }
+
     fun start(session: SessionInfo, settings: StreamSettings) {
         if (released) return
         this.session = session
@@ -2676,6 +2695,7 @@ class NativeStreamClient(
         lastRightStickY = 0
         controllerMouseAssistActive = false
         controllerMouseAssistAutoArmed = false
+        controllerMouseEmulationActive = false
         controllerMouseMoveLogged = false
         controllerMouseLeftButtonDown = false
         controllerMouseRightButtonDown = false
@@ -3966,12 +3986,20 @@ class NativeStreamClient(
         physicalHatButtons = if (axes.hatUsedAsLeftStick) 0 else event.hatDpadButtons()
         lastLeftTrigger = normalizeToUint8(lt)
         lastRightTrigger = normalizeToUint8(rt)
-        lastLeftStickX = normalizeToInt16(leftX)
-        lastLeftStickY = normalizeToInt16(-leftY)
+        // When left-stick mouse emulation is active, keep lastLeftStick{X,Y} = 0 so the game
+        // receives no stick deflection. The actual motion is forwarded as mouse delta instead.
+        if (controllerMouseEmulationActive) {
+            lastLeftStickX = 0
+            lastLeftStickY = 0
+        } else {
+            lastLeftStickX = normalizeToInt16(leftX)
+            lastLeftStickY = normalizeToInt16(-leftY)
+        }
         lastRightStickX = normalizeToInt16(rightX)
         lastRightStickY = normalizeToInt16(-rightY)
+        val emulationMouseSent = if (controllerMouseEmulationActive) sendControllerMouseMove(leftX, leftY) else false
         val mouseSent = sendControllerMouseMove(rightX, rightY)
-        return sendCurrentGamepadState(controllerId = controllerId) || mouseSent
+        return sendCurrentGamepadState(controllerId = controllerId) || mouseSent || emulationMouseSent
     }
 
     private fun dispatchGamepadKey(event: KeyEvent): Boolean {
@@ -3989,6 +4017,9 @@ class NativeStreamClient(
             }
             physicalControllerConnected = true
             physicalControllerActive = true
+            if (handleControllerMouseEmulationButton(mask, pressed)) {
+                return true
+            }
             if (handleControllerMouseButton(mask, pressed)) {
                 return true
             }
@@ -4053,20 +4084,28 @@ class NativeStreamClient(
     }
 
     private fun sendControllerMouseMove(stickX: Float, stickY: Float): Boolean {
-        if (!controllerMouseAssistActive) return false
+        if (!controllerMouseAssistActive && !controllerMouseEmulationActive) return false
         val delta = AndroidControllerMouseAssist.mouseDelta(stickX, stickY) ?: return false
         val sent = sendTouchMouseMove(delta.dx, delta.dy)
         if (sent && !controllerMouseMoveLogged) {
             controllerMouseMoveLogged = true
-            NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} auto=$controllerMouseAssistAutoArmed")
+            NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} auto=$controllerMouseAssistAutoArmed emulation=$controllerMouseEmulationActive")
         }
         return sent
     }
 
     private fun handleControllerMouseButton(buttonMask: Int, pressed: Boolean): Boolean {
-        if (!controllerMouseAssistActive) return false
+        if (!controllerMouseAssistActive && !controllerMouseEmulationActive) return false
         val mouseButton = AndroidControllerMouseAssist.mouseButtonForGamepad(buttonMask) ?: return false
         setControllerMouseButton(mouseButton, pressed)
+        return true
+    }
+
+    /** When emulation mode is on, intercept Gamepad A as a left mouse click (button 1). */
+    private fun handleControllerMouseEmulationButton(buttonMask: Int, pressed: Boolean): Boolean {
+        if (!controllerMouseEmulationActive) return false
+        if (buttonMask != GamepadButtonMapping.A) return false
+        setControllerMouseButton(1, pressed)
         return true
     }
 

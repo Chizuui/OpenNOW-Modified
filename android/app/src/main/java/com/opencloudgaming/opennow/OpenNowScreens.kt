@@ -5514,6 +5514,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     var statsVisible by remember(state.settings.showStatsOnLaunch) { mutableStateOf(state.settings.showStatsOnLaunch) }
     var streamStats by remember { mutableStateOf(StreamRuntimeStats()) }
     var controllerMouseAssistEnabled by remember(session?.sessionId) { mutableStateOf(false) }
+    var controllerMouseEmulationEnabled by remember(session?.sessionId) { mutableStateOf(false) }
     val streamReady = session?.isReadyForStream() == true
     val tvProfile = state.androidTvProfile
     val physicalControllerConnected = rememberPhysicalControllerConnected(enabled = streamReady)
@@ -5965,6 +5966,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     tvProfile = tvProfile,
                     touchControlsVisible = touchControlsVisible,
                     controllerMouseAssistEnabled = controllerMouseAssistEnabled,
+                    controllerMouseEmulationEnabled = controllerMouseEmulationEnabled,
                     showSessionTimer = state.settings.sessionCounterEnabled,
                     sessionTimerLimit = smartSessionLimit,
                     sessionStartedAtMs = sessionStartedAtMs,
@@ -6008,6 +6010,11 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     },
                     onControllerMouseAssistToggle = {
                         client.setControllerMouseAssistEnabled(!controllerMouseAssistEnabled)
+                    },
+                    onControllerMouseEmulationToggle = {
+                        val newState = !controllerMouseEmulationEnabled
+                        controllerMouseEmulationEnabled = newState
+                        client.setControllerMouseEmulationActive(newState)
                     },
                     onExit = {
                         controlsOpen = false
@@ -7112,6 +7119,7 @@ private fun StreamControlsPanel(
     tvProfile: Boolean,
     touchControlsVisible: Boolean,
     controllerMouseAssistEnabled: Boolean,
+    controllerMouseEmulationEnabled: Boolean,
     showSessionTimer: Boolean,
     sessionTimerLimit: SmartSessionLimit,
     sessionStartedAtMs: Long,
@@ -7132,6 +7140,7 @@ private fun StreamControlsPanel(
     onBackspace: () -> Unit,
     onSteamMenuOpen: () -> Unit,
     onControllerMouseAssistToggle: () -> Unit,
+    onControllerMouseEmulationToggle: () -> Unit,
     onExit: () -> Unit,
     onTouchControlsToggle: () -> Unit,
     onMousePadToggle: () -> Unit,
@@ -7365,6 +7374,14 @@ private fun StreamControlsPanel(
                         ) {
                             onButtonTone()
                             onControllerMouseAssistToggle()
+                        }
+                        StreamControlSwitch(
+                            "Mouse mode (Left stick)",
+                            if (controllerMouseEmulationEnabled) "L stick moves · A clicks" else "Off",
+                            controllerMouseEmulationEnabled,
+                        ) {
+                            onButtonTone()
+                            onControllerMouseEmulationToggle()
                         }
                     } else {
                         StreamControlSwitch("Finger mouse", if (settings.androidTouch.mousePad) "On" else "Off", settings.androidTouch.mousePad) {
