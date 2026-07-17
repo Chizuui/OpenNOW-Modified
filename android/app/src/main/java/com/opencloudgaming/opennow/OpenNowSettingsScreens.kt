@@ -645,7 +645,9 @@ private fun SettingsContent(
                     label = "Mouse mode (Left stick)",
                     checked = settings.controllerMouseEmulation,
                     description = "Toggle in Stream Controls per session. Left stick moves the cursor, A button clicks, B button right-clicks.",
-                ) { enabled -> viewModel.updateSettings(settings.copy(controllerMouseEmulation = enabled)) }
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(controllerMouseEmulation = enabled))
+                }
                 SettingSwitch("Touch controls", settings.androidTouch.enabled) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(enabled = enabled))) }
                 val touchStyleOptions = listOf(
                     SettingsChoiceOption(TouchControllerStyle.V1.name, "V1 (Solid)"),
