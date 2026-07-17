@@ -5628,6 +5628,9 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             onControllerMouseAssistChanged = {
                 controllerMouseAssistEnabled = it
             },
+            onStreamStopped = {
+                viewModel.stopStream()
+            },
         )
     }
 
@@ -9580,6 +9583,17 @@ private fun PortraitTouchControls(
         }
 
         TouchControlGroup(
+            id = "portrait-guide",
+            layoutEditing = layoutEditing,
+            offsetX = getLocalOffset("guide").x.dp,
+            offsetY = getLocalOffset("guide").y.dp,
+            onOffsetChange = { x, y -> onLocalOffsetChange("guide", x, y) },
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = buttonSize48 + 8.dp, end = buttonSize44 * 2 + 16.dp),
+        ) {
+            GamepadButton("Steam Overlay", 0x0400, client, opacity, buttonSize44, onButtonTone, iconRes = R.drawable.ic_store_steam)
+        }
+
+        TouchControlGroup(
             id = "portrait-start",
             layoutEditing = layoutEditing,
             offsetX = getLocalOffset("start").x.dp,
@@ -9699,9 +9713,20 @@ private fun BoxScope.LandscapeTouchControls(
             offsetX = getLocalOffset("select").x.dp,
             offsetY = getLocalOffset("select").y.dp,
             onOffsetChange = { x, y -> onLocalOffsetChange("select", x, y) },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(end = selectSize / 2 + 27.dp),
+            modifier = Modifier.align(Alignment.BottomCenter).padding(end = selectSize / 2 + 54.dp),
         ) {
             GamepadButton("◀", 0x0020, client, opacity, selectSize, onButtonTone)
+        }
+
+        TouchControlGroup(
+            id = "landscape-guide",
+            layoutEditing = layoutEditing,
+            offsetX = getLocalOffset("guide").x.dp,
+            offsetY = getLocalOffset("guide").y.dp,
+            onOffsetChange = { x, y -> onLocalOffsetChange("guide", x, y) },
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            GamepadButton("Steam Overlay", 0x0400, client, opacity, selectSize, onButtonTone, iconRes = R.drawable.ic_store_steam)
         }
 
         TouchControlGroup(
@@ -9710,7 +9735,7 @@ private fun BoxScope.LandscapeTouchControls(
             offsetX = getLocalOffset("start").x.dp,
             offsetY = getLocalOffset("start").y.dp,
             onOffsetChange = { x, y -> onLocalOffsetChange("start", x, y) },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(start = selectSize / 2 + 27.dp),
+            modifier = Modifier.align(Alignment.BottomCenter).padding(start = selectSize / 2 + 54.dp),
         ) {
             GamepadButton("▶", 0x0010, client, opacity, selectSize, onButtonTone)
         }
@@ -10407,6 +10432,7 @@ private fun GamepadButton(
     opacity: Float,
     size: androidx.compose.ui.unit.Dp,
     onPressTone: () -> Unit = {},
+    iconRes: Int? = null,
 ) {
     val currentOnPressTone by rememberUpdatedState(onPressTone)
     var pressed by remember { mutableStateOf(false) }
@@ -10449,11 +10475,20 @@ private fun GamepadButton(
             },
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = label,
-            fontWeight = FontWeight.SemiBold,
-            color = Color.White.copy(alpha = opacity * 0.9f),
-        )
+        if (iconRes != null) {
+            androidx.compose.material3.Icon(
+                painter = painterResource(iconRes),
+                contentDescription = label,
+                modifier = Modifier.size(size * 0.55f),
+                tint = Color.White.copy(alpha = opacity * 0.9f),
+            )
+        } else {
+            Text(
+                text = label,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White.copy(alpha = opacity * 0.9f),
+            )
+        }
     }
     DisposableEffect(client, mask) {
         onDispose {
