@@ -2615,7 +2615,7 @@ class NativeStreamClient(
         controllerMouseLoopJob = scope.launch {
             val currentJob = coroutineContext[Job]
             while (currentJob?.isActive == true) {
-                // Poll/send mouse updates at 60Hz (approx 16ms delay)
+                // Poll/send mouse updates at 60Hz (approx 16ms delay; physical caches are cleared on disconnect/reset)
                 delay(16L)
                 if (controllerMouseEmulationActive) {
                     sendControllerMouseMove(physicalLeftStickX, physicalLeftStickY)
