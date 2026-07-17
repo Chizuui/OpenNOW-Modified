@@ -7358,13 +7358,13 @@ private fun StreamControlsPanel(
                     if (settings.stream.streamSharpeningEnabled) {
                         CompactSlider("Sharpness amount", settings.stream.streamSharpeningAmount, 0f, 1f, onSharpeningAmountChange)
                     }
-                    StreamControlSwitch("Stretch to fill", if (settings.stretchStreamToFill) "On" else "Off", settings.stretchStreamToFill) {
-                        onButtonTone()
-                        onStretchToFillToggle()
-                    }
-                    StreamControlSwitch("Stretch to zoom", if (settings.stretchStreamToZoom) "On" else "Off", settings.stretchStreamToZoom) {
+                    StreamControlSwitch("Stretch to fill", if (settings.stretchStreamToZoom) "On" else "Off", settings.stretchStreamToZoom) {
                         onButtonTone()
                         onStretchToZoomToggle()
+                    }
+                    StreamControlSwitch("Stretch to zoom", if (settings.stretchStreamToFill) "On" else "Off", settings.stretchStreamToFill) {
+                        onButtonTone()
+                        onStretchToFillToggle()
                     }
                 }
             }
