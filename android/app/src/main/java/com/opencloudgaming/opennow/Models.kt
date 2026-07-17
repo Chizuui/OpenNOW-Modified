@@ -220,6 +220,12 @@ data class AndroidTouchSettings(
 
     fun withResetOffsets(): AndroidTouchSettings {
         return this.copy(
+            opacity = 0.82f,
+            scale = 1f,
+            buttonScale = 1f,
+            stickScale = 1f,
+            edgePaddingDp = 14f,
+            bottomPaddingDp = 10f,
             leftOffsetXDp = 0f,
             leftOffsetYDp = 0f,
             rightOffsetXDp = 0f,
