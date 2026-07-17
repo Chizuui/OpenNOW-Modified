@@ -993,7 +993,7 @@ object NativeStreamInputRouter {
         keyCode == KeyEvent.KEYCODE_MENU && !controllerInputDevice
 
     fun shouldHandleStreamExitKey(keyCode: Int, controllerInputDevice: Boolean, hardwareKeyboardSource: Boolean): Boolean =
-        keyCode == KeyEvent.KEYCODE_BACK ||
+        (keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice) ||
             (keyCode == KeyEvent.KEYCODE_ESCAPE && !hardwareKeyboardSource)
 
     private fun KeyEvent.isControllerInputDevice(): Boolean =
@@ -2594,11 +2594,8 @@ class NativeStreamClient(
     fun setControllerMouseEmulationActive(enabled: Boolean) {
         if (controllerMouseEmulationActive == enabled) return
         if (!enabled) {
-            // Release any held left-click so mouse state stays clean.
-            if (controllerMouseLeftButtonDown) {
-                controllerMouseLeftButtonDown = false
-                sendMouseButton(button = 1, pressed = false, source = "controller mouse emulation")
-            }
+            // Release any held mouse buttons so state stays clean.
+            releaseControllerMouseButtons()
             // Zero both physical and virtual left-stick memory so neither controller path
             // delivers stale deflection to the game after mode is disabled.
             lastLeftStickX = 0
@@ -2742,6 +2739,10 @@ class NativeStreamClient(
         lastLeftStickY = 0
         lastRightStickX = 0
         lastRightStickY = 0
+        physicalLeftStickX = 0f
+        physicalLeftStickY = 0f
+        physicalRightStickX = 0f
+        physicalRightStickY = 0f
         controllerMouseAssistActive = false
         controllerMouseAssistAutoArmed = false
         controllerMouseEmulationActive = false
@@ -3227,9 +3228,6 @@ class NativeStreamClient(
                 recordStreamDiagnostic("signaling disconnected ${event.reason}")
                 val reason = event.reason
                 val isSessionTerminated = reason.contains("code=1000", ignoreCase = true) ||
-                        reason.contains("code=1001", ignoreCase = true) ||
-                        reason.contains("http=503", ignoreCase = true) ||
-                        reason.contains("Service Unavailable", ignoreCase = true) ||
                         reason.contains("http=410", ignoreCase = true) ||
                         reason.contains("http=404", ignoreCase = true) ||
                         reason.contains("Not Found", ignoreCase = true)
@@ -3244,9 +3242,7 @@ class NativeStreamClient(
             is SignalingEvent.Error -> {
                 recordStreamDiagnostic("signaling error ${event.message}")
                 val message = event.message
-                val isSessionTerminated = message.contains("http=503", ignoreCase = true) ||
-                        message.contains("Service Unavailable", ignoreCase = true) ||
-                        message.contains("http=410", ignoreCase = true) ||
+                val isSessionTerminated = message.contains("http=410", ignoreCase = true) ||
                         message.contains("http=404", ignoreCase = true) ||
                         message.contains("Not Found", ignoreCase = true)
                 if (isSessionTerminated) {
@@ -4351,6 +4347,10 @@ class NativeStreamClient(
             lastLeftStickY = 0
             lastRightStickX = 0
             lastRightStickY = 0
+            physicalLeftStickX = 0f
+            physicalLeftStickY = 0f
+            physicalRightStickX = 0f
+            physicalRightStickY = 0f
             sendCurrentGamepadState()
         }
         updateHapticsAdvertisement(force = connectionChanged)

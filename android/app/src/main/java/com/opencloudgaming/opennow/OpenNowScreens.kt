@@ -5549,7 +5549,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     var statsVisible by remember(state.settings.showStatsOnLaunch) { mutableStateOf(state.settings.showStatsOnLaunch) }
     var streamStats by remember { mutableStateOf(StreamRuntimeStats()) }
     var controllerMouseAssistEnabled by remember(session?.sessionId) { mutableStateOf(false) }
-    var controllerMouseEmulationEnabled by remember(session?.sessionId) { mutableStateOf(false) }
+    var controllerMouseEmulationEnabled by remember(session?.sessionId) { mutableStateOf(state.settings.controllerMouseEmulation) }
     val streamReady = session?.isReadyForStream() == true
     val tvProfile = state.androidTvProfile
     val physicalControllerConnected = rememberPhysicalControllerConnected(enabled = streamReady)
@@ -5801,6 +5801,11 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     LaunchedEffect(session?.sessionId, session?.status, streamReady) {
         if (session != null && streamReady) {
             client.start(session, launchStreamSettings)
+        }
+    }
+    LaunchedEffect(client, controllerMouseEmulationEnabled, streamReady) {
+        if (streamReady) {
+            client.setControllerMouseEmulationActive(controllerMouseEmulationEnabled)
         }
     }
     LaunchedEffect(
