@@ -2397,6 +2397,11 @@ class NativeStreamClient(
     private var phoneRumbleFallbackEnabled = true
     private var phoneRumbleSupportLogged = false
     private var released = false
+    private var controllerMouseLoopJob: Job? = null
+    private var physicalLeftStickX = 0f
+    private var physicalLeftStickY = 0f
+    private var physicalRightStickX = 0f
+    private var physicalRightStickY = 0f
 
     private data class RumbleEffectProfile(
         val weakAmplitude: Int,
@@ -2608,6 +2613,31 @@ class NativeStreamClient(
         NativeInputDiagnostics.add("controller mouse emulation ${if (enabled) "enabled" else "disabled"}")
     }
 
+    private fun startControllerMouseLoop() {
+        controllerMouseLoopJob?.cancel()
+        controllerMouseLoopJob = scope.launch {
+            while (controllerMouseLoopJob?.isActive == true) {
+                // Poll/send mouse updates at 60Hz (approx 16ms delay)
+                delay(16L)
+                if (controllerMouseEmulationActive) {
+                    sendControllerMouseMove(physicalLeftStickX, physicalLeftStickY)
+                }
+                if (controllerMouseAssistActive) {
+                    sendControllerMouseMove(physicalRightStickX, physicalRightStickY)
+                }
+            }
+        }
+    }
+
+    private fun stopControllerMouseLoop() {
+        controllerMouseLoopJob?.cancel()
+        controllerMouseLoopJob = null
+        physicalLeftStickX = 0f
+        physicalLeftStickY = 0f
+        physicalRightStickX = 0f
+        physicalRightStickY = 0f
+    }
+
     fun start(session: SessionInfo, settings: StreamSettings) {
         if (released) return
         this.session = session
@@ -2627,9 +2657,11 @@ class NativeStreamClient(
             "start session=${streamDiagnosticId(session.sessionId)} status=${session.status} server=${session.serverIp.take(96)} signaling=${signalingUrlForDiagnostics(session.signalingUrl, session.sessionId)} settings=${settings.resolution}/${settings.fps}/${settings.codec} bitrate=${settings.maxBitrateMbps}",
         )
         startTransport(session, settings, transportGeneration)
+        startControllerMouseLoop()
     }
 
     fun stop() {
+        stopControllerMouseLoop()
         transportGeneration += 1
         reconnectAttempts = 0
         sessionRecoveryRequested = false
@@ -4039,9 +4071,11 @@ class NativeStreamClient(
         }
         lastRightStickX = normalizeToInt16(rightX)
         lastRightStickY = normalizeToInt16(-rightY)
-        val emulationMouseSent = if (controllerMouseEmulationActive) sendControllerMouseMove(leftX, leftY) else false
-        val mouseSent = sendControllerMouseMove(rightX, rightY)
-        return sendCurrentGamepadState(controllerId = controllerId) || mouseSent || emulationMouseSent
+        physicalLeftStickX = leftX
+        physicalLeftStickY = leftY
+        physicalRightStickX = rightX
+        physicalRightStickY = rightY
+        return sendCurrentGamepadState(controllerId = controllerId)
     }
 
     private fun dispatchGamepadKey(event: KeyEvent): Boolean {

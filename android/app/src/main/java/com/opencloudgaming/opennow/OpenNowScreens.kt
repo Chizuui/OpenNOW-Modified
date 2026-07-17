@@ -7442,7 +7442,7 @@ private fun StreamControlsPanel(
                     // gamepad and touch controller.
                     StreamControlSwitch(
                         "Mouse mode (Left stick)",
-                        if (controllerMouseEmulationEnabled) "L stick moves · A clicks" else "Off",
+                        if (controllerMouseEmulationEnabled) "L stick moves · A clicks · B right-clicks" else "Off",
                         controllerMouseEmulationEnabled,
                     ) {
                         onButtonTone()
