@@ -7746,9 +7746,9 @@ private fun CompactSlider(label: String, value: Float, min: Float, max: Float, o
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(if (focused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
             .border(
-                width = 1.dp,
+                width = if (focused) 2.dp else 1.dp,
                 color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
                 shape = RoundedCornerShape(12.dp)
             )
@@ -7786,9 +7786,9 @@ private fun CompactDpSlider(label: String, value: Float, min: Float, max: Float,
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(if (focused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
             .border(
-                width = 1.dp,
+                width = if (focused) 2.dp else 1.dp,
                 color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
                 shape = RoundedCornerShape(12.dp)
             )
