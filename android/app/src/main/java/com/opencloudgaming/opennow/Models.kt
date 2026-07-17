@@ -1376,7 +1376,18 @@ internal fun StreamSettings.adjustedForDevice(report: RuntimeCodecReport?): Stre
 
     val capability = report?.capabilities?.firstOrNull { it.codec == codec }
     val codecSupported = capability?.streamingDecoderUsableForLaunch() ?: true
-    val effectiveCodec = if (codecSupported) codec else report.bestStreamingFallbackCodec()
+    
+    val isUltrawide = aspectRatio != "16:9" && aspectRatio != "16:10"
+    val shouldFallbackFromAv1ToH265 = codec == VideoCodec.AV1 && isUltrawide &&
+            report?.capabilities?.firstOrNull { it.codec == VideoCodec.H265 }?.streamingDecoderUsableForLaunch() == true
+
+    val effectiveCodec = if (shouldFallbackFromAv1ToH265) {
+        VideoCodec.H265
+    } else if (codecSupported) {
+        codec
+    } else {
+        report.bestStreamingFallbackCodec()
+    }
 
     val profileBitrateCap = when {
         !codecSupported -> 35
@@ -1420,7 +1431,10 @@ internal fun StreamSettings.androidSafeVideoFallback(): StreamSettings =
         hdrEnabled = false,
         enableCloudGsync = false,
         streamSharpeningEnabled = false,
+        aspectRatio = "16:9",
+        resolution = normalizeStreamResolutionForAspect(resolution, "16:9"),
     ).cappedResolution(SAFE_VIDEO_FALLBACK_MAX_WIDTH, SAFE_VIDEO_FALLBACK_MAX_HEIGHT, strict = false)
+
 
 private fun StreamSettings.androidWebRtcColorQuality(): ColorQuality {
     val compatible = withCodecColorCompatibility()

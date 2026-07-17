@@ -141,6 +141,17 @@ class StreamResolutionTest {
     }
 
     @Test
+    fun androidSafeVideoFallbackForcesSixteenByNineAspectAndResolution() {
+        val settings = StreamSettings(resolution = "1680x720", aspectRatio = "21:9", codec = VideoCodec.AV1)
+        val fallback = settings.androidSafeVideoFallback()
+        
+        assertEquals(VideoCodec.H264, fallback.codec)
+        assertEquals("16:9", fallback.aspectRatio)
+        assertEquals("1280x720", fallback.resolution)
+    }
+
+
+    @Test
     fun persistedUnsupportedAspectFallsBackToSupportedSixteenByNineMode() {
         val adjusted = StreamSettings(resolution = "1600x720", aspectRatio = "20:9")
             .withResolutionAllowed(SubscriptionInfo(membershipTier = "FREE"), null)

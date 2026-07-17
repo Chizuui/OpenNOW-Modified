@@ -41,6 +41,47 @@ class StreamSettingsDeviceAdjustmentTest {
     }
 
     @Test
+    fun fallsBackFromAv1ToH265OnUltrawideWhenH265Supported() {
+        val report = RuntimeCodecReport(
+            capabilities = listOf(
+                CodecCapability(
+                    codec = VideoCodec.AV1,
+                    decoderAvailable = true,
+                    encoderAvailable = true,
+                    hardwareDecoder = true,
+                    hardwareEncoder = true,
+                    nativeDecoderAvailable = true,
+                    webRtcDecoderAvailable = true,
+                    webRtcHardwareDecoderAvailable = true,
+                ),
+                CodecCapability(
+                    codec = VideoCodec.H265,
+                    decoderAvailable = true,
+                    encoderAvailable = true,
+                    hardwareDecoder = true,
+                    hardwareEncoder = true,
+                    nativeDecoderAvailable = true,
+                    webRtcDecoderAvailable = true,
+                    webRtcHardwareDecoderAvailable = true,
+                )
+            ),
+            nativeRuntimeSummary = "",
+            androidTvProfile = false,
+            lowPowerGpuProfile = false
+        )
+
+        val settings = StreamSettings(
+            resolution = "1680x720",
+            aspectRatio = "21:9",
+            codec = VideoCodec.AV1
+        )
+
+        val adjusted = settings.adjustedForDevice(report)
+        assertEquals(VideoCodec.H265, adjusted.codec)
+    }
+
+
+    @Test
     fun av1DropsChroma444BeforeLaunch() {
         val adjusted = StreamSettings(codec = VideoCodec.AV1, colorQuality = ColorQuality.EightBit444)
             .adjustedForDevice(
