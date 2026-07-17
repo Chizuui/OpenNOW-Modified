@@ -1530,8 +1530,9 @@ internal object GamepadButtonMapping {
 }
 
 internal object SteamMenuChord {
-    fun buttons(aPressed: Boolean): Int =
-        GamepadButtonMapping.GUIDE or if (aPressed) GamepadButtonMapping.A else 0
+    // Send only the Guide (Home) button. The GUIDE+A chord previously used caused unintended
+    // A-button input during gameplay; a plain Guide press is sufficient to open Steam overlay.
+    fun buttons(aPressed: Boolean): Int = GamepadButtonMapping.GUIDE
 }
 
 internal class SteamOverlayChordState {

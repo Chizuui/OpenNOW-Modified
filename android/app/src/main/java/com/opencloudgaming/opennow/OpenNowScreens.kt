@@ -7372,7 +7372,7 @@ private fun StreamControlsPanel(
                 StreamPanelSection("Input") {
                     StreamControlAction(
                         label = "Steam Menu",
-                        value = "Send Home + A to the streamed PC",
+                        value = "Send Home to the streamed PC",
                         action = "Open",
                     ) {
                         onButtonTone()
