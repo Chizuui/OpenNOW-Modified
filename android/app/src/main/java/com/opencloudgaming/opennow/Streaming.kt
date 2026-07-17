@@ -2271,6 +2271,7 @@ class NativeStreamClient(
     private val onFirstVideoFrameRendered: () -> Unit = {},
     private val onStats: (StreamRuntimeStats) -> Unit = {},
     private val onControllerMouseAssistChanged: (Boolean) -> Unit = {},
+    private val onStreamStopped: () -> Unit = {},
 ) {
     private val appContext = context.applicationContext
     private val eglBase: EglBase = EglBase.create()
@@ -3129,11 +3130,37 @@ class NativeStreamClient(
             }
             is SignalingEvent.Disconnected -> {
                 recordStreamDiagnostic("signaling disconnected ${event.reason}")
-                scheduleTransportReconnect("Signaling disconnected: ${event.reason}", SIGNALING_RECONNECT_DELAY_MS, generation)
+                val reason = event.reason
+                val isSessionTerminated = reason.contains("code=1000", ignoreCase = true) ||
+                        reason.contains("code=1001", ignoreCase = true) ||
+                        reason.contains("http=503", ignoreCase = true) ||
+                        reason.contains("Service Unavailable", ignoreCase = true) ||
+                        reason.contains("http=410", ignoreCase = true) ||
+                        reason.contains("http=404", ignoreCase = true) ||
+                        reason.contains("Not Found", ignoreCase = true)
+                if (isSessionTerminated) {
+                    recordStreamDiagnostic("Signaling disconnected normally. Stopping stream.")
+                    stop()
+                    scope.launch { onStreamStopped() }
+                } else {
+                    scheduleTransportReconnect("Signaling disconnected: ${event.reason}", SIGNALING_RECONNECT_DELAY_MS, generation)
+                }
             }
             is SignalingEvent.Error -> {
                 recordStreamDiagnostic("signaling error ${event.message}")
-                scheduleTransportReconnect("Signaling failed: ${event.message}", SIGNALING_RECONNECT_DELAY_MS, generation)
+                val message = event.message
+                val isSessionTerminated = message.contains("http=503", ignoreCase = true) ||
+                        message.contains("Service Unavailable", ignoreCase = true) ||
+                        message.contains("http=410", ignoreCase = true) ||
+                        message.contains("http=404", ignoreCase = true) ||
+                        message.contains("Not Found", ignoreCase = true)
+                if (isSessionTerminated) {
+                    recordStreamDiagnostic("Signaling error indicates session terminated. Stopping stream.")
+                    stop()
+                    scope.launch { onStreamStopped() }
+                } else {
+                    scheduleTransportReconnect("Signaling failed: ${event.message}", SIGNALING_RECONNECT_DELAY_MS, generation)
+                }
             }
             is SignalingEvent.Log -> recordStreamDiagnostic(event.message)
             is SignalingEvent.RemoteIce -> {

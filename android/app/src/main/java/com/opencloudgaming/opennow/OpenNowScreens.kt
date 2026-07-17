@@ -5628,6 +5628,9 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             onControllerMouseAssistChanged = {
                 controllerMouseAssistEnabled = it
             },
+            onStreamStopped = {
+                viewModel.stopStream()
+            },
         )
     }
 
