@@ -246,7 +246,7 @@ class GstreamerStreamClient(
                 val parts = data.split("|", limit = 2)
                 val mlineIndex = parts.getOrNull(0)?.toIntOrNull() ?: 0
                 val candidateSdp = parts.getOrNull(1) ?: return
-                val iceCandidate = IceCandidate(/* sdpMid */ "0", mlineIndex, candidateSdp)
+                val iceCandidate = IceCandidate(/* sdpMid */ mlineIndex.toString(), mlineIndex, candidateSdp)
                 NativeInputDiagnostics.add("GstreamerStreamClient sending local ICE candidate")
                 scope.launch { signaling?.sendIceCandidate(iceCandidate) }
             }
