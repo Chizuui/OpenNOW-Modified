@@ -131,4 +131,6 @@
     <string name="accent_lime">Lime</string>
     <string name="accent_coral">Coral</string>
     <string name="accent_violet">Violet</string>
+    <string name="settings_native_streamer">Native Streamer (GStreamer)</string>
+    <string name="settings_native_streamer_desc">Experimental: uses a GStreamer WebRTC pipeline instead of the standard WebRTC backend. Requires GStreamer libraries on the device. May be less stable.</string>
 </resources>

@@ -181,6 +181,8 @@ data class StreamSettings(
     val streamSharpeningAmount: Float = 0.25f,
     val microphoneMode: MicrophoneMode = MicrophoneMode.Disabled,
     val microphoneDeviceId: String = "",
+    // When true, uses the experimental GStreamer native pipeline instead of WebRTC.
+    val nativeStreamerEnabled: Boolean = false,
 )
 
 @Serializable
