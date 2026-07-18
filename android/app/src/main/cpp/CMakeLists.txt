@@ -85,6 +85,7 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
             pcre2-8
             intl
             iconv
+            orc-0.4
         )
             set(_lib_path "${_GST_LIB_DIR}/lib${_lib}.a")
             if(EXISTS "${_lib_path}")
@@ -126,4 +127,5 @@ target_link_libraries(
     ${android-lib}
     ${log-lib}
     ${mediandk-lib}
+    z
 )
