@@ -196,6 +196,20 @@ static void on_pad_added(GstElement * /*src*/, GstPad *pad, gpointer /*user_data
     gst_object_unref(sink_pad);
 }
 
+// Called by GstBin when a new element is dynamically added (deep within the bin structure).
+// We use this to configure the dynamic rtpjitterbuffer for low latency on GStreamer versions
+// that do not expose the "latency" property directly on webrtcbin (like GStreamer 1.18.5).
+static void on_deep_element_added(GstBin * /*bin*/, GstBin * /*sub_bin*/, GstElement *element, gpointer /*user_data*/) {
+    const gchar *name = GST_ELEMENT_NAME(element);
+    if (name && g_str_has_prefix(name, "rtpjitterbuffer")) {
+        LOGI("on_deep_element_added: detected rtpjitterbuffer '%s', setting latency to 2ms and drop-on-latency=true", name);
+        g_object_set(element,
+                     "latency", (guint) 2,
+                     "drop-on-latency", TRUE,
+                     nullptr);
+    }
+}
+
 // ─── JNI methods ─────────────────────────────────────────────────────────────
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -278,8 +292,8 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     }
 
     // ── Low-latency pipeline configuration ───────────────────────────────────
-    // 1. webrtcbin: 2ms jitter buffer — minimal buffering for real-time decode.
-    g_object_set(webrtcbin, "latency", (guint) 2, nullptr);
+    // 1. Listen to deep-element-added to configure the dynamic rtpjitterbuffer latency.
+    g_signal_connect(pipeline, "deep-element-added", G_CALLBACK(on_deep_element_added), nullptr);
     LOGI("gstCreatePipeline: webrtcbin latency set to 2ms");
 
     // 2. Video queue: leaky downstream with max 1 buffer — drops stale frames.
