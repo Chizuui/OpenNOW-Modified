@@ -68,6 +68,8 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
             gstreamer-1.0
             gstwebrtc-1.0
             gstsdp-1.0
+            gstrtp-1.0
+            gsttag-1.0
             gstapp-1.0
             gstbase-1.0
             gstaudio-1.0
@@ -80,6 +82,9 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
             gio-2.0
             ffi
             nice
+            pcre2-8
+            intl
+            iconv
         )
             set(_lib_path "${_GST_LIB_DIR}/lib${_lib}.a")
             if(EXISTS "${_lib_path}")
