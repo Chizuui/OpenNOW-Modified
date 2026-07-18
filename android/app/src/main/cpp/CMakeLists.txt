@@ -66,16 +66,22 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
         set(_GST_LIBS "")
         foreach(_lib
             gstreamer-1.0
-            gstwebrtc-1.0
-            gstsdp-1.0
+            gstbase-1.0
+            gstvideo-1.0
+            gstaudio-1.0
+            gstpbutils-1.0
             gstrtp-1.0
+            gstsdp-1.0
+            gstwebrtc-1.0
             gsttag-1.0
             gstapp-1.0
-            gstbase-1.0
-            gstaudio-1.0
-            gstvideo-1.0
-            gstpbutils-1.0
             gstnet-1.0
+            gstgl-1.0
+            gstcodecparsers-1.0
+            gstcontroller-1.0
+            gstsctp-1.0
+            gstwebrtcnice-1.0
+            gstphotography-1.0
             glib-2.0
             gobject-2.0
             gmodule-2.0
@@ -86,6 +92,30 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
             intl
             iconv
             orc-0.4
+            ssl
+            crypto
+            srtp2
+            png16
+            jpeg
+            graphene-1.0
+            z
+            gstcoreelements
+            gstplayback
+            gstvideoconvertscale
+            gstopengl
+            gstaudioconvert
+            gstaudioresample
+            gstopensles
+            gstwebrtc
+            gstnice
+            gstdtls
+            gstsrtp
+            gstrtp
+            gstrtpmanager
+            gsttypefindfunctions
+            gstvideoparsersbad
+            gstandroidmedia
+            gstsctp
         )
             set(_lib_path "${_GST_LIB_DIR}/lib${_lib}.a")
             if(EXISTS "${_lib_path}")

@@ -75,6 +75,48 @@ Java_com_opencloudgaming_opennow_NativeCodecProbe_nativeDecoderAvailable(JNIEnv 
 #include <gst/sdp/gstsdpmessage.h>
 #include <android/native_window_jni.h>
 
+// Declare the GStreamer static plugins with C linkage to prevent name mangling
+extern "C" {
+    GST_PLUGIN_STATIC_DECLARE(coreelements);
+    GST_PLUGIN_STATIC_DECLARE(webrtc);
+    GST_PLUGIN_STATIC_DECLARE(playback);
+    GST_PLUGIN_STATIC_DECLARE(videoconvertscale);
+    GST_PLUGIN_STATIC_DECLARE(opengl);
+    GST_PLUGIN_STATIC_DECLARE(audioconvert);
+    GST_PLUGIN_STATIC_DECLARE(audioresample);
+    GST_PLUGIN_STATIC_DECLARE(opensles);
+    GST_PLUGIN_STATIC_DECLARE(nice);
+    GST_PLUGIN_STATIC_DECLARE(dtls);
+    GST_PLUGIN_STATIC_DECLARE(srtp);
+    GST_PLUGIN_STATIC_DECLARE(rtp);
+    GST_PLUGIN_STATIC_DECLARE(rtpmanager);
+    GST_PLUGIN_STATIC_DECLARE(typefindfunctions);
+    GST_PLUGIN_STATIC_DECLARE(videoparsersbad);
+    GST_PLUGIN_STATIC_DECLARE(androidmedia);
+    GST_PLUGIN_STATIC_DECLARE(sctp);
+}
+
+// This function is automatically called by gst_init() to register static plugins
+extern "C" void gst_init_static_plugins(void) {
+    GST_PLUGIN_STATIC_REGISTER(coreelements);
+    GST_PLUGIN_STATIC_REGISTER(webrtc);
+    GST_PLUGIN_STATIC_REGISTER(playback);
+    GST_PLUGIN_STATIC_REGISTER(videoconvertscale);
+    GST_PLUGIN_STATIC_REGISTER(opengl);
+    GST_PLUGIN_STATIC_REGISTER(audioconvert);
+    GST_PLUGIN_STATIC_REGISTER(audioresample);
+    GST_PLUGIN_STATIC_REGISTER(opensles);
+    GST_PLUGIN_STATIC_REGISTER(nice);
+    GST_PLUGIN_STATIC_REGISTER(dtls);
+    GST_PLUGIN_STATIC_REGISTER(srtp);
+    GST_PLUGIN_STATIC_REGISTER(rtp);
+    GST_PLUGIN_STATIC_REGISTER(rtpmanager);
+    GST_PLUGIN_STATIC_REGISTER(typefindfunctions);
+    GST_PLUGIN_STATIC_REGISTER(videoparsersbad);
+    GST_PLUGIN_STATIC_REGISTER(androidmedia);
+    GST_PLUGIN_STATIC_REGISTER(sctp);
+}
+
 #include <atomic>
 #include <mutex>
 #include <thread>
