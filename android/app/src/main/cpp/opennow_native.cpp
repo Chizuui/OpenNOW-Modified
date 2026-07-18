@@ -335,7 +335,10 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
 
     GstElement *pipeline = gst_parse_launch(pipeline_desc, &error);
     if (!pipeline || error) {
-        LOGE("gstCreatePipeline: parse error: %s", error ? error->message : "unknown");
+        std::string err_msg = "gst_parse_launch failed: ";
+        err_msg += error ? error->message : "unknown error";
+        LOGE("gstCreatePipeline: %s", err_msg.c_str());
+        post_event("error", err_msg.c_str());
         if (error) g_error_free(error);
         if (pipeline) gst_object_unref(pipeline);
         return JNI_FALSE;
@@ -347,7 +350,11 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     GstElement *audiosink  = gst_bin_get_by_name(GST_BIN(pipeline), "asink");
 
     if (!webrtcbin || !videosink) {
-        LOGE("gstCreatePipeline: could not find named elements in pipeline");
+        std::string missing = "missing elements:";
+        if (!webrtcbin) missing += " webrtcbin";
+        if (!videosink) missing += " glimagesink";
+        LOGE("gstCreatePipeline: %s", missing.c_str());
+        post_event("error", missing.c_str());
         if (webrtcbin)  gst_object_unref(webrtcbin);
         if (videosink)  gst_object_unref(videosink);
         if (videoqueue) gst_object_unref(videoqueue);
