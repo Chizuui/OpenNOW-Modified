@@ -326,6 +326,46 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetSurface(
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstAddIceServer(
+        JNIEnv *env, jobject /*thiz*/, jstring jurl, jstring jusername, jstring jcredential) {
+    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    if (!g_ctx.webrtcbin) return;
+
+    const char *url = env->GetStringUTFChars(jurl, nullptr);
+    const char *username = jusername ? env->GetStringUTFChars(jusername, nullptr) : nullptr;
+    const char *credential = jcredential ? env->GetStringUTFChars(jcredential, nullptr) : nullptr;
+
+    LOGI("gstAddIceServer: url=%s", url);
+
+    if (g_str_has_prefix(url, "stun:")) {
+        std::string stun_uri = url;
+        if (stun_uri.find("stun://") == std::string::npos) {
+            stun_uri.replace(0, 5, "stun://");
+        }
+        g_object_set(g_ctx.webrtcbin, "stun-server", stun_uri.c_str(), nullptr);
+        LOGI("gstAddIceServer: set stun-server to %s", stun_uri.c_str());
+    } else if (g_str_has_prefix(url, "turn:")) {
+        std::string turn_uri = url;
+        if (turn_uri.find("turn://") == std::string::npos) {
+            turn_uri.replace(0, 5, "turn://");
+        }
+        if (username && credential) {
+            size_t pos = turn_uri.find("turn://");
+            if (pos != std::string::npos) {
+                turn_uri.insert(pos + 7, std::string(username) + ":" + std::string(credential) + "@");
+            }
+        }
+        gboolean added = FALSE;
+        g_signal_emit_by_name(g_ctx.webrtcbin, "add-turn-server", turn_uri.c_str(), &added);
+        LOGI("gstAddIceServer: add-turn-server %s added=%d", turn_uri.c_str(), added);
+    }
+
+    env->ReleaseStringUTFChars(jurl, url);
+    if (username) env->ReleaseStringUTFChars(jusername, username);
+    if (credential) env->ReleaseStringUTFChars(jcredential, credential);
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
         JNIEnv *env, jobject /*thiz*/, jobject surface) {

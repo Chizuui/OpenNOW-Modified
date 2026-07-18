@@ -68,6 +68,9 @@ class NativeStreamerBridge(
     /** Attaches or updates the rendering Surface after the pipeline is created. Safe to call at any time. */
     external fun gstSetSurface(surface: Surface?)
 
+    /** Registers a STUN or TURN server on webrtcbin to enable ICE connectivity across NAT. */
+    external fun gstAddIceServer(url: String, username: String?, credential: String?)
+
     /** Stops the pipeline and releases all GStreamer resources. */
     external fun gstDestroyPipeline()
 

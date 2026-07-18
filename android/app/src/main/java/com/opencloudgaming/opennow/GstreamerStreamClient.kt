@@ -166,6 +166,14 @@ class GstreamerStreamClient(
         // If surface was already attached before pipeline was ready, set it now.
         renderSurface?.let { bridge.gstSetSurface(it) }
 
+        // Populate ICE servers to GStreamer before connecting signaling
+        session.iceServers.forEach { server ->
+            server.urls.forEach { url ->
+                Log.d(TAG, "Configuring GStreamer ICE server: url=$url")
+                bridge.gstAddIceServer(url, server.username, server.credential)
+            }
+        }
+
         if (generation != transportGeneration) return
 
         emitState("Connecting signaling")
