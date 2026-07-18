@@ -180,6 +180,30 @@ static void on_ice_candidate(GstElement * /*webrtc*/, guint mline_index, gchar *
     post_event("ice-candidate", data.c_str());
 }
 
+struct SetLocalDescriptionContext {
+    gchar *sdp_str;
+    GstWebRTCSessionDescription *answer;
+};
+
+// Called when set-local-description promise completes.
+static void on_local_description_set(GstPromise *promise, gpointer user_data) {
+    auto *ctx = static_cast<SetLocalDescriptionContext *>(user_data);
+    const GstStructure *reply = gst_promise_get_reply(promise);
+
+    if (reply && gst_structure_has_field(reply, "error")) {
+        LOGE("GStreamer failed to set-local-description");
+        post_event("error", "set-local-description-failed");
+    } else {
+        LOGI("GStreamer set-local-description success — sending SDP answer");
+        post_event("sdp-answer", ctx->sdp_str);
+    }
+
+    g_free(ctx->sdp_str);
+    gst_webrtc_session_description_free(ctx->answer);
+    delete ctx;
+    gst_promise_unref(promise);
+}
+
 // Called when webrtcbin is ready to negotiate and has created a local offer/answer.
 static void on_answer_created(GstPromise *promise, gpointer /*user_data*/) {
     const GstStructure *reply = gst_promise_get_reply(promise);
@@ -196,16 +220,9 @@ static void on_answer_created(GstPromise *promise, gpointer /*user_data*/) {
     gchar *sdp_str = gst_sdp_message_as_text(answer->sdp);
     LOGI("GStreamer answer SDP created");
 
-    // Set local description first.
-    GstPromise *set_promise = gst_promise_new();
+    auto *ctx = new SetLocalDescriptionContext{sdp_str, answer};
+    GstPromise *set_promise = gst_promise_new_with_change_func(on_local_description_set, ctx, nullptr);
     g_signal_emit_by_name(g_ctx.webrtcbin, "set-local-description", answer, set_promise);
-    gst_promise_interrupt(set_promise);
-    gst_promise_unref(set_promise);
-
-    // Forward the SDP answer text to Kotlin so it can be sent via signaling.
-    post_event("sdp-answer", sdp_str);
-    g_free(sdp_str);
-    gst_webrtc_session_description_free(answer);
 }
 
 // Called when negotiation is needed (we only log here as we handle answer creation on demand).
