@@ -793,6 +793,48 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun loginWithChizui() {
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    error = null,
+                    launchPhase = "Opening ChizuiLogin...",
+                    deviceLoginPrompt = null,
+                )
+            }
+            runCatching {
+                val serverUrl = state.value.settings.chizuiLoginUrl
+                authRepository.loginWithChizui(serverUrl)
+            }
+                .onSuccess { session ->
+                    _state.update {
+                        it.copy(
+                            authSession = session,
+                            selectedProvider = session.provider,
+                            savedAccounts = authStore.state.value.sessions.map { saved -> saved.toSavedAccount() },
+                            launchPhase = "",
+                            deviceLoginPrompt = null,
+                            error = null,
+                            page = defaultLaunchAppPage(),
+                        )
+                    }
+                    OpenNowAnalytics.capture(
+                        event = "user_logged_in_chizui",
+                        properties = mapOf(
+                            "provider" to session.provider.code,
+                            "membership_tier" to session.user.membershipTier,
+                        ),
+                    )
+                    refreshAfterAuth(session)
+                }
+                .onFailure { error ->
+                    if (error is CancellationException) return@onFailure
+                    _state.update { it.copy(error = error.message ?: "ChizuiLogin failed", launchPhase = "", deviceLoginPrompt = null) }
+                }
+        }
+    }
+
     fun loginWithCode(provider: LoginProvider = state.value.selectedProvider) {
         if (!provider.supportsDeviceCodeLogin) {
             login(provider)

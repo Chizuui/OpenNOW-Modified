@@ -303,6 +303,7 @@ data class AppSettings(
     val analyticsOptOut: Boolean = true,
     val analyticsConsentAsked: Boolean = false,
     val allowEscapeToExitFullscreen: Boolean = false,
+    val chizuiLoginUrl: String = "https://gfn.chizui.dev",
 )
 
 internal const val MIN_GAME_CARD_SCALE = 0.75f
@@ -781,6 +782,8 @@ data class AuthSession(
     val provider: LoginProvider,
     val tokens: AuthTokens,
     val user: AuthUser,
+    val chizuiServerUrl: String? = null,
+    val chizuiJwtToken: String? = null,
 )
 
 data class DeviceLoginPrompt(
