@@ -182,6 +182,8 @@ class GstreamerStreamClient(
         runCatching { bridge.gstDestroyPipeline() }
     }
 
+    private var lastOfferSdp: String? = null
+
     private fun handleSignaling(event: SignalingEvent) {
         when (event) {
             SignalingEvent.Connected -> {
@@ -208,6 +210,7 @@ class GstreamerStreamClient(
             is SignalingEvent.Offer -> {
                 NativeInputDiagnostics.add("GstreamerStreamClient received SDP offer (${event.sdp.length} chars)")
                 emitState("Streaming (GStreamer)")
+                lastOfferSdp = event.sdp
                 bridge.gstSetRemoteOffer(event.sdp)
             }
             is SignalingEvent.RemoteIce -> {
@@ -228,7 +231,15 @@ class GstreamerStreamClient(
             "sdp-answer" -> {
                 // Forward the GStreamer-generated answer back to the signaling server.
                 NativeInputDiagnostics.add("GstreamerStreamClient sending SDP answer via signaling")
-                scope.launch { signaling?.sendAnswer(data, nvstSdp = null) }
+                val offer = lastOfferSdp
+                if (offer != null) {
+                    val nvst = runCatching {
+                        SdpTools.buildNvstSdp(offerSdp = offer, settings = settings, localAnswer = data)
+                    }.getOrNull()
+                    scope.launch { signaling?.sendAnswer(data, nvstSdp = nvst) }
+                } else {
+                    scope.launch { signaling?.sendAnswer(data, nvstSdp = null) }
+                }
             }
             "ice-candidate" -> {
                 // data = "mlineIndex|candidateString"
