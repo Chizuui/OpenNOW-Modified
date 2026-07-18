@@ -31,6 +31,9 @@ class NativeStreamerBridge(
             false
         }
 
+        /** Returns true if the native .so loaded successfully at class init time. */
+        fun isLibraryLoaded(): Boolean = libraryLoaded
+
         /** Returns true if the native library was loaded and GStreamer was compiled in. */
         fun isGStreamerAvailable(): Boolean {
             if (!libraryLoaded) return false

@@ -123,18 +123,40 @@ class GstreamerStreamClient(
         settings: StreamSettings,
         generation: Int,
     ) {
-        if (!NativeStreamerBridge.isGStreamerAvailable()) {
+        val libLoaded = NativeStreamerBridge.isLibraryLoaded()
+        NativeInputDiagnostics.add("GstreamerStreamClient step libLoaded=$libLoaded")
+        if (!libLoaded) {
+            emitError("GStreamer native library failed to load (opennow_native.so missing or corrupt).")
+            return
+        }
+
+        val gstAvailable = NativeStreamerBridge.isGStreamerAvailable()
+        NativeInputDiagnostics.add("GstreamerStreamClient step gstAvailable=$gstAvailable")
+        if (!gstAvailable) {
             emitError("GStreamer is not available in this build (GSTREAMER_ROOT_ANDROID was not set at compile time).")
             return
         }
 
         emitState("Initialising GStreamer pipeline")
-        val pipelineOk = runCatching {
-            bridge.initAndCreatePipeline()
-        }.getOrElse { ex ->
-            Log.e(TAG, "initAndCreatePipeline threw: ${ex.message}")
+        NativeInputDiagnostics.add("GstreamerStreamClient step calling gstNativeInit")
+        val initOk = runCatching { bridge.gstNativeInit() }.getOrElse { ex ->
+            Log.e(TAG, "gstNativeInit threw: ${ex.message}")
+            NativeInputDiagnostics.add("GstreamerStreamClient step gstNativeInit threw: ${ex.message}")
             false
         }
+        NativeInputDiagnostics.add("GstreamerStreamClient step gstNativeInit=$initOk")
+        if (!initOk) {
+            emitError("GStreamer init failed (gstNativeInit returned false).")
+            return
+        }
+
+        NativeInputDiagnostics.add("GstreamerStreamClient step calling gstCreatePipeline")
+        val pipelineOk = runCatching { bridge.gstCreatePipeline(null) }.getOrElse { ex ->
+            Log.e(TAG, "gstCreatePipeline threw: ${ex.message}")
+            NativeInputDiagnostics.add("GstreamerStreamClient step gstCreatePipeline threw: ${ex.message}")
+            false
+        }
+        NativeInputDiagnostics.add("GstreamerStreamClient step gstCreatePipeline=$pipelineOk")
 
         if (!pipelineOk) {
             emitError("Failed to create GStreamer pipeline. Check that GStreamer libs are present.")
