@@ -204,11 +204,9 @@ static void on_answer_created(GstPromise *promise, gpointer /*user_data*/) {
     gst_webrtc_session_description_free(answer);
 }
 
-// Called after the remote offer is applied; triggers answer creation.
+// Called when negotiation is needed (we only log here as we handle answer creation on demand).
 static void on_negotiation_needed(GstElement *webrtcbin, gpointer /*user_data*/) {
-    LOGI("GStreamer negotiation needed — creating answer");
-    GstPromise *promise = gst_promise_new_with_change_func(on_answer_created, nullptr, nullptr);
-    g_signal_emit_by_name(webrtcbin, "create-answer", nullptr, promise);
+    LOGI("GStreamer negotiation needed (ignored as we are the answerer)");
 }
 
 // Called when a new decoded video/audio pad is added by webrtcbin.
@@ -470,8 +468,12 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetRemoteOffer(
                 LOGE("gstSetRemoteOffer: set-remote-description failed");
                 post_event("error", "set-remote-description-failed");
             } else {
-                LOGI("gstSetRemoteOffer: remote description set — negotiation will proceed");
+                LOGI("gstSetRemoteOffer: remote description set — creating answer now");
                 post_event("status", "remote-offer-set");
+
+                // Trigger answer creation now that the remote offer has been applied.
+                GstPromise *answer_promise = gst_promise_new_with_change_func(on_answer_created, nullptr, nullptr);
+                g_signal_emit_by_name(g_ctx.webrtcbin, "create-answer", nullptr, answer_promise);
             }
         },
         nullptr, nullptr);
