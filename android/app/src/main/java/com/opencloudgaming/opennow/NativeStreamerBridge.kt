@@ -62,6 +62,9 @@ class NativeStreamerBridge(
      */
     external fun gstAddRemoteIce(candidate: String, sdpMid: String?, sdpMLineIndex: Int)
 
+    /** Attaches or updates the rendering Surface after the pipeline is created. Safe to call at any time. */
+    external fun gstSetSurface(surface: Surface?)
+
     /** Stops the pipeline and releases all GStreamer resources. */
     external fun gstDestroyPipeline()
 
@@ -75,7 +78,14 @@ class NativeStreamerBridge(
      *
      * @return true on success; false if GStreamer is unavailable or a step failed.
      */
-    fun initAndCreatePipeline(surface: Surface?): Boolean {
+    /**
+     * Convenience: initialise the library and create the pipeline.
+     * Surface is NOT required here — call [gstSetSurface] separately once the
+     * SurfaceHolder is available (the pipeline can start without a surface).
+     *
+     * @return true on success; false if GStreamer is unavailable or a step failed.
+     */
+    fun initAndCreatePipeline(): Boolean {
         if (!libraryLoaded) {
             Log.e(TAG, "initAndCreatePipeline: native library not loaded")
             return false
@@ -88,7 +98,7 @@ class NativeStreamerBridge(
             Log.e(TAG, "initAndCreatePipeline: gstNativeInit failed")
             return false
         }
-        val created = gstCreatePipeline(surface)
+        val created = gstCreatePipeline(null)
         if (!created) {
             Log.e(TAG, "initAndCreatePipeline: gstCreatePipeline failed")
         }

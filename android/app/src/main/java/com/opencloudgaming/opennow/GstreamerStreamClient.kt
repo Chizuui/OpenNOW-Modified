@@ -64,6 +64,10 @@ class GstreamerStreamClient(
     fun attachSurface(surface: Surface?) {
         renderSurface = surface
         Log.d(TAG, "attachSurface: ${if (surface != null) "attached" else "detached"}")
+        // Forward to native immediately if pipeline is already up.
+        if (!released) {
+            runCatching { bridge.gstSetSurface(surface) }
+        }
     }
 
     /**
@@ -126,7 +130,7 @@ class GstreamerStreamClient(
 
         emitState("Initialising GStreamer pipeline")
         val pipelineOk = runCatching {
-            bridge.initAndCreatePipeline(renderSurface)
+            bridge.initAndCreatePipeline()
         }.getOrElse { ex ->
             Log.e(TAG, "initAndCreatePipeline threw: ${ex.message}")
             false
@@ -136,6 +140,9 @@ class GstreamerStreamClient(
             emitError("Failed to create GStreamer pipeline. Check that GStreamer libs are present.")
             return
         }
+
+        // If surface was already attached before pipeline was ready, set it now.
+        renderSurface?.let { bridge.gstSetSurface(it) }
 
         if (generation != transportGeneration) return
 

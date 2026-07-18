@@ -282,21 +282,44 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstNativeInit(
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetSurface(
+        JNIEnv *env, jobject /*thiz*/, jobject surface) {
+    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+
+    ANativeWindow *new_window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    LOGI("gstSetSurface: window=%p (previous=%p)", new_window, g_ctx.native_window);
+
+    if (g_ctx.native_window) {
+        ANativeWindow_release(g_ctx.native_window);
+    }
+    g_ctx.native_window = new_window;
+
+    // If the pipeline is already up, update glimagesink immediately.
+    if (g_ctx.videosink) {
+        if (new_window) {
+            g_object_set(g_ctx.videosink, "window-handle", (guintptr) new_window, nullptr);
+            LOGI("gstSetSurface: updated glimagesink window-handle");
+        } else {
+            g_object_set(g_ctx.videosink, "window-handle", (guintptr) 0, nullptr);
+            LOGI("gstSetSurface: cleared glimagesink window-handle");
+        }
+    }
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
         JNIEnv *env, jobject /*thiz*/, jobject surface) {
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
 
-    // Retrieve the native window from the Java Surface object.
+    // Surface is optional at pipeline creation time — it can be attached later
+    // via gstSetSurface() when the SurfaceHolder becomes available.
     ANativeWindow *window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
-    if (!window) {
-        LOGE("gstCreatePipeline: invalid Surface — no ANativeWindow");
-        return JNI_FALSE;
-    }
     if (g_ctx.native_window) {
         ANativeWindow_release(g_ctx.native_window);
     }
     g_ctx.native_window = window;
+    LOGI("gstCreatePipeline: surface=%p native_window=%p", surface ? (void*)1 : nullptr, window);
 
     // Build a low-latency WebRTC receive pipeline:
     //   webrtcbin → named video queue → decodebin → videoconvert → glimagesink
@@ -363,8 +386,13 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     }
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Bind the rendering window to glimagesink.
-    g_object_set(videosink, "window-handle", (guintptr) window, nullptr);
+    // Bind the rendering window to glimagesink (may be 0/null if surface not yet available).
+    if (window) {
+        g_object_set(videosink, "window-handle", (guintptr) window, nullptr);
+        LOGI("gstCreatePipeline: bound ANativeWindow to glimagesink");
+    } else {
+        LOGI("gstCreatePipeline: no surface yet — will be set via gstSetSurface()");
+    }
 
     // Wire up WebRTC signal handlers.
     g_signal_connect(webrtcbin, "on-ice-candidate",      G_CALLBACK(on_ice_candidate),      nullptr);
@@ -515,6 +543,10 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstIsAvailable(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstNativeInit(
         JNIEnv * /*env*/, jobject /*thiz*/) { return JNI_FALSE; }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetSurface(
+        JNIEnv * /*env*/, jobject /*thiz*/, jobject /*surface*/) {}
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
