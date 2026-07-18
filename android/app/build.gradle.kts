@@ -55,7 +55,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.opencloudgaming.opennow"
+        applicationId = "com.opencloudgaming.opennow.chizui"
         minSdk = 23
         targetSdk = 36
         versionCode = 44
@@ -70,6 +70,18 @@ android {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
+        val gstRoot = firstNonBlankValue(
+            gradlePropertyValue("gstreamer.dir", "gstreamer.sdk"),
+            environmentValue("GSTREAMER_ROOT_ANDROID"),
+            localPropertyValue("gstreamer.dir", "gstreamer.sdk")
+        )
+        if (gstRoot.isNotEmpty()) {
+            externalNativeBuild {
+                cmake {
+                    arguments("-DGSTREAMER_ROOT_ANDROID=$gstRoot")
+                }
+            }
+        }
     }
 
     buildTypes {
