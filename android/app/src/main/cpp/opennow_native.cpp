@@ -170,6 +170,10 @@ static void post_event(const char *tag, const char *data) {
 
 // Called by webrtcbin when a local ICE candidate is gathered.
 static void on_ice_candidate(GstElement * /*webrtc*/, guint mline_index, gchar *candidate, gpointer /*user_data*/) {
+    if (!candidate || strlen(candidate) == 0) {
+        LOGI("GStreamer ICE gathering complete (null/empty candidate)");
+        return;
+    }
     LOGI("GStreamer ICE candidate mline=%u cand=%s", mline_index, candidate);
     // Encode as "mlineIndex|candidate" so Kotlin can split and forward to signaling.
     std::string data = std::to_string(mline_index) + "|" + candidate;
