@@ -55,7 +55,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.opencloudgaming.opennow.chizui"
+        applicationId = "com.opencloudgaming.opennow"
         minSdk = 23
         targetSdk = 36
         versionCode = 44

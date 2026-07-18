@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">OpenNOW Chizui</string>
+    <string name="app_name">OpenNOW</string>
     <string name="status_starting_opennow">Starting OpenNOW</string>
     <string name="login_with_provider">Sign in with %1$s</string>
     <string name="login_tv_start">Sign in on another device with %1$s</string>
