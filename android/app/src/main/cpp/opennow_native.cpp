@@ -331,7 +331,7 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
         "webrtcbin name=webrtc bundle-policy=max-bundle "
         "  webrtc. ! queue name=vqueue ! decodebin name=dbin "
         "  dbin. ! videoconvert ! glimagesink name=vsink "
-        "  dbin. ! audioconvert ! audioresample ! openslesink name=asink";
+        "  dbin. ! audioconvert ! audioresample ! openslessink name=asink";
 
     GstElement *pipeline = gst_parse_launch(pipeline_desc, &error);
     if (!pipeline || error) {
