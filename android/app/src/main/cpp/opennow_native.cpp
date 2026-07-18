@@ -85,6 +85,7 @@ struct GstPipelineContext {
     GstElement  *pipeline    = nullptr;
     GstElement  *webrtcbin   = nullptr;
     GstElement  *videosink   = nullptr;
+    GstElement  *videoqueue  = nullptr; // low-latency video queue
     GMainLoop   *loop        = nullptr;
     std::thread  loop_thread;
     std::atomic<bool> running{false};
@@ -241,17 +242,17 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     }
     g_ctx.native_window = window;
 
-    // Build a minimal WebRTC receive pipeline:
-    //   webrtcbin → (dynamic pads) → decodebin → videoconvert → glimagesink
-    // Audio is handled by webrtcbin's autoaudiosink branch.
+    // Build a low-latency WebRTC receive pipeline:
+    //   webrtcbin → named video queue → decodebin → videoconvert → glimagesink
+    //   webrtcbin → audioconvert → audioresample → autoaudiosink
+    //
+    // The queue is named "vqueue" so we can apply low-latency properties after creation.
     GError *error = nullptr;
-    // Use "autoaudiosink" so GStreamer picks the right audio output for Android.
-    // Video is rendered via "glimagesink" which can accept an ANativeWindow.
     const gchar *pipeline_desc =
         "webrtcbin name=webrtc bundle-policy=max-bundle "
-        "  webrtc. ! queue ! decodebin name=dbin "
+        "  webrtc. ! queue name=vqueue ! decodebin name=dbin "
         "  dbin. ! videoconvert ! glimagesink name=vsink "
-        "  dbin. ! audioconvert ! audioresample ! autoaudiosink";
+        "  dbin. ! audioconvert ! audioresample ! autoaudiosink name=asink";
 
     GstElement *pipeline = gst_parse_launch(pipeline_desc, &error);
     if (!pipeline || error) {
@@ -263,12 +264,48 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
 
     GstElement *webrtcbin = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
     GstElement *videosink = gst_bin_get_by_name(GST_BIN(pipeline), "vsink");
+    GstElement *videoqueue = gst_bin_get_by_name(GST_BIN(pipeline), "vqueue");
+    GstElement *audiosink  = gst_bin_get_by_name(GST_BIN(pipeline), "asink");
 
     if (!webrtcbin || !videosink) {
         LOGE("gstCreatePipeline: could not find named elements in pipeline");
+        if (webrtcbin)  gst_object_unref(webrtcbin);
+        if (videosink)  gst_object_unref(videosink);
+        if (videoqueue) gst_object_unref(videoqueue);
+        if (audiosink)  gst_object_unref(audiosink);
         gst_object_unref(pipeline);
         return JNI_FALSE;
     }
+
+    // ── Low-latency pipeline configuration ───────────────────────────────────
+    // 1. webrtcbin: 2ms jitter buffer — minimal buffering for real-time decode.
+    g_object_set(webrtcbin, "latency", (guint) 2, nullptr);
+    LOGI("gstCreatePipeline: webrtcbin latency set to 2ms");
+
+    // 2. Video queue: leaky downstream with max 1 buffer — drops stale frames.
+    if (videoqueue) {
+        g_object_set(videoqueue,
+                     "max-size-buffers", (guint) 1,
+                     "max-size-bytes",   (guint) 0,
+                     "max-size-time",    (guint64) 0,
+                     "leaky",            (gint) 2, // GST_QUEUE_LEAK_DOWNSTREAM
+                     nullptr);
+        LOGI("gstCreatePipeline: video queue configured for low latency");
+    }
+
+    // 3. Video sink: disable presentation sync so frames are displayed immediately.
+    g_object_set(videosink,
+                 "sync",        FALSE,
+                 "async",       FALSE,
+                 "qos",         FALSE,
+                 nullptr);
+    LOGI("gstCreatePipeline: glimagesink configured sync=false");
+
+    // 4. Audio sink: also disable sync to prevent audio holding up the pipeline.
+    if (audiosink) {
+        g_object_set(audiosink, "sync", FALSE, nullptr);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Bind the rendering window to glimagesink.
     g_object_set(videosink, "window-handle", (guintptr) window, nullptr);
@@ -282,6 +319,9 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     g_ctx.pipeline  = pipeline;
     g_ctx.webrtcbin = webrtcbin;
     g_ctx.videosink = videosink;
+    g_ctx.videoqueue = videoqueue;
+    // audiosink is not stored; it is owned by the pipeline (unref our query ref).
+    if (audiosink) gst_object_unref(audiosink);
 
     // Start the GLib main loop on a dedicated thread.
     g_ctx.loop = g_main_loop_new(nullptr, FALSE);
@@ -373,9 +413,10 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstDestroyPipeline(
     if (g_ctx.pipeline) {
         gst_element_set_state(g_ctx.pipeline, GST_STATE_NULL);
         gst_object_unref(g_ctx.pipeline);
-        g_ctx.pipeline  = nullptr;
-        g_ctx.webrtcbin = nullptr;
-        g_ctx.videosink = nullptr;
+        g_ctx.pipeline   = nullptr;
+        g_ctx.webrtcbin  = nullptr;
+        g_ctx.videosink  = nullptr;
+        g_ctx.videoqueue = nullptr;
     }
 
     if (g_ctx.loop) {

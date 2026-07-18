@@ -14,6 +14,8 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PointerIcon
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
@@ -5763,17 +5765,46 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 viewModel.recoverStreamSession(it)
             },
             onFirstVideoFrameRendered = {
-                markInitialVideoFrameRendered()
+                if (!launchStreamSettings.nativeStreamerEnabled) markInitialVideoFrameRendered()
             },
             onStats = {
-                streamStats = it
-                viewModel.updateStreamRuntimeStats(it)
+                if (!launchStreamSettings.nativeStreamerEnabled) {
+                    streamStats = it
+                    viewModel.updateStreamRuntimeStats(it)
+                }
             },
             onControllerMouseAssistChanged = {
                 controllerMouseAssistEnabled = it
             },
             onStreamStopped = {
-                viewModel.stopStream()
+                if (!launchStreamSettings.nativeStreamerEnabled) viewModel.stopStream()
+            },
+        )
+    }
+
+    // GStreamer native streaming client — only started when nativeStreamerEnabled is true.
+    // It manages its own signaling and video rendering independently.
+    val gstClient = remember {
+        GstreamerStreamClient(
+            context = context.applicationContext,
+            onState = {
+                if (launchStreamSettings.nativeStreamerEnabled) {
+                    streamState = it
+                    viewModel.recordNativeStreamState(it)
+                    if (it == "Streaming (GStreamer)") viewModel.markStreamConnected()
+                }
+            },
+            onError = {
+                if (launchStreamSettings.nativeStreamerEnabled) {
+                    streamState = it
+                    viewModel.markStreamError(it)
+                }
+            },
+            onFirstVideoFrameRendered = {
+                if (launchStreamSettings.nativeStreamerEnabled) markInitialVideoFrameRendered()
+            },
+            onStreamStopped = {
+                if (launchStreamSettings.nativeStreamerEnabled) viewModel.stopStream()
             },
         )
     }
@@ -5794,6 +5825,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             NativeStreamInputRouter.setStreamUiActive(false)
             NativeStreamInputRouter.detach(client)
             client.release()
+            gstClient.release()
         }
     }
     DisposableEffect(audioController) {
@@ -5908,7 +5940,13 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     }
     LaunchedEffect(session?.sessionId, session?.status, streamReady) {
         if (session != null && streamReady) {
-            client.start(session, launchStreamSettings)
+            if (launchStreamSettings.nativeStreamerEnabled) {
+                // GStreamer mode: GstreamerStreamClient drives the stream.
+                // NativeStreamClient is NOT started to avoid conflicting signaling.
+                gstClient.start(session, launchStreamSettings)
+            } else {
+                client.start(session, launchStreamSettings)
+            }
         }
     }
     LaunchedEffect(client, controllerMouseEmulationEnabled, streamReady) {
@@ -5961,6 +5999,8 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
         } else {
             StreamVideoSurface(
                 client = client,
+                gstClient = gstClient,
+                nativeStreamerEnabled = launchStreamSettings.nativeStreamerEnabled,
                 settings = streamSettings,
                 decodedResolution = streamStats.resolution,
                 serverNegotiatedResolution = session.negotiatedStreamProfile?.resolution,
@@ -6436,6 +6476,8 @@ private fun formatSessionWarningThreshold(thresholdSeconds: Int): String {
 @Composable
 private fun StreamVideoSurface(
     client: NativeStreamClient,
+    gstClient: GstreamerStreamClient,
+    nativeStreamerEnabled: Boolean,
     settings: StreamSettings,
     decodedResolution: String?,
     serverNegotiatedResolution: String?,
@@ -6565,45 +6607,72 @@ private fun StreamVideoSurface(
         ) {
             // AndroidView resizes the SurfaceView in place. Re-keying it as the viewport
             // settles creates overlapping renderer surfaces during stream startup.
-            key(settings.streamSharpeningEnabled) {
+            if (nativeStreamerEnabled) {
+                // GStreamer mode: render into a plain SurfaceView whose Surface is fed to GStreamer.
                 AndroidView(
                     modifier = rendererModifier,
                     factory = { ctx ->
-                        client.createRenderer(ctx, settings, stretchToFill).apply {
+                        SurfaceView(ctx).apply {
                             isFocusable = false
                             isFocusableInTouchMode = false
-                            hideAndroidPointerTree()
-                            scaleX = stretchScaleX
-                            scaleY = stretchScaleY
+                            holder.addCallback(object : SurfaceHolder.Callback {
+                                override fun surfaceCreated(h: SurfaceHolder) {
+                                    gstClient.attachSurface(h.surface)
+                                }
+                                override fun surfaceChanged(h: SurfaceHolder, format: Int, w: Int, h2: Int) {}
+                                override fun surfaceDestroyed(h: SurfaceHolder) {
+                                    gstClient.attachSurface(null)
+                                }
+                            })
                         }
                     },
-                    update = { renderer ->
-                        client.updateRendererSettings(settings, stretchToFill)
-                        renderer.scaleX = stretchScaleX
-                        renderer.scaleY = stretchScaleY
-                        renderer.isFocusable = false
-                        renderer.isFocusableInTouchMode = false
-                        pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
-                            client.dispatchMotion(event)
-                        }
-                        if (hideExternalMousePointer) {
-                            pointerRootView.hideAndroidPointerTree()
-                            renderer.hideAndroidPointerTree()
-                        } else {
-                            pointerRootView.showAndroidPointerTree()
-                            renderer.showAndroidPointerTree()
-                        }
-                        renderer.setOnKeyListener(null)
-                        renderer.setOnGenericMotionListener { _, event ->
-                            if (hideExternalMousePointer) pointerRootView.hideAndroidPointerTree()
-                            client.dispatchMotion(event)
-                        }
-                        renderer.setOnTouchListener { view, event ->
+                    update = { sv ->
+                        sv.setOnTouchListener { view, event ->
                             NativeStreamInputRouter.dispatchTouch(event, view.width, view.height)
                         }
                     },
-                    onRelease = client::releaseRenderer,
                 )
+            } else {
+                key(settings.streamSharpeningEnabled) {
+                    AndroidView(
+                        modifier = rendererModifier,
+                        factory = { ctx ->
+                            client.createRenderer(ctx, settings, stretchToFill).apply {
+                                isFocusable = false
+                                isFocusableInTouchMode = false
+                                hideAndroidPointerTree()
+                                scaleX = stretchScaleX
+                                scaleY = stretchScaleY
+                            }
+                        },
+                        update = { renderer ->
+                            client.updateRendererSettings(settings, stretchToFill)
+                            renderer.scaleX = stretchScaleX
+                            renderer.scaleY = stretchScaleY
+                            renderer.isFocusable = false
+                            renderer.isFocusableInTouchMode = false
+                            pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
+                                client.dispatchMotion(event)
+                            }
+                            if (hideExternalMousePointer) {
+                                pointerRootView.hideAndroidPointerTree()
+                                renderer.hideAndroidPointerTree()
+                            } else {
+                                pointerRootView.showAndroidPointerTree()
+                                renderer.showAndroidPointerTree()
+                            }
+                            renderer.setOnKeyListener(null)
+                            renderer.setOnGenericMotionListener { _, event ->
+                                if (hideExternalMousePointer) pointerRootView.hideAndroidPointerTree()
+                                client.dispatchMotion(event)
+                            }
+                            renderer.setOnTouchListener { view, event ->
+                                NativeStreamInputRouter.dispatchTouch(event, view.width, view.height)
+                            }
+                        },
+                        onRelease = client::releaseRenderer,
+                    )
+                }
             }
         }
         FingerMouseInputLayer(
