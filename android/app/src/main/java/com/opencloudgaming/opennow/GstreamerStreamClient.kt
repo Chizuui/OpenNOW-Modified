@@ -9,6 +9,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.freedesktop.gstreamer.GStreamer
 import org.webrtc.IceCandidate
 
 /**
@@ -138,6 +139,42 @@ class GstreamerStreamClient(
         }
 
         emitState("Initialising GStreamer pipeline")
+
+        // Initialise GStreamer's Android JNI bootstrap. This calls nativeInit(context) in
+        // gstandroid.c.o which registers the JavaVM pointer and application Context with
+        // GStreamer core. The androidmedia plugin (hardware MediaCodec decoders) depends on
+        // this registration happening before gst_init() is called.
+        NativeInputDiagnostics.add("GstreamerStreamClient step calling GStreamer.init")
+        val gstInitOk = runCatching {
+            GStreamer.init(appContext)
+            true
+        }.getOrElse { ex ->
+            Log.e(TAG, "GStreamer.init threw: ${ex.message}")
+            NativeInputDiagnostics.add("GstreamerStreamClient step GStreamer.init threw: ${ex.message}")
+            false
+        }
+        NativeInputDiagnostics.add("GstreamerStreamClient step GStreamer.init=$gstInitOk")
+        if (!gstInitOk) {
+            // GStreamer.init() failed — the JNI method nativeInit() was not registered by
+            // gstandroid.c.o's JNI_OnLoad (class not found at load time). Fall back to
+            // direct C++ injection: gstSetAndroidContext calls Java_org_freedesktop_gstreamer_GStreamer_nativeInit
+            // directly, which sets _context and _class_loader in gstandroid.c.o so that
+            // the androidmedia (hardware MediaCodec) plugin can enumerate codecs.
+            NativeInputDiagnostics.add("GstreamerStreamClient step calling gstSetAndroidContext fallback")
+            val ctxOk = runCatching {
+                bridge.gstSetAndroidContext(appContext)
+                true
+            }.getOrElse { ex ->
+                NativeInputDiagnostics.add("GstreamerStreamClient step gstSetAndroidContext threw: ${ex.message}")
+                false
+            }
+            NativeInputDiagnostics.add("GstreamerStreamClient step gstSetAndroidContext=$ctxOk")
+            if (!ctxOk) {
+                emitError("GStreamer Android init failed (GStreamer.init threw). Hardware decoders may not be available.")
+                // Do not return — gst_init() may still work without full Context registration.
+            }
+        }
+
         NativeInputDiagnostics.add("GstreamerStreamClient step calling gstNativeInit")
         val initOk = runCatching { bridge.gstNativeInit() }.getOrElse { ex ->
             Log.e(TAG, "gstNativeInit threw: ${ex.message}")
@@ -167,11 +204,24 @@ class GstreamerStreamClient(
         renderSurface?.let { bridge.gstSetSurface(it) }
 
         // Populate ICE servers to GStreamer before connecting signaling
+        val iceServerCount = session.iceServers.sumOf { it.urls.size }
+        NativeInputDiagnostics.add("GstreamerStreamClient configuring $iceServerCount ICE server URLs from session")
         session.iceServers.forEach { server ->
             server.urls.forEach { url ->
-                Log.d(TAG, "Configuring GStreamer ICE server: url=$url")
+                val urlType = when {
+                    url.startsWith("stun:") -> "STUN"
+                    url.startsWith("turns:") -> "TURNS"
+                    url.startsWith("turn:") -> "TURN"
+                    else -> "unknown"
+                }
+                val hasAuth = !server.username.isNullOrBlank() && !server.credential.isNullOrBlank()
+                Log.d(TAG, "Configuring GStreamer ICE server: url=$url type=$urlType hasAuth=$hasAuth")
+                NativeInputDiagnostics.add("GstreamerStreamClient gstAddIceServer type=$urlType hasAuth=$hasAuth url=${url.take(60)}")
                 bridge.gstAddIceServer(url, server.username, server.credential)
             }
+        }
+        if (iceServerCount == 0) {
+            NativeInputDiagnostics.add("GstreamerStreamClient WARNING: session.iceServers is empty — no STUN/TURN configured!")
         }
 
         if (generation != transportGeneration) return
@@ -216,13 +266,33 @@ class GstreamerStreamClient(
             }
             is SignalingEvent.Log -> NativeInputDiagnostics.add("GstreamerStreamClient sig-log: ${event.message}")
             is SignalingEvent.Offer -> {
-                NativeInputDiagnostics.add("GstreamerStreamClient received SDP offer (${event.sdp.length} chars)")
+                val rawOffer = event.sdp
+                NativeInputDiagnostics.add("GstreamerStreamClient received SDP offer (${rawOffer.length} chars)")
+                
+                // Munge SDP offer so GStreamer connects to the real server IP instead of 0.0.0.0,
+                // and prefers the codec configured in StreamSettings.
+                val sessionInfo = session
+                val preparedOffer = if (sessionInfo != null) {
+                    val fixed = SdpTools.fixServerEndpoint(rawOffer, sessionInfo.serverIp, sessionInfo.mediaConnectionInfo)
+                    val preferred = SdpTools.preferCodec(fixed, settings)
+                    if (fixed != rawOffer) {
+                        NativeInputDiagnostics.add("GstreamerStreamClient: Fixed server IP/endpoints in offer SDP")
+                    }
+                    if (preferred != fixed) {
+                        NativeInputDiagnostics.add("GstreamerStreamClient: Applied codec preference to offer SDP")
+                    }
+                    preferred
+                } else {
+                    rawOffer
+                }
+
                 emitState("Streaming (GStreamer)")
-                lastOfferSdp = event.sdp
-                bridge.gstSetRemoteOffer(event.sdp)
+                lastOfferSdp = preparedOffer
+                bridge.gstSetRemoteOffer(preparedOffer)
             }
             is SignalingEvent.RemoteIce -> {
                 val c: IceCandidate = event.candidate
+                NativeInputDiagnostics.add("GstreamerStreamClient gstAddRemoteIce mid=${c.sdpMid} line=${c.sdpMLineIndex} sdp=${c.sdp.take(80)}")
                 bridge.gstAddRemoteIce(
                     candidate = c.sdp,
                     sdpMid = c.sdpMid,
@@ -240,13 +310,14 @@ class GstreamerStreamClient(
                 // Forward the GStreamer-generated answer back to the signaling server.
                 NativeInputDiagnostics.add("GstreamerStreamClient sending SDP answer via signaling")
                 val offer = lastOfferSdp
+                val mungedAnswer = SdpTools.mungeAnswerSdp(data, settings.maxBitrateMbps * 1000)
                 if (offer != null) {
                     val nvst = runCatching {
-                        SdpTools.buildNvstSdp(offerSdp = offer, settings = settings, localAnswer = data)
+                        SdpTools.buildNvstSdp(offerSdp = offer, settings = settings, localAnswer = mungedAnswer)
                     }.getOrNull()
-                    scope.launch { signaling?.sendAnswer(data, nvstSdp = nvst) }
+                    scope.launch { signaling?.sendAnswer(mungedAnswer, nvstSdp = nvst) }
                 } else {
-                    scope.launch { signaling?.sendAnswer(data, nvstSdp = null) }
+                    scope.launch { signaling?.sendAnswer(mungedAnswer, nvstSdp = null) }
                 }
             }
             "ice-candidate" -> {

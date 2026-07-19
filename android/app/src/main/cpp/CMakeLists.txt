@@ -116,6 +116,9 @@ if(DEFINED _GST_ROOT AND EXISTS "${_GST_ROOT}")
             gstvideoparsersbad
             gstandroidmedia
             gstsctp
+            gstopus
+            gstopusparse
+            opus
         )
             set(_lib_path "${_GST_LIB_DIR}/lib${_lib}.a")
             if(EXISTS "${_lib_path}")

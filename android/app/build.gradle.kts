@@ -55,11 +55,11 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.opencloudgaming.opennow"
+        applicationId = "com.opencloudgaming.opennow.chizui"
         minSdk = 23
         targetSdk = 36
-        versionCode = 44
-        versionName = "0.8.9"
+        versionCode = 45
+        versionName = "0.9.10"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "POSTHOG_PROJECT_TOKEN", buildConfigString(postHogProjectToken))
@@ -91,6 +91,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("debug") // LOCAL TESTING ONLY - do not push
             buildConfigField("boolean", "APK_UPDATES_SUPPORTED", (!buildingPlayReleaseBundle).toString())
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

@@ -43,6 +43,14 @@ class NativeStreamerBridge(
 
     // ── Native method declarations ───────────────────────────────────────────
 
+    /**
+     * Injects the Android [Context] directly into GStreamer's internal context/class-loader
+     * storage by calling the GStreamer bootstrap function. This must be called before
+     * [gstNativeInit] when [org.freedesktop.gstreamer.GStreamer.init] fails (e.g. because
+     * the JNI registration in gstandroid.c.o did not complete at library load time).
+     */
+    external fun gstSetAndroidContext(context: android.content.Context)
+
     /** Initialises GStreamer (gst_init) and caches JVM / callback references. */
     external fun gstNativeInit(): Boolean
 

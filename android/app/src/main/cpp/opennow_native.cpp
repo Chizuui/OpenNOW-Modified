@@ -94,6 +94,8 @@ extern "C" {
     GST_PLUGIN_STATIC_DECLARE(videoparsersbad);
     GST_PLUGIN_STATIC_DECLARE(androidmedia);
     GST_PLUGIN_STATIC_DECLARE(sctp);
+    GST_PLUGIN_STATIC_DECLARE(opus);
+    GST_PLUGIN_STATIC_DECLARE(opusparse);
 }
 
 // This function is automatically called by gst_init() to register static plugins
@@ -115,6 +117,8 @@ extern "C" void gst_init_static_plugins(void) {
     GST_PLUGIN_STATIC_REGISTER(videoparsersbad);
     GST_PLUGIN_STATIC_REGISTER(androidmedia);
     GST_PLUGIN_STATIC_REGISTER(sctp);
+    GST_PLUGIN_STATIC_REGISTER(opus);
+    GST_PLUGIN_STATIC_REGISTER(opusparse);
 }
 
 #include <atomic>
@@ -230,32 +234,405 @@ static void on_negotiation_needed(GstElement *webrtcbin, gpointer /*user_data*/)
     LOGI("GStreamer negotiation needed (ignored as we are the answerer)");
 }
 
-// Called when a new decoded video/audio pad is added by webrtcbin.
-static void on_pad_added(GstElement * /*src*/, GstPad *pad, gpointer /*user_data*/) {
-    GstPad *sink_pad = gst_element_get_static_pad(g_ctx.videosink, "sink");
-    if (gst_pad_is_linked(sink_pad)) {
-        gst_object_unref(sink_pad);
-        return;
+// ICE state name helpers
+static const char *ice_connection_state_name(guint state) {
+    switch (state) {
+        case 0: return "new";
+        case 1: return "checking";
+        case 2: return "connected";
+        case 3: return "completed";
+        case 4: return "failed";
+        case 5: return "disconnected";
+        case 6: return "closed";
+        default: return "unknown";
     }
-    GstCaps *new_pad_caps = gst_pad_get_current_caps(pad);
-    if (!new_pad_caps) {
-        gst_object_unref(sink_pad);
-        return;
+}
+
+static const char *ice_gathering_state_name(guint state) {
+    switch (state) {
+        case 0: return "new";
+        case 1: return "gathering";
+        case 2: return "complete";
+        default: return "unknown";
     }
-    const gchar *name = gst_structure_get_name(gst_caps_get_structure(new_pad_caps, 0));
-    LOGI("GStreamer pad added: %s", name ? name : "unknown");
-    if (name && g_str_has_prefix(name, "video/")) {
-        GstPadLinkReturn link_ret = gst_pad_link(pad, sink_pad);
-        if (link_ret != GST_PAD_LINK_OK) {
-            LOGE("GStreamer failed to link video pad: %d", link_ret);
-        } else {
-            LOGI("GStreamer video pad linked to sink");
-            post_event("status", "video-pad-linked");
+}
+
+static const char *peer_connection_state_name(guint state) {
+    switch (state) {
+        case 0: return "new";
+        case 1: return "connecting";
+        case 2: return "connected";
+        case 3: return "disconnected";
+        case 4: return "failed";
+        case 5: return "closed";
+        default: return "unknown";
+    }
+}
+
+static const char *signaling_state_name(guint state) {
+    switch (state) {
+        case 0: return "stable";
+        case 1: return "have-local-offer";
+        case 2: return "have-remote-offer";
+        case 3: return "have-local-pranswer";
+        case 4: return "have-remote-pranswer";
+        case 5: return "closed";
+        default: return "unknown";
+    }
+}
+
+static void on_ice_connection_state_change(GstElement *webrtcbin, GParamSpec * /*pspec*/, gpointer /*user_data*/) {
+    guint state = 0;
+    g_object_get(webrtcbin, "ice-connection-state", &state, nullptr);
+    const char *name = ice_connection_state_name(state);
+    LOGI("GStreamer ICE connection state → %s (%u)", name, state);
+    post_event("status", (std::string("ice-connection-") + name).c_str());
+}
+
+static void on_ice_gathering_state_change(GstElement *webrtcbin, GParamSpec * /*pspec*/, gpointer /*user_data*/) {
+    guint state = 0;
+    g_object_get(webrtcbin, "ice-gathering-state", &state, nullptr);
+    const char *name = ice_gathering_state_name(state);
+    LOGI("GStreamer ICE gathering state → %s (%u)", name, state);
+    post_event("status", (std::string("ice-gathering-") + name).c_str());
+}
+
+static void on_connection_state_change(GstElement *webrtcbin, GParamSpec * /*pspec*/, gpointer /*user_data*/) {
+    guint state = 0;
+    g_object_get(webrtcbin, "connection-state", &state, nullptr);
+    const char *name = peer_connection_state_name(state);
+    LOGI("GStreamer Peer Connection state → %s (%u)", name, state);
+    post_event("status", (std::string("peer-connection-") + name).c_str());
+}
+
+static void on_signaling_state_change(GstElement *webrtcbin, GParamSpec * /*pspec*/, gpointer /*user_data*/) {
+    guint state = 0;
+    g_object_get(webrtcbin, "signaling-state", &state, nullptr);
+    const char *name = signaling_state_name(state);
+    LOGI("GStreamer WebRTC signaling state → %s (%u)", name, state);
+    post_event("status", (std::string("webrtc-signaling-") + name).c_str());
+}
+
+// Dynamically scan registered GStreamer element factories to find the best Android MediaCodec decoder for a codec.
+static std::string find_best_amc_decoder(const std::string &codec) {
+    std::string best_factory = "";
+    int best_score = -1;
+
+    GList *factories = gst_element_factory_list_get_elements(GST_ELEMENT_FACTORY_TYPE_DECODER | GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO, GST_RANK_NONE);
+    for (GList *l = factories; l != nullptr; l = l->next) {
+        GstElementFactory *f = GST_ELEMENT_FACTORY(l->data);
+        const gchar *name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(f));
+        if (!name) continue;
+
+        std::string fname = name;
+        // Target MediaCodec elements: amcviddec-xxxx
+        if (fname.rfind("amcviddec-", 0) != 0) continue;
+
+        // Check codec match
+        bool matches = false;
+        if (codec == "H265" || codec == "HEVC") {
+            matches = (fname.find("hevc") != std::string::npos || fname.find("h265") != std::string::npos);
+        } else if (codec == "H264") {
+            matches = (fname.find("avc") != std::string::npos || fname.find("h264") != std::string::npos);
+        } else if (codec == "AV1") {
+            matches = (fname.find("av1") != std::string::npos);
+        }
+
+        if (matches) {
+            int score = 10; // Base score for hardware amcviddec
+            if (fname.find("c2") != std::string::npos && (fname.find("mtk") != std::string::npos || fname.find("mediatek") != std::string::npos)) {
+                score = 100; // Prefer Codec2 MediaTek hardware decoder (usually more stable)
+            } else if (fname.find("omx") != std::string::npos && (fname.find("mtk") != std::string::npos || fname.find("mediatek") != std::string::npos)) {
+                score = 90;  // OMX MediaTek hardware decoder
+            } else if (fname.find("c2") != std::string::npos) {
+                score = 80;  // Standard Codec2 hardware decoder
+            } else if (fname.find("google") != std::string::npos || fname.find("android") != std::string::npos) {
+                score = 1;   // Software decoders are last resort
+            }
+
+            if (score > best_score) {
+                best_score = score;
+                best_factory = fname;
+            }
         }
     }
-    gst_caps_unref(new_pad_caps);
-    gst_object_unref(sink_pad);
+    gst_plugin_feature_list_free(factories);
+    return best_factory;
 }
+
+// Context passed to the notify::caps lambda so it can self-disconnect.
+struct CapsWatchCtx { GstElement *src; gulong handler_id; };
+
+// Called when a new decoded video/audio pad is added by webrtcbin.
+static void on_pad_added(GstElement *src, GstPad *pad, gpointer /*user_data*/) {
+    GstCaps *pad_caps = gst_pad_get_current_caps(pad);
+    if (!pad_caps) {
+        // Caps not yet negotiated — subscribe to caps change and handle then.
+        LOGW("on_pad_added: pad has no caps yet, subscribing to notify::caps");
+        // Keep a ref on pad and src so the lambda can use them safely.
+        // Store the handler ID in a heap-allocated gulong so we can self-disconnect.
+        gst_object_ref(pad);
+        auto *caps_ctx = new CapsWatchCtx{ static_cast<GstElement *>(gst_object_ref(src)), 0 };
+        caps_ctx->handler_id = g_signal_connect(pad, "notify::caps",
+            G_CALLBACK(+[](GObject *obj, GParamSpec *, gpointer user_data) {
+                GstPad *p = GST_PAD(obj);
+                auto *ctx = static_cast<CapsWatchCtx *>(user_data);
+                GstCaps *caps = gst_pad_get_current_caps(p);
+                if (caps) {
+                    LOGI("on_pad_added(notify::caps): now have caps, calling on_pad_added again");
+                    on_pad_added(ctx->src, p, nullptr);
+                    gst_caps_unref(caps);
+                    g_signal_handler_disconnect(obj, ctx->handler_id);
+                    gst_object_unref(ctx->src);
+                    gst_object_unref(p);   // matches ref taken before connect
+                    delete ctx;
+                }
+            }), caps_ctx);
+        return;
+    }
+
+    GstStructure *str = gst_caps_get_structure(pad_caps, 0);
+    const gchar *media_type = gst_structure_get_name(str);
+    LOGI("on_pad_added: pad caps media_type=%s", media_type ? media_type : "unknown");
+    post_event("status", (std::string("pad-added-caps-") + (media_type ? media_type : "unknown")).c_str());
+
+    std::string media_kind;
+    if (media_type && g_str_equal(media_type, "application/x-rtp")) {
+        const gchar *media = gst_structure_get_string(str, "media");
+        if (media) {
+            media_kind = media;
+            LOGI("on_pad_added: resolved RTP media kind=%s", media);
+            post_event("status", (std::string("pad-added-rtp-media-") + media).c_str());
+        }
+    } else if (media_type) {
+        if (g_str_has_prefix(media_type, "video/")) {
+            media_kind = "video";
+        } else if (g_str_has_prefix(media_type, "audio/")) {
+            media_kind = "audio";
+        }
+    }
+    gst_caps_unref(pad_caps);
+
+
+    GstElement *pipeline = g_ctx.pipeline;
+    if (!pipeline) return;
+
+    if (media_kind == "video") {
+        // Already linked?
+        if (g_ctx.videosink) {
+            LOGW("on_pad_added: video chain already created, skipping");
+            return;
+        }
+
+        // 1. Get the encoding name from RTP caps to create matching depay/parser/decoder
+        std::string depay_factory;
+        std::string parser_factory;
+        std::string amc_decoder_factory;
+        const gchar *encoding = gst_structure_get_string(str, "encoding-name");
+        LOGI("on_pad_added: RTP video encoding-name=%s", encoding ? encoding : "null");
+        post_event("status", (std::string("video-encoding-") + (encoding ? encoding : "null")).c_str());
+
+        if (encoding) {
+            std::string enc_upper = encoding;
+            for (auto &c : enc_upper) c = toupper(c);
+            if (enc_upper == "H265" || enc_upper == "HEVC") {
+                depay_factory = "rtph265depay";
+                parser_factory = "h265parse";
+                amc_decoder_factory = find_best_amc_decoder("HEVC");
+            } else if (enc_upper == "H264") {
+                depay_factory = "rtph264depay";
+                parser_factory = "h264parse";
+                amc_decoder_factory = find_best_amc_decoder("H264");
+            } else if (enc_upper == "AV1") {
+                depay_factory = "rtpav1depay";
+                parser_factory = "";
+                amc_decoder_factory = find_best_amc_decoder("AV1");
+            }
+        }
+
+        if (depay_factory.empty()) {
+            LOGW("on_pad_added: unknown video encoding, falling back to H265 depayloader");
+            depay_factory = "rtph265depay";
+            parser_factory = "h265parse";
+            amc_decoder_factory = find_best_amc_decoder("HEVC");
+        }
+
+        GstElement *depay   = gst_element_factory_make(depay_factory.c_str(), nullptr);
+        GstElement *parser  = parser_factory.empty() ? nullptr : gst_element_factory_make(parser_factory.c_str(), nullptr);
+        GstElement *vconv   = gst_element_factory_make("videoconvert", nullptr);
+        GstElement *vsink   = gst_element_factory_make("autovideosink",  "vsink");
+
+        // Force parser to repeat codec config (SPS/PPS) headers in the stream
+        if (parser) {
+            g_object_set(parser, "config-interval", -1, nullptr);
+            LOGI("on_pad_added: configured config-interval=-1 on parser");
+        }
+
+        // Try direct hardware MediaCodec decoder first to bypass decodebin
+        GstElement *decoder = nullptr;
+        if (!amc_decoder_factory.empty()) {
+            decoder = gst_element_factory_make(amc_decoder_factory.c_str(), nullptr);
+            if (decoder) {
+                LOGI("on_pad_added: successfully instantiated direct hardware decoder: %s", amc_decoder_factory.c_str());
+                post_event("status", (std::string("video-decoder-amc-") + amc_decoder_factory).c_str());
+            }
+        }
+        bool using_amc = (decoder != nullptr);
+
+        if (!using_amc) {
+            LOGW("on_pad_added: direct AMC decoder not found or failed, falling back to decodebin");
+            decoder = gst_element_factory_make("decodebin", nullptr);
+        }
+
+        if (!depay || (!parser && !parser_factory.empty()) || !decoder || !vconv || !vsink) {
+            LOGE("on_pad_added: failed to create video decode elements");
+            if (depay)   gst_object_unref(depay);
+            if (parser)  gst_object_unref(parser);
+            if (decoder) gst_object_unref(decoder);
+            if (vconv)   gst_object_unref(vconv);
+            if (vsink)   gst_object_unref(vsink);
+            return;
+        }
+
+        // Low-latency sink config
+        g_object_set(vsink, "sync", FALSE, "async", FALSE, "qos", FALSE, nullptr);
+        if (g_ctx.native_window) {
+            g_object_set(vsink, "window-handle", (guintptr) g_ctx.native_window, nullptr);
+        }
+
+        if (parser) {
+            gst_bin_add_many(GST_BIN(pipeline), depay, parser, decoder, vconv, vsink, nullptr);
+            gst_element_sync_state_with_parent(depay);
+            gst_element_sync_state_with_parent(parser);
+        } else {
+            gst_bin_add_many(GST_BIN(pipeline), depay, decoder, vconv, vsink, nullptr);
+            gst_element_sync_state_with_parent(depay);
+        }
+        gst_element_sync_state_with_parent(decoder);
+        gst_element_sync_state_with_parent(vconv);
+        gst_element_sync_state_with_parent(vsink);
+
+        // Link: depay -> [parser] -> decoder
+        if (parser) {
+            if (!gst_element_link_many(depay, parser, decoder, nullptr)) {
+                LOGE("on_pad_added: failed to link depay -> parser -> decoder");
+                post_event("error", "failed-to-link-depay-parser-decoder");
+            }
+        } else {
+            if (!gst_element_link(depay, decoder)) {
+                LOGE("on_pad_added: failed to link depay -> decoder");
+                post_event("error", "failed-to-link-depay-decoder");
+            }
+        }
+
+        if (using_amc) {
+            // Static linking if using direct AMC decoder (no dynamic pad needed)
+            if (!gst_element_link_many(decoder, vconv, vsink, nullptr)) {
+                LOGE("on_pad_added: failed to link decoder -> videoconvert -> vsink");
+                post_event("error", "failed-to-link-decoder-vconv-vsink");
+            } else {
+                LOGI("on_pad_added: statically linked video chain (using direct hardware decoder)");
+                post_event("status", "video-pad-linked");
+            }
+        } else {
+            // Fallback: If using decodebin, link videoconvert -> vsink and wait for dynamic pad
+            if (!gst_element_link(vconv, vsink)) {
+                LOGE("on_pad_added: failed to link videoconvert -> vsink");
+                post_event("error", "failed-to-link-vconv-vsink");
+            }
+
+            g_signal_connect(decoder, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *decoded_pad, gpointer user_data) {
+                GstElement *vconv_inner = static_cast<GstElement *>(user_data);
+                GstPad *vconv_sink = gst_element_get_static_pad(vconv_inner, "sink");
+                if (!gst_pad_is_linked(vconv_sink)) {
+                    GstCaps *dcaps = gst_pad_get_current_caps(decoded_pad);
+                    if (dcaps) {
+                        const gchar *dtype = gst_structure_get_name(gst_caps_get_structure(dcaps, 0));
+                        if (dtype && g_str_has_prefix(dtype, "video/")) {
+                            GstPadLinkReturn r = gst_pad_link(decoded_pad, vconv_sink);
+                            if (r == GST_PAD_LINK_OK) {
+                                LOGI("on_pad_added: decoded video pad linked -> videoconvert");
+                                post_event("status", "video-pad-linked");
+                            } else {
+                                LOGE("on_pad_added: decoded video pad link failed: %d", r);
+                                std::string ev = std::string("failed-to-link-dynamic-pad-") + std::to_string(r);
+                                post_event("error", ev.c_str());
+                            }
+                        }
+                        gst_caps_unref(dcaps);
+                    }
+                }
+                gst_object_unref(vconv_sink);
+            }), vconv);
+        }
+
+        // Link webrtcbin video pad -> depay
+        GstPad *depay_sink = gst_element_get_static_pad(depay, "sink");
+        GstPadLinkReturn ret = gst_pad_link(pad, depay_sink);
+        gst_object_unref(depay_sink);
+        if (ret != GST_PAD_LINK_OK) {
+            LOGE("on_pad_added: failed to link webrtcbin video pad -> depay: %d", ret);
+        } else {
+            LOGI("on_pad_added: webrtcbin video pad linked -> depay");
+            post_event("status", "video-pad-linked-to-depay");
+        }
+
+        g_ctx.videosink = vsink;
+
+    } else if (media_kind == "audio") {
+        // Audio path: rtpopusdepay → opusdec → audioconvert → audioresample → openslessink
+        // We bypass decodebin here because we know the codec is always Opus (from the SDP),
+        // and decodebin was failing with "missing plug-in" when the Opus decoder wasn't
+        // discovered through its caps-negotiation path.
+        GstElement *depay   = gst_element_factory_make("rtpopusdepay", nullptr);
+        GstElement *opusdec = gst_element_factory_make("opusdec",      nullptr);
+        GstElement *aconv   = gst_element_factory_make("audioconvert",  nullptr);
+        GstElement *aresamp = gst_element_factory_make("audioresample", nullptr);
+        GstElement *asink   = gst_element_factory_make("openslessink",  nullptr);
+        if (!asink) {
+            LOGW("on_pad_added: openslessink not available, trying autoaudiosink");
+            asink = gst_element_factory_make("autoaudiosink", nullptr);
+        }
+        if (!depay || !opusdec || !aconv || !aresamp || !asink) {
+            LOGE("on_pad_added: failed to create audio elements (depay=%p opusdec=%p aconv=%p aresamp=%p asink=%p)",
+                 (void*)depay, (void*)opusdec, (void*)aconv, (void*)aresamp, (void*)asink);
+            if (depay)   gst_object_unref(depay);
+            if (opusdec) gst_object_unref(opusdec);
+            if (aconv)   gst_object_unref(aconv);
+            if (aresamp) gst_object_unref(aresamp);
+            if (asink)   gst_object_unref(asink);
+            return;
+        }
+
+        g_object_set(asink, "sync", FALSE, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline), depay, opusdec, aconv, aresamp, asink, nullptr);
+        gst_element_sync_state_with_parent(depay);
+        gst_element_sync_state_with_parent(opusdec);
+        gst_element_sync_state_with_parent(aconv);
+        gst_element_sync_state_with_parent(aresamp);
+        gst_element_sync_state_with_parent(asink);
+
+        if (!gst_element_link_many(depay, opusdec, aconv, aresamp, asink, nullptr)) {
+            LOGE("on_pad_added: failed to link audio chain depay -> opusdec -> audioconvert -> audioresample -> audiosink");
+        } else {
+            LOGI("on_pad_added: audio chain linked: depay -> opusdec -> audioconvert -> audioresample -> audiosink");
+        }
+
+        // Link webrtcbin audio pad -> depay
+        GstPad *depay_sink = gst_element_get_static_pad(depay, "sink");
+        GstPadLinkReturn ret = gst_pad_link(pad, depay_sink);
+        gst_object_unref(depay_sink);
+        if (ret != GST_PAD_LINK_OK) {
+            LOGE("on_pad_added: failed to link webrtcbin audio pad -> depay: %d", ret);
+        } else {
+            LOGI("on_pad_added: webrtcbin audio pad linked -> depay");
+            post_event("status", "audio-pad-linked-to-depay");
+        }
+    } else {
+        LOGI("on_pad_added: ignoring unknown pad media type: %s", media_type ? media_type : "null");
+    }
+}
+
 
 // Called by GstBin when a new element is dynamically added (deep within the bin structure).
 // We use this to configure the dynamic rtpjitterbuffer for low latency on GStreamer versions
@@ -272,6 +649,74 @@ static void on_deep_element_added(GstBin * /*bin*/, GstBin * /*sub_bin*/, GstEle
 }
 
 // ─── JNI methods ─────────────────────────────────────────────────────────────
+// NOTE: JNI_OnLoad is intentionally NOT defined here. libgstreamer-1.0.a
+// (gstandroid.c.o) provides its own JNI_OnLoad which registers the JavaVM
+// and application Context via GStreamer.nativeInit(). Defining a second
+// JNI_OnLoad would shadow GStreamer's, breaking the androidmedia plugin.
+//
+// HOWEVER: gstandroid.c.o's JNI_OnLoad calls FindClass to register the
+// nativeInit JNI method, which may fail if the Kotlin class is not yet loaded
+// at library-load time. In that case, _context and _class_loader remain null,
+// and androidmedia cannot enumerate MediaCodec decoders.
+//
+// gstSetAndroidContext is our fallback: it directly calls the gstandroid symbol
+// Java_org_freedesktop_gstreamer_GStreamer_nativeInit, which is always linked
+// into our .so, bypassing the JNI registration dependency.
+
+// We cache the application context globally in our own variable.
+static jobject g_android_context = nullptr;
+static jobject g_android_class_loader = nullptr;
+
+extern "C" jobject gst_android_get_application_context(void) {
+    return g_android_context;
+}
+
+extern "C" jobject gst_android_get_application_class_loader(void) {
+    return g_android_class_loader;
+}
+
+extern "C" JavaVM *gst_android_get_java_vm(void) {
+    return g_ctx.jvm;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetAndroidContext(
+        JNIEnv *env, jobject /*thiz*/, jobject context) {
+    if (!context) {
+        LOGE("gstSetAndroidContext: null context");
+        return;
+    }
+    
+    // Cache the JavaVM immediately
+    if (!g_ctx.jvm) {
+        env->GetJavaVM(&g_ctx.jvm);
+        LOGI("gstSetAndroidContext: cached JVM %p", (void*)g_ctx.jvm);
+    }
+
+    LOGI("gstSetAndroidContext: caching Android context for androidmedia plugin");
+    if (g_android_context) {
+        env->DeleteGlobalRef(g_android_context);
+    }
+    g_android_context = env->NewGlobalRef(context);
+
+    // Retrieve class loader from context
+    jclass context_class = env->GetObjectClass(context);
+    jmethodID get_class_loader_mid = env->GetMethodID(context_class, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    if (get_class_loader_mid) {
+        jobject class_loader = env->CallObjectMethod(context, get_class_loader_mid);
+        if (class_loader) {
+            if (g_android_class_loader) {
+                env->DeleteGlobalRef(g_android_class_loader);
+            }
+            g_android_class_loader = env->NewGlobalRef(class_loader);
+            LOGI("gstSetAndroidContext: cached ClassLoader %p", (void*)g_android_class_loader);
+        } else {
+            LOGW("gstSetAndroidContext: getClassLoader returned null");
+        }
+    } else {
+        LOGE("gstSetAndroidContext: failed to find getClassLoader method on Context class");
+    }
+}
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstNativeInit(
@@ -282,8 +727,15 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstNativeInit(
         return JNI_TRUE;
     }
 
-    // Cache JVM and bridge object reference for async callbacks.
-    env->GetJavaVM(&g_ctx.jvm);
+    // Cache the JavaVM pointer so post_event() can attach GLib/GStreamer
+    // worker threads to JNI. GStreamer's JNI_OnLoad (gstandroid.c.o) has
+    // already run by this point; we just need our own copy of the pointer.
+    if (!g_ctx.jvm) {
+        env->GetJavaVM(&g_ctx.jvm);
+        LOGI("gstNativeInit: cached JVM %p", (void*)g_ctx.jvm);
+    }
+
+    // Cache bridge object reference for async callbacks.
     if (g_ctx.bridge_obj) {
         env->DeleteGlobalRef(g_ctx.bridge_obj);
     }
@@ -295,8 +747,28 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstNativeInit(
         return JNI_FALSE;
     }
 
+    // Log context status
+    LOGI("gstNativeInit: cached context context=%p", (void*)g_android_context);
+    if (!g_android_context) {
+        LOGW("gstNativeInit: Android context is null — hardware decoders may fail. "
+             "Call gstSetAndroidContext before gstNativeInit.");
+    }
+
+
+
     gst_init(nullptr, nullptr);
     LOGI("GStreamer initialized: %s", gst_version_string());
+
+    // Print all registered video decoders to diagnostics via post_event
+    GList *factories = gst_element_factory_list_get_elements(GST_ELEMENT_FACTORY_TYPE_DECODER | GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO, GST_RANK_NONE);
+    for (GList *l = factories; l != nullptr; l = l->next) {
+        GstElementFactory *f = GST_ELEMENT_FACTORY(l->data);
+        const gchar *name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(f));
+        std::string ev_name = std::string("factory-decoder-") + name;
+        post_event("status", ev_name.c_str());
+    }
+    gst_plugin_feature_list_free(factories);
+
     post_event("status", "gstreamer-initialized");
     return JNI_TRUE;
 }
@@ -326,43 +798,105 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstSetSurface(
     }
 }
 
+// Helper: percent-encode characters in a URI component that would break URI parsing
+// We only encode the minimal set: @ : / ? # which can appear in TURN credentials
+static std::string percent_encode_credential(const std::string &raw) {
+    std::string out;
+    out.reserve(raw.size() * 3);
+    for (unsigned char c : raw) {
+        // Characters that must be percent-encoded inside a URI authority segment
+        if (c == '@' || c == ':' || c == '/' || c == '?' || c == '#' ||
+            c == '[' || c == ']' || c == ' ' || c == '%') {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            out += buf;
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstAddIceServer(
         JNIEnv *env, jobject /*thiz*/, jstring jurl, jstring jusername, jstring jcredential) {
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
-    if (!g_ctx.webrtcbin) return;
+    if (!g_ctx.webrtcbin) {
+        LOGW("gstAddIceServer: called but webrtcbin is null (pipeline not ready)");
+        return;
+    }
 
-    const char *url = env->GetStringUTFChars(jurl, nullptr);
-    const char *username = jusername ? env->GetStringUTFChars(jusername, nullptr) : nullptr;
+    const char *url        = env->GetStringUTFChars(jurl, nullptr);
+    const char *username   = jusername   ? env->GetStringUTFChars(jusername,   nullptr) : nullptr;
     const char *credential = jcredential ? env->GetStringUTFChars(jcredential, nullptr) : nullptr;
 
-    LOGI("gstAddIceServer: url=%s", url);
+    LOGI("gstAddIceServer: url=%s user=%s hasCred=%s",
+         url,
+         username   ? username   : "(none)",
+         credential ? "yes"      : "no");
+
+    bool handled = false;
 
     if (g_str_has_prefix(url, "stun:")) {
+        // Normalise "stun:<host>:<port>" → "stun://<host>:<port>"
         std::string stun_uri = url;
         if (stun_uri.find("stun://") == std::string::npos) {
             stun_uri.replace(0, 5, "stun://");
         }
         g_object_set(g_ctx.webrtcbin, "stun-server", stun_uri.c_str(), nullptr);
-        LOGI("gstAddIceServer: set stun-server to %s", stun_uri.c_str());
-    } else if (g_str_has_prefix(url, "turn:")) {
+        LOGI("gstAddIceServer: set stun-server → %s", stun_uri.c_str());
+        handled = true;
+
+    } else if (g_str_has_prefix(url, "turn:") || g_str_has_prefix(url, "turns:")) {
+        // Determine scheme and normalise the URI
+        bool is_turns = g_str_has_prefix(url, "turns:");
         std::string turn_uri = url;
-        if (turn_uri.find("turn://") == std::string::npos) {
-            turn_uri.replace(0, 5, "turn://");
-        }
-        if (username && credential) {
-            size_t pos = turn_uri.find("turn://");
-            if (pos != std::string::npos) {
-                turn_uri.insert(pos + 7, std::string(username) + ":" + std::string(credential) + "@");
+        if (is_turns) {
+            // "turns:<host>…" → "turns://<host>…"
+            if (turn_uri.find("turns://") == std::string::npos) {
+                turn_uri.replace(0, 6, "turns://");
+            }
+        } else {
+            // "turn:<host>…" → "turn://<host>…"
+            if (turn_uri.find("turn://") == std::string::npos) {
+                turn_uri.replace(0, 5, "turn://");
             }
         }
+
+        // Embed credentials as "turn://user:password@host:port"
+        // Percent-encode the credentials so special chars (@, :, /) don't break the URI.
+        if (username && credential) {
+            std::string encoded_user = percent_encode_credential(username);
+            std::string encoded_pass = percent_encode_credential(credential);
+            std::string prefix = is_turns ? "turns://" : "turn://";
+            size_t pos = turn_uri.find(prefix);
+            if (pos != std::string::npos) {
+                turn_uri.insert(pos + prefix.size(),
+                                encoded_user + ":" + encoded_pass + "@");
+            }
+        } else {
+            LOGW("gstAddIceServer: TURN server has no credentials — relay may not work");
+        }
+
         gboolean added = FALSE;
         g_signal_emit_by_name(g_ctx.webrtcbin, "add-turn-server", turn_uri.c_str(), &added);
-        LOGI("gstAddIceServer: add-turn-server %s added=%d", turn_uri.c_str(), added);
+        LOGI("gstAddIceServer: add-turn-server scheme=%s result=%s uri=%s",
+             is_turns ? "turns" : "turn",
+             added ? "SUCCESS" : "FAILED",
+             turn_uri.c_str());
+        if (!added) {
+            LOGW("gstAddIceServer: add-turn-server returned FALSE — server was NOT registered. "
+                 "This may indicate the URI is malformed or libnice does not support this scheme.");
+        }
+        handled = true;
+    }
+
+    if (!handled) {
+        LOGW("gstAddIceServer: unrecognised URL scheme, ignoring: %s", url);
     }
 
     env->ReleaseStringUTFChars(jurl, url);
-    if (username) env->ReleaseStringUTFChars(jusername, username);
+    if (username)   env->ReleaseStringUTFChars(jusername,   username);
     if (credential) env->ReleaseStringUTFChars(jcredential, credential);
 }
 
@@ -380,98 +914,97 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
     g_ctx.native_window = window;
     LOGI("gstCreatePipeline: surface=%p native_window=%p", surface ? (void*)1 : nullptr, window);
 
-    // Build a low-latency WebRTC receive pipeline:
-    //   webrtcbin → named video queue → decodebin → videoconvert → glimagesink
-    //   webrtcbin → audioconvert → audioresample → autoaudiosink
-    //
-    // The queue is named "vqueue" so we can apply low-latency properties after creation.
-    GError *error = nullptr;
-    const gchar *pipeline_desc =
-        "webrtcbin name=webrtc bundle-policy=max-bundle "
-        "  webrtc. ! queue name=vqueue ! decodebin name=dbin "
-        "  dbin. ! videoconvert ! glimagesink name=vsink "
-        "  dbin. ! audioconvert ! audioresample ! openslessink name=asink";
-
-    GstElement *pipeline = gst_parse_launch(pipeline_desc, &error);
-    if (!pipeline || error) {
-        std::string err_msg = "gst_parse_launch failed: ";
-        err_msg += error ? error->message : "unknown error";
-        LOGE("gstCreatePipeline: %s", err_msg.c_str());
-        post_event("error", err_msg.c_str());
-        if (error) g_error_free(error);
-        if (pipeline) gst_object_unref(pipeline);
+    // Create a bare pipeline — webrtcbin has dynamic source pads so it cannot
+    // be statically linked to downstream elements.  The decode chains are
+    // assembled in on_pad_added when webrtcbin emits each media pad.
+    GstElement *pipeline = gst_pipeline_new("opennow-pipeline");
+    GstElement *webrtcbin = gst_element_factory_make("webrtcbin", "webrtc");
+    if (!pipeline || !webrtcbin) {
+        LOGE("gstCreatePipeline: could not create pipeline or webrtcbin element");
+        post_event("error", "pipeline-create-failed: missing webrtcbin plugin");
+        if (webrtcbin) gst_object_unref(webrtcbin);
+        if (pipeline)  gst_object_unref(pipeline);
         return JNI_FALSE;
     }
 
-    GstElement *webrtcbin = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
-    GstElement *videosink = gst_bin_get_by_name(GST_BIN(pipeline), "vsink");
-    GstElement *videoqueue = gst_bin_get_by_name(GST_BIN(pipeline), "vqueue");
-    GstElement *audiosink  = gst_bin_get_by_name(GST_BIN(pipeline), "asink");
+    // Configure bundle policy before anything else.
+    gst_util_set_object_arg(G_OBJECT(webrtcbin), "bundle-policy", "max-bundle");
 
-    if (!webrtcbin || !videosink) {
-        std::string missing = "missing elements:";
-        if (!webrtcbin) missing += " webrtcbin";
-        if (!videosink) missing += " glimagesink";
-        LOGE("gstCreatePipeline: %s", missing.c_str());
-        post_event("error", missing.c_str());
-        if (webrtcbin)  gst_object_unref(webrtcbin);
-        if (videosink)  gst_object_unref(videosink);
-        if (videoqueue) gst_object_unref(videoqueue);
-        if (audiosink)  gst_object_unref(audiosink);
-        gst_object_unref(pipeline);
-        return JNI_FALSE;
-    }
+    gst_bin_add(GST_BIN(pipeline), webrtcbin);  // pipeline takes ownership
 
-    // ── Low-latency pipeline configuration ───────────────────────────────────
-    // 1. Listen to deep-element-added to configure the dynamic rtpjitterbuffer latency.
+    // ── Low-latency configuration ─────────────────────────────────────────────
+    // 1. Listen to deep-element-added to configure rtpjitterbuffer latency.
     g_signal_connect(pipeline, "deep-element-added", G_CALLBACK(on_deep_element_added), nullptr);
-    LOGI("gstCreatePipeline: webrtcbin latency set to 2ms");
 
-    // 2. Video queue: leaky downstream with max 1 buffer — drops stale frames.
-    if (videoqueue) {
-        g_object_set(videoqueue,
-                     "max-size-buffers", (guint) 1,
-                     "max-size-bytes",   (guint) 0,
-                     "max-size-time",    (guint64) 0,
-                     "leaky",            (gint) 2, // GST_QUEUE_LEAK_DOWNSTREAM
-                     nullptr);
-        LOGI("gstCreatePipeline: video queue configured for low latency");
-    }
+    // 2. Wire up WebRTC signal handlers.
+    g_signal_connect(webrtcbin, "on-ice-candidate",                G_CALLBACK(on_ice_candidate),                nullptr);
+    g_signal_connect(webrtcbin, "on-negotiation-needed",           G_CALLBACK(on_negotiation_needed),           nullptr);
+    g_signal_connect(webrtcbin, "pad-added",                       G_CALLBACK(on_pad_added),                    nullptr);
+    g_signal_connect(webrtcbin, "notify::ice-connection-state",    G_CALLBACK(on_ice_connection_state_change),  nullptr);
+    g_signal_connect(webrtcbin, "notify::ice-gathering-state",     G_CALLBACK(on_ice_gathering_state_change),   nullptr);
+    g_signal_connect(webrtcbin, "notify::connection-state",        G_CALLBACK(on_connection_state_change),      nullptr);
+    g_signal_connect(webrtcbin, "notify::signaling-state",         G_CALLBACK(on_signaling_state_change),       nullptr);
 
-    // 3. Video sink: disable presentation sync so frames are displayed immediately.
-    g_object_set(videosink,
-                 "sync",        FALSE,
-                 "async",       FALSE,
-                 "qos",         FALSE,
-                 nullptr);
-    LOGI("gstCreatePipeline: glimagesink configured sync=false");
+    // 3. Attach a bus watch to surface GStreamer errors / state changes into diagnostics.
+    GstBus *bus = gst_element_get_bus(pipeline);
+    gst_bus_add_watch(bus, [](GstBus * /*bus*/, GstMessage *msg, gpointer /*user_data*/) -> gboolean {
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR: {
+                GError *err = nullptr;
+                gchar  *dbg = nullptr;
+                gst_message_parse_error(msg, &err, &dbg);
+                LOGE("GStreamer BUS ERROR from '%s': %s | debug: %s",
+                     GST_OBJECT_NAME(msg->src),
+                     err ? err->message : "(null)",
+                     dbg ? dbg : "(none)");
+                std::string ev = std::string("gst-error:") +
+                                 (err ? err->message : "unknown") + " src=" +
+                                 GST_OBJECT_NAME(msg->src);
+                post_event("error", ev.c_str());
+                g_clear_error(&err);
+                g_free(dbg);
+                break;
+            }
+            case GST_MESSAGE_WARNING: {
+                GError *err = nullptr;
+                gchar  *dbg = nullptr;
+                gst_message_parse_warning(msg, &err, &dbg);
+                LOGW("GStreamer BUS WARNING from '%s': %s | debug: %s",
+                     GST_OBJECT_NAME(msg->src),
+                     err ? err->message : "(null)",
+                     dbg ? dbg : "(none)");
+                g_clear_error(&err);
+                g_free(dbg);
+                break;
+            }
+            case GST_MESSAGE_EOS:
+                LOGI("GStreamer BUS: EOS");
+                post_event("status", "gst-eos");
+                break;
+            case GST_MESSAGE_STATE_CHANGED: {
+                if (GST_MESSAGE_SRC(msg) == GST_OBJECT(g_ctx.pipeline)) {
+                    GstState old_s, new_s, pending;
+                    gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
+                    LOGI("GStreamer pipeline state: %s -> %s (pending: %s)",
+                         gst_element_state_get_name(old_s),
+                         gst_element_state_get_name(new_s),
+                         gst_element_state_get_name(pending));
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return G_SOURCE_CONTINUE;
+    }, nullptr);
+    gst_object_unref(bus);
 
-    // 4. Audio sink: also disable sync to prevent audio holding up the pipeline.
-    if (audiosink) {
-        g_object_set(audiosink, "sync", FALSE, nullptr);
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // Bind the rendering window to glimagesink (may be 0/null if surface not yet available).
-    if (window) {
-        g_object_set(videosink, "window-handle", (guintptr) window, nullptr);
-        LOGI("gstCreatePipeline: bound ANativeWindow to glimagesink");
-    } else {
-        LOGI("gstCreatePipeline: no surface yet — will be set via gstSetSurface()");
-    }
-
-    // Wire up WebRTC signal handlers.
-    g_signal_connect(webrtcbin, "on-ice-candidate",      G_CALLBACK(on_ice_candidate),      nullptr);
-    g_signal_connect(webrtcbin, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), nullptr);
-    g_signal_connect(webrtcbin, "pad-added",             G_CALLBACK(on_pad_added),           nullptr);
-
-    // Store context.
-    g_ctx.pipeline  = pipeline;
-    g_ctx.webrtcbin = webrtcbin;
-    g_ctx.videosink = videosink;
-    g_ctx.videoqueue = videoqueue;
-    // audiosink is not stored; it is owned by the pipeline (unref our query ref).
-    if (audiosink) gst_object_unref(audiosink);
+    // 3. Pre-bind the rendering window to glimagesink (may be null if surface not yet available).
+    //    The actual glimagesink will be created in on_pad_added; store it for later.
+    g_ctx.pipeline      = pipeline;
+    g_ctx.webrtcbin     = webrtcbin;
+    g_ctx.videosink     = nullptr;   // created dynamically in on_pad_added
+    g_ctx.videoqueue    = nullptr;
 
     // Start the GLib main loop on a dedicated thread.
     g_ctx.loop = g_main_loop_new(nullptr, FALSE);
@@ -482,7 +1015,7 @@ Java_com_opencloudgaming_opennow_NativeStreamerBridge_gstCreatePipeline(
         LOGI("GStreamer GLib main loop exited");
     });
 
-    // Set pipeline to PLAYING.
+    // Set pipeline to PLAYING so webrtcbin can start ICE gathering immediately.
     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         LOGE("gstCreatePipeline: failed to set pipeline to PLAYING");
