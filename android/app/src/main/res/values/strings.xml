@@ -7,7 +7,7 @@
     <string name="profile_account_options">Account options</string>
     <string name="profile_identity">%1$s • %2$s</string>
     <string name="profile_not_available">Not available</string>
-    <string name="app_name">OpenNOW</string>
+    <string name="app_name">OpenNOW Chizui</string>
     <string name="status_starting_opennow">Starting OpenNOW</string>
     <string name="login_with_provider">Sign in with %1$s</string>
     <string name="login_tv_start">Sign in on another device with %1$s</string>
