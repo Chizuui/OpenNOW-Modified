@@ -209,6 +209,16 @@ internal fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                             Text(stringResource(R.string.login_use_code))
                         }
                     }
+                    Button(
+                        onClick = { viewModel.loginWithChizui() },
+                        enabled = !normalLoginBusy,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.tertiary,
+                            contentColor = MaterialTheme.colorScheme.onTertiary
+                        )
+                    ) {
+                        Text("Sign in with ChizuiLogin")
+                    }
                     if (tvLogin) {
                         TvPhonePairingPanel(state = state, viewModel = viewModel)
                     }

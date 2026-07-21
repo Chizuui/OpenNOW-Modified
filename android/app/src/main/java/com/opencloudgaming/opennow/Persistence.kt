@@ -381,6 +381,7 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
         tvLayoutProfileVersion = tvLayoutProfileVersion.coerceAtLeast(0),
         controllerUiSounds = controllerUiSounds,
         autoFullScreen = true,
+        chizuiLoginUrl = chizuiLoginUrl.trim(),
     )
 }
 

@@ -57,7 +57,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.opencloudgaming.opennow"
+        applicationId = "com.opencloudgaming.opennow.chizui"
         minSdk = 23
         // Android 17 target changes are audited; LAN access is permission-gated at its feature boundary.
         //noinspection EditedTargetSdkVersion
@@ -86,6 +86,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("debug") // LOCAL TESTING ONLY - do not push
             buildConfigField("boolean", "APK_UPDATES_SUPPORTED", (!buildingPlayReleaseBundle).toString())
             buildConfigField("boolean", "PLAY_STORE_RELEASE", buildingPlayReleaseBundle.toString())
             buildConfigField("boolean", "LOCAL_APP_LAUNCHER_SUPPORTED", (!buildingPlayReleaseBundle).toString())
