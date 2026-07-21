@@ -365,6 +365,50 @@ class SettingsStore(context: Context) {
         replace(AppSettings())
     }
 
+    private fun AppSettings.normalizedForAndroid(): AppSettings {
+        val compatibleStream = stream.withCodecColorCompatibility()
+        val lowPowerSafe = compatibleStream.copy(
+            codec = compatibleStream.codec,
+            sessionProxyUrl = stream.sessionProxyUrl.trim(),
+            maxBitrateMbps = compatibleStream.maxBitrateMbps.coerceIn(1, 150),
+            fps = compatibleStream.fps.coerceIn(30, 360),
+            streamSharpeningAmount = compatibleStream.streamSharpeningAmount.coerceIn(0f, 1f),
+        )
+        return copy(
+            stream = lowPowerSafe,
+            posterSizeScale = posterSizeScale.coerceIn(MIN_GAME_CARD_SCALE, MAX_GAME_CARD_SCALE),
+            androidTouch = androidTouch.copy(
+                opacity = androidTouch.opacity.coerceIn(0.15f, 1f),
+                scale = androidTouch.scale.coerceIn(0.6f, 1.4f),
+                buttonScale = androidTouch.buttonScale.coerceIn(0.65f, 1.5f),
+                stickScale = androidTouch.stickScale.coerceIn(0.65f, 1.5f),
+                joystickDeadZone = androidTouch.joystickDeadZone.coerceIn(0f, 0.3f),
+                edgePaddingDp = androidTouch.edgePaddingDp.coerceIn(0f, 72f),
+                bottomPaddingDp = androidTouch.bottomPaddingDp.coerceIn(0f, 120f),
+                leftOffsetXDp = androidTouch.leftOffsetXDp.coerceIn(-220f, 220f),
+                leftOffsetYDp = androidTouch.leftOffsetYDp.coerceIn(-160f, 160f),
+                rightOffsetXDp = androidTouch.rightOffsetXDp.coerceIn(-220f, 220f),
+                rightOffsetYDp = androidTouch.rightOffsetYDp.coerceIn(-160f, 160f),
+                offsets = androidTouch.offsets.mapValues { (_, offset) ->
+                    TouchOffset(
+                        x = offset.x.coerceIn(-320f, 320f),
+                        y = offset.y.coerceIn(-320f, 320f)
+                    )
+                },
+            ),
+            streamIntroMusic = streamIntroMusic,
+            queueReadyMusic = queueReadyMusic,
+            legacyCropStreamToFill = false,
+            stretchStreamToFit = stretchStreamToFit,
+            streamPresentationProfileVersion = streamPresentationProfileVersion.coerceAtLeast(STREAM_PRESENTATION_PROFILE_VERSION),
+            nerdCatalogBackgroundUri = nerdCatalogBackgroundUri?.trim()?.takeIf { it.isNotBlank() },
+            tvSafeAreaPaddingDp = tvSafeAreaPaddingDp.coerceIn(0f, 120f),
+            tvLayoutProfileVersion = tvLayoutProfileVersion.coerceAtLeast(0),
+            controllerUiSounds = controllerUiSounds,
+            autoFullScreen = true,
+            chizuiLoginUrl = chizuiLoginUrl.trim(),
+        )
+    }
 }
 
 class AuthStore(context: Context) {
