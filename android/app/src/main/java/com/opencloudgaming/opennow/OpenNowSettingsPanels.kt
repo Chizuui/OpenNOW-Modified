@@ -499,6 +499,10 @@ internal fun AccountSettingsPanel(state: OpenNowUiState, viewModel: OpenNowViewM
                 viewModel.selectProvider(provider)
                 viewModel.login(provider)
             },
+            onChizuiSelected = {
+                addAccountPromptOpen = false
+                viewModel.loginWithChizui(promptSelectAccount = true)
+            },
             onDismiss = { addAccountPromptOpen = false },
         )
     }
@@ -605,8 +609,10 @@ private fun AddAccountProviderDialog(
     providers: List<LoginProvider>,
     selectedProvider: LoginProvider,
     onProviderSelected: (LoginProvider) -> Unit,
+    onChizuiSelected: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var isChizuiSelected by remember { mutableStateOf(false) }
     var providerChoice by remember(providers, selectedProvider) {
         mutableStateOf(providers.preferredProvider(selectedProvider))
     }
@@ -627,15 +633,33 @@ private fun AddAccountProviderDialog(
                 )
                 providers.forEach { provider ->
                     ProviderChoiceRow(
-                        provider = provider,
-                        selected = provider.sameProvider(providerChoice),
-                        onClick = { providerChoice = provider },
+                        displayName = provider.displayName,
+                        code = provider.code,
+                        selected = !isChizuiSelected && provider.sameProvider(providerChoice),
+                        onClick = {
+                            isChizuiSelected = false
+                            providerChoice = provider
+                        },
                     )
                 }
+                ProviderChoiceRow(
+                    displayName = "ChizuiLogin",
+                    code = "Custom token & OAuth provider",
+                    selected = isChizuiSelected,
+                    onClick = {
+                        isChizuiSelected = true
+                    },
+                )
             }
         },
         confirmButton = {
-            Button(onClick = { onProviderSelected(providerChoice) }) {
+            Button(onClick = {
+                if (isChizuiSelected) {
+                    onChizuiSelected()
+                } else {
+                    onProviderSelected(providerChoice)
+                }
+            }) {
                 Text("Continue")
             }
         },
@@ -649,6 +673,16 @@ private fun AddAccountProviderDialog(
 
 @Composable
 private fun ProviderChoiceRow(provider: LoginProvider, selected: Boolean, onClick: () -> Unit) {
+    ProviderChoiceRow(
+        displayName = provider.displayName,
+        code = provider.code,
+        selected = selected,
+        onClick = onClick,
+    )
+}
+
+@Composable
+private fun ProviderChoiceRow(displayName: String, code: String, selected: Boolean, onClick: () -> Unit) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -668,14 +702,14 @@ private fun ProviderChoiceRow(provider: LoginProvider, selected: Boolean, onClic
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    provider.displayName,
+                    displayName,
                     color = SettingsText,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    provider.code,
+                    code,
                     color = SettingsTextMuted,
                     style = MaterialTheme.typography.bodySmall,
                     maxLines = 1,

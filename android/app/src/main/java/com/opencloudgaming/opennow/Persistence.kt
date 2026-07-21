@@ -340,6 +340,7 @@ class SettingsStore(context: Context) {
             tvLayoutProfileVersion = tvLayoutProfileVersion.coerceAtLeast(0),
             controllerUiSounds = controllerUiSounds,
             autoFullScreen = true,
+            chizuiLoginUrl = chizuiLoginUrl.trim(),
         )
     }
 }
