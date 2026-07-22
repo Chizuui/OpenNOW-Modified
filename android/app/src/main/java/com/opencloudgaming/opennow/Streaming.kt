@@ -833,6 +833,7 @@ object NativeStreamInputRouter {
 
     fun setMouseDirectClick(enabled: Boolean) {
         mouseDirectClick = enabled
+        touchMouseState.reset(client)
     }
 
     fun setStretchToFit(enabled: Boolean) {
@@ -2152,6 +2153,8 @@ private class TouchMouseState {
     private var virtualCursorX = 0f
     private var virtualCursorY = 0f
     private var virtualCursorInitialized = false
+    private var lastStreamWidth = 0
+    private var lastStreamHeight = 0
     private var twoFingerTapCandidate = false
 
     fun reset(client: NativeStreamClient?) {
@@ -2160,6 +2163,8 @@ private class TouchMouseState {
         selecting = false
         doubleTapDragCandidate = false
         virtualCursorInitialized = false
+        lastStreamWidth = 0
+        lastStreamHeight = 0
         twoFingerTapCandidate = false
     }
 
@@ -2205,10 +2210,12 @@ private class TouchMouseState {
                 }
             }
 
-            if (!virtualCursorInitialized) {
+            if (!virtualCursorInitialized || lastStreamWidth != streamWidth || lastStreamHeight != streamHeight) {
                 virtualCursorX = streamWidth / 2f
                 virtualCursorY = streamHeight / 2f
                 virtualCursorInitialized = true
+                lastStreamWidth = streamWidth
+                lastStreamHeight = streamHeight
             }
 
             when (event.actionMasked) {
