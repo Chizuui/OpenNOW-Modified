@@ -6732,8 +6732,13 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad) {
         NativeStreamInputRouter.setTouchMouseEnabled(streamReady && touchInputEnabled && state.settings.androidTouch.mousePad)
     }
-    LaunchedEffect(state.settings.androidTouch.mouseDirectClick) {
-        NativeStreamInputRouter.setMouseDirectClick(state.settings.androidTouch.mouseDirectClick)
+    // Gated on touchInputEnabled as well as the setting: finger touches already stop at
+    // setTouchMouseEnabled during PiP, but external mouse and touchpad events reach direct click
+    // through their own path and would otherwise be mapped against the tiny PiP window.
+    LaunchedEffect(state.settings.androidTouch.mouseDirectClick, touchInputEnabled) {
+        NativeStreamInputRouter.setMouseDirectClick(
+            state.settings.androidTouch.mouseDirectClick && touchInputEnabled,
+        )
     }
 
     LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen, touchControlsVisible) {

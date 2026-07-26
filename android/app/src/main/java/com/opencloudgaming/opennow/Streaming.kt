@@ -824,12 +824,26 @@ object NativeStreamInputRouter {
 
     fun attach(next: NativeStreamClient) {
         client = next
+        // A new session is the only event that genuinely invalidates where we think the host's
+        // cursor is. Window resizes and setting changes do not move it.
+        touchMouseState.forgetCursorPosition()
     }
 
     fun detach(next: NativeStreamClient) {
         if (client === next) {
             client = null
+            touchMouseState.forgetCursorPosition()
         }
+    }
+
+    /**
+     * The system interrupted the touch session — entering PiP, or the activity going to background.
+     * Releases any button we are holding so it cannot stick down on the host, and deliberately
+     * leaves the cursor shadow alone: resizing our window does not move the host's cursor, so the
+     * shadow is still correct and re-deriving it would only introduce error.
+     */
+    fun releaseTouchMouseForLifecycle() {
+        touchMouseState.reset(client)
     }
 
     fun setTouchMouseEnabled(enabled: Boolean) {
@@ -2166,6 +2180,131 @@ internal class FirstVideoFrameWatchdog(
     }
 }
 
+/** A point in the stream's own pixel space, as produced by [streamPointForTouch]. */
+internal data class StreamPoint(val x: Float, val y: Float)
+
+/**
+ * Maps a touch inside a view of [viewWidth] x [viewHeight] onto the stream's pixel space, undoing
+ * the letterbox/pillarbox bars the renderer adds whenever the view and the stream disagree about
+ * aspect ratio.
+ *
+ * Everything it needs arrives as an argument, and the result is expressed as a fraction of the
+ * view — which is why a window resize (PiP, rotation, minimise) needs no cursor bookkeeping at all.
+ * The event carries the view size it was measured against, so even a size captured mid-resize maps
+ * that event correctly.
+ */
+internal fun streamPointForTouch(
+    touchX: Float,
+    touchY: Float,
+    viewWidth: Int,
+    viewHeight: Int,
+    streamWidth: Int,
+    streamHeight: Int,
+    stretchToFit: Boolean,
+    renderingAspectRatio: Float,
+): StreamPoint {
+    if (viewWidth <= 0 || viewHeight <= 0 || streamWidth <= 0 || streamHeight <= 0) {
+        return StreamPoint(0f, 0f)
+    }
+
+    var videoWidth = viewWidth.toFloat()
+    var videoHeight = viewHeight.toFloat()
+    var offsetX = 0f
+    var offsetY = 0f
+
+    if (!stretchToFit) {
+        val streamAspectRatio =
+            if (renderingAspectRatio > 0f) renderingAspectRatio else viewAspectOf(streamWidth, streamHeight)
+        val viewAspectRatio = viewAspectOf(viewWidth, viewHeight)
+        if (viewAspectRatio > streamAspectRatio) {
+            // Pillarboxed — bars left and right.
+            videoWidth = viewHeight * streamAspectRatio
+            offsetX = (viewWidth - videoWidth) / 2f
+        } else if (viewAspectRatio < streamAspectRatio) {
+            // Letterboxed — bars top and bottom.
+            videoHeight = viewWidth / streamAspectRatio
+            offsetY = (viewHeight - videoHeight) / 2f
+        }
+    }
+
+    return StreamPoint(
+        x = ((touchX - offsetX) / videoWidth * streamWidth).coerceIn(0f, streamWidth.toFloat()),
+        y = ((touchY - offsetY) / videoHeight * streamHeight).coerceIn(0f, streamHeight.toFloat()),
+    )
+}
+
+private fun viewAspectOf(width: Int, height: Int): Float = width.toFloat() / height.toFloat()
+
+/** A whole-pixel relative move, the only kind the wire format carries. */
+internal data class CursorDelta(val dx: Int, val dy: Int)
+
+/**
+ * Our model of where the host's cursor sits, in stream pixels.
+ *
+ * The protocol has no absolute-positioning packet — [InputEncoder.INPUT_MOUSE_REL] is all there is
+ * — so direct click fakes absolute pointing by remembering where it last put the cursor and sending
+ * the difference to the next tap. The model is only useful while it agrees with reality, which
+ * makes the question "what actually invalidates it?" the whole design:
+ *
+ * - **A new session does.** Nothing else. See [forget].
+ * - **A resolution change rescales it**, it does not void it: the host's cursor keeps the same
+ *   relative position on the resized desktop.
+ * - **Our own window does not.** Entering PiP, rotating, or backgrounding resizes *us*; the host's
+ *   cursor does not budge. Re-deriving the shadow on those events is what made direct click miss
+ *   after PiP — it replaced a correct value with a guess of "centre", and the next tap sent its
+ *   delta from that wrong origin, landing off by however far the cursor really was from centre.
+ *   This class takes no view size at all, so that mistake cannot be made again here.
+ */
+internal class VirtualCursor {
+    private var x = 0f
+    private var y = 0f
+    private var initialized = false
+    private var streamWidth = 0
+    private var streamHeight = 0
+
+    /** Exposed for tests; production code only ever needs [consumeDeltaTo]. */
+    val position: StreamPoint get() = StreamPoint(x, y)
+
+    fun onStreamSize(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        if (!initialized) {
+            // Nothing better than a guess for the first tap of a session; every tap after it
+            // corrects the model, so at worst one tap lands off.
+            x = width / 2f
+            y = height / 2f
+            initialized = true
+        } else if (streamWidth != width || streamHeight != height) {
+            if (streamWidth > 0 && streamHeight > 0) {
+                x = x / streamWidth * width
+                y = y / streamHeight * height
+            }
+        }
+        streamWidth = width
+        streamHeight = height
+    }
+
+    /**
+     * The move to send in order to land on [target], advancing the model by exactly that much —
+     * not by [target]. The two differ by the rounding residue, and assigning [target] would swallow
+     * that residue every event, letting the model random-walk away from the real cursor over a long
+     * drag. Null when the rounded move is zero and there is nothing worth sending.
+     */
+    fun consumeDeltaTo(target: StreamPoint): CursorDelta? {
+        val dx = (target.x - x).roundToInt()
+        val dy = (target.y - y).roundToInt()
+        if (dx == 0 && dy == 0) return null
+        x += dx
+        y += dy
+        return CursorDelta(dx, dy)
+    }
+
+    fun forget() {
+        initialized = false
+        streamWidth = 0
+        streamHeight = 0
+    }
+}
+
 private class TouchMouseState {
     private var activePointerId = -1
     private var downX = 0f
@@ -2178,26 +2317,35 @@ private class TouchMouseState {
     private var lastTapTimeMs = Long.MIN_VALUE
     private var lastTapX = Float.NaN
     private var lastTapY = Float.NaN
-    private var virtualCursorX = 0f
-    private var virtualCursorY = 0f
-    private var virtualCursorInitialized = false
-    private var lastStreamWidth = 0
-    private var lastStreamHeight = 0
-    private var lastViewWidth = 0
-    private var lastViewHeight = 0
+    private val virtualCursor = VirtualCursor()
     private var twoFingerTapCandidate = false
 
+    /**
+     * Tears down the in-flight gesture only. It deliberately does **not** clear the cursor shadow:
+     * every caller (PiP, backgrounding, a setting toggle, a geometry change) alters our window or
+     * our own state, none of which move the host's cursor. Clearing it here was what made direct
+     * click miss after PiP — the next tap re-centred on a guess and sent its delta from the wrong
+     * origin. Use [forgetCursorPosition] for the one case that really does invalidate it.
+     */
     fun reset(client: NativeStreamClient?) {
+        // Correct for both modes now that direct click also maintains `selecting`. Widening this
+        // to `activePointerId >= 0` instead would fire in touchpad mode during an ordinary drag,
+        // where a pointer is tracked but no button is held, sending a spurious release.
         if (selecting) client?.setTouchMouseButton(false)
         activePointerId = -1
         selecting = false
         doubleTapDragCandidate = false
-        virtualCursorInitialized = false
-        lastStreamWidth = 0
-        lastStreamHeight = 0
-        lastViewWidth = 0
-        lastViewHeight = 0
         twoFingerTapCandidate = false
+    }
+
+    /** The host cursor is no longer where we think it is — only true across sessions. */
+    fun forgetCursorPosition() {
+        virtualCursor.forget()
+    }
+
+    private fun moveVirtualCursorTo(target: StreamPoint, client: NativeStreamClient) {
+        val delta = virtualCursor.consumeDeltaTo(target) ?: return
+        client.sendRawMouseMove(delta.dx, delta.dy)
     }
 
     fun handle(
@@ -2217,40 +2365,8 @@ private class TouchMouseState {
         }
 
         if (directClick) {
-            val parts = client.settings.resolution.split("x")
-            val streamWidth = parts.getOrNull(0)?.toIntOrNull() ?: 1920
-            val streamHeight = parts.getOrNull(1)?.toIntOrNull() ?: 1080
-
-            var videoWidth = width.toFloat()
-            var videoHeight = height.toFloat()
-            var offsetX = 0f
-            var offsetY = 0f
-
-            if (!stretchToFit && width > 0 && height > 0) {
-                val streamAspectRatio = if (renderingAspectRatio > 0f) renderingAspectRatio else (streamWidth.toFloat() / streamHeight.toFloat())
-                val screenAspectRatio = width.toFloat() / height.toFloat()
-                if (screenAspectRatio > streamAspectRatio) {
-                    // Pillarboxed (black bars left/right)
-                    videoWidth = height * streamAspectRatio
-                    videoHeight = height.toFloat()
-                    offsetX = (width - videoWidth) / 2f
-                } else if (screenAspectRatio < streamAspectRatio) {
-                    // Letterboxed (black bars top/bottom)
-                    videoWidth = width.toFloat()
-                    videoHeight = width / streamAspectRatio
-                    offsetY = (height - videoHeight) / 2f
-                }
-            }
-
-            if (!virtualCursorInitialized || lastStreamWidth != streamWidth || lastStreamHeight != streamHeight || lastViewWidth != width || lastViewHeight != height) {
-                virtualCursorX = streamWidth / 2f
-                virtualCursorY = streamHeight / 2f
-                virtualCursorInitialized = true
-                lastStreamWidth = streamWidth
-                lastStreamHeight = streamHeight
-                lastViewWidth = width
-                lastViewHeight = height
-            }
+            val (streamWidth, streamHeight) = streamResolutionPixels(client.settings)
+            virtualCursor.onStreamSize(streamWidth, streamHeight)
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -2266,29 +2382,29 @@ private class TouchMouseState {
                         // If we get here the old pointer was lifted without a UP event — reset first.
                         if (activePointerId >= 0) {
                             client.setTouchMouseButton(false)
+                            selecting = false
                         }
 
                         activePointerId = pointerId
-                        val touchX = event.getX(index)
-                        val touchY = event.getY(index)
-                        val rx = touchX - offsetX
-                        val ry = touchY - offsetY
-                        val targetX = if (videoWidth > 0) (rx / videoWidth * streamWidth).coerceIn(0f, streamWidth.toFloat()) else 0f
-                        val targetY = if (videoHeight > 0) (ry / videoHeight * streamHeight).coerceIn(0f, streamHeight.toFloat()) else 0f
-
-                        val dx = targetX - virtualCursorX
-                        val dy = targetY - virtualCursorY
-
-                        val idx = dx.roundToInt()
-                        val idy = dy.roundToInt()
-
-                        if (idx != 0 || idy != 0) {
-                            client.sendRawMouseMove(idx, idy)
-                        }
-                        virtualCursorX = targetX
-                        virtualCursorY = targetY
+                        val target = streamPointForTouch(
+                            touchX = event.getX(index),
+                            touchY = event.getY(index),
+                            viewWidth = width,
+                            viewHeight = height,
+                            streamWidth = streamWidth,
+                            streamHeight = streamHeight,
+                            stretchToFit = stretchToFit,
+                            renderingAspectRatio = renderingAspectRatio,
+                        )
+                        moveVirtualCursorTo(target, client)
 
                         client.setTouchMouseButton(true)
+                        // `selecting` is this class's single record of "we are holding the button
+                        // down on the host". Direct click used to leave it false and track the
+                        // press only through activePointerId, so reset() — which releases on
+                        // `selecting` — could not release it, and backgrounding mid-tap left the
+                        // button stuck down with no event left to clear it.
+                        selecting = true
                     }
                     return true
                 }
@@ -2296,24 +2412,19 @@ private class TouchMouseState {
                     if (activePointerId >= 0) {
                         val index = event.findPointerIndex(activePointerId)
                         if (index >= 0) {
-                            val touchX = event.getX(index)
-                            val touchY = event.getY(index)
-                            val rx = touchX - offsetX
-                            val ry = touchY - offsetY
-                            val targetX = if (videoWidth > 0) (rx / videoWidth * streamWidth).coerceIn(0f, streamWidth.toFloat()) else 0f
-                            val targetY = if (videoHeight > 0) (ry / videoHeight * streamHeight).coerceIn(0f, streamHeight.toFloat()) else 0f
-
-                            val dx = targetX - virtualCursorX
-                            val dy = targetY - virtualCursorY
-
-                            val idx = dx.roundToInt()
-                            val idy = dy.roundToInt()
-
-                            if (idx != 0 || idy != 0) {
-                                client.sendRawMouseMove(idx, idy)
-                            }
-                            virtualCursorX = targetX
-                            virtualCursorY = targetY
+                            moveVirtualCursorTo(
+                                streamPointForTouch(
+                                    touchX = event.getX(index),
+                                    touchY = event.getY(index),
+                                    viewWidth = width,
+                                    viewHeight = height,
+                                    streamWidth = streamWidth,
+                                    streamHeight = streamHeight,
+                                    stretchToFit = stretchToFit,
+                                    renderingAspectRatio = renderingAspectRatio,
+                                ),
+                                client,
+                            )
                         }
                     }
                     return true
@@ -2321,6 +2432,7 @@ private class TouchMouseState {
                 MotionEvent.ACTION_UP -> {
                     // Final pointer lifted — always release the button.
                     client.setTouchMouseButton(false)
+                    selecting = false
                     activePointerId = -1
                     return true
                 }
@@ -2328,12 +2440,14 @@ private class TouchMouseState {
                     val releasedId = event.getPointerId(event.actionIndex)
                     if (releasedId == activePointerId) {
                         client.setTouchMouseButton(false)
+                        selecting = false
                         activePointerId = -1
                     }
                     return true
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     client.setTouchMouseButton(false)
+                    selecting = false
                     activePointerId = -1
                     return true
                 }
