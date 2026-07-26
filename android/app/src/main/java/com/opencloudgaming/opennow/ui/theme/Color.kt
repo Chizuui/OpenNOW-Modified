@@ -44,6 +44,7 @@ object OpenNowPalette {
      * stop disagreeing about what "bad" looks like. Good deliberately has no tint of its own —
      * colouring the normal case just makes the abnormal one harder to spot.
      */
+    val StatusGood = AccentDefault
     val StatusFair = Color(0xffffc95a)
     val StatusPoor = AccentCoral
 

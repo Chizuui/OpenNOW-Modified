@@ -141,6 +141,26 @@
     <string name="stream_statusbar_metric_latency">Dec / Jit</string>
     <string name="stream_statusbar_metric_loss">Loss</string>
 
+    <!-- Session report -->
+    <string name="session_report_score">%1$d/100</string>
+    <string name="session_report_subtitle">%1$s • %2$d quality samples</string>
+    <string name="session_report_connection">Connection</string>
+    <string name="session_report_not_measured">Not measured</string>
+    <string name="session_report_metric_latency">Latency</string>
+    <string name="session_report_metric_speed">Stream speed</string>
+    <string name="session_report_metric_loss">Packet loss</string>
+    <string name="session_report_metric_jitter">Jitter</string>
+    <string name="session_report_metric_fps">Frame rate</string>
+    <string name="session_report_metric_decode">Decode</string>
+    <string name="session_report_ms_avg">%1$d ms avg</string>
+    <string name="session_report_ms_peak">%1$d ms peak</string>
+    <string name="session_report_peak">%1$s peak</string>
+    <string name="session_report_loss_stable">Stable</string>
+    <string name="session_report_loss_affects">May affect clarity</string>
+    <string name="session_report_jitter_detail">Timing variation</string>
+    <string name="session_report_fps_detail">Average / target FPS</string>
+    <string name="session_report_decode_detail">Per video frame</string>
+
     <!-- Exit confirmation -->
     <string name="stream_exit_eyebrow">Session Control</string>
     <string name="stream_exit_title">Exit Stream?</string>
@@ -151,6 +171,7 @@
 
     <!-- Bug reporter -->
     <string name="bug_report_section">Bug reporter</string>
+    <string name="bug_report_dialog_title">Report a bug</string>
     <string name="bug_report_open_label">Report a stream bug</string>
     <string name="bug_report_open_summary">Send an issue and redacted diagnostics</string>
 

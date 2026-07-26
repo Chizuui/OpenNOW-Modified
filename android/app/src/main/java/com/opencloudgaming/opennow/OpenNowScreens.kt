@@ -614,11 +614,12 @@ private fun SessionReportDialog(
     onDismiss: () -> Unit,
     onReportBug: () -> Unit,
 ) {
+    // Four tones for a 0-100 score was more colour than information, and AccentLime vs
+    // AccentDefault is indistinguishable at the 0.12 alpha this fills with.
     val scoreColor = when (report.rating) {
-        SessionReportRating.Excellent -> Green
-        SessionReportRating.Good -> Color(0xffc7ef6b)
-        SessionReportRating.Fair -> Color(0xffffc95a)
-        SessionReportRating.Poor -> Color(0xffff8d7a)
+        SessionReportRating.Excellent, SessionReportRating.Good -> OpenNowPalette.StatusGood
+        SessionReportRating.Fair -> OpenNowPalette.StatusFair
+        SessionReportRating.Poor -> OpenNowPalette.StatusPoor
     }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -632,28 +633,31 @@ private fun SessionReportDialog(
             ) {
                 Surface(
                     color = scoreColor.copy(alpha = 0.12f),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(OpenNowRadius.lg + 2.dp),
                     border = BorderStroke(1.dp, scoreColor.copy(alpha = 0.38f)),
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        modifier = Modifier.fillMaxWidth().padding(OpenNowSpacing.lg),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text(report.gameTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                             Text(
-                                "${formatSessionTimerDuration(report.durationSeconds)} • ${report.sampleCount} quality samples",
+                                stringResource(
+                                    R.string.session_report_subtitle,
+                                    formatSessionTimerDuration(report.durationSeconds),
+                                    report.sampleCount,
+                                ),
                                 color = TextMuted,
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
                         Column(horizontalAlignment = Alignment.End) {
                             Text(
-                                "${report.score}/100",
+                                stringResource(R.string.session_report_score, report.score),
                                 color = scoreColor,
-                                style = MaterialTheme.typography.headlineMedium,
-                                fontWeight = FontWeight.Black,
+                                style = MaterialTheme.typography.headlineMedium.numeric(),
                             )
                             Text(report.rating.label, color = scoreColor, style = MaterialTheme.typography.labelMedium)
                         }
@@ -666,43 +670,53 @@ private fun SessionReportDialog(
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                Text("Connection", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    SessionReportMetric(
-                        label = "Latency",
-                        value = report.averagePingMs?.let { "$it ms avg" } ?: "Not measured",
-                        detail = report.peakPingMs?.let { "$it ms peak" },
-                    )
-                    SessionReportMetric(
-                        label = "Stream speed",
-                        value = formatRuntimeBitrate(report.averageBitrateKbps),
-                        detail = report.peakBitrateKbps?.let { "${formatRuntimeBitrate(it)} peak" },
-                    )
-                    SessionReportMetric(
-                        label = "Packet loss",
-                        value = report.packetLossPct?.let { "%.2f%%".format(Locale.US, it) } ?: "Not measured",
-                        detail = report.packetLossPct?.let { if (it <= 0.5) "Stable" else "May affect clarity" },
-                    )
-                    SessionReportMetric(
-                        label = "Jitter",
-                        value = report.averageJitterMs?.let { "%.1f ms".format(Locale.US, it) } ?: "Not measured",
-                        detail = "Timing variation",
-                    )
-                    SessionReportMetric(
-                        label = "Frame rate",
-                        value = report.averageFps?.let { "%.1f / %d".format(Locale.US, it, report.targetFps) } ?: "Not measured",
-                        detail = "Average / target FPS",
-                    )
-                    SessionReportMetric(
-                        label = "Decode",
-                        value = report.averageDecodeMs?.let { "%.1f ms".format(Locale.US, it) } ?: "Not measured",
-                        detail = "Per video frame",
-                    )
-                }
+                Text(stringResource(R.string.session_report_connection), style = MaterialTheme.typography.titleSmall)
+                SessionReportMetricGrid(
+                    listOf(
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_latency),
+                            value = report.averagePingMs?.let { stringResource(R.string.session_report_ms_avg, it) },
+                            detail = report.peakPingMs?.let { stringResource(R.string.session_report_ms_peak, it) },
+                            quality = report.averagePingMs?.let(StreamQuality::latency),
+                        ),
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_speed),
+                            value = formatRuntimeBitrate(report.averageBitrateKbps),
+                            detail = report.peakBitrateKbps?.let {
+                                stringResource(R.string.session_report_peak, formatRuntimeBitrate(it))
+                            },
+                        ),
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_loss),
+                            value = report.packetLossPct?.let { "%.2f%%".format(Locale.US, it) },
+                            detail = report.packetLossPct?.let {
+                                stringResource(
+                                    if (it <= 0.5) R.string.session_report_loss_stable
+                                    else R.string.session_report_loss_affects,
+                                )
+                            },
+                            quality = report.packetLossPct?.let(StreamQuality::packetLoss),
+                        ),
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_jitter),
+                            value = report.averageJitterMs?.let { "%.1f ms".format(Locale.US, it) },
+                            detail = stringResource(R.string.session_report_jitter_detail),
+                            quality = report.averageJitterMs?.let(StreamQuality::jitter),
+                        ),
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_fps),
+                            value = report.averageFps?.let { "%.1f / %d".format(Locale.US, it, report.targetFps) },
+                            detail = stringResource(R.string.session_report_fps_detail),
+                            quality = report.averageFps?.let { StreamQuality.frameRate(it, report.targetFps) },
+                        ),
+                        SessionReportMetricData(
+                            label = stringResource(R.string.session_report_metric_decode),
+                            value = report.averageDecodeMs?.let { "%.1f ms".format(Locale.US, it) },
+                            detail = stringResource(R.string.session_report_decode_detail),
+                            quality = report.averageDecodeMs?.let { StreamQuality.decode(it, report.targetFps) },
+                        ),
+                    ),
+                )
                 val networkLabel = when (report.networkKind) {
                     AndroidNetworkKind.Wifi -> report.wifiBand.label
                     else -> report.networkKind.label
@@ -768,7 +782,7 @@ private fun CompletedSessionBugReportDialog(
         onDismissRequest = {
             if (!submission.uploading) onDismiss()
         },
-        title = { Text("Report a bug") },
+        title = { Text(stringResource(R.string.bug_report_dialog_title)) },
         text = {
             Column(
                 modifier = Modifier
@@ -785,32 +799,83 @@ private fun CompletedSessionBugReportDialog(
                 )
             }
         },
+        // The reporter owns Submit, so confirmButton stays empty — but without an explicit Close
+        // there was no way out at all while uploading, since onDismissRequest is blocked then too.
         confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !submission.uploading) {
+                Text(stringResource(R.string.action_close))
+            }
+        },
     )
 }
 
+private data class SessionReportMetricData(
+    val label: String,
+    /** Null when the metric was never measured. */
+    val value: String?,
+    val detail: String?,
+    val quality: StreamQualityLevel? = null,
+)
+
+/**
+ * Six cards in an even two- or three-column grid.
+ *
+ * They used to be a FlowRow of fixed 136dp cards, which left a ragged right edge at every width
+ * and, because `value` was unbounded while `detail` was capped at one line, let cards in the same
+ * row end up different heights.
+ */
 @Composable
-private fun SessionReportMetric(
-    label: String,
-    value: String,
-    detail: String?,
-) {
+private fun SessionReportMetricGrid(metrics: List<SessionReportMetricData>) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val columns = if (maxWidth >= 520.dp) 3 else 2
+        Column(verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+            metrics.chunked(columns).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                    row.forEach { metric -> SessionReportMetric(metric, Modifier.weight(1f)) }
+                    // Six items divide evenly into 2 and 3, so this is defensive only.
+                    repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionReportMetric(metric: SessionReportMetricData, modifier: Modifier = Modifier) {
+    val notMeasured = stringResource(R.string.session_report_not_measured)
     Surface(
-        modifier = Modifier.width(136.dp),
+        modifier = modifier,
         color = PanelAlt,
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(OpenNowRadius.md),
     ) {
-        Column(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
-            Text(label, color = TextMuted, style = MaterialTheme.typography.labelSmall)
-            Text(value, color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-            detail?.let { Text(it, color = TextMuted, style = MaterialTheme.typography.labelSmall, maxLines = 1) }
+        // A fixed three-line structure keeps every card the same height without an intrinsics
+        // pass, which would be a second measure inside an already-scrolling dialog.
+        Column(Modifier.padding(horizontal = OpenNowSpacing.md, vertical = 10.dp)) {
+            Text(metric.label, color = TextMuted, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            Text(
+                metric.value ?: notMeasured,
+                color = metric.quality?.tint() ?: TextPrimary,
+                style = MaterialTheme.typography.bodyMedium.numeric(),
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            // Rendered even when absent so the line box is still reserved.
+            Text(
+                metric.detail.orEmpty(),
+                color = TextMuted,
+                style = MaterialTheme.typography.labelSmall.numeric(),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
 
 @Composable
 private fun SessionReportFindingRow(finding: SessionReportFinding) {
-    val titleColor = if (finding.kind == SessionReportFindingKind.Warning) Color(0xffffc95a) else Green
+    val titleColor = if (finding.kind == SessionReportFindingKind.Warning) OpenNowPalette.StatusFair else Green
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(finding.title, color = titleColor, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
         Text(finding.detail, color = TextMuted, style = MaterialTheme.typography.bodySmall)
@@ -7236,7 +7301,7 @@ private fun StreamSessionTimerMenuRow(
 ) {
     val display = sessionTimerDisplay(limit, startedAtMs, nowMs)
     val progressColor = when {
-        display.warning -> Color(0xffffc266)
+        display.warning -> OpenNowPalette.StatusNotice
         else -> MaterialTheme.colorScheme.primary
     }
     Column(
@@ -7254,7 +7319,7 @@ private fun StreamSessionTimerMenuRow(
             }
             Text(
                 display.value,
-                color = if (display.warning) Color(0xffffc266) else TextPrimary,
+                color = if (display.warning) OpenNowPalette.StatusNotice else TextPrimary,
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
@@ -8539,9 +8604,9 @@ private fun BugReportDataDisclosure(
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        color = Color(0xffffc266).copy(alpha = 0.10f),
+        color = OpenNowPalette.StatusNotice.copy(alpha = 0.10f),
         contentColor = TextPrimary,
-        border = BorderStroke(1.dp, Color(0xffffc266).copy(alpha = 0.38f)),
+        border = BorderStroke(1.dp, OpenNowPalette.StatusNotice.copy(alpha = 0.38f)),
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -8549,7 +8614,7 @@ private fun BugReportDataDisclosure(
         ) {
             Text(
                 title,
-                color = Color(0xffffc266),
+                color = OpenNowPalette.StatusNotice,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.labelLarge,
             )
@@ -9506,9 +9571,9 @@ private fun ActiveStreamModePill(
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
-                        color = Color(0xffffc266).copy(alpha = 0.10f),
+                        color = OpenNowPalette.StatusNotice.copy(alpha = 0.10f),
                         contentColor = TextPrimary,
-                        border = BorderStroke(1.dp, Color(0xffffc266).copy(alpha = 0.32f)),
+                        border = BorderStroke(1.dp, OpenNowPalette.StatusNotice.copy(alpha = 0.32f)),
                     ) {
                         Column(
                             modifier = Modifier.padding(12.dp),
@@ -9516,7 +9581,7 @@ private fun ActiveStreamModePill(
                         ) {
                             Text(
                                 text = "Why it happened",
-                                color = Color(0xffffc266),
+                                color = OpenNowPalette.StatusNotice,
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.Bold,
                             )
