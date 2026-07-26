@@ -7,7 +7,6 @@ import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.opencloudgaming.opennow.R
 
@@ -41,68 +40,77 @@ val Inter = FontFamily(
  * Weight and tracking are baked into each style, so call sites stop appending
  * `fontWeight = FontWeight.ExtraBold` by hand — which is how the previous UI ended up with the
  * same visual role rendered at three different weights on three different screens.
+ *
+ * **Every `letterSpacing` here must be `sp`, and every style must set one explicitly.**
+ * `TextUnit` arithmetic throws `IllegalArgumentException: Cannot perform operation for Sp and Em`
+ * when the two operands use different units, and Material components lerp between typography
+ * styles — `OutlinedTextField` animates its label between `bodyLarge` and `bodySmall`, for one.
+ * An earlier revision expressed tracking in `em` but left `titleSmall` and `bodyLarge` on
+ * Material's `sp` defaults, which crashed the Stream settings page the moment a text field with a
+ * label was composed. Material also lerps against its own hardcoded `sp` styles, so `sp`
+ * throughout is the only combination that cannot collide. `TypographyUnitsTest` enforces this.
  */
 val OpenNowTypography = Typography().run {
     copy(
         displayLarge = displayLarge.copy(
             fontFamily = Inter, fontWeight = FontWeight.ExtraBold,
-            fontSize = 44.sp, lineHeight = 50.sp, letterSpacing = (-0.02).em,
+            fontSize = 44.sp, lineHeight = 50.sp, letterSpacing = (-0.88).sp,
         ),
         displayMedium = displayMedium.copy(
             fontFamily = Inter, fontWeight = FontWeight.ExtraBold,
-            fontSize = 36.sp, lineHeight = 42.sp, letterSpacing = (-0.02).em,
+            fontSize = 36.sp, lineHeight = 42.sp, letterSpacing = (-0.72).sp,
         ),
         displaySmall = displaySmall.copy(
             fontFamily = Inter, fontWeight = FontWeight.ExtraBold,
-            fontSize = 30.sp, lineHeight = 36.sp, letterSpacing = (-0.018).em,
+            fontSize = 30.sp, lineHeight = 36.sp, letterSpacing = (-0.54).sp,
         ),
         headlineLarge = headlineLarge.copy(
             fontFamily = Inter, fontWeight = FontWeight.Bold,
-            fontSize = 27.sp, lineHeight = 33.sp, letterSpacing = (-0.014).em,
+            fontSize = 27.sp, lineHeight = 33.sp, letterSpacing = (-0.38).sp,
         ),
         headlineMedium = headlineMedium.copy(
             fontFamily = Inter, fontWeight = FontWeight.Bold,
-            fontSize = 24.sp, lineHeight = 30.sp, letterSpacing = (-0.012).em,
+            fontSize = 24.sp, lineHeight = 30.sp, letterSpacing = (-0.29).sp,
         ),
         headlineSmall = headlineSmall.copy(
             fontFamily = Inter, fontWeight = FontWeight.Bold,
-            fontSize = 22.sp, lineHeight = 28.sp, letterSpacing = (-0.011).em,
+            fontSize = 22.sp, lineHeight = 28.sp, letterSpacing = (-0.24).sp,
         ),
         titleLarge = titleLarge.copy(
             fontFamily = Inter, fontWeight = FontWeight.Bold,
-            fontSize = 19.sp, lineHeight = 25.sp, letterSpacing = (-0.008).em,
+            fontSize = 19.sp, lineHeight = 25.sp, letterSpacing = (-0.15).sp,
         ),
         titleMedium = titleMedium.copy(
             fontFamily = Inter, fontWeight = FontWeight.SemiBold,
-            fontSize = 16.sp, lineHeight = 22.sp, letterSpacing = (-0.004).em,
+            fontSize = 16.sp, lineHeight = 22.sp, letterSpacing = (-0.06).sp,
         ),
         titleSmall = titleSmall.copy(
             fontFamily = Inter, fontWeight = FontWeight.SemiBold,
-            fontSize = 14.sp, lineHeight = 20.sp,
+            fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp,
         ),
         bodyLarge = bodyLarge.copy(
             fontFamily = Inter, fontWeight = FontWeight.Normal,
-            fontSize = 16.sp, lineHeight = 24.sp,
+            fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.5.sp,
         ),
         bodyMedium = bodyMedium.copy(
             fontFamily = Inter, fontWeight = FontWeight.Normal,
-            fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.007.em,
+            fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp,
         ),
         bodySmall = bodySmall.copy(
             fontFamily = Inter, fontWeight = FontWeight.Normal,
-            fontSize = 12.sp, lineHeight = 17.sp, letterSpacing = 0.01.em,
+            fontSize = 12.sp, lineHeight = 17.sp, letterSpacing = 0.12.sp,
         ),
         labelLarge = labelLarge.copy(
             fontFamily = Inter, fontWeight = FontWeight.SemiBold,
-            fontSize = 13.sp, lineHeight = 16.sp, letterSpacing = 0.02.em,
+            fontSize = 13.sp, lineHeight = 16.sp, letterSpacing = 0.26.sp,
         ),
         labelMedium = labelMedium.copy(
             fontFamily = Inter, fontWeight = FontWeight.Medium,
-            fontSize = 12.sp, lineHeight = 15.sp, letterSpacing = 0.025.em,
+            fontSize = 12.sp, lineHeight = 15.sp, letterSpacing = 0.3.sp,
         ),
         labelSmall = labelSmall.copy(
             fontFamily = Inter, fontWeight = FontWeight.Medium,
-            fontSize = 11.sp, lineHeight = 14.sp, letterSpacing = 0.04.em,
+            fontSize = 11.sp, lineHeight = 14.sp, letterSpacing = 0.44.sp,
         ),
     )
 }
