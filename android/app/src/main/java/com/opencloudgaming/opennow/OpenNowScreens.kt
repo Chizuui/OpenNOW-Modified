@@ -260,6 +260,7 @@ import com.opencloudgaming.opennow.ui.theme.OpenNowShapes
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 import com.opencloudgaming.opennow.ui.theme.OpenNowTypography
 import com.opencloudgaming.opennow.ui.theme.numeric
+import com.opencloudgaming.opennow.ui.theme.tint
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -9253,29 +9254,45 @@ private fun StreamStatsPill(
     modifier: Modifier = Modifier,
 ) {
     if (metrics.enabledCount() == 0) return
+    val compact = style == StreamStatsStyle.Compact
     val deviceStatus = rememberCompactStreamDeviceStatus()
     Surface(
-        modifier = modifier.padding(8.dp).widthIn(max = if (style == StreamStatsStyle.Compact) 720.dp else 300.dp),
-        shape = RoundedCornerShape(if (style == StreamStatsStyle.Compact) 999.dp else 16.dp),
+        modifier = modifier
+            .padding(OpenNowSpacing.sm)
+            .widthIn(max = if (compact) 720.dp else 300.dp),
+        shape = RoundedCornerShape(if (compact) OpenNowRadius.full else OpenNowRadius.lg),
+        // Stays genuinely see-through — this one sits over gameplay by design. The hairline is
+        // what keeps its edge readable against a bright frame.
         color = Panel.copy(alpha = 0.52f),
+        border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
         tonalElevation = 0.dp,
     ) {
-        if (style == StreamStatsStyle.Compact) {
+        if (compact) {
             Row(
-                Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                Modifier.padding(horizontal = OpenNowSpacing.md, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus, serverLocation)
             }
         } else {
             FlowRow(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = OpenNowSpacing.md, vertical = OpenNowSpacing.sm),
                 maxItemsInEachRow = 2,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                StreamStatsMetricItems(streamStats, streamSettings, metrics, deviceStatus, serverLocation)
+                StreamStatsMetricItems(
+                    streamStats,
+                    streamSettings,
+                    metrics,
+                    deviceStatus,
+                    serverLocation,
+                    // Two aligned columns instead of a ragged pair of runs.
+                    itemModifier = Modifier.weight(1f),
+                )
             }
         }
     }
@@ -9666,67 +9683,121 @@ private fun StreamStatsMetricItems(
     metrics: StreamStatsMetrics,
     deviceStatus: CompactStreamDeviceStatus,
     serverLocation: String?,
+    /** Applied to every item; the expanded layout passes a weight so its two columns line up. */
+    itemModifier: Modifier = Modifier,
 ) {
+    // The target is what the user asked for; streamStats.fps is what is actually arriving.
+    val targetFps = streamSettings.fps
     if (metrics.fps) {
-        StreamStatsText("FPS ${streamStats.fps?.toString() ?: streamSettings.fps}")
+        val fps = streamStats.fps
+        StreamStatsText(
+            value = "FPS ${fps ?: targetFps}",
+            modifier = itemModifier,
+            quality = fps?.let { StreamQuality.frameRate(it.toDouble(), targetFps) },
+            contentDescription = stringResource(R.string.stream_stats_cd_fps, fps ?: targetFps),
+        )
     }
     if (metrics.ping) {
         val ping = streamStats.pingMs
-        val color = when {
-            ping == null -> TextPrimary
-            ping >= 100 -> Color(0xffff4f4f) // Bright red
-            ping >= 50 -> Color(0xffffa500) // Orange
-            else -> TextPrimary
-        }
-        StreamStatsText("Ping ${ping?.let { "${it}ms" } ?: "--"}", color = color)
+        StreamStatsText(
+            value = stringResource(R.string.stream_stats_ping, ping?.let { "${it}ms" } ?: NO_STAT_VALUE),
+            modifier = itemModifier,
+            quality = ping?.let(StreamQuality::latency),
+            contentDescription = ping?.let { stringResource(R.string.stream_stats_cd_ping, it) },
+        )
     }
     if (metrics.latency) {
-        streamStats.decodeMs?.let {
-            StreamStatsText("Dec %.1fms".format(java.util.Locale.US, it))
+        streamStats.decodeMs?.let { decode ->
+            StreamStatsText(
+                value = stringResource(R.string.stream_stats_decode, "%.1f".format(Locale.US, decode)),
+                modifier = itemModifier,
+                quality = StreamQuality.decode(decode, targetFps),
+                contentDescription = stringResource(R.string.stream_stats_cd_decode, "%.1f".format(Locale.US, decode)),
+            )
         }
-        streamStats.jitterMs?.let {
-            StreamStatsText("Jit %.1fms".format(java.util.Locale.US, it))
+        streamStats.jitterMs?.let { jitter ->
+            StreamStatsText(
+                value = stringResource(R.string.stream_stats_jitter, "%.1f".format(Locale.US, jitter)),
+                modifier = itemModifier,
+                quality = StreamQuality.jitter(jitter),
+                contentDescription = stringResource(R.string.stream_stats_cd_jitter, "%.1f".format(Locale.US, jitter)),
+            )
         }
     }
     if (metrics.packetLoss) {
         streamStats.packetLossPct?.let { loss ->
-            val color = if (loss > 1.0) Color(0xffff4f4f) else TextPrimary
-            StreamStatsText("Loss %.1f%%".format(java.util.Locale.US, loss), color = color)
+            // %.2f, matching the session report — %.1f hid the 0.5% boundary the ladder cares about.
+            val formatted = "%.2f".format(Locale.US, loss)
+            StreamStatsText(
+                value = stringResource(R.string.stream_stats_loss, formatted),
+                modifier = itemModifier,
+                quality = StreamQuality.packetLoss(loss),
+                contentDescription = stringResource(R.string.stream_stats_cd_loss, formatted),
+            )
         }
     }
     if (metrics.bitrate) {
-        StreamStatsText(formatRuntimeBitrate(streamStats.bitrateKbps))
+        StreamStatsText(formatRuntimeBitrate(streamStats.bitrateKbps), modifier = itemModifier)
     }
     if (metrics.battery) {
-        StreamBatteryIndicator(deviceStatus)
+        StreamBatteryIndicator(deviceStatus, itemModifier)
     }
     if (metrics.connection) {
-        StreamNetworkIndicator(deviceStatus)
+        StreamNetworkIndicator(deviceStatus, itemModifier)
     }
     if (metrics.resolution) {
         StreamStatsText(
             streamStats.resolution?.let(::formatRuntimeResolution)
                 ?: formatRuntimeResolution(normalizeStreamResolutionForAspect(streamSettings.resolution, streamSettings.aspectRatio)),
+            modifier = itemModifier,
         )
     }
     if (metrics.codec) {
-        StreamStatsText(streamStats.codec?.takeIf { it.isNotBlank() } ?: streamSettings.codec.name)
+        StreamStatsText(streamStats.codec?.takeIf { it.isNotBlank() } ?: streamSettings.codec.name, modifier = itemModifier)
     }
     if (metrics.location && !serverLocation.isNullOrBlank()) {
         val displayName = serverLocation.removePrefix("NPA-").removePrefix("NP-").uppercase()
-        StreamStatsText(displayName)
+        StreamStatsText(displayName, modifier = itemModifier)
     }
 }
 
+/** Shown in place of a metric that has not been measured yet. */
+private const val NO_STAT_VALUE = "--"
+
 @Composable
-private fun StreamStatsText(value: String, color: Color = TextPrimary) {
+private fun StreamStatsText(
+    value: String,
+    modifier: Modifier = Modifier,
+    quality: StreamQualityLevel? = null,
+    contentDescription: String? = null,
+) {
+    // Colour alone used to carry the warning, which says nothing to a colour-blind user or to
+    // TalkBack. The quality level is spelled out in the description instead.
+    val qualityLabel = quality?.let { stringResource(it.labelRes()) }
+    val describedAs = contentDescription?.let { base ->
+        if (qualityLabel != null) "$base, $qualityLabel" else base
+    }
     Text(
         value,
-        color = color,
-        style = MaterialTheme.typography.labelSmall,
+        modifier = if (describedAs != null) {
+            modifier.semantics { this.contentDescription = describedAs }
+        } else {
+            modifier
+        },
+        color = quality?.tint() ?: TextPrimary,
+        // Tabular figures: without these every value is a different width each tick, so the whole
+        // row reflows roughly once a second.
+        style = MaterialTheme.typography.labelSmall.numeric(),
         fontWeight = FontWeight.SemiBold,
         maxLines = 1,
     )
+}
+
+@StringRes
+private fun StreamQualityLevel.labelRes(): Int = when (this) {
+    StreamQualityLevel.Good -> R.string.stream_quality_good
+    StreamQualityLevel.Fair -> R.string.stream_quality_fair
+    StreamQualityLevel.Poor -> R.string.stream_quality_poor
 }
 
 private data class CompactStreamDeviceStatus(
@@ -9763,12 +9834,12 @@ private fun readCompactStreamDeviceStatus(context: Context): CompactStreamDevice
 }
 
 @Composable
-private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus) {
+private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val description = status.batteryPercent?.let { percent ->
         "Battery $percent percent${if (status.batteryCharging) ", charging" else ""}"
     } ?: "Battery unknown"
     Row(
-        modifier = Modifier.semantics { contentDescription = description },
+        modifier = modifier.semantics { contentDescription = description },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -9788,7 +9859,7 @@ private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus) {
 }
 
 @Composable
-private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus) {
+private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val bars = status.networkBars?.coerceIn(0, 4)
     val label = when (status.networkKind) {
         AndroidNetworkKind.Cellular -> status.cellularGeneration ?: status.networkKind.label
@@ -9801,7 +9872,7 @@ private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus) {
     }
     val description = "${label ?: status.networkKind.label} signal ${bars?.toString() ?: "unknown"} bars"
     Row(
-        modifier = Modifier.semantics { contentDescription = description },
+        modifier = modifier.semantics { contentDescription = description },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

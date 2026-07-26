@@ -57,6 +57,21 @@
     <string name="controller_action_favorite">Favorite</string>
     <string name="controller_action_unfavorite">Unfavorite</string>
     <string name="action_cancel">Cancel</string>
+
+    <!-- In-stream status bar overlay -->
+    <string name="stream_stats_ping">Ping %1$s</string>
+    <string name="stream_stats_decode">Dec %1$sms</string>
+    <string name="stream_stats_jitter">Jit %1$sms</string>
+    <string name="stream_stats_loss">Loss %1$s%%</string>
+    <string name="stream_stats_cd_fps">%1$d frames per second</string>
+    <string name="stream_stats_cd_ping">Ping %1$d milliseconds</string>
+    <string name="stream_stats_cd_decode">Decode time %1$s milliseconds per frame</string>
+    <string name="stream_stats_cd_jitter">Jitter %1$s milliseconds</string>
+    <string name="stream_stats_cd_loss">Packet loss %1$s percent</string>
+    <string name="stream_quality_good">good</string>
+    <string name="stream_quality_fair">fair</string>
+    <string name="stream_quality_poor">poor</string>
+
     <string name="action_dismiss">Dismiss</string>
     <string name="action_play_on_tv">Play on %1$s</string>
     <string name="action_clear_filters">Clear filters</string>
