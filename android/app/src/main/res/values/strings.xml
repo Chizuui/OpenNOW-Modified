@@ -58,6 +58,10 @@
     <string name="controller_action_unfavorite">Unfavorite</string>
     <string name="action_cancel">Cancel</string>
 
+    <!-- Shared settings/stream control rows -->
+    <string name="control_show_description">Show description</string>
+    <string name="control_hide_description">Hide description</string>
+
     <!-- In-stream status bar overlay -->
     <string name="stream_stats_ping">Ping %1$s</string>
     <string name="stream_stats_decode">Dec %1$sms</string>
