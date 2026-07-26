@@ -252,6 +252,15 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.min
 import kotlin.math.floor
+import com.opencloudgaming.opennow.ui.controls.ControlActionRow
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
+import com.opencloudgaming.opennow.ui.controls.ControlRowStyle
+import com.opencloudgaming.opennow.ui.controls.ControlSection
+import com.opencloudgaming.opennow.ui.controls.ControlSectionStyle
+import com.opencloudgaming.opennow.ui.controls.ControlSliderRow
+import com.opencloudgaming.opennow.ui.controls.ControlSwitchRow
+import com.opencloudgaming.opennow.ui.controls.LocalControlRowStyle
+import com.opencloudgaming.opennow.ui.controls.LocalControlSectionStyle
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
@@ -8185,15 +8194,24 @@ private fun StreamControlsPanel(
                     bounds.bottom.roundToInt(),
                 )
             },
-        shape = RoundedCornerShape(18.dp),
-        color = Panel.copy(alpha = 0.93f),
+        shape = RoundedCornerShape(OpenNowRadius.lg + 2.dp),
+        // Firmer than the old 0.93: at that alpha TextMuted did not reliably clear 4.5:1 over
+        // bright gameplay. The hairline keeps the panel's edge visible against a light frame.
+        color = OpenNowPalette.PanelOverVideo,
         contentColor = TextPrimary,
+        border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
         tonalElevation = 6.dp,
     ) {
+        // Every control row inside the panel picks up the denser, over-video styling — and, more
+        // importantly, becomes properly focusable. The panel's own row widgets never were.
+        CompositionLocalProvider(
+            LocalControlRowStyle provides ControlRowStyle.stream(),
+            LocalControlSectionStyle provides ControlSectionStyle.stream(),
+        ) {
         LazyColumn(
             modifier = Modifier.onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
-            contentPadding = PaddingValues(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = PaddingValues(OpenNowSpacing.md + 2.dp),
+            verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
         ) {
             if (page == StreamControlsPage.StatusBar) {
                 item {
@@ -8308,154 +8326,234 @@ private fun StreamControlsPanel(
                 }
             }
             item {
-                StreamPanelSection("Display") {
-                    StreamControlSwitch("Audio", if (audioMuted) "Muted" else "On", !audioMuted) {
-                        onButtonTone()
-                        onAudioToggle()
-                    }
-                    StreamControlNavigation(
-                        "Status bar",
-                        if (!statsVisible) "Off" else "${settings.streamStatsStyle.label} · ${settings.streamStatsMetrics.enabledCount()} items",
-                    ) {
-                        onButtonTone()
-                        page = StreamControlsPage.StatusBar
-                    }
-                    StreamControlSwitch("Stream sharpening", if (settings.stream.streamSharpeningEnabled) "On" else "Off", settings.stream.streamSharpeningEnabled) {
-                        onButtonTone()
-                        onSharpeningToggle()
-                    }
+                ControlSection(stringResource(R.string.stream_panel_section_display)) {
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_audio),
+                        checked = !audioMuted,
+                        onCheckedChange = {
+                            onButtonTone()
+                            onAudioToggle()
+                        },
+                        value = if (audioMuted) stringResource(R.string.stream_panel_audio_muted) else onOffLabel(true),
+                    )
+                    ControlNavigationRow(
+                        label = stringResource(R.string.stream_panel_status_bar),
+                        onClick = {
+                            onButtonTone()
+                            page = StreamControlsPage.StatusBar
+                        },
+                        value = if (!statsVisible) {
+                            onOffLabel(false)
+                        } else {
+                            stringResource(
+                                R.string.stream_panel_status_bar_summary,
+                                settings.streamStatsStyle.label,
+                                settings.streamStatsMetrics.enabledCount(),
+                            )
+                        },
+                    )
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_sharpening),
+                        checked = settings.stream.streamSharpeningEnabled,
+                        onCheckedChange = {
+                            onButtonTone()
+                            onSharpeningToggle()
+                        },
+                        value = onOffLabel(settings.stream.streamSharpeningEnabled),
+                    )
                     if (settings.stream.streamSharpeningEnabled) {
-                        CompactSlider("Sharpness amount", settings.stream.streamSharpeningAmount, 0f, 1f, onSharpeningAmountChange)
+                        ControlSliderRow(
+                            label = stringResource(R.string.stream_panel_sharpening_amount),
+                            value = settings.stream.streamSharpeningAmount,
+                            min = 0f,
+                            max = 1f,
+                            step = SHARPENING_SLIDER_STEP,
+                            onChange = onSharpeningAmountChange,
+                        )
                     }
-                    StreamControlSwitch("Stretch to fit", if (settings.stretchStreamToFit) "On" else "Off", settings.stretchStreamToFit) {
-                        onButtonTone()
-                        onStretchToFitToggle()
-                    }
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_stretch_to_fit),
+                        checked = settings.stretchStreamToFit,
+                        onCheckedChange = {
+                            onButtonTone()
+                            onStretchToFitToggle()
+                        },
+                        value = onOffLabel(settings.stretchStreamToFit),
+                    )
                 }
             }
             item {
-                StreamPanelSection("Input") {
+                ControlSection(stringResource(R.string.stream_panel_section_input)) {
                     if (microphoneRequested) {
-                        StreamControlSwitch(
-                            label = "Microphone",
-                            value = when {
-                                !microphonePermissionGranted -> "Permission required"
-                                microphoneEnabled -> "On"
-                                else -> "Muted"
-                            },
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_microphone),
                             checked = microphoneEnabled && microphonePermissionGranted,
-                        ) {
+                            onCheckedChange = {
+                                onButtonTone()
+                                onMicrophoneToggle()
+                            },
+                            value = when {
+                                !microphonePermissionGranted -> stringResource(R.string.stream_panel_microphone_permission)
+                                microphoneEnabled -> onOffLabel(true)
+                                else -> stringResource(R.string.stream_panel_audio_muted)
+                            },
+                        )
+                    }
+                    ControlActionRow(
+                        label = stringResource(R.string.stream_panel_steam_menu),
+                        actionLabel = stringResource(R.string.action_open),
+                        onClick = {
                             onButtonTone()
-                            onMicrophoneToggle()
-                        }
-                    }
-                    StreamControlAction(
-                        label = "Steam Menu",
-                        value = "Send Home to the streamed PC",
-                        action = "Open",
+                            onSteamMenuOpen()
+                        },
+                        value = stringResource(R.string.stream_panel_steam_menu_summary),
+                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        onButtonTone()
-                        onSteamMenuOpen()
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        OutlinedButton(
-                            onClick = {
-                                onButtonTone()
-                                onEsc()
-                            },
-                            modifier = Modifier.weight(1f),
-                        ) { Text("Esc") }
-                        OutlinedButton(
-                            onClick = {
-                                onButtonTone()
-                                onEnter()
-                            },
-                            modifier = Modifier.weight(1f),
-                        ) { Text("Enter") }
-                        OutlinedButton(
-                            onClick = {
-                                onButtonTone()
-                                onBackspace()
-                            },
-                            modifier = Modifier.weight(1f),
-                        ) { Text("⌫") }
+                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_esc), Modifier.weight(1f)) {
+                            onButtonTone()
+                            onEsc()
+                        }
+                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_enter), Modifier.weight(1f)) {
+                            onButtonTone()
+                            onEnter()
+                        }
+                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_backspace), Modifier.weight(1f)) {
+                            onButtonTone()
+                            onBackspace()
+                        }
                     }
                     if (tvProfile) {
-                        StreamControlSwitch(
-                            "Controller mouse",
-                            if (controllerMouseAssistEnabled) "Right stick · A click · B right-click" else "Off",
-                            controllerMouseAssistEnabled,
-                        ) {
-                            onButtonTone()
-                            onControllerMouseAssistToggle()
-                        }
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_controller_mouse),
+                            checked = controllerMouseAssistEnabled,
+                            onCheckedChange = {
+                                onButtonTone()
+                                onControllerMouseAssistToggle()
+                            },
+                            value = if (controllerMouseAssistEnabled) {
+                                stringResource(R.string.stream_panel_controller_mouse_summary)
+                            } else {
+                                onOffLabel(false)
+                            },
+                        )
                     } else {
-                        StreamControlSwitch("Finger mouse", if (settings.androidTouch.mousePad) "On" else "Off", settings.androidTouch.mousePad) {
-                            onButtonTone()
-                            onMousePadToggle()
-                        }
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_finger_mouse),
+                            checked = settings.androidTouch.mousePad,
+                            onCheckedChange = {
+                                onButtonTone()
+                                onMousePadToggle()
+                            },
+                            value = onOffLabel(settings.androidTouch.mousePad),
+                        )
                         if (settings.androidTouch.mousePad) {
-                            Box(Modifier.padding(start = 24.dp)) {
-                                StreamControlSwitch("Direct click", if (settings.androidTouch.mouseDirectClick) "On" else "Off", settings.androidTouch.mouseDirectClick) {
+                            ControlSwitchRow(
+                                label = stringResource(R.string.stream_panel_direct_click),
+                                checked = settings.androidTouch.mouseDirectClick,
+                                onCheckedChange = {
                                     onButtonTone()
                                     onMouseDirectClickToggle()
-                                }
-                            }
+                                },
+                                value = onOffLabel(settings.androidTouch.mouseDirectClick),
+                                // Reads as a child of Finger mouse; replaces a hand-written Box.
+                                indentLevel = 1,
+                            )
                         }
-                        StreamControlSwitch("Touch controller", if (touchControlsVisible) "Visible" else "Hidden", touchControlsVisible) {
-                            onButtonTone()
-                            onTouchControlsToggle()
-                        }
-                        StreamControlNavigation(
-                            "Joysticks",
-                            when (settings.androidTouch.joystickMode) {
-                                TouchJoystickMode.Fixed -> "Fixed"
-                                TouchJoystickMode.Dynamic -> "Dynamic"
-                            },
-                        ) {
-                            onButtonTone()
-                            page = StreamControlsPage.Joysticks
-                        }
-                        if (touchControlsVisible) {
-                            StreamControlSwitch("Clean style", if (settings.androidTouch.touchControllerStyle == TouchControllerStyle.V2) "On" else "Off", settings.androidTouch.touchControllerStyle == TouchControllerStyle.V2) {
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_touch_controller),
+                            checked = touchControlsVisible,
+                            onCheckedChange = {
                                 onButtonTone()
-                                onToggleTouchControllerStyle()
-                            }
+                                onTouchControlsToggle()
+                            },
+                            value = stringResource(
+                                if (touchControlsVisible) R.string.common_visible else R.string.common_hidden,
+                            ),
+                        )
+                        ControlNavigationRow(
+                            label = stringResource(R.string.stream_panel_joysticks),
+                            onClick = {
+                                onButtonTone()
+                                page = StreamControlsPage.Joysticks
+                            },
+                            value = stringResource(
+                                when (settings.androidTouch.joystickMode) {
+                                    TouchJoystickMode.Fixed -> R.string.stream_panel_joystick_fixed
+                                    TouchJoystickMode.Dynamic -> R.string.stream_panel_joystick_dynamic
+                                },
+                            ),
+                        )
+                        if (touchControlsVisible) {
+                            val cleanStyle = settings.androidTouch.touchControllerStyle == TouchControllerStyle.V2
+                            ControlSwitchRow(
+                                label = stringResource(R.string.stream_panel_clean_style),
+                                checked = cleanStyle,
+                                onCheckedChange = {
+                                    onButtonTone()
+                                    onToggleTouchControllerStyle()
+                                },
+                                value = onOffLabel(cleanStyle),
+                            )
                         }
-                        StreamControlSwitch("Phone rumble fallback", if (settings.phoneRumbleFallback) "On" else "Off", settings.phoneRumbleFallback) {
-                            onButtonTone()
-                            onPhoneRumbleFallbackToggle()
-                        }
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_phone_rumble),
+                            checked = settings.phoneRumbleFallback,
+                            onCheckedChange = {
+                                onButtonTone()
+                                onPhoneRumbleFallbackToggle()
+                            },
+                            value = onOffLabel(settings.phoneRumbleFallback),
+                        )
                     }
                     // Mouse mode (Left stick): shown for all profiles — works with both physical
                     // gamepad and touch controller.
-                    StreamControlSwitch(
-                        "Mouse mode (Left stick)",
-                        if (controllerMouseEmulationEnabled) "L stick moves · A clicks · B right-clicks" else "Off",
-                        controllerMouseEmulationEnabled,
-                    ) {
-                        onButtonTone()
-                        onControllerMouseEmulationToggle()
-                    }
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_mouse_mode),
+                        checked = controllerMouseEmulationEnabled,
+                        onCheckedChange = {
+                            onButtonTone()
+                            onControllerMouseEmulationToggle()
+                        },
+                        value = if (controllerMouseEmulationEnabled) {
+                            stringResource(R.string.stream_panel_mouse_mode_summary)
+                        } else {
+                            onOffLabel(false)
+                        },
+                    )
                 }
             }
             if (!tvProfile) item {
-                StreamPanelSection("Touch Layout") {
-                    StreamControlSwitch("Drag edit mode", if (touchLayoutEditing) "On" else "Off", touchLayoutEditing) {
-                        onButtonTone()
-                        onTouchLayoutEditingToggle()
-                    }
-                    StreamControlAction("Reset touch layout", "Reset positions to default", "Reset") {
-                        onButtonTone()
-                        onTouchLayoutReset()
-                    }
-                    CompactSlider("Layout scale", settings.androidTouch.scale, 0.6f, 1.4f, onTouchScaleChange)
-                    CompactSlider("Button size", settings.androidTouch.buttonScale, 0.65f, 1.5f, onButtonScaleChange)
-                    CompactSlider("Opacity", settings.androidTouch.opacity, 0.15f, 1f, onOpacityChange)
-                    CompactDpSlider("Edge padding", settings.androidTouch.edgePaddingDp, 0f, 72f, onTouchEdgePaddingChange)
-                    CompactDpSlider("Bottom padding", settings.androidTouch.bottomPaddingDp, 0f, 120f, onTouchBottomPaddingChange)
-                    CompactDpSlider("Left position", settings.androidTouch.leftOffsetYDp, -160f, 160f, onTouchLeftOffsetChange)
-                    CompactDpSlider("Right position", settings.androidTouch.rightOffsetYDp, -160f, 160f, onTouchRightOffsetChange)
+                ControlSection(stringResource(R.string.stream_panel_section_touch_layout)) {
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_drag_edit),
+                        checked = touchLayoutEditing,
+                        onCheckedChange = {
+                            onButtonTone()
+                            onTouchLayoutEditingToggle()
+                        },
+                        value = onOffLabel(touchLayoutEditing),
+                    )
+                    ControlActionRow(
+                        label = stringResource(R.string.stream_panel_reset_layout),
+                        actionLabel = stringResource(R.string.action_reset),
+                        onClick = {
+                            onButtonTone()
+                            onTouchLayoutReset()
+                        },
+                        value = stringResource(R.string.stream_panel_reset_layout_summary),
+                    )
+                    // These seven drive the touch overlay live: watching it move while dragging is
+                    // the whole point, so they preview on every frame as well as committing.
+                    TouchLayoutSlider(R.string.stream_panel_layout_scale, settings.androidTouch.scale, 0.6f, 1.4f, TOUCH_SCALE_SLIDER_STEP, onTouchScaleChange)
+                    TouchLayoutSlider(R.string.stream_panel_button_size, settings.androidTouch.buttonScale, 0.65f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onButtonScaleChange)
+                    TouchLayoutSlider(R.string.stream_panel_opacity, settings.androidTouch.opacity, 0.15f, 1f, TOUCH_SCALE_SLIDER_STEP, onOpacityChange)
+                    TouchLayoutSlider(R.string.stream_panel_edge_padding, settings.androidTouch.edgePaddingDp, 0f, 72f, TOUCH_DP_SLIDER_STEP, onTouchEdgePaddingChange, unit = DP_UNIT)
+                    TouchLayoutSlider(R.string.stream_panel_bottom_padding, settings.androidTouch.bottomPaddingDp, 0f, 120f, TOUCH_DP_SLIDER_STEP, onTouchBottomPaddingChange, unit = DP_UNIT)
+                    TouchLayoutSlider(R.string.stream_panel_left_position, settings.androidTouch.leftOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchLeftOffsetChange, unit = DP_UNIT)
+                    TouchLayoutSlider(R.string.stream_panel_right_position, settings.androidTouch.rightOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchRightOffsetChange, unit = DP_UNIT)
                 }
             }
             item {
@@ -8467,6 +8565,7 @@ private fun StreamControlsPanel(
                 )
             }
             }
+        }
         }
     }
     DisposableEffect(Unit) {
@@ -8548,17 +8647,18 @@ private fun StreamBugReporter(
     var consentChecked by rememberSaveable { mutableStateOf(false) }
     var confirmationOpen by rememberSaveable { mutableStateOf(false) }
 
-    StreamPanelSection("Bug reporter") {
+    ControlSection(stringResource(R.string.bug_report_section)) {
         if (!expanded) {
-            StreamControlAction(
-                label = "Report a stream bug",
-                value = "Send an issue and redacted diagnostics",
-                action = "Open",
-            ) {
-                onButtonTone()
-                expanded = true
-            }
-            return@StreamPanelSection
+            ControlActionRow(
+                label = stringResource(R.string.bug_report_open_label),
+                actionLabel = stringResource(R.string.action_open),
+                onClick = {
+                    onButtonTone()
+                    expanded = true
+                },
+                value = stringResource(R.string.bug_report_open_summary),
+            )
+            return@ControlSection
         }
 
         if (submission.submitted) {
@@ -8611,7 +8711,7 @@ private fun StreamBugReporter(
                     }
                 }
             }
-            return@StreamPanelSection
+            return@ControlSection
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -8824,24 +8924,28 @@ private fun JoystickSettingsPage(
                 Text("Back")
             }
             Column(Modifier.weight(1f)) {
-                Text("Joysticks", fontWeight = FontWeight.Bold)
-                Text("Tune the touch analog controls", color = TextMuted, style = MaterialTheme.typography.labelSmall)
+                Text(stringResource(R.string.stream_joysticks_title), fontWeight = FontWeight.Bold)
+                Text(
+                    stringResource(R.string.stream_joysticks_subtitle),
+                    color = TextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
-        StreamControlSwitch(
-            label = "Dynamic placement",
-            value = if (settings.joystickMode == TouchJoystickMode.Dynamic) {
-                "Starts centered beneath your thumb"
-            } else {
-                "Uses the saved fixed center"
+        val dynamic = settings.joystickMode == TouchJoystickMode.Dynamic
+        ControlSwitchRow(
+            label = stringResource(R.string.stream_joysticks_dynamic),
+            checked = dynamic,
+            onCheckedChange = {
+                onButtonTone()
+                onModeToggle()
             },
-            checked = settings.joystickMode == TouchJoystickMode.Dynamic,
-        ) {
-            onButtonTone()
-            onModeToggle()
-        }
-        CompactSlider("Stick size", settings.stickScale, 0.65f, 1.5f, onStickScaleChange)
-        CompactSlider("Dead zone", settings.joystickDeadZone, 0f, 0.3f, onDeadZoneChange)
+            value = stringResource(
+                if (dynamic) R.string.stream_joysticks_dynamic_on else R.string.stream_joysticks_dynamic_off,
+            ),
+        )
+        TouchLayoutSlider(R.string.stream_joysticks_stick_size, settings.stickScale, 0.65f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onStickScaleChange)
+        TouchLayoutSlider(R.string.stream_joysticks_dead_zone, settings.joystickDeadZone, 0f, 0.3f, JOYSTICK_DEAD_ZONE_STEP, onDeadZoneChange)
         Text(
             "Dynamic mode keeps the saved stick area, but treats wherever your thumb first lands as neutral. This avoids sudden movement when you miss the exact center.",
             color = TextMuted,
@@ -8894,25 +8998,54 @@ private fun StatusBarSettingsPage(
                 Text("Back")
             }
             Column(Modifier.weight(1f)) {
-                Text("Status bar", fontWeight = FontWeight.Bold)
-                Text("Choose its layout and information", color = TextMuted, style = MaterialTheme.typography.labelSmall)
+                Text(stringResource(R.string.stream_statusbar_title), fontWeight = FontWeight.Bold)
+                Text(
+                    stringResource(R.string.stream_statusbar_subtitle),
+                    color = TextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
-        StreamControlSwitch("Visible", if (statsVisible) "On" else "Off", statsVisible) {
-            onButtonTone()
-            onStatsToggle()
-        }
+        ControlSwitchRow(
+            label = stringResource(R.string.common_visible),
+            checked = statsVisible,
+            onCheckedChange = {
+                onButtonTone()
+                onStatsToggle()
+            },
+            value = onOffLabel(statsVisible),
+        )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusBarOptionAction("Appearance", settings.streamStatsStyle.label, Modifier.weight(1f)) {
-                onButtonTone()
-                onStatsStyleCycle()
-            }
-            StatusBarOptionAction("Position", settings.streamStatsPosition.label, Modifier.weight(1f)) {
-                onButtonTone()
-                onStatsPositionCycle()
-            }
+            ControlActionRow(
+                label = stringResource(R.string.stream_statusbar_appearance),
+                actionLabel = settings.streamStatsStyle.label,
+                onClick = {
+                    onButtonTone()
+                    onStatsStyleCycle()
+                },
+                modifier = Modifier.weight(1f),
+            )
+            ControlActionRow(
+                label = stringResource(R.string.stream_statusbar_position),
+                actionLabel = settings.streamStatsPosition.label,
+                onClick = {
+                    onButtonTone()
+                    onStatsPositionCycle()
+                },
+                modifier = Modifier.weight(1f),
+            )
         }
-        Text("Items", color = TextMuted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        Text(
+            stringResource(R.string.stream_statusbar_items),
+            color = TextMuted,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        // Ten small toggles side by side; the standard row height would waste the panel.
+        val statusBarMetricStyle = ControlRowStyle.stream().copy(
+            verticalPadding = 6.dp,
+            labelStyle = MaterialTheme.typography.labelMedium,
+        )
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val columns = when {
                 maxWidth >= 800.dp -> 5
@@ -8928,264 +9061,167 @@ private fun StatusBarSettingsPage(
                 horizontalArrangement = Arrangement.spacedBy(gap),
                 verticalArrangement = Arrangement.spacedBy(gap),
             ) {
-                StatusBarMetricSwitch("FPS", metrics.fps, Modifier.width(itemWidth)) {
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_fps),
+                    checked = metrics.fps,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(fps = !metrics.fps))
-                }
-                StatusBarMetricSwitch("Ping", metrics.ping, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_ping),
+                    checked = metrics.ping,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(ping = !metrics.ping))
-                }
-                StatusBarMetricSwitch("Bitrate", metrics.bitrate, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_bitrate),
+                    checked = metrics.bitrate,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(bitrate = !metrics.bitrate))
-                }
-                StatusBarMetricSwitch("Battery", metrics.battery, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_battery),
+                    checked = metrics.battery,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(battery = !metrics.battery))
-                }
-                StatusBarMetricSwitch("Connection", metrics.connection, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_connection),
+                    checked = metrics.connection,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(connection = !metrics.connection))
-                }
-                StatusBarMetricSwitch("Resolution", metrics.resolution, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_resolution),
+                    checked = metrics.resolution,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(resolution = !metrics.resolution))
-                }
-                StatusBarMetricSwitch("Codec", metrics.codec, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_codec),
+                    checked = metrics.codec,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(codec = !metrics.codec))
-                }
-                StatusBarMetricSwitch("Server", metrics.location, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_server),
+                    checked = metrics.location,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(location = !metrics.location))
-                }
-                StatusBarMetricSwitch("Dec / Jit", metrics.latency, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_latency),
+                    checked = metrics.latency,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(latency = !metrics.latency))
-                }
-                StatusBarMetricSwitch("Loss", metrics.packetLoss, Modifier.width(itemWidth)) {
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
+                ControlSwitchRow(
+                    label = stringResource(R.string.stream_statusbar_metric_loss),
+                    checked = metrics.packetLoss,
+                    onCheckedChange = {
                     onButtonTone()
                     onStatsMetricsChange(metrics.copy(packetLoss = !metrics.packetLoss))
-                }
+                    },
+                    modifier = Modifier.width(itemWidth),
+                    style = statusBarMetricStyle,
+                )
             }
         }
     }
 }
 
+/**
+ * The three bare key buttons in the Input section. Extracted so the manual focus-ring pattern the
+ * panel needs lives in one place instead of being repeated per button.
+ */
 @Composable
-private fun StatusBarOptionAction(label: String, value: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
-    Column(
-        modifier
-            .clip(RoundedCornerShape(12.dp))
-            .onFocusChanged { focused = it.isFocused }
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier.onFocusChanged { focused = it.isFocused },
+        border = BorderStroke(
+            width = if (focused) 2.dp else 1.dp,
+            color = if (focused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+        ),
     ) {
-        Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-        Text(value, color = TextMuted, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+        Text(label, maxLines = 1)
     }
 }
 
+/**
+ * A touch-layout slider. Unlike the settings sliders these preview on every drag frame, because
+ * the overlay they are adjusting is on screen underneath the panel and watching it move is the
+ * point of the control.
+ */
 @Composable
-private fun StatusBarMetricSwitch(label: String, checked: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    Row(
-        modifier
-            .clip(RoundedCornerShape(12.dp))
-            .onFocusChanged { focused = it.isFocused }
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-        Switch(checked = checked, onCheckedChange = { onClick() })
-    }
+private fun TouchLayoutSlider(
+    @StringRes labelRes: Int,
+    value: Float,
+    min: Float,
+    max: Float,
+    step: Float,
+    onChange: (Float) -> Unit,
+    unit: String? = null,
+) {
+    ControlSliderRow(
+        label = stringResource(labelRes),
+        value = value,
+        min = min,
+        max = max,
+        step = step,
+        onChange = onChange,
+        onChangePreview = onChange,
+        unit = unit,
+    )
 }
 
+/** "On" / "Off", so the same boolean reads the same way everywhere. */
 @Composable
-private fun StreamPanelSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, color = TextMuted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-        content()
-    }
-}
+private fun onOffLabel(enabled: Boolean): String =
+    stringResource(if (enabled) R.string.common_on else R.string.common_off)
 
-@Composable
-private fun StreamControlSwitch(label: String, value: String, checked: Boolean, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .onFocusChanged { focused = it.isFocused }
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(label, fontWeight = FontWeight.SemiBold)
-            Text(value, color = TextMuted, style = MaterialTheme.typography.labelSmall)
-        }
-        Switch(checked = checked, onCheckedChange = { onClick() })
-    }
-}
-
-@Composable
-private fun StreamControlNavigation(label: String, value: String, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .onFocusChanged { focused = it.isFocused }
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(label, fontWeight = FontWeight.SemiBold)
-            Text(value, color = TextMuted, style = MaterialTheme.typography.labelSmall)
-        }
-        Icon(
-            painter = painterResource(R.drawable.ic_chevron_right),
-            contentDescription = "Open $label options",
-            tint = TextPrimary,
-            modifier = Modifier.size(22.dp),
-        )
-    }
-}
-
-@Composable
-private fun StreamControlAction(label: String, value: String, action: String = "Change", onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .onFocusChanged { focused = it.isFocused }
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(label, fontWeight = FontWeight.SemiBold)
-            Text(value, color = TextMuted, style = MaterialTheme.typography.labelSmall)
-        }
-        Text(action, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
-    }
-}
-
-@Composable
-private fun CompactSlider(label: String, value: Float, min: Float, max: Float, onChange: (Float) -> Unit) {
-    var local by remember(value) { mutableFloatStateOf(value) }
-    val focusManager = LocalFocusManager.current
-    var focused by remember { mutableStateOf(false) }
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = if (focused) 2.dp else 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .padding(horizontal = 12.dp, vertical = 8.dp)
-    ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(label, Modifier.weight(1f))
-            Text("${(local * 100).roundToInt()}%", color = TextMuted)
-        }
-        Slider(
-            modifier = Modifier
-                .onFocusChanged { focused = it.isFocused }
-                .onPreviewKeyEvent {
-                    handleSliderDpadInput(it, local, min, max, 0.05f, focusManager) { newVal ->
-                        local = newVal
-                        onChange(newVal)
-                    }
-                },
-            value = local,
-            onValueChange = {
-                local = it.coerceIn(min, max)
-                onChange(local)
-            },
-            valueRange = min..max,
-        )
-    }
-}
-
-@Composable
-private fun CompactDpSlider(label: String, value: Float, min: Float, max: Float, onChange: (Float) -> Unit) {
-    var local by remember(value) { mutableFloatStateOf(value) }
-    val focusManager = LocalFocusManager.current
-    var focused by remember { mutableStateOf(false) }
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (focused) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.06f))
-            .border(
-                width = if (focused) 2.dp else 1.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .padding(horizontal = 12.dp, vertical = 8.dp)
-    ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(label, Modifier.weight(1f))
-            Text("${local.roundToInt()} dp", color = TextMuted)
-        }
-        Slider(
-            modifier = Modifier
-                .onFocusChanged { focused = it.isFocused }
-                .onPreviewKeyEvent {
-                    handleSliderDpadInput(it, local, min, max, 2f, focusManager) { newVal ->
-                        local = newVal
-                        onChange(newVal)
-                    }
-                },
-            value = local,
-            onValueChange = {
-                local = it.coerceIn(min, max)
-                onChange(local)
-            },
-            valueRange = min..max,
-        )
-    }
-}
+private const val SHARPENING_SLIDER_STEP = 0.05f
+private const val TOUCH_SCALE_SLIDER_STEP = 0.05f
+private const val TOUCH_DP_SLIDER_STEP = 2f
+private const val JOYSTICK_DEAD_ZONE_STEP = 0.01f
+private const val DP_UNIT = "dp"
 
 @Composable
 private fun StreamKeyboardBar(

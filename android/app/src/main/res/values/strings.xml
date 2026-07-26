@@ -58,6 +58,93 @@
     <string name="controller_action_unfavorite">Unfavorite</string>
     <string name="action_cancel">Cancel</string>
 
+    <!-- Reusable state words. One pair each, so the same boolean stops reading "On/Off" in one
+         row and "Visible/Hidden" in the next for no reason. -->
+    <string name="common_on">On</string>
+    <string name="common_off">Off</string>
+    <string name="common_visible">Visible</string>
+    <string name="common_hidden">Hidden</string>
+    <string name="action_back">Back</string>
+    <string name="action_open">Open</string>
+    <string name="action_reset">Reset</string>
+    <string name="action_close">Close</string>
+
+    <!-- In-stream controls panel -->
+    <string name="stream_panel_title">Stream Controls</string>
+    <string name="stream_panel_exit">Exit</string>
+    <string name="stream_panel_done">Done</string>
+    <string name="stream_panel_cd_keyboard">Open keyboard sender</string>
+    <string name="stream_panel_section_display">Display</string>
+    <string name="stream_panel_section_input">Input</string>
+    <string name="stream_panel_section_touch_layout">Touch Layout</string>
+    <string name="stream_panel_audio">Audio</string>
+    <string name="stream_panel_audio_muted">Muted</string>
+    <string name="stream_panel_status_bar">Status bar</string>
+    <string name="stream_panel_status_bar_summary">%1$s · %2$d items</string>
+    <string name="stream_panel_sharpening">Stream sharpening</string>
+    <string name="stream_panel_sharpening_amount">Sharpness amount</string>
+    <string name="stream_panel_stretch_to_fit">Stretch to fit</string>
+    <string name="stream_panel_microphone">Microphone</string>
+    <string name="stream_panel_microphone_permission">Permission required</string>
+    <string name="stream_panel_steam_menu">Steam Menu</string>
+    <string name="stream_panel_steam_menu_summary">Send Home to the streamed PC</string>
+    <string name="stream_panel_key_esc">Esc</string>
+    <string name="stream_panel_key_enter">Enter</string>
+    <string name="stream_panel_key_backspace">⌫</string>
+    <string name="stream_panel_controller_mouse">Controller mouse</string>
+    <string name="stream_panel_controller_mouse_summary">Right stick · A click · B right-click</string>
+    <string name="stream_panel_finger_mouse">Finger mouse</string>
+    <string name="stream_panel_direct_click">Direct click</string>
+    <string name="stream_panel_touch_controller">Touch controller</string>
+    <string name="stream_panel_joysticks">Joysticks</string>
+    <string name="stream_panel_joystick_fixed">Fixed</string>
+    <string name="stream_panel_joystick_dynamic">Dynamic</string>
+    <string name="stream_panel_clean_style">Clean style</string>
+    <string name="stream_panel_phone_rumble">Phone rumble fallback</string>
+    <string name="stream_panel_mouse_mode">Mouse mode (Left stick)</string>
+    <string name="stream_panel_mouse_mode_summary">L stick moves · A clicks · B right-clicks</string>
+    <string name="stream_panel_drag_edit">Drag edit mode</string>
+    <string name="stream_panel_reset_layout">Reset touch layout</string>
+    <string name="stream_panel_reset_layout_summary">Reset positions to default</string>
+    <string name="stream_panel_layout_scale">Layout scale</string>
+    <string name="stream_panel_button_size">Button size</string>
+    <string name="stream_panel_opacity">Opacity</string>
+    <string name="stream_panel_edge_padding">Edge padding</string>
+    <string name="stream_panel_bottom_padding">Bottom padding</string>
+    <string name="stream_panel_left_position">Left position</string>
+    <string name="stream_panel_right_position">Right position</string>
+
+    <!-- Joysticks sub-page -->
+    <string name="stream_joysticks_title">Joysticks</string>
+    <string name="stream_joysticks_subtitle">Tune the touch analog controls</string>
+    <string name="stream_joysticks_dynamic">Dynamic placement</string>
+    <string name="stream_joysticks_dynamic_on">Starts centered beneath your thumb</string>
+    <string name="stream_joysticks_dynamic_off">Uses the saved fixed center</string>
+    <string name="stream_joysticks_stick_size">Stick size</string>
+    <string name="stream_joysticks_dead_zone">Dead zone</string>
+
+    <!-- Status bar sub-page -->
+    <string name="stream_statusbar_title">Status bar</string>
+    <string name="stream_statusbar_subtitle">Choose its layout and information</string>
+    <string name="stream_statusbar_appearance">Appearance</string>
+    <string name="stream_statusbar_position">Position</string>
+    <string name="stream_statusbar_items">Items</string>
+    <string name="stream_statusbar_metric_fps">FPS</string>
+    <string name="stream_statusbar_metric_ping">Ping</string>
+    <string name="stream_statusbar_metric_bitrate">Bitrate</string>
+    <string name="stream_statusbar_metric_battery">Battery</string>
+    <string name="stream_statusbar_metric_connection">Connection</string>
+    <string name="stream_statusbar_metric_resolution">Resolution</string>
+    <string name="stream_statusbar_metric_codec">Codec</string>
+    <string name="stream_statusbar_metric_server">Server</string>
+    <string name="stream_statusbar_metric_latency">Dec / Jit</string>
+    <string name="stream_statusbar_metric_loss">Loss</string>
+
+    <!-- Bug reporter -->
+    <string name="bug_report_section">Bug reporter</string>
+    <string name="bug_report_open_label">Report a stream bug</string>
+    <string name="bug_report_open_summary">Send an issue and redacted diagnostics</string>
+
     <!-- Shared settings/stream control rows -->
     <string name="control_show_description">Show description</string>
     <string name="control_hide_description">Hide description</string>
