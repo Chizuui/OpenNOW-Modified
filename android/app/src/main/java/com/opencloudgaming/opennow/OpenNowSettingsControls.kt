@@ -46,6 +46,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.opencloudgaming.opennow.ui.theme.numeric
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -188,6 +189,37 @@ internal fun SessionProxyWarningDialog(onCancel: () -> Unit, onEnable: () -> Uni
     )
 }
 
+/**
+ * Turns a raw slider value into something readable.
+ *
+ * Every sub-integer slider used to render as `"%.2f"`, so opacity showed `0.75` and card size
+ * showed `1.00` — numbers with no stated unit and no obvious meaning. Fractional 0..1 ranges now
+ * read as percentages, and anything else gets its unit appended.
+ */
+internal fun formatSliderValue(
+    value: Float,
+    min: Float,
+    max: Float,
+    step: Float,
+    unit: String? = null,
+    valueFormatter: ((Float) -> String)? = null,
+): String {
+    valueFormatter?.let { return it(value) }
+    val isFraction = step < 1f
+    val looksLikeRatio = isFraction && min >= 0f && max <= 2f
+    return when {
+        looksLikeRatio && unit == null -> "${(value * 100f).roundToInt()}%"
+        isFraction -> buildString {
+            append("%.2f".format(value))
+            unit?.let { append(' ').append(it) }
+        }
+        else -> buildString {
+            append(value.roundToInt())
+            unit?.let { append(' ').append(it) }
+        }
+    }
+}
+
 @Composable
 internal fun NumberSlider(
     label: String,
@@ -195,6 +227,10 @@ internal fun NumberSlider(
     min: Float,
     max: Float,
     step: Float,
+    /** Appended to the value, e.g. "FPS", "ms", "dp". Ignored when [valueFormatter] is supplied. */
+    unit: String? = null,
+    /** Full control over the readout when neither the percent nor the unit default fits. */
+    valueFormatter: ((Float) -> String)? = null,
     descriptionProvider: ((Float) -> String?)? = null,
     onChange: (Float) -> Unit
 ) {
@@ -218,7 +254,12 @@ internal fun NumberSlider(
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text(if (step < 1f) "%.2f".format(local) else local.roundToInt().toString(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                formatSliderValue(local, min, max, step, unit, valueFormatter),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // Tabular figures so the readout does not reflow while the thumb is being dragged.
+                style = MaterialTheme.typography.labelLarge.numeric(),
+            )
         }
         Slider(
             modifier = Modifier

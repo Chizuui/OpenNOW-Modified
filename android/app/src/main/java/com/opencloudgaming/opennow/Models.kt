@@ -277,6 +277,8 @@ data class AppSettings(
     val tvLayoutProfileVersion: Int = 0,
     val localTvRemoteEnabled: Boolean = false,
     val showGameStoreLabels: Boolean = true,
+    /** Game titles under the poster in the catalog grid. Off makes the grid pure box art. */
+    val showCardTitles: Boolean = true,
     val expressiveUi: Boolean = true,
     val dynamicColor: Boolean = false,
     val uiAccent: UiAccent = UiAccent.OpenNow,
