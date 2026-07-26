@@ -41,6 +41,10 @@ import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -91,6 +95,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -6917,6 +6922,26 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     },
                 )
             }
+            // A wash behind the panel. Backdrop blur is impossible here — the video is a
+            // SurfaceView on its own hardware layer, which neither Modifier.blur nor RenderEffect
+            // can sample across — so separation comes from a gradient plus the panel's own fill.
+            AnimatedVisibility(
+                visible = controlsOpen,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.matchParentSize(),
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0f to Color.Transparent,
+                                1f to OpenNowPalette.StreamScrim,
+                            ),
+                        ),
+                )
+            }
             AnimatedVisibility(
                 visible = controlsOpen,
                 enter = fadeIn() + slideInVertically(initialOffsetY = { it / 4 }) + scaleIn(initialScale = 0.96f),
@@ -8168,9 +8193,7 @@ private fun StreamControlsPanel(
     val doneFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     var page by remember { mutableStateOf(StreamControlsPage.Main) }
-    var keyboardFocused by remember { mutableStateOf(false) }
-    var exitFocused by remember { mutableStateOf(false) }
-    var doneFocused by remember { mutableStateOf(false) }
+    val reduceMotion = LocalReduceMotion.current
     BackHandler(enabled = page != StreamControlsPage.Main) {
         page = StreamControlsPage.Main
     }
@@ -8185,15 +8208,7 @@ private fun StreamControlsPanel(
             .padding(14.dp)
             .fillMaxWidth(0.94f)
             .fillMaxHeight(0.72f)
-            .onGloballyPositioned { coordinates ->
-                val bounds = coordinates.boundsInRoot()
-                NativeStreamInputRouter.setStreamPanelTouchPassthroughBounds(
-                    bounds.left.roundToInt(),
-                    bounds.top.roundToInt(),
-                    bounds.right.roundToInt(),
-                    bounds.bottom.roundToInt(),
-                )
-            },
+            .streamTouchPassthrough(PASSTHROUGH_ID_PANEL),
         shape = RoundedCornerShape(OpenNowRadius.lg + 2.dp),
         // Firmer than the old 0.93: at that alpha TextMuted did not reliably clear 4.5:1 over
         // bright gameplay. The hairline keeps the panel's edge visible against a light frame.
@@ -8208,114 +8223,51 @@ private fun StreamControlsPanel(
             LocalControlRowStyle provides ControlRowStyle.stream(),
             LocalControlSectionStyle provides ControlSectionStyle.stream(),
         ) {
+        Column(Modifier.fillMaxSize()) {
+        // The header is outside the scrolling area now. It used to be the first LazyColumn item,
+        // so it scrolled away and each of the three pages hand-rolled its own copy of it.
+        StreamPanelHeader(
+            page = page,
+            gameTitle = gameTitle,
+            status = status,
+            highlightDone = highlightDone,
+            focusRequester = doneFocusRequester,
+            onBack = { page = StreamControlsPage.Main },
+            onKeyboardOpen = onKeyboardOpen,
+            onExit = onExit,
+            onClose = onClose,
+            onButtonTone = onButtonTone,
+        )
+        AnimatedContent(
+            targetState = page,
+            transitionSpec = { streamPanelPageTransition(initialState, targetState, reduceMotion) },
+            label = "stream-controls-page",
+        ) { currentPage ->
         LazyColumn(
-            modifier = Modifier.onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
+            modifier = Modifier
+                .fillMaxSize()
+                .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
             contentPadding = PaddingValues(OpenNowSpacing.md + 2.dp),
             verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
         ) {
-            if (page == StreamControlsPage.StatusBar) {
-                item {
-                    StatusBarSettingsPage(
-                        settings = settings,
-                        statsVisible = statsVisible,
-                        onStatsToggle = onStatsToggle,
-                        onStatsStyleCycle = onStatsStyleCycle,
-                        onStatsPositionCycle = onStatsPositionCycle,
-                        onStatsMetricsChange = onStatsMetricsChange,
-                        onButtonTone = onButtonTone,
-                        onBack = { page = StreamControlsPage.Main },
-                    )
-                }
-            } else if (page == StreamControlsPage.Joysticks) {
-                item {
-                    JoystickSettingsPage(
-                        settings = settings.androidTouch,
-                        onModeToggle = onJoystickModeToggle,
-                        onDeadZoneChange = onJoystickDeadZoneChange,
-                        onStickScaleChange = onStickScaleChange,
-                        onButtonTone = onButtonTone,
-                        onBack = { page = StreamControlsPage.Main },
-                    )
-                }
-            } else {
-                item {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Stream Controls", fontWeight = FontWeight.Bold)
-                        Text(gameTitle, color = TextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    if (status != null) {
-                        Text(status, color = TextMuted, style = MaterialTheme.typography.labelMedium)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            onButtonTone()
-                            onKeyboardOpen()
-                        },
-                        modifier = Modifier
-                            .onFocusChanged { keyboardFocused = it.isFocused }
-                            .border(
-                                width = 1.dp,
-                                color = if (keyboardFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                shape = ButtonDefaults.outlinedShape
-                            ),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_keyboard),
-                            contentDescription = "Open keyboard sender",
-                            tint = TextPrimary,
-                            modifier = Modifier.size(20.dp),
-                        )
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            onButtonTone()
-                            onExit()
-                        },
-                        modifier = Modifier
-                            .onFocusChanged { exitFocused = it.isFocused }
-                            .border(
-                                width = 1.dp,
-                                color = if (exitFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                shape = ButtonDefaults.outlinedShape
-                            ),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    ) {
-                        Text("Exit")
-                    }
-                    val doneAction = {
-                        onButtonTone()
-                        onClose()
-                    }
-                    val doneModifier = Modifier
-                        .focusRequester(doneFocusRequester)
-                        .onFocusChanged { doneFocused = it.isFocused }
-                        .border(
-                            width = 1.dp,
-                            color = if (doneFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                            shape = ButtonDefaults.outlinedShape
-                        )
-                    if (highlightDone) {
-                        Button(
-                            onClick = doneAction,
-                            modifier = doneModifier,
-                            border = BorderStroke(2.dp, TextPrimary),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        ) {
-                            Text("Done")
-                        }
-                    } else {
-                        OutlinedButton(
-                            onClick = doneAction,
-                            modifier = doneModifier,
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                        ) {
-                            Text("Done")
-                        }
-                    }
-                }
-            }
+            when (currentPage) {
+                StreamControlsPage.StatusBar -> statusBarPageItems(
+                    settings = settings,
+                    statsVisible = statsVisible,
+                    onStatsToggle = onStatsToggle,
+                    onStatsStyleCycle = onStatsStyleCycle,
+                    onStatsPositionCycle = onStatsPositionCycle,
+                    onStatsMetricsChange = onStatsMetricsChange,
+                    onButtonTone = onButtonTone,
+                )
+                StreamControlsPage.Joysticks -> joystickPageItems(
+                    settings = settings.androidTouch,
+                    onModeToggle = onJoystickModeToggle,
+                    onDeadZoneChange = onJoystickDeadZoneChange,
+                    onStickScaleChange = onStickScaleChange,
+                    onButtonTone = onButtonTone,
+                )
+                StreamControlsPage.Main -> {
             if (showSessionTimer) {
                 item {
                     StreamSessionTimerMenuRow(
@@ -8564,10 +8516,13 @@ private fun StreamControlsPanel(
                     onButtonTone = onButtonTone,
                 )
             }
-            }
-        }
-        }
-    }
+                } // StreamControlsPage.Main
+            } // when (currentPage)
+        } // LazyColumn
+        } // AnimatedContent
+        } // Column
+        } // CompositionLocalProvider
+    } // Surface
     DisposableEffect(Unit) {
         onDispose {
             NativeStreamInputRouter.clearStreamPanelTouchPassthroughBounds()
@@ -8630,6 +8585,206 @@ private fun BugReportDataDisclosure(
             )
         }
     }
+}
+
+/**
+ * The one header for all three panel pages. Replaces three hand-rolled Rows that had drifted apart,
+ * and — because it lives outside the scrolling area now — stays put while the page scrolls.
+ */
+/**
+ * Publishes this composable's screen bounds to the native input router so touches landing on it are
+ * treated as UI rather than forwarded into the game.
+ *
+ * Two guards the hand-written version did not have:
+ *  - a zero-size measurement is ignored, instead of publishing a degenerate rect;
+ *  - the rect is inflated slightly, because boundsInRoot() includes graphicsLayer transforms and
+ *    the panel enters under scaleIn(0.96f) — mid-animation it would otherwise under-report and
+ *    leak touches around its edge.
+ *
+ * The caller must keep this on a node whose size does not depend on its content. A content-driven
+ * height would shrink the rect during a transition and leak touches into the game.
+ */
+@Composable
+private fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Modifier {
+    val inflatePx = with(LocalDensity.current) { inflate.roundToPx() }
+    DisposableEffect(id) {
+        onDispose { NativeStreamInputRouter.clearOverlayTouchPassthroughBound(id) }
+    }
+    return onGloballyPositioned { coordinates ->
+        val bounds = coordinates.boundsInRoot()
+        if (bounds.width <= 0f || bounds.height <= 0f) return@onGloballyPositioned
+        NativeStreamInputRouter.setOverlayTouchPassthroughBound(
+            id,
+            bounds.left.roundToInt() - inflatePx,
+            bounds.top.roundToInt() - inflatePx,
+            bounds.right.roundToInt() + inflatePx,
+            bounds.bottom.roundToInt() + inflatePx,
+        )
+    }
+}
+
+private const val PASSTHROUGH_ID_PANEL = "controls-panel"
+private const val PASSTHROUGH_ID_KEYBOARD = "keyboard-bar"
+private const val PASSTHROUGH_ID_EXIT = "exit-confirmation"
+
+@Composable
+private fun StreamPanelHeader(
+    page: StreamControlsPage,
+    gameTitle: String,
+    status: String?,
+    highlightDone: Boolean,
+    focusRequester: FocusRequester,
+    onBack: () -> Unit,
+    onKeyboardOpen: () -> Unit,
+    onExit: () -> Unit,
+    onClose: () -> Unit,
+    onButtonTone: () -> Unit,
+) {
+    val onMain = page == StreamControlsPage.Main
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                start = OpenNowSpacing.md + 2.dp,
+                end = OpenNowSpacing.md + 2.dp,
+                top = OpenNowSpacing.md + 2.dp,
+                bottom = OpenNowSpacing.sm,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
+    ) {
+        if (!onMain) {
+            StreamPanelHeaderButton(
+                onClick = {
+                    onButtonTone()
+                    onBack()
+                },
+                modifier = Modifier.focusRequester(focusRequester),
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_arrow_back),
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(R.string.action_back), maxLines = 1)
+            }
+        }
+        Column(Modifier.weight(1f)) {
+            Text(
+                stringResource(
+                    when (page) {
+                        StreamControlsPage.Main -> R.string.stream_panel_title
+                        StreamControlsPage.StatusBar -> R.string.stream_statusbar_title
+                        StreamControlsPage.Joysticks -> R.string.stream_joysticks_title
+                    },
+                ),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                when (page) {
+                    StreamControlsPage.Main -> gameTitle
+                    StreamControlsPage.StatusBar -> stringResource(R.string.stream_statusbar_subtitle)
+                    StreamControlsPage.Joysticks -> stringResource(R.string.stream_joysticks_subtitle)
+                },
+                color = TextMuted,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (onMain) {
+            if (status != null) {
+                Text(status, color = TextMuted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+            }
+            StreamPanelHeaderButton(
+                onClick = {
+                    onButtonTone()
+                    onKeyboardOpen()
+                },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_keyboard),
+                    contentDescription = stringResource(R.string.stream_panel_cd_keyboard),
+                    tint = TextPrimary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            StreamPanelHeaderButton(
+                onClick = {
+                    onButtonTone()
+                    onExit()
+                },
+            ) {
+                Text(stringResource(R.string.stream_panel_exit), maxLines = 1)
+            }
+            val doneAction = {
+                onButtonTone()
+                onClose()
+            }
+            if (highlightDone) {
+                var doneFocused by remember { mutableStateOf(false) }
+                Button(
+                    onClick = doneAction,
+                    modifier = Modifier
+                        .focusRequester(focusRequester)
+                        .onFocusChanged { doneFocused = it.isFocused },
+                    border = BorderStroke(2.dp, if (doneFocused) MaterialTheme.colorScheme.primary else TextPrimary),
+                    contentPadding = PaddingValues(horizontal = OpenNowSpacing.md, vertical = 6.dp),
+                ) {
+                    Text(stringResource(R.string.stream_panel_done), maxLines = 1)
+                }
+            } else {
+                StreamPanelHeaderButton(onClick = doneAction, modifier = Modifier.focusRequester(focusRequester)) {
+                    Text(stringResource(R.string.stream_panel_done), maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * An outlined button that actually shows a focus ring. OutlinedButton alone gives no visible focus
+ * state here, so the panel used to repeat this onFocusChanged + border pattern per button.
+ */
+@Composable
+private fun StreamPanelHeaderButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable RowScope.() -> Unit,
+) {
+    var focused by remember { mutableStateOf(false) }
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier.onFocusChanged { focused = it.isFocused },
+        border = BorderStroke(
+            width = if (focused) 2.dp else 1.dp,
+            color = if (focused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+        content = content,
+    )
+}
+
+/** Slides forward going into a sub-page and back coming out of one. */
+private fun streamPanelPageTransition(
+    from: StreamControlsPage,
+    to: StreamControlsPage,
+    reduceMotion: Boolean,
+): ContentTransform {
+    if (reduceMotion) {
+        return fadeIn(tween(0)) togetherWith fadeOut(tween(0))
+    }
+    val forward = from == StreamControlsPage.Main && to != StreamControlsPage.Main
+    val duration = OpenNowMotion.DurationStandard
+    val easing = OpenNowMotion.EasingStandard
+    return (
+        slideInHorizontally(tween(duration, easing = easing)) { width -> if (forward) width / 6 else -width / 6 } +
+            fadeIn(tween(duration, easing = easing))
+        ) togetherWith (
+        slideOutHorizontally(tween(duration, easing = easing)) { width -> if (forward) -width / 6 else width / 6 } +
+            fadeOut(tween(OpenNowMotion.DurationFast, easing = easing))
+        )
 }
 
 @Composable
@@ -8884,54 +9039,14 @@ private fun StreamBugReporter(
     }
 }
 
-@Composable
-private fun JoystickSettingsPage(
+private fun LazyListScope.joystickPageItems(
     settings: AndroidTouchSettings,
     onModeToggle: () -> Unit,
     onDeadZoneChange: (Float) -> Unit,
     onStickScaleChange: (Float) -> Unit,
     onButtonTone: () -> Unit,
-    onBack: () -> Unit,
 ) {
-    val backFocusRequester = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        delay(120)
-        runCatching { backFocusRequester.requestFocus() }
-    }
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedButton(
-                onClick = {
-                    onButtonTone()
-                    onBack()
-                },
-                modifier = Modifier.focusRequester(backFocusRequester),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_arrow_back),
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(6.dp))
-                Text("Back")
-            }
-            Column(Modifier.weight(1f)) {
-                Text(stringResource(R.string.stream_joysticks_title), fontWeight = FontWeight.Bold)
-                Text(
-                    stringResource(R.string.stream_joysticks_subtitle),
-                    color = TextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
-        }
+    item {
         val dynamic = settings.joystickMode == TouchJoystickMode.Dynamic
         ControlSwitchRow(
             label = stringResource(R.string.stream_joysticks_dynamic),
@@ -8944,10 +9059,16 @@ private fun JoystickSettingsPage(
                 if (dynamic) R.string.stream_joysticks_dynamic_on else R.string.stream_joysticks_dynamic_off,
             ),
         )
+    }
+    item {
         TouchLayoutSlider(R.string.stream_joysticks_stick_size, settings.stickScale, 0.65f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onStickScaleChange)
+    }
+    item {
         TouchLayoutSlider(R.string.stream_joysticks_dead_zone, settings.joystickDeadZone, 0f, 0.3f, JOYSTICK_DEAD_ZONE_STEP, onDeadZoneChange)
+    }
+    item {
         Text(
-            "Dynamic mode keeps the saved stick area, but treats wherever your thumb first lands as neutral. This avoids sudden movement when you miss the exact center.",
+            stringResource(R.string.stream_joysticks_explainer),
             color = TextMuted,
             style = MaterialTheme.typography.bodySmall,
         )
@@ -8955,8 +9076,7 @@ private fun JoystickSettingsPage(
 }
 
 @OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun StatusBarSettingsPage(
+private fun LazyListScope.statusBarPageItems(
     settings: AppSettings,
     statsVisible: Boolean,
     onStatsToggle: () -> Unit,
@@ -8964,48 +9084,9 @@ private fun StatusBarSettingsPage(
     onStatsPositionCycle: () -> Unit,
     onStatsMetricsChange: (StreamStatsMetrics) -> Unit,
     onButtonTone: () -> Unit,
-    onBack: () -> Unit,
 ) {
-    val backFocusRequester = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        delay(120)
-        runCatching { backFocusRequester.requestFocus() }
-    }
     val metrics = settings.streamStatsMetrics
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedButton(
-                onClick = {
-                    onButtonTone()
-                    onBack()
-                },
-                modifier = Modifier.focusRequester(backFocusRequester),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_arrow_back),
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(6.dp))
-                Text("Back")
-            }
-            Column(Modifier.weight(1f)) {
-                Text(stringResource(R.string.stream_statusbar_title), fontWeight = FontWeight.Bold)
-                Text(
-                    stringResource(R.string.stream_statusbar_subtitle),
-                    color = TextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
-        }
+    item {
         ControlSwitchRow(
             label = stringResource(R.string.common_visible),
             checked = statsVisible,
@@ -9015,7 +9096,9 @@ private fun StatusBarSettingsPage(
             },
             value = onOffLabel(statsVisible),
         )
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    }
+    item {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
             ControlActionRow(
                 label = stringResource(R.string.stream_statusbar_appearance),
                 actionLabel = settings.streamStatsStyle.label,
@@ -9035,12 +9118,16 @@ private fun StatusBarSettingsPage(
                 modifier = Modifier.weight(1f),
             )
         }
+    }
+    item {
         Text(
             stringResource(R.string.stream_statusbar_items),
             color = TextMuted,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,
         )
+    }
+    item {
         // Ten small toggles side by side; the standard row height would waste the panel.
         val statusBarMetricStyle = ControlRowStyle.stream().copy(
             verticalPadding = 6.dp,
@@ -9247,11 +9334,18 @@ private fun StreamKeyboardBar(
         keyboardController?.show()
     }
     Surface(
-        modifier = modifier.fillMaxWidth(),
-        color = Panel.copy(alpha = 0.95f),
+        modifier = modifier
+            .fillMaxWidth()
+            // The keyboard bar registered no passthrough bounds at all, so on a phone every tap on
+            // it — including on the text field — was also forwarded into the game as touch input.
+            .streamTouchPassthrough(PASSTHROUGH_ID_KEYBOARD),
+        // Bottom-anchored, so only the top corners round. It was the one square-cornered overlay.
+        shape = RoundedCornerShape(topStart = OpenNowRadius.lg, topEnd = OpenNowRadius.lg),
+        color = OpenNowPalette.PanelOverVideo,
+        border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
         tonalElevation = 8.dp,
     ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(OpenNowSpacing.md), verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
@@ -10127,35 +10221,66 @@ private fun StreamExitConfirmation(
         delay(80)
         runCatching { keepPlayingFocusRequester.requestFocus() }
     }
+    val scrimInteraction = remember { MutableInteractionSource() }
     Box(
         Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.58f))
-            .clickable(onClick = onKeepPlaying),
+            // The scrim covers everything, so it reports the full screen — otherwise a mis-tap on
+            // "Exit Stream" also lands in the game underneath.
+            .streamTouchPassthrough(PASSTHROUGH_ID_EXIT, inflate = 0.dp)
+            .background(OpenNowPalette.StreamScrim)
+            // indication = null: a full-screen ripple is wrong, and without its own interaction
+            // source the scrim competes with the two buttons for D-pad focus.
+            .clickable(
+                interactionSource = scrimInteraction,
+                indication = null,
+                onClick = onKeepPlaying,
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
             modifier = modifier
-                .padding(24.dp)
-                .fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            color = Panel.copy(alpha = 0.95f),
+                .padding(OpenNowSpacing.xl)
+                .fillMaxWidth()
+                // Unbounded fillMaxWidth made this enormous on a tablet or TV.
+                .widthIn(max = 440.dp),
+            // Same radius as the controls panel, so the two overlays read as one family.
+            shape = RoundedCornerShape(OpenNowRadius.lg + 2.dp),
+            color = OpenNowPalette.PanelOverVideo,
             contentColor = TextPrimary,
+            border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
             tonalElevation = 8.dp,
         ) {
-            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Session Control", color = TextMuted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                Text("Exit Stream?", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text("Do you really want to exit $gameTitle?", color = TextMuted)
-                Text("Your current cloud gaming session will be closed.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(
+                Modifier.padding(OpenNowSpacing.lg + 2.dp),
+                verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
+            ) {
+                Text(
+                    stringResource(R.string.stream_exit_eyebrow),
+                    color = TextMuted,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(stringResource(R.string.stream_exit_title), style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.stream_exit_body, gameTitle), color = TextMuted)
+                Text(
+                    stringResource(R.string.stream_exit_caveat),
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     OutlinedButton(
                         onClick = onKeepPlaying,
                         modifier = Modifier
                             .weight(1f)
                             .focusRequester(keepPlayingFocusRequester),
-                    ) { Text("Keep Playing") }
-                    Button(onClick = onExit, modifier = Modifier.weight(1f)) { Text("Exit Stream") }
+                    ) { Text(stringResource(R.string.stream_exit_keep_playing), maxLines = 1) }
+                    Button(onClick = onExit, modifier = Modifier.weight(1f)) {
+                        Text(stringResource(R.string.stream_exit_confirm), maxLines = 1)
+                    }
                 }
             }
         }

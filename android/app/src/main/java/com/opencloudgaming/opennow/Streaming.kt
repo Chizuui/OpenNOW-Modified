@@ -805,6 +805,14 @@ object NativeStreamInputRouter {
     private var streamChromePassthroughBounds: TouchPassthroughBounds? = null
     @Volatile
     private var streamPanelPassthroughBounds: TouchPassthroughBounds? = null
+    /**
+     * Bounds for transient full-screen or anchored overlays, keyed so they cannot clobber each
+     * other. The keyboard bar, the exit confirmation and the controls launcher can all be present
+     * across the same stream, and a single shared slot meant whichever disposed last wiped the
+     * others' rect and left them forwarding taps into the game.
+     */
+    @Volatile
+    private var overlayPassthroughBounds: Map<String, TouchPassthroughBounds> = emptyMap()
     @Volatile
     private var touchControllerPassthroughBounds: Map<String, TouchPassthroughBounds> = emptyMap()
     @Volatile
@@ -913,6 +921,19 @@ object NativeStreamInputRouter {
 
     fun clearUiTouchPassthroughBounds() {
         streamChromePassthroughBounds = null
+        uiTouchPassthroughActive = false
+        nativeUiTouchPointerIds.clear()
+    }
+
+    fun setOverlayTouchPassthroughBound(id: String, left: Int, top: Int, right: Int, bottom: Int) {
+        overlayPassthroughBounds = overlayPassthroughBounds.toMutableMap().also {
+            it[id] = TouchPassthroughBounds(left, top, right, bottom)
+        }
+    }
+
+    fun clearOverlayTouchPassthroughBound(id: String) {
+        if (id !in overlayPassthroughBounds) return
+        overlayPassthroughBounds = overlayPassthroughBounds.toMutableMap().also { it.remove(id) }
         uiTouchPassthroughActive = false
         nativeUiTouchPointerIds.clear()
     }
@@ -1277,6 +1298,7 @@ object NativeStreamInputRouter {
         val y = event.getY(index)
         return streamChromePassthroughBounds?.contains(x, y) == true ||
             streamPanelPassthroughBounds?.contains(x, y) == true ||
+            overlayPassthroughBounds.values.any { it.contains(x, y) } ||
             touchControllerContains(x, y, width, height)
     }
 
