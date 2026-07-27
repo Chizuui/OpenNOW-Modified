@@ -298,7 +298,8 @@ class GfnApiTest {
         assertEquals("NATIVE", headers["nv-client-type"])
         assertEquals("WINDOWS", headers["nv-device-os"])
         assertEquals("DESKTOP", headers["nv-device-type"])
-        assertTrue(headers["User-Agent"].orEmpty().contains("NVIDIACEFClient"))
+        assertTrue(headers["User-Agent"].orEmpty().contains("GFN-PC/22.0"))
+        assertTrue(headers["User-Agent"].orEmpty().contains("Android"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 

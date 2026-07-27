@@ -72,7 +72,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 private const val GFN_USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173"
+    "GFN-PC/22.0 (Android 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 // User-Agent used by the official GeForce NOW Android client for touch sessions.
 private const val GFN_ANDROID_TOUCH_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-Touch 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
