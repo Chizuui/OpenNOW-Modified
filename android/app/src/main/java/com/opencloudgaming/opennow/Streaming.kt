@@ -1414,6 +1414,13 @@ object NativeStreamInputRouter {
         if (index !in 0 until event.pointerCount) return false
         val x = event.getX(index)
         val y = event.getY(index)
+
+        // Ignore edge swipes to allow system gestures (like back swipe) to propagate instead of being sent to the stream
+        val density = android.content.res.Resources.getSystem().displayMetrics.density
+        val edgeWidthPx = 24f * density
+        val isNearEdge = !androidTvProfile && width > 0 && (x < edgeWidthPx || x > width - edgeWidthPx)
+        if (isNearEdge) return true
+
         return streamChromePassthroughBounds?.contains(x, y) == true ||
             streamPanelPassthroughBounds?.contains(x, y) == true ||
             overlayPassthroughBounds.values.any { it.contains(x, y) } ||

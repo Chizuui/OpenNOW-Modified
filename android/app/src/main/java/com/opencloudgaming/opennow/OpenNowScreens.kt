@@ -6491,7 +6491,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             !showTouchControlsWithPhysicalController
     // The gamepad overlay and native touch want the same fingers. Native touch wins where it
     // applies: the game is showing its own touch UI, so a virtual pad on top of it is in the way.
-    val nativeTouchActive = shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, state.streamGame)
+    val nativeTouchActive = !tvProfile && shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, state.streamGame)
     val touchControlsVisible = shouldShowAndroidTouchControls(
         tvProfile = tvProfile,
         touchInputEnabled = touchInputEnabled,
@@ -6749,7 +6749,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     }
     LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.nativeTouchMode, state.streamGame?.id) {
         val game = state.streamGame
-        val wanted = shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, game)
+        val wanted = !tvProfile && shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, game)
         val enabled = streamReady && touchInputEnabled && wanted
         NativeStreamInputRouter.setNativeTouchEnabled(enabled)
         // Records what the catalog says about this game even when we leave touch off, so the fixed

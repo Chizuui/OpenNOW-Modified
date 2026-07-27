@@ -777,18 +777,20 @@ private fun SettingsContent(
                 NumberSlider("Joystick dead zone", settings.androidTouch.joystickDeadZone, 0f, 0.3f, 0.01f) { value ->
                     viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(joystickDeadZone = value)))
                 }
-                // Sends fingers to the PC as a real touchscreen, so games with a touch mode switch
-                // to it themselves. Auto limits that to games known to react; Always is the escape
-                // hatch for when the built-in list lags behind the catalog.
-                ChoiceMenuRow(
-                    label = "Native touch",
-                    options = NativeTouchMode.entries.map { mode ->
-                        ChoiceMenuOption(value = mode.name, label = nativeTouchModeLabel(mode))
-                    },
-                    selectedLabel = nativeTouchModeLabel(settings.androidTouch.nativeTouchMode),
-                ) { value ->
-                    val mode = NativeTouchMode.entries.firstOrNull { it.name == value } ?: NativeTouchMode.Auto
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(nativeTouchMode = mode)))
+                if (!state.androidTvProfile) {
+                    // Sends fingers to the PC as a real touchscreen, so games with a touch mode switch
+                    // to it themselves. Auto limits that to games known to react; Always is the escape
+                    // hatch for when the built-in list lags behind the catalog.
+                    ChoiceMenuRow(
+                        label = "Native touch",
+                        options = NativeTouchMode.entries.map { mode ->
+                            ChoiceMenuOption(value = mode.name, label = nativeTouchModeLabel(mode))
+                        },
+                        selectedLabel = nativeTouchModeLabel(settings.androidTouch.nativeTouchMode),
+                    ) { value ->
+                        val mode = NativeTouchMode.entries.firstOrNull { it.name == value } ?: NativeTouchMode.Auto
+                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(nativeTouchMode = mode)))
+                    }
                 }
                 SettingSwitch("Finger mouse", settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {

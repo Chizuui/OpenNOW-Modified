@@ -3141,7 +3141,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
      * well-formed touch packets.
      */
     private fun appLaunchModeFor(game: GameInfo?): Int =
-        if (shouldUseNativeTouch(_state.value.settings.androidTouch.nativeTouchMode, game)) {
+        if (!androidTvProfile && shouldUseNativeTouch(_state.value.settings.androidTouch.nativeTouchMode, game)) {
             GfnAppLaunchMode.TOUCH_FRIENDLY
         } else {
             GfnAppLaunchMode.GAMEPAD_FRIENDLY
