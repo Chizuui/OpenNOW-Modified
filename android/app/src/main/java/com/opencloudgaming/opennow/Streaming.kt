@@ -793,6 +793,10 @@ object NativeStreamInputRouter {
     @Volatile
     private var renderingAspectRatio = 0f
     @Volatile
+    private var decodedStreamWidth = 0
+    @Volatile
+    private var decodedStreamHeight = 0
+    @Volatile
     private var captureAllTouch = false
     @Volatile
     private var systemMenuHandler: (() -> Unit)? = null
@@ -836,6 +840,8 @@ object NativeStreamInputRouter {
         // A new session is the only event that genuinely invalidates where we think the host's
         // cursor is. Window resizes and setting changes do not move it.
         touchMouseState.forgetCursorPosition()
+        decodedStreamWidth = 0
+        decodedStreamHeight = 0
     }
 
     fun detach(next: NativeStreamClient) {
@@ -843,6 +849,8 @@ object NativeStreamInputRouter {
             client = null
             touchMouseState.forgetCursorPosition()
             touchSlots.clear()
+            decodedStreamWidth = 0
+            decodedStreamHeight = 0
         }
     }
 
@@ -888,6 +896,13 @@ object NativeStreamInputRouter {
         if (renderingAspectRatio != ratio) {
             renderingAspectRatio = ratio
             touchMouseState.reset(client)
+        }
+    }
+
+    fun setDecodedStreamResolution(width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            decodedStreamWidth = width
+            decodedStreamHeight = height
         }
     }
 
@@ -1065,6 +1080,8 @@ object NativeStreamInputRouter {
             height = height,
             stretchToFit = stretchToFit,
             renderingAspectRatio = renderingAspectRatio,
+            decodedStreamWidth = decodedStreamWidth,
+            decodedStreamHeight = decodedStreamHeight,
         )
     }
 
@@ -2588,6 +2605,13 @@ private class TouchMouseState {
     private var lastTapY = Float.NaN
     private val virtualCursor = VirtualCursor()
     private var twoFingerTapCandidate = false
+    // 2-finger scroll state
+    private var secondPointerId = -1
+    private var secondPointerDownY = 0f
+    private var secondPointerLastY = 0f
+    private var isScrollGesture = false
+    private var scrollAccumulator = 0f
+    private var scrollGestureOccurred = false
 
     /**
      * Tears down the in-flight gesture only. It deliberately does **not** clear the cursor shadow:
@@ -2605,6 +2629,10 @@ private class TouchMouseState {
         selecting = false
         doubleTapDragCandidate = false
         twoFingerTapCandidate = false
+        secondPointerId = -1
+        isScrollGesture = false
+        scrollAccumulator = 0f
+        scrollGestureOccurred = false
     }
 
     /** The host cursor is no longer where we think it is — only true across sessions. */
@@ -2627,6 +2655,8 @@ private class TouchMouseState {
         height: Int = 0,
         stretchToFit: Boolean = false,
         renderingAspectRatio: Float = 0f,
+        decodedStreamWidth: Int = 0,
+        decodedStreamHeight: Int = 0,
     ): Boolean {
         if (!enabled) {
             reset(client)
@@ -2634,7 +2664,9 @@ private class TouchMouseState {
         }
 
         if (directClick) {
-            val (streamWidth, streamHeight) = streamResolutionPixels(client.settings)
+            val settingsRes = streamResolutionPixels(client.settings)
+            val streamWidth = if (decodedStreamWidth > 0) decodedStreamWidth else settingsRes.first
+            val streamHeight = if (decodedStreamHeight > 0) decodedStreamHeight else settingsRes.second
             virtualCursor.onStreamSize(streamWidth, streamHeight)
 
             when (event.actionMasked) {
@@ -2752,6 +2784,12 @@ private class TouchMouseState {
                         }
                         if (nonIgnoredCount == 2) {
                             twoFingerTapCandidate = true
+                            secondPointerId = newPointerId
+                            val secIdx = event.findPointerIndex(newPointerId)
+                            if (secIdx >= 0) {
+                                secondPointerLastY = event.getY(secIdx)
+                                secondPointerDownY = secondPointerLastY
+                            }
                         }
                     }
                 }
@@ -2762,6 +2800,31 @@ private class TouchMouseState {
                     val index = event.firstPointerIndexNotIn(ignoredPointerIds)
                     if (index >= 0) beginPointer(event, index)
                     return index >= 0
+                }
+                // Handle 2-finger scroll
+                if (secondPointerId >= 0) {
+                    val secIdx = event.findPointerIndex(secondPointerId)
+                    if (secIdx >= 0) {
+                        val secY = event.getY(secIdx)
+                        val secDy = secY - secondPointerLastY
+                        secondPointerLastY = secY
+                        if (!isScrollGesture && abs(secY - secondPointerDownY) > SCROLL_START_SLOP_PX) {
+                            isScrollGesture = true
+                            scrollGestureOccurred = true
+                            twoFingerTapCandidate = false
+                            scrollAccumulator = 0f
+                            NativeInputDiagnostics.add("touch scroll start")
+                        }
+                        if (isScrollGesture) {
+                            scrollAccumulator -= secDy
+                            val notches = (scrollAccumulator / SCROLL_PX_PER_NOTCH).toInt()
+                            if (notches != 0) {
+                                client.sendTouchMouseWheel(notches * 120)
+                                scrollAccumulator -= notches * SCROLL_PX_PER_NOTCH
+                            }
+                            return true
+                        }
+                    }
                 }
                 val index = event.findPointerIndex(activePointerId)
                 if (index < 0) return true
@@ -2787,8 +2850,16 @@ private class TouchMouseState {
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 val index = event.actionIndex
-                if (index in 0 until event.pointerCount && event.getPointerId(index) == activePointerId) {
-                    finishPointer(event, index, client)
+                if (index in 0 until event.pointerCount) {
+                    val upId = event.getPointerId(index)
+                    if (upId == secondPointerId) {
+                        secondPointerId = -1
+                        isScrollGesture = false
+                        scrollAccumulator = 0f
+                    }
+                    if (upId == activePointerId) {
+                        finishPointer(event, index, client)
+                    }
                 }
                 return true
             }
@@ -2826,11 +2897,13 @@ private class TouchMouseState {
         val tapDistanceX = abs(x - downX)
         val tapDistanceY = abs(y - downY)
         val wasTap = activePointerId >= 0 &&
+            !scrollGestureOccurred &&
             event.eventTime - downTimeMs <= TOUCH_MOUSE_TAP_TIMEOUT_MS &&
             tapDistanceX <= TOUCH_MOUSE_TAP_SLOP_PX &&
             tapDistanceY <= TOUCH_MOUSE_TAP_SLOP_PX
         activePointerId = -1
         doubleTapDragCandidate = false
+        scrollGestureOccurred = false
         if (selecting) {
             client.setTouchMouseButton(false)
             selecting = false
@@ -2885,6 +2958,8 @@ private class TouchMouseState {
         private const val TOUCH_MOUSE_TAP_TIMEOUT_MS = 450L
         private const val TOUCH_MOUSE_DOUBLE_TAP_TIMEOUT_MS = 320L
         private const val TOUCH_MOUSE_DOUBLE_TAP_SLOP_PX = 36f
+        private const val SCROLL_START_SLOP_PX = 12f
+        private const val SCROLL_PX_PER_NOTCH = 20f
     }
 }
 
@@ -3090,6 +3165,9 @@ class NativeStreamClient(
 
                 override fun onFrameResolutionChanged(videoWidth: Int, videoHeight: Int, rotation: Int) {
                     NativeInputDiagnostics.add("video renderer resolution=${videoWidth}x$videoHeight rotation=$rotation")
+                    if (videoWidth > 0 && videoHeight > 0) {
+                        NativeStreamInputRouter.setDecodedStreamResolution(videoWidth, videoHeight)
+                    }
                 }
             }
             val sharpnessDrawer = if (settings.streamSharpeningEnabled) {
@@ -3595,6 +3673,10 @@ class NativeStreamClient(
             delay(160L)
             sendMouseButton(button = 3, pressed = false, source = "touch mouse right click")
         }
+    }
+
+    fun sendTouchMouseWheel(delta: Int) {
+        sendReliableInput(inputEncoder.encodeMouseWheel(delta))
     }
 
     fun sendKeyCode(keyCode: Int) {
