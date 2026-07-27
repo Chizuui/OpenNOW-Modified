@@ -5329,9 +5329,9 @@ private fun GameDetailsLandscapeContent(
                             .onFocusChanged { dismissFocused = it.isFocused }
                     ) {
                         Text(
-                            "Dismiss", 
+                            "Dismiss",
                             color = if (dismissFocused) accent else TextPrimary,
-                            maxLines = 1, 
+                            maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
@@ -7203,6 +7203,9 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     onOpacityChange = { value ->
                         viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(opacity = value)))
                     },
+                    onMouseScrollSensitivityChange = { value ->
+                        viewModel.updateSettings(state.settings.copy(stream = state.settings.stream.copy(mouseScrollSensitivity = value)))
+                    },
                     onTouchEdgePaddingChange = { value ->
                         viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(edgePaddingDp = value)))
                     },
@@ -8267,6 +8270,7 @@ private fun StreamControlsPanel(
     onButtonScaleChange: (Float) -> Unit,
     onStickScaleChange: (Float) -> Unit,
     onOpacityChange: (Float) -> Unit,
+    onMouseScrollSensitivityChange: (Int) -> Unit,
     onTouchEdgePaddingChange: (Float) -> Unit,
     onTouchBottomPaddingChange: (Float) -> Unit,
     onTouchLeftOffsetChange: (Float) -> Unit,
@@ -8500,6 +8504,29 @@ private fun StreamControlsPanel(
                                 value = onOffLabel(settings.androidTouch.mouseDirectClick),
                                 // Reads as a child of Finger mouse; replaces a hand-written Box.
                                 indentLevel = 1,
+                            )
+
+                            val scrollHint = when {
+                                settings.stream.mouseScrollSensitivity <= 20 -> "Fast"
+                                settings.stream.mouseScrollSensitivity <= 40 -> "Normal"
+                                settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
+                                else -> "Slow"
+                            }
+
+                            ControlActionRow(
+                                label = "Scroll sensitivity",
+                                actionLabel = scrollHint,
+                                onClick = {
+                                    onButtonTone()
+                                    val next = when {
+                                        settings.stream.mouseScrollSensitivity <= 20 -> 40
+                                        settings.stream.mouseScrollSensitivity <= 40 -> 60
+                                        settings.stream.mouseScrollSensitivity <= 60 -> 80
+                                        else -> 20
+                                    }
+                                    onMouseScrollSensitivityChange(next)
+                                },
+                                indentLevel = 1
                             )
                         }
                         ControlSwitchRow(

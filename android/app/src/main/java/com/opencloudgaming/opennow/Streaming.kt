@@ -2816,11 +2816,12 @@ private class TouchMouseState {
                             NativeInputDiagnostics.add("touch scroll start")
                         }
                         if (isScrollGesture) {
+                            val scrollPxPerNotch = client.settings.mouseScrollSensitivity.toFloat().coerceIn(10f, 100f)
                             scrollAccumulator -= secDy
-                            val notches = (scrollAccumulator / SCROLL_PX_PER_NOTCH).toInt()
+                            val notches = (scrollAccumulator / scrollPxPerNotch).toInt()
                             if (notches != 0) {
                                 client.sendTouchMouseWheel(notches * 120)
-                                scrollAccumulator -= notches * SCROLL_PX_PER_NOTCH
+                                scrollAccumulator -= notches * scrollPxPerNotch
                             }
                             return true
                         }
@@ -2959,7 +2960,6 @@ private class TouchMouseState {
         private const val TOUCH_MOUSE_DOUBLE_TAP_TIMEOUT_MS = 320L
         private const val TOUCH_MOUSE_DOUBLE_TAP_SLOP_PX = 36f
         private const val SCROLL_START_SLOP_PX = 12f
-        private const val SCROLL_PX_PER_NOTCH = 20f
     }
 }
 

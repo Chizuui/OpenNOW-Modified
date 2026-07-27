@@ -795,7 +795,27 @@ private fun SettingsContent(
                 SettingSwitch("Finger mouse", settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {
                     Box(Modifier.padding(start = 24.dp)) {
-                        SettingSwitch("Direct click", settings.androidTouch.mouseDirectClick) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseDirectClick = enabled))) }
+                        Column {
+                            SettingSwitch("Direct click", settings.androidTouch.mouseDirectClick) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseDirectClick = enabled))) }
+
+                            val scrollHint = when {
+                                settings.stream.mouseScrollSensitivity <= 20 -> "Very fast"
+                                settings.stream.mouseScrollSensitivity <= 40 -> "Standard"
+                                settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
+                                else -> "Slow"
+                            }
+
+                            NumberSlider(
+                                label = "Mouse scroll sensitivity",
+                                value = settings.stream.mouseScrollSensitivity.toFloat(),
+                                min = 10f,
+                                max = 100f,
+                                step = 5f,
+                                unit = " ($scrollHint)"
+                            ) { value ->
+                                viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value.toInt()) }
+                            }
+                        }
                     }
                 }
                 NumberSlider("Touch layout scale", settings.androidTouch.scale, 0.6f, 1.4f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(scale = value))) }

@@ -182,6 +182,7 @@ data class StreamSettings(
     val streamSharpeningAmount: Float = 0.25f,
     val microphoneMode: MicrophoneMode = MicrophoneMode.Disabled,
     val microphoneDeviceId: String = "",
+    val mouseScrollSensitivity: Int = 30,
 )
 
 internal fun StreamSettings.withMicrophoneSettingsFrom(source: StreamSettings): StreamSettings =
@@ -1776,14 +1777,14 @@ private fun StreamSettings.withoutAndroidTvSharpening(report: RuntimeCodecReport
 private fun StreamSettings.cappedResolution(maxWidth: Int, maxHeight: Int, strict: Boolean = false): StreamSettings {
     val normalized = normalizeStreamResolutionForAspect(resolution, aspectRatio)
     val (width, height) = parseResolutionPixels(normalized)
-    
+
     val fits = if (strict) {
         width <= maxWidth && height <= maxHeight
     } else {
         val maxPixelCount = (maxWidth * maxHeight * DECODER_RESOLUTION_HEADROOM).roundToInt()
         width <= maxWidth * 2 && height <= maxHeight * 2 && (width * height) <= maxPixelCount
     }
-    
+
     if (fits) return copy(resolution = normalized)
 
     val sameAspect = STREAM_RESOLUTION_OPTIONS
