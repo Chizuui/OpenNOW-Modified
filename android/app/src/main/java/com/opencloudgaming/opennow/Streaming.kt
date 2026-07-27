@@ -822,6 +822,15 @@ object NativeStreamInputRouter {
     private val nativeUiTouchPointerIds = mutableSetOf<Int>()
     private val touchMouseState = TouchMouseState()
 
+    /**
+     * When set, fingers are forwarded to the host as real touch instead of being turned into a
+     * cursor. Mutually exclusive with the touch-mouse and direct-click paths by construction:
+     * [dispatchTouch] takes this branch first and returns.
+     */
+    @Volatile
+    private var nativeTouchEnabled = false
+    private val touchSlots = TouchSlotAllocator()
+
     fun attach(next: NativeStreamClient) {
         client = next
         // A new session is the only event that genuinely invalidates where we think the host's
@@ -833,6 +842,7 @@ object NativeStreamInputRouter {
         if (client === next) {
             client = null
             touchMouseState.forgetCursorPosition()
+            touchSlots.clear()
         }
     }
 
@@ -844,6 +854,7 @@ object NativeStreamInputRouter {
      */
     fun releaseTouchMouseForLifecycle() {
         touchMouseState.reset(client)
+        releaseAllNativeTouches()
     }
 
     fun setTouchMouseEnabled(enabled: Boolean) {
@@ -855,6 +866,14 @@ object NativeStreamInputRouter {
 
     fun setMouseDirectClick(enabled: Boolean) {
         mouseDirectClick = enabled
+        touchMouseState.reset(client)
+    }
+
+    fun setNativeTouchEnabled(enabled: Boolean) {
+        if (nativeTouchEnabled == enabled) return
+        nativeTouchEnabled = enabled
+        // Leaving the mode mid-gesture would otherwise strand whatever fingers are down.
+        releaseAllNativeTouches()
         touchMouseState.reset(client)
     }
 
@@ -1002,10 +1021,11 @@ object NativeStreamInputRouter {
 
     fun shouldForwardTouchBeforeViews(event: MotionEvent, width: Int, height: Int): Boolean {
         val isDirectClick = mouseDirectClick && event.isExternalMousePointerEvent()
+        val isNativeTouch = nativeTouchEnabled && event.isFingerTouchEvent()
         if (
             client == null ||
             streamUiActive ||
-            !(touchMouseEnabled || isDirectClick) ||
+            !(touchMouseEnabled || isDirectClick || isNativeTouch) ||
             !captureAllTouch ||
             width <= 0 ||
             height <= 0 ||
@@ -1015,6 +1035,10 @@ object NativeStreamInputRouter {
         }
         updateNativeUiTouchPointers(event, width, height)
         if (!eventHasStreamTouchPointer(event, width, height)) return false
+        // The single-pointer restriction below belongs to the cursor paths, where only one finger
+        // can drive the pointer. Native touch forwards every finger by definition, so a two-finger
+        // gesture reaching this point is the normal case rather than something to hand to the views.
+        if (isNativeTouch) return true
         return event.pointerCount == 1 || nativeUiTouchPointerIds.isNotEmpty()
     }
 
@@ -1028,6 +1052,9 @@ object NativeStreamInputRouter {
         val isDirectClick = mouseDirectClick && event.isExternalMousePointerEvent()
         if (!event.isFingerTouchEvent() && !isDirectClick) return false
         updateNativeUiTouchPointers(event, width, height)
+        if (nativeTouchEnabled && event.isFingerTouchEvent() && width > 0 && height > 0) {
+            return dispatchNativeTouch(event, current, width, height)
+        }
         return touchMouseState.handle(
             event = event,
             enabled = (touchMouseEnabled || isDirectClick) && width > 0 && height > 0,
@@ -1039,6 +1066,83 @@ object NativeStreamInputRouter {
             stretchToFit = stretchToFit,
             renderingAspectRatio = renderingAspectRatio,
         )
+    }
+
+    /**
+     * Forwards every finger as native touch, so the host presents a digitizer and touch-aware games
+     * switch to their own mobile UI. Unlike the cursor paths this keeps no per-gesture state of its
+     * own — the only thing carried across events is the pointer-id to slot mapping.
+     */
+    private fun dispatchNativeTouch(
+        event: MotionEvent,
+        client: NativeStreamClient,
+        width: Int,
+        height: Int,
+    ): Boolean {
+        val phase = when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> TouchPhase.DOWN
+            MotionEvent.ACTION_MOVE -> TouchPhase.MOVE
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> TouchPhase.UP
+            MotionEvent.ACTION_CANCEL -> TouchPhase.CANCEL
+            else -> return false
+        }
+
+        // Android reports which pointer changed only for the down/up actions; a MOVE carries fresh
+        // positions for every finger at once, and all of them belong in the batch.
+        val indices = if (phase == TouchPhase.MOVE || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            0 until event.pointerCount
+        } else {
+            val index = if (event.actionMasked == MotionEvent.ACTION_DOWN) 0 else event.actionIndex
+            index..index
+        }
+
+        val pointers = indices.mapNotNull { index ->
+            if (index !in 0 until event.pointerCount) return@mapNotNull null
+            val pointerId = event.getPointerId(index)
+            // Fingers on our own chrome belong to the overlay, not the game.
+            if (pointerId in nativeUiTouchPointerIds) return@mapNotNull null
+            TouchPointerSample(
+                pointerId = pointerId,
+                x = event.getX(index),
+                y = event.getY(index),
+                radiusX = event.getTouchMajor(index) / 2f,
+                radiusY = event.getTouchMinor(index) / 2f,
+            )
+        }
+        if (pointers.isEmpty()) return false
+
+        val (streamWidth, streamHeight) = streamResolutionPixels(client.settings)
+        val records = buildTouchBatch(
+            allocator = touchSlots,
+            phase = phase,
+            pointers = pointers,
+            viewWidth = width,
+            viewHeight = height,
+            streamWidth = streamWidth,
+            streamHeight = streamHeight,
+            stretchToFit = stretchToFit,
+            renderingAspectRatio = renderingAspectRatio,
+        )
+        if (records.isEmpty()) return false
+        return client.sendNativeTouch(records)
+    }
+
+    /**
+     * Lifts every finger the host still believes is down. Called when touch is turned off or the
+     * session is interrupted, because in neither case will the platform deliver the missing UP.
+     */
+    private fun releaseAllNativeTouches() {
+        val current = client
+        val pointerIds = touchSlots.activePointerIds()
+        if (current != null && pointerIds.isNotEmpty()) {
+            val records = pointerIds.mapNotNull { pointerId ->
+                touchSlots.release(pointerId)?.let { slot ->
+                    TouchRecord(slot = slot, phase = TouchPhase.CANCEL, x = 0, y = 0)
+                }
+            }
+            if (records.isNotEmpty()) current.sendNativeTouch(records)
+        }
+        touchSlots.clear()
     }
 
     fun dispatchExternalMouseTouch(event: MotionEvent, width: Int, height: Int): Boolean {
@@ -2183,6 +2287,156 @@ internal class FirstVideoFrameWatchdog(
 /** A point in the stream's own pixel space, as produced by [streamPointForTouch]. */
 internal data class StreamPoint(val x: Float, val y: Float)
 
+/** Phase of a single finger, as the host expects it on the wire. */
+internal object TouchPhase {
+    const val DOWN = 1
+    const val UP = 2
+    const val MOVE = 4
+    const val CANCEL = 8
+}
+
+/** Touch coordinates travel as an unsigned 16-bit fraction of the video area. */
+internal const val TOUCH_COORDINATE_MAX = 65535
+
+/** The host tracks at most this many fingers at once. */
+internal const val MAX_CONCURRENT_TOUCHES = 8
+
+/** One packet carries at most this many records. */
+internal const val MAX_TOUCH_RECORDS_PER_BATCH = 40
+
+/**
+ * One finger in one packet. [slot] is the host's finger index — deliberately not the platform's
+ * pointer id, see [TouchSlotAllocator].
+ */
+internal data class TouchRecord(
+    val slot: Int,
+    val phase: Int,
+    val x: Int,
+    val y: Int,
+    val radiusX: Int = 0,
+    val radiusY: Int = 0,
+    val timestampUs: Long = 0L,
+)
+
+/**
+ * Maps platform pointer ids onto the small, dense finger indices the host expects.
+ *
+ * Android pointer ids are arbitrary and can climb without bound across a session; the host wants
+ * the lowest free index, reused as soon as a finger lifts. Forwarding pointer ids directly would
+ * make the host see fingers appear at ever-higher indices and eventually run past its own limit.
+ *
+ * Kept free of `MotionEvent` so it can be tested on the JVM.
+ */
+internal class TouchSlotAllocator {
+    private val slotByPointerId = mutableMapOf<Int, Int>()
+    private val usedSlots = mutableSetOf<Int>()
+
+    val activeCount: Int get() = slotByPointerId.size
+
+    /** Slot for [pointerId], allocating the lowest free one. Null when all slots are in use. */
+    fun acquire(pointerId: Int): Int? {
+        slotByPointerId[pointerId]?.let { return it }
+        var slot = 0
+        while (slot in usedSlots) slot++
+        if (slot >= MAX_CONCURRENT_TOUCHES) return null
+        slotByPointerId[pointerId] = slot
+        usedSlots.add(slot)
+        return slot
+    }
+
+    /** Slot for [pointerId] without allocating one. */
+    fun peek(pointerId: Int): Int? = slotByPointerId[pointerId]
+
+    /** Frees the slot held by [pointerId], returning it so the caller can still report the lift. */
+    fun release(pointerId: Int): Int? {
+        val slot = slotByPointerId.remove(pointerId) ?: return null
+        usedSlots.remove(slot)
+        return slot
+    }
+
+    fun activePointerIds(): List<Int> = slotByPointerId.keys.toList()
+
+    fun clear() {
+        slotByPointerId.clear()
+        usedSlots.clear()
+    }
+}
+
+/** One finger as the platform reported it, before any mapping. */
+internal data class TouchPointerSample(
+    val pointerId: Int,
+    val x: Float,
+    val y: Float,
+    val radiusX: Float = 0f,
+    val radiusY: Float = 0f,
+)
+
+/**
+ * Turns one input event's fingers into the records for a single packet.
+ *
+ * Holds every rule that is easy to get subtly wrong — slot allocation, normalising to the video
+ * area, and what to do with a finger that is outside it — and takes no `MotionEvent`, so all of it
+ * is testable on the JVM.
+ */
+internal fun buildTouchBatch(
+    allocator: TouchSlotAllocator,
+    phase: Int,
+    pointers: List<TouchPointerSample>,
+    viewWidth: Int,
+    viewHeight: Int,
+    streamWidth: Int,
+    streamHeight: Int,
+    stretchToFit: Boolean,
+    renderingAspectRatio: Float,
+    timestampUs: Long = 0L,
+): List<TouchRecord> {
+    if (viewWidth <= 0 || viewHeight <= 0 || streamWidth <= 0 || streamHeight <= 0) return emptyList()
+
+    // A lift must always be reported, wherever the finger ended up. Swallowing one leaves the host
+    // holding that finger down for the rest of the session.
+    val lifting = phase == TouchPhase.UP || phase == TouchPhase.CANCEL
+    val records = ArrayList<TouchRecord>(pointers.size)
+
+    for (pointer in pointers) {
+        if (records.size >= MAX_TOUCH_RECORDS_PER_BATCH) break
+
+        val point = streamPointForTouch(
+            touchX = pointer.x,
+            touchY = pointer.y,
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            streamWidth = streamWidth,
+            streamHeight = streamHeight,
+            stretchToFit = stretchToFit,
+            renderingAspectRatio = renderingAspectRatio,
+            clamp = false,
+        )
+        val x = point.x / streamWidth * TOUCH_COORDINATE_MAX
+        val y = point.y / streamHeight * TOUCH_COORDINATE_MAX
+        val radiusX = pointer.radiusX / streamWidth * TOUCH_COORDINATE_MAX
+        val radiusY = pointer.radiusY / streamHeight * TOUCH_COORDINATE_MAX
+
+        val outside = x < -radiusX || x > TOUCH_COORDINATE_MAX + radiusX ||
+            y < -radiusY || y > TOUCH_COORDINATE_MAX + radiusY
+        if (outside && !lifting) continue
+
+        val slot = (
+            if (lifting) allocator.release(pointer.pointerId) else allocator.acquire(pointer.pointerId)
+            ) ?: continue
+
+        records += TouchRecord(
+            slot = slot,
+            phase = phase,
+            x = x.roundToInt().coerceIn(0, TOUCH_COORDINATE_MAX),
+            y = y.roundToInt().coerceIn(0, TOUCH_COORDINATE_MAX),
+            radiusX = pointer.radiusX.roundToInt(),
+            radiusY = pointer.radiusY.roundToInt(),
+            timestampUs = timestampUs,
+        )
+    }
+    return records
+}
+
 /**
  * Maps a touch inside a view of [viewWidth] x [viewHeight] onto the stream's pixel space, undoing
  * the letterbox/pillarbox bars the renderer adds whenever the view and the stream disagree about
@@ -2202,6 +2456,11 @@ internal fun streamPointForTouch(
     streamHeight: Int,
     stretchToFit: Boolean,
     renderingAspectRatio: Float,
+    /**
+     * Clamping is right for a cursor, which must land somewhere. Native touch passes false so it
+     * can tell a finger on the letterbox bar from one at the edge of the picture, and drop it.
+     */
+    clamp: Boolean = true,
 ): StreamPoint {
     if (viewWidth <= 0 || viewHeight <= 0 || streamWidth <= 0 || streamHeight <= 0) {
         return StreamPoint(0f, 0f)
@@ -2227,10 +2486,13 @@ internal fun streamPointForTouch(
         }
     }
 
-    return StreamPoint(
-        x = ((touchX - offsetX) / videoWidth * streamWidth).coerceIn(0f, streamWidth.toFloat()),
-        y = ((touchY - offsetY) / videoHeight * streamHeight).coerceIn(0f, streamHeight.toFloat()),
-    )
+    val x = (touchX - offsetX) / videoWidth * streamWidth
+    val y = (touchY - offsetY) / videoHeight * streamHeight
+    return if (clamp) {
+        StreamPoint(x.coerceIn(0f, streamWidth.toFloat()), y.coerceIn(0f, streamHeight.toFloat()))
+    } else {
+        StreamPoint(x, y)
+    }
 }
 
 private fun viewAspectOf(width: Int, height: Int): Float = width.toFloat() / height.toFloat()
@@ -3176,6 +3438,12 @@ class NativeStreamClient(
             inputEncoder.encodeMouseMove(dx, dy),
             partiallyReliable = partiallyReliable,
         )
+    }
+
+    /** Sends one batch of finger updates. Reliable: a dropped lift leaves a finger stuck down. */
+    internal fun sendNativeTouch(touches: List<TouchRecord>): Boolean {
+        val packet = inputEncoder.encodeTouchBatch(touches) ?: return false
+        return sendReliableInput(packet)
     }
 
     fun sendTouchMouseMove(dx: Int, dy: Int, partiallyReliable: Boolean = true): Boolean {
@@ -5912,6 +6180,53 @@ class InputEncoder {
         return wrapSingle(bytes)
     }
 
+    /**
+     * A batch of finger updates, one packet per input event.
+     *
+     * Layout, taken from the official web client's encoder. Note the opcode is little-endian while
+     * everything after it is big-endian — the same split every other packet here uses.
+     *
+     * ```
+     * 0..3    opcode 24            uint32 LE
+     * 4..5    payload size         uint16 BE   = 8 + 16 * count
+     * 6..7    count                uint16 BE
+     * 8+      records, 16 bytes each:
+     *           +0     slot        uint8
+     *           +1     phase       uint8       1=down 2=up 4=move 8=cancel
+     *           +2..3  x           uint16 BE   0..65535 across the video area
+     *           +4..5  y           uint16 BE
+     *           +6     radiusX     uint8
+     *           +7     radiusY     uint8
+     *           +8..15 timestamp   int64 BE    microseconds
+     * ```
+     *
+     * Returns null for an empty batch so callers cannot send a header describing nothing.
+     */
+    internal fun encodeTouchBatch(touches: List<TouchRecord>, nowUs: Long = timestampUs()): ByteArray? {
+        if (touches.isEmpty()) return null
+        val count = minOf(touches.size, MAX_TOUCH_RECORDS_PER_BATCH)
+        val payloadSize = 8 + 16 * count
+        val bytes = ByteArray(payloadSize)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(INPUT_TOUCH)
+        val be = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+        be.putShort(4, payloadSize.toShort())
+        be.putShort(6, count.toShort())
+        for (index in 0 until count) {
+            val touch = touches[index]
+            val offset = 8 + 16 * index
+            bytes[offset] = touch.slot.toByte()
+            bytes[offset + 1] = touch.phase.toByte()
+            be.putShort(offset + 2, touch.x.coerceIn(0, TOUCH_COORDINATE_MAX).toShort())
+            be.putShort(offset + 4, touch.y.coerceIn(0, TOUCH_COORDINATE_MAX).toShort())
+            bytes[offset + 6] = touch.radiusX.coerceIn(0, 255).toByte()
+            bytes[offset + 7] = touch.radiusY.coerceIn(0, 255).toByte()
+            // 0 means "stamp it here", so the router does not have to reach for the same clock
+            // every other packet in this encoder uses.
+            be.putLong(offset + 8, if (touch.timestampUs != 0L) touch.timestampUs else nowUs)
+        }
+        return wrapSingle(bytes, nowUs)
+    }
+
     fun encodeHapticsEnabled(enabled: Boolean): ByteArray {
         val bytes = ByteArray(6)
         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(INPUT_HAPTICS_ENABLED)
@@ -5963,11 +6278,11 @@ class InputEncoder {
         return wrapSingle(bytes)
     }
 
-    private fun wrapSingle(payload: ByteArray): ByteArray {
+    private fun wrapSingle(payload: ByteArray, nowUs: Long = timestampUs()): ByteArray {
         if (protocolVersion <= 2) return payload
         return ByteArray(10 + payload.size).also {
             it[0] = 0x23
-            ByteBuffer.wrap(it).order(ByteOrder.BIG_ENDIAN).putLong(1, timestampUs())
+            ByteBuffer.wrap(it).order(ByteOrder.BIG_ENDIAN).putLong(1, nowUs)
             it[9] = 0x22
             payload.copyInto(it, 10)
         }
@@ -6038,6 +6353,12 @@ class InputEncoder {
         const val INPUT_MOUSE_WHEEL = 10
         const val INPUT_GAMEPAD = 12
         const val INPUT_HAPTICS_ENABLED = 13
+
+        /**
+         * Native multi-touch. The host turns these into a Windows digitizer, which is what makes
+         * touch-aware games switch to their mobile UI on their own.
+         */
+        const val INPUT_TOUCH = 24
 
         fun mapKeyEvent(event: KeyEvent): KeyboardPayload? {
             if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) return null

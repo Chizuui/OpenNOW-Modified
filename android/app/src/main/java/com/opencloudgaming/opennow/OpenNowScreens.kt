@@ -6489,12 +6489,15 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
         physicalControllerConnected &&
             state.settings.androidTouch.enabled &&
             !showTouchControlsWithPhysicalController
+    // The gamepad overlay and native touch want the same fingers. Native touch wins where it
+    // applies: the game is showing its own touch UI, so a virtual pad on top of it is in the way.
+    val nativeTouchActive = shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, state.streamGame)
     val touchControlsVisible = shouldShowAndroidTouchControls(
         tvProfile = tvProfile,
         touchInputEnabled = touchInputEnabled,
         touchControlsEnabled = state.settings.androidTouch.enabled,
         suppressedByPhysicalController = touchControlsSuppressedByPhysicalController,
-    )
+    ) && !nativeTouchActive
     val fallbackSessionStartedAtMs = remember(session?.sessionId) { System.currentTimeMillis() }
     val sessionStartedAtMs = session?.timerStartedAtMs ?: fallbackSessionStartedAtMs
     var timerNowMs by remember(session?.sessionId) { mutableStateOf(System.currentTimeMillis()) }
@@ -6729,8 +6732,12 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
         }
     }
 
-    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad) {
-        NativeStreamInputRouter.setTouchMouseEnabled(streamReady && touchInputEnabled && state.settings.androidTouch.mousePad)
+    // Also gated on nativeTouchActive: dispatchTouch would take the native branch first anyway, but
+    // leaving two input modes both flagged "enabled" is how they end up fighting later.
+    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, nativeTouchActive) {
+        NativeStreamInputRouter.setTouchMouseEnabled(
+            streamReady && touchInputEnabled && state.settings.androidTouch.mousePad && !nativeTouchActive,
+        )
     }
     // Gated on touchInputEnabled as well as the setting: finger touches already stop at
     // setTouchMouseEnabled during PiP, but external mouse and touchpad events reach direct click
@@ -6740,12 +6747,23 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             state.settings.androidTouch.mouseDirectClick && touchInputEnabled,
         )
     }
+    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.nativeTouchMode, state.streamGame?.id) {
+        val game = state.streamGame
+        val wanted = shouldUseNativeTouch(state.settings.androidTouch.nativeTouchMode, game)
+        val enabled = streamReady && touchInputEnabled && wanted
+        NativeStreamInputRouter.setNativeTouchEnabled(enabled)
+        // Records what the catalog says about this game even when we leave touch off, so the fixed
+        // list in NativeTouchGames.kt can be filled in — and eventually retired — from real data.
+        if (game != null && streamReady) {
+            NativeInputDiagnostics.add(nativeTouchDiagnostics(game, enabled))
+        }
+    }
 
-    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen, touchControlsVisible) {
+    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, nativeTouchActive, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen, touchControlsVisible) {
         NativeStreamInputRouter.setCaptureAllTouch(
             streamReady &&
                 touchInputEnabled &&
-                state.settings.androidTouch.mousePad &&
+                (state.settings.androidTouch.mousePad || nativeTouchActive) &&
                 !controlsOpen &&
                 !exitConfirmOpen &&
                 !keyboardOpen &&

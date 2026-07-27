@@ -205,6 +205,19 @@ enum class TouchJoystickMode {
 @Serializable
 data class TouchOffset(val x: Float = 0f, val y: Float = 0f)
 
+/**
+ * Whether fingers are forwarded to the host as real touch rather than turned into a cursor.
+ *
+ * [Auto] limits it to games known to react to a touch device, which is the whole feature for most
+ * people. The other two exist because that list is maintained by hand and will lag reality.
+ */
+@Serializable
+enum class NativeTouchMode {
+    Auto,
+    Off,
+    Always,
+}
+
 @Serializable
 data class AndroidTouchSettings(
     val enabled: Boolean = true,
@@ -222,6 +235,7 @@ data class AndroidTouchSettings(
     val rightOffsetXDp: Float = 0f,
     val rightOffsetYDp: Float = 0f,
     val mouseDirectClick: Boolean = false,
+    val nativeTouchMode: NativeTouchMode = NativeTouchMode.Auto,
     val offsets: Map<String, TouchOffset> = mapOf(
         "lstick_landscape" to TouchOffset(-67.02336f, 1.4236208f),
         "l3_landscape" to TouchOffset(-159.65048f, 119.79623f),
