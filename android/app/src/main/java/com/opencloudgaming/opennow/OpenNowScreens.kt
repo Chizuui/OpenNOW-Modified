@@ -6857,6 +6857,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
             StreamVideoSurface(
                 client = client,
                 settings = streamSettings,
+                androidTouch = state.settings.androidTouch,
                 decodedResolution = streamStats.resolution,
                 serverNegotiatedResolution = session.negotiatedStreamProfile?.resolution,
                 hideExternalMousePointer = externalMousePassthroughActive,
@@ -7210,6 +7211,12 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     onMouseScrollSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value) }
                     },
+                    onNativeTouchScrollScaleChange = { value ->
+                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(nativeTouchScrollScale = value)))
+                    },
+                    onNativeTouchJitterThresholdChange = { value ->
+                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(nativeTouchJitterThresholdDp = value)))
+                    },
                     onTouchEdgePaddingChange = { value ->
                         viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(edgePaddingDp = value)))
                     },
@@ -7395,6 +7402,7 @@ private fun formatSessionWarningThreshold(thresholdSeconds: Int): String {
 private fun StreamVideoSurface(
     client: NativeStreamClient,
     settings: StreamSettings,
+    androidTouch: AndroidTouchSettings,
     decodedResolution: String?,
     serverNegotiatedResolution: String?,
     hideExternalMousePointer: Boolean,
@@ -7476,6 +7484,15 @@ private fun StreamVideoSurface(
         settings.streamSharpeningAmount,
     ) {
         client.updateRendererSettings(settings)
+    }
+    LaunchedEffect(
+        androidTouch.nativeTouchScrollScale,
+        androidTouch.nativeTouchJitterThresholdDp,
+    ) {
+        NativeStreamInputRouter.setNativeTouchSettings(
+            scrollScale = androidTouch.nativeTouchScrollScale,
+            jitterThresholdDp = androidTouch.nativeTouchJitterThresholdDp,
+        )
     }
     DisposableEffect(client, rootView, pointerRootView, hideExternalMousePointer) {
         pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
@@ -8286,6 +8303,8 @@ private fun StreamControlsPanel(
     onOpacityChange: (Float) -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
+    onNativeTouchScrollScaleChange: (Float) -> Unit,
+    onNativeTouchJitterThresholdChange: (Float) -> Unit,
     onTouchEdgePaddingChange: (Float) -> Unit,
     onTouchBottomPaddingChange: (Float) -> Unit,
     onTouchLeftOffsetChange: (Float) -> Unit,
@@ -8380,6 +8399,8 @@ private fun StreamControlsPanel(
                     onControllerMouseEmulationToggle = onControllerMouseEmulationToggle,
                     onMouseSensitivityChange = onMouseSensitivityChange,
                     onMouseScrollSensitivityChange = onMouseScrollSensitivityChange,
+                    onNativeTouchScrollScaleChange = onNativeTouchScrollScaleChange,
+                    onNativeTouchJitterThresholdChange = onNativeTouchJitterThresholdChange,
                     onButtonTone = onButtonTone,
                 )
                 StreamControlsPage.Main -> {
@@ -9220,6 +9241,8 @@ private fun LazyListScope.mouseModePageItems(
     onControllerMouseEmulationToggle: () -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
+    onNativeTouchScrollScaleChange: (Float) -> Unit,
+    onNativeTouchJitterThresholdChange: (Float) -> Unit,
     onButtonTone: () -> Unit,
 ) {
     item {
@@ -9263,7 +9286,39 @@ private fun LazyListScope.mouseModePageItems(
             )
         }
     }
+    if (settings.androidTouch.nativeTouchMode != NativeTouchMode.Off) {
+        item {
+            val scrollSpeedLabel = when {
+                settings.androidTouch.nativeTouchScrollScale <= 0.5f -> "Very slow"
+                settings.androidTouch.nativeTouchScrollScale <= 0.8f -> "Slow"
+                settings.androidTouch.nativeTouchScrollScale <= 1.2f -> "Normal"
+                settings.androidTouch.nativeTouchScrollScale <= 1.6f -> "Fast"
+                else -> "Very fast"
+            }
+            ControlSliderRow(
+                label = "Touch scroll speed",
+                value = settings.androidTouch.nativeTouchScrollScale,
+                min = 0.25f,
+                max = 2.0f,
+                step = 0.05f,
+                onChange = onNativeTouchScrollScaleChange,
+                descriptionProvider = { scrollSpeedLabel }
+            )
+        }
+        item {
+            ControlSliderRow(
+                label = "Touch tap stability",
+                value = settings.androidTouch.nativeTouchJitterThresholdDp,
+                min = 0f,
+                max = 24f,
+                step = 1f,
+                onChange = onNativeTouchJitterThresholdChange,
+                valueFormatter = { "${it.toInt()}dp" }
+            )
+        }
+    }
 }
+
 
 @OptIn(ExperimentalLayoutApi::class)
 private fun LazyListScope.statusBarPageItems(

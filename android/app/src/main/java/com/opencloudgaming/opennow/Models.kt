@@ -237,6 +237,17 @@ data class AndroidTouchSettings(
     val rightOffsetYDp: Float = 0f,
     val mouseDirectClick: Boolean = false,
     val nativeTouchMode: NativeTouchMode = NativeTouchMode.Auto,
+    /**
+     * Scales the velocity of touch movement in native touch mode. Values below 1.0 slow down
+     * scroll/swipe gestures; values above 1.0 speed them up. Default 1.0 = no scaling.
+     */
+    val nativeTouchScrollScale: Float = 1.0f,
+    /**
+     * Minimum movement in dp before a MOVE event is forwarded in native touch mode.
+     * Suppresses small sensor jitter that can look like a micro-swipe instead of a tap.
+     * Default 8dp matches ViewConfiguration.getScaledTouchSlop() on most devices.
+     */
+    val nativeTouchJitterThresholdDp: Float = 8f,
     val offsets: Map<String, TouchOffset> = mapOf(
         "lstick_landscape" to TouchOffset(-67.02336f, 1.4236208f),
         "l3_landscape" to TouchOffset(-159.65048f, 119.79623f),

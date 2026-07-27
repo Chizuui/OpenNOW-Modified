@@ -834,6 +834,14 @@ object NativeStreamInputRouter {
     @Volatile
     private var nativeTouchEnabled = false
     private val touchSlots = TouchSlotAllocator()
+    /**
+     * Tracks the initial DOWN position per pointer ID for jitter guard in native touch mode.
+     * Entries are added on DOWN and removed on UP/CANCEL.
+     */
+    private val nativeTouchDownPoints = mutableMapOf<Int, Pair<Float, Float>>()
+    /** Native touch settings synced from [AndroidTouchSettings]. */
+    @Volatile private var nativeTouchScrollScale: Float = 1.0f
+    @Volatile private var nativeTouchJitterThresholdPx: Float = 0f
 
     fun attach(next: NativeStreamClient) {
         client = next
@@ -882,7 +890,14 @@ object NativeStreamInputRouter {
         nativeTouchEnabled = enabled
         // Leaving the mode mid-gesture would otherwise strand whatever fingers are down.
         releaseAllNativeTouches()
+        nativeTouchDownPoints.clear()
         touchMouseState.reset(client)
+    }
+
+    fun setNativeTouchSettings(scrollScale: Float, jitterThresholdDp: Float) {
+        val density = android.content.res.Resources.getSystem().displayMetrics.density
+        nativeTouchScrollScale = scrollScale
+        nativeTouchJitterThresholdPx = jitterThresholdDp * density
     }
 
     fun setStretchToFit(enabled: Boolean) {
@@ -1113,15 +1128,62 @@ object NativeStreamInputRouter {
             index..index
         }
 
+        val scrollScale = nativeTouchScrollScale.coerceIn(0.25f, 2.0f)
+        val jitterThresholdPx = nativeTouchJitterThresholdPx.coerceAtLeast(0f)
+
         val pointers = indices.mapNotNull { index ->
             if (index !in 0 until event.pointerCount) return@mapNotNull null
             val pointerId = event.getPointerId(index)
             // Fingers on our own chrome belong to the overlay, not the game.
             if (pointerId in nativeUiTouchPointerIds) return@mapNotNull null
+
+            val rawX = event.getX(index)
+            val rawY = event.getY(index)
+
+            when (phase) {
+                TouchPhase.DOWN -> {
+                    // Record the starting position for jitter guard.
+                    nativeTouchDownPoints[pointerId] = rawX to rawY
+                }
+                TouchPhase.MOVE -> {
+                    val down = nativeTouchDownPoints[pointerId]
+                    if (down != null && jitterThresholdPx > 0f) {
+                        val dx = rawX - down.first
+                        val dy = rawY - down.second
+                        val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                        // Suppress MOVE events until the finger has moved far enough from its
+                        // initial touch point. This eliminates sensor jitter being interpreted
+                        // as a micro-swipe that triggers a double-click or unintended scroll.
+                        if (distance < jitterThresholdPx) return@mapNotNull null
+                    }
+                }
+                TouchPhase.UP, TouchPhase.CANCEL -> {
+                    nativeTouchDownPoints.remove(pointerId)
+                }
+            }
+
+            // Apply scroll-scale to MOVE positions by interpolating from the DOWN point.
+            // This scales the apparent velocity of gesture without clamping coordinates.
+            val scaledX: Float
+            val scaledY: Float
+            if (phase == TouchPhase.MOVE && scrollScale != 1.0f) {
+                val down = nativeTouchDownPoints[pointerId]
+                if (down != null) {
+                    scaledX = down.first + (rawX - down.first) * scrollScale
+                    scaledY = down.second + (rawY - down.second) * scrollScale
+                } else {
+                    scaledX = rawX
+                    scaledY = rawY
+                }
+            } else {
+                scaledX = rawX
+                scaledY = rawY
+            }
+
             TouchPointerSample(
                 pointerId = pointerId,
-                x = event.getX(index),
-                y = event.getY(index),
+                x = scaledX,
+                y = scaledY,
                 radiusX = event.getTouchMajor(index) / 2f,
                 radiusY = event.getTouchMinor(index) / 2f,
             )
@@ -1432,9 +1494,10 @@ object NativeStreamInputRouter {
         val x = event.getX(index)
         val y = event.getY(index)
 
-        // Ignore edge swipes to allow system gestures (like back swipe) to propagate instead of being sent to the stream
+        // Narrow edge exclusion zone: 12dp is enough to capture system back-swipe gestures while
+        // still allowing game UI elements placed near the screen edges to be reached.
         val density = android.content.res.Resources.getSystem().displayMetrics.density
-        val edgeWidthPx = 24f * density
+        val edgeWidthPx = 12f * density
         val isNearEdge = !androidTvProfile && width > 0 && (x < edgeWidthPx || x > width - edgeWidthPx)
         if (isNearEdge) return true
 
