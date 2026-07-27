@@ -72,18 +72,13 @@ import kotlin.math.max
 import kotlin.math.min
 
 private const val GFN_USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173"
-private const val GFN_WINDOWS_USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173"
+    "GFN-PC/22.0 (Android 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 // User-Agent used by the official GeForce NOW Android client for touch sessions.
 private const val GFN_ANDROID_TOUCH_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-Touch 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 // User-Agent used by the official GeForce NOW Android client for TV sessions.
 private const val GFN_ANDROID_TV_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-TV 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
-// User-Agent used by the official GeForce NOW Android client for standard gamepad sessions.
-private const val GFN_ANDROID_GAMEPAD_USER_AGENT =
-    "GFN-PC/22.0 (Android 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 private const val GFN_CLIENT_VERSION = "2.0.80.173"
 private const val LCARS_CLIENT_ID = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
 private const val GFN_PLAY_ORIGIN = "https://play.geforcenow.com"
@@ -387,7 +382,7 @@ internal fun buildMinimalClaimRequestBody(
             put("clientVersion", "30.0")
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
-            put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else CloudMatchDesktopIdentity.PLATFORM_NAME)
+            put("clientPlatformName", "android")
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
@@ -646,11 +641,15 @@ internal fun cloudMatchHeaders(
 ): Headers =
     Headers.Builder().apply {
         val touchFriendly = appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY
-        val isAndroidProfile = touchFriendly || isAndroidTv
         val userAgentString = when {
             isAndroidTv -> GFN_ANDROID_TV_USER_AGENT
             touchFriendly -> GFN_ANDROID_TOUCH_USER_AGENT
-            else -> GFN_WINDOWS_USER_AGENT
+            else -> GFN_USER_AGENT
+        }
+        val deviceType = when {
+            isAndroidTv -> "DESKTOP"
+            touchFriendly -> "TABLET"
+            else -> "PHONE"
         }
         add("User-Agent", userAgentString)
         add("Authorization", gfnJwtAuthorization(token))
@@ -662,8 +661,8 @@ internal fun cloudMatchHeaders(
         add("nv-client-version", GFN_CLIENT_VERSION)
         add("nv-device-make", "UNKNOWN")
         add("nv-device-model", "UNKNOWN")
-        add("nv-device-os", if (isAndroidProfile) "ANDROID" else CloudMatchDesktopIdentity.DEVICE_OS)
-        add("nv-device-type", if (touchFriendly) "TABLET" else CloudMatchDesktopIdentity.DEVICE_TYPE)
+        add("nv-device-os", "ANDROID")
+        add("nv-device-type", deviceType)
         add("x-device-id", deviceId)
         if (includeOrigin) {
             add("Origin", GFN_PLAY_ORIGIN)
@@ -2755,7 +2754,7 @@ class GfnSessionRepository(
                 put("clientVersion", "30.0")
                 put("sdkVersion", "1.0")
                 put("streamerVersion", 1)
-                put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else CloudMatchDesktopIdentity.PLATFORM_NAME)
+                put("clientPlatformName", "android")
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
                 }

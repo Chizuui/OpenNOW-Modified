@@ -195,7 +195,7 @@ class GfnApiTest {
         assertEquals(0, monitor.getValue("positionY").jsonPrimitive.int)
         assertEquals(JsonNull, monitor.getValue("displayData"))
         assertEquals(JsonNull, monitor.getValue("hdr10PlusGamingData"))
-        assertEquals("windows", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals("android", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
         // GAMEPAD_FRIENDLY: the default for a session that is not asking for a touchscreen.
         assertEquals(2, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
         assertEquals(true, sessionRequestData.getValue("enablePersistingInGameSettings").jsonPrimitive.boolean)
@@ -296,9 +296,10 @@ class GfnApiTest {
 
         assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
         assertEquals("NATIVE", headers["nv-client-type"])
-        assertEquals("WINDOWS", headers["nv-device-os"])
-        assertEquals("DESKTOP", headers["nv-device-type"])
-        assertTrue(headers["User-Agent"].orEmpty().contains("NVIDIACEFClient"))
+        assertEquals("ANDROID", headers["nv-device-os"])
+        assertEquals("PHONE", headers["nv-device-type"])
+        assertTrue(headers["User-Agent"].orEmpty().contains("GFN-PC/22.0"))
+        assertTrue(headers["User-Agent"].orEmpty().contains("Android"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 
@@ -727,7 +728,7 @@ class GfnApiTest {
             appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
         )
         val sessionRequestData = body.getValue("sessionRequestData").jsonObject
-        assertEquals("windows", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals("android", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
         assertEquals(GfnAppLaunchMode.GAMEPAD_FRIENDLY, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
     }
 
