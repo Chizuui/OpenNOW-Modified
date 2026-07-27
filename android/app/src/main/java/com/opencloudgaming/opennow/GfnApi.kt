@@ -82,6 +82,9 @@ private const val GFN_MOBILE_USER_AGENT =
 // enforced by GFN on mobile browsers, while still presenting as an Android device to allow touch layouts.
 private const val GFN_TABLET_USER_AGENT =
     "Mozilla/5.0 (Linux; Android 14; Tablet; Pixel Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+// User-Agent used by the official GeForce NOW Android client for touch sessions.
+private const val GFN_ANDROID_TOUCH_USER_AGENT =
+    "GFN-PC/22.0 (Android-Generic-Touch 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 private const val GFN_CLIENT_VERSION = "2.0.80.173"
 private const val LCARS_CLIENT_ID = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
 private const val GFN_PLAY_ORIGIN = "https://play.geforcenow.com"
@@ -385,7 +388,7 @@ internal fun buildMinimalClaimRequestBody(
             put("clientVersion", "30.0")
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
-            put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "browser" else CloudMatchDesktopIdentity.PLATFORM_NAME)
+            put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else CloudMatchDesktopIdentity.PLATFORM_NAME)
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
@@ -639,20 +642,20 @@ internal fun cloudMatchHeaders(
     clientId: String,
     deviceId: String,
     includeOrigin: Boolean,
-    // When true, mimic a tablet browser identity so the GFN host launches games like NTE in their
-    // touch UI mode (triggered by clientPlatformName = "browser", clientType = "BROWSER", and
-    // deviceOs = "ANDROID"), while allowing high resolution streams (e.g. 2560x1080) because
-    // tablet user-agents and "TABLET" device types are not subject to the 720p mobile phone cap.
+    // When true, mimic the official GeForce NOW Android client touch identity (User-Agent,
+    // clientPlatformName = "android", clientType = "NATIVE", deviceOs = "ANDROID", deviceType = "TABLET").
+    // This triggers in-game touch layouts natively (e.g. NTE) while preserving full-resolution
+    // streaming (e.g. 2560x1080) because native GFN Android client sessions are not capped to 720p.
     touchFriendly: Boolean = false,
 ): Headers =
     Headers.Builder()
-        .add("User-Agent", if (touchFriendly) GFN_TABLET_USER_AGENT else GFN_USER_AGENT)
+        .add("User-Agent", if (touchFriendly) GFN_ANDROID_TOUCH_USER_AGENT else GFN_USER_AGENT)
         .add("Authorization", gfnJwtAuthorization(token))
         .add("Content-Type", "application/json")
         .add("nv-browser-type", "CHROME")
         .add("nv-client-id", clientId)
-        .add("nv-client-streamer", if (touchFriendly) "NVIDIA-BROWSER" else CloudMatchDesktopIdentity.STREAMER)
-        .add("nv-client-type", if (touchFriendly) "BROWSER" else CloudMatchDesktopIdentity.CLIENT_TYPE)
+        .add("nv-client-streamer", if (touchFriendly) "NVIDIA-CLASSIC" else CloudMatchDesktopIdentity.STREAMER)
+        .add("nv-client-type", if (touchFriendly) "NATIVE" else CloudMatchDesktopIdentity.CLIENT_TYPE)
         .add("nv-client-version", GFN_CLIENT_VERSION)
         .add("nv-device-make", "UNKNOWN")
         .add("nv-device-model", "UNKNOWN")
@@ -2750,7 +2753,7 @@ class GfnSessionRepository(
                 put("clientVersion", "30.0")
                 put("sdkVersion", "1.0")
                 put("streamerVersion", 1)
-                put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "browser" else CloudMatchDesktopIdentity.PLATFORM_NAME)
+                put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else CloudMatchDesktopIdentity.PLATFORM_NAME)
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
                 }

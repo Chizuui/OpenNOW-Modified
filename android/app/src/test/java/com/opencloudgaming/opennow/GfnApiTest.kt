@@ -303,7 +303,7 @@ class GfnApiTest {
     }
 
     @Test
-    fun cloudMatchUsesAndroidTabletIdentityForTouchFriendly() {
+    fun cloudMatchUsesAndroidTouchIdentityForTouchFriendly() {
         val headers = cloudMatchHeaders(
             token = "token",
             clientId = "client",
@@ -312,13 +312,12 @@ class GfnApiTest {
             touchFriendly = true,
         )
 
-        assertEquals("NVIDIA-BROWSER", headers["nv-client-streamer"])
-        assertEquals("BROWSER", headers["nv-client-type"])
+        assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
+        assertEquals("NATIVE", headers["nv-client-type"])
         assertEquals("ANDROID", headers["nv-device-os"])
         assertEquals("TABLET", headers["nv-device-type"])
         val userAgent = headers["User-Agent"].orEmpty()
-        assertTrue(userAgent.contains("Tablet"))
-        assertFalse(userAgent.contains("Mobile"))
+        assertTrue(userAgent.contains("Android-Generic-Touch"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 
@@ -695,10 +694,9 @@ class GfnApiTest {
         )
         val sessionRequestData = body.getValue("sessionRequestData").jsonObject
 
-        // TOUCH_FRIENDLY sessions must declare themselves as "browser" to trigger in-game mobile UI
-        // layouts (e.g. NTE: Neverness to Everness). For GAMEPAD_FRIENDLY sessions the platform
-        // remains "windows" so the server allocates the full desktop resolution / frame rate.
-        assertEquals("browser", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
+        // TOUCH_FRIENDLY sessions declare themselves as "android" to trigger in-game mobile UI
+        // layouts (e.g. NTE: Neverness to Everness) and bypass browser resolution caps.
+        assertEquals("android", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
         assertEquals(GfnAppLaunchMode.TOUCH_FRIENDLY, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
     }
 
