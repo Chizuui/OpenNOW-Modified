@@ -73,15 +73,6 @@ import kotlin.math.min
 
 private const val GFN_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173"
-// User-Agent used for touch-friendly (browser/mobile) sessions. Matches what Chrome on Android
-// sends to GFN Web, which is what the GFN host reads to decide whether to launch NTE (and other
-// mobile-first titles) in their mobile UI mode.
-private const val GFN_MOBILE_USER_AGENT =
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
-// Tablet User-Agent (does not contain the word "Mobile"). Used to bypass the 720p resolution cap
-// enforced by GFN on mobile browsers, while still presenting as an Android device to allow touch layouts.
-private const val GFN_TABLET_USER_AGENT =
-    "Mozilla/5.0 (Linux; Android 14; Tablet; Pixel Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 // User-Agent used by the official GeForce NOW Android client for touch sessions.
 private const val GFN_ANDROID_TOUCH_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-Touch 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
