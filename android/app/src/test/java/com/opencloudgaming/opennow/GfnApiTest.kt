@@ -303,6 +303,26 @@ class GfnApiTest {
     }
 
     @Test
+    fun cloudMatchUsesAndroidTabletIdentityForTouchFriendly() {
+        val headers = cloudMatchHeaders(
+            token = "token",
+            clientId = "client",
+            deviceId = "device",
+            includeOrigin = true,
+            touchFriendly = true,
+        )
+
+        assertEquals("NVIDIA-BROWSER", headers["nv-client-streamer"])
+        assertEquals("BROWSER", headers["nv-client-type"])
+        assertEquals("ANDROID", headers["nv-device-os"])
+        assertEquals("TABLET", headers["nv-device-type"])
+        val userAgent = headers["User-Agent"].orEmpty()
+        assertTrue(userAgent.contains("Tablet"))
+        assertFalse(userAgent.contains("Mobile"))
+        assertEquals("https://play.geforcenow.com", headers["Origin"])
+    }
+
+    @Test
     fun physicalResolutionMetadataDoesNotUndercutRequested1440pStream() {
         val settings = StreamSettings(
             resolution = "2560x1440",

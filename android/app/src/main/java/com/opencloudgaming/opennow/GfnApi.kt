@@ -78,6 +78,10 @@ private const val GFN_USER_AGENT =
 // mobile-first titles) in their mobile UI mode.
 private const val GFN_MOBILE_USER_AGENT =
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+// Tablet User-Agent (does not contain the word "Mobile"). Used to bypass the 720p resolution cap
+// enforced by GFN on mobile browsers, while still presenting as an Android device to allow touch layouts.
+private const val GFN_TABLET_USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 14; Tablet; Pixel Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 private const val GFN_CLIENT_VERSION = "2.0.80.173"
 private const val LCARS_CLIENT_ID = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
 private const val GFN_PLAY_ORIGIN = "https://play.geforcenow.com"
@@ -635,13 +639,14 @@ internal fun cloudMatchHeaders(
     clientId: String,
     deviceId: String,
     includeOrigin: Boolean,
-    // When true, mimic a mobile browser identity so the GFN host launches games like NTE in their
-    // mobile/touch UI mode instead of the desktop PC mode. Browsers on Android cannot add custom
-    // nv-* headers, so the absence of NATIVE/DESKTOP identity is what the server keys off.
+    // When true, mimic a tablet browser identity so the GFN host launches games like NTE in their
+    // touch UI mode (triggered by clientPlatformName = "browser", clientType = "BROWSER", and
+    // deviceOs = "ANDROID"), while allowing high resolution streams (e.g. 2560x1080) because
+    // tablet user-agents and "TABLET" device types are not subject to the 720p mobile phone cap.
     touchFriendly: Boolean = false,
 ): Headers =
     Headers.Builder()
-        .add("User-Agent", if (touchFriendly) GFN_MOBILE_USER_AGENT else GFN_USER_AGENT)
+        .add("User-Agent", if (touchFriendly) GFN_TABLET_USER_AGENT else GFN_USER_AGENT)
         .add("Authorization", gfnJwtAuthorization(token))
         .add("Content-Type", "application/json")
         .add("nv-browser-type", "CHROME")
@@ -652,7 +657,7 @@ internal fun cloudMatchHeaders(
         .add("nv-device-make", "UNKNOWN")
         .add("nv-device-model", "UNKNOWN")
         .add("nv-device-os", if (touchFriendly) "ANDROID" else CloudMatchDesktopIdentity.DEVICE_OS)
-        .add("nv-device-type", if (touchFriendly) "PHONE" else CloudMatchDesktopIdentity.DEVICE_TYPE)
+        .add("nv-device-type", if (touchFriendly) "TABLET" else CloudMatchDesktopIdentity.DEVICE_TYPE)
         .add("x-device-id", deviceId)
         .apply {
             if (includeOrigin) {
