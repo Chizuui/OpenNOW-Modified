@@ -196,7 +196,8 @@ class GfnApiTest {
         assertEquals(JsonNull, monitor.getValue("displayData"))
         assertEquals(JsonNull, monitor.getValue("hdr10PlusGamingData"))
         assertEquals("windows", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
-        assertEquals(1, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
+        // GAMEPAD_FRIENDLY: the default for a session that is not asking for a touchscreen.
+        assertEquals(2, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
         assertEquals(true, sessionRequestData.getValue("enablePersistingInGameSettings").jsonPrimitive.boolean)
         assertEquals(1920, physicalResolution.getValue("horizontalPixels").jsonPrimitive.int)
         assertEquals(1080, physicalResolution.getValue("verticalPixels").jsonPrimitive.int)

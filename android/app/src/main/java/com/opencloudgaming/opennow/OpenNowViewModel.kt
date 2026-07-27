@@ -1661,6 +1661,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     zone = "prod",
                     settings = settings,
                     accountLinked = shouldSendAccountLinked(game, selectedVariant),
+                    appLaunchMode = appLaunchModeFor(game),
                 )
                 recordDebugEvent("queue", "Created session ${created.debugSummary()}")
                 pollUntilReady(token, created, settings)
@@ -1940,6 +1941,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     zone = "prod",
                     settings = pending.settings,
                     accountLinked = pending.accountLinked,
+                    appLaunchMode = appLaunchModeFor(pending.game),
                 )
                 recordDebugEvent("queue", "Created replacement session ${created.debugSummary()}")
                 pollUntilReady(token, created, pending.settings)
@@ -3132,13 +3134,28 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         return pollUntilReady(token, latest, settings)
     }
 
+    /**
+     * The host builds its virtual input devices from this when the session is created, and never
+     * revisits it. It must therefore agree with what [shouldUseNativeTouch] decides at stream time:
+     * a session created as GAMEPAD_FRIENDLY has no touchscreen, and will silently drop perfectly
+     * well-formed touch packets.
+     */
+    private fun appLaunchModeFor(game: GameInfo?): Int =
+        if (shouldUseNativeTouch(_state.value.settings.androidTouch.nativeTouchMode, game)) {
+            GfnAppLaunchMode.TOUCH_FRIENDLY
+        } else {
+            GfnAppLaunchMode.GAMEPAD_FRIENDLY
+        }
+
     private suspend fun claimActiveSessionOrContinuePolling(
         token: String,
         active: ActiveSessionInfo,
         settings: StreamSettings,
     ): SessionInfo {
         return try {
-            sessionRepository.claimSession(token, active, settings)
+            // Claiming re-sends the session request body, so repeating the mode the session was
+            // created with keeps it from being downgraded mid-flight.
+            sessionRepository.claimSession(token, active, settings, appLaunchModeFor(_state.value.streamGame))
         } catch (error: SessionClaimNotReadyException) {
             val fallback = active.toPendingSession(zone = "prod")
             val latest = error.latestSession?.let { mergeQueueSessionState(fallback, it) } ?: fallback

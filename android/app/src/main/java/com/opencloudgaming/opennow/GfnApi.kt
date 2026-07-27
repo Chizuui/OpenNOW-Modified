@@ -101,12 +101,25 @@ private object CloudMatchDesktopIdentity {
     // WebRTC is the transport, but CloudMatch uses the desktop/native identity and
     // monitor descriptor to allocate the full requested resolution and frame rate.
     const val PLATFORM_NAME = "windows"
-    const val APP_LAUNCH_MODE = 2
     const val PERSIST_GAME_SETTINGS = true
     const val STREAMER = "NVIDIA-CLASSIC"
     const val CLIENT_TYPE = "NATIVE"
     const val DEVICE_OS = "WINDOWS"
     const val DEVICE_TYPE = "DESKTOP"
+}
+
+/**
+ * Server-side values, chosen when the session is created. They decide which virtual input devices
+ * the host sets up, which is why the choice cannot be revisited once the game is running.
+ *
+ * [TOUCH_FRIENDLY] is what makes the host present a digitizer. The official client gates its whole
+ * touch pipeline on it — `enableTouchInput: appLaunchMode === AppLaunchMode.TouchFriendly` — so a
+ * session created as [GAMEPAD_FRIENDLY] will silently ignore perfectly well-formed touch packets.
+ */
+internal object GfnAppLaunchMode {
+    const val DEFAULT = 1
+    const val GAMEPAD_FRIENDLY = 2
+    const val TOUCH_FRIENDLY = 3
 }
 private const val LIBRARY_WITH_TIME_QUERY_HASH = "039e8c0d553972975485fee56e59f2549d2fdb518e247a42ab5022056a74406f"
 private const val DEFAULT_LOCALE = "en_US"
@@ -348,6 +361,7 @@ internal fun buildMinimalClaimRequestBody(
     deviceId: String,
     settings: StreamSettings? = null,
     physicalDisplayResolution: Pair<Int, Int>? = null,
+    appLaunchMode: Int = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
 ): JsonObject {
     val profile = settings?.requestProfile()
     return buildJsonObject {
@@ -382,7 +396,7 @@ internal fun buildMinimalClaimRequestBody(
             put("parentSessionId", JsonNull)
             put("appId", appId.toIntOrNull() ?: 0)
             put("streamerVersion", 1)
-            put("appLaunchMode", CloudMatchDesktopIdentity.APP_LAUNCH_MODE)
+            put("appLaunchMode", appLaunchMode)
             put("sdkVersion", "1.0")
             put("enhancedStreamMode", 1)
             put("useOps", true)
@@ -2411,6 +2425,9 @@ class GfnSessionRepository(
         zone: String,
         settings: StreamSettings,
         accountLinked: Boolean = true,
+        // Decided here and never again: the host provisions its virtual input devices from this,
+        // so a session created without it cannot be given a touchscreen later.
+        appLaunchMode: Int = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
     ): SessionInfo {
         require(appId.all(Char::isDigit)) { "Invalid launch appId '$appId'." }
         val clientId = UUID.randomUUID().toString()
@@ -2423,6 +2440,7 @@ class GfnSessionRepository(
             accountLinked = accountLinked,
             deviceId = deviceId,
             physicalDisplayResolution = physicalDisplayResolutionProvider(),
+            appLaunchMode = appLaunchMode,
         )
         val url = "$base/v2/session?keyboardLayout=${encoded(settings.keyboardLayout)}&languageCode=${encoded(settings.gameLanguage)}"
         val host = Uri.parse(base).host.orEmpty()
@@ -2538,7 +2556,12 @@ class GfnSessionRepository(
         }.orEmpty()
     }
 
-    suspend fun claimSession(token: String, active: ActiveSessionInfo, settings: StreamSettings): SessionInfo {
+    suspend fun claimSession(
+        token: String,
+        active: ActiveSessionInfo,
+        settings: StreamSettings,
+        appLaunchMode: Int = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+    ): SessionInfo {
         val deviceId = authStore.stableDeviceId()
         val clientId = UUID.randomUUID().toString()
         val providerBase = normalizeStreamingServiceUrl(active.streamingBaseUrl.orEmpty())?.trimEnd('/')
@@ -2576,6 +2599,7 @@ class GfnSessionRepository(
                 deviceId = deviceId,
                 settings = settings,
                 physicalDisplayResolution = physicalDisplayResolutionProvider(),
+                appLaunchMode = appLaunchMode,
             )
             val claimRequest = Request.Builder()
                 .url("$sessionBase/v2/session/${active.sessionId}?keyboardLayout=${encoded(settings.keyboardLayout)}&languageCode=${encoded(settings.gameLanguage)}")
@@ -2697,6 +2721,7 @@ class GfnSessionRepository(
         accountLinked: Boolean,
         deviceId: String,
         physicalDisplayResolution: Pair<Int, Int>?,
+        appLaunchMode: Int,
     ): JsonObject {
         val profile = settings.requestProfile()
         return buildJsonObject {
@@ -2724,7 +2749,7 @@ class GfnSessionRepository(
                 put("remoteControllersBitmap", 0)
                 put("clientTimezoneOffset", java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()))
                 put("enhancedStreamMode", 1)
-                put("appLaunchMode", CloudMatchDesktopIdentity.APP_LAUNCH_MODE)
+                put("appLaunchMode", appLaunchMode)
                 put("secureRTSPSupported", false)
                 put("partnerCustomData", "")
                 put("accountLinked", accountLinked)
@@ -2740,8 +2765,9 @@ class GfnSessionRepository(
         deviceId: String,
         settings: StreamSettings,
         physicalDisplayResolution: Pair<Int, Int>?,
+        appLaunchMode: Int,
     ): JsonObject =
-        buildMinimalClaimRequestBody(appId, deviceId, settings, physicalDisplayResolution)
+        buildMinimalClaimRequestBody(appId, deviceId, settings, physicalDisplayResolution, appLaunchMode)
 
     private suspend fun toSessionInfo(zone: String, base: String, payload: JsonObject, clientId: String, deviceId: String): SessionInfo {
         val status = payload.obj("requestStatus")?.int("statusCode")
