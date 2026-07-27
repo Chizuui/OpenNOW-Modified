@@ -73,6 +73,11 @@ import kotlin.math.min
 
 private const val GFN_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173"
+// User-Agent used for touch-friendly (browser/mobile) sessions. Matches what Chrome on Android
+// sends to GFN Web, which is what the GFN host reads to decide whether to launch NTE (and other
+// mobile-first titles) in their mobile UI mode.
+private const val GFN_MOBILE_USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 private const val GFN_CLIENT_VERSION = "2.0.80.173"
 private const val LCARS_CLIENT_ID = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
 private const val GFN_PLAY_ORIGIN = "https://play.geforcenow.com"
@@ -376,7 +381,7 @@ internal fun buildMinimalClaimRequestBody(
             put("clientVersion", "30.0")
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
-            put("clientPlatformName", CloudMatchDesktopIdentity.PLATFORM_NAME)
+            put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "browser" else CloudMatchDesktopIdentity.PLATFORM_NAME)
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
@@ -630,20 +635,24 @@ internal fun cloudMatchHeaders(
     clientId: String,
     deviceId: String,
     includeOrigin: Boolean,
+    // When true, mimic a mobile browser identity so the GFN host launches games like NTE in their
+    // mobile/touch UI mode instead of the desktop PC mode. Browsers on Android cannot add custom
+    // nv-* headers, so the absence of NATIVE/DESKTOP identity is what the server keys off.
+    touchFriendly: Boolean = false,
 ): Headers =
     Headers.Builder()
-        .add("User-Agent", GFN_USER_AGENT)
+        .add("User-Agent", if (touchFriendly) GFN_MOBILE_USER_AGENT else GFN_USER_AGENT)
         .add("Authorization", gfnJwtAuthorization(token))
         .add("Content-Type", "application/json")
         .add("nv-browser-type", "CHROME")
         .add("nv-client-id", clientId)
-        .add("nv-client-streamer", CloudMatchDesktopIdentity.STREAMER)
-        .add("nv-client-type", CloudMatchDesktopIdentity.CLIENT_TYPE)
+        .add("nv-client-streamer", if (touchFriendly) "NVIDIA-BROWSER" else CloudMatchDesktopIdentity.STREAMER)
+        .add("nv-client-type", if (touchFriendly) "BROWSER" else CloudMatchDesktopIdentity.CLIENT_TYPE)
         .add("nv-client-version", GFN_CLIENT_VERSION)
         .add("nv-device-make", "UNKNOWN")
         .add("nv-device-model", "UNKNOWN")
-        .add("nv-device-os", CloudMatchDesktopIdentity.DEVICE_OS)
-        .add("nv-device-type", CloudMatchDesktopIdentity.DEVICE_TYPE)
+        .add("nv-device-os", if (touchFriendly) "ANDROID" else CloudMatchDesktopIdentity.DEVICE_OS)
+        .add("nv-device-type", if (touchFriendly) "PHONE" else CloudMatchDesktopIdentity.DEVICE_TYPE)
         .add("x-device-id", deviceId)
         .apply {
             if (includeOrigin) {
@@ -2447,7 +2456,7 @@ class GfnSessionRepository(
         val requestHttp = if (isZoneHostname(host)) sessionProxyHttpClient(settings, http) else http
         val request = Request.Builder()
             .url(url)
-            .headers(cloudMatchHeaders(token, clientId, deviceId, includeOrigin = true))
+            .headers(cloudMatchHeaders(token, clientId, deviceId, includeOrigin = true, touchFriendly = appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY))
             .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
         val (code, text) = requestHttp.awaitText(request)
@@ -2736,7 +2745,7 @@ class GfnSessionRepository(
                 put("clientVersion", "30.0")
                 put("sdkVersion", "1.0")
                 put("streamerVersion", 1)
-                put("clientPlatformName", CloudMatchDesktopIdentity.PLATFORM_NAME)
+                put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "browser" else CloudMatchDesktopIdentity.PLATFORM_NAME)
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps))
                 }

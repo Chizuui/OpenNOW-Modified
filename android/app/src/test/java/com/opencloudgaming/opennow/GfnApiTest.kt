@@ -666,4 +666,32 @@ class GfnApiTest {
         assertTrue(exported.contains("client_id=public-client"))
     }
 
+    @Test
+    fun touchFriendlyClaimRequestAdvertisesBrowserPlatform() {
+        val body = buildMinimalClaimRequestBody(
+            appId = "123",
+            deviceId = "device",
+            appLaunchMode = GfnAppLaunchMode.TOUCH_FRIENDLY,
+        )
+        val sessionRequestData = body.getValue("sessionRequestData").jsonObject
+
+        // TOUCH_FRIENDLY sessions must declare themselves as "browser" to trigger in-game mobile UI
+        // layouts (e.g. NTE: Neverness to Everness). For GAMEPAD_FRIENDLY sessions the platform
+        // remains "windows" so the server allocates the full desktop resolution / frame rate.
+        assertEquals("browser", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals(GfnAppLaunchMode.TOUCH_FRIENDLY, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
+    }
+
+    @Test
+    fun gamepadFriendlyClaimRequestRetainsWindowsPlatform() {
+        val body = buildMinimalClaimRequestBody(
+            appId = "123",
+            deviceId = "device",
+            appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+        )
+        val sessionRequestData = body.getValue("sessionRequestData").jsonObject
+        assertEquals("windows", sessionRequestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals(GfnAppLaunchMode.GAMEPAD_FRIENDLY, sessionRequestData.getValue("appLaunchMode").jsonPrimitive.int)
+    }
+
 }
