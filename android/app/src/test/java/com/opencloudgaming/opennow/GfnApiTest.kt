@@ -298,8 +298,7 @@ class GfnApiTest {
         assertEquals("NATIVE", headers["nv-client-type"])
         assertEquals("WINDOWS", headers["nv-device-os"])
         assertEquals("DESKTOP", headers["nv-device-type"])
-        assertTrue(headers["User-Agent"].orEmpty().contains("GFN-PC/22.0"))
-        assertTrue(headers["User-Agent"].orEmpty().contains("Android"))
+        assertTrue(headers["User-Agent"].orEmpty().contains("NVIDIACEFClient"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 
@@ -310,7 +309,7 @@ class GfnApiTest {
             clientId = "client",
             deviceId = "device",
             includeOrigin = true,
-            touchFriendly = true,
+            appLaunchMode = GfnAppLaunchMode.TOUCH_FRIENDLY,
         )
 
         assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
@@ -319,6 +318,25 @@ class GfnApiTest {
         assertEquals("TABLET", headers["nv-device-type"])
         val userAgent = headers["User-Agent"].orEmpty()
         assertTrue(userAgent.contains("Android-Generic-Touch"))
+        assertEquals("https://play.geforcenow.com", headers["Origin"])
+    }
+
+    @Test
+    fun cloudMatchUsesAndroidTvIdentityForTvProfile() {
+        val headers = cloudMatchHeaders(
+            token = "token",
+            clientId = "client",
+            deviceId = "device",
+            includeOrigin = true,
+            isAndroidTv = true,
+        )
+
+        assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
+        assertEquals("NATIVE", headers["nv-client-type"])
+        assertEquals("ANDROID", headers["nv-device-os"])
+        assertEquals("DESKTOP", headers["nv-device-type"])
+        val userAgent = headers["User-Agent"].orEmpty()
+        assertTrue(userAgent.contains("Android-Generic-TV"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 

@@ -196,6 +196,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         http = http,
         physicalDisplayResolutionProvider = { application.physicalStreamDisplayResolution() },
         diagnosticsSink = { response -> recordSessionDiagnosticResponse(response) },
+        isAndroidTv = isAndroidTvProfile(application),
     )
     private val appUpdater = AndroidAppUpdater(application, http)
     private val androidUpdateNoticeStore = AndroidUpdateNoticeStore(application)
