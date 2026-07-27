@@ -1077,37 +1077,89 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     fun switchAccount(userId: String) {
         viewModelScope.launch {
             pendingActiveSessionLaunch = null
-            authStore.setActiveSession(userId)
-            val session = authRepository.restore(forceRefresh = false) ?: return@launch
-            gamesJob?.cancel()
-            _state.update {
-                it.copy(
-                    authSession = session,
-                    selectedProvider = session.provider,
-                    savedAccounts = authStore.state.value.sessions.map { saved -> saved.toSavedAccount() },
-                    subscriptionInfo = null,
-                    accountConnectors = emptyList(),
-                    loadingAccountConnectors = false,
-                    connectorActionStore = null,
-                    games = emptyList(),
-                    libraryGames = emptyList(),
-                    catalogResult = CatalogBrowseResult(emptyList()),
-                    libraryFilterIds = emptyList(),
-                    selectedGame = null,
-                    activeSession = null,
-                    activeSessionDecision = null,
-                    error = null,
-                    page = AppPage.Home,
+            _state.update { it.copy(settingsRefreshing = true, error = null) }
+            try {
+                authStore.setActiveSession(userId)
+                val result = runCatching {
+                    authRepository.restore(
+                        forceRefresh = false,
+                        throwOnRefreshFailure = false,
+                        removeExpiredSessionOnFailure = true
+                    )
+                }
+                val session = result.getOrNull()
+                gamesJob?.cancel()
+                if (session == null) {
+                    // target session was expired/invalid and got removed.
+                    // Fall back to whatever active session is left.
+                    val fallbackSession = runCatching {
+                        authRepository.restore(
+                            forceRefresh = false,
+                            throwOnRefreshFailure = false,
+                            removeExpiredSessionOnFailure = true
+                        )
+                    }.getOrNull()
+                    _state.update { current ->
+                        current.copy(
+                            authSession = fallbackSession,
+                            selectedProvider = fallbackSession?.provider ?: current.selectedProvider,
+                            savedAccounts = authStore.state.value.sessions.map { saved -> saved.toSavedAccount() },
+                            subscriptionInfo = null,
+                            accountConnectors = emptyList(),
+                            loadingAccountConnectors = false,
+                            connectorActionStore = null,
+                            games = emptyList(),
+                            libraryGames = emptyList(),
+                            catalogResult = CatalogBrowseResult(emptyList()),
+                            libraryFilterIds = emptyList(),
+                            selectedGame = null,
+                            activeSession = null,
+                            activeSessionDecision = null,
+                            error = "Failed to switch account: session expired. Please log in again.",
+                            page = AppPage.Home,
+                            settingsRefreshing = false,
+                        )
+                    }
+                    return@launch
+                }
+                _state.update { current ->
+                    current.copy(
+                        authSession = session,
+                        selectedProvider = session.provider,
+                        savedAccounts = authStore.state.value.sessions.map { saved -> saved.toSavedAccount() },
+                        subscriptionInfo = null,
+                        accountConnectors = emptyList(),
+                        loadingAccountConnectors = false,
+                        connectorActionStore = null,
+                        games = emptyList(),
+                        libraryGames = emptyList(),
+                        catalogResult = CatalogBrowseResult(emptyList()),
+                        libraryFilterIds = emptyList(),
+                        selectedGame = null,
+                        activeSession = null,
+                        activeSessionDecision = null,
+                        error = null,
+                        page = AppPage.Home,
+                        settingsRefreshing = false,
+                    )
+                }
+                OpenNowAnalytics.capture(
+                    event = "account_switched",
+                    properties = mapOf(
+                        "provider" to session.provider.code,
+                        "membership_tier" to session.user.membershipTier,
+                    ),
                 )
+                refreshAfterAuth(session)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { current ->
+                    current.copy(
+                        error = e.message ?: "Failed to switch account",
+                        settingsRefreshing = false,
+                    )
+                }
             }
-            OpenNowAnalytics.capture(
-                event = "account_switched",
-                properties = mapOf(
-                    "provider" to session.provider.code,
-                    "membership_tier" to session.user.membershipTier,
-                ),
-            )
-            refreshAfterAuth(session)
         }
     }
 
