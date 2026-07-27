@@ -751,11 +751,45 @@ private fun SettingsContent(
                 SettingSwitch("Clipboard paste", settings.clipboardPaste) { enabled -> viewModel.updateSettings(settings.copy(clipboardPaste = enabled)) }
                 SettingSwitch("Phone rumble fallback", settings.phoneRumbleFallback) { enabled -> viewModel.updateSettings(settings.copy(phoneRumbleFallback = enabled)) }
                 SettingSwitch(
-                    label = "Mouse mode (Left stick)",
+                    label = stringResource(R.string.stream_panel_mouse_mode),
                     checked = settings.controllerMouseEmulation,
-                    description = "Toggle in Stream Controls per session. Left stick moves the cursor, A button clicks, B button right-clicks.",
+                    description = "Toggle in Stream Controls per session. Left stick moves the cursor, right stick scrolls, A button clicks, B button right-clicks.",
                 ) { enabled ->
                     viewModel.updateSettings(settings.copy(controllerMouseEmulation = enabled))
+                }
+                if (settings.controllerMouseEmulation) {
+                    Box(Modifier.padding(start = 24.dp)) {
+                        Column {
+                            NumberSlider(
+                                label = "Mouse sensitivity",
+                                value = settings.stream.mouseSensitivity,
+                                min = 0.25f,
+                                max = 3f,
+                                step = 0.05f,
+                                valueFormatter = { "%.2fx".format(it) }
+                            ) { value ->
+                                viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = value) }
+                            }
+
+                            val scrollHint = when {
+                                settings.stream.mouseScrollSensitivity <= 20 -> "Very fast"
+                                settings.stream.mouseScrollSensitivity <= 40 -> "Standard"
+                                settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
+                                else -> "Slow"
+                            }
+
+                            NumberSlider(
+                                label = "Mouse scroll sensitivity",
+                                value = settings.stream.mouseScrollSensitivity.toFloat(),
+                                min = 10f,
+                                max = 100f,
+                                step = 5f,
+                                unit = " ($scrollHint)"
+                            ) { value ->
+                                viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value.toInt()) }
+                            }
+                        }
+                    }
                 }
                 SettingSwitch("Touch controls", settings.androidTouch.enabled) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(enabled = enabled))) }
                 val touchStyleOptions = listOf(

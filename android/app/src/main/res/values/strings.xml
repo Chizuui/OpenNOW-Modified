@@ -101,8 +101,10 @@
     <string name="stream_panel_joystick_dynamic">Dynamic</string>
     <string name="stream_panel_clean_style">Clean style</string>
     <string name="stream_panel_phone_rumble">Phone rumble fallback</string>
-    <string name="stream_panel_mouse_mode">Mouse mode (Left stick)</string>
-    <string name="stream_panel_mouse_mode_summary">L stick moves · A clicks · B right-clicks</string>
+    <string name="stream_panel_mouse_mode">Mouse mode (Using Gamepad)</string>
+    <string name="stream_panel_mouse_mode_summary">L stick moves mouse ·R stick scroll · R stick scrolls · A clicks · B right-clicks</string>
+    <string name="stream_mouse_mode_title">Mouse mode</string>
+    <string name="stream_mouse_mode_subtitle">Configure mouse emulation</string>
     <string name="stream_panel_drag_edit">Drag edit mode</string>
     <string name="stream_panel_reset_layout">Reset touch layout</string>
     <string name="stream_panel_reset_layout_summary">Reset positions to default</string>

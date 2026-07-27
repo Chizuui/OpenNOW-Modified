@@ -1615,6 +1615,17 @@ internal object AndroidControllerMouseAssist {
         return if (dx != 0 || dy != 0) ControllerMouseDelta(dx, dy) else null
     }
 
+    fun scrollNotches(stickY: Float, scrollSensitivity: Int, accumulator: Float): Pair<Int, Float> {
+        val y = stickY.coerceIn(-1f, 1f)
+        if (abs(y) < 0.1f) return Pair(0, accumulator)
+
+        val sensitivity = scrollSensitivity.toFloat().coerceIn(10f, 100f)
+        val factor = 6.0f / sensitivity
+        val nextAccumulator = accumulator + -y * factor
+        val notches = nextAccumulator.toInt()
+        return Pair(notches, nextAccumulator - notches)
+    }
+
     fun mouseButtonForGamepad(buttonMask: Int): Int? =
         when (buttonMask) {
             GamepadButtonMapping.A -> 1
@@ -3103,6 +3114,7 @@ class NativeStreamClient(
     private var physicalLeftStickY = 0f
     private var physicalRightStickX = 0f
     private var physicalRightStickY = 0f
+    private var controllerScrollAccumulator = 0f
 
     private data class RumbleEffectProfile(
         val weakAmplitude: Int,
@@ -3256,6 +3268,7 @@ class NativeStreamClient(
             mouseAcceleration = settings.mouseAcceleration,
             streamSharpeningEnabled = settings.streamSharpeningEnabled,
             streamSharpeningAmount = settings.streamSharpeningAmount,
+            mouseScrollSensitivity = settings.mouseScrollSensitivity,
         )
         rendererSharpnessDrawer?.amount = streamSharpnessShaderStrength(settings.streamSharpeningEnabled, settings.streamSharpeningAmount)
         renderer?.setStreamScaling()
@@ -3309,6 +3322,10 @@ class NativeStreamClient(
             virtualLeftStickActive = false
             virtualLeftStickX = 0
             virtualLeftStickY = 0
+            physicalLeftStickX = 0f
+            physicalLeftStickY = 0f
+            physicalRightStickX = 0f
+            physicalRightStickY = 0f
         }
         controllerMouseEmulationActive = enabled
         updateControllerMouseLoop()
@@ -3326,6 +3343,7 @@ class NativeStreamClient(
                 delay(16L)
                 if (controllerMouseEmulationActive) {
                     sendControllerMouseMove(physicalLeftStickX, physicalLeftStickY)
+                    sendControllerMouseScroll(physicalRightStickY)
                 }
                 if (controllerMouseAssistActive) {
                     sendControllerMouseMove(physicalRightStickX, physicalRightStickY)
@@ -3462,6 +3480,7 @@ class NativeStreamClient(
         physicalLeftStickY = 0f
         physicalRightStickX = 0f
         physicalRightStickY = 0f
+        controllerScrollAccumulator = 0f
         controllerMouseAssistActive = false
         controllerMouseAssistAutoArmed = false
         controllerMouseEmulationActive = false
@@ -3868,7 +3887,8 @@ class NativeStreamClient(
         if (controllerMouseEmulationActive) {
             // Redirect left-stick input to mouse movement; keep virtual stick zeroed so the game
             // receives no stick deflection from the touch controller either.
-            sendControllerMouseMove(normalizedX, normalizedY)
+            physicalLeftStickX = normalizedX
+            physicalLeftStickY = normalizedY
             virtualLeftStickActive = false
             virtualLeftStickX = 0
             virtualLeftStickY = 0
@@ -3885,6 +3905,16 @@ class NativeStreamClient(
         val scale = radialDeadzoneScale(x, y, deadzone = 0.08f)
         val normalizedX = x * scale
         val normalizedY = y * scale
+        if (controllerMouseEmulationActive) {
+            // Redirect right-stick input to scrolling; keep virtual stick zeroed.
+            physicalRightStickX = normalizedX
+            physicalRightStickY = normalizedY
+            virtualRightStickActive = false
+            virtualRightStickX = 0
+            virtualRightStickY = 0
+            sendCurrentGamepadState()
+            return
+        }
         virtualRightStickActive = normalizedX != 0f || normalizedY != 0f
         virtualRightStickX = normalizeToInt16(normalizedX)
         virtualRightStickY = normalizeToInt16(-normalizedY)
@@ -5020,17 +5050,19 @@ class NativeStreamClient(
         physicalHatButtons = if (axes.hatUsedAsLeftStick) 0 else event.hatDpadButtons()
         lastLeftTrigger = normalizeToUint8(lt)
         lastRightTrigger = normalizeToUint8(rt)
-        // When left-stick mouse emulation is active, keep lastLeftStick{X,Y} = 0 so the game
-        // receives no stick deflection. The actual motion is forwarded as mouse delta instead.
+        // When left-stick mouse emulation is active, keep both sticks' deflection = 0 so the game
+        // receives no stick deflection. The actual motions are forwarded as mouse delta and mouse scroll instead.
         if (controllerMouseEmulationActive) {
             lastLeftStickX = 0
             lastLeftStickY = 0
+            lastRightStickX = 0
+            lastRightStickY = 0
         } else {
             lastLeftStickX = normalizeToInt16(leftX)
             lastLeftStickY = normalizeToInt16(-leftY)
+            lastRightStickX = normalizeToInt16(rightX)
+            lastRightStickY = normalizeToInt16(-rightY)
         }
-        lastRightStickX = normalizeToInt16(rightX)
-        lastRightStickY = normalizeToInt16(-rightY)
         physicalLeftStickX = leftX
         physicalLeftStickY = leftY
         physicalRightStickX = rightX
@@ -5128,6 +5160,19 @@ class NativeStreamClient(
             NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} auto=$controllerMouseAssistAutoArmed emulation=$controllerMouseEmulationActive")
         }
         return sent
+    }
+
+    private fun sendControllerMouseScroll(stickY: Float) {
+        if (!controllerMouseEmulationActive) return
+        val (notches, nextAccumulator) = AndroidControllerMouseAssist.scrollNotches(
+            stickY = stickY,
+            scrollSensitivity = settings.mouseScrollSensitivity,
+            accumulator = controllerScrollAccumulator
+        )
+        controllerScrollAccumulator = nextAccumulator
+        if (notches != 0) {
+            sendTouchMouseWheel(notches * 120)
+        }
     }
 
     private fun handleControllerMouseButton(buttonMask: Int, pressed: Boolean): Boolean {

@@ -6543,6 +6543,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
         mouseAcceleration = state.settings.stream.mouseAcceleration,
         streamSharpeningEnabled = launchStreamSettings.streamSharpeningEnabled && state.settings.stream.streamSharpeningEnabled,
         streamSharpeningAmount = state.settings.stream.streamSharpeningAmount,
+        mouseScrollSensitivity = state.settings.stream.mouseScrollSensitivity,
     )
     val statsAlignment = when (state.settings.streamStatsPosition) {
         StreamStatsPosition.Left -> Alignment.TopStart
@@ -7203,8 +7204,11 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     onOpacityChange = { value ->
                         viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(opacity = value)))
                     },
+                    onMouseSensitivityChange = { value ->
+                        viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = value) }
+                    },
                     onMouseScrollSensitivityChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(stream = state.settings.stream.copy(mouseScrollSensitivity = value)))
+                        viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value) }
                     },
                     onTouchEdgePaddingChange = { value ->
                         viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(edgePaddingDp = value)))
@@ -7463,6 +7467,15 @@ private fun StreamVideoSurface(
     }
     LaunchedEffect(streamAspectRatio) {
         NativeStreamInputRouter.setRenderingAspectRatio(streamAspectRatio)
+    }
+    LaunchedEffect(
+        settings.mouseSensitivity,
+        settings.mouseScrollSensitivity,
+        settings.mouseAcceleration,
+        settings.streamSharpeningEnabled,
+        settings.streamSharpeningAmount,
+    ) {
+        client.updateRendererSettings(settings)
     }
     DisposableEffect(client, rootView, pointerRootView, hideExternalMousePointer) {
         pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
@@ -8219,6 +8232,7 @@ private enum class StreamControlsPage {
     Main,
     StatusBar,
     Joysticks,
+    MouseMode,
 }
 
 @Composable
@@ -8270,6 +8284,7 @@ private fun StreamControlsPanel(
     onButtonScaleChange: (Float) -> Unit,
     onStickScaleChange: (Float) -> Unit,
     onOpacityChange: (Float) -> Unit,
+    onMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
     onTouchEdgePaddingChange: (Float) -> Unit,
     onTouchBottomPaddingChange: (Float) -> Unit,
@@ -8357,6 +8372,14 @@ private fun StreamControlsPanel(
                     onModeToggle = onJoystickModeToggle,
                     onDeadZoneChange = onJoystickDeadZoneChange,
                     onStickScaleChange = onStickScaleChange,
+                    onButtonTone = onButtonTone,
+                )
+                StreamControlsPage.MouseMode -> mouseModePageItems(
+                    settings = settings,
+                    controllerMouseEmulationEnabled = controllerMouseEmulationEnabled,
+                    onControllerMouseEmulationToggle = onControllerMouseEmulationToggle,
+                    onMouseSensitivityChange = onMouseSensitivityChange,
+                    onMouseScrollSensitivityChange = onMouseScrollSensitivityChange,
                     onButtonTone = onButtonTone,
                 )
                 StreamControlsPage.Main -> {
@@ -8577,12 +8600,11 @@ private fun StreamControlsPanel(
                     }
                     // Mouse mode (Left stick): shown for all profiles — works with both physical
                     // gamepad and touch controller.
-                    ControlSwitchRow(
+                    ControlNavigationRow(
                         label = stringResource(R.string.stream_panel_mouse_mode),
-                        checked = controllerMouseEmulationEnabled,
-                        onCheckedChange = {
+                        onClick = {
                             onButtonTone()
-                            onControllerMouseEmulationToggle()
+                            page = StreamControlsPage.MouseMode
                         },
                         value = if (controllerMouseEmulationEnabled) {
                             stringResource(R.string.stream_panel_mouse_mode_summary)
@@ -8792,6 +8814,7 @@ private fun StreamPanelHeader(
                         StreamControlsPage.Main -> R.string.stream_panel_title
                         StreamControlsPage.StatusBar -> R.string.stream_statusbar_title
                         StreamControlsPage.Joysticks -> R.string.stream_joysticks_title
+                        StreamControlsPage.MouseMode -> R.string.stream_mouse_mode_title
                     },
                 ),
                 style = MaterialTheme.typography.titleMedium,
@@ -8801,6 +8824,7 @@ private fun StreamPanelHeader(
                     StreamControlsPage.Main -> gameTitle
                     StreamControlsPage.StatusBar -> stringResource(R.string.stream_statusbar_subtitle)
                     StreamControlsPage.Joysticks -> stringResource(R.string.stream_joysticks_subtitle)
+                    StreamControlsPage.MouseMode -> stringResource(R.string.stream_mouse_mode_subtitle)
                 },
                 color = TextMuted,
                 style = MaterialTheme.typography.labelSmall,
@@ -9187,6 +9211,57 @@ private fun LazyListScope.joystickPageItems(
             color = TextMuted,
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+private fun LazyListScope.mouseModePageItems(
+    settings: AppSettings,
+    controllerMouseEmulationEnabled: Boolean,
+    onControllerMouseEmulationToggle: () -> Unit,
+    onMouseSensitivityChange: (Float) -> Unit,
+    onMouseScrollSensitivityChange: (Int) -> Unit,
+    onButtonTone: () -> Unit,
+) {
+    item {
+        ControlSwitchRow(
+            label = "Enable Mouse Mode",
+            checked = controllerMouseEmulationEnabled,
+            onCheckedChange = {
+                onButtonTone()
+                onControllerMouseEmulationToggle()
+            },
+            value = onOffLabel(controllerMouseEmulationEnabled),
+        )
+    }
+    if (controllerMouseEmulationEnabled) {
+        item {
+            ControlSliderRow(
+                label = "Mouse sensitivity",
+                value = settings.stream.mouseSensitivity,
+                min = 0.25f,
+                max = 3f,
+                step = 0.05f,
+                onChange = onMouseSensitivityChange,
+                valueFormatter = { "%.2fx".format(it) }
+            )
+        }
+        item {
+            val scrollHint = when {
+                settings.stream.mouseScrollSensitivity <= 20 -> "Fast"
+                settings.stream.mouseScrollSensitivity <= 40 -> "Normal"
+                settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
+                else -> "Slow"
+            }
+            ControlSliderRow(
+                label = "Scroll sensitivity",
+                value = settings.stream.mouseScrollSensitivity.toFloat(),
+                min = 10f,
+                max = 100f,
+                step = 5f,
+                onChange = { onMouseScrollSensitivityChange(it.toInt()) },
+                descriptionProvider = { "Speed: $scrollHint" }
+            )
+        }
     }
 }
 
