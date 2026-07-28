@@ -26,6 +26,9 @@ export function defaultProvider(): LoginProvider {
 }
 
 export function normalizeProvider(provider: LoginProvider): LoginProvider {
+  if (!provider.streamingServiceUrl) {
+    return provider;
+  }
   return {
     ...provider,
     streamingServiceUrl: provider.streamingServiceUrl.endsWith("/")
@@ -42,6 +45,14 @@ export class ProviderDiscovery {
       return this.providers;
     }
 
+    const chizuiMockProvider: LoginProvider = {
+      idpId: "chizui",
+      code: "CHIZUI",
+      displayName: "Chizui Login",
+      streamingServiceUrl: "",
+      priority: 999,
+    };
+
     let response: Response;
     try {
       response = await fetch(SERVICE_URLS_ENDPOINT, {
@@ -52,13 +63,13 @@ export class ProviderDiscovery {
       });
     } catch (error) {
       console.warn("Failed to fetch providers, using default:", error);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
 
     if (!response.ok) {
       console.warn(`Providers fetch failed with status ${response.status}, using default`);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
 
@@ -77,12 +88,13 @@ export class ProviderDiscovery {
         .sort((a, b) => a.priority - b.priority)
         .map(normalizeProvider);
 
-      this.providers = providers.length > 0 ? providers : [defaultProvider()];
+      providers.push(chizuiMockProvider);
+      this.providers = providers;
       console.log(`Loaded ${this.providers.length} providers`);
       return this.providers;
     } catch (error) {
       console.warn("Failed to parse providers response, using default:", error);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
   }

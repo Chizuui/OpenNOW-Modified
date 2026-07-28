@@ -72,6 +72,7 @@ export class AuthService {
       state: this.state,
       enrichmentCaches: this.enrichmentCaches,
       logout: () => this.accountManager.logout(),
+      fetchChizuiSession: (url, token, userId) => this.fetchChizuiSession(url, token, userId),
     });
     this.accountManager = new AccountManager(
       this.state,
@@ -227,6 +228,59 @@ export class AuthService {
     const initialTokens = await exchangeAuthorizationCode(code, verifier, port);
     const session = await this.buildLoginSession(initialTokens, provider);
     return this.saveLoginSession(session);
+  }
+
+  async loginWithChizui(serverUrl: string): Promise<AuthSession> {
+    const port = await findAvailablePort();
+    const oauthUrl = `${serverUrl.replace(/\/$/, "")}/?callback_port=${port}&prompt=select_account`;
+
+    const codePromise = waitForAuthorizationCode(port, 120000);
+    await shell.openExternal(oauthUrl);
+    const code = await codePromise;
+
+    const jwtToken = code.startsWith("CHIZUI_") ? code.substring("CHIZUI_".length) : code;
+    const session = await this.fetchChizuiSession(serverUrl, jwtToken);
+
+    const sessionWithChizui: AuthSession = {
+      ...session,
+      provider: normalizeProvider(session.provider),
+      chizuiServerUrl: serverUrl,
+      chizuiJwtToken: jwtToken,
+    };
+
+    return this.saveLoginSession(sessionWithChizui);
+  }
+
+  public async fetchChizuiSession(serverUrl: string, jwtToken: string, gfnUserId?: string): Promise<AuthSession> {
+    const url = `${serverUrl.replace(/\/$/, "")}/api/gfn/tokens${gfnUserId ? `?gfn_user_id=${gfnUserId}` : ""}`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${jwtToken}`,
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      let errMsg = `HTTP error ${response.status}`;
+      try {
+        const parsed = JSON.parse(body) as { error: string };
+        if (parsed.error) errMsg = parsed.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+
+    const payload = (await response.json()) as {
+      data?: AuthSession;
+      error?: string;
+    };
+
+    if (!payload.data) {
+      throw new Error(payload.error || "Session tokens not found on server");
+    }
+
+    return payload.data;
   }
 
   async startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge> {

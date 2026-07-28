@@ -118,6 +118,24 @@ export function SettingsInterfaceSection({ settings, showAll, handleChange, hand
             <span className="settings-subtle-hint">{t("settings.interface.translucentUIHint") || "Enable glassmorphism and translucent overlays."}</span>
           </div>
 
+          <div className="settings-row settings-row--column">
+            <div className="settings-row-top settings-row-top--compact">
+              <label className="settings-label settings-label--wrap" htmlFor="settings-interface-low-performance">
+                <span className="settings-label-title">{t("settings.interface.lowPerformanceMode") || "Low Performance Mode"}</span>
+              </label>
+              <label className="settings-toggle">
+                <input
+                  id="settings-interface-low-performance"
+                  type="checkbox"
+                  checked={settings.lowPerformanceMode}
+                  onChange={(e) => handleChange("lowPerformanceMode", e.target.checked)}
+                />
+                <span className="settings-toggle-track" />
+              </label>
+            </div>
+            <span className="settings-subtle-hint">{t("settings.interface.lowPerformanceModeHint") || "Disable performance-heavy visual effects (gradients, blur, animations, interactive shaders) to reduce CPU/GPU usage."}</span>
+          </div>
+
           <div className="settings-row">
             <label className="settings-label" htmlFor="settings-interface-accent-color">
               {t("settings.interface.accentColor")}

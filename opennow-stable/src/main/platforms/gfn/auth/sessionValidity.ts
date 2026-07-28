@@ -21,6 +21,7 @@ interface SessionValidityDependencies {
   state: PersistedAccountState;
   enrichmentCaches: SubscriptionVpcEnrichmentCaches;
   logout: () => Promise<void>;
+  fetchChizuiSession?: (serverUrl: string, jwtToken: string, gfnUserId?: string) => Promise<AuthSession>;
 }
 
 export function shouldRefreshSession(tokens: AuthTokens): boolean {
@@ -161,6 +162,41 @@ export class SessionValidityCoordinator {
     };
 
     const refreshErrors: string[] = [];
+
+    if (currentSession.chizuiServerUrl && currentSession.chizuiJwtToken && this.dependencies.fetchChizuiSession) {
+      try {
+        const chizuiSession = await this.dependencies.fetchChizuiSession(
+          currentSession.chizuiServerUrl,
+          currentSession.chizuiJwtToken,
+          userId,
+        );
+        let refreshedTokens = chizuiSession.tokens;
+        refreshedTokens = await this.ensureClientToken(refreshedTokens);
+
+        const updatedSession: AuthSession = {
+          ...currentSession,
+          tokens: refreshedTokens,
+          user: chizuiSession.user || currentSession.user,
+        };
+        accounts.updateSession(updatedSession);
+        this.dependencies.enrichmentCaches.clearSubscription();
+        await this.dependencies.enrichmentCaches.enrichUserTier();
+        await this.dependencies.state.persist();
+
+        return {
+          session: accounts.getSession(),
+          refresh: {
+            attempted: true,
+            forced: forceRefresh,
+            outcome: "refreshed",
+            message: "Session token refreshed via Chizui login server.",
+          },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error while refreshing with Chizui server";
+        refreshErrors.push(`chizui_refresh: ${message}`);
+      }
+    }
     if (tokens.clientToken) {
       try {
         const refreshedFromClientToken = await refreshWithClientToken(

@@ -67,7 +67,7 @@ export interface AuthSessionApi {
   setLogoutConfirmOpen: Dispatch<SetStateAction<boolean>>;
   selectedProvider: LoginProvider | null;
   refreshSavedAccounts: () => Promise<SavedAccount[]>;
-  handleLogin: () => Promise<void>;
+  handleLogin: (chizuiServerUrl?: string) => Promise<void>;
   handleQrLogin: () => Promise<void>;
   handleCancelQrLogin: () => void;
   handleSwitchAccount: (userId: string) => Promise<void>;
@@ -213,7 +213,7 @@ export function useAuthSession({
     t,
   ]);
 
-  const handleLogin = useCallback(async () => {
+  const handleLogin = useCallback(async (chizuiServerUrl?: string) => {
     setIsLoggingIn(true);
     setActiveLoginMode("oauth");
     setLoginError(null);
@@ -222,7 +222,15 @@ export function useAuthSession({
     }
     setQrLoginChallenge(null);
     try {
-      const session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      let session;
+      if (providerIdpId === "chizui") {
+        if (!chizuiServerUrl) {
+          throw new Error("Chizui login requires a server URL");
+        }
+        session = await window.openNow.chizuiLogin({ serverUrl: chizuiServerUrl });
+      } else {
+        session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      }
       setAuthSession(session);
       setProviderIdpId(session.provider.idpId);
       await refreshSavedAccounts();

@@ -149,6 +149,7 @@ export interface Settings {
   errorReportingConsent: ErrorReportingConsent;
   /** Anonymous install UUID used as PostHog distinct ID (empty until first grant or feedback) */
   telemetryInstallId: string;
+  lowPerformanceMode: boolean;
 }
 
 export const SHORTCUT_SETTING_KEYS = [
@@ -282,6 +283,7 @@ export function createDefaultSettings(platform: string): Settings {
     videoShader: { ...DEFAULT_VIDEO_SHADER_SETTINGS },
     errorReportingConsent: "unset",
     telemetryInstallId: "",
+    lowPerformanceMode: false,
   };
 }
 
