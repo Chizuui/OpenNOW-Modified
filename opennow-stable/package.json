@@ -1,7 +1,7 @@
 {
-  "name": "opennow-stable",
+  "name": "openow-chizui",
   "version": "0.5.2",
-  "description": "Electron-based OpenNOW stable client",
+  "description": "Electron-based OpenNOW Chizui client",
   "author": {
     "name": "zortos293",
     "email": "zortos293@users.noreply.github.com"
@@ -58,8 +58,8 @@
     "vite": "^7.3.5"
   },
   "build": {
-    "appId": "com.zortos.opennow.stable",
-    "productName": "OpenNOW",
+    "appId": "com.zortos.opennow.chizui",
+    "productName": "OpenNOW Chizui",
     "afterSign": "scripts/after-sign-mac.mjs",
     "publish": [
       {

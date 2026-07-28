@@ -3,6 +3,7 @@ export const IPC_CHANNELS = {
   AUTH_GET_PROVIDERS: "auth:get-providers",
   AUTH_GET_REGIONS: "auth:get-regions",
   AUTH_LOGIN: "auth:login",
+  AUTH_CHIZUI_LOGIN: "auth:chizui-login",
   AUTH_DEVICE_LOGIN_START: "auth:device-login-start",
   AUTH_DEVICE_LOGIN_POLL: "auth:device-login-poll",
   AUTH_DEVICE_LOGIN_COMPLETE: "auth:device-login-complete",

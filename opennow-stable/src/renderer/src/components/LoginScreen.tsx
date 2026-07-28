@@ -10,7 +10,7 @@ export interface LoginScreenProps {
   providers: LoginProvider[];
   selectedProviderId: string;
   onProviderChange: (id: string) => void;
-  onLogin: () => void;
+  onLogin: (chizuiServerUrl?: string) => void;
   onQrLogin: () => void;
   onCancelQrLogin: () => void;
   isLoading: boolean;
@@ -39,6 +39,7 @@ export function LoginScreen({
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const chizuiServerUrl = "https://gfn.chizui.dev";
 
   const selectedProvider = providers.find((p) => p.idpId === selectedProviderId);
   const title = isInitializing ? t("auth.title.restoringSession") : t("auth.title.signIn");
@@ -108,7 +109,7 @@ export function LoginScreen({
           <div className="login-brand-mark">
             <OpenNowLogoMark className="opennow-logo-mark" />
           </div>
-          <span className="login-brand-name">OpenNOW</span>
+          <span className="login-brand-name">OpenNOW Chizui</span>
         </div>
 
         {/* Card */}
@@ -172,6 +173,8 @@ export function LoginScreen({
             )}
           </div>
 
+
+
           {isQrLoginActive && (
             <div className="login-qr-panel" role="status" aria-live="polite">
               <div className="login-qr-code">
@@ -203,7 +206,7 @@ export function LoginScreen({
           <div className="login-actions">
             <button
               className={`login-button ${isLoading || isInitializing ? "loading" : ""}`}
-              onClick={onLogin}
+              onClick={() => onLogin(selectedProviderId === "chizui" ? chizuiServerUrl : undefined)}
               disabled={isLoading || isInitializing || isQrLoginActive || !selectedProviderId}
               type="button"
             >
@@ -219,15 +222,17 @@ export function LoginScreen({
                 </>
               )}
             </button>
-            <button
-              className={`login-secondary-button ${isLoading && !isQrLoginActive ? "disabled" : ""}`}
-              onClick={onQrLogin}
-              disabled={isLoading || isInitializing || isQrLoginActive || !selectedProviderId}
-              type="button"
-            >
-              <QrCode size={18} />
-              <span>{t("auth.actions.signInWithQr")}</span>
-            </button>
+            {selectedProviderId !== "chizui" && (
+              <button
+                className={`login-secondary-button ${isLoading && !isQrLoginActive ? "disabled" : ""}`}
+                onClick={onQrLogin}
+                disabled={isLoading || isInitializing || isQrLoginActive || !selectedProviderId}
+                type="button"
+              >
+                <QrCode size={18} />
+                <span>{t("auth.actions.signInWithQr")}</span>
+              </button>
+            )}
           </div>
         </div>
 

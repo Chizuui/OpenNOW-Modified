@@ -123,6 +123,9 @@ function defaultProvider(): LoginProvider {
 }
 
 function normalizeProvider(provider: LoginProvider): LoginProvider {
+  if (!provider.streamingServiceUrl) {
+    return provider;
+  }
   return {
     ...provider,
     streamingServiceUrl: provider.streamingServiceUrl.endsWith("/")
@@ -681,6 +684,14 @@ export class AuthService {
       return this.providers;
     }
 
+    const chizuiMockProvider: LoginProvider = {
+      idpId: "chizui",
+      code: "CHIZUI",
+      displayName: "Chizui Login",
+      streamingServiceUrl: "",
+      priority: 999,
+    };
+
     let response: Response;
     try {
       response = await fetch(SERVICE_URLS_ENDPOINT, {
@@ -691,13 +702,13 @@ export class AuthService {
       });
     } catch (error) {
       console.warn("Failed to fetch providers, using default:", error);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
 
     if (!response.ok) {
       console.warn(`Providers fetch failed with status ${response.status}, using default`);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
 
@@ -717,12 +728,13 @@ export class AuthService {
         .sort((a, b) => a.priority - b.priority)
         .map(normalizeProvider);
 
-      this.providers = providers.length > 0 ? providers : [defaultProvider()];
+      providers.push(chizuiMockProvider);
+      this.providers = providers;
       console.log(`Loaded ${this.providers.length} providers`);
       return this.providers;
     } catch (error) {
       console.warn("Failed to parse providers response, using default:", error);
-      this.providers = [defaultProvider()];
+      this.providers = [defaultProvider(), chizuiMockProvider];
       return this.providers;
     }
   }
@@ -960,6 +972,59 @@ export class AuthService {
     const initialTokens = await exchangeAuthorizationCode(code, verifier, port);
     const session = await this.buildLoginSession(initialTokens, provider);
     return this.saveLoginSession(session);
+  }
+
+  async loginWithChizui(serverUrl: string): Promise<AuthSession> {
+    const port = await findAvailablePort();
+    const oauthUrl = `${serverUrl.replace(/\/$/, "")}/?callback_port=${port}&prompt=select_account`;
+
+    const codePromise = waitForAuthorizationCode(port, 120000);
+    await shell.openExternal(oauthUrl);
+    const code = await codePromise;
+
+    const jwtToken = code.startsWith("CHIZUI_") ? code.substring("CHIZUI_".length) : code;
+    const session = await this.fetchChizuiSession(serverUrl, jwtToken);
+
+    const sessionWithChizui: AuthSession = {
+      ...session,
+      provider: normalizeProvider(session.provider),
+      chizuiServerUrl: serverUrl,
+      chizuiJwtToken: jwtToken,
+    };
+
+    return this.saveLoginSession(sessionWithChizui);
+  }
+
+  private async fetchChizuiSession(serverUrl: string, jwtToken: string, gfnUserId?: string): Promise<AuthSession> {
+    const url = `${serverUrl.replace(/\/$/, "")}/api/gfn/tokens${gfnUserId ? `?gfn_user_id=${gfnUserId}` : ""}`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${jwtToken}`,
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      let errMsg = `HTTP error ${response.status}`;
+      try {
+        const parsed = JSON.parse(body) as { error: string };
+        if (parsed.error) errMsg = parsed.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+
+    const payload = (await response.json()) as {
+      data?: AuthSession;
+      error?: string;
+    };
+
+    if (!payload.data) {
+      throw new Error(payload.error || "Session tokens not found on server");
+    }
+
+    return payload.data;
   }
 
   async startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge> {
@@ -1307,6 +1372,41 @@ export class AuthService {
     };
 
     const refreshErrors: string[] = [];
+
+    if (currentSession.chizuiServerUrl && currentSession.chizuiJwtToken) {
+      try {
+        const chizuiSession = await this.fetchChizuiSession(
+          currentSession.chizuiServerUrl,
+          currentSession.chizuiJwtToken,
+          userId
+        );
+        let refreshedTokens = chizuiSession.tokens;
+        refreshedTokens = await this.ensureClientToken(refreshedTokens, userId);
+
+        const updatedSession: AuthSession = {
+          ...currentSession,
+          tokens: refreshedTokens,
+          user: chizuiSession.user || currentSession.user,
+        };
+        this.sessions.set(updatedSession.user.userId, updatedSession);
+        this.clearSubscriptionCache();
+        await this.enrichUserTier();
+        await this.persist();
+
+        return {
+          session: this.getSession(),
+          refresh: {
+            attempted: true,
+            forced: forceRefresh,
+            outcome: "refreshed",
+            message: "Session token refreshed via Chizui login server.",
+          },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error while refreshing with Chizui server";
+        refreshErrors.push(`chizui_refresh: ${message}`);
+      }
+    }
 
     if (tokens.clientToken) {
       try {

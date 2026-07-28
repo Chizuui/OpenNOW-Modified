@@ -2153,7 +2153,7 @@ export function App(): JSX.Element {
   }, [hydrateCatalogSnapshot, loadSessionRuntimeData, resetStorePanels, t]);
 
   // Login handler
-  const handleLogin = useCallback(async () => {
+  const handleLogin = useCallback(async (chizuiServerUrl?: string) => {
     setIsLoggingIn(true);
     setActiveLoginMode("oauth");
     setLoginError(null);
@@ -2162,7 +2162,15 @@ export function App(): JSX.Element {
     }
     setQrLoginChallenge(null);
     try {
-      const session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      let session;
+      if (providerIdpId === "chizui") {
+        if (!chizuiServerUrl) {
+          throw new Error("Chizui login requires a server URL");
+        }
+        session = await window.openNow.chizuiLogin({ serverUrl: chizuiServerUrl });
+      } else {
+        session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      }
       setAuthSession(session);
       setProviderIdpId(session.provider.idpId);
       await refreshSavedAccounts();

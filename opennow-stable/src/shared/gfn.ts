@@ -658,6 +658,8 @@ export interface AuthSession {
   provider: LoginProvider;
   tokens: AuthTokens;
   user: AuthUser;
+  chizuiServerUrl?: string;
+  chizuiJwtToken?: string;
 }
 
 export interface SavedAccount {
@@ -1538,6 +1540,7 @@ export interface OpenNowApi {
   getLoginProviders(): Promise<LoginProvider[]>;
   getRegions(input?: RegionsFetchRequest): Promise<StreamRegion[]>;
   login(input: AuthLoginRequest): Promise<AuthSession>;
+  chizuiLogin(input: { serverUrl: string }): Promise<AuthSession>;
   startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge>;
   pollDeviceLogin(input: AuthDeviceLoginPollRequest): Promise<AuthDeviceLoginPollResult>;
   completeDeviceLogin(input: AuthDeviceLoginAttemptRequest): Promise<AuthSession>;

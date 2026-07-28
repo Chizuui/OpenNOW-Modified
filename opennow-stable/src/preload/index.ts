@@ -79,6 +79,7 @@ const api: OpenNowApi = {
   getLoginProviders: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_GET_PROVIDERS),
   getRegions: (input: RegionsFetchRequest = {}) => ipcRenderer.invoke(IPC_CHANNELS.AUTH_GET_REGIONS, input),
   login: (input: AuthLoginRequest) => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGIN, input),
+  chizuiLogin: (input: { serverUrl: string }) => ipcRenderer.invoke(IPC_CHANNELS.AUTH_CHIZUI_LOGIN, input),
   startDeviceLogin: (input: AuthDeviceLoginStartRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.AUTH_DEVICE_LOGIN_START, input),
   pollDeviceLogin: (input: AuthDeviceLoginPollRequest) =>
