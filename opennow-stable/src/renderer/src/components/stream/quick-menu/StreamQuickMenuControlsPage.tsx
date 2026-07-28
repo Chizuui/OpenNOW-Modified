@@ -1,5 +1,6 @@
 import type { JSX, RefObject } from "react";
 import type { MicrophoneMode, VideoShaderSettings } from "@shared/gfn";
+import { SettingRange } from "../../settings/SettingRange";
 import { DEFAULT_VIDEO_SHADER_SETTINGS } from "@shared/gfn";
 import type { StreamDiagnosticsStore } from "../../../utils/streamDiagnosticsStore";
 import { SidebarMicMutedBadge } from "../StreamEmptyStates";
@@ -24,6 +25,8 @@ interface StreamQuickMenuControlsPageProps {
   onMouseSensitivityChange: (value: number) => void;
   mouseAcceleration: number;
   onMouseAccelerationChange: (value: number) => void;
+  maxBitrateMbps: number;
+  onMaxBitrateMbpsChange: (value: number) => void;
   gstreamerEnabled: boolean;
   videoShader: VideoShaderSettings;
   onVideoShaderChange: (value: VideoShaderSettings) => void;
@@ -39,6 +42,8 @@ export function StreamQuickMenuControlsPage({
   onMouseSensitivityChange,
   mouseAcceleration,
   onMouseAccelerationChange,
+  maxBitrateMbps,
+  onMaxBitrateMbpsChange,
   gstreamerEnabled,
   videoShader,
   onVideoShaderChange,
@@ -100,6 +105,23 @@ export function StreamQuickMenuControlsPage({
             }}
           />
           <span className="sidebar-hint">Dynamic turn boost strength (1% = off-like, 150% = strongest).</span>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Max Bitrate</span>
+            <span className="settings-value-badge">{maxBitrateMbps} Mbps</span>
+          </div>
+          <SettingRange
+            id="quick-menu-max-bitrate"
+            className="settings-slider"
+            min={5}
+            max={150}
+            step={5}
+            value={maxBitrateMbps}
+            onPreview={onMaxBitrateMbpsChange}
+            onCommit={onMaxBitrateMbpsChange}
+          />
+          <span className="sidebar-hint">Matches Stream settings bitrate. Applies live to the active session.</span>
         </div>
       </section>
       <div className="sidebar-separator" aria-hidden="true" />
