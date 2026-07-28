@@ -56,6 +56,8 @@ export function SettingsNativeStreamerSection({
   const { t } = useTranslation();
   const [nativeStreamerStatus, setNativeStreamerStatus] = useState<NativeStreamerStatus | null>(null);
   const [nativeStreamerStatusLoading, setNativeStreamerStatusLoading] = useState(false);
+  const [probeElapsedSeconds, setProbeElapsedSeconds] = useState(0);
+  const probeStartedAtRef = useRef<number | null>(null);
   const [nativeStreamerEnablePromptOpen, setNativeStreamerEnablePromptOpen] = useState(false);
   const nativeStreamerEnablePromptConfirmRef = useRef<HTMLButtonElement | null>(null);
   const hostVideoBackends = getHostVideoBackends(nativeStreamerStatus);
@@ -81,6 +83,8 @@ export function SettingsNativeStreamerSection({
       return;
     }
 
+    probeStartedAtRef.current = Date.now();
+    setProbeElapsedSeconds(0);
     setNativeStreamerStatusLoading(true);
     try {
       setNativeStreamerStatus(await window.openNow.getNativeStreamerStatus());
@@ -99,12 +103,24 @@ export function SettingsNativeStreamerSection({
       });
     } finally {
       setNativeStreamerStatusLoading(false);
+      probeStartedAtRef.current = null;
     }
   }, []);
 
   useEffect(() => {
     void refreshNativeStreamerStatus();
   }, [refreshNativeStreamerStatus]);
+
+  useEffect(() => {
+    if (!nativeStreamerStatusLoading) return;
+    const id = window.setInterval(() => {
+      const start = probeStartedAtRef.current;
+      if (start !== null) {
+        setProbeElapsedSeconds(Math.floor((Date.now() - start) / 1000));
+      }
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [nativeStreamerStatusLoading]);
 
   useEffect(() => {
     if (nativeStreamerEnablePromptOpen) {
@@ -261,11 +277,13 @@ export function SettingsNativeStreamerSection({
                           : "settings-inline-badge--updater-error"
                     }`}
                   >
-                    {nativeStreamerStatusLoading
-                      ? t("app.status.checking")
-                      : nativeStreamerStatus?.gstreamerAvailable
-                        ? t("settings.nativeStreamer.gstreamerReady")
-                        : t("settings.nativeStreamer.notReady")}
+                    {nativeStreamerStatusLoading && probeElapsedSeconds >= 2
+                      ? `${t("app.status.checking")} (${probeElapsedSeconds}s)`
+                      : nativeStreamerStatusLoading
+                        ? t("app.status.checking")
+                        : nativeStreamerStatus?.gstreamerAvailable
+                          ? t("settings.nativeStreamer.gstreamerReady")
+                          : t("settings.nativeStreamer.notReady")}
                   </span>
                   <span className={`settings-inline-badge ${getGstreamerRuntimeBadgeClass(nativeStreamerStatus)}`}>
                     {formatGstreamerRuntimeLabel(nativeStreamerStatus)}
