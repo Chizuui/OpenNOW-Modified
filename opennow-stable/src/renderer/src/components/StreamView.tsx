@@ -86,6 +86,8 @@ interface StreamViewProps {
   onMouseSensitivityChange: (value: number) => void;
   mouseAcceleration: number;
   onMouseAccelerationChange: (value: number) => void;
+  maxBitrateMbps: number;
+  onMaxBitrateMbpsChange: (value: number) => void;
   onRequestPointerLock?: () => void;
   onReleasePointerLock?: () => void;
   onNativeInputPaused?: (paused: boolean) => void;
@@ -140,6 +142,8 @@ export function StreamView({
   onMouseSensitivityChange,
   mouseAcceleration,
   onMouseAccelerationChange,
+  maxBitrateMbps,
+  onMaxBitrateMbpsChange,
   onRequestPointerLock,
   onReleasePointerLock,
   onNativeInputPaused,
@@ -699,6 +703,8 @@ export function StreamView({
         onMouseSensitivityChange={onMouseSensitivityChange}
         mouseAcceleration={mouseAcceleration}
         onMouseAccelerationChange={onMouseAccelerationChange}
+        maxBitrateMbps={maxBitrateMbps}
+        onMaxBitrateMbpsChange={onMaxBitrateMbpsChange}
         gstreamerEnabled={gstreamerEnabled}
         videoShader={videoShader}
         onVideoShaderChange={onVideoShaderChange}
