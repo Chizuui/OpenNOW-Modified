@@ -1,4 +1,8 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// NOTE: Do NOT add `windows_subsystem = "windows"` here.
+// This binary communicates with the Electron main process via stdin/stdout IPC (spawnSync/spawn).
+// GUI-subsystem binaries on Windows cannot have piped stdio handles attached by Node.js,
+// which causes STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) when spawned with piped stdio.
+// The console window is hidden automatically because Electron spawns it without a visible console.
 
 mod backend;
 #[cfg(feature = "gstreamer")]
