@@ -2226,14 +2226,11 @@ fn decoder_factory_usable(factory: &'static str) -> bool {
         }
     }
 
-    let usable = gst::ElementFactory::make(factory)
-        .build()
-        .ok()
-        .is_some_and(|decoder| {
-            let usable = decoder.set_state(gst::State::Ready).is_ok();
-            let _ = decoder.set_state(gst::State::Null);
-            usable
-        });
+    // Fast probe: registry lookup only. Instantiating each decoder + transitioning
+    // to State::Ready during capability enumeration adds tens of seconds to hello
+    // and stalls the Settings tab. The actual pipeline builds + state transitions
+    // still happen at session start.
+    let usable = gst::ElementFactory::find(factory).is_some();
     if let Ok(mut probes) = probes.lock() {
         probes.insert(factory, usable);
     }
