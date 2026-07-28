@@ -165,9 +165,18 @@ export function ShaderAtmosphere({
   const [reducedMotion, setReducedMotion] = useState(
     () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
   );
+  const [lowPerfMode, setLowPerfMode] = useState(() => document.body.classList.contains("low-perf-mode"));
   const [documentVisible, setDocumentVisible] = useState(() => document.visibilityState !== "hidden");
   const pointerRef = useRef<PointerPosition>({ x: -2, y: -2 });
-  const renderActive = active && documentVisible && !reducedMotion;
+  const renderActive = active && documentVisible && !reducedMotion && !lowPerfMode;
+
+  useEffect(() => {
+    const observer = new MutationObserver(() => {
+      setLowPerfMode(document.body.classList.contains("low-perf-mode"));
+    });
+    observer.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -184,12 +193,12 @@ export function ShaderAtmosphere({
   }, []);
 
   useEffect(() => {
-    if (reducedMotion) {
+    if (reducedMotion || lowPerfMode) {
       setWebGlSupported(false);
       return;
     }
     setWebGlSupported(supportsWebGl());
-  }, [reducedMotion]);
+  }, [reducedMotion, lowPerfMode]);
 
   useEffect(() => {
     if (!renderActive || variant === "controller") return undefined;
@@ -218,12 +227,12 @@ export function ShaderAtmosphere({
       className={[
         "shader-atmosphere",
         `shader-atmosphere--${variant}`,
-        reducedMotion ? "shader-atmosphere--reduced-motion" : "",
+        (reducedMotion || lowPerfMode) ? "shader-atmosphere--reduced-motion" : "",
         className,
       ].filter(Boolean).join(" ")}
       aria-hidden="true"
     >
-      {!reducedMotion && webGlSupported && (
+      {!reducedMotion && !lowPerfMode && webGlSupported && (
         <Canvas
           dpr={[0.75, 1]}
           frameloop={renderActive ? "always" : "never"}

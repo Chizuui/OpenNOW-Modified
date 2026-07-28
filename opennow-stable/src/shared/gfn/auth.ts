@@ -29,6 +29,8 @@ export interface AuthSession {
   provider: LoginProvider;
   tokens: AuthTokens;
   user: AuthUser;
+  chizuiServerUrl?: string;
+  chizuiJwtToken?: string;
 }
 
 export interface SavedAccount {

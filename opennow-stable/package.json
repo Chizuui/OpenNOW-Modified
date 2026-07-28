@@ -1,5 +1,5 @@
 {
-  "name": "opennow-stable",
+  "name": "openow-chizui",
   "version": "0.5.1",
   "description": "Electron-based OpenNOW stable client",
   "author": {
@@ -84,8 +84,8 @@
     "ws": "$ws"
   },
   "build": {
-    "appId": "com.zortos.opennow.stable",
-    "productName": "OpenNOW",
+    "appId": "com.chizui.opennow",
+    "productName": "OpenNOW Chizui",
     "afterSign": "scripts/after-sign-mac.mjs",
     "publish": [
       {
