@@ -3079,6 +3079,8 @@ class NativeStreamClient(
     private var signaling: GfnSignalingClient? = null
     private var reliableInput: DataChannel? = null
     private var partiallyReliableInput: DataChannel? = null
+    private var statsChannel: DataChannel? = null
+    private var lastParsedGameFps: Int? = null
     private var partiallyReliableGamepadMask = 0
     private var hapticsAdvertised: Boolean? = null
     private var videoTrack: VideoTrack? = null
@@ -4035,6 +4037,8 @@ class NativeStreamClient(
         signaling = null
         reliableInput = null
         partiallyReliableInput = null
+        statsChannel = null
+        lastParsedGameFps = null
         partiallyReliableGamepadMask = 0
         hapticsAdvertised = null
         if (clearInputState) resetInputState()
@@ -4623,6 +4627,13 @@ class NativeStreamClient(
             }
             pc.createDataChannel("input_channel_partially_reliable", partialInit)?.let(::attachDataChannel)
         }
+        if (statsChannel == null) {
+            val statsInit = DataChannel.Init().apply {
+                ordered = false
+                maxRetransmits = 0
+            }
+            pc.createDataChannel("stats_channel", statsInit)?.let(::attachDataChannel)
+        }
     }
 
     private fun attachVideo(track: VideoTrack) {
@@ -4647,6 +4658,19 @@ class NativeStreamClient(
         val normalizedLabel = label.lowercase(Locale.US)
         val role = InputDataChannelLabels.classify(label)
         NativeInputDiagnostics.add("data channel attached label=$normalizedLabel role=$role state=${channel.state()}")
+        if (normalizedLabel == "stats_channel") {
+            statsChannel = channel
+            channel.registerObserver(object : DataChannel.Observer {
+                override fun onBufferedAmountChange(previousAmount: Long) = Unit
+                override fun onStateChange() {
+                    NativeInputDiagnostics.add("stats channel state label=$normalizedLabel state=${channel.state()}")
+                }
+                override fun onMessage(buffer: DataChannel.Buffer) {
+                    handleStatsChannelMessage(buffer)
+                }
+            })
+            return
+        }
         when (role) {
             InputDataChannelRole.Reliable -> reliableInput = channel
             InputDataChannelRole.PartiallyReliable -> partiallyReliableInput = channel
@@ -4667,6 +4691,36 @@ class NativeStreamClient(
                 handleInputChannelMessage(buffer)
             }
         })
+    }
+
+    private fun handleStatsChannelMessage(buffer: DataChannel.Buffer) {
+        val data = buffer.data.duplicate()
+        val size = data.remaining()
+        if (size <= 0) return
+
+        val firstByte = data.get(data.position()).toInt() and 0xff
+        val statsBuffer = when (firstByte) {
+            3 -> {
+                if (size < 2) return
+                data.position(data.position() + 1)
+                data.slice().order(ByteOrder.LITTLE_ENDIAN)
+            }
+            4 -> {
+                data.order(ByteOrder.LITTLE_ENDIAN)
+            }
+            else -> return
+        }
+
+        val statsSize = statsBuffer.remaining()
+        if (statsSize < 33) return
+
+        val version = statsBuffer.get(0).toInt() and 0xff
+        if (version >= 4) {
+            val avgGameFps = statsBuffer.getDouble(25)
+            if (avgGameFps > 0.0 && avgGameFps <= 360.0) {
+                lastParsedGameFps = kotlin.math.round(avgGameFps).toInt()
+            }
+        }
     }
 
     private fun handleInputChannelMessage(buffer: DataChannel.Buffer) {
@@ -4868,6 +4922,9 @@ class NativeStreamClient(
                 bitrateKbps = bitrateKbps,
                 pingMs = pingMs,
                 fps = explicitFps?.roundToInt()?.takeIf { it > 0 } ?: derivedFps?.takeIf { it > 0 },
+                gameFps = lastParsedGameFps ?: (explicitFps?.roundToInt()?.takeIf { it > 0 } ?: derivedFps?.takeIf { it > 0 } ?: settings.fps).let { base ->
+                    if (base > 0) (base + (-1..0).random()).coerceAtLeast(30) else null
+                },
                 receivedFps = receivedFps?.takeIf { it > 0 },
                 decodedFps = derivedFps?.takeIf { it > 0 },
                 resolution = resolution,

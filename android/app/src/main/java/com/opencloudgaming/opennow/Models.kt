@@ -1542,6 +1542,7 @@ data class StreamRuntimeStats(
     val bitrateKbps: Int? = null,
     val pingMs: Int? = null,
     val fps: Int? = null,
+    val gameFps: Int? = null,
     val receivedFps: Int? = null,
     val decodedFps: Int? = null,
     val resolution: String? = null,
