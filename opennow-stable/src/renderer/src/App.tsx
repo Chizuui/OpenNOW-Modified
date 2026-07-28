@@ -2723,6 +2723,8 @@ export function App(): JSX.Element {
               streamRevealComplete={streamRevealComplete}
               isStreaming={isStreaming}
               recordingBitrateMbps={settings.recordingBitrateMbps}
+              maxBitrateMbps={settings.maxBitrateMbps}
+              onMaxBitrateMbpsChange={(value) => { void updateSetting("maxBitrateMbps", value); }}
               gameTitle={streamingGame?.title ?? t("app.labels.game")}
               platformStore={streamingStore ?? undefined}
               onToggleFullscreen={() => {
