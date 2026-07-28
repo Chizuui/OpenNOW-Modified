@@ -41,6 +41,10 @@ import {
   SAFE_FALLBACK_STREAM_PROFILE,
 } from "@shared/gfn";
 import { GfnWebRtcClient } from "./gfn/webrtcClient";
+import { StreamingContext } from "./streaming/StreamingContext";
+import { WebRTCEngine } from "./streaming/webrtc/WebRTCEngine";
+import { NativeEngine } from "./streaming/native/NativeEngine";
+import { StreamingEngineType } from "./streaming/streamingTypes";
 import { formatShortcutForDisplay, isShortcutMatch, normalizeShortcut } from "./shortcuts";
 import { dispatchStreamShortcutAction } from "./streamShortcutActions";
 import { useElapsedSeconds } from "./utils/useElapsedSeconds";
@@ -673,6 +677,19 @@ export function App(): JSX.Element {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const clientRef = useRef<GfnWebRtcClient | null>(null);
+  const streamingContextRef = useRef<StreamingContext | null>(null);
+  if (!streamingContextRef.current) {
+    streamingContextRef.current = new StreamingContext({
+      type: settings.streamClientMode === "native" ? StreamingEngineType.Native : StreamingEngineType.WebRTC,
+      resolution: settings.resolution,
+      fps: settings.fps,
+      maxBitrateMbps: settings.maxBitrateMbps,
+      codec: settings.codec,
+      colorQuality: settings.colorQuality,
+      enableAudio: true,
+    });
+  }
+  const attemptSessionRecoveryRef = useRef<((reason: string) => Promise<boolean>) | null>(null);
   const isStreamingRef = useRef(streamStatus === "streaming");
 
   useEffect(() => {
@@ -690,6 +707,16 @@ export function App(): JSX.Element {
     }
     clientRef.current?.setOutputVolume(streamVolume);
   }, [streamVolume]);
+
+  useEffect(() => {
+    streamingContextRef.current?.updateConfig({
+      resolution: settings.resolution,
+      fps: settings.fps,
+      maxBitrateMbps: settings.maxBitrateMbps,
+      codec: settings.codec,
+      type: settings.streamClientMode === "native" ? StreamingEngineType.Native : StreamingEngineType.WebRTC,
+    });
+  }, [settings.resolution, settings.fps, settings.maxBitrateMbps, settings.codec, settings.streamClientMode]);
   const sessionRef = useRef<SessionInfo | null>(null);
   const hasInitializedRef = useRef(false);
   const regionsRequestRef = useRef(0);
@@ -2629,7 +2656,138 @@ export function App(): JSX.Element {
     return {};
   }, []);
 
-  const applyClaimedSessionAndConnect = useCallback(async (
+  const connectSessionEngine: (sessionInfo: SessionInfo) => Promise<void> = useCallback(async (sessionInfo: SessionInfo): Promise<void> => {
+    if (!videoRef.current || !audioRef.current) {
+      throw new Error("Video or audio refs not resolved");
+    }
+
+    const client = new GfnWebRtcClient({
+      videoElement: videoRef.current,
+      audioElement: audioRef.current,
+      autoFullScreen: settings.autoFullScreen,
+      microphoneMode: settings.microphoneMode,
+      microphoneDeviceId: settings.microphoneDeviceId || undefined,
+      nativeCursorOverlay: settings.nativeCursorOverlay,
+      mouseSensitivity: settings.mouseSensitivity,
+      mouseAcceleration: settings.mouseAcceleration,
+      keyboardLayout: settings.keyboardLayout,
+      clipboardPaste: settings.clipboardPaste,
+      readClipboardText: readStreamClipboardText,
+      onLog: (line: string) => console.log(`[WebRTC] ${line}`),
+      onStats: (stats) => diagnosticsStore.set(stats),
+      onTimeWarning: (warning) => {
+        setRemoteStreamWarning({
+          code: warning.code,
+          message: warningMessage(t, warning.code),
+          tone: warningTone(warning.code),
+          secondsLeft: warning.secondsLeft,
+        });
+      },
+      onMicStateChange: (state) => {
+        console.log(`[App] Mic state: ${state.state}${state.deviceLabel ? ` (${state.deviceLabel})` : ""}`);
+      },
+      onControllerMetaPress: () => {
+        if (streamStatusRef.current === "streaming") {
+          dispatchStreamShortcutAction("toggleSidebar");
+        }
+      },
+      onIceConnectionStateChange: (iceState) => {
+        latestIceConnectionStateRef.current = iceState;
+        if (iceDisconnectedRecoveryTimerRef.current !== null) {
+          window.clearTimeout(iceDisconnectedRecoveryTimerRef.current);
+          iceDisconnectedRecoveryTimerRef.current = null;
+        }
+        if (appUnloadingRef.current) {
+          return;
+        }
+        if (streamStatusRef.current !== "streaming") {
+          return;
+        }
+        if (iceState === "failed") {
+          console.warn("[Recovery] ICE failed; attempting targeted recovery");
+          void attemptSessionRecoveryRef.current?.("ICE failed").catch((error: any) => {
+            console.error("[Recovery] ICE-failed recovery failed:", error);
+          });
+          return;
+        }
+        if (iceState === "disconnected") {
+          iceDisconnectedRecoveryTimerRef.current = window.setTimeout(() => {
+            iceDisconnectedRecoveryTimerRef.current = null;
+            if (appUnloadingRef.current || streamStatusRef.current !== "streaming") {
+              return;
+            }
+            if (latestIceConnectionStateRef.current !== "disconnected") {
+              return;
+            }
+            console.warn("[Recovery] ICE remained disconnected; attempting targeted recovery");
+            void attemptSessionRecoveryRef.current?.("ICE disconnected timeout").catch((error: any) => {
+              console.error("[Recovery] ICE-disconnected recovery failed:", error);
+            });
+          }, ICE_DISCONNECTED_RECOVERY_GRACE_MS);
+        }
+      },
+    });
+
+    client.setOutputVolume(streamVolume);
+    client.setMicrophoneLevel(streamMicLevel);
+    if (settings.microphoneMode !== "disabled") {
+      void client.startMicrophone();
+    }
+
+    clientRef.current = client;
+
+    const config = {
+      type: settings.streamClientMode === "native" ? StreamingEngineType.Native : StreamingEngineType.WebRTC,
+      resolution: settings.resolution,
+      fps: settings.fps,
+      maxBitrateMbps: settings.maxBitrateMbps,
+      codec: settings.codec,
+      colorQuality: settings.colorQuality,
+      enableAudio: true,
+    };
+
+    let engine;
+    if (config.type === StreamingEngineType.Native) {
+      engine = new NativeEngine(config, client, {
+        settings: {
+          ...settings,
+          nativeStreamerBackend: "gstreamer",
+        },
+        shortcuts: {
+          toggleStats: settings.shortcutToggleStats,
+          togglePointerLock: settings.shortcutTogglePointerLock,
+          toggleFullscreen: settings.shortcutToggleFullscreen,
+          stopStream: settings.shortcutStopStream,
+          toggleAntiAfk: settings.shortcutToggleAntiAfk,
+          toggleMicrophone: settings.shortcutToggleMicrophone,
+          screenshot: settings.shortcutScreenshot,
+          toggleRecording: settings.shortcutToggleRecording,
+        },
+      });
+    } else {
+      engine = new WebRTCEngine(config, client);
+    }
+
+    await engine.initialize();
+    await streamingContextRef.current?.setEngine(engine);
+
+    const streamSession = {
+      sessionId: sessionInfo.sessionId,
+      serverAddress: sessionInfo.signalingServer,
+      authToken: authSession?.tokens.idToken ?? authSession?.tokens.accessToken ?? "",
+      rawSession: sessionInfo,
+    };
+
+    await streamingContextRef.current?.connect(streamSession);
+  }, [
+    settings,
+    streamVolume,
+    streamMicLevel,
+    t,
+    readStreamClipboardText,
+  ]);
+
+  const applyClaimedSessionAndConnect: (claimed: SessionInfo, expectedRecoveryGeneration?: number) => Promise<void> = useCallback(async (
     claimed: SessionInfo,
     expectedRecoveryGeneration?: number,
   ): Promise<void> => {
@@ -2696,8 +2854,8 @@ export function App(): JSX.Element {
     setQueuePosition(undefined);
     setLaunchError(null);
     setStreamStatus("connecting");
-    await window.openNow.connectSignaling(buildSignalingConnectRequest(claimed));
-  }, [buildSignalingConnectRequest, disconnectSignalingControlled, isRecoveryGenerationCurrent]);
+    await connectSessionEngine(claimed);
+  }, [connectSessionEngine, disconnectSignalingControlled, isRecoveryGenerationCurrent]);
 
   const claimAndConnectSession = useCallback(async (existingSession: ActiveSessionInfo): Promise<void> => {
     const sid = existingSession.sessionId;
@@ -2763,7 +2921,7 @@ export function App(): JSX.Element {
     await resumePromiseHolder.promise;
   }, [applyClaimedSessionAndConnect, authSession, buildCurrentStreamSettings, effectiveStreamingBaseUrl, findGameContextForSession, resolveResumeIdentity, resolveSessionClaimAppId, resolveSubscriptionInfoForLaunch, warmNativeStreamerForLaunch]);
 
-  const attemptSessionRecovery = useCallback(async (reason: string): Promise<boolean> => {
+  const attemptSessionRecovery: (reason: string) => Promise<boolean> = useCallback(async (reason: string): Promise<boolean> => {
     const recoveryState = signalingRecoveryRef.current;
     const recoveryGeneration = recoveryState.generation;
     const currentStatus = streamStatusRef.current;
@@ -2956,6 +3114,8 @@ export function App(): JSX.Element {
     resolveSubscriptionInfoForLaunch,
   ]);
 
+  attemptSessionRecoveryRef.current = attemptSessionRecovery;
+
   const handleExpectedNativeSessionClose = useCallback((reason: string): void => {
     console.log("[Recovery] Treating signaling close as ended session:", reason);
     const activeGameId = streamingGameRef.current?.id;
@@ -2973,85 +3133,8 @@ export function App(): JSX.Element {
   // Signaling events
   useEffect(() => {
     const ensureWebRtcClient = (): GfnWebRtcClient | null => {
-      if (clientRef.current) {
-        return clientRef.current;
-      }
-      if (!videoRef.current || !audioRef.current) {
-        return null;
-      }
-
-      clientRef.current = new GfnWebRtcClient({
-        videoElement: videoRef.current,
-        audioElement: audioRef.current,
-        autoFullScreen: settings.autoFullScreen,
-        microphoneMode: settings.microphoneMode,
-        microphoneDeviceId: settings.microphoneDeviceId || undefined,
-        nativeCursorOverlay: settings.nativeCursorOverlay,
-        mouseSensitivity: settings.mouseSensitivity,
-        mouseAcceleration: settings.mouseAcceleration,
-        keyboardLayout: settings.keyboardLayout,
-        clipboardPaste: settings.clipboardPaste,
-        readClipboardText: readStreamClipboardText,
-        onLog: (line: string) => console.log(`[WebRTC] ${line}`),
-        onStats: (stats) => diagnosticsStore.set(stats),
-        onTimeWarning: (warning) => {
-          setRemoteStreamWarning({
-            code: warning.code,
-            message: warningMessage(t, warning.code),
-            tone: warningTone(warning.code),
-            secondsLeft: warning.secondsLeft,
-          });
-        },
-        onMicStateChange: (state) => {
-          console.log(`[App] Mic state: ${state.state}${state.deviceLabel ? ` (${state.deviceLabel})` : ""}`);
-        },
-        onControllerMetaPress: () => {
-          if (streamStatusRef.current === "streaming") {
-            dispatchStreamShortcutAction("toggleSidebar");
-          }
-        },
-        onIceConnectionStateChange: (iceState) => {
-          latestIceConnectionStateRef.current = iceState;
-          if (iceDisconnectedRecoveryTimerRef.current !== null) {
-            window.clearTimeout(iceDisconnectedRecoveryTimerRef.current);
-            iceDisconnectedRecoveryTimerRef.current = null;
-          }
-          if (appUnloadingRef.current) {
-            return;
-          }
-          if (streamStatusRef.current !== "streaming") {
-            return;
-          }
-          if (iceState === "failed") {
-            console.warn("[Recovery] ICE failed; attempting targeted recovery");
-            void attemptSessionRecovery("ICE failed").catch((error) => {
-              console.error("[Recovery] ICE-failed recovery failed:", error);
-            });
-            return;
-          }
-          if (iceState === "disconnected") {
-            iceDisconnectedRecoveryTimerRef.current = window.setTimeout(() => {
-              iceDisconnectedRecoveryTimerRef.current = null;
-              if (appUnloadingRef.current || streamStatusRef.current !== "streaming") {
-                return;
-              }
-              if (latestIceConnectionStateRef.current !== "disconnected") {
-                return;
-              }
-              console.warn("[Recovery] ICE remained disconnected; attempting targeted recovery");
-              void attemptSessionRecovery("ICE disconnected timeout").catch((error) => {
-                console.error("[Recovery] ICE-disconnected recovery failed:", error);
-              });
-            }, ICE_DISCONNECTED_RECOVERY_GRACE_MS);
-          }
-        },
-      });
-      clientRef.current.setOutputVolume(streamVolume);
-      clientRef.current.setMicrophoneLevel(streamMicLevel);
-      if (settings.microphoneMode !== "disabled") {
-        void clientRef.current.startMicrophone();
-      }
-      return clientRef.current;
+      const activeEngine = streamingContextRef.current?.getEngine();
+      return activeEngine ? (activeEngine as any).getClientInstance?.() || null : null;
     };
 
     const activateNativeInputForCurrentSession = (protocolVersion?: number): void => {
@@ -3084,6 +3167,7 @@ export function App(): JSX.Element {
     const unsubscribe = window.openNow.onSignalingEvent(async (event: MainToRendererSignalingEvent) => {
       console.log(`[App] Signaling event: ${event.type}`, event.type === "offer" ? `(SDP ${event.sdp.length} chars)` : "", event.type === "remote-ice" ? event.candidate : "");
       try {
+        await streamingContextRef.current?.getEngine()?.handleSignalingEvent(event);
         if (event.type === "offer") {
           pendingControlledDisconnectsRef.current = 0;
           const activeSession = sessionRef.current;
@@ -3120,7 +3204,7 @@ export function App(): JSX.Element {
               console.warn(
                 `[Recovery] No remote ICE received within ${SIGNALING_REMOTE_ICE_GRACE_MS}ms after offer; forcing targeted recovery`,
               );
-              void attemptSessionRecovery("No remote ICE received after offer").catch((error) => {
+              void attemptSessionRecoveryRef.current?.("No remote ICE received after offer").catch((error: any) => {
                 console.error("[Recovery] ICE-timeout recovery failed:", error);
               });
             }, SIGNALING_REMOTE_ICE_GRACE_MS);
@@ -3133,29 +3217,17 @@ export function App(): JSX.Element {
             iceServersCount: activeSession.iceServers?.length,
           }));
 
-          const client = ensureWebRtcClient();
-
-          if (client) {
-            await client.handleOffer(event.sdp, activeSession, {
-              codec: settings.codec,
-              colorQuality: settings.colorQuality,
-              resolution: settings.resolution,
-              fps: settings.fps,
-              maxBitrateKbps: settings.maxBitrateMbps * 1000,
-              nativeTransitionDiagnostics: settings.nativeTransitionDiagnostics,
-            });
-            setLaunchError(null);
-            setStreamStatus("streaming");
-            markDiscordStreamStarted();
-            scheduleStableRecoveryReset(activeSession.sessionId);
-            console.log(
-              "[Stream] Offer applied; use [WebRTC] logs for ICE/video dimensions. signalingServer=%s media=%s",
-              activeSession.signalingServer,
-              activeSession.mediaConnectionInfo
-                ? `${activeSession.mediaConnectionInfo.ip}:${activeSession.mediaConnectionInfo.port}`
-                : "n/a",
-            );
-          }
+          setLaunchError(null);
+          setStreamStatus("streaming");
+          markDiscordStreamStarted();
+          scheduleStableRecoveryReset(activeSession.sessionId);
+          console.log(
+            "[Stream] Offer applied; use [WebRTC] logs for ICE/video dimensions. signalingServer=%s media=%s",
+            activeSession.signalingServer,
+            activeSession.mediaConnectionInfo
+              ? `${activeSession.mediaConnectionInfo.ip}:${activeSession.mediaConnectionInfo.port}`
+              : "n/a",
+          );
         } else if (event.type === "native-stream-started") {
           console.log("[App] Native streamer started:", event.message ?? "");
           activateNativeInputForCurrentSession(nativeInputProtocolVersionRef.current ?? undefined);
@@ -3217,7 +3289,7 @@ export function App(): JSX.Element {
             return;
           }
 
-          const recovered = await attemptSessionRecovery(reason).catch((error) => {
+          const recovered = await attemptSessionRecoveryRef.current?.(reason).catch((error: any) => {
             console.error("[Recovery] Native streamer recovery failed:", error);
             return false;
           });
@@ -3246,7 +3318,6 @@ export function App(): JSX.Element {
             window.clearTimeout(remoteIceGraceTimerRef.current);
             remoteIceGraceTimerRef.current = null;
           }
-          await clientRef.current?.addRemoteCandidate(event.candidate);
         } else if (event.type === "disconnected") {
           if (appUnloadingRef.current) {
             console.log("[Recovery] Ignoring signaling disconnect during app shutdown");
@@ -3302,7 +3373,7 @@ export function App(): JSX.Element {
             return;
           }
           console.warn("Signaling disconnected:", event.reason);
-          const recovered = await attemptSessionRecovery(event.reason).catch((error) => {
+          const recovered = await attemptSessionRecoveryRef.current?.(event.reason).catch((error: any) => {
             console.error("[Recovery] Signaling recovery failed:", error);
             throw error;
           });
@@ -3642,7 +3713,7 @@ export function App(): JSX.Element {
         status: sessionToConnect.status,
       });
 
-      await window.openNow.connectSignaling(buildSignalingConnectRequest(sessionToConnect));
+      await connectSessionEngine(sessionToConnect);
     } catch (error) {
       if (launchAbortRef.current) {
         return;
@@ -3662,7 +3733,7 @@ export function App(): JSX.Element {
     activeSessionProxyUrl,
     allKnownGames,
     buildCurrentStreamSettings,
-    buildSignalingConnectRequest,
+    connectSessionEngine,
     claimAndConnectSession,
     effectiveStreamingBaseUrl,
     refreshNavbarActiveSession,
