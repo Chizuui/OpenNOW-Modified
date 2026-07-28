@@ -491,14 +491,24 @@ if (process.platform !== "win32") {
   chmodSync(packagePlatformBinary, 0o755);
 }
 
-if (hasFeature(nativeFeatures, "gstreamer")) {
+const skipVerify = ["1", "true", "yes"].includes(
+  (process.env.OPENNOW_SKIP_NATIVE_VERIFY ?? "").trim().toLowerCase(),
+);
+
+if (hasFeature(nativeFeatures, "gstreamer") && !skipVerify) {
   verifyGstreamerBinary(packageBinary, buildEnv);
   if (bundleGstreamerRuntime(gstreamerSdkRoot, nativeFeatures)) {
     const bundledEnv = buildBundledGstreamerEnv(buildEnv, packagePlatformBinary);
     if (process.platform === "win32") {
       verifyBundledWindowsLoader(packagePlatformBinary, buildEnv);
-        }
+    }
     verifyGstreamerBinary(packagePlatformBinary, bundledEnv);
+  }
+} else if (hasFeature(nativeFeatures, "gstreamer")) {
+  console.log("Skipping native streamer hello verification (OPENNOW_SKIP_NATIVE_VERIFY=1).");
+  if (bundleGstreamerRuntime(gstreamerSdkRoot, nativeFeatures)) {
+    const bundledEnv = buildBundledGstreamerEnv(buildEnv, packagePlatformBinary);
+    void bundledEnv; // bundled runtime copied; verification skipped for headless hosts.
   }
 }
 
