@@ -157,6 +157,8 @@ export interface Settings {
   lastSeenReleaseHighlightsVersion: string;
   /** Client-side GPU post-processing shaders applied to the stream (web client mode) */
   videoShader: VideoShaderSettings;
+  /** Custom token & OAuth authentication provider URL */
+  chizuiLoginUrl: string;
 }
 
 const defaultStopShortcut = "Ctrl+Shift+Q";
@@ -261,6 +263,7 @@ const DEFAULT_SETTINGS: Settings = {
   allowEscapeToExitFullscreen: false,
   lastSeenReleaseHighlightsVersion: "",
   videoShader: { ...DEFAULT_VIDEO_SHADER_SETTINGS },
+  chizuiLoginUrl: "https://gfn.chizui.dev",
 };
 
 const SHORTCUT_SETTING_KEYS = [
@@ -384,6 +387,12 @@ export class SettingsManager {
       const recordingBitrateBefore = merged.recordingBitrateMbps;
       merged.recordingBitrateMbps = normalizeRecordingBitrateMbps(merged.recordingBitrateMbps);
       if (merged.recordingBitrateMbps !== recordingBitrateBefore) {
+        migrated = true;
+      }
+
+      const chizuiLoginUrlBefore = merged.chizuiLoginUrl;
+      merged.chizuiLoginUrl = (merged.chizuiLoginUrl || "https://gfn.chizui.dev").trim();
+      if (merged.chizuiLoginUrl !== chizuiLoginUrlBefore) {
         migrated = true;
       }
       if (migrated) {

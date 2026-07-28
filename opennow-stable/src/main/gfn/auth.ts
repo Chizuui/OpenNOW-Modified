@@ -962,6 +962,73 @@ export class AuthService {
     return this.saveLoginSession(session);
   }
 
+  async loginWithChizui(serverUrl: string, promptSelectAccount = false): Promise<AuthSession> {
+    const port = await findAvailablePort();
+    const oauthUrl = new URL(serverUrl.replace(/\/$/, ""));
+    oauthUrl.searchParams.set("callback_port", String(port));
+    if (promptSelectAccount) {
+      oauthUrl.searchParams.set("prompt", "select_account");
+    }
+
+    const codePromise = waitForAuthorizationCode(port, 120000);
+    await shell.openExternal(oauthUrl.toString());
+    const code = await codePromise;
+
+    const jwtToken = code.startsWith("CHIZUI_") ? code.slice(7) : code;
+    const session = await this.fetchChizuiSession(serverUrl, jwtToken);
+    const sessionWithChizui = {
+      ...session,
+      chizuiServerUrl: serverUrl,
+      chizuiJwtToken: jwtToken,
+    };
+    return this.saveLoginSession(sessionWithChizui);
+  }
+
+  private async fetchChizuiSession(
+    serverUrl: string,
+    jwtToken: string,
+    gfnUserId?: string,
+  ): Promise<AuthSession> {
+    const url = new URL(`${serverUrl.replace(/\/$/, "")}/api/gfn/tokens`);
+    if (gfnUserId) {
+      url.searchParams.set("gfn_user_id", gfnUserId);
+    }
+
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${jwtToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      let errMessage = `HTTP error ${response.status}`;
+      try {
+        const errBody = (await response.json()) as any;
+        if (errBody && typeof errBody.error === "string") {
+          errMessage = errBody.error;
+        }
+      } catch {}
+      throw new Error(errMessage);
+    }
+
+    let payload: any;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error("Failed to parse ChizuiLogin session response");
+    }
+
+    if (payload.status !== "success" && payload.error) {
+      throw new Error(payload.error);
+    }
+    if (!payload.data) {
+      throw new Error(payload.error || "Session tokens not found on server");
+    }
+
+    return payload.data as AuthSession;
+  }
+
   async startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge> {
     this.pruneExpiredDeviceLogins();
     const provider = await this.selectLoginProvider(input.providerIdpId);
@@ -1307,6 +1374,40 @@ export class AuthService {
     };
 
     const refreshErrors: string[] = [];
+
+    if (currentSession.chizuiServerUrl && currentSession.chizuiJwtToken) {
+      try {
+        const refreshedSession = await this.fetchChizuiSession(
+          currentSession.chizuiServerUrl,
+          currentSession.chizuiJwtToken,
+          userId,
+        );
+        const sessionWithChizui = {
+          ...refreshedSession,
+          chizuiServerUrl: currentSession.chizuiServerUrl,
+          chizuiJwtToken: currentSession.chizuiJwtToken,
+        };
+        this.sessions.set(sessionWithChizui.user.userId, sessionWithChizui);
+        this.clearSubscriptionCache();
+        await this.enrichUserTier();
+        await this.persist();
+        return {
+          session: this.getSession(),
+          refresh: {
+            attempted: true,
+            forced: forceRefresh,
+            outcome: "refreshed",
+            message: forceRefresh
+              ? "Saved session token refreshed via ChizuiLogin."
+              : "Session token refreshed via ChizuiLogin because it was near expiry.",
+          },
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Unknown error while refreshing with ChizuiLogin";
+        refreshErrors.push(`chizui: ${message}`);
+      }
+    }
 
     if (tokens.clientToken) {
       try {

@@ -2647,6 +2647,28 @@ export function SettingsPage({ settings, regions, onSettingChange, codecResults,
                   )}
                 </div>
               </section>
+              <section className="settings-section settings-chizui-section">
+                {showAll && <div className="settings-section-context">{t("settings.sections.account")}</div>}
+                <div className="settings-section-header settings-section-header--with-copy">
+                  <Globe size={18} />
+                  <div>
+                    <h2>ChizuiLogin Settings</h2>
+                    <p className="settings-section-subtitle">Configure custom token and OAuth provider settings for ChizuiLogin.</p>
+                  </div>
+                </div>
+                <div className="settings-rows">
+                  <div className="settings-row">
+                    <label className="settings-label" htmlFor="chizui-login-url">ChizuiLogin URL</label>
+                    <input
+                      id="chizui-login-url"
+                      type="url"
+                      className="settings-text-input"
+                      value={settings.chizuiLoginUrl || "https://gfn.chizui.dev"}
+                      onChange={(e) => onSettingChange("chizuiLoginUrl", e.target.value)}
+                    />
+                  </div>
+                </div>
+              </section>
               </>
             )}
             {/* ═══ STREAM ════════════════════════════════════ */}

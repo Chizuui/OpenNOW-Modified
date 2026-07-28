@@ -220,9 +220,9 @@ export function LoginScreen({
               )}
             </button>
             <button
-              className={`login-secondary-button ${isLoading && !isQrLoginActive ? "disabled" : ""}`}
+              className={`login-secondary-button ${(isLoading && !isQrLoginActive) || selectedProviderId === "chizui" ? "disabled" : ""}`}
               onClick={onQrLogin}
-              disabled={isLoading || isInitializing || isQrLoginActive || !selectedProviderId}
+              disabled={isLoading || isInitializing || isQrLoginActive || !selectedProviderId || selectedProviderId === "chizui"}
               type="button"
             >
               <QrCode size={18} />

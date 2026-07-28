@@ -55,11 +55,12 @@
     "react-scan": "^0.5.3",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3",
+    "undici": "^8.9.0",
     "vite": "^7.3.5"
   },
   "build": {
-    "appId": "com.zortos.opennow.stable",
-    "productName": "OpenNOW",
+    "appId": "com.zortos.opennow.chizui",
+    "productName": "OpenNow-Chizui",
     "afterSign": "scripts/after-sign-mac.mjs",
     "publish": [
       {
@@ -97,10 +98,10 @@
       ]
     },
     "nsis": {
-      "artifactName": "OpenNOW-v${version}-setup-${arch}.${ext}"
+      "artifactName": "OpenNow-Chizui-v${version}-setup-${arch}.${ext}"
     },
     "portable": {
-      "artifactName": "OpenNOW-v${version}-portable-${arch}.${ext}"
+      "artifactName": "OpenNow-Chizui-v${version}-portable-${arch}.${ext}"
     },
     "mac": {
       "target": [
@@ -108,7 +109,7 @@
         "zip"
       ],
       "category": "public.app-category.games",
-      "artifactName": "OpenNOW-v${version}-mac-${arch}.${ext}"
+      "artifactName": "OpenNow-Chizui-v${version}-mac-${arch}.${ext}"
     },
     "linux": {
       "target": [
@@ -117,7 +118,7 @@
       ],
       "category": "Game",
       "maintainer": "zortos293 <zortos293@users.noreply.github.com>",
-      "artifactName": "OpenNOW-v${version}-linux-${arch}.${ext}"
+      "artifactName": "OpenNow-Chizui-v${version}-linux-${arch}.${ext}"
     },
     "deb": {
       "depends": [

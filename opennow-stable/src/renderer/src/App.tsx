@@ -548,6 +548,7 @@ export function App(): JSX.Element {
     autoCheckForUpdates: true,
     lastSeenReleaseHighlightsVersion: "",
     videoShader: { ...DEFAULT_VIDEO_SHADER_SETTINGS },
+    chizuiLoginUrl: "https://gfn.chizui.dev",
   });
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [releaseHighlightsPayload, setReleaseHighlightsPayload] = useState<ReleaseHighlightsPayload | null>(null);
@@ -2088,11 +2089,19 @@ export function App(): JSX.Element {
           signalingRecoveryRef.current.appId = persistedRuntimeSnapshot.recoveryAppId;
         }
 
-        setProviders(providerList);
+        const chizuiProvider: LoginProvider = {
+          idpId: "chizui",
+          code: "CHIZUI",
+          displayName: "ChizuiLogin",
+          streamingServiceUrl: loadedSettings.chizuiLoginUrl || "https://gfn.chizui.dev",
+          priority: 999,
+        };
+        const updatedProviders = [...providerList, chizuiProvider];
+        setProviders(updatedProviders);
         setAuthSession(persistedSession);
         setSavedAccounts(accounts);
 
-        const activeProviderId = persistedSession?.provider?.idpId ?? providerList[0]?.idpId ?? "";
+        const activeProviderId = persistedSession?.provider?.idpId ?? updatedProviders[0]?.idpId ?? "";
         setProviderIdpId(activeProviderId);
 
         if (persistedSession) {
@@ -2135,7 +2144,12 @@ export function App(): JSX.Element {
     }
     setQrLoginChallenge(null);
     try {
-      const session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      let session;
+      if (providerIdpId === "chizui") {
+        session = await window.openNow.loginChizui(settings.chizuiLoginUrl);
+      } else {
+        session = await window.openNow.login({ providerIdpId: providerIdpId || undefined });
+      }
       setAuthSession(session);
       setProviderIdpId(session.provider.idpId);
       await refreshSavedAccounts();
@@ -2146,7 +2160,7 @@ export function App(): JSX.Element {
       setIsLoggingIn(false);
       setActiveLoginMode(null);
     }
-  }, [loadSessionRuntimeData, providerIdpId, qrLoginChallenge, refreshSavedAccounts, t]);
+  }, [loadSessionRuntimeData, providerIdpId, qrLoginChallenge, refreshSavedAccounts, settings.chizuiLoginUrl, t]);
 
   const qrLoginAttemptRef = useRef(0);
   const completingQrLoginRef = useRef(false);

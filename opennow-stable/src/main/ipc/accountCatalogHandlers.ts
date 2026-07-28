@@ -138,6 +138,13 @@ export function registerAccountCatalogIpcHandlers(
   );
 
   ipcMain.handle(
+    IPC_CHANNELS.AUTH_LOGIN_CHIZUI,
+    async (_event, serverUrl: string, promptSelectAccount?: boolean) => {
+      return authService.loginWithChizui(serverUrl, promptSelectAccount);
+    },
+  );
+
+  ipcMain.handle(
     IPC_CHANNELS.AUTH_DEVICE_LOGIN_START,
     async (_event, payload: AuthDeviceLoginStartRequest) => {
       return authService.startDeviceLogin(payload);

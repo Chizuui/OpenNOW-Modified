@@ -410,6 +410,8 @@ export interface Settings {
   lastSeenReleaseHighlightsVersion: string;
   /** Client-side GPU post-processing shaders applied to the stream (web client mode) */
   videoShader: VideoShaderSettings;
+  /** Custom token & OAuth authentication provider URL */
+  chizuiLoginUrl: string;
 }
 
 export const DEFAULT_STREAM_PREFERENCES: Readonly<Pick<Settings, "codec" | "colorQuality">> = Object.freeze({
@@ -658,6 +660,8 @@ export interface AuthSession {
   provider: LoginProvider;
   tokens: AuthTokens;
   user: AuthUser;
+  chizuiServerUrl?: string;
+  chizuiJwtToken?: string;
 }
 
 export interface SavedAccount {
@@ -1538,6 +1542,7 @@ export interface OpenNowApi {
   getLoginProviders(): Promise<LoginProvider[]>;
   getRegions(input?: RegionsFetchRequest): Promise<StreamRegion[]>;
   login(input: AuthLoginRequest): Promise<AuthSession>;
+  loginChizui(serverUrl: string, promptSelectAccount?: boolean): Promise<AuthSession>;
   startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge>;
   pollDeviceLogin(input: AuthDeviceLoginPollRequest): Promise<AuthDeviceLoginPollResult>;
   completeDeviceLogin(input: AuthDeviceLoginAttemptRequest): Promise<AuthSession>;
