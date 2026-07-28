@@ -95,12 +95,7 @@ export function LoginScreen({
 
   return (
     <div className="login-screen">
-      <div className="login-bg">
-        <div className="login-bg-orb login-bg-orb--1" />
-        <div className="login-bg-orb login-bg-orb--2" />
-        <div className="login-bg-orb login-bg-orb--3" />
-        <div className="login-bg-noise" />
-      </div>
+      <div className="login-bg" />
 
       <div className="login-content">
         {/* Brand */}

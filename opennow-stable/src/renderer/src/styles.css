@@ -142,39 +142,15 @@ body,
 
 
 @keyframes float-a {
-
-  0%,
-  100% {
-    transform: translate(0, 0) scale(1);
-  }
-
-  50% {
-    transform: translate(-40px, 30px) scale(1.15);
-  }
+  0%, 100% { transform: none; }
 }
 
 @keyframes float-b {
-
-  0%,
-  100% {
-    transform: translate(0, 0) scale(1);
-  }
-
-  50% {
-    transform: translate(30px, -25px) scale(1.08);
-  }
+  0%, 100% { transform: none; }
 }
 
 @keyframes float-c {
-
-  0%,
-  100% {
-    transform: translate(0, 0) scale(1);
-  }
-
-  50% {
-    transform: translate(-20px, -30px) scale(1.12);
-  }
+  0%, 100% { transform: none; }
 }
 
 @keyframes fade-in {
@@ -258,33 +234,11 @@ body,
 }
 
 @keyframes pulse-glow {
-
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-
-  50% {
-    transform: scale(1.08);
-    opacity: 0.85;
-  }
+  0%, 100% { opacity: 1; }
 }
 
 @keyframes float-subtle {
-
-  0%,
-  100% {
-    transform: translateY(0) rotate(0);
-  }
-
-  33% {
-    transform: translateY(-3px) rotate(0.1deg);
-  }
-
-  66% {
-    transform: translateY(1px) rotate(-0.1deg);
-  }
+  0%, 100% { transform: none; }
 }
 
 @keyframes shimmer {
@@ -9885,3 +9839,61 @@ button.game-card-store-chip.owned.active:hover {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+/* ---------- UI Simplification Overrides ---------- */
+* {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Simplify App Container backgrounds (no heavy radial gradients) */
+.app-container {
+  background: var(--bg-a) !important;
+}
+.app-container--controller {
+  background: #020303 !important;
+}
+
+/* Simplify Login Background */
+.login-screen {
+  background: var(--bg-a) !important;
+}
+.login-bg {
+  background: var(--bg-a) !important;
+}
+.login-card {
+  background: var(--bg-b) !important;
+  box-shadow: var(--shadow-md) !important;
+  border-radius: var(--r-md) !important;
+}
+
+/* Simplify Navbar (no translucent gradients) */
+.navbar {
+  background: var(--bg-a) !important;
+  border-bottom: 1px solid var(--panel-border-solid) !important;
+}
+
+/* Modals & Backdrops */
+.logout-confirm-backdrop,
+.navbar-modal-backdrop,
+.queue-modal-backdrop,
+.release-highlights-modal-backdrop {
+  background: rgba(0, 0, 0, 0.75) !important;
+}
+
+.logout-confirm-card,
+.navbar-modal,
+.queue-modal,
+.release-highlights-modal {
+  background: var(--panel) !important;
+  border-radius: var(--r-md) !important;
+  box-shadow: var(--shadow-md) !important;
+}
+
+/* Disable heavy card glow or scales */
+.game-card:hover,
+.store-panel-card:hover {
+  transform: none !important;
+  box-shadow: var(--shadow-sm) !important;
+}
+

@@ -99,6 +99,9 @@ import { getReleaseHighlightsPayload, normalizeReleaseVersion, shouldShowRelease
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Set application name before any paths or preferences are initialized
+app.name = "OpenNow-Chizui";
+
 // Configure Chromium video, WebRTC, and input behavior before app.whenReady().
 
 function loadBootstrapChromiumPreferences(): BootstrapChromiumPreferences {
