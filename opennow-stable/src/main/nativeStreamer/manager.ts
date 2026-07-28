@@ -67,7 +67,10 @@ interface PendingRequest {
 }
 
 const HELLO_TIMEOUT_MS = 10000;
-const BUNDLED_GSTREAMER_HELLO_TIMEOUT_MS = process.platform === "win32" ? 120000 : 30000;
+// PCs with multiple GPUs (Intel iGPU + NVIDIA dGPU + virtual display adapters
+// for streaming software like Parsec/GameViewer) can take 60–90 s to finish
+// gst::init() plugin scanner because Vulkan/D3D/D3D12 sinks enumerate drivers.
+const BUNDLED_GSTREAMER_HELLO_TIMEOUT_MS = process.platform === "win32" ? 90000 : 30000;
 const CONTROL_TIMEOUT_MS = 8000;
 const SESSION_START_TIMEOUT_MS = process.platform === "win32" ? 90000 : 45000;
 const SURFACE_UPDATE_TIMEOUT_MS = 15000;
@@ -202,6 +205,17 @@ export class NativeStreamerManager {
   async probeStatus(): Promise<NativeStreamerStatus> {
     if (!isNativeStreamerSupportedPlatform(process.platform)) {
       return createUnsupportedNativeStreamerStatus();
+    }
+
+    // Reuse cached capabilities when the child process is still alive; spawn + hello only on first probe
+    // or after a restart.
+    if (this.capabilities && this.child && this.gstreamerRuntime) {
+      return createNativeStreamerStatus(
+        this.capabilities,
+        this.gstreamerRuntime,
+        this.options.getVideoBackendPreference(),
+        process.platform,
+      );
     }
 
     try {
