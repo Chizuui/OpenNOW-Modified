@@ -204,7 +204,7 @@ export function StreamView({
       video.removeEventListener("playing", syncVideoFrame);
       video.removeEventListener("resize", syncVideoFrame);
     };
-  }, [isConnecting]);
+  }, [isConnecting, localVideoRef.current]);
 
   const streamVideoReady = streamHasVideo || videoElementHasFrame;
   const [sessionReadySplashVisible, setSessionReadySplashVisible] = useState(false);

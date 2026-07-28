@@ -283,7 +283,7 @@ export function createDefaultSettings(platform: string): Settings {
     videoShader: { ...DEFAULT_VIDEO_SHADER_SETTINGS },
     errorReportingConsent: "unset",
     telemetryInstallId: "",
-    lowPerformanceMode: false,
+    lowPerformanceMode: true,
   };
 }
 

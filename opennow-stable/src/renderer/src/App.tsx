@@ -1308,6 +1308,13 @@ export function App(): JSX.Element {
     if (settingsLoaded) {
       await window.openNow.setSetting(key, value);
     }
+    if (key === "streamClientMode" && value === "web" && settings.codec === "AV1") {
+      const activeProvider = authSession?.provider;
+      const isYes = activeProvider?.idpId === "yes" || activeProvider?.displayName?.toLowerCase().includes("yes");
+      if (isYes) {
+        void updateSetting("codec", "H265");
+      }
+    }
     if (key === "identifyAsSteamDeck" && authSession) {
       try {
         await loadSubscriptionInfo(authSession);
@@ -1315,7 +1322,7 @@ export function App(): JSX.Element {
         console.warn("Failed to refresh subscription after Steam Deck identity change:", error);
       }
     }
-  }, [authSession, loadSubscriptionInfo, previewSetting, settingsLoaded]);
+  }, [authSession, loadSubscriptionInfo, previewSetting, settingsLoaded, settings.codec]);
 
   useEffect(() => {
     if (!settingsLoaded || !subscriptionInfo) {

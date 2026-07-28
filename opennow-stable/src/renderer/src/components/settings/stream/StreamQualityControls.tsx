@@ -178,9 +178,11 @@ export function StreamQualityControls({
           <div className="settings-chip-row">
             {codecOptions.map((codec) => {
               const badgeState = getCodecDecodeBadgeState(codec, codecResults, codecTesting);
+              const isSupported = codecTesting || badgeState === "gpu" || badgeState === "cpu";
               return (
                 <button
                   key={codec}
+                  disabled={!isSupported}
                   className={`settings-chip settings-chip--codec ${settings.codec === codec ? "active" : ""}`}
                   aria-pressed={settings.codec === codec}
                   onClick={() => handleCodecChange(codec)}
