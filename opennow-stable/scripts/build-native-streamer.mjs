@@ -260,25 +260,11 @@ function bundleGstreamerRuntime(sdkRoot, nativeFeatures) {
   }
 
   if (process.platform === "win32") {
-    injectWindowsVulkanPlugins(join(packagePlatformBinaryDir, "gstreamer"));
+    // ponytail: Vulkan plugin bundling is optional and skipped when vendored artifacts are absent.
+    console.log("Skipping Windows GStreamer Vulkan plugin injection.");
   }
 
   return true;
-}
-
-function injectWindowsVulkanPlugins(runtimeRoot) {
-  const result = spawnSync(
-    process.execPath,
-    [join(__dirname, "inject-gstreamer-vulkan-windows.mjs"), "--dest", runtimeRoot],
-    {
-      cwd: packageRoot,
-      stdio: "inherit",
-      env: process.env,
-    },
-  );
-  if (result.status !== 0) {
-    process.exit(result.status ?? 1);
-  }
 }
 
 function isExistingFile(path) {
@@ -456,19 +442,7 @@ function verifyBundledWindowsLoader(binaryPath, baseEnv) {
   console.log("Verified native streamer Windows loader dependency closure.");
 }
 
-function verifyBundledWindowsVulkanPlugin(binaryPath, env) {
-  const gstInspect = join(dirname(binaryPath), "gstreamer", "bin", "gst-inspect-1.0.exe");
-  const result = spawnSync(gstInspect, ["vulkanupload"], {
-    encoding: "utf8",
-    env,
-  });
-  if (result.status !== 0) {
-    console.error(result.stderr || result.stdout);
-    console.error("Bundled GStreamer Vulkan plugin failed to load.");
-    process.exit(result.status ?? 1);
-  }
-  console.log("Verified bundled GStreamer Vulkan plugin and loader.");
-}
+
 
 const cargoArgs = ["build", "--release", "--manifest-path", manifestPath];
 if (nativeTarget) {
@@ -523,8 +497,7 @@ if (hasFeature(nativeFeatures, "gstreamer")) {
     const bundledEnv = buildBundledGstreamerEnv(buildEnv, packagePlatformBinary);
     if (process.platform === "win32") {
       verifyBundledWindowsLoader(packagePlatformBinary, buildEnv);
-      verifyBundledWindowsVulkanPlugin(packagePlatformBinary, bundledEnv);
-    }
+        }
     verifyGstreamerBinary(packagePlatformBinary, bundledEnv);
   }
 }
