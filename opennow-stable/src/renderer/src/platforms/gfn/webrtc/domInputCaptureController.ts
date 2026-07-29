@@ -73,8 +73,6 @@ export class DomInputCaptureController {
   private readonly pressedKeys = new Set<number>();
   private pointerLockTarget: HTMLElement | null = null;
   private autoPointerLockInProgress = false;
-  private pointerLockEscapeTimer: number | null = null;
-  private pointerLockRelockTimer: number | null = null;
   private suppressNextSyntheticEscape = false;
   private syntheticEscapeSuppressionTimer: number | null = null;
   private keyboardLockState: "unknown" | "unsupported" | "locked" | "failed" = "unknown";
@@ -779,21 +777,8 @@ export class DomInputCaptureController {
             const targetServerY = Math.round(targetAbsY * scaleY);
 
             if (simulatedAbsX === null || simulatedAbsY === null) {
-              // No baseline known: assume server cursor is centered and move from
-              // center -> target in server pixels so remote cursor matches HW cursor.
-              const baselineXServer = Math.round(serverWidth / 2);
-              const baselineYServer = Math.round(serverHeight / 2);
-              const dx = Math.round(targetServerX - baselineXServer);
-              const dy = Math.round(targetServerY - baselineYServer);
-              if (dx !== 0 || dy !== 0) {
-                const movePayload = this.dependencies.inputEncoder.encodeMouseMove({
-                  dx: Math.max(-32768, Math.min(32767, dx)),
-                  dy: Math.max(-32768, Math.min(32767, dy)),
-                  timestampUs: timestampUs(),
-                });
-                this.dependencies.sendReliable(movePayload);
-              }
-              // Record simulated baseline in server pixels.
+              // Simply set the simulated baseline directly without sending a large jump delta.
+              // This prevents the camera from snapping when pointer lock is lost/gained.
               simulatedAbsX = targetServerX;
               simulatedAbsY = targetServerY;
             } else {
@@ -937,6 +922,13 @@ export class DomInputCaptureController {
         const absY = event.clientY - rect.top;
         lastAbsX = absX;
         lastAbsY = absY;
+        
+        // Auto-lock seamlessly on hover movement if the overlay is closed.
+        try {
+          if (document?.body?.dataset?.sidebarOpen !== "1") {
+            tryAutoLock();
+          }
+        } catch {}
       }
     };
 
@@ -955,6 +947,13 @@ export class DomInputCaptureController {
         const absY = event.clientY - rect.top;
         lastAbsX = absX;
         lastAbsY = absY;
+
+        // Auto-lock seamlessly on hover movement if the overlay is closed.
+        try {
+          if (document?.body?.dataset?.sidebarOpen !== "1") {
+            tryAutoLock();
+          }
+        } catch {}
       }
     };
 
@@ -972,6 +971,12 @@ export class DomInputCaptureController {
         || event.code === "Escape"
         || event.keyCode === 27;
       const mapped = mapKeyboardEvent(event, this.dependencies.getKeyboardLayout()) ?? (isEscapeEvent ? codeMap.Escape : null);
+
+      // Prevent Escape from releasing Pointer Lock at the browser level on normal keydown
+      if (isEscapeEvent && isPointerLockActive()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
 
       // Keep browser from handling held keys (for example Tab focus traversal)
       // while streaming input is active.
@@ -1138,53 +1143,12 @@ export class DomInputCaptureController {
       videoElement.focus();
     };
 
-    const schedulePointerLockRetention = (reason: string): void => {
-      if (this.pointerLockRelockTimer !== null) {
-        return;
-      }
-
-      this.pointerLockRelockTimer = window.setTimeout(() => {
-        this.pointerLockRelockTimer = null;
-
-        if (!this.dependencies.isInputReady() || !this.shouldSendSyntheticEscapeOnPointerLockLoss() || isPointerLockActive()) {
-          return;
-        }
-
-        const target = this.pointerLockTarget;
-        if (!target) {
-          return;
-        }
-
-        void this.requestPointerLockWithOptionalFullscreen(target, false)
-          .then(() => {
-            this.dependencies.log(`Pointer lock restored after ${reason}`);
-          })
-          .catch((error: unknown) => {
-            this.dependencies.log(`Pointer lock restore failed after ${reason}: ${String(error)}`);
-          });
-      }, 75);
-    };
-
-    // Store lock target for pointer lock re-acquisition
-    this.pointerLockTarget = pointerLockTarget;
-
-    // Handle pointer lock changes — send synthetic Escape when lock is lost by browser
-    // (matches official GFN client's "pointerLockEscape" feature)
+    // Handle pointer lock changes
     const onPointerLockChange = () => {
       if (isPointerLockActive()) {
         this.cursorOverlay?.setPointerLocked(true);
-        // Pointer lock gained — cancel any pending synthetic Escape.
-        // Reset absolute position tracking since we switch to relative movement.
         lastAbsX = null;
         lastAbsY = null;
-        if (this.pointerLockEscapeTimer !== null) {
-          window.clearTimeout(this.pointerLockEscapeTimer);
-          this.pointerLockEscapeTimer = null;
-        }
-        if (this.pointerLockRelockTimer !== null) {
-          window.clearTimeout(this.pointerLockRelockTimer);
-          this.pointerLockRelockTimer = null;
-        }
         this.clearSyntheticEscapeSuppression();
         // Try to acquire keyboard lock for low-level key capture (best-effort).
         try {
@@ -1219,58 +1183,7 @@ export class DomInputCaptureController {
         return;
       }
 
-      if (!this.shouldSendSyntheticEscapeOnPointerLockLoss()) {
-        this.releasePressedKeys("pointer lock lost while unfocused");
-        return;
-      }
-
-      // VK 0x1B = 27 = Escape
-      const escapeWasPressed = this.pressedKeys.has(0x1B);
-
-      if (escapeWasPressed) {
-        // Escape was already tracked as pressed — the normal keyup handler will fire
-        // and send Escape keyup to the server. No synthetic needed, but Chromium
-        // still released pointer lock, so restore it after keyup has a chance to run.
-        schedulePointerLockRetention("tracked Escape");
-        return;
-      }
-
-      // Escape was NOT tracked as pressed — browser intercepted it before our keydown fired.
-      // Send synthetic Escape keydown+keyup after 50ms (matches official GFN client).
-      // Also re-acquire pointer lock so the user stays in the game.
-      this.pointerLockEscapeTimer = window.setTimeout(() => {
-        this.pointerLockEscapeTimer = null;
-
-        if (!this.dependencies.isInputReady()) return;
-
-        if (!this.shouldSendSyntheticEscapeOnPointerLockLoss()) {
-          this.releasePressedKeys("focus changed before synthetic Escape");
-          return;
-        }
-
-        // Release all currently held keys first (matching official client's MS() function)
-        this.releasePressedKeys("pointer lock lost before synthetic Escape");
-
-        // Send synthetic Escape keydown + keyup
-        this.dependencies.log("Sending synthetic Escape (pointer lock lost by browser)");
-        const escDown = this.dependencies.inputEncoder.encodeKeyDown({
-          keycode: 0x1B,
-          scancode: codeMap.Escape.scancode,
-          modifiers: 0,
-          timestampUs: timestampUs(),
-        });
-        this.dependencies.sendReliableSingleInput(escDown);
-
-        const escUp = this.dependencies.inputEncoder.encodeKeyUp({
-          keycode: 0x1B,
-          scancode: codeMap.Escape.scancode,
-          modifiers: 0,
-          timestampUs: timestampUs(),
-        });
-        this.dependencies.sendReliableSingleInput(escUp);
-
-        schedulePointerLockRetention("synthetic Escape");
-      }, 50);
+      this.releasePressedKeys("pointer lock lost");
     };
 
     const onWindowBlur = () => {
@@ -1481,14 +1394,6 @@ export class DomInputCaptureController {
     this.inputCleanup.push(() => document.removeEventListener("visibilitychange", onVisibilityChange));
     this.inputCleanup.push(() => window.removeEventListener("focus", onWindowFocus));
     this.inputCleanup.push(() => {
-      if (this.pointerLockEscapeTimer !== null) {
-        window.clearTimeout(this.pointerLockEscapeTimer);
-        this.pointerLockEscapeTimer = null;
-      }
-      if (this.pointerLockRelockTimer !== null) {
-        window.clearTimeout(this.pointerLockRelockTimer);
-        this.pointerLockRelockTimer = null;
-      }
       this.clearSyntheticEscapeSuppression();
       this.releasePressedKeys("input cleanup");
       this.pendingMouseDxFloat = 0;

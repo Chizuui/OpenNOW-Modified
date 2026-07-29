@@ -57,16 +57,13 @@ export function shouldCaptureEscapeFullscreenInput(
     return false;
   }
 
-  if (state.pointerLockActive) {
+  // Always capture Escape if the streaming session is active to prevent
+  // Chromium from dropping the pointer lock on Escape tap.
+  if (state.streamInputActive) {
     return true;
   }
 
-  // Electron's fullscreen state can lag the renderer IPC request. Protect both
-  // signals, but only while a stream input route is actually active.
-  if (
-    state.streamInputActive
-    && (state.windowFullscreen || state.rendererControlledFullscreen)
-  ) {
+  if (state.pointerLockActive) {
     return true;
   }
 
