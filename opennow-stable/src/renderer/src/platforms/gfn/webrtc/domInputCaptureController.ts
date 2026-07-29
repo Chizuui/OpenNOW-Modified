@@ -745,62 +745,9 @@ export class DomInputCaptureController {
       }
       autoLockPending = true;
 
-      // Align server cursor to current HW cursor (if we have an entry position)
-      // before requesting pointer lock so the transition appears smooth.
-      try {
-        const targetAbsX = pendingEntryAbsX ?? lastAbsX;
-        const targetAbsY = pendingEntryAbsY ?? lastAbsY;
-        // Consume pending entry coords
-        pendingEntryAbsX = null;
-        pendingEntryAbsY = null;
-
-        if (typeof targetAbsX === "number" && typeof targetAbsY === "number") {
-          const targetRect = pointerLockTarget.getBoundingClientRect();
-          this.cursorOverlay?.setClientPosition(targetRect.left + targetAbsX, targetRect.top + targetAbsY);
-          const overlayAbs = this.cursorOverlay?.isCursorVisible()
-            ? this.cursorOverlay.getAbsolutePosition()
-            : null;
-          const { scaleX, scaleY, serverWidth, serverHeight } = getPointerScale();
-
-          if (overlayAbs) {
-            // Overlay cursor is visible: pin the server cursor with one
-            // absolute packet instead of simulating relative moves.
-            const movePayload = this.dependencies.inputEncoder.encodeMouseAbsolute({
-              ...overlayAbs,
-              timestampUs: timestampUs(),
-            });
-            this.dependencies.sendReliable(movePayload);
-            markServerCursorAt(overlayAbs);
-          } else {
-            // Translate the element-local target into server pixels.
-            const targetServerX = Math.round(targetAbsX * scaleX);
-            const targetServerY = Math.round(targetAbsY * scaleY);
-
-            if (simulatedAbsX === null || simulatedAbsY === null) {
-              // Simply set the simulated baseline directly without sending a large jump delta.
-              // This prevents the camera from snapping when pointer lock is lost/gained.
-              simulatedAbsX = targetServerX;
-              simulatedAbsY = targetServerY;
-            } else {
-              // sim values are stored in server pixels now; compute server delta.
-              const dx = Math.round(targetServerX - simulatedAbsX);
-              const dy = Math.round(targetServerY - simulatedAbsY);
-              if (dx !== 0 || dy !== 0) {
-                const movePayload = this.dependencies.inputEncoder.encodeMouseMove({
-                  dx: Math.max(-32768, Math.min(32767, dx)),
-                  dy: Math.max(-32768, Math.min(32767, dy)),
-                  timestampUs: timestampUs(),
-                });
-                this.dependencies.sendReliable(movePayload);
-                simulatedAbsX += dx;
-                simulatedAbsY += dy;
-              }
-            }
-          }
-        }
-      } catch (err) {
-        this.dependencies.log(`Pointer lock alignment failed (non-fatal): ${String(err)}`);
-      }
+      // Consume pending entry coords without calculating absolute pointer jumps
+      pendingEntryAbsX = null;
+      pendingEntryAbsY = null;
 
       void this.attemptAutoPointerLock(this.dependencies.shouldAutoFullscreen())
         .catch(() => {})
