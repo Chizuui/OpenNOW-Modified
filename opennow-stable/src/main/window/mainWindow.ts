@@ -1,6 +1,7 @@
-import { BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, ipcMain, app } from "electron";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import { IPC_CHANNELS } from "@shared/ipc";
 import type { DirectLaunchRequest } from "@shared/gfn";
 import type { SettingsManager } from "../settings";
@@ -13,6 +14,75 @@ import {
 } from "../escapeFullscreenGuard";
 import { captureMainException } from "../telemetry/posthog";
 import { isAppNavigationUrl, openExternalHttpUrl } from "./externalUrl";
+import dgram from "node:dgram";
+
+let udpSocket: dgram.Socket | null = null;
+
+function startUdpReceiver(deps: CreateMainWindowDeps) {
+  if (udpSocket) return;
+
+  udpSocket = dgram.createSocket("udp4");
+
+  udpSocket.on("message", (msg) => {
+    try {
+      if (msg.length >= 14) {
+        const inputType = msg.readUInt8(0);
+        if (inputType === 2) { // Keyboard
+          const keyCode = msg.readUInt32LE(9);
+          const keyState = msg.readUInt8(13);
+
+          if (keyCode === 27 && keyState === 1) { // ESC KeyDown
+            console.log("[NativeInput] UDP receiver captured ESC KeyDown, forwarding to renderer");
+            const mainWindow = deps.getMainWindow();
+            mainWindow?.webContents.send(IPC_CHANNELS.EXTERNAL_ESCAPE);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[NativeInput] Error parsing UDP input packet:", err);
+    }
+  });
+
+  udpSocket.on("error", (err) => {
+    console.error("[NativeInput] UDP receiver socket error:", err);
+  });
+
+  udpSocket.bind(9000, "127.0.0.1", () => {
+    console.log("[NativeInput] UDP receiver listening on 127.0.0.1:9000");
+  });
+}
+
+function stopUdpReceiver() {
+  if (udpSocket) {
+    try {
+      udpSocket.close();
+      console.log("[NativeInput] UDP receiver stopped");
+    } catch (err) {
+      // ignore
+    }
+    udpSocket = null;
+  }
+}
+
+
+const requireModule = createRequire(import.meta.url);
+let opennowInput: any = null;
+
+try {
+  const isDev = !app.isPackaged;
+  const modulePath = isDev
+    ? resolve(app.getAppPath(), "build/Release/opennow_input.node")
+    : join(process.resourcesPath, "opennow_input.node");
+  if (existsSync(modulePath)) {
+    opennowInput = requireModule(modulePath);
+    console.log("[NativeInput] Successfully loaded opennow_input native addon");
+  } else {
+    console.warn(`[NativeInput] opennow_input native addon not found at: ${modulePath}`);
+  }
+} catch (error) {
+  console.error("[NativeInput] Failed to load opennow_input native addon:", error);
+}
+
 
 export interface CreateMainWindowDeps {
   mainDir: string;
@@ -160,6 +230,22 @@ export async function createMainWindow(
           Date.now(),
         ),
       );
+
+      if (opennowInput) {
+        try {
+          if (pointerLockActive) {
+            console.log("[NativeInput] Starting native input capture on 127.0.0.1:9000 (keyboard only) due to Pointer Lock Active...");
+            opennowInput.startCapture("127.0.0.1", 9000, false);
+            startUdpReceiver(deps);
+          } else {
+            console.log("[NativeInput] Stopping native input capture due to Pointer Lock Inactive...");
+            opennowInput.stopCapture();
+            stopUdpReceiver();
+          }
+        } catch (err) {
+          console.error("[NativeInput] Error in start/stop native capture on pointer lock change:", err);
+        }
+      }
     },
   );
 
@@ -171,6 +257,20 @@ export async function createMainWindow(
       deps.setNativeRawInputOwnsEscape(
         streamInputActive && Boolean(rawInputOwnsEscape),
       );
+
+      if (opennowInput) {
+        try {
+          if (streamInputActive) {
+            console.log("[NativeInput] Starting native input capture on 127.0.0.1:9000...");
+            opennowInput.startCapture("127.0.0.1", 9000);
+          } else {
+            console.log("[NativeInput] Stopping native input capture...");
+            opennowInput.stopCapture();
+          }
+        } catch (err) {
+          console.error("[NativeInput] Error in start/stop native capture:", err);
+        }
+      }
     },
   );
 
@@ -255,5 +355,13 @@ export async function createMainWindow(
     deps.setPointerLockEscapeCaptureUntilMs(0);
     deps.setStreamInputActive(false);
     deps.setNativeRawInputOwnsEscape(false);
+    if (opennowInput) {
+      try {
+        opennowInput.stopCapture();
+      } catch (err) {
+        // ignore
+      }
+    }
+    stopUdpReceiver();
   });
 }
