@@ -136,6 +136,9 @@ export interface OpenNowApi {
   onToggleFullscreen(listener: () => void): () => void;
   onExitFullscreen(listener: () => void): () => void;
   quitApp(): Promise<void>;
+  minimizeWindow(): Promise<void>;
+  maximizeWindow(): Promise<void>;
+  closeWindow(): Promise<void>;
   getUpdaterState(): Promise<AppUpdaterState>;
   checkForUpdates(): Promise<AppUpdaterState>;
   downloadUpdate(): Promise<AppUpdaterState>;

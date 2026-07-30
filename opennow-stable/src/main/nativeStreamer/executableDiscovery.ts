@@ -48,13 +48,12 @@ export function shouldIgnorePackagedExecutableOverride(
 export function resolveNativeStreamerExecutableCandidates(
   options: NativeStreamerExecutableDiscoveryOptions,
 ): string[] {
-  const exeName = nativeStreamerExecutableName(options.platform);
+  const exeNames = options.platform === "win32"
+    ? ["opennow-streamer-cpp.exe", "opennow-streamer.exe"]
+    : [nativeStreamerExecutableName(options.platform)];
   const platformKey = nativeStreamerPlatformKey(options.platform, options.arch);
-  const bundledCandidates = [
-    join(options.resourcesPath, "native", "opennow-streamer", platformKey, exeName),
-    join(options.resourcesPath, "native", "opennow-streamer", exeName),
-  ];
   const candidates: string[] = [];
+
   const addCandidate = (candidate: string | undefined): void => {
     if (!candidate || !isExistingFile(candidate) || candidates.includes(candidate)) {
       return;
@@ -62,29 +61,31 @@ export function resolveNativeStreamerExecutableCandidates(
     candidates.push(candidate);
   };
 
-  if (options.isPackaged) {
-    for (const candidate of bundledCandidates) {
-      if (!isExistingFile(candidate) || !hasBundledRuntimeNextToExecutable(candidate)) {
-        continue;
+  for (const exeName of exeNames) {
+    const bundledCandidates = [
+      join(options.resourcesPath, "native", "opennow-streamer", platformKey, exeName),
+      join(options.resourcesPath, "native", "opennow-streamer", exeName),
+    ];
+
+    if (options.isPackaged) {
+      for (const candidate of bundledCandidates) {
+        if (!isExistingFile(candidate)) {
+          continue;
+        }
+        addCandidate(
+          materializePackagedNativeStreamerCache(
+            candidate,
+            platformKey,
+            exeName,
+            options.cacheContext,
+          ) ?? undefined,
+        );
       }
-      addCandidate(
-        materializePackagedNativeStreamerCache(
-          candidate,
-          platformKey,
-          exeName,
-          options.cacheContext,
-        ) ?? undefined,
-      );
     }
-  }
-  bundledCandidates.forEach(addCandidate);
-  if (options.isPackaged && candidates.length > 0) {
-    const packagedBundledCandidates = candidates.filter((candidate) =>
-      hasBundledRuntimeNextToExecutable(candidate),
-    );
-    return packagedBundledCandidates.length > 0 ? packagedBundledCandidates : candidates;
+    bundledCandidates.forEach(addCandidate);
   }
 
+  // Fallback candidates
   const configuredPath = options.getConfiguredPath().trim();
   if (configuredPath) {
     if (isExistingFile(configuredPath)) {
@@ -101,28 +102,32 @@ export function resolveNativeStreamerExecutableCandidates(
     }
   }
 
-  [
-    options.envExecutablePath,
-    ...bundledCandidates,
-    resolve(options.mainDir, "../../../native/opennow-streamer/bin", platformKey, exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/bin", exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/dist", platformKey, exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/dist", exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/target/release", platformKey, exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/target/release", exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/target/debug", platformKey, exeName),
-    resolve(options.mainDir, "../../../native/opennow-streamer/target/debug", exeName),
-    resolve(options.appPath, "../native/opennow-streamer/bin", platformKey, exeName),
-    resolve(options.appPath, "../native/opennow-streamer/bin", exeName),
-    resolve(options.appPath, "../native/opennow-streamer/dist", platformKey, exeName),
-    resolve(options.appPath, "../native/opennow-streamer/dist", exeName),
-    resolve(options.appPath, "../native/opennow-streamer/target/release", platformKey, exeName),
-    resolve(options.appPath, "../native/opennow-streamer/target/release", exeName),
-    resolve(options.appPath, "../native/opennow-streamer/target/debug", platformKey, exeName),
-    resolve(options.appPath, "../native/opennow-streamer/target/debug", exeName),
-  ]
-    .filter((candidate): candidate is string => Boolean(candidate))
-    .forEach(addCandidate);
+  for (const exeName of exeNames) {
+    [
+      options.envExecutablePath,
+      resolve(options.mainDir, "../../../native/opennow-streamer-cpp/build/bin", exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer-cpp/build/bin", platformKey, exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/bin", platformKey, exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/bin", exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/dist", platformKey, exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/dist", exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/target/release", platformKey, exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/target/release", exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/target/debug", platformKey, exeName),
+      resolve(options.mainDir, "../../../native/opennow-streamer/target/debug", exeName),
+      resolve(options.appPath, "../native/opennow-streamer-cpp/build/bin", exeName),
+      resolve(options.appPath, "../native/opennow-streamer/bin", platformKey, exeName),
+      resolve(options.appPath, "../native/opennow-streamer/bin", exeName),
+      resolve(options.appPath, "../native/opennow-streamer/dist", platformKey, exeName),
+      resolve(options.appPath, "../native/opennow-streamer/dist", exeName),
+      resolve(options.appPath, "../native/opennow-streamer/target/release", platformKey, exeName),
+      resolve(options.appPath, "../native/opennow-streamer/target/release", exeName),
+      resolve(options.appPath, "../native/opennow-streamer/target/debug", platformKey, exeName),
+      resolve(options.appPath, "../native/opennow-streamer/target/debug", exeName),
+    ]
+      .filter((candidate): candidate is string => Boolean(candidate))
+      .forEach(addCandidate);
+  }
 
   if (candidates.length > 0) {
     return candidates;

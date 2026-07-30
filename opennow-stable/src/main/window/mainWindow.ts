@@ -71,7 +71,9 @@ export async function createMainWindow(
     minHeight: 680,
     ...(startFullscreen ? { fullscreen: true } : {}),
     autoHideMenuBar: true,
-    backgroundColor: "#0f172a",
+    transparent: true,
+    frame: false,
+    backgroundColor: "#00000000",
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,

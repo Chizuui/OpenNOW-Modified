@@ -434,7 +434,15 @@ export function StreamView({
       const rect = element.getBoundingClientRect();
       const width = Math.round(rect.width * dpr);
       const height = Math.round(rect.height * dpr);
-      const visible = width >= 2 && height >= 2 && !showSideBar && !exitPrompt.open;
+      
+      // If native internal hole is active, we must always send visible=true to let the C++ streamer
+      // map its window to the parent HWND, even if the dummy video element starts at 0x0 size.
+      const isVisibleSize = nativeInternalHole ? true : (width >= 2 && height >= 2);
+      const visible = isVisibleSize && !showSideBar && !exitPrompt.open;
+      
+      const sendWidth = (width >= 2) ? width : Math.round(window.innerWidth * dpr);
+      const sendHeight = (height >= 2) ? height : Math.round(window.innerHeight * dpr);
+
       updateSurface({
         deviceScaleFactor: dpr,
         visible,
@@ -443,8 +451,8 @@ export function StreamView({
           ? {
               x: Math.round(rect.left * dpr),
               y: Math.round(rect.top * dpr),
-              width,
-              height,
+              width: sendWidth,
+              height: sendHeight,
             }
           : null,
       });

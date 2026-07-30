@@ -287,6 +287,14 @@ export function useSignalingEvents({
           }
         } else if (event.type === "native-stream-started") {
           console.log("[App] Native streamer started:", event.message ?? "");
+          // Immediately activate native renderer so nativeInternalHole in StreamView
+          // becomes true, which triggers surface updates to the C++ streamer.
+          // Without this, nativeRendererActive would only become true after the first
+          // stats event, but stats require frames, and frames require a surface — a loop.
+          diagnosticsStore.set({
+            ...diagnosticsStore.getSnapshot(),
+            nativeRendererActive: true,
+          });
           activateNativeInputForCurrentSession(nativeInputProtocolVersionRef.current ?? undefined);
         } else if (event.type === "native-input-ready") {
           console.log("[App] Native input protocol ready:", event.protocolVersion);

@@ -1,0 +1,9 @@
+{
+  "name": "opennow-streamer-cpp",
+  "version": "1.0.0",
+  "dependencies": [
+    "libdatachannel",
+    "nlohmann-json",
+    "spdlog"
+  ]
+}

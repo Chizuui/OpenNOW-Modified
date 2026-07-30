@@ -232,6 +232,31 @@ export function SettingsNativeStreamerSection({
               </div>
 
               <div className="settings-row settings-row--column">
+                <label className="settings-label">{t("settings.nativeStreamer.nativeStreamerEngine")}</label>
+                <div className="settings-chip-row">
+                  <button
+                    type="button"
+                    className={`settings-chip ${settings.nativeStreamerBackend === "cpp-native" ? "active" : ""}`}
+                    aria-pressed={settings.nativeStreamerBackend === "cpp-native"}
+                    onClick={() => handleChange("nativeStreamerBackend", "cpp-native")}
+                  >
+                    <span>C++ (Zero GStreamer)</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`settings-chip ${settings.nativeStreamerBackend === "gstreamer" ? "active" : ""}`}
+                    aria-pressed={settings.nativeStreamerBackend === "gstreamer"}
+                    onClick={() => handleChange("nativeStreamerBackend", "gstreamer")}
+                  >
+                    <span>Rust (GStreamer)</span>
+                  </button>
+                </div>
+                <span className="settings-subtle-hint">
+                  {t("settings.nativeStreamer.nativeStreamerEngineHint")}
+                </span>
+              </div>
+
+              <div className="settings-row settings-row--column">
                 <div className="settings-row-top settings-row-top--compact">
                   <label className="settings-label settings-label--wrap" htmlFor="settings-native-show-stats">
                     <span className="settings-label-title">{t("settings.nativeStreamer.showNativeStreamerStats")}</span>

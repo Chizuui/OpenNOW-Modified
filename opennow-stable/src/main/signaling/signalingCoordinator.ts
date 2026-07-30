@@ -336,7 +336,8 @@ export class SignalingCoordinator {
   private getNativeStreamerManager(): NativeStreamerManager {
     this.nativeStreamerManager ??= new NativeStreamerManager({
       mainDir: this.deps.mainDir,
-      getBackendPreference: () => "gstreamer",
+      getBackendPreference: () =>
+        this.deps.settingsManager?.get("nativeStreamerBackend") ?? "gstreamer",
       getVideoBackendPreference: () =>
         this.deps.settingsManager?.get("nativeVideoBackend") ?? "auto",
       getExecutablePathOverride: () =>
@@ -376,11 +377,7 @@ export class SignalingCoordinator {
 
   private routeSignalingEvent(event: MainToRendererSignalingEvent): void {
     if (event.type === "disconnected") {
-      void this.nativeStreamerManager?.stop(
-        `signaling disconnected: ${event.reason}`,
-      );
-      this.nativeStreamerContext = null;
-      this.nativeStreamerFallbackSessionId = null;
+      console.log(`[Signaling] WebSocket disconnected (reason: ${event.reason}). Forwarding to renderer without stopping native streamer.`);
       this.emitToRenderer(event);
       return;
     }

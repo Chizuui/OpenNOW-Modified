@@ -162,6 +162,31 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
     });
   });
 
+  ipcMain.handle(IPC_CHANNELS.WINDOW_MINIMIZE, async () => {
+    const mainWindow = deps.getMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.minimize();
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WINDOW_MAXIMIZE, async () => {
+    const mainWindow = deps.getMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+      } else {
+        mainWindow.maximize();
+      }
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WINDOW_CLOSE, async () => {
+    const mainWindow = deps.getMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
+
   ipcMain.handle(
     IPC_CHANNELS.OPEN_EXTERNAL_URL,
     async (_event, url: string): Promise<void> => {

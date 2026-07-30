@@ -1,6 +1,6 @@
 import type { StreamClientMode } from "./stream";
 
-export type NativeStreamerBackend = "stub" | "gstreamer";
+export type NativeStreamerBackend = "stub" | "gstreamer" | "cpp-native";
 export type NativeStreamerBackendPreference = "auto" | NativeStreamerBackend;
 export type NativeStreamerFeatureMode = "auto" | "disabled" | "forced";
 export type NativeVideoBackendPreference =

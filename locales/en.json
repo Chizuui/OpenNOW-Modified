@@ -797,6 +797,8 @@
       "enablePromptEsc": "cancel",
       "reportOnGithubIssues": "Report on GitHub Issues",
       "reportOnDiscord": "Report on Discord",
+      "nativeStreamerEngine": "Streamer Engine",
+      "nativeStreamerEngineHint": "Select the backend engine used to run native stream sessions. C++ (recommended) offers the best latency, zero GStreamer dependencies, and native Raw Input. Rust uses GStreamer.",
       "showNativeStreamerStats": "Show Native Streamer Stats",
       "showNativeStreamerStatsHint": "Display the native streamer's own diagnostics overlay during native sessions.",
       "streamerStatus": "Streamer Status",

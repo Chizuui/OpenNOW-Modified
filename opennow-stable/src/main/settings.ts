@@ -223,7 +223,7 @@ export class SettingsManager {
       migrated = true;
     }
 
-    if (settings.nativeStreamerBackend !== "gstreamer") {
+    if (settings.nativeStreamerBackend !== "gstreamer" && settings.nativeStreamerBackend !== "cpp-native") {
       settings.nativeStreamerBackend = "gstreamer";
       migrated = true;
     }

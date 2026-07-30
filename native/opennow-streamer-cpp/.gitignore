@@ -1,0 +1,18 @@
+# Build directory
+build/
+bin/
+
+# Dependency directories (vcpkg)
+vcpkg_installed/
+
+# MSVC directories
+.vs/
+out/
+x64/
+Debug/
+Release/
+
+# User-specific files
+*.user
+*.suo
+*.db

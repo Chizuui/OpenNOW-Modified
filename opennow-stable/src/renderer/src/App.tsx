@@ -84,6 +84,7 @@ import { useTranslation } from "./i18n";
 // UI Components
 import { LoginScreen } from "./components/LoginScreen";
 import { Navbar } from "./components/Navbar";
+import { TitleBar } from "./components/TitleBar";
 import { HomePage } from "./components/HomePage";
 import { LibraryPage } from "./components/LibraryPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
@@ -160,6 +161,11 @@ export function App(): JSX.Element {
     (stats) => stats.nativeRendererActive || stats.framesDecoded > 0,
   );
 
+  const nativeRendererActive = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.nativeRendererActive,
+  );
+
   const { runtime: streamRuntime, recovery, snapshot } = useStreamSession();
   const {
     session, setSession,
@@ -208,6 +214,18 @@ export function App(): JSX.Element {
     signalingRecoveryRef,
     directLaunchSessionSeenRef,
   } = streamRuntime;
+
+  useEffect(() => {
+    const isStreamingNative = streamStatus !== "idle" && nativeRendererActive;
+    if (isStreamingNative) {
+      document.body.classList.add("native-stream-active");
+    } else {
+      document.body.classList.remove("native-stream-active");
+    }
+    return () => {
+      document.body.classList.remove("native-stream-active");
+    };
+  }, [streamStatus, nativeRendererActive]);
   const {
     disconnectSignalingControlled,
     isRecoveryGenerationCurrent,
@@ -2531,6 +2549,7 @@ export function App(): JSX.Element {
 
   return (
     <div className={`app-container${effectiveControllerMode ? " app-container--controller" : ""}${showCatalogAtmosphere ? " app-container--atmosphere" : ""}`} style={getAppStyle(settings.posterSizeScale)}>
+      <TitleBar />
       <div
         className="app-shell"
         inert={shellBlocked ? true : undefined}

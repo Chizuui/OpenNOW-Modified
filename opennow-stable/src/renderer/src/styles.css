@@ -62,6 +62,7 @@
 
   /* Layout */
   --navbar-h: 48px;
+  --titlebar-h: 32px;
 }
 
 [data-theme="light"] {
@@ -174,7 +175,7 @@ body,
 
 .auth-refresh-notice {
   position: fixed;
-  top: calc(var(--navbar-h) + 10px);
+  top: calc(var(--titlebar-h) + var(--navbar-h) + 10px);
   left: 50%;
   transform: translateX(-50%);
   z-index: 1200;
@@ -207,7 +208,7 @@ body,
    ====================================================== */
 .navbar {
   position: fixed;
-  top: 0;
+  top: var(--titlebar-h);
   left: 0;
   right: 0;
   height: var(--navbar-h);
@@ -1474,7 +1475,11 @@ body,
    ====================================================== */
 .login-screen {
   position: fixed;
-  inset: 0;
+  top: var(--titlebar-h);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(100vh - var(--titlebar-h));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -9042,11 +9047,11 @@ button.game-card-store-chip.owned.active:hover {
 /* Sidebar overlay for settings */
 .sidebar {
   position: fixed;
-  top: 14px;
+  top: calc(var(--titlebar-h) + 14px);
   left: 14px;
   z-index: 1002;
   width: min(380px, calc(100vw - 28px));
-  max-height: calc(100vh - 28px);
+  max-height: calc(100vh - var(--titlebar-h) - 28px);
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -11264,3 +11269,79 @@ button.game-card-store-chip.owned.active:hover {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
+
+/* ---------- Transparent Window Overlay & Custom Title Bar ---------- */
+body.native-stream-active,
+body.native-stream-active #root,
+body.native-stream-active .app-container,
+body.native-stream-active .app-shell,
+body.native-stream-active .main-content,
+body.native-stream-active .stream-container {
+  background: transparent !important;
+}
+
+.custom-title-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 32px;
+  background: #090d16;
+  color: #f8fafc;
+  font-family: inherit;
+  font-size: 12px;
+  user-select: none;
+  border-bottom: 1px solid #1e293b;
+  position: relative;
+  z-index: 99999;
+}
+
+body.native-stream-active .custom-title-bar {
+  background: rgba(9, 13, 22, 0.4);
+  backdrop-filter: blur(4px);
+  border-bottom-color: rgba(30, 41, 59, 0.4);
+}
+
+.custom-title-bar__drag-area {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding-left: 12px;
+  -webkit-app-region: drag;
+}
+
+.custom-title-bar__title {
+  font-weight: 700;
+  color: #22c55e; /* GFN green accent */
+  letter-spacing: 0.5px;
+}
+
+.custom-title-bar__controls {
+  display: flex;
+  height: 100%;
+}
+
+.custom-title-bar__button {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 46px;
+  height: 100%;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  -webkit-app-region: no-drag;
+}
+
+.custom-title-bar__button:hover {
+  background: #1e293b;
+  color: #f8fafc;
+}
+
+.custom-title-bar__button--close:hover {
+  background: #ef4444;
+  color: #ffffff;
+}
+

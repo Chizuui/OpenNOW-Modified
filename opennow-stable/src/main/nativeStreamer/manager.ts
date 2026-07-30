@@ -109,9 +109,22 @@ export class NativeStreamerManager {
 
   constructor(private readonly options: NativeStreamerManagerOptions) {
     this.surfaceUpdates = new NativeSurfaceUpdateQueue(
-      (surface) => this.request({ type: "surface", surface }, SURFACE_UPDATE_TIMEOUT_MS).then(() => undefined),
+      (surface) => {
+        this.fireAndForgetCommand({ type: "surface", surface });
+        return Promise.resolve();
+      },
       (error) => console.warn("[NativeStreamer] Failed to update native render surface:", error),
     );
+  }
+
+  private fireAndForgetCommand(input: NativeStreamerCommandInput): void {
+    const child = this.child;
+    if (!child || child.killed || !child.stdin.writable) {
+      return;
+    }
+    const id = randomUUID();
+    const payload = { ...input, id } as NativeStreamerCommand;
+    child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
   }
 
   isRunning(): boolean {
@@ -398,7 +411,7 @@ export class NativeStreamerManager {
       const backendPreference = this.options.getBackendPreference();
       let lastError: Error | null = null;
 
-      for (const executablePath of resolveNativeStreamerExecutableCandidates({
+      let candidates = resolveNativeStreamerExecutableCandidates({
         platform: process.platform,
         arch: process.arch,
         resourcesPath: process.resourcesPath,
@@ -415,7 +428,16 @@ export class NativeStreamerManager {
           tempDirectory: tmpdir(),
           userDataPath: app.getPath("userData"),
         },
-      })) {
+      });
+
+      // Sort candidates based on backend preference
+      if (backendPreference === "cpp-native") {
+        candidates = candidates.sort((a, b) => (b.includes("cpp") ? 1 : a.includes("cpp") ? -1 : 0));
+      } else if (backendPreference === "gstreamer") {
+        candidates = candidates.sort((a, b) => (a.includes("cpp") ? 1 : b.includes("cpp") ? -1 : 0));
+      }
+
+      for (const executablePath of candidates) {
         try {
           await this.startProcess(executablePath, backendPreference);
           return;
@@ -736,7 +758,8 @@ export class NativeStreamerManager {
     if (message.type === "stats") {
       this.options.emit({
         type: "native-stream-stats",
-        stats: message.stats,
+        // C++ streamer sends stats as flat fields on the root message, not nested under .stats
+        stats: message.stats ?? message,
       });
       return;
     }
