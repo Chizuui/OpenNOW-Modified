@@ -30,6 +30,8 @@ export function buildVideoAccelerationCommandLine(
   const disableFeatures = ["WebRtcHideLocalIpsWithMdns"];
   const switches: Record<string, string | true> = {
     "ignore-gpu-blocklist": true,
+    "enable-gpu-rasterization": true,
+    "enable-zero-copy": true,
   };
   const isLinuxArm = platform === "linux" && (arch === "arm64" || arch === "arm");
 
