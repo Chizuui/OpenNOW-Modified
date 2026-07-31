@@ -28,7 +28,9 @@
       "showInFolder": "폴더에 표시",
       "sort": "정렬",
       "stop": "중지",
-      "switch": "스위치"
+      "switch": "스위치",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "확인 중",

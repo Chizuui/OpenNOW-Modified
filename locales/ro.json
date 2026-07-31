@@ -28,7 +28,9 @@
       "showInFolder": "Afișați în dosar",
       "sort": "Sortează",
       "stop": "Oprește",
-      "switch": "Schimbă"
+      "switch": "Schimbă",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Se verifică",

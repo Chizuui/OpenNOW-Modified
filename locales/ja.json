@@ -28,7 +28,9 @@
       "showInFolder": "フォルダ内に表示",
       "sort": "並べ替え",
       "stop": "停止",
-      "switch": "スイッチ"
+      "switch": "スイッチ",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "チェック中",

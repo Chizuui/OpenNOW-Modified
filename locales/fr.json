@@ -28,7 +28,9 @@
       "showInFolder": "Afficher dans le dossier",
       "sort": "Trier",
       "stop": "Arrêter",
-      "switch": "Changer"
+      "switch": "Changer",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Vérification",
