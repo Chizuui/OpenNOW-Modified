@@ -28,7 +28,9 @@
       "showInFolder": "Показать в папке",
       "sort": "Сортировать",
       "stop": "Стоп",
-      "switch": "Переключатель"
+      "switch": "Переключатель",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Проверка",

@@ -92,6 +92,7 @@ import { SettingsModalHost } from "./components/SettingsModalHost";
 import { StreamLoading } from "./components/StreamLoading";
 import { StreamView } from "./components/StreamView";
 import { QueueServerSelectModal } from "./components/QueueServerSelectModal";
+import { GameDetailModal } from "./components/GameDetailModal";
 import { ReleaseHighlightsModal } from "./components/ReleaseHighlightsModal";
 import { ErrorReportingConsentModal } from "./components/ErrorReportingConsentModal";
 import { FeedbackModal } from "./components/FeedbackModal";
@@ -1874,6 +1875,14 @@ export function App(): JSX.Element {
   ]);
 
   // Gate handler: shows queue server modal for FREE-tier users before launching
+  const [detailsGame, setDetailsGame] = useState<GameInfo | null>(null);
+  const handleOpenDetails = useCallback((game: GameInfo) => {
+    setDetailsGame(game);
+  }, []);
+  const handleCloseDetails = useCallback(() => {
+    setDetailsGame(null);
+  }, []);
+
   const handleInitiatePlay = useCallback(async (game: GameInfo) => {
     const effectiveTier = normalizeMembershipTier(
       subscriptionInfo?.membershipTier ?? authSession?.user.membershipTier,
@@ -2364,7 +2373,12 @@ export function App(): JSX.Element {
     toggleSessionFullscreen,
   ]);
 
-  const filteredGames = games;
+  const filteredGames = useMemo(() => {
+    const query = searchQuery.trim();
+    // Instant local filter for responsive typing; the debounced server browse
+    // in useCatalogData refines/expands results a moment later.
+    return query ? games.filter((game) => matchesGameSearch(game, query)) : games;
+  }, [games, searchQuery]);
 
   const filteredLibraryGames = useMemo(() => {
     const query = searchQuery.trim();
@@ -2616,6 +2630,7 @@ export function App(): JSX.Element {
                 isLoading={effectiveControllerMode ? isLoadingStorePanels : isLoadingCatalog}
                 selectedGameId={selectedGameId}
                 onSelectGame={setSelectedGameId}
+                onOpenDetails={handleOpenDetails}
                 selectedVariantByGameId={variantByGameId}
                 onSelectGameVariant={handleSelectGameVariant}
                 filterGroups={catalogFilterGroups}
@@ -2651,6 +2666,7 @@ export function App(): JSX.Element {
                   isLoading={isLoadingLibrary}
                   selectedGameId={selectedGameId}
                   onSelectGame={setSelectedGameId}
+                  onOpenDetails={handleOpenDetails}
                   selectedVariantByGameId={variantByGameId}
                   onSelectGameVariant={handleSelectGameVariant}
                   libraryCount={libraryGames.length}
@@ -2841,6 +2857,19 @@ export function App(): JSX.Element {
       </SettingsModalHost>
       {logoutConfirmModal}
       {removeAccountConfirmModal}
+      <GameDetailModal
+        open={detailsGame !== null}
+        game={detailsGame}
+        selectedVariantId={detailsGame ? variantByGameId[detailsGame.id] : undefined}
+        onSelectVariant={(variantId) => {
+          if (detailsGame) handleSelectGameVariant(detailsGame.id, variantId);
+        }}
+        onPlay={(game) => {
+          handleCloseDetails();
+          void handleInitiatePlay(game);
+        }}
+        onClose={handleCloseDetails}
+      />
       {queueModalGame && streamStatus === "idle" && (
         <QueueServerSelectModal
           game={queueModalGame}
