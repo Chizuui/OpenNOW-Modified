@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.Stable
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -178,6 +179,7 @@ internal fun OpenNowUiState.isNativeStreamReady(): Boolean =
     streamStatus in setOf("connecting", "streaming") &&
         streamSession?.isReadyForStream() == true
 
+@Stable
 class OpenNowViewModel(application: Application) : AndroidViewModel(application) {
     private val openNowApplication = application as OpenNowApplication
     private val http: OkHttpClient = openNowApplication.httpClient

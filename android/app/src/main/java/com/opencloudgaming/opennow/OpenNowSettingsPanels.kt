@@ -39,6 +39,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -456,7 +457,7 @@ private fun updateMessageColor(status: AndroidUpdateStatus): Color =
         AndroidUpdateStatus.Available,
         AndroidUpdateStatus.Downloaded,
         AndroidUpdateStatus.NotAvailable -> MaterialTheme.colorScheme.primary
-        AndroidUpdateStatus.Error -> Color(0xffff9f9f)
+        AndroidUpdateStatus.Error -> OpenNowPalette.ErrorText
         else -> SettingsTextMuted
     }
 
@@ -756,8 +757,8 @@ private fun AccountPlayTimeStatsPanel(subscriptionInfo: SubscriptionInfo?, fallb
                                 .height(4.dp)
                                 .background(
                                     when {
-                                        progressFraction >= 0.9f -> Color(0xffff8a65)
-                                        progressFraction >= 0.75f -> Color(0xffffc266)
+                                        progressFraction >= 0.9f -> OpenNowPalette.WarningStrong
+                                        progressFraction >= 0.75f -> OpenNowPalette.StatusNotice
                                         else -> MaterialTheme.colorScheme.primary
                                     },
                                 ),
@@ -905,8 +906,8 @@ private fun StorageAddonPanel(storageAddon: StorageAddon?, openExternal: (String
                             )
                         }
                         val usageColor = when {
-                            usageFraction >= 0.9f -> Color(0xffff8a65)
-                            usageFraction >= 0.75f -> Color(0xffffc266)
+                            usageFraction >= 0.9f -> OpenNowPalette.WarningStrong
+                            usageFraction >= 0.75f -> OpenNowPalette.StatusNotice
                             else -> MaterialTheme.colorScheme.primary
                         }
                         Box(
@@ -1250,7 +1251,7 @@ private fun CodecCapabilityRow(capability: CodecCapability) {
                 Text(capability.codec.name, color = SettingsText, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 Text(
                     status,
-                    color = if (healthy) MaterialTheme.colorScheme.primary else Color(0xffffc266),
+                    color = if (healthy) MaterialTheme.colorScheme.primary else OpenNowPalette.StatusNotice,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                 )
@@ -1494,7 +1495,7 @@ internal fun DebugLogsPanel(state: OpenNowUiState, viewModel: OpenNowViewModel) 
         }
     }
     saveError?.let {
-        Text(it, color = Color(0xffff9f9f), style = MaterialTheme.typography.bodySmall)
+        Text(it, color = OpenNowPalette.ErrorText, style = MaterialTheme.typography.bodySmall)
     }
 }
 

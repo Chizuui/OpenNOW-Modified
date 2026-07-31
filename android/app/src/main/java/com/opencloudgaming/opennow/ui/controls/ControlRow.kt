@@ -114,7 +114,7 @@ data class ControlRowStyle(
             borderRestWidth = 1.dp,
             borderFocusWidth = 2.dp,
             horizontalPadding = OpenNowSpacing.md,
-            verticalPadding = 10.dp,
+            verticalPadding = OpenNowSpacing.md,
             contentGap = 2.dp,
             labelStyle = MaterialTheme.typography.titleSmall,
             labelWeight = FontWeight.SemiBold,
@@ -268,7 +268,7 @@ data class ControlSectionStyle(
             titleStyle = MaterialTheme.typography.titleMedium,
             titleWeight = FontWeight.Bold,
             titleColor = MaterialTheme.colorScheme.onSurface,
-            itemSpacing = 10.dp,
+            itemSpacing = OpenNowSpacing.md,
         )
 
         @Composable
@@ -306,7 +306,7 @@ internal fun ControlSection(
             shape = RoundedCornerShape(SETTINGS_ROW_RADIUS),
         ) {
             Column(
-                Modifier.fillMaxWidth().padding(14.dp),
+                Modifier.fillMaxWidth().padding(OpenNowSpacing.md),
                 verticalArrangement = Arrangement.spacedBy(style.itemSpacing),
                 content = body,
             )

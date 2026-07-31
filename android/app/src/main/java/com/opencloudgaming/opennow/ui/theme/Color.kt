@@ -39,6 +39,12 @@ object OpenNowPalette {
     val ErrorContainer = Color(0xff33181c)
     val OnErrorContainer = Color(0xffffb8bf)
 
+    /** Inline error text (validation messages, failed-operation notices) sitting on a dark surface. */
+    val ErrorText = Color(0xffff9f9f)
+
+    /** A meter or progress bar entering its danger zone — louder than [StatusNotice], not yet an error. */
+    val WarningStrong = Color(0xffff8a65)
+
     /**
      * The quality ladder, shared by the in-stream stats pill and the post-session report so the two
      * stop disagreeing about what "bad" looks like. Good deliberately has no tint of its own —

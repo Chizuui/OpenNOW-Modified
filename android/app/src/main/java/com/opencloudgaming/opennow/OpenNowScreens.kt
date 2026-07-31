@@ -1194,7 +1194,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 }
                 if (state.error != null) {
                     Spacer(Modifier.height(14.dp))
-                    Text(state.error.orEmpty(), color = Color(0xffff9f9f))
+                    Text(state.error.orEmpty(), color = OpenNowPalette.ErrorText)
                 }
             }
         }
@@ -9005,7 +9005,7 @@ private fun BugReportPreflightDeckView(
     val accent = when (card.tone) {
         BugReportPreflightTone.Healthy -> Green
         BugReportPreflightTone.Notice -> MaterialTheme.colorScheme.primary
-        BugReportPreflightTone.Warning -> Color(0xffffc266)
+        BugReportPreflightTone.Warning -> OpenNowPalette.StatusNotice
     }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -9050,7 +9050,7 @@ private fun BugReportPreflightDeckView(
             val targetAccent = when (targetCard.tone) {
                 BugReportPreflightTone.Healthy -> Green
                 BugReportPreflightTone.Notice -> MaterialTheme.colorScheme.primary
-                BugReportPreflightTone.Warning -> Color(0xffffc266)
+                BugReportPreflightTone.Warning -> OpenNowPalette.StatusNotice
             }
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -11451,7 +11451,7 @@ private fun QueueStatusPanel(
         }
         error?.let {
             Spacer(Modifier.height(12.dp))
-            Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+            Text(it, color = OpenNowPalette.ErrorText, textAlign = TextAlign.Center)
         }
     }
 }
@@ -11567,7 +11567,7 @@ private fun QueueAdPanel(
                         onCancel = onCancel,
                     )
                     error?.let {
-                        Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+                        Text(it, color = OpenNowPalette.ErrorText, textAlign = TextAlign.Center)
                     }
                 }
             }
@@ -11596,7 +11596,7 @@ private fun QueueAdPanel(
                     onCancel = onCancel,
                 )
                 error?.let {
-                    Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+                    Text(it, color = OpenNowPalette.ErrorText, textAlign = TextAlign.Center)
                 }
             }
         }
@@ -13339,7 +13339,7 @@ private fun FilterMenu(
                         modifier = Modifier.fillMaxHeight(0.6f),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        items(options) { option ->
+                        items(options, key = { it.id }) { option ->
                             val isSelected = option.id in selectedIds
                             var rowFocused by remember { mutableStateOf(false) }
                             Row(
@@ -13579,7 +13579,7 @@ private fun PrintedWasteOptionsColumn(
         } else if (state.printedWasteError != null) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(state.printedWasteError, color = Color(0xffff9f9f))
+                    Text(state.printedWasteError, color = OpenNowPalette.ErrorText)
                     OutlinedButton(onClick = onRetry) { Text("Retry") }
                 }
             }
@@ -13822,14 +13822,14 @@ private fun formatPrintedWasteWait(etaMs: Long): String {
 private fun queueColor(queue: Int): Color = when {
     queue <= 5 -> Green
     queue <= 20 -> Color(0xffc7ef6b)
-    queue <= 45 -> Color(0xffffc95a)
+    queue <= 45 -> OpenNowPalette.StatusFair
     else -> Color(0xffff8d8d)
 }
 
 private fun pingColor(pingMs: Long): Color = when {
     pingMs <= 60L -> Green
     pingMs <= 120L -> Color(0xffc7ef6b)
-    pingMs <= 180L -> Color(0xffffc95a)
+    pingMs <= 180L -> OpenNowPalette.StatusFair
     else -> Color(0xffff8d8d)
 }
 
