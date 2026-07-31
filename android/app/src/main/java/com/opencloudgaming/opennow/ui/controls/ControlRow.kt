@@ -41,6 +41,8 @@ import com.opencloudgaming.opennow.isTvActivateKey
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
+import com.opencloudgaming.opennow.ui.theme.OpenNowElevation
+import com.opencloudgaming.opennow.ui.theme.LocalExpressiveUi
 
 /**
  * How a settings-style row is painted.
@@ -300,10 +302,14 @@ internal fun ControlSection(
         content()
     }
     if (style.usesCard) {
+        val expressive = LocalExpressiveUi.current
         Card(
             modifier = modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape = RoundedCornerShape(SETTINGS_ROW_RADIUS),
+            elevation = CardDefaults.cardElevation(
+                defaultElevation = if (expressive) OpenNowElevation.low else OpenNowElevation.flat,
+            ),
         ) {
             Column(
                 Modifier.fillMaxWidth().padding(OpenNowSpacing.md),

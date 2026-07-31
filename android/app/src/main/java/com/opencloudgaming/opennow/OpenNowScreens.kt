@@ -41,6 +41,7 @@ import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -119,8 +120,12 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedButton
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Cast
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.IconButton
@@ -267,6 +272,8 @@ import com.opencloudgaming.opennow.ui.controls.ControlSwitchRow
 import com.opencloudgaming.opennow.ui.controls.LocalControlRowStyle
 import com.opencloudgaming.opennow.ui.controls.LocalControlSectionStyle
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
+import com.opencloudgaming.opennow.ui.theme.LocalExpressiveUi
+import com.opencloudgaming.opennow.ui.theme.OpenNowElevation
 import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
@@ -353,7 +360,10 @@ fun OpenNowTheme(settings: AppSettings, content: @Composable () -> Unit) {
         }.getOrDefault(1f)
         systemScale == 0f || !settings.controllerBackgroundAnimations
     }
-    CompositionLocalProvider(LocalReduceMotion provides reduceMotion) {
+    CompositionLocalProvider(
+        LocalReduceMotion provides reduceMotion,
+        LocalExpressiveUi provides settings.expressiveUi,
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = OpenNowTypography,
@@ -3487,7 +3497,7 @@ private fun StoreRailGameCardSkeleton(
     expressiveUi: Boolean,
     portraitCard: Boolean,
 ) {
-    val shape = RoundedCornerShape(if (expressiveUi) 12.dp else 8.dp)
+    val shape = RoundedCornerShape(if (expressiveUi) OpenNowRadius.lg else OpenNowRadius.sm)
     Surface(
         modifier = Modifier
             .width(width)
@@ -3995,7 +4005,7 @@ private fun StoreComingNextCarousel(
             label = "coming-next-carousel",
         ) { targetPage ->
             val featured = games[targetPage.coerceIn(games.indices)]
-            val shape = RoundedCornerShape(if (settings.expressiveUi) 24.dp else 16.dp)
+            val shape = RoundedCornerShape(if (settings.expressiveUi) OpenNowRadius.xl else OpenNowRadius.lg)
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -4116,7 +4126,7 @@ private fun StoreComingNextCarousel(
                     ControllerFocusFrame(
                         visible = enhancedControllerFocus,
                         animate = settings.controllerBackgroundAnimations,
-                        cornerRadius = if (settings.expressiveUi) 24.dp else 16.dp,
+                        cornerRadius = if (settings.expressiveUi) OpenNowRadius.xl else OpenNowRadius.lg,
                     )
                 }
             }
@@ -4201,7 +4211,7 @@ private fun StoreRailGameCard(
 ) {
     var focused by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
-    val shape = RoundedCornerShape(if (expressiveUi) OpenNowRadius.md else OpenNowRadius.sm)
+    val shape = RoundedCornerShape(if (expressiveUi) OpenNowRadius.lg else OpenNowRadius.sm)
     val actionButtonSize = 34.dp
     val enhancedControllerFocus = shouldShowEnhancedControllerFocus(
         focused = focused,
@@ -4212,16 +4222,21 @@ private fun StoreRailGameCard(
     val pressed by interaction.collectIsPressedAsState()
     val hovered by interaction.collectIsHoveredAsState()
     val reduceMotion = LocalReduceMotion.current
+    val cardScaleSpec: AnimationSpec<Float> = when {
+        reduceMotion -> tween(durationMillis = 0)
+        expressiveUi -> OpenNowMotion.SpringSpatial
+        else -> tween(
+            durationMillis = OpenNowMotion.DurationStandard,
+            easing = OpenNowMotion.EasingStandard,
+        )
+    }
     val cardScale by animateFloatAsState(
         targetValue = when {
             pressed -> 0.965f
             focused || hovered -> if (tvProfile) 1.08f else 1.035f
             else -> 1f
         },
-        animationSpec = tween(
-            durationMillis = if (reduceMotion) 0 else OpenNowMotion.DurationStandard,
-            easing = OpenNowMotion.EasingStandard,
-        ),
+        animationSpec = cardScaleSpec,
         label = "rail-card-scale",
     )
     val dimAlpha = rememberCatalogCardAlpha(focused = focused, tvProfile = tvProfile)
@@ -4272,8 +4287,8 @@ private fun StoreRailGameCard(
             ),
         shape = shape,
         color = OpenNowPalette.ImagePlaceholder,
-        tonalElevation = if (focused) 4.dp else 0.dp,
-        shadowElevation = if (focused) 8.dp else 1.dp,
+        tonalElevation = if (focused) OpenNowElevation.md else if (expressiveUi) OpenNowElevation.low else OpenNowElevation.flat,
+        shadowElevation = if (focused) OpenNowElevation.focus else OpenNowElevation.low,
     ) {
         Box(Modifier.fillMaxSize().clip(shape)) {
             UrlImage(
@@ -4306,7 +4321,7 @@ private fun StoreRailGameCard(
             ControllerFocusFrame(
                 visible = enhancedControllerFocus,
                 animate = controllerBackgroundAnimations,
-                cornerRadius = if (expressiveUi) 12.dp else 8.dp,
+                cornerRadius = if (expressiveUi) OpenNowRadius.lg else OpenNowRadius.sm,
             )
         }
     }
@@ -4677,7 +4692,7 @@ private fun GameCard(
 ) {
     var focused by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
-    val cardShape = RoundedCornerShape(if (expressiveUi) OpenNowRadius.md else OpenNowRadius.sm)
+    val cardShape = RoundedCornerShape(if (expressiveUi) OpenNowRadius.lg else OpenNowRadius.sm)
     val handheldPosterCard = !tvProfile
     val launcherTile = handheldPosterCard && thumbnailPlayOverlay
     val overlayActionSize = if (launcherTile) 34.dp else 44.dp
@@ -4696,6 +4711,16 @@ private fun GameCard(
     val pressed by interaction.collectIsPressedAsState()
     val hovered by interaction.collectIsHoveredAsState()
     val reduceMotion = LocalReduceMotion.current
+    // Expressive motion uses a physical spring so the card overshoots slightly and settles, rather
+    // than easing a fixed 260ms tween. Non-expressive keeps the original tween exactly.
+    val cardScaleSpec: AnimationSpec<Float> = when {
+        reduceMotion -> tween(durationMillis = 0)
+        expressiveUi -> OpenNowMotion.SpringSpatial
+        else -> tween(
+            durationMillis = OpenNowMotion.DurationStandard,
+            easing = OpenNowMotion.EasingStandard,
+        )
+    }
     val cardScale by animateFloatAsState(
         targetValue = when {
             pressed -> 0.965f
@@ -4704,10 +4729,7 @@ private fun GameCard(
             focused || hovered -> if (tvProfile) 1.08f else 1.035f
             else -> 1f
         },
-        animationSpec = tween(
-            durationMillis = if (reduceMotion) 0 else OpenNowMotion.DurationStandard,
-            easing = OpenNowMotion.EasingStandard,
-        ),
+        animationSpec = cardScaleSpec,
         label = "game-card-scale",
     )
     val dimAlpha = rememberCatalogCardAlpha(focused = focused, tvProfile = tvProfile)
@@ -4762,7 +4784,16 @@ private fun GameCard(
             colors = CardDefaults.cardColors(
                 containerColor = if (expressiveUi) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f) else Panel,
             ),
-            elevation = CardDefaults.cardElevation(defaultElevation = if (focused) 8.dp else 0.dp),
+            // Expressive cards carry a small resting tint so the grid reads as layered objects, not
+            // a flat wall; focus lifts them clearly above their neighbours. Non-expressive stays
+            // flat at rest as before.
+            elevation = CardDefaults.cardElevation(
+                defaultElevation = when {
+                    focused -> OpenNowElevation.focus
+                    expressiveUi -> OpenNowElevation.low
+                    else -> OpenNowElevation.flat
+                },
+            ),
             shape = cardShape,
         ) {
             Box(
@@ -4802,7 +4833,7 @@ private fun GameCard(
                 ControllerFocusFrame(
                     visible = enhancedControllerFocus,
                     animate = controllerBackgroundAnimations && !reduceMotion,
-                    cornerRadius = if (expressiveUi) OpenNowRadius.md else OpenNowRadius.sm,
+                    cornerRadius = if (expressiveUi) OpenNowRadius.lg else OpenNowRadius.sm,
                 )
             }
         }
@@ -5085,6 +5116,8 @@ private fun GameDetailsSheet(
     // here rather than by switching to ModalBottomSheet so the sheet keeps its lockedFocusGroup and
     // focus requesters, which the controller and TV navigation depend on.
     val density = LocalDensity.current
+    val expressiveUi = LocalExpressiveUi.current
+    val sheetTopRadius = if (expressiveUi) OpenNowRadius.xxl else OpenNowRadius.xl
     var dragOffset by remember(game.id) { mutableFloatStateOf(0f) }
     val dismissThresholdPx = with(density) { SHEET_DISMISS_DRAG_THRESHOLD.toPx() }
     val dragState = rememberDraggableState { delta ->
@@ -5111,9 +5144,9 @@ private fun GameDetailsSheet(
                     },
                 )
                 .clickable(onClick = {}),
-            shape = if (fullScreen) RoundedCornerShape(0.dp) else RoundedCornerShape(topStart = OpenNowRadius.xl, topEnd = OpenNowRadius.xl),
+            shape = if (fullScreen) RoundedCornerShape(0.dp) else RoundedCornerShape(topStart = sheetTopRadius, topEnd = sheetTopRadius),
             color = Panel,
-            tonalElevation = 8.dp,
+            tonalElevation = OpenNowElevation.focus,
         ) {
             Column(Modifier.fillMaxSize()) {
                 if (!fullScreen) {
@@ -8373,7 +8406,7 @@ private fun StreamControlsPanel(
         color = OpenNowPalette.PanelOverVideo,
         contentColor = TextPrimary,
         border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
-        tonalElevation = 6.dp,
+        tonalElevation = OpenNowElevation.high,
     ) {
         // Every control row inside the panel picks up the denser, over-video styling — and, more
         // importantly, becomes properly focusable. The panel's own row widgets never were.
@@ -13239,13 +13272,13 @@ private fun SortPicker(
     val selectedLabel = labels.firstOrNull { it.id == selected }?.label ?: labels.first().label
     var expanded by remember { mutableStateOf(false) }
     val controlShape = RoundedCornerShape(999.dp)
-    val controlColor = Color.White.copy(alpha = 0.1f)
+    val controlColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
     Box(modifier) {
         OutlinedButton(
             onClick = { expanded = true },
             modifier = Modifier.fillMaxWidth().height(if (compact) TopBarCompactControlHeight else 40.dp),
             shape = controlShape,
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             colors = ButtonDefaults.outlinedButtonColors(
                 containerColor = controlColor,
                 contentColor = TextPrimary,
@@ -13285,7 +13318,18 @@ private fun SelectedFilterChips(options: List<CatalogFilterOption>, selectedIds:
     if (selectedOptions.isEmpty()) return
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         selectedOptions.take(4).forEach { option ->
-            AssistChip(onClick = { onToggle(option.id) }, label = { Text(option.label, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+            FilterChip(
+                selected = true,
+                onClick = { onToggle(option.id) },
+                label = { Text(option.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                trailingIcon = {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = null,
+                        modifier = Modifier.size(FilterChipDefaults.IconSize),
+                    )
+                },
+            )
         }
         if (selectedOptions.size > 4) {
             AssistChip(onClick = {}, label = { Text("+${selectedOptions.size - 4}") })
@@ -13299,6 +13343,7 @@ private fun catalogVisibleFilterGroups(groups: List<CatalogFilterGroup>): List<C
 private fun catalogFilterOptions(groups: List<CatalogFilterGroup>): List<CatalogFilterOption> =
     groups.flatMap { group -> group.options.take(if (group.id == "genre") 10 else group.options.size) }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FilterMenu(
     options: List<CatalogFilterOption>,
@@ -13308,13 +13353,13 @@ private fun FilterMenu(
 ) {
     var expanded by remember { mutableStateOf(false) }
     val filterControlShape = RoundedCornerShape(999.dp)
-    val filterControlColor = Color.White.copy(alpha = 0.1f)
+    val filterControlColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
     Box {
         OutlinedButton(
             onClick = { expanded = true },
             modifier = Modifier.height(if (compact) TopBarCompactControlHeight else 36.dp),
             shape = filterControlShape,
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             colors = ButtonDefaults.outlinedButtonColors(
                 containerColor = filterControlColor,
                 contentColor = TextPrimary,
@@ -13335,37 +13380,36 @@ private fun FilterMenu(
                     )
                 },
                 text = {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxHeight(0.6f),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxHeight(0.6f)
+                            .verticalScroll(rememberScrollState())
                     ) {
-                        items(options, key = { it.id }) { option ->
-                            val isSelected = option.id in selectedIds
-                            var rowFocused by remember { mutableStateOf(false) }
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .onFocusChanged { rowFocused = it.isFocused }
-                                    .background(if (rowFocused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
-                                    .border(
-                                        width = 1.dp,
-                                        color = if (rowFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                        shape = RoundedCornerShape(8.dp)
-                                    )
-                                    .clickable { onToggle(option.id) }
-                                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Checkbox(
-                                    checked = isSelected,
-                                    onCheckedChange = null
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Text(
-                                    option.label,
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = TextPrimary
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            options.forEach { option ->
+                                val isSelected = option.id in selectedIds
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = { onToggle(option.id) },
+                                    label = {
+                                        Text(
+                                            option.label,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    },
+                                    leadingIcon = if (isSelected) {
+                                        {
+                                            Icon(
+                                                Icons.Filled.Check,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(FilterChipDefaults.IconSize),
+                                            )
+                                        }
+                                    } else null,
                                 )
                             }
                         }
@@ -13821,16 +13865,16 @@ private fun formatPrintedWasteWait(etaMs: Long): String {
 
 private fun queueColor(queue: Int): Color = when {
     queue <= 5 -> Green
-    queue <= 20 -> Color(0xffc7ef6b)
+    queue <= 20 -> OpenNowPalette.AccentLime
     queue <= 45 -> OpenNowPalette.StatusFair
-    else -> Color(0xffff8d8d)
+    else -> OpenNowPalette.StatusPoor
 }
 
 private fun pingColor(pingMs: Long): Color = when {
     pingMs <= 60L -> Green
-    pingMs <= 120L -> Color(0xffc7ef6b)
+    pingMs <= 120L -> OpenNowPalette.AccentLime
     pingMs <= 180L -> OpenNowPalette.StatusFair
-    else -> Color(0xffff8d8d)
+    else -> OpenNowPalette.StatusPoor
 }
 
 private fun regionLabel(region: String): String = when (region) {

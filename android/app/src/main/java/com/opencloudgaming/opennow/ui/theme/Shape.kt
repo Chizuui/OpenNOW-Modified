@@ -14,6 +14,9 @@ object OpenNowRadius {
     val md = 12.dp
     val lg = 16.dp
     val xl = 24.dp
+
+    /** M3 Expressive corner — cards, sheets, and dialogs when `expressiveUi` is on. */
+    val xxl = 28.dp
     val full = 999.dp
 }
 
