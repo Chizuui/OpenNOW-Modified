@@ -28,7 +28,9 @@
       "showInFolder": "Toon in map",
       "sort": "Sorteren",
       "stop": "Stop",
-      "switch": "Schakel"
+      "switch": "Schakel",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Controleren",

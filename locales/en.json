@@ -32,7 +32,9 @@
       "showInFolder": "Show in folder",
       "sort": "Sort",
       "stop": "Stop",
-      "switch": "Switch"
+      "switch": "Switch",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Checking",

@@ -28,7 +28,9 @@
       "showInFolder": "Klasörde göster",
       "sort": "Sırala",
       "stop": "Durdur",
-      "switch": "Anahtar"
+      "switch": "Anahtar",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Kontrol ediliyor",

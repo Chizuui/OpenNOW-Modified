@@ -28,7 +28,9 @@
       "showInFolder": "在文件夹中显示",
       "sort": "排序",
       "stop": "停止",
-      "switch": "开关"
+      "switch": "开关",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "检查",

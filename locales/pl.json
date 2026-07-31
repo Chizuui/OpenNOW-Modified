@@ -28,7 +28,9 @@
       "showInFolder": "Pokaż w folderze",
       "sort": "Sortuj",
       "stop": "Zatrzymaj",
-      "switch": "Zamień"
+      "switch": "Zamień",
+      "readMore": "Read more",
+      "showLess": "Show less"
     },
     "status": {
       "checking": "Sprawdzanie",
