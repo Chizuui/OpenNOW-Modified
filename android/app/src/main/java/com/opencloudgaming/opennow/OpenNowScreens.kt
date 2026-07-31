@@ -111,6 +111,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.SuggestionChip
+import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -137,6 +139,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -5522,7 +5525,7 @@ private fun GameDetailsScrollableContent(
                 }
             }
         }
-        Surface(color = Panel.copy(alpha = 0.98f), tonalElevation = 8.dp) {
+        Surface(color = Panel.copy(alpha = 0.98f), tonalElevation = OpenNowElevation.focus) {
             // Play is the point of the screen, so it takes the width. Dismiss and the secondary
             // actions become fixed-size icons rather than equal-weight buttons that squeezed Play
             // down to a third of the bar whenever a TV was connected.
@@ -5703,12 +5706,12 @@ private fun LongPressPlayButton(
         ) {
             ZortosPlayMark(
                 modifier = Modifier.size(20.dp),
-                ringColor = Color.Black,
+                ringColor = OpenNowPalette.OnAccent,
             )
             Spacer(Modifier.width(8.dp))
             Text(
                 stringResource(R.string.action_play),
-                color = Color.Black,
+                color = OpenNowPalette.OnAccent,
                 fontWeight = if (controllerFocused) FontWeight.ExtraBold else FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -5904,20 +5907,25 @@ private fun GameTitleBlock(game: GameInfo, compact: Boolean) {
 @Composable
 private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
     val ownedStores = ownedStoreLabels(game)
-    val shape = RoundedCornerShape(if (compact) 12.dp else 14.dp)
+    val shape = RoundedCornerShape(OpenNowRadius.full)
     if (ownedStores.isEmpty()) {
+        // A pill that hugs its label, not a full-width slab. "Not owned" is one metadata fact about
+        // the game; painted edge-to-edge in error red it read as a failure banner and dominated a
+        // screen whose actual subject is the key art above it.
         Surface(
-            modifier = Modifier.fillMaxWidth(),
             shape = shape,
-            color = Color(0xff4a1216),
-            tonalElevation = 0.dp,
+            color = OpenNowPalette.ErrorContainer,
+            contentColor = OpenNowPalette.OnErrorContainer,
+            tonalElevation = OpenNowElevation.flat,
         ) {
             Text(
                 "Not owned",
-                color = OpenNowPalette.OnErrorContainer,
                 style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = if (compact) 8.dp else 10.dp),
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(
+                    horizontal = OpenNowSpacing.md,
+                    vertical = if (compact) OpenNowSpacing.xs else 6.dp,
+                ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -5973,7 +5981,17 @@ private fun GameGenreChips(game: GameInfo, compact: Boolean) {
         contentPadding = PaddingValues(end = if (compact) 6.dp else 8.dp),
     ) {
         items(genres, key = { it }) { label ->
-            AssistChip(onClick = {}, label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+            // Read-only metadata, not an action — SuggestionChip with a disabled interaction reads
+            // as a tag rather than a button and drops the pointless ripple of the old AssistChip.
+            SuggestionChip(
+                onClick = {},
+                enabled = false,
+                label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                colors = SuggestionChipDefaults.suggestionChipColors(
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ),
+            )
         }
     }
 }
@@ -6007,9 +6025,9 @@ private fun GameScreenshotGallery(game: GameInfo, compact: Boolean) {
                     modifier = Modifier
                         .width(if (compact) 224.dp else 288.dp)
                         .aspectRatio(16f / 9f),
-                    shape = RoundedCornerShape(if (compact) 12.dp else 14.dp),
+                    shape = RoundedCornerShape(if (compact) OpenNowRadius.md else OpenNowRadius.lg),
                     color = Color.Black,
-                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
                 ) {
                     UrlImage(
                         url = optimizedNvidiaImageUrl(screenshot, requestWidth),
@@ -6028,20 +6046,21 @@ private fun GameDescriptionDisclosure(description: String?, compact: Boolean) {
     val text = description?.takeIf { it.isNotBlank() } ?: "No description is available for this game yet."
     var focused by remember { mutableStateOf(false) }
     val accent = MaterialTheme.colorScheme.primary
+    val descShape = RoundedCornerShape(if (compact) OpenNowRadius.md else OpenNowRadius.lg)
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(if (compact) 12.dp else 14.dp))
+            .clip(descShape)
             .onFocusChanged { focused = it.isFocused }
             .border(
                 width = 1.dp,
                 color = if (focused) accent else Color.Transparent,
-                shape = RoundedCornerShape(if (compact) 12.dp else 14.dp)
+                shape = descShape,
             )
             .clickable { expanded = !expanded },
-        shape = RoundedCornerShape(if (compact) 12.dp else 14.dp),
-        color = if (focused) PanelAlt.copy(alpha = 0.85f) else PanelAlt,
-        tonalElevation = 0.dp,
+        shape = descShape,
+        color = if (focused) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface,
+        tonalElevation = OpenNowElevation.low,
     ) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = if (compact) 8.dp else 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -11448,56 +11467,59 @@ private fun QueueStatusPanel(
 ) {
     val context = LocalContext.current
     Column(
-        modifier,
+        modifier = modifier.padding(
+            horizontal = if (compact) OpenNowSpacing.xl else OpenNowSpacing.xxl,
+            vertical = OpenNowSpacing.xl,
+        ),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        val imageWidth = if (compact) 154.dp else 220.dp
-        UrlImage(
-            gameTvBannerImageUrl(context, game),
-            Modifier
-                .width(imageWidth)
-                .aspectRatio(16f / 9f)
-                .clip(RoundedCornerShape(14.dp)),
-        )
-        Spacer(Modifier.height(if (compact) 12.dp else 16.dp))
-        Text(
-            game?.title ?: "Starting stream",
-            color = TextPrimary,
-            style = if (compact) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            textAlign = TextAlign.Center,
-        )
-        AnimatedQueueStatusText(
-            queueCopy = queueCopy,
-            queuePosition = queuePosition,
-            compact = compact,
-        )
-        Spacer(Modifier.height(if (compact) 14.dp else 18.dp))
-        LinearProgressIndicator(Modifier.fillMaxWidth(if (compact) 0.9f else 0.7f))
-        Spacer(Modifier.height(12.dp))
-        Row(
-            Modifier.fillMaxWidth(if (compact) 0.92f else 0.7f),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            OutlinedButton(onClick = onMinimize, modifier = Modifier.weight(1f)) {
-                Text("Minimize", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val imageWidth = if (compact) 154.dp else 220.dp
+            UrlImage(
+                gameTvBannerImageUrl(context, game),
+                Modifier
+                    .width(imageWidth)
+                    .aspectRatio(16f / 9f)
+                    .clip(RoundedCornerShape(if (compact) OpenNowRadius.md else OpenNowRadius.lg)),
+            )
+            Spacer(Modifier.height(if (compact) 12.dp else 16.dp))
+            Text(
+                game?.title ?: "Starting stream",
+                color = TextPrimary,
+                style = if (compact) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+            )
+            AnimatedQueueStatusText(
+                queueCopy = queueCopy,
+                queuePosition = queuePosition,
+                compact = compact,
+            )
+            Spacer(Modifier.height(if (compact) 14.dp else 18.dp))
+            LinearProgressIndicator(Modifier.fillMaxWidth(if (compact) 0.9f else 0.7f))
+            Spacer(Modifier.height(16.dp))
+            Row(
+                Modifier.fillMaxWidth(if (compact) 0.92f else 0.7f),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                FilledTonalButton(onClick = onMinimize, modifier = Modifier.weight(1f)) {
+                    Text("Minimize", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                FilledTonalButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                    Text(stringResource(R.string.action_cancel), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
             }
-            OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
-                Text("Cancel", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (compact && queuePosition != null) {
+                Spacer(Modifier.height(14.dp))
+                LandscapeQueuePositionDock(queuePosition = queuePosition)
+            }
+            error?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, color = OpenNowPalette.ErrorText, textAlign = TextAlign.Center)
             }
         }
-        if (compact && queuePosition != null) {
-            Spacer(Modifier.height(14.dp))
-            LandscapeQueuePositionDock(queuePosition = queuePosition)
-        }
-        error?.let {
-            Spacer(Modifier.height(12.dp))
-            Text(it, color = OpenNowPalette.ErrorText, textAlign = TextAlign.Center)
-        }
-    }
 }
 
 @Composable
