@@ -1536,7 +1536,11 @@ export class GfnWebRtcClient {
     // not reliably hold the cursor and conflicts with DOM pointer lock. The
     // GFN-parity DOM+fullscreen path below is the single source of truth.
     this.domInputController.setNativeMouseActive(false);
-    void this.domInputController.attemptAutoPointerLock(true).catch(() => {});
+    // Automatically trigger pointer lock right away upon input handshake ready,
+    // achieving 100% GFN parity (no click needed to capture mouse).
+    requestAnimationFrame(() => {
+      void this.domInputController.attemptAutoPointerLock(true).catch(() => {});
+    });
   }
 
   /** Release native raw-mouse capture (used when an overlay/exit prompt opens
@@ -2083,6 +2087,30 @@ export class GfnWebRtcClient {
     pc.ondatachannel = (event) => {
       const channel = event.channel;
       this.log(`Remote data channel received: label=${channel.label}, ordered=${channel.ordered}`);
+
+      if (channel.label === "stats") {
+        channel.binaryType = "arraybuffer";
+        channel.onmessage = (msgEvent) => {
+          const buf = msgEvent.data as ArrayBuffer;
+          if (!buf || buf.byteLength < 33) return;
+          try {
+            const view = new DataView(buf);
+            const version = view.getUint8(0);
+            if (version >= 4) {
+              const avgGameFps = view.getFloat64(25, true); // little-endian
+              if (avgGameFps > 0 && avgGameFps <= 360) {
+                const fps = Math.round(avgGameFps);
+                this.diagnostics.gameFps = fps;
+                this.emitStats();
+              }
+            }
+          } catch (err) {
+            // ignore parse errors
+          }
+        };
+        return;
+      }
+
       if (channel.label !== "control_channel") {
         return;
       }

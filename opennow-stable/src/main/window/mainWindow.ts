@@ -113,6 +113,9 @@ export async function createMainWindow(
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Keep the renderer at full frame rate even when the window is
+      // backgrounded or occluded (e.g. Discord share / screen capture).
+      backgroundThrottling: false,
     },
   });
   deps.setMainWindow(window);

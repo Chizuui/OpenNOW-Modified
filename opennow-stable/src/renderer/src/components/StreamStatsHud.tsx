@@ -63,7 +63,9 @@ export function StreamStatsHud({
   // ── KPI values (GFN parity) ──
   // GAME = frames the game produces (decode source); STREAM = frames rendered
   // to screen; PING = round-trip latency.
-  const gameFps = stats.decodeFps > 0 ? String(stats.decodeFps) : "--";
+  const gameFps = stats.gameFps !== undefined && stats.gameFps > 0
+    ? String(stats.gameFps)
+    : (stats.decodeFps > 0 ? String(stats.decodeFps) : "--");
   const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
   const rttColor = getRttColor(stats.rttMs);
   const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";

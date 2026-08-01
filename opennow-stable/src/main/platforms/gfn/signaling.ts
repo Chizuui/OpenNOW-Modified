@@ -87,9 +87,21 @@ export class GfnSignalingClient {
 
   private setupHeartbeat(): void {
     this.clearHeartbeat();
+    // Send an application-level heartbeat every 2s AND a native WebSocket ping
+    // every 3s. The native ping keeps the TCP connection alive at the protocol
+    // level so idle-timeout / load-balancer keepalive doesn't drop the signaling
+    // socket after ~60-90s (which used to kick the stream back to the menu and
+    // force a RESUME). The app-level hb is the NVST protocol keepalive.
     this.heartbeatTimer = setInterval(() => {
+      try {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.ping();
+        }
+      } catch {
+        // best-effort ping
+      }
       this.sendJson({ hb: 1 });
-    }, 5000);
+    }, 2000);
     this.heartbeatTimer.unref?.();
   }
 
@@ -307,11 +319,9 @@ export class GfnSignalingClient {
   }
 
   async sendIceCandidate(candidate: IceCandidatePayload): Promise<void> {
-    if (isTcpIceCandidate(candidate.candidate)) {
-      console.log(`[Signaling] Dropping TCP local ICE candidate: ${candidate.candidate}`);
-      return;
-    }
-
+    // Send all candidate types (TCP included) for maximum connectivity. UDP is
+    // preferred but TCP provides a fallback route on throttled/dropped UDP,
+    // which keeps the stream from lagging or being kicked out.
     console.log(`[Signaling] Sending local ICE candidate: ${candidate.candidate} (sdpMid=${candidate.sdpMid})`);
     console.log(`[Signaling] Sending ICE peer_msg from=${this.peerId} to=${this.remotePeerId}`);
     this.sendJson({
@@ -359,7 +369,4 @@ export class GfnSignalingClient {
   }
 }
 
-function isTcpIceCandidate(candidate: string): boolean {
-  const parts = candidate.trim().split(/\s+/);
-  return parts[2]?.toLowerCase() === "tcp";
-}
+
