@@ -1,39 +1,47 @@
 #ifndef WIN_INPUT_HOOK_H
 #define WIN_INPUT_HOOK_H
 
-#include <string>
+#include <windows.h>
 #include <thread>
 #include <atomic>
-#include "udp_client.h"
+#include <functional>
+#include <cstdint>
 
-// Define the payload structure
-#pragma pack(push, 1)
-struct GfnInputPayload {
-    uint8_t inputType; // 0x01 = Mouse, 0x02 = Keyboard
-    int32_t deltaX;    // Untuk Mouse
-    int32_t deltaY;    // Untuk Mouse
-    uint32_t keyCode;  // Virtual Key Code (VK_*) untuk Keyboard
-    uint8_t keyState;  // 1 = KeyDown, 0 = KeyUp
+// A single mouse event captured from RawInput and delivered to JS.
+// kind: 0 = move (relative delta), 1 = button, 2 = wheel
+struct MouseEvent {
+    uint8_t kind;
+    int32_t dx;      // move: relative X
+    int32_t dy;      // move: relative Y
+    uint8_t button;  // button: 0=left 1=right 2=middle 3=x1 4=x2
+    uint8_t state;   // button: 1=down 0=up
+    int32_t wheel;   // wheel: signed notches * WHEEL_DELTA
 };
-#pragma pack(pop)
 
+// Captures raw mouse input at the OS level and confines the cursor to a window,
+// without swallowing keyboard input. Delta/buttons/wheel are pushed to the
+// supplied callback (which marshals them to the JS thread). Keyboard stays on
+// the normal DOM path so Escape reaches the game without releasing anything.
 class WinInputHook {
 public:
-    static bool Start(const std::string& ip, int port, bool grab_mouse = true);
+    using EventCallback = std::function<void(const MouseEvent&)>;
+
+    // Start capturing for the given top-level window. Safe to call once.
+    static bool Start(HWND target, EventCallback cb);
     static void Stop();
+    static bool IsRunning();
 
 private:
     static void MessageLoopThread();
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-    static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+    static void ConfineCursorToTarget();
 
     static std::thread worker_thread_;
     static std::atomic<bool> running_;
     static std::atomic<DWORD> thread_id_;
-    static std::atomic<bool> grab_mouse_;
-    static HHOOK keyboard_hook_;
+    static HWND target_hwnd_;
     static HWND msg_hwnd_;
-    static UdpClient* udp_client_;
+    static EventCallback callback_;
 };
 
 #endif // WIN_INPUT_HOOK_H

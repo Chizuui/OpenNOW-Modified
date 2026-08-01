@@ -165,7 +165,7 @@ export function App(): JSX.Element {
   const {
     session, setSession,
     streamStatus, setStreamStatus,
-    showStatsOverlay, setShowStatsOverlay,
+    statsMode, setStatsMode,
     antiAfkEnabled, setAntiAfkEnabled,
     antiAfkAckNonce, setAntiAfkAckNonce,
     nativeInputCaptureActive, setNativeInputCaptureActive,
@@ -236,7 +236,7 @@ export function App(): JSX.Element {
   }, [streamingGame]);
 
   const resetStatsOverlayToPreference = useCallback((): void => {
-    setShowStatsOverlay(settings.showStatsOnLaunch);
+    setStatsMode(settings.showStatsOnLaunch ? "compact" : "off");
   }, [settings.showStatsOnLaunch]);
 
   const runCodecTest = useCallback(async (): Promise<void> => {
@@ -384,7 +384,7 @@ export function App(): JSX.Element {
 
   const onBootstrapSettings = useCallback((loadedSettings: Settings, _sessionProxyUrl: string | undefined) => {
     setSettings(loadedSettings);
-    setShowStatsOverlay(loadedSettings.showStatsOnLaunch);
+    setStatsMode(loadedSettings.showStatsOnLaunch ? "compact" : "off");
     setSettingsLoaded(true);
   }, []);
 
@@ -1007,8 +1007,20 @@ export function App(): JSX.Element {
       }
     };
 
-    if (settings.autoFullScreen && !(sessionFullscreen || document.fullscreenElement)) {
-      await setSessionFullscreen(true);
+    // Enter DOM fullscreen (requestFullscreen), NOT Electron window fullscreen.
+    // Only DOM fullscreen sets document.fullscreenElement, which is what lets
+    // navigator.keyboard.lock(["Escape",...]) engage so an Escape tap reaches
+    // the game without releasing the pointer lock (exactly how the official GFN
+    // web client behaves). A long Escape hold still exits fullscreen.
+    if (!document.fullscreenElement) {
+      try {
+        await document.documentElement.requestFullscreen();
+      } catch (err) {
+        // Fall back to Electron window fullscreen if the DOM request is rejected.
+        try {
+          await setSessionFullscreen(true);
+        } catch {}
+      }
     }
 
     await requestPointerLockCompat({ unadjustedMovement: true })
@@ -1019,7 +1031,7 @@ export function App(): JSX.Element {
         throw err;
       })
       .catch(() => {});
-  }, [sessionFullscreen, setSessionFullscreen, settings.autoFullScreen]);
+  }, [setSessionFullscreen]);
 
   const handleRequestPointerLock = useCallback(() => {
     if (videoRef.current) {
@@ -2175,6 +2187,10 @@ export function App(): JSX.Element {
   }, [currentPage, handleDismissLaunchError, launchError?.action]);
 
   const releasePointerLockIfNeeded = useCallback(async () => {
+    // Native raw-mouse mode: free the cursor for overlay/menu interaction.
+    if (clientRef.current?.isNativeMouseGrabbed()) {
+      clientRef.current.pauseNativeMouse();
+    }
     if (document.pointerLockElement) {
       clientRef.current?.suppressNextSyntheticEscapeOnPointerLockLoss();
       document.exitPointerLock();
@@ -2208,7 +2224,8 @@ export function App(): JSX.Element {
   const handleStreamShortcutAction = useCallback((action: NativeStreamerShortcutAction): void => {
     switch (action) {
       case "toggleStats":
-        setShowStatsOverlay((prev) => !prev);
+        // Cycle the stats overlay: off → compact → full → off.
+        setStatsMode((prev) => (prev === "off" ? "compact" : prev === "compact" ? "full" : "off"));
         return;
       case "togglePointerLock":
         if (nativeStreamingRef.current) {
@@ -2706,7 +2723,8 @@ export function App(): JSX.Element {
               videoRef={videoRef}
               audioRef={audioRef}
               diagnosticsStore={diagnosticsStore}
-              showStats={showStatsOverlay}
+              statsMode={statsMode}
+              statsPosition={settings.statsOverlayPosition}
               showNativeStats={settings.showNativeStreamerStats}
               nativeInputCaptureActive={nativeInputCaptureActive}
               gstreamerEnabled={settings.streamClientMode === "native"}
@@ -2768,6 +2786,9 @@ export function App(): JSX.Element {
               }}
               onShowSessionTimeRemainingInStatsOverlayChange={(value) => {
                 void updateSetting("showSessionTimeRemainingInStatsOverlay", value);
+              }}
+              onStatsPositionChange={(value) => {
+                void updateSetting("statsOverlayPosition", value);
               }}
               subscriptionInfo={subscriptionInfo}
               micTrack={clientRef.current?.getMicTrack() ?? null}

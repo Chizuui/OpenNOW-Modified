@@ -2,7 +2,7 @@ import { useRef } from "react";
 import type { Dispatch, JSX, RefObject, SetStateAction } from "react";
 import { AnimatePresence, m } from "motion/react";
 import { Gauge, Images, Keyboard, LogOut, Save, SlidersHorizontal, Trash2, X } from "lucide-react";
-import type { MicrophoneMode, SubscriptionInfo, VideoShaderSettings } from "@shared/gfn";
+import type { MicrophoneMode, StatsOverlayPosition, SubscriptionInfo, VideoShaderSettings } from "@shared/gfn";
 import SideBar from "../../SideBar";
 import type { StreamDiagnosticsStore } from "../../../utils/streamDiagnosticsStore";
 import { useMicMeter } from "../../../hooks/useMicMeter";
@@ -39,6 +39,8 @@ interface StreamQuickMenuProps {
   onToggleMicrophone?: () => void;
   showSessionTimeRemainingInStatsOverlay: boolean;
   onShowSessionTimeRemainingInStatsOverlayChange: (value: boolean) => void;
+  statsPosition: StatsOverlayPosition;
+  onStatsPositionChange: (value: StatsOverlayPosition) => void;
   sidebarToggleShortcutDisplay: string;
   controllerSidebarShortcutDisplay: string;
   mouseSensitivity: number;
@@ -84,6 +86,8 @@ export function StreamQuickMenu({
   onToggleMicrophone,
   showSessionTimeRemainingInStatsOverlay,
   onShowSessionTimeRemainingInStatsOverlayChange,
+  statsPosition,
+  onStatsPositionChange,
   sidebarToggleShortcutDisplay,
   controllerSidebarShortcutDisplay,
   mouseSensitivity,
@@ -220,6 +224,8 @@ export function StreamQuickMenu({
                 screenshotApiAvailable={screenshotGallery.screenshotApiAvailable}
                 showSessionTimeRemainingInStatsOverlay={showSessionTimeRemainingInStatsOverlay}
                 onShowSessionTimeRemainingInStatsOverlayChange={onShowSessionTimeRemainingInStatsOverlayChange}
+                statsPosition={statsPosition}
+                onStatsPositionChange={onStatsPositionChange}
                 sidebarToggleShortcutDisplay={sidebarToggleShortcutDisplay}
                 controllerSidebarShortcutDisplay={controllerSidebarShortcutDisplay}
               />

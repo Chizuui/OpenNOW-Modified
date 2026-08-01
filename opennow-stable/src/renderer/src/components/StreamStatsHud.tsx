@@ -1,21 +1,19 @@
 import { useMemo, useState } from "react";
 import { AnimatePresence, m, useReducedMotion } from "motion/react";
-import { AlertTriangle, ChevronDown } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import type { JSX } from "react";
+import type { StatsOverlayPosition } from "@shared/gfn";
 import type { StreamLagReason } from "../platforms/gfn/webrtcClient";
 import type { StreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import { useStreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import {
-  getBitratePerformanceColor,
-  getInputQueueColor,
+  formatServerLocation,
   getPacketLossColor,
   getRttColor,
-  getTimingColor,
 } from "../utils/streamDiagnosticsFormat";
 import {
   disclosureTransition,
   getStatusPulseMotion,
-  smoothEase,
   surfaceRevealTransition,
 } from "./MotionProvider";
 import { useTranslation } from "../i18n";
@@ -37,23 +35,10 @@ function getLagReasonLabel(reason: StreamLagReason): string {
   }
 }
 
-function getLagReasonColor(reason: StreamLagReason): string {
-  switch (reason) {
-    case "network":
-    case "decoder":
-      return "var(--error)";
-    case "input_backpressure":
-    case "render":
-      return "var(--warning)";
-    case "stable":
-      return "var(--success)";
-    default:
-      return "var(--ink-muted)";
-  }
-}
-
 export interface StreamStatsHudProps {
   diagnosticsStore: StreamDiagnosticsStore;
+  mode: "compact" | "full";
+  position: StatsOverlayPosition;
   gstreamerEnabled: boolean;
   serverRegion?: string;
   sessionTimeRemainingText: string | null;
@@ -62,6 +47,8 @@ export interface StreamStatsHudProps {
 
 export function StreamStatsHud({
   diagnosticsStore,
+  mode,
+  position,
   gstreamerEnabled,
   serverRegion,
   sessionTimeRemainingText,
@@ -71,49 +58,42 @@ export function StreamStatsHud({
   const reducedMotion = useReducedMotion();
   const statusPulseMotion = getStatusPulseMotion(reducedMotion);
   const stats = useStreamDiagnosticsStore(diagnosticsStore);
-  const [expanded, setExpanded] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const hasLiveBitrate = stats.bitrateKbps > 0;
-  const bitrateKbps = hasLiveBitrate ? stats.bitrateKbps : stats.targetBitrateKbps;
-  const bitrateMbps = bitrateKbps > 0 ? (bitrateKbps / 1000).toFixed(1) : "--";
-  const bitrateLabel = hasLiveBitrate
-    ? `${bitrateMbps} Mbps`
-    : stats.targetBitrateKbps > 0
-      ? `Target ${bitrateMbps} Mbps`
-      : "-- Mbps";
-  const bitratePerformancePercent =
-    stats.targetBitrateKbps > 0 && stats.bitrateKbps > 0
-      ? (stats.bitrateKbps / stats.targetBitrateKbps) * 100
-      : 0;
-  const bitratePerformanceText =
-    bitratePerformancePercent > 0 ? `${bitratePerformancePercent.toFixed(0)}%` : "--";
-  const bitratePerformanceColor = getBitratePerformanceColor(bitratePerformancePercent);
-  const hasResolution = stats.nativeRendererActive || stats.resolution !== "";
-  const displayFps = Math.max(stats.decodeFps, stats.renderFps);
-  const primaryText = hasResolution
-    ? `${stats.resolution || "Native renderer"}${displayFps > 0 ? ` · ${displayFps}fps` : ""}`
-    : t("stream.stats.connecting");
-  const hasCodec = Boolean(stats.codec && stats.codec !== "");
-  const regionLabel = stats.serverRegion || serverRegion || "";
-  const decodeColor = getTimingColor(stats.decodeTimeMs, 8, 16);
-  const renderColor = getTimingColor(stats.renderTimeMs, 12, 22);
-  const jitterBufferColor = getTimingColor(stats.jitterBufferDelayMs, 10, 24);
-  const lossColor = getPacketLossColor(stats.packetLossPercent);
-  const lossLabel = stats.nativeRendererActive ? "Drop" : "Loss";
-  const lossTitle = stats.nativeRendererActive
-    ? "Native renderer dropped frame percentage"
-    : t("stream.stats.packetLoss");
-  const dText = stats.decodeTimeMs > 0 ? `${stats.decodeTimeMs.toFixed(1)}ms` : "--";
-  const rText = stats.renderTimeMs > 0 ? `${stats.renderTimeMs.toFixed(1)}ms` : "--";
-  const jbText = stats.jitterBufferDelayMs > 0 ? `${stats.jitterBufferDelayMs.toFixed(1)}ms` : "--";
-  const inputLive = stats.inputReady && stats.connectionState === "connected";
-  const inputQueueColor = getInputQueueColor(stats.inputQueueBufferedBytes, stats.inputQueueDropCount);
-  const inputQueueText = `${(stats.inputQueueBufferedBytes / 1024).toFixed(1)}KB`;
-  const partiallyReliableQueueText = `${(stats.partiallyReliableInputQueueBufferedBytes / 1024).toFixed(1)}KB`;
-  const mouseResidualText = `${stats.mouseResidualMagnitude.toFixed(2)}px`;
+  // ── KPI values (GFN parity) ──
+  // GAME = frames the game produces (decode source); STREAM = frames rendered
+  // to screen; PING = round-trip latency.
+  const gameFps = stats.decodeFps > 0 ? String(stats.decodeFps) : "--";
+  const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
   const rttColor = getRttColor(stats.rttMs);
-  const rttText = stats.rttMs > 0 ? `${stats.rttMs.toFixed(0)}ms` : "--";
+  const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";
+
+  const gpuTitle = stats.gpuType && stats.gpuType !== "" ? stats.gpuType : t("stream.stats.title");
+  const regionLabel = formatServerLocation(stats.serverZone, stats.serverRegion || serverRegion || "");
+
+  // ── Network section ──
+  // Packet loss shown as a percentage over the sampling interval (WebRTC raw
+  // packetsLost can go negative from duplicates, so the percent is clamped ≥0).
+  const packetLossPct = Math.max(0, stats.packetLossPercent);
+  const packetLossColor = getPacketLossColor(packetLossPct);
+  const packetLossText = `${packetLossPct.toFixed(1)}%`;
+  const totalAvailableMbps = stats.targetBitrateKbps > 0
+    ? `${(stats.targetBitrateKbps / 1000).toFixed(0)} Mbps`
+    : "--";
+  const usedMbps = stats.bitrateKbps > 0 ? (stats.bitrateKbps / 1000).toFixed(0) : null;
+  const usedPercent = stats.targetBitrateKbps > 0 && stats.bitrateKbps > 0
+    ? Math.round((stats.bitrateKbps / stats.targetBitrateKbps) * 100)
+    : null;
+  const totalUsedText = usedMbps
+    ? `${usedMbps} Mbps${usedPercent !== null ? ` (${usedPercent}%)` : ""}`
+    : "--";
+
+  // ── Stream section ──
+  const resolutionText = stats.resolution && stats.resolution !== ""
+    ? stats.resolution
+    : (stats.nativeRendererActive ? "Native renderer" : "--");
+  const codecText = [stats.codec, stats.colorCodec].filter((v) => v && v !== "").join(", ") || "--";
+
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
   const hasPacketLoss = stats.packetLossPercent > 0;
   const hasIssues = hasLagIssue || hasPacketLoss;
@@ -121,14 +101,20 @@ export function StreamStatsHud({
   const advancedLines = useMemo(() => {
     const lines: string[] = [];
     lines.push(
-      `Input queue peak ${(stats.inputQueuePeakBufferedBytes / 1024).toFixed(1)}KB · PR peak ${(stats.partiallyReliableInputQueuePeakBufferedBytes / 1024).toFixed(1)}KB · drops ${stats.inputQueueDropCount} · sched ${stats.inputQueueMaxSchedulingDelayMs.toFixed(1)}ms · residual ${mouseResidualText}`,
+      `Decode ${stats.decodeTimeMs.toFixed(1)}ms · Render ${stats.renderTimeMs.toFixed(1)}ms · JitterBuf ${stats.jitterBufferDelayMs.toFixed(1)}ms · Jitter ${stats.jitterMs.toFixed(1)}ms`,
+    );
+    lines.push(
+      `Input queue ${(stats.inputQueueBufferedBytes / 1024).toFixed(1)}KB · peak ${(stats.inputQueuePeakBufferedBytes / 1024).toFixed(1)}KB · drops ${stats.inputQueueDropCount} · sched ${stats.inputQueueMaxSchedulingDelayMs.toFixed(1)}ms · residual ${stats.mouseResidualMagnitude.toFixed(2)}px`,
+    );
+    lines.push(
+      `Mouse flush ${stats.mouseFlushIntervalMs.toFixed(0)}ms · ${stats.mousePacketsPerSecond}/s · PR ${stats.partiallyReliableInputOpen ? `${stats.mouseMoveTransport} · ${(stats.partiallyReliableInputQueueBufferedBytes / 1024).toFixed(1)}KB` : "off"}`,
     );
     lines.push(
       gstreamerEnabled
         ? `GStreamer enabled · ${stats.nativeRendererActive ? "in use" : "not active"}`
         : "GStreamer disabled · Chromium WebRTC",
     );
-    const hwLine = [stats.hardwareAcceleration, stats.colorCodec].filter(Boolean).join(" · ");
+    const hwLine = [stats.hardwareAcceleration, stats.gpuType].filter(Boolean).join(" · ");
     if (hwLine) lines.push(hwLine);
     if (stats.decoderPressureActive || stats.decoderRecoveryAttempts > 0) {
       lines.push(
@@ -137,239 +123,145 @@ export function StreamStatsHud({
     }
     if (stats.nativeTransitionSummary || stats.nativeQueueMode || stats.nativeCapsFramerate) {
       lines.push(
-        `Native transition ${stats.nativeTransitionSummary ?? "none"} · queue ${stats.nativeQueueMode ?? "unknown"} · caps ${stats.nativeCapsFramerate ?? "unknown"}${typeof stats.nativeRequestedFps === "number" ? ` · requested ${stats.nativeRequestedFps}fps` : ""}${typeof stats.nativeFramesPendingToPresent === "number" ? ` · pending ${stats.nativeFramesPendingToPresent}` : ""}${typeof stats.nativePartialFlushCount === "number" || typeof stats.nativeCompleteFlushCount === "number" ? ` · flush ${stats.nativePartialFlushCount ?? 0}/${stats.nativeCompleteFlushCount ?? 0}` : ""}`,
+        `Native transition ${stats.nativeTransitionSummary ?? "none"} · queue ${stats.nativeQueueMode ?? "unknown"} · caps ${stats.nativeCapsFramerate ?? "unknown"}`,
       );
     }
-    if (stats.nativeRequestedStreamingFeaturesSummary || stats.nativeFinalizedStreamingFeaturesSummary) {
-      lines.push(
-        `Stream features requested ${stats.nativeRequestedStreamingFeaturesSummary ?? "none"} · finalized ${stats.nativeFinalizedStreamingFeaturesSummary ?? "none"}`,
-      );
-    }
-    const gpuRegion = [stats.gpuType, regionLabel].filter(Boolean).join(" · ");
-    if (gpuRegion) lines.push(gpuRegion);
     if (hasLagIssue) {
       lines.push(`Lag source ${getLagReasonLabel(stats.lagReason).toLowerCase()} · ${stats.lagReasonDetail}`);
     }
     return lines;
-  }, [
-    gstreamerEnabled,
-    hasLagIssue,
-    mouseResidualText,
-    regionLabel,
-    stats,
-  ]);
+  }, [gstreamerEnabled, hasLagIssue, stats]);
+
+  const kpiRow = (
+    <div className="sv-stats-kpis">
+      <div className="sv-stats-kpi-card">
+        <span className="sv-stats-kpi-num">{gameFps}</span>
+        <span className="sv-stats-kpi-unit">{t("stream.stats.fpsUnit")}</span>
+        <span className="sv-stats-kpi-name">{t("stream.stats.game")}</span>
+      </div>
+      <div className="sv-stats-kpi-card">
+        <span className="sv-stats-kpi-num">{streamFps}</span>
+        <span className="sv-stats-kpi-unit">{t("stream.stats.fpsUnit")}</span>
+        <span className="sv-stats-kpi-name">{t("stream.stats.stream")}</span>
+      </div>
+      <div className="sv-stats-kpi-card">
+        <span className="sv-stats-kpi-num" style={{ color: rttColor }}>{pingText}</span>
+        <span className="sv-stats-kpi-unit">{t("stream.stats.msUnit")}</span>
+        <span className="sv-stats-kpi-name">{t("stream.stats.ping")}</span>
+      </div>
+    </div>
+  );
 
   return (
     <m.aside
       className={[
         "sv-stats",
-        expanded ? "sv-stats--expanded" : "",
+        `sv-stats--${mode}`,
+        `sv-stats--pos-${position}`,
         hasIssues ? "sv-stats--warn" : "",
         hintsVisible ? "sv-stats--hints" : "",
       ]
         .filter(Boolean)
         .join(" ")}
-      initial={{ opacity: 0, x: -14, y: 10 }}
-      animate={{ opacity: 1, x: 0, y: 0 }}
-      exit={{ opacity: 0, x: -10, y: 6 }}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 6 }}
       transition={surfaceRevealTransition}
       aria-label={t("stream.stats.overlayLabel")}
     >
-      <button
-        type="button"
-        className="sv-stats-toggle"
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-        title={expanded ? t("stream.stats.collapse") : t("stream.stats.expand")}
-      >
-        <div className="sv-stats-toggle-main">
-          <p className="sv-stats-primary">{primaryText}</p>
-          <div className="sv-stats-toggle-meta">
-            <span className="sv-stats-kpi">
-              <span className="sv-stats-kpi-label">{t("stream.stats.rtt")}</span>
-              <span className="sv-stats-kpi-val sv-stats-kpi-val--rtt" style={{ color: rttColor }}>
-                {rttText}
-              </span>
-            </span>
-            <span className="sv-stats-kpi-divider" aria-hidden />
-            <span className="sv-stats-kpi">
-              <span className="sv-stats-kpi-label">{t("stream.stats.bitrateShort")}</span>
-              <span className="sv-stats-kpi-val">{bitrateLabel}</span>
-            </span>
-          </div>
-        </div>
-
-        <div className="sv-stats-toggle-trail">
-          <span className={`sv-stats-live ${inputLive ? "is-live" : "is-pending"}`}>
-            {inputLive ? t("stream.stats.live") : t("stream.stats.sync")}
-          </span>
-          {hasIssues && (
-            <m.span
-              className="sv-stats-alert-dot"
-              aria-hidden
-              animate={statusPulseMotion.animate}
-              transition={statusPulseMotion.transition}
-            >
-              <AlertTriangle size={11} />
-            </m.span>
-          )}
+      <header className="sv-stats-head">
+        <span className="sv-stats-head-accent" aria-hidden />
+        <span className="sv-stats-head-title">{gpuTitle}</span>
+        {hasIssues && (
           <m.span
-            className="sv-stats-chevron"
-            animate={{ rotate: expanded ? 180 : 0 }}
-            transition={{ duration: 0.22, ease: smoothEase }}
+            className="sv-stats-alert-dot"
             aria-hidden
+            animate={statusPulseMotion.animate}
+            transition={statusPulseMotion.transition}
           >
-            <ChevronDown size={14} />
+            <AlertTriangle size={12} />
           </m.span>
+        )}
+      </header>
+
+      {kpiRow}
+
+      {mode === "compact" ? (
+        <div className="sv-stats-serverbar" title={regionLabel}>
+          {regionLabel}
         </div>
-      </button>
-
-      <AnimatePresence initial={false}>
-        {hasIssues && !expanded && (
-          <m.div
-            key="warn-strip"
-            className="sv-stats-warn-strip"
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={disclosureTransition}
-          >
-            {hasPacketLoss && (
-              <span className="sv-stats-warn-pill">
-                {t("stream.stats.packetLossValue", { value: stats.packetLossPercent.toFixed(1) })}
-              </span>
-            )}
-            {hasLagIssue && (
-              <span className="sv-stats-warn-pill" title={stats.lagReasonDetail}>
-                {getLagReasonLabel(stats.lagReason)}
-              </span>
-            )}
-          </m.div>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence initial={false}>
-        {expanded && (
-          <m.div
-            key="details"
-            className="sv-stats-details"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={disclosureTransition}
-          >
-            <div className="sv-stats-details-inner">
-              <div className="sv-stats-sub">
-                <span className="sv-stats-sub-left">
-                  {hasCodec ? stats.codec : "N/A"}
-                  {stats.isHdr && <span className="sv-stats-hdr">HDR</span>}
-                </span>
-                {sessionTimeRemainingText && (
-                  <span className="sv-stats-chip sv-stats-chip--time" title={t("sidebar.sessionTimeRemainingTitle")}>
-                    {t("stream.stats.timeRemainingShort")}{" "}
-                    <span className="sv-stats-chip-val">{sessionTimeRemainingText}</span>
-                  </span>
-                )}
-              </div>
-
-              <div className="sv-stats-metrics">
-                <span className="sv-stats-chip" title={t("stream.stats.roundTripLatency")}>
-                  RTT{" "}
-                  <span className="sv-stats-chip-val" style={{ color: rttColor }}>
-                    {rttText}
-                  </span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.decodeTime")}>
-                  D <span className="sv-stats-chip-val" style={{ color: decodeColor }}>{dText}</span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.renderTime")}>
-                  R <span className="sv-stats-chip-val" style={{ color: renderColor }}>{rText}</span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.jitterBuffer")}>
-                  JB <span className="sv-stats-chip-val" style={{ color: jitterBufferColor }}>{jbText}</span>
-                </span>
-                <span className="sv-stats-chip" title={lossTitle}>
-                  {lossLabel}{" "}
-                  <span className="sv-stats-chip-val" style={{ color: lossColor }}>
-                    {stats.packetLossPercent.toFixed(2)}%
-                  </span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.bitratePerformance")}>
-                  Bit{" "}
-                  <span className="sv-stats-chip-val" style={{ color: bitratePerformanceColor }}>
-                    {bitratePerformanceText}
-                  </span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.inputQueuePressure")}>
-                  IQ{" "}
-                  <span className="sv-stats-chip-val" style={{ color: inputQueueColor }}>
-                    {inputQueueText}
-                  </span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.inputChannelState")}>
-                  PR{" "}
-                  <span
-                    className="sv-stats-chip-val"
-                    style={{ color: stats.partiallyReliableInputOpen ? "var(--success)" : "var(--ink-muted)" }}
-                  >
-                    {stats.partiallyReliableInputOpen
-                      ? `${stats.mouseMoveTransport === "partially_reliable" ? "mouse" : "open"} · ${partiallyReliableQueueText}`
-                      : "off"}
-                  </span>
-                </span>
-                <span className="sv-stats-chip" title={t("stream.stats.mouseFlushCadence")}>
-                  MF{" "}
-                  <span
-                    className="sv-stats-chip-val"
-                    style={{ color: stats.mouseAdaptiveFlushActive ? "var(--warning)" : "var(--success)" }}
-                  >
-                    {stats.mouseFlushIntervalMs.toFixed(0)}ms · {stats.mousePacketsPerSecond}/s
-                  </span>
-                </span>
-                {hasLagIssue && (
-                  <span className="sv-stats-chip sv-stats-chip--warn" title={stats.lagReasonDetail}>
-                    Lag{" "}
-                    <span className="sv-stats-chip-val" style={{ color: getLagReasonColor(stats.lagReason) }}>
-                      {getLagReasonLabel(stats.lagReason)}
-                    </span>
-                  </span>
-                )}
-              </div>
-
-              {advancedLines.length > 0 && (
-                <div className="sv-stats-advanced">
-                  <button
-                    type="button"
-                    className="sv-stats-advanced-toggle"
-                    onClick={() => setAdvancedOpen((value) => !value)}
-                    aria-expanded={advancedOpen}
-                  >
-                    {advancedOpen ? t("stream.stats.hideAdvanced") : t("stream.stats.showAdvanced")}
-                  </button>
-                  <AnimatePresence initial={false}>
-                    {advancedOpen && (
-                      <m.div
-                        key="advanced"
-                        className="sv-stats-advanced-body"
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={disclosureTransition}
-                      >
-                        {advancedLines.map((line) => (
-                          <p key={line} className="sv-stats-foot">
-                            {line}
-                          </p>
-                        ))}
-                      </m.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              )}
+      ) : (
+        <div className="sv-stats-full">
+          <section className="sv-stats-section">
+            <h4 className="sv-stats-section-title">{t("stream.stats.network")}</h4>
+            <p className="sv-stats-subhead">{t("stream.stats.stability")}</p>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.packetLoss")}</span>
+              <span style={{ color: hasPacketLoss ? packetLossColor : undefined }}>{packetLossText}</span>
             </div>
-          </m.div>
-        )}
-      </AnimatePresence>
+            <p className="sv-stats-subhead">{t("stream.stats.bandwidth")}</p>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.totalAvailable")}</span>
+              <span>{totalAvailableMbps}</span>
+            </div>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.totalUsed")}</span>
+              <span>{totalUsedText}</span>
+            </div>
+          </section>
+
+          <section className="sv-stats-section">
+            <h4 className="sv-stats-section-title">{t("stream.stats.streamSection")}</h4>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.resolution")}</span>
+              <span>{resolutionText}</span>
+            </div>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.codec")}</span>
+              <span>{codecText}</span>
+            </div>
+            <div className="sv-stats-row">
+              <span>{t("stream.stats.serverLocation")}</span>
+              <span>{regionLabel}</span>
+            </div>
+            {sessionTimeRemainingText && (
+              <div className="sv-stats-row">
+                <span>{t("stream.stats.timeRemainingShort")}</span>
+                <span>{sessionTimeRemainingText}</span>
+              </div>
+            )}
+          </section>
+
+          {advancedLines.length > 0 && (
+            <div className="sv-stats-advanced">
+              <button
+                type="button"
+                className="sv-stats-advanced-toggle"
+                onClick={() => setAdvancedOpen((v) => !v)}
+                aria-expanded={advancedOpen}
+              >
+                {advancedOpen ? t("stream.stats.hideAdvanced") : t("stream.stats.showAdvanced")}
+              </button>
+              <AnimatePresence initial={false}>
+                {advancedOpen && (
+                  <m.div
+                    key="advanced"
+                    className="sv-stats-advanced-body"
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={disclosureTransition}
+                  >
+                    {advancedLines.map((line) => (
+                      <p key={line} className="sv-stats-foot">{line}</p>
+                    ))}
+                  </m.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+        </div>
+      )}
     </m.aside>
   );
 }
