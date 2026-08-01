@@ -49,9 +49,9 @@ export interface MouseInputDiagnostics {
   adaptiveFlushActive: boolean;
 }
 
-const MOUSE_FLUSH_FAST_MS = 4;
-const MOUSE_FLUSH_NORMAL_MS = 8;
-const MOUSE_FLUSH_SAFE_MS = 16;
+const MOUSE_FLUSH_FAST_MS = 0;
+const MOUSE_FLUSH_NORMAL_MS = 0;
+const MOUSE_FLUSH_SAFE_MS = 0;
 
 function timestampUs(sourceTimestampMs?: number): bigint {
   return captureTimestampUs(sourceTimestampMs);
@@ -1235,6 +1235,14 @@ export class DomInputCaptureController {
       );
       videoElement.focus();
     };
+
+    // Auto-lock on mouse enter or first move over video without requiring a click
+    const onVideoAreaHover = () => {
+      if (!isPointerLockActive() && this.dependencies.isInputReady()) {
+        tryAutoLock();
+      }
+    };
+    pointerLockTarget.addEventListener("mouseenter", onVideoAreaHover);
 
     const schedulePointerLockRetention = (reason: string): void => {
       if (this.pointerLockRelockTimer !== null) {

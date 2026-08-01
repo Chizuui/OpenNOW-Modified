@@ -35,8 +35,12 @@ export function buildVideoAccelerationCommandLine(
 
   if (platform === "win32") {
     if (preferences.decoderPreference !== "software") {
-      enableFeatures.push("D3D11VideoDecoder");
+      enableFeatures.push("D3D11VideoDecoder", "HardwareAcceleratedVideoDecode", "VaapiVideoDecoder");
     }
+    switches["enable-gpu-rasterization"] = true;
+    switches["enable-zero-copy"] = true;
+    switches["ignore-gpu-blocklist"] = true;
+    switches["enable-accelerated-video-decode"] = true;
     if (preferences.decoderPreference !== "software" || preferences.encoderPreference !== "software") {
       enableFeatures.push("MediaFoundationD3D11VideoCapture");
     }
