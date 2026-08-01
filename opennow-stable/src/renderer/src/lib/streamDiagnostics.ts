@@ -44,6 +44,7 @@ export function defaultDiagnostics(): StreamDiagnostics {
     lagReasonDetail: "Waiting for stream stats",
     gpuType: "",
     serverRegion: "",
+    serverZone: "",
     decoderPressureActive: false,
     decoderRecoveryAttempts: 0,
     decoderRecoveryAction: "none",

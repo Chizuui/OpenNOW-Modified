@@ -77,6 +77,22 @@ import type {
 } from "./media";
 import type { PrintedWasteQueueData, PrintedWasteServerMapping } from "./printedWaste";
 
+/** A raw mouse event captured by the native addon (Windows RawInput). */
+export interface NativeMouseEventPayload {
+  /** 0 = relative move, 1 = button, 2 = wheel */
+  kind: number;
+  /** move: relative delta X */
+  dx: number;
+  /** move: relative delta Y */
+  dy: number;
+  /** button: 0=left 1=right 2=middle 3=x1 4=x2 */
+  button: number;
+  /** button: 1=down 0=up */
+  state: number;
+  /** wheel: signed notches (multiples of 120) */
+  wheel: number;
+}
+
 export interface OpenNowApi {
   getAuthSession(input?: AuthSessionRequest): Promise<AuthSessionResult>;
   getLoginProviders(): Promise<LoginProvider[]>;
@@ -176,6 +192,16 @@ export interface OpenNowApi {
 
   /** Listen for external Escape events forwarded by the main process */
   onExternalEscape(listener: () => void): () => void;
+
+  /** Begin native raw-mouse capture + cursor confinement. Resolves false when
+   *  the native addon is unavailable (renderer should fall back to pointer lock). */
+  grabNativeMouse(): Promise<boolean>;
+
+  /** Stop native raw-mouse capture and release the cursor. */
+  releaseNativeMouse(): Promise<void>;
+
+  /** Listen for raw mouse events (move/button/wheel) from the native addon. */
+  onNativeMouseEvent(listener: (ev: NativeMouseEventPayload) => void): () => void;
 
   /** Open a trusted external URL in the OS default browser */
   openExternalUrl(url: string): Promise<void>;

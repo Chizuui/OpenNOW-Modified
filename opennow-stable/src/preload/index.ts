@@ -8,6 +8,7 @@ import type {
   AuthDeviceLoginStartRequest,
   AuthSession,
   AuthSessionRequest,
+  NativeMouseEventPayload,
   DirectLaunchRequest,
   GamesFetchRequest,
   CatalogBrowseRequest,
@@ -219,6 +220,13 @@ const api: OpenNowApi = {
     const wrapped = () => listener();
     ipcRenderer.on(IPC_CHANNELS.EXTERNAL_ESCAPE, wrapped);
     return () => ipcRenderer.off(IPC_CHANNELS.EXTERNAL_ESCAPE, wrapped);
+  },
+  grabNativeMouse: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.NATIVE_MOUSE_GRAB),
+  releaseNativeMouse: (): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.NATIVE_MOUSE_RELEASE),
+  onNativeMouseEvent: (listener: (ev: NativeMouseEventPayload) => void) => {
+    const wrapped = (_e: unknown, ev: NativeMouseEventPayload) => listener(ev);
+    ipcRenderer.on(IPC_CHANNELS.NATIVE_MOUSE_EVENT, wrapped);
+    return () => ipcRenderer.off(IPC_CHANNELS.NATIVE_MOUSE_EVENT, wrapped);
   },
   openExternalUrl: (url: string): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.OPEN_EXTERNAL_URL, url),
   getMicrophonePermission: () => ipcRenderer.invoke(IPC_CHANNELS.MICROPHONE_PERMISSION_GET),

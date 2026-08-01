@@ -14,59 +14,25 @@ import {
 } from "../escapeFullscreenGuard";
 import { captureMainException } from "../telemetry/posthog";
 import { isAppNavigationUrl, openExternalHttpUrl } from "./externalUrl";
-import dgram from "node:dgram";
 
-let udpSocket: dgram.Socket | null = null;
-
-function startUdpReceiver(deps: CreateMainWindowDeps) {
-  if (udpSocket) return;
-
-  udpSocket = dgram.createSocket("udp4");
-
-  udpSocket.on("message", (msg) => {
-    try {
-      if (msg.length >= 14) {
-        const inputType = msg.readUInt8(0);
-        if (inputType === 2) { // Keyboard
-          const keyCode = msg.readUInt32LE(9);
-          const keyState = msg.readUInt8(13);
-
-          if (keyCode === 27 && keyState === 1) { // ESC KeyDown
-            console.log("[NativeInput] UDP receiver captured ESC KeyDown, forwarding to renderer");
-            const mainWindow = deps.getMainWindow();
-            mainWindow?.webContents.send(IPC_CHANNELS.EXTERNAL_ESCAPE);
-          }
-        }
-      }
-    } catch (err) {
-      console.error("[NativeInput] Error parsing UDP input packet:", err);
-    }
-  });
-
-  udpSocket.on("error", (err) => {
-    console.error("[NativeInput] UDP receiver socket error:", err);
-  });
-
-  udpSocket.bind(9000, "127.0.0.1", () => {
-    console.log("[NativeInput] UDP receiver listening on 127.0.0.1:9000");
-  });
+// Native RawInput mouse addon (Windows). Captures raw mouse + confines the
+// cursor so Escape never releases anything (we don't use browser pointer-lock).
+// Events arrive via an N-API ThreadSafeFunction callback — no UDP, no keyboard hook.
+interface NativeMouseEvent {
+  kind: number;   // 0 = move, 1 = button, 2 = wheel
+  dx: number;
+  dy: number;
+  button: number; // 0=L 1=R 2=M 3=X1 4=X2
+  state: number;  // 1=down 0=up
+  wheel: number;  // signed notches * 120
 }
-
-function stopUdpReceiver() {
-  if (udpSocket) {
-    try {
-      udpSocket.close();
-      console.log("[NativeInput] UDP receiver stopped");
-    } catch (err) {
-      // ignore
-    }
-    udpSocket = null;
-  }
+interface OpennowInputAddon {
+  grabMouse(hwnd: Buffer, onEvent: (ev: NativeMouseEvent) => void): boolean;
+  releaseMouse(): void;
 }
-
 
 const requireModule = createRequire(import.meta.url);
-let opennowInput: any = null;
+let opennowInput: OpennowInputAddon | null = null;
 
 try {
   const isDev = !app.isPackaged;
@@ -74,13 +40,13 @@ try {
     ? resolve(app.getAppPath(), "build/Release/opennow_input.node")
     : join(process.resourcesPath, "opennow_input.node");
   if (existsSync(modulePath)) {
-    opennowInput = requireModule(modulePath);
-    console.log("[NativeInput] Successfully loaded opennow_input native addon");
+    opennowInput = requireModule(modulePath) as OpennowInputAddon;
+    console.log("[NativeInput] Loaded opennow_input raw-mouse addon");
   } else {
-    console.warn(`[NativeInput] opennow_input native addon not found at: ${modulePath}`);
+    console.warn(`[NativeInput] opennow_input addon not found at: ${modulePath} (falling back to DOM pointer lock)`);
   }
 } catch (error) {
-  console.error("[NativeInput] Failed to load opennow_input native addon:", error);
+  console.error("[NativeInput] Failed to load opennow_input addon:", error);
 }
 
 
@@ -230,22 +196,6 @@ export async function createMainWindow(
           Date.now(),
         ),
       );
-
-      if (opennowInput) {
-        try {
-          if (pointerLockActive) {
-            console.log("[NativeInput] Starting native input capture on 127.0.0.1:9000 (keyboard only) due to Pointer Lock Active...");
-            opennowInput.startCapture("127.0.0.1", 9000, false);
-            startUdpReceiver(deps);
-          } else {
-            console.log("[NativeInput] Stopping native input capture due to Pointer Lock Inactive...");
-            opennowInput.stopCapture();
-            stopUdpReceiver();
-          }
-        } catch (err) {
-          console.error("[NativeInput] Error in start/stop native capture on pointer lock change:", err);
-        }
-      }
     },
   );
 
@@ -257,22 +207,39 @@ export async function createMainWindow(
       deps.setNativeRawInputOwnsEscape(
         streamInputActive && Boolean(rawInputOwnsEscape),
       );
-
-      if (opennowInput) {
-        try {
-          if (streamInputActive) {
-            console.log("[NativeInput] Starting native input capture on 127.0.0.1:9000...");
-            opennowInput.startCapture("127.0.0.1", 9000);
-          } else {
-            console.log("[NativeInput] Stopping native input capture...");
-            opennowInput.stopCapture();
-          }
-        } catch (err) {
-          console.error("[NativeInput] Error in start/stop native capture:", err);
-        }
-      }
     },
   );
+
+  // Native raw-mouse grab/release. On grab, hand the window's native handle to
+  // the addon; every raw mouse event is forwarded to the renderer via IPC
+  // (no UDP). Returns whether native capture actually started so the renderer
+  // can fall back to DOM pointer lock when the addon is unavailable.
+  ipcMain.handle(IPC_CHANNELS.NATIVE_MOUSE_GRAB, (): boolean => {
+    if (!opennowInput) return false;
+    const mainWindow = deps.getMainWindow();
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    try {
+      const handle = mainWindow.getNativeWindowHandle();
+      return opennowInput.grabMouse(handle, (nativeEvent: NativeMouseEvent) => {
+        const target = deps.getMainWindow();
+        if (target && !target.isDestroyed()) {
+          target.webContents.send(IPC_CHANNELS.NATIVE_MOUSE_EVENT, nativeEvent);
+        }
+      });
+    } catch (err) {
+      console.error("[NativeInput] grabMouse failed:", err);
+      return false;
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.NATIVE_MOUSE_RELEASE, (): void => {
+    if (!opennowInput) return;
+    try {
+      opennowInput.releaseMouse();
+    } catch (err) {
+      console.error("[NativeInput] releaseMouse failed:", err);
+    }
+  });
 
   // Intercept Escape early to avoid Chromium exiting fullscreen before the
   // renderer can forward the key to the remote session. Keep a short fullscreen
@@ -357,11 +324,10 @@ export async function createMainWindow(
     deps.setNativeRawInputOwnsEscape(false);
     if (opennowInput) {
       try {
-        opennowInput.stopCapture();
-      } catch (err) {
+        opennowInput.releaseMouse();
+      } catch {
         // ignore
       }
     }
-    stopUdpReceiver();
   });
 }
