@@ -56,6 +56,8 @@ export interface StreamDiagnostics {
   // System info
   gpuType: string;
   serverRegion: string;
+  /** Raw CloudMatch zone code (e.g. "NP-TYO-01"), used for a friendly location label. */
+  serverZone: string;
 
   // Decoder recovery status
   decoderPressureActive: boolean;

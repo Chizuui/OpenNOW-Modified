@@ -24,6 +24,8 @@
     "dist:signed": "npm run build && npm run native:build && electron-builder",
     "native:check": "cargo check --manifest-path ../native/opennow-streamer/Cargo.toml",
     "native:build": "node scripts/build-native-streamer.mjs",
+    "input:rebuild": "node-gyp rebuild",
+    "input:build": "node-gyp build",
     "lint": "oxlint src",
     "locales:check": "node scripts/check-translations.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.json",
@@ -113,6 +115,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "build/Release/opennow_input.node",
+        "to": "opennow_input.node"
       }
     ],
     "asar": true,

@@ -98,6 +98,14 @@ export class DomInputCaptureController {
   private mouseCoalescedBatchEntries = 0;
   private nativeCursorOverlayEnabled: boolean;
 
+  // Native RawInput mode (Windows addon): when active, mouse comes from the OS
+  // via injectNativeMouseEvent() instead of DOM/pointer-lock. The DOM mouse
+  // handlers already gate on isPointerLockActive() (false in native mode), so
+  // they stand down automatically — no double input.
+  private nativeMouseActive = false;
+  private queueNativeMouseMovement: (dx: number, dy: number) => void = () => {};
+  private scheduleNativeMouseFlush: () => void = () => {};
+
   constructor(
     private readonly dependencies: DomInputCaptureDependencies,
     options: { mouseSensitivity: number; mouseAccelerationPercent: number; nativeCursorOverlay: boolean },
@@ -243,6 +251,9 @@ export class DomInputCaptureController {
   }
 
   private requestEscapeKeyboardLock(): void {
+    // Match the official GFN web client: keyboard.lock() only works (and is only
+    // requested) in fullscreen. This is what actually keeps Escape from
+    // releasing the pointer lock — so the stream forces fullscreen on entry.
     if (!document.fullscreenElement) {
       if (this.keyboardLockState === "locked") {
         this.keyboardLockState = "unknown";
@@ -277,17 +288,22 @@ export class DomInputCaptureController {
     ensureFullscreen: boolean,
   ): Promise<void> {
     if (ensureFullscreen && !document.fullscreenElement) {
-      if (typeof window.openNow?.setFullscreen === "function") {
-        try {
-          await window.openNow.setFullscreen(true);
-        } catch (error) {
-          this.dependencies.log(`Native fullscreen request failed: ${String(error)}`);
-        }
-      } else {
-        try {
-          await document.documentElement.requestFullscreen();
-        } catch (error) {
-          this.dependencies.log(`DOM fullscreen request failed: ${String(error)}`);
+      // Use DOM fullscreen (requestFullscreen) FIRST, not Electron window
+      // fullscreen. navigator.keyboard.lock() — the only thing that stops Escape
+      // from releasing pointer lock — requires document.fullscreenElement to be
+      // set, which Electron's BrowserWindow.setFullscreen() does NOT do. This is
+      // exactly what the official GFN web client relies on. Fall back to the
+      // native window fullscreen only if the DOM request is rejected.
+      try {
+        await document.documentElement.requestFullscreen();
+      } catch (error) {
+        this.dependencies.log(`DOM fullscreen request failed: ${String(error)}`);
+        if (typeof window.openNow?.setFullscreen === "function") {
+          try {
+            await window.openNow.setFullscreen(true);
+          } catch (nativeError) {
+            this.dependencies.log(`Native fullscreen request failed: ${String(nativeError)}`);
+          }
         }
       }
     }
@@ -421,6 +437,60 @@ export class DomInputCaptureController {
     }
 
     return Array.from(text).length;
+  }
+
+  /** Toggle native RawInput mouse mode. When active, the DOM mouse handlers
+   *  stand down (they gate on pointer lock, which native mode does not use) and
+   *  movement/buttons/wheel arrive via injectNativeMouseEvent(). */
+  setNativeMouseActive(active: boolean): void {
+    this.nativeMouseActive = active;
+    if (!active) {
+      this.flushPendingMovement();
+    }
+  }
+
+  isNativeMouseActive(): boolean {
+    return this.nativeMouseActive;
+  }
+
+  /** Feed one raw mouse event from the native addon into the encode pipeline. */
+  injectNativeMouseEvent(ev: { kind: number; dx: number; dy: number; button: number; state: number; wheel: number }): void {
+    if (!this.nativeMouseActive || !this.dependencies.isInputReady()) {
+      return;
+    }
+    if (ev.kind === 0) {
+      // Relative move.
+      if (ev.dx !== 0 || ev.dy !== 0) {
+        this.queueNativeMouseMovement(ev.dx, ev.dy);
+        this.scheduleNativeMouseFlush();
+      }
+      return;
+    }
+    if (ev.kind === 1) {
+      // Button. Native RawInput order (0=L 1=R 2=M 3=X1 4=X2) mapped to GFN
+      // button ids (1=Left 2=Middle 3=Right 4=Back/X1 5=Forward/X2). NOTE: do
+      // not reuse toMouseButton() here — that expects DOM button order, which
+      // swaps middle/right relative to RawInput.
+      const NATIVE_TO_GFN_BUTTON: Record<number, number> = { 0: 1, 1: 3, 2: 2, 3: 4, 4: 5 };
+      const gfnButton = NATIVE_TO_GFN_BUTTON[ev.button];
+      if (gfnButton === undefined) {
+        return;
+      }
+      const payload = ev.state === 1
+        ? this.dependencies.inputEncoder.encodeMouseButtonDown({ button: gfnButton, timestampUs: timestampUs() })
+        : this.dependencies.inputEncoder.encodeMouseButtonUp({ button: gfnButton, timestampUs: timestampUs() });
+      this.dependencies.sendReliableSingleInput(payload);
+      return;
+    }
+    if (ev.kind === 2) {
+      // Wheel. Native gives signed notches * 120; forward the raw signed value
+      // clamped to int16 like the DOM wheel path.
+      const delta = Math.max(-32768, Math.min(32767, Math.round(ev.wheel)));
+      if (delta !== 0) {
+        const payload = this.dependencies.inputEncoder.encodeMouseWheel({ delta, timestampUs: timestampUs() });
+        this.dependencies.sendReliableSingleInput(payload);
+      }
+    }
   }
 
   install(videoElement: HTMLVideoElement): void {
@@ -735,6 +805,32 @@ export class DomInputCaptureController {
       }
     };
 
+    // Native RawInput movement path. Mirrors queueMouseMovement's sensitivity +
+    // acceleration but is NOT gated on pointer lock (native mode has none), and
+    // skips the DOM delta filter / cursor overlay (raw OS deltas are already
+    // clean). Feeds the same pending-delta batch + flush pipeline.
+    this.queueNativeMouseMovement = (dx: number, dy: number): void => {
+      if (!this.dependencies.isInputReady()) {
+        return;
+      }
+      let adjustedDx = dx * this.mouseSensitivity;
+      let adjustedDy = dy * this.mouseSensitivity;
+      if (this.mouseAccelerationPercent > 1) {
+        const speed = Math.hypot(adjustedDx, adjustedDy);
+        const strength = (this.mouseAccelerationPercent - 1) / 149;
+        const accelFactor = 1 + Math.min(0.6 * strength, (speed / 50) * strength);
+        adjustedDx *= accelFactor;
+        adjustedDy *= accelFactor;
+      }
+      this.pendingMouseDxFloat += adjustedDx;
+      this.pendingMouseDyFloat += adjustedDy;
+      if (this.pendingMouseTimestampUs === null) {
+        this.pendingMouseTimestampUs = timestampUs();
+      }
+      this.mouseCoalescedBatchEntries += 1;
+    };
+    this.scheduleNativeMouseFlush = scheduleMouseBatchFlush;
+
     const tryAutoLock = (): void => {
       try {
         if (document?.body?.dataset?.sidebarOpen === "1") {
@@ -817,7 +913,9 @@ export class DomInputCaptureController {
         this.dependencies.log(`Pointer lock alignment failed (non-fatal): ${String(err)}`);
       }
 
-      void this.attemptAutoPointerLock(this.dependencies.shouldAutoFullscreen())
+      // Force fullscreen on re-lock too, so keyboard.lock() stays engaged and
+      // Escape keeps reaching the game without dropping the pointer (GFN parity).
+      void this.attemptAutoPointerLock(true)
         .catch(() => {})
         .finally(() => {
           autoLockPending = false;
@@ -1313,9 +1411,19 @@ export class DomInputCaptureController {
       tryAutoLock();
     };
 
-    // Release any prior Keyboard API lock when leaving fullscreen (e.g. other UI may have locked keys).
+    // Re-assert the keyboard lock on entering fullscreen. When leaving fullscreen,
+    // keep the lock if the pointer is still locked (windowed play still needs
+    // Escape held); only release it once we no longer own the input.
     const onFullscreenChange = () => {
       if (document.fullscreenElement) {
+        this.requestEscapeKeyboardLock();
+        return;
+      }
+      const pointerLocked =
+        document.pointerLockElement === this.pointerLockTarget
+        || document.pointerLockElement === this.dependencies.videoElement;
+      if (pointerLocked) {
+        // Still capturing input in a window — keep Escape locked.
         this.requestEscapeKeyboardLock();
         return;
       }

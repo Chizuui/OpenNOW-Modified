@@ -275,6 +275,8 @@ export class GfnWebRtcClient {
   private statsTimer: number | null = null;
   private statsPollInFlight = false;
   private externalEscapeCleanup: (() => void) | null = null;
+  private nativeMouseEventCleanup: (() => void) | null = null;
+  private nativeMouseGrabbed = false;
   private queuedCandidates: RTCIceCandidateInit[] = [];
 
   private static readonly NATIVE_INPUT_PROTOCOL_FALLBACK = 3;
@@ -340,6 +342,7 @@ export class GfnWebRtcClient {
   private isHdr = false;
   private videoDecodeStallWarningSent = false;
   private serverRegion = "";
+  private serverZone = "";
   private gpuType = "";
 
   private diagnostics: StreamDiagnostics = {
@@ -383,6 +386,7 @@ export class GfnWebRtcClient {
     lagReasonDetail: "Waiting for stream stats",
     gpuType: "",
     serverRegion: "",
+    serverZone: "",
     decoderPressureActive: false,
     decoderRecoveryAttempts: 0,
     decoderRecoveryAction: "none",
@@ -524,6 +528,18 @@ export class GfnWebRtcClient {
       });
     } catch {
       this.externalEscapeCleanup = null;
+    }
+
+    // Native RawInput mouse events (Windows addon). Delivered from the main
+    // process; forwarded straight into the DOM controller's encode pipeline.
+    // Active only while we've grabbed the native mouse (nativeMouseGrabbed).
+    try {
+      this.nativeMouseEventCleanup = window.openNow.onNativeMouseEvent((ev) => {
+        if (!this.inputReady || !this.nativeMouseGrabbed) return;
+        this.domInputController.injectNativeMouseEvent(ev);
+      });
+    } catch {
+      this.nativeMouseEventCleanup = null;
     }
 
     // Configure video element for lowest latency playback
@@ -709,6 +725,24 @@ export class GfnWebRtcClient {
     this.domInputController.suppressNextSyntheticEscapeOnPointerLockLoss(durationMs);
   }
 
+  /** Release the native raw mouse (cursor becomes free/visible). Called when an
+   *  overlay / exit prompt / sidebar opens so the user can interact with the UI. */
+  public pauseNativeMouse(): void {
+    this.releaseNativeMouse();
+  }
+
+  /** Re-grab the native raw mouse after an overlay closes (no-op if the addon
+   *  is unavailable — the pointer-lock fallback path handles that case). */
+  public resumeNativeMouse(): void {
+    if (!this.inputReady) return;
+    void this.enableNativeMouseOrFallback();
+  }
+
+  /** True when the native raw mouse is currently grabbed. */
+  public isNativeMouseGrabbed(): boolean {
+    return this.nativeMouseGrabbed;
+  }
+
   /**
    * Replace the b=AS bandwidth line in video sections of an SDP string.
    * Unlike mungeAnswerSdp, this is safe to call on an already-munged SDP
@@ -837,6 +871,7 @@ export class GfnWebRtcClient {
       lagReasonDetail: "Waiting for stream stats",
       gpuType: this.gpuType,
       serverRegion: this.serverRegion,
+      serverZone: this.serverZone,
       decoderPressureActive: false,
       decoderRecoveryAttempts: 0,
       decoderRecoveryAction: "none",
@@ -1485,8 +1520,35 @@ export class GfnWebRtcClient {
       this.gamepadController.refreshHapticsAdvertisement();
       this.setupInputHeartbeat();
       this.gamepadController.start();
-      // After input becomes ready, attempt to auto-enable pointer lock.
-      void this.domInputController.attemptAutoPointerLock(this.shouldAutoFullscreen()).catch(() => {});
+      // After input becomes ready, grab the native raw mouse (Windows) so Escape
+      // never releases the cursor. Falls back to DOM pointer lock if the native
+      // addon is unavailable.
+      void this.enableNativeMouseOrFallback();
+    }
+  }
+
+  /** Enter stream input capture. Uses the official GFN approach: DOM pointer
+   *  lock + FORCED fullscreen so navigator.keyboard.lock(["Escape",...]) engages.
+   *  That is what makes an Escape tap reach the game without releasing the mouse,
+   *  and lets a long Escape hold exit fullscreen (handled in the main process). */
+  private async enableNativeMouseOrFallback(): Promise<void> {
+    // NOTE: the native raw-mouse addon path is intentionally disabled — it does
+    // not reliably hold the cursor and conflicts with DOM pointer lock. The
+    // GFN-parity DOM+fullscreen path below is the single source of truth.
+    this.domInputController.setNativeMouseActive(false);
+    void this.domInputController.attemptAutoPointerLock(true).catch(() => {});
+  }
+
+  /** Release native raw-mouse capture (used when an overlay/exit prompt opens
+   *  and when the session tears down). Safe to call when not grabbed. */
+  private releaseNativeMouse(): void {
+    if (!this.nativeMouseGrabbed) return;
+    this.nativeMouseGrabbed = false;
+    this.domInputController.setNativeMouseActive(false);
+    try {
+      void window.openNow.releaseNativeMouse();
+    } catch {
+      // best effort
     }
   }
 
@@ -1944,8 +2006,11 @@ export class GfnWebRtcClient {
       `Input channel policy: partial reliable threshold=${this.partialReliableThresholdMs}ms${negotiatedPartialReliable === null ? " (fallback)" : ""}, hidMask=0x${this.riInputCapabilities.hidDeviceMask.toString(16)}, prGamepadMask=0x${this.riInputCapabilities.enablePartiallyReliableTransferGamepad.toString(16)}, prHidMask=0x${this.riInputCapabilities.enablePartiallyReliableTransferHid.toString(16)}`,
     );
 
-    // Extract server region from session
-    this.serverRegion = session.signalingServer || session.streamingBaseUrl || "";
+    // Extract server region from session. session.zone is the environment name
+    // ("prod"), not a location — so the friendly label is derived from the
+    // server hostname/IP (e.g. "npa-yes-kul-01..." → Malaysia (KUL)).
+    this.serverZone = "";
+    this.serverRegion = session.signalingServer || session.serverIp || session.streamingBaseUrl || "";
     // Clean up the region string (extract hostname or region name)
     if (this.serverRegion) {
       try {
@@ -1966,6 +2031,7 @@ export class GfnWebRtcClient {
     this.pc = pc;
     this.diagnostics.connectionState = pc.connectionState;
     this.diagnostics.serverRegion = this.serverRegion;
+    this.diagnostics.serverZone = this.serverZone;
     this.diagnostics.gpuType = this.gpuType;
     this.emitStats();
 
@@ -2294,8 +2360,11 @@ export class GfnWebRtcClient {
 
   dispose(): void {
     this.cleanupPeerConnection();
+    this.releaseNativeMouse();
     this.externalEscapeCleanup?.();
     this.externalEscapeCleanup = null;
+    this.nativeMouseEventCleanup?.();
+    this.nativeMouseEventCleanup = null;
 
     // Cleanup microphone
     if (this.micManager) {

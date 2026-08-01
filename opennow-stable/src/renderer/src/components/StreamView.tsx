@@ -9,7 +9,8 @@ import type { StreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import { useStreamDiagnosticsSelector } from "../utils/streamDiagnosticsStore";
 import { getStoreDisplayName, getStoreIconComponent } from "./GameCard";
 import { SessionElapsedIndicator } from "./ElapsedSessionIndicators";
-import type { MicrophoneMode, SubscriptionInfo, VideoShaderSettings } from "@shared/gfn";
+import type { MicrophoneMode, StatsOverlayPosition, SubscriptionInfo, VideoShaderSettings } from "@shared/gfn";
+import type { StatsOverlayMode } from "../lib/appTypes";
 import { VideoShaderPipeline } from "../platforms/gfn/videoShaderPipeline";
 import { formatShortcutForDisplay } from "../shortcuts";
 import { useScreenshotGallery } from "../hooks/useScreenshotGallery";
@@ -34,7 +35,8 @@ interface StreamViewProps {
   videoRef: React.Ref<HTMLVideoElement>;
   audioRef: React.Ref<HTMLAudioElement>;
   diagnosticsStore: StreamDiagnosticsStore;
-  showStats: boolean;
+  statsMode: StatsOverlayMode;
+  statsPosition: StatsOverlayPosition;
   showNativeStats?: boolean;
   nativeInputCaptureActive?: boolean;
   gstreamerEnabled: boolean;
@@ -96,6 +98,7 @@ interface StreamViewProps {
   onScreenshotShortcutChange: (value: string) => void;
   onRecordingShortcutChange: (value: string) => void;
   onShowSessionTimeRemainingInStatsOverlayChange: (value: boolean) => void;
+  onStatsPositionChange: (value: StatsOverlayPosition) => void;
   subscriptionInfo: SubscriptionInfo | null;
   micTrack?: MediaStreamTrack | null;
   className?: string;
@@ -108,7 +111,8 @@ export function StreamView({
   videoRef,
   audioRef,
   diagnosticsStore,
-  showStats,
+  statsMode,
+  statsPosition,
   showNativeStats = false,
   nativeInputCaptureActive = false,
   gstreamerEnabled,
@@ -152,6 +156,7 @@ export function StreamView({
   onScreenshotShortcutChange,
   onRecordingShortcutChange,
   onShowSessionTimeRemainingInStatsOverlayChange,
+  onStatsPositionChange,
   subscriptionInfo,
   micTrack,
   hideStreamButtons = false,
@@ -209,7 +214,7 @@ export function StreamView({
   const streamVideoReady = streamHasVideo || videoElementHasFrame;
   const [sessionReadySplashVisible, setSessionReadySplashVisible] = useState(false);
   const sessionReadySplashShownRef = useRef(false);
-  const showStatsHud = showStats && !nativeRendererActive && !isConnecting;
+  const showStatsHud = statsMode !== "off" && !nativeRendererActive && !isConnecting;
 
   useEffect(() => {
     if (isConnecting) {
@@ -438,7 +443,7 @@ export function StreamView({
       updateSurface({
         deviceScaleFactor: dpr,
         visible,
-        showStats: showStats || showNativeStats,
+        showStats: statsMode !== "off" || showNativeStats,
         rect: visible
           ? {
               x: Math.round(rect.left * dpr),
@@ -489,7 +494,7 @@ export function StreamView({
         showStats: false,
       });
     };
-  }, [exitPrompt.open, showNativeStats, showSideBar, showStats]);
+  }, [exitPrompt.open, showNativeStats, showSideBar, statsMode]);
 
   useEffect(() => {
     const handlePointerLockChange = () => {
@@ -536,6 +541,31 @@ export function StreamView({
       }
     };
   }, [onNativeInputPaused, showSideBar]);
+
+  // When the Exit Stream prompt is open, treat it like the sidebar: release the
+  // pointer lock and mark input blocked so mouse clicks/movement go to the popup
+  // (and the OS cursor), not through to the game behind it. Reuses the same
+  // body dataset flag the auto-lock + input-block checks already honor.
+  useEffect(() => {
+    if (!exitPrompt.open) {
+      return;
+    }
+    try {
+      document.body.dataset.sidebarOpen = "1";
+    } catch {}
+    onNativeInputPaused?.(true);
+    if (onReleasePointerLock) {
+      void onReleasePointerLock();
+    } else if (document.pointerLockElement) {
+      document.exitPointerLock();
+    }
+    return () => {
+      onNativeInputPaused?.(false);
+      try {
+        delete (document.body.dataset as DOMStringMap).sidebarOpen;
+      } catch {}
+    };
+  }, [exitPrompt.open, onNativeInputPaused, onReleasePointerLock]);
 
   useEffect(() => {
     if (showSideBar) {
@@ -697,6 +727,8 @@ export function StreamView({
         onToggleMicrophone={onToggleMicrophone}
         showSessionTimeRemainingInStatsOverlay={showSessionTimeRemainingInStatsOverlay}
         onShowSessionTimeRemainingInStatsOverlayChange={onShowSessionTimeRemainingInStatsOverlayChange}
+        statsPosition={statsPosition}
+        onStatsPositionChange={onStatsPositionChange}
         sidebarToggleShortcutDisplay={sidebarToggleShortcutDisplay}
         controllerSidebarShortcutDisplay={CONTROLLER_SIDEBAR_SHORTCUT_DISPLAY}
         mouseSensitivity={mouseSensitivity}
@@ -785,6 +817,8 @@ export function StreamView({
           <StreamStatsHud
             key="stream-stats-hud"
             diagnosticsStore={diagnosticsStore}
+            mode={statsMode === "full" ? "full" : "compact"}
+            position={statsPosition}
             gstreamerEnabled={gstreamerEnabled}
             serverRegion={serverRegion}
             sessionTimeRemainingText={showSessionTimeRemainingInStats ? sessionTimeRemainingText : null}

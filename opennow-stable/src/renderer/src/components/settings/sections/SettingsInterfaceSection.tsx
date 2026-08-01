@@ -1,5 +1,5 @@
 import { useCallback, useMemo, type JSX } from "react";
-import type { AppAccentColor, Settings } from "@shared/gfn";
+import type { AppAccentColor, Settings, StatsOverlayPosition } from "@shared/gfn";
 import { useTranslation } from "../../../i18n";
 import { SelectDropdown } from "../../ui/SelectDropdown";
 import { SettingRange } from "../SettingRange";
@@ -186,6 +186,27 @@ export function SettingsInterfaceSection({ settings, showAll, handleChange, hand
               </label>
             </div>
             <span className="settings-subtle-hint">{t("settings.interface.showStatsOnStreamLaunchHint")}</span>
+          </div>
+
+          <div className="settings-row">
+            <label className="settings-label" htmlFor="statsOverlayPosition">
+              {t("settings.interface.statsOverlayPosition") || "Stats overlay position"}
+              <span className="settings-hint">{t("settings.interface.statsOverlayPositionHint") || "Where the stream stats overlay is anchored on screen."}</span>
+            </label>
+            <div className="settings-row-control">
+              <SelectDropdown
+                id="statsOverlayPosition"
+                value={settings.statsOverlayPosition}
+                options={[
+                  { value: "bottom-left", label: t("settings.interface.posBottomLeft") || "Bottom left" },
+                  { value: "bottom-right", label: t("settings.interface.posBottomRight") || "Bottom right" },
+                  { value: "top-left", label: t("settings.interface.posTopLeft") || "Top left" },
+                  { value: "top-right", label: t("settings.interface.posTopRight") || "Top right" },
+                ]}
+                onChange={(value) => handleChange("statsOverlayPosition", value as StatsOverlayPosition)}
+                ariaLabel={t("settings.interface.statsOverlayPosition") || "Stats overlay position"}
+              />
+            </div>
           </div>
 
           <div className="settings-row settings-row--column">

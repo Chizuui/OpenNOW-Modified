@@ -11,6 +11,7 @@ import type {
 import type {
   LaunchErrorState,
   LocalSessionTimerWarningState,
+  StatsOverlayMode,
   StreamStatus,
   StreamWarningState,
 } from "../../lib/appTypes";
@@ -21,7 +22,7 @@ import type { SignalingRecoveryState } from "../../lib/streamSessionHelpers";
 export function useStreamRuntimeState() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("idle");
-  const [showStatsOverlay, setShowStatsOverlay] = useState(false);
+  const [statsMode, setStatsMode] = useState<StatsOverlayMode>("off");
   const [antiAfkEnabled, setAntiAfkEnabled] = useState(false);
   const [antiAfkAckNonce, setAntiAfkAckNonce] = useState(0);
   const [nativeInputCaptureActive, setNativeInputCaptureActive] = useState(false);
@@ -87,7 +88,7 @@ export function useStreamRuntimeState() {
   return {
     session, setSession,
     streamStatus, setStreamStatus,
-    showStatsOverlay, setShowStatsOverlay,
+    statsMode, setStatsMode,
     antiAfkEnabled, setAntiAfkEnabled,
     antiAfkAckNonce, setAntiAfkAckNonce,
     nativeInputCaptureActive, setNativeInputCaptureActive,

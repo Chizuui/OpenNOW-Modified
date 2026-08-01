@@ -8,7 +8,7 @@ import {
   Minimize,
   MousePointer2,
 } from "lucide-react";
-import type { SubscriptionInfo } from "@shared/gfn";
+import type { StatsOverlayPosition, SubscriptionInfo } from "@shared/gfn";
 import { RemainingPlaytimeIndicator } from "../../ElapsedSessionIndicators";
 import { useTranslation } from "../../../i18n";
 
@@ -30,6 +30,8 @@ interface StreamQuickMenuSessionPageProps {
   screenshotApiAvailable: boolean;
   showSessionTimeRemainingInStatsOverlay: boolean;
   onShowSessionTimeRemainingInStatsOverlayChange: (value: boolean) => void;
+  statsPosition: StatsOverlayPosition;
+  onStatsPositionChange: (value: StatsOverlayPosition) => void;
   sidebarToggleShortcutDisplay: string;
   controllerSidebarShortcutDisplay: string;
 }
@@ -52,6 +54,8 @@ export function StreamQuickMenuSessionPage({
   screenshotApiAvailable,
   showSessionTimeRemainingInStatsOverlay,
   onShowSessionTimeRemainingInStatsOverlayChange,
+  statsPosition,
+  onStatsPositionChange,
   sidebarToggleShortcutDisplay,
   controllerSidebarShortcutDisplay,
 }: StreamQuickMenuSessionPageProps): JSX.Element {
@@ -138,6 +142,30 @@ export function StreamQuickMenuSessionPage({
           <span className="sidebar-mini-toggle-track" />
         </label>
       )}
+      <section className="sidebar-setting-card sidebar-stats-position" aria-label={t("sidebar.statsPosition")}>
+        <span>
+          <strong>{t("sidebar.statsPosition")}</strong>
+          <small>{t("sidebar.statsPositionHint")}</small>
+        </span>
+        <div className="sidebar-stats-position-grid" role="group" aria-label={t("sidebar.statsPosition")}>
+          {([
+            ["top-left", t("settings.interface.posTopLeft")],
+            ["top-right", t("settings.interface.posTopRight")],
+            ["bottom-left", t("settings.interface.posBottomLeft")],
+            ["bottom-right", t("settings.interface.posBottomRight")],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={`sidebar-stats-position-btn${statsPosition === value ? " is-active" : ""}`}
+              aria-pressed={statsPosition === value}
+              onClick={() => onStatsPositionChange(value as StatsOverlayPosition)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </section>
       <div className="sidebar-open-shortcuts">
         <span><kbd>{sidebarToggleShortcutDisplay}</kbd> Keyboard</span>
         <span><Gamepad2 size={14} /> {controllerSidebarShortcutDisplay}</span>
