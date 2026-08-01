@@ -18,6 +18,7 @@ export interface StreamDiagnostics {
   targetBitrateKbps: number;
   decodeFps: number;
   renderFps: number;
+  gameFps?: number;
 
   // Network stats
   packetsLost: number;

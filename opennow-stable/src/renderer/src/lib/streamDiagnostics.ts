@@ -17,6 +17,7 @@ export function defaultDiagnostics(): StreamDiagnostics {
     targetBitrateKbps: 0,
     decodeFps: 0,
     renderFps: 0,
+    gameFps: undefined,
     packetsLost: 0,
     packetsReceived: 0,
     packetLossPercent: 0,

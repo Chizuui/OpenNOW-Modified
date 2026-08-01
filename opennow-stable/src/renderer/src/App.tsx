@@ -950,23 +950,15 @@ export function App(): JSX.Element {
   }, [nativeStreamerShortcuts, session, streamStatus]);
 
   const setSessionFullscreen = useCallback(async (nextFullscreen: boolean) => {
-    const canUseNativeFullscreen = typeof window.openNow?.setFullscreen === "function";
     if (document.pointerLockElement) {
       clientRef.current?.suppressNextSyntheticEscapeOnPointerLockLoss();
     }
 
-    if (canUseNativeFullscreen) {
-      try {
-        // Electron owns desktop fullscreen. Stacking HTML fullscreen on top lets
-        // Chromium force-exit the DOM layer on Escape before stream input runs.
-        await window.openNow.setFullscreen(nextFullscreen);
-        setSessionFullscreenState(nextFullscreen);
-      } catch (error) {
-        console.warn(`Failed to set native fullscreen state (${nextFullscreen ? "enter" : "exit"}):`, error);
-      }
-      return;
-    }
-
+    // Keep the DOM fullscreen layer (document.fullscreenElement) and the native
+    // desktop window in sync. DOM fullscreen is what lets keyboard.lock() grab
+    // Escape for the game; the native layer mirrors that state into the window.
+    // Exiting only one layer (old behavior) left document.fullscreenElement set,
+    // so the quick-menu Windowed/Fullscreen button read "Windowed" forever.
     try {
       if (nextFullscreen) {
         if (!document.fullscreenElement) {
@@ -975,7 +967,21 @@ export function App(): JSX.Element {
       } else if (document.fullscreenElement) {
         await document.exitFullscreen();
       }
-    } catch {}
+    } catch {
+      // DOM fullscreen request can be rejected; fall through to native-only.
+    }
+
+    const canUseNativeFullscreen = typeof window.openNow?.setFullscreen === "function";
+    if (canUseNativeFullscreen) {
+      try {
+        await window.openNow.setFullscreen(nextFullscreen);
+        setSessionFullscreenState(nextFullscreen);
+      } catch (error) {
+        console.warn(`Failed to set native fullscreen state (${nextFullscreen ? "enter" : "exit"}):`, error);
+        setSessionFullscreenState(!!document.fullscreenElement);
+      }
+      return;
+    }
 
     setSessionFullscreenState(!!document.fullscreenElement);
   }, []);
@@ -2132,6 +2138,7 @@ export function App(): JSX.Element {
   const handleStopStream = useCallback(async () => {
     try {
       resolveExitPrompt(false);
+      void setSessionFullscreen(false);
       const status = streamStatusRef.current;
       if (status !== "idle" && status !== "streaming") {
         launchAbortRef.current = true;
@@ -2160,7 +2167,7 @@ export function App(): JSX.Element {
     } catch (error) {
       console.error("Stop failed:", error);
     }
-  }, [endPlaytimeSession, markExplicitSignalingShutdown, refreshNavbarActiveSession, resetLaunchRuntime, resolveExitPrompt, stopSessionByTarget, streamingGame]);
+  }, [endPlaytimeSession, markExplicitSignalingShutdown, refreshNavbarActiveSession, resetLaunchRuntime, resolveExitPrompt, setSessionFullscreen, stopSessionByTarget, streamingGame]);
 
   const handleDismissLaunchError = useCallback(async () => {
     markExplicitSignalingShutdown();

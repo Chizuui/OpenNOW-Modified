@@ -252,7 +252,7 @@ export function buildNvstSdp(params: NvstParams): string {
     `a=video.clientViewportHt:${params.height}`,
     `a=video.maxFPS:${params.fps}`,
     `a=video.initialBitrateKbps:${startupBitrate}`,
-    `a=video.initialPeakBitrateKbps:${startupBitrate}`,
+    `a=video.initialPeakBitrateKbps:${maxBitrate}`,
     `a=vqos.bw.maximumBitrateKbps:${maxBitrate}`,
     `a=vqos.bw.minimumBitrateKbps:${OFFICIAL_MIN_BITRATE_KBPS}`,
     `a=vqos.bw.peakBitrateKbps:${maxBitrate}`,
