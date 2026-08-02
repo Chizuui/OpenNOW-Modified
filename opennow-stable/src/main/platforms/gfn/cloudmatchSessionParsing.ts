@@ -427,6 +427,7 @@ export async function toSessionInfo(options: ToSessionInfoOptions): Promise<Sess
     negotiatedStreamProfile,
     requestedStreamingFeatures,
     finalizedStreamingFeatures,
+    serverLocation: payload.session.serverLocation,
     clientId,
     deviceId,
   };
