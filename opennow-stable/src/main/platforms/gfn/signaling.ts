@@ -87,19 +87,10 @@ export class GfnSignalingClient {
 
   private setupHeartbeat(): void {
     this.clearHeartbeat();
-    // Send an application-level heartbeat every 2s AND a native WebSocket ping
-    // every 3s. The native ping keeps the TCP connection alive at the protocol
-    // level so idle-timeout / load-balancer keepalive doesn't drop the signaling
-    // socket after ~60-90s (which used to kick the stream back to the menu and
-    // force a RESUME). The app-level hb is the NVST protocol keepalive.
+    // Send an application-level heartbeat every 2s. The app-level hb is the
+    // NVST protocol keepalive. Native ws.ping() is removed because some
+    // middleboxes/firewalls drop or choke on raw WebSocket ping frames.
     this.heartbeatTimer = setInterval(() => {
-      try {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.ping();
-        }
-      } catch {
-        // best-effort ping
-      }
       this.sendJson({ hb: 1 });
     }, 2000);
     this.heartbeatTimer.unref?.();

@@ -7,6 +7,7 @@ import type { StreamLagReason } from "../platforms/gfn/webrtcClient";
 import type { StreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import { useStreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import {
+  formatBitrate,
   formatServerLocation,
   getPacketLossColor,
   getRttColor,
@@ -61,34 +62,35 @@ export function StreamStatsHud({
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // ── KPI values (GFN parity) ──
-  // GAME = frames the game produces (decode source); STREAM = frames rendered
-  // to screen; PING = round-trip latency.
+  // GAME = frames decoded from stream (server-side game FPS);
+  // STREAM = frames rendered on this device.
+  // Prefer stats_channel gameFps > decodeFps > renderFps fallback.
   const gameFps = stats.gameFps !== undefined && stats.gameFps > 0
     ? String(stats.gameFps)
-    : (stats.decodeFps > 0 ? String(stats.decodeFps) : "--");
+    : (stats.decodeFps !== undefined && stats.decodeFps > 0
+      ? String(stats.decodeFps)
+      : (stats.renderFps > 0 ? String(stats.renderFps) : "--"));
   const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
   const rttColor = getRttColor(stats.rttMs);
   const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";
 
   const gpuTitle = stats.gpuType && stats.gpuType !== "" ? stats.gpuType : t("stream.stats.title");
-  const regionLabel = formatServerLocation(stats.serverZone, stats.serverRegion || serverRegion || "");
+  const regionLabel = formatServerLocation(
+    stats.serverZone,
+    stats.serverRegion || serverRegion || "",
+  );
 
   // ── Network section ──
   // Packet loss shown as a percentage over the sampling interval (WebRTC raw
   // packetsLost can go negative from duplicates, so the percent is clamped ≥0).
   const packetLossPct = Math.max(0, stats.packetLossPercent);
   const packetLossColor = getPacketLossColor(packetLossPct);
-  const packetLossText = `${packetLossPct.toFixed(1)}%`;
+  const packetLossText = `${packetLossPct.toFixed(2)}%`;
   const totalAvailableMbps = stats.targetBitrateKbps > 0
-    ? `${(stats.targetBitrateKbps / 1000).toFixed(0)} Mbps`
+    ? formatBitrate(stats.targetBitrateKbps)
     : "--";
-  const usedMbps = stats.bitrateKbps > 0 ? (stats.bitrateKbps / 1000).toFixed(0) : null;
-  const usedPercent = stats.targetBitrateKbps > 0 && stats.bitrateKbps > 0
-    ? Math.round((stats.bitrateKbps / stats.targetBitrateKbps) * 100)
-    : null;
-  const totalUsedText = usedMbps
-    ? `${usedMbps} Mbps${usedPercent !== null ? ` (${usedPercent}%)` : ""}`
-    : "--";
+  const totalUsedText = stats.bitrateKbps > 0 ? formatBitrate(stats.bitrateKbps) : "--";
+  const jitterText = stats.jitterMs > 0 ? `${stats.jitterMs.toFixed(1)}ms` : "--";
 
   // ── Stream section ──
   const resolutionText = stats.resolution && stats.resolution !== ""
@@ -200,6 +202,10 @@ export function StreamStatsHud({
             <div className="sv-stats-row">
               <span>{t("stream.stats.packetLoss")}</span>
               <span style={{ color: hasPacketLoss ? packetLossColor : undefined }}>{packetLossText}</span>
+            </div>
+            <div className="sv-stats-row">
+              <span>Jitter</span>
+              <span>{jitterText}</span>
             </div>
             <p className="sv-stats-subhead">{t("stream.stats.bandwidth")}</p>
             <div className="sv-stats-row">

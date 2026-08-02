@@ -13,7 +13,7 @@ export const RECOVERABLE_STREAM_STATUSES: readonly StreamStatus[] = ["streaming"
 export const SIGNALING_RECOVERY_ATTEMPT_DELAYS_MS = [0, 3000] as const;
 export const SIGNALING_RECOVERY_STABLE_RESET_DELAY_MS = 15000;
 export const SIGNALING_REMOTE_ICE_GRACE_MS = 5000;
-export const ICE_DISCONNECTED_RECOVERY_GRACE_MS = 15000;
+export const ICE_DISCONNECTED_RECOVERY_GRACE_MS = 30000;
 
 export function isExpectedNativeSessionClose(reason: string): boolean {
   const normalized = reason.trim().toLowerCase();
