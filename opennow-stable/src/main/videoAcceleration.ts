@@ -35,15 +35,20 @@ export function buildVideoAccelerationCommandLine(
 
   if (platform === "win32") {
     if (preferences.decoderPreference !== "software") {
-      enableFeatures.push("D3D11VideoDecoder", "HardwareAcceleratedVideoDecode", "VaapiVideoDecoder");
+      enableFeatures.push(
+        "D3D11VideoDecoder",
+        "HardwareAcceleratedVideoDecode",
+        "VaapiVideoDecoder",
+        "MediaFoundationD3D11VideoCapture",
+      );
     }
     switches["enable-gpu-rasterization"] = true;
     switches["enable-zero-copy"] = true;
     switches["ignore-gpu-blocklist"] = true;
     switches["enable-accelerated-video-decode"] = true;
-    if (preferences.decoderPreference !== "software" || preferences.encoderPreference !== "software") {
-      enableFeatures.push("MediaFoundationD3D11VideoCapture");
-    }
+    switches["enable-accelerated-2d-canvas"] = true;
+    switches["enable-gpu-memory-buffers"] = true;
+    switches["use-angle"] = "d3d11";
   } else if (platform === "linux") {
     if (isLinuxArm) {
       if (preferences.decoderPreference !== "software") {

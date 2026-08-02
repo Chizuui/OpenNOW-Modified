@@ -978,7 +978,7 @@ export class GfnWebRtcClient {
       void this.collectStats().finally(() => {
         this.statsPollInFlight = false;
       });
-    }, 500);
+    }, 1000);
   }
 
   private updateRenderFps(): void {
@@ -1162,6 +1162,19 @@ export class GfnWebRtcClient {
         prevSample,
       });
       await this.decoderPressureController.recover(pressureSignal);
+    }
+
+    // Browser BWE estimate: matches GFN's dynamic "Total Available" bitrate.
+    const availableBitrate = Number(
+      activePair?.availableIncomingBitrate ?? activePair?.availableOutgoingBitrate ?? 0,
+    );
+    // Chromium sometimes exposes a placeholder 300 kbps BWE estimate. Reject
+    // it when the live stream is already receiving more, then use its negotiated ceiling.
+    const availableKbps = Math.round(availableBitrate / 1000);
+    if (availableKbps >= this.diagnostics.bitrateKbps && availableKbps >= 1000) {
+      this.diagnostics.targetBitrateKbps = availableKbps;
+    } else {
+      this.diagnostics.targetBitrateKbps = this.decoderPressureController.targetBitrateKbps;
     }
 
     // RTT from active candidate pair
@@ -1556,7 +1569,46 @@ export class GfnWebRtcClient {
     }
   }
 
+  private handleStatsChannelMessage(buf: ArrayBuffer): void {
+    const bytes = new Uint8Array(buf);
+    if (!bytes || bytes.length < 1) return;
+    try {
+      // Mirrors Android handleStatsChannelMessage: first byte is a type
+      // (3 = 1-byte header + stats payload, 4 = stats payload directly).
+      let offset = 0;
+      if (bytes[0] === 3) {
+        if (bytes.length < 2) return;
+        offset = 1;
+      } else if (bytes[0] !== 4) {
+        return;
+      }
+      if (bytes.length - offset < 33) return;
+      const view = new DataView(buf);
+      const version = view.getUint8(offset);
+      if (version >= 4) {
+        const avgGameFps = view.getFloat64(offset + 25, true); // little-endian
+        if (avgGameFps > 0 && avgGameFps <= 360) {
+          const fps = Math.round(avgGameFps);
+          this.diagnostics.gameFps = fps;
+          this.emitStats();
+        }
+      }
+    } catch (err) {
+      // ignore parse errors
+    }
+  }
+
   private createDataChannels(pc: RTCPeerConnection): void {
+    // Stats channel for GFN performance metrics (must be "stats_channel" to match server)
+    const statsChannel = pc.createDataChannel("stats_channel", {
+      ordered: false,
+      maxRetransmits: 0,
+    });
+    statsChannel.binaryType = "arraybuffer";
+    statsChannel.onmessage = (msgEvent) => {
+      this.handleStatsChannelMessage(msgEvent.data as ArrayBuffer);
+    };
+
     this.reliableInputChannel = pc.createDataChannel("input_channel_v1", {
       ordered: true,
     });
@@ -2013,15 +2065,17 @@ export class GfnWebRtcClient {
     // Extract server region from session. session.zone is the environment name
     // ("prod"), not a location — so the friendly label is derived from the
     // server hostname/IP (e.g. "npa-yes-kul-01..." → Malaysia (KUL)).
-    this.serverZone = "";
-    this.serverRegion = session.signalingServer || session.serverIp || session.streamingBaseUrl || "";
-    // Clean up the region string (extract hostname or region name)
+    this.serverZone = session.zone || "";
+    this.serverRegion = session.serverIp || session.signalingServer || session.streamingBaseUrl || "";
     if (this.serverRegion) {
+      // If it looks like a URL or has protocol, strip it down to host/IP
       try {
-        const url = new URL(this.serverRegion);
+        const cleanUrl = this.serverRegion.includes("://") ? this.serverRegion : `https://${this.serverRegion}`;
+        const url = new URL(cleanUrl);
         this.serverRegion = url.hostname;
       } catch {
-        // Keep as-is if not a valid URL
+        // fallback extraction using split if URL parser fails
+        this.serverRegion = this.serverRegion.replace(/^https?:\/\//, "").split("/")[0];
       }
     }
 
@@ -2088,25 +2142,10 @@ export class GfnWebRtcClient {
       const channel = event.channel;
       this.log(`Remote data channel received: label=${channel.label}, ordered=${channel.ordered}`);
 
-      if (channel.label === "stats") {
+      if (channel.label === "stats" || channel.label === "stats_channel") {
         channel.binaryType = "arraybuffer";
         channel.onmessage = (msgEvent) => {
-          const buf = msgEvent.data as ArrayBuffer;
-          if (!buf || buf.byteLength < 33) return;
-          try {
-            const view = new DataView(buf);
-            const version = view.getUint8(0);
-            if (version >= 4) {
-              const avgGameFps = view.getFloat64(25, true); // little-endian
-              if (avgGameFps > 0 && avgGameFps <= 360) {
-                const fps = Math.round(avgGameFps);
-                this.diagnostics.gameFps = fps;
-                this.emitStats();
-              }
-            }
-          } catch (err) {
-            // ignore parse errors
-          }
+          this.handleStatsChannelMessage(msgEvent.data as ArrayBuffer);
         };
         return;
       }

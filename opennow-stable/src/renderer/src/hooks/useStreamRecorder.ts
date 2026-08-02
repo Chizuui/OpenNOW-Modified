@@ -3,6 +3,13 @@ import type { RefObject } from "react";
 import type { RecordingEntry } from "@shared/gfn";
 import { fitThumbnailSize, selectRecordingMimeType } from "../components/stream/streamRuntimeHelpers";
 
+// Record at ≤720p / 60fps via canvas downscale to keep MediaRecorder encode cost
+// low (it shares the main thread with the WebRTC decoder). GFN uses a GPU encoder
+// off-pipeline; this is the closest the web client can get without new tooling.
+const RECORD_CAP_WIDTH = 1280;
+const RECORD_CAP_HEIGHT = 720;
+const RECORD_CAP_FPS = 60;
+
 interface UseStreamRecorderOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   audioRef: RefObject<HTMLAudioElement | null>;
@@ -27,6 +34,7 @@ export function useStreamRecorder({
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartTimeRef = useRef(0);
   const recordingTimerRef = useRef<number | undefined>(undefined);
+  const recordingDrawRafRef = useRef<number | undefined>(undefined);
   const thumbnailDataUrlRef = useRef<string | null>(null);
   const recCarouselRef = useRef<HTMLDivElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -106,8 +114,42 @@ export function useStreamRecorder({
       audioCtx.createMediaStreamSource(micStream).connect(audioDest);
     }
 
+    // Record via a canvas downscale (720p@60) instead of re-encoding the raw
+    // 1080p60 stream track. MediaRecorder encodes on the same main thread as the
+    // WebRTC decoder, so full-res re-encode starves the CPU and makes the stream
+    // stutter — and in severe cases drops ICE back to the home screen. Capping
+    // pixels keeps encode cost low (GFN-native uses a GPU H.264 encoder off the
+    // frame pipeline; the web client can't, so this is the closest parity).
+    let recordVideoTrack: MediaStreamTrack | null = null;
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      const scale = Math.min(
+        1,
+        RECORD_CAP_WIDTH / video.videoWidth,
+        RECORD_CAP_HEIGHT / video.videoHeight,
+      );
+      const capWidth = Math.max(1, Math.round(video.videoWidth * scale));
+      const capHeight = Math.max(1, Math.round(video.videoHeight * scale));
+      const cap = document.createElement("canvas");
+      cap.width = capWidth;
+      cap.height = capHeight;
+      const capCtx = cap.getContext("2d");
+      const capStream = cap.captureStream(RECORD_CAP_FPS);
+      recordVideoTrack = capStream.getVideoTracks()[0];
+      if (recordVideoTrack) {
+        recordVideoTrack.contentHint = "detail";
+      }
+      const draw = (): void => {
+        recordingDrawRafRef.current = requestAnimationFrame(draw);
+        if (capCtx && video.videoWidth > 0) {
+          capCtx.drawImage(video, 0, 0, capWidth, capHeight);
+        }
+      };
+      draw();
+    }
+    const videoTracksForRecord = recordVideoTrack ? [recordVideoTrack] : stream.getVideoTracks();
+
     const composed = new MediaStream([
-      ...stream.getVideoTracks(),
+      ...videoTracksForRecord,
       ...audioDest.stream.getAudioTracks(),
     ]);
 
@@ -175,6 +217,10 @@ export function useStreamRecorder({
     recorder.onstop = () => {
       window.clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
+      if (recordingDrawRafRef.current) {
+        cancelAnimationFrame(recordingDrawRafRef.current);
+        recordingDrawRafRef.current = undefined;
+      }
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
       const id = recordingIdRef.current;
@@ -204,6 +250,10 @@ export function useStreamRecorder({
     recorder.onerror = () => {
       window.clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
+      if (recordingDrawRafRef.current) {
+        cancelAnimationFrame(recordingDrawRafRef.current);
+        recordingDrawRafRef.current = undefined;
+      }
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
       const id = recordingIdRef.current;
@@ -217,7 +267,7 @@ export function useStreamRecorder({
     };
 
     mediaRecorderRef.current = recorder;
-    recorder.start(2000);
+    recorder.start(5000);
   }, [
     audioRef,
     gameTitle,
@@ -231,6 +281,9 @@ export function useStreamRecorder({
   useEffect(() => {
     return () => {
       window.clearInterval(recordingTimerRef.current);
+      if (recordingDrawRafRef.current) {
+        cancelAnimationFrame(recordingDrawRafRef.current);
+      }
       const recorder = mediaRecorderRef.current;
       const id = recordingIdRef.current;
       if (recorder && recorder.state !== "inactive") {

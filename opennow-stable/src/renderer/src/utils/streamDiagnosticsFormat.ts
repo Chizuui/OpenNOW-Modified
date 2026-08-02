@@ -80,10 +80,16 @@ const SERVER_CITY_LABELS: Record<string, string> = {
  */
 export function formatServerLocation(zone: string, hostname: string): string {
   const zoneCode = (zone || "").trim();
+  let host = (hostname || "").trim();
+  try {
+    host = new URL(host.includes("://") ? host : `https://${host}`).hostname;
+  } catch {
+    host = host.replace(/^https?:\/\//i, "").split("/")[0];
+  }
 
   // Scan every 3-letter token in the zone id + hostname and pick the first one
   // that is a known city code. This avoids false positives like "yes"/"net".
-  const source = `${zoneCode} ${hostname || ""}`.toLowerCase();
+  const source = `${zoneCode} ${host}`.toLowerCase();
   const tokens = source.match(/[a-z]{3}/g) ?? [];
   let city: string | undefined;
   for (const tok of tokens) {
