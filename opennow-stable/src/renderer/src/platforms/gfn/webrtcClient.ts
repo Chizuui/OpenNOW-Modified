@@ -2071,29 +2071,6 @@ export class GfnWebRtcClient {
     const rawRegionSource = session.serverLocation || session.signalingServer || session.streamingBaseUrl || session.serverIp || "";
     // Compute the serverLocationLabel from the cleanest original source first (before stripping port/protocol)
     let label = formatServerLocation(session.zone || "", rawRegionSource);
-
-    if (label === "--" && session.streamingBaseUrl) {
-      try {
-        const url = new URL(session.streamingBaseUrl);
-        const host = url.hostname;
-        const parts = host.split('.');
-        if (parts.length > 0) {
-          const regionPart = parts[0]; // e.g. "ap-india"
-          const regionMap: Record<string, string> = {
-            'india': 'India', 'singapore': 'Singapore', 'japan': 'Japan', 'tokyo': 'Japan',
-            'ap-india': 'India', 'ap-singapore': 'Singapore', 'ap-japan': 'Japan',
-            'my-yes': 'Malaysia', 'kr-gkr': 'South Korea', 'th-bpc': 'Thailand',
-            'poland': 'Poland',
-          };
-          const rawKey = regionPart.toLowerCase();
-          const suffixKey = rawKey.replace(/^(?:ap|eu|na|sa|oc)-/, '');
-          const country = regionMap[rawKey] || regionMap[suffixKey] || regionMap[rawKey.split('-')[0]];
-          if (country) {
-            label = `${country} (${regionPart.toUpperCase()})`;
-          }
-        }
-      } catch {}
-    }
     this.serverLocationLabel = label;
     this.log(`[webrtc] serverLocationLabel computed as: "${this.serverLocationLabel}"`);
 
