@@ -240,6 +240,7 @@ export interface SessionInfo {
   negotiatedStreamProfile?: NegotiatedStreamProfile;
   requestedStreamingFeatures?: StreamingFeatures;
   finalizedStreamingFeatures?: StreamingFeatures;
+  serverLocation?: string;
   clientId?: string;
   deviceId?: string;
 }

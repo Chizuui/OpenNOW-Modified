@@ -42,6 +42,7 @@ export interface StreamStatsHudProps {
   position: StatsOverlayPosition;
   gstreamerEnabled: boolean;
   serverRegion?: string;
+  userSelectedRegionName?: string;
   sessionTimeRemainingText: string | null;
   hintsVisible?: boolean;
 }
@@ -52,6 +53,7 @@ export function StreamStatsHud({
   position,
   gstreamerEnabled,
   serverRegion,
+  userSelectedRegionName,
   sessionTimeRemainingText,
   hintsVisible = false,
 }: StreamStatsHudProps): JSX.Element {
@@ -75,10 +77,13 @@ export function StreamStatsHud({
   const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";
 
   const gpuTitle = stats.gpuType && stats.gpuType !== "" ? stats.gpuType : t("stream.stats.title");
-  const regionLabel = formatServerLocation(
-    stats.serverZone,
-    stats.serverRegion || serverRegion || "",
-  );
+  const parsedRegionLabel = stats.serverLocationLabel && stats.serverLocationLabel !== "--"
+    ? stats.serverLocationLabel
+    : formatServerLocation(
+        stats.serverZone,
+        stats.serverRegion || serverRegion || "",
+      );
+  const regionLabel = parsedRegionLabel !== "--" ? parsedRegionLabel : (userSelectedRegionName || "--");
 
   // ── Network section ──
   // Packet loss shown as a percentage over the sampling interval (WebRTC raw

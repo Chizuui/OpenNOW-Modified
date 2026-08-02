@@ -61,6 +61,7 @@ import {
   type RiInputCapabilities,
 } from "./webrtc/inputChannelPolicy";
 import { GamepadController } from "./webrtc/gamepadController";
+import { formatServerLocation } from "../../utils/streamDiagnosticsFormat";
 import { DomInputCaptureController } from "./webrtc/domInputCaptureController";
 import { PeerMediaLifecycleController } from "./webrtc/peerMediaLifecycleController";
 
@@ -343,6 +344,7 @@ export class GfnWebRtcClient {
   private videoDecodeStallWarningSent = false;
   private serverRegion = "";
   private serverZone = "";
+  private serverLocationLabel = ""; // <--- NEW FIELD
   private gpuType = "";
 
   private diagnostics: StreamDiagnostics = {
@@ -2066,7 +2068,36 @@ export class GfnWebRtcClient {
     // ("prod"), not a location — so the friendly label is derived from the
     // server hostname/IP (e.g. "npa-yes-kul-01..." → Malaysia (KUL)).
     this.serverZone = session.zone || "";
-    this.serverRegion = session.serverIp || session.signalingServer || session.streamingBaseUrl || "";
+    const rawRegionSource = session.serverLocation || session.signalingServer || session.streamingBaseUrl || session.serverIp || "";
+    // Compute the serverLocationLabel from the cleanest original source first (before stripping port/protocol)
+    let label = formatServerLocation(session.zone || "", rawRegionSource);
+
+    if (label === "--" && session.streamingBaseUrl) {
+      try {
+        const url = new URL(session.streamingBaseUrl);
+        const host = url.hostname;
+        const parts = host.split('.');
+        if (parts.length > 0) {
+          const regionPart = parts[0]; // e.g. "ap-india"
+          const regionMap: Record<string, string> = {
+            'india': 'India', 'singapore': 'Singapore', 'japan': 'Japan', 'tokyo': 'Japan',
+            'ap-india': 'India', 'ap-singapore': 'Singapore', 'ap-japan': 'Japan',
+            'my-yes': 'Malaysia', 'kr-gkr': 'South Korea', 'th-bpc': 'Thailand',
+            'poland': 'Poland',
+          };
+          const rawKey = regionPart.toLowerCase();
+          const suffixKey = rawKey.replace(/^(?:ap|eu|na|sa|oc)-/, '');
+          const country = regionMap[rawKey] || regionMap[suffixKey] || regionMap[rawKey.split('-')[0]];
+          if (country) {
+            label = `${country} (${regionPart.toUpperCase()})`;
+          }
+        }
+      } catch {}
+    }
+    this.serverLocationLabel = label;
+    this.log(`[webrtc] serverLocationLabel computed as: "${this.serverLocationLabel}"`);
+
+    this.serverRegion = rawRegionSource;
     if (this.serverRegion) {
       // If it looks like a URL or has protocol, strip it down to host/IP
       try {
@@ -2087,14 +2118,14 @@ export class GfnWebRtcClient {
 
     const pc = new RTCPeerConnection(rtcConfig);
     this.pc = pc;
+    this.resetInputState();
+    this.resetDiagnostics();
     this.diagnostics.connectionState = pc.connectionState;
     this.diagnostics.serverRegion = this.serverRegion;
     this.diagnostics.serverZone = this.serverZone;
+    this.diagnostics.serverLocationLabel = this.serverLocationLabel; // <--- ADD THIS
     this.diagnostics.gpuType = this.gpuType;
     this.emitStats();
-
-    this.resetInputState();
-    this.resetDiagnostics();
     this.createDataChannels(pc);
     this.domInputController.install(this.options.videoElement);
     this.setupStatsPolling();
