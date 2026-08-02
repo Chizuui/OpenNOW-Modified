@@ -81,6 +81,7 @@ export async function createMainWindow(
   const settings = deps.settingsManager.getAll();
   let escapeHoldState: EscapeHoldCaptureState = { keyDownCaptured: false, holdFired: false };
   let escapeHoldTimer: NodeJS.Timeout | null = null;
+  let lastEscapeTapTime: number | null = null;
   const clearEscapeHoldTimer = (): void => {
     if (escapeHoldTimer !== null) {
       clearTimeout(escapeHoldTimer);
@@ -291,6 +292,12 @@ export async function createMainWindow(
 
       if (resolved.action === "tap") {
         clearEscapeHoldTimer();
+        // Debounce: 500ms
+        const now = Date.now();
+        if (now - (lastEscapeTapTime ?? 0) < 500) {
+          return;
+        }
+        lastEscapeTapTime = now;
         // Windows internal native mode receives the same physical key through
         // its persistent RawInput keyboard sink. Forward only when Electron is
         // the input owner so the remote session sees exactly one Escape tap.

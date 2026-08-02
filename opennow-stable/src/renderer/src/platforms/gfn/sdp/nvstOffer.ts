@@ -250,7 +250,7 @@ export function buildNvstSdp(params: NvstParams): string {
   lines.push(
     `a=video.clientViewportWd:${params.width}`,
     `a=video.clientViewportHt:${params.height}`,
-    `a=video.maxFPS:${params.fps}`,
+    `a=video.maxFPS:120`, // ponytail: force 120 FPS request to GFN server regardless of client settings; revert when GFN dynamically handles requested FPS.
     `a=video.initialBitrateKbps:${startupBitrate}`,
     `a=video.initialPeakBitrateKbps:${maxBitrate}`,
     `a=vqos.bw.maximumBitrateKbps:${maxBitrate}`,
