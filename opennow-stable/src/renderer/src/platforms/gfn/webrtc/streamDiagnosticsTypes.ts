@@ -59,6 +59,8 @@ export interface StreamDiagnostics {
   serverRegion: string;
   /** Raw CloudMatch zone code (e.g. "NP-TYO-01"), used for a friendly location label. */
   serverZone: string;
+  /** Pre-resolved friendly location label (e.g. "India (BOM)"), computed once at session start before serverRegion degrades to an IP. */
+  serverLocationLabel?: string;
 
   // Decoder recovery status
   decoderPressureActive: boolean;

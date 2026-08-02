@@ -85,7 +85,7 @@ export function buildNvstSdp(params: NvstParams): string {
       "a=vqos.dfc.decodeFpsAdjPercent:85",
       "a=vqos.dfc.targetDownCooldownMs:250",
       `a=vqos.dfc.dfcAlgoVersion:${is120Fps || is240Fps ? 2 : 1}`,
-      `a=vqos.dfc.minTargetFps:${is120Fps || is240Fps ? 100 : 60}`,
+      `a=vqos.dfc.minTargetFps:${is120Fps || is240Fps ? 100 : 100}`,
       "a=vqos.resControl.dfc.useClientFpsPerf:0",
       "a=vqos.dfc.adjustResAndFps:0",
     );

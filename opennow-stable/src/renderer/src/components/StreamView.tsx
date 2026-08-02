@@ -119,6 +119,7 @@ export function StreamView({
   nativeExternalRenderer = false,
   shortcuts,
   serverRegion,
+  userSelectedRegionName,
   antiAfkEnabled,
   antiAfkAckNonce,
   showAntiAfkIndicator,
@@ -821,6 +822,7 @@ export function StreamView({
             position={statsPosition}
             gstreamerEnabled={gstreamerEnabled}
             serverRegion={serverRegion}
+            userSelectedRegionName={userSelectedRegionName}
             sessionTimeRemainingText={showSessionTimeRemainingInStats ? sessionTimeRemainingText : null}
             hintsVisible={showHints}
           />

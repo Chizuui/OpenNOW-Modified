@@ -763,6 +763,11 @@ export function App(): JSX.Element {
     return storageRegionUrl ?? undefined;
   }, [regions]);
 
+  const userSelectedRegionName = useMemo(() => {
+    if (!settings.region) return t("settings.region.autoBest");
+    return regions.find(r => r.url === settings.region)?.name ?? settings.region;
+  }, [regions, settings.region, t]);
+
   const {
     activeQueueAd,
     activeQueueAdMediaUrl,
@@ -2748,6 +2753,7 @@ export function App(): JSX.Element {
               }}
               hideStreamButtons={settings.hideStreamButtons}
               serverRegion={session?.serverIp}
+              userSelectedRegionName={userSelectedRegionName}
               antiAfkEnabled={antiAfkEnabled}
               antiAfkAckNonce={antiAfkAckNonce}
               showAntiAfkIndicator={settings.showAntiAfkIndicator}
