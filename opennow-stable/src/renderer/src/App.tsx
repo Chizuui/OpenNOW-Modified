@@ -764,9 +764,15 @@ export function App(): JSX.Element {
   }, [regions]);
 
   const userSelectedRegionName = useMemo(() => {
-    if (!settings.region) return t("settings.region.autoBest");
-    return regions.find(r => r.url === settings.region)?.name ?? settings.region;
-  }, [regions, settings.region, t]);
+    if (settings.region) {
+      return regions.find(r => r.url === settings.region)?.name ?? settings.region;
+    }
+    const activeUrl = session?.streamingBaseUrl?.replace(/\/$/, "");
+    const activeRegion = activeUrl && regions.find(
+      (region) => region.url.replace(/\/$/, "") === activeUrl,
+    );
+    return activeRegion?.name ?? t("settings.region.autoBest");
+  }, [regions, session?.streamingBaseUrl, settings.region, t]);
 
   const {
     activeQueueAd,
