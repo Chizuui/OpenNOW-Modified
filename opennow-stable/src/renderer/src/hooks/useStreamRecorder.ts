@@ -8,7 +8,7 @@ import { fitThumbnailSize, selectRecordingMimeType } from "../components/stream/
 // off-pipeline; this is the closest the web client can get without new tooling.
 const RECORD_CAP_WIDTH = 1280;
 const RECORD_CAP_HEIGHT = 720;
-const RECORD_CAP_FPS = 60;
+const RECORD_CAP_FPS = 30;
 
 interface UseStreamRecorderOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
