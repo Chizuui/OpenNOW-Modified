@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, m, useReducedMotion } from "motion/react";
 import { AlertTriangle } from "lucide-react";
 import type { JSX } from "react";
 import type { StatsOverlayPosition } from "@shared/gfn";
 import type { StreamLagReason } from "../platforms/gfn/webrtcClient";
+import { isRttSpike, PACKET_LOSS_BANNER_PERCENT } from "../platforms/gfn/webrtc/streamLag";
 import type { StreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import { useStreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import {
@@ -62,6 +63,43 @@ export function StreamStatsHud({
   const statusPulseMotion = getStatusPulseMotion(reducedMotion);
   const stats = useStreamDiagnosticsStore(diagnosticsStore);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [rttSpikeActive, setRttSpikeActive] = useState(false);
+  const [rttSpikeValueMs, setRttSpikeValueMs] = useState(0);
+  const lastRttRef = useRef(0);
+  const rttSpikeTimerRef = useRef<number | undefined>(undefined);
+
+  // Detect sudden RTT spikes (≥2× previous sample, ≥80ms) so the HUD can show
+  // a visible "ping tinggi tiba-tiba" banner instead of relying on the log.
+  // Note: this only catches sudden jumps, not gradual degradation (40→60→80→100
+  // never doubles per step) — sustained high RTT is already visible via the red
+  // ping KPI and the "network" lag reason.
+  useEffect(() => {
+    const currentRtt = stats.rttMs;
+    const previousRtt = lastRttRef.current;
+    lastRttRef.current = currentRtt;
+
+    if (isRttSpike(previousRtt, currentRtt)) {
+      // Freeze the spike RTT so the banner keeps showing the jumped value even
+      // if the link recovers to a low RTT on the next poll before auto-hide.
+      setRttSpikeValueMs(Math.round(currentRtt));
+      setRttSpikeActive(true);
+      if (rttSpikeTimerRef.current !== undefined) {
+        window.clearTimeout(rttSpikeTimerRef.current);
+      }
+      rttSpikeTimerRef.current = window.setTimeout(() => {
+        setRttSpikeActive(false);
+        rttSpikeTimerRef.current = undefined;
+      }, 5000);
+    }
+  }, [stats.rttMs]);
+
+  useEffect(() => {
+    return () => {
+      if (rttSpikeTimerRef.current !== undefined) {
+        window.clearTimeout(rttSpikeTimerRef.current);
+      }
+    };
+  }, []);
 
   // ── KPI values (GFN parity) ──
   // GAME = frames decoded from stream (server-side game FPS);
@@ -107,6 +145,9 @@ export function StreamStatsHud({
 
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
   const hasPacketLoss = stats.packetLossPercent > 0;
+  // Banner threshold is coarser than the alert dot: sub-0.15% loss is normal
+  // noise, so it should not flash the transient banner on every poll.
+  const bannerPacketLoss = stats.packetLossPercent >= PACKET_LOSS_BANNER_PERCENT;
   const hasIssues = hasLagIssue || hasPacketLoss;
 
   const advancedLines = useMemo(() => {
@@ -194,6 +235,31 @@ export function StreamStatsHud({
           </m.span>
         )}
       </header>
+
+      {/* Transient network alert banner: sudden RTT spike or real packet loss. */}
+      <AnimatePresence initial={false}>
+        {(rttSpikeActive || bannerPacketLoss) && (
+          <m.div
+            key="network-alert"
+            className={[
+              "sv-stats-net-alert",
+              rttSpikeActive && bannerPacketLoss ? "sv-stats-net-alert--critical" : "",
+            ].filter(Boolean).join(" ")}
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={disclosureTransition}
+            role="status"
+          >
+            <AlertTriangle size={12} aria-hidden />
+            <span>
+              {rttSpikeActive && `RTT spike ${rttSpikeValueMs}ms`}
+              {rttSpikeActive && bannerPacketLoss && " · "}
+              {bannerPacketLoss && `${stats.packetLossPercent.toFixed(2)}% loss`}
+            </span>
+          </m.div>
+        )}
+      </AnimatePresence>
 
       {kpiRow}
 
