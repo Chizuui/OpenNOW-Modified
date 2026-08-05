@@ -8,14 +8,16 @@ interface PeerMediaLifecycleDependencies {
 export class PeerMediaLifecycleController {
   private readonly videoStream = new MediaStream();
   private readonly audioStream = new MediaStream();
-  private audioContext: AudioContext | null = null;
-  private audioSourceNode: MediaStreamAudioSourceNode | null = null;
-  private audioGainNode: GainNode | null = null;
   private outputVolume = 1;
 
   constructor(private readonly dependencies: PeerMediaLifecycleDependencies) {
     dependencies.videoElement.srcObject = this.videoStream;
     dependencies.audioElement.srcObject = this.audioStream;
+    // Keep the audio element muted until a track arrives; attachTrack() plays
+    // it directly. Playing the WebRTC audio track through the media element
+    // keeps libwebrtc's A/V sync clock intact — the previous AudioContext
+    // re-route decoupled audio from the video pipeline, causing drift and
+    // underrun stutter that read as "lag" even with a healthy network.
     dependencies.audioElement.muted = true;
     dependencies.audioElement.volume = this.outputVolume;
   }
@@ -68,53 +70,36 @@ export class PeerMediaLifecycleController {
 
     if (track.kind === "audio") {
       this.replaceTrackInStream(this.audioStream, track);
-      this.cleanupAudioRouting();
-
-      let audioContext: AudioContext | null = null;
-      let audioSourceNode: MediaStreamAudioSourceNode | null = null;
-      let audioGainNode: GainNode | null = null;
-      try {
-        audioContext = new AudioContext({
-          latencyHint: "interactive",
-          sampleRate: 48000,
-        });
-        audioSourceNode = audioContext.createMediaStreamSource(this.audioStream);
-        audioGainNode = audioContext.createGain();
-        audioGainNode.gain.value = this.outputVolume;
-        audioSourceNode.connect(audioGainNode);
-        audioGainNode.connect(audioContext.destination);
-        if (audioContext.state === "suspended") {
-          void audioContext.resume();
-        }
-        this.audioContext = audioContext;
-        this.audioSourceNode = audioSourceNode;
-        this.audioGainNode = audioGainNode;
-        this.dependencies.log(
-          `Audio routed through AudioContext (latency: ${(audioContext.baseLatency * 1000).toFixed(1)}ms, sampleRate: ${audioContext.sampleRate}Hz)`,
-        );
-      } catch (error) {
-        if (audioSourceNode) {
-          try {
-            audioSourceNode.disconnect();
-          } catch {
-            // Ignore cleanup errors from a partially-created node.
-          }
-        }
-        if (audioGainNode) {
-          try {
-            audioGainNode.disconnect();
-          } catch {
-            // Ignore cleanup errors from a partially-created node.
-          }
-        }
-        if (audioContext) {
-          void audioContext.close().catch(() => {});
-        }
-        this.startDirectAudioPlayback(
-          `AudioContext creation failed, falling back to audio element: ${String(error)}`,
-        );
-      }
+      this.dependencies.audioElement.volume = this.outputVolume;
+      this.startAudioElementPlayback();
     }
+  }
+
+  private startAudioElementPlayback(): void {
+    const audio = this.dependencies.audioElement;
+    const unlock = (): void => {
+      audio.muted = false;
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+    };
+    audio.muted = false;
+    audio
+      .play()
+      .then(() => {
+        this.dependencies.log("Audio track attached (element playback)");
+      })
+      .catch((playError) => {
+        // Unmuted autoplay can be rejected before the first user activation.
+        // Fall back to muted playback (always allowed) and unmute on the next
+        // user gesture so audio is never silently lost.
+        this.dependencies.log(
+          `Audio autoplay blocked; will unmute on next gesture: ${String(playError)}`,
+        );
+        audio.muted = true;
+        audio.play().catch(() => {});
+        document.addEventListener("pointerdown", unlock);
+        document.addEventListener("keydown", unlock);
+      });
   }
 
   setOutputVolume(volume: number): void {
@@ -123,9 +108,6 @@ export class PeerMediaLifecycleController {
       Math.min(1, Number.isFinite(volume) ? volume : 1),
     );
     this.dependencies.audioElement.volume = this.outputVolume;
-    if (this.audioGainNode) {
-      this.audioGainNode.gain.value = this.outputVolume;
-    }
   }
 
   reset(): void {
@@ -160,41 +142,7 @@ export class PeerMediaLifecycleController {
   }
 
   private cleanupAudioRouting(): void {
-    if (this.audioSourceNode) {
-      try {
-        this.audioSourceNode.disconnect();
-      } catch {
-        // Ignore cleanup errors from an already-disconnected node.
-      }
-      this.audioSourceNode = null;
-    }
-    if (this.audioGainNode) {
-      try {
-        this.audioGainNode.disconnect();
-      } catch {
-        // Ignore cleanup errors from an already-disconnected node.
-      }
-      this.audioGainNode = null;
-    }
-    if (this.audioContext) {
-      void this.audioContext.close().catch(() => {});
-      this.audioContext = null;
-    }
     this.dependencies.audioElement.pause();
     this.dependencies.audioElement.muted = true;
-  }
-
-  private startDirectAudioPlayback(reason: string): void {
-    this.dependencies.log(reason);
-    this.dependencies.audioElement.muted = false;
-    this.dependencies.audioElement.volume = this.outputVolume;
-    this.dependencies.audioElement
-      .play()
-      .then(() => {
-        this.dependencies.log("Audio track attached (fallback)");
-      })
-      .catch((playError) => {
-        this.dependencies.log(`Audio autoplay blocked: ${String(playError)}`);
-      });
   }
 }

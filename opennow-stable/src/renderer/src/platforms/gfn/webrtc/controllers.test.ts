@@ -21,31 +21,36 @@ const pressureSignal: DecoderPressureSignal = {
   dropRatePercent: 7,
 };
 
-test("decoder recovery waits for three pressure polls and clears after six stable polls", async () => {
+test("decoder recovery tracks pressure but leaves the stream alone for backlog/drop pressure", async () => {
   const states: DecoderPressureState[] = [];
+  const logs: string[] = [];
   let keyframeRequests = 0;
   const controller = new DecoderPressureController({
-    log: () => {},
+    log: (message) => logs.push(message),
     getPeerConnection: () => null,
     getControlChannel: () => null,
     requestSignalingKeyframe: async () => {
       keyframeRequests++;
     },
-    setMaxBitrateKbps: async () => {},
     onStateChange: (state) => states.push(state),
     now: () => 2_000,
   });
 
+  // Non-severe pressure (backlog + drops) must NOT interrupt the stream:
+  // no keyframes, no bitrate churn, and the jitter buffer stays adaptive
+  // so transient jitter is absorbed instead of turning into frame drops.
+  await controller.recover(pressureSignal);
   await controller.recover(pressureSignal);
   await controller.recover(pressureSignal);
   assert.equal(keyframeRequests, 0);
-
-  await controller.recover(pressureSignal);
-  assert.equal(keyframeRequests, 1);
+  assert.ok(
+    logs.some((line) => line.includes("video=adaptive audio=adaptive")),
+    "backlog/drop pressure keeps adaptive jitter targets",
+  );
   assert.deepEqual(states.at(-1), {
     active: true,
-    recoveryAttempts: 1,
-    recoveryAction: "signaling_keyframe",
+    recoveryAttempts: 0,
+    recoveryAction: "none",
   });
 
   const stableSignal = { ...pressureSignal, active: false, reason: "stable" };
@@ -59,6 +64,45 @@ test("decoder recovery waits for three pressure polls and clears after six stabl
     active: false,
     recoveryAttempts: 0,
     recoveryAction: "none",
+  });
+});
+
+test("decoder recovery requests a keyframe only on a severe decode stall", async () => {
+  const states: DecoderPressureState[] = [];
+  const logs: string[] = [];
+  let keyframeRequests = 0;
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {
+      keyframeRequests++;
+    },
+    onStateChange: (state) => states.push(state),
+    now: () => 2_000,
+  });
+
+  const stallSignal: DecoderPressureSignal = {
+    active: true,
+    reason: "severe_stall",
+    backlogFrames: 200,
+    dropRatePercent: 0,
+  };
+
+  await controller.recover(stallSignal);
+  await controller.recover(stallSignal);
+  assert.equal(keyframeRequests, 0);
+
+  await controller.recover(stallSignal);
+  assert.equal(keyframeRequests, 1);
+  assert.ok(
+    logs.some((line) => line.includes("video=30ms audio=32ms")),
+    "severe stall pins explicit low-latency jitter targets",
+  );
+  assert.deepEqual(states.at(-1), {
+    active: true,
+    recoveryAttempts: 1,
+    recoveryAction: "signaling_keyframe",
   });
 });
 
