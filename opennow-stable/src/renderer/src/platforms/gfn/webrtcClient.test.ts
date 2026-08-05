@@ -10,6 +10,7 @@ import {
   classifyDecoderPressureSample,
   classifyStreamLagReason,
   evaluateControllerOverlayShortcutGate,
+  isRttSpike,
   quantizeMouseDeltaWithResidual,
   subsampleCoalescedPointerEvents,
 } from "./webrtcClient";
@@ -249,6 +250,19 @@ const stableLagParams = {
   dropRatePercent: 0.1,
   backpressureThresholdBytes: 64 * 1024,
 };
+
+test("isRttSpike flags only a sudden RTT jump into spike territory", () => {
+  // Normal fluctuation below the spike floor is not a spike.
+  assert.equal(isRttSpike(40, 60), false);
+  assert.equal(isRttSpike(0, 120), false); // no previous baseline yet
+  // Doubling into ≥80ms is a spike.
+  assert.equal(isRttSpike(45, 100), true);
+  assert.equal(isRttSpike(40, 80), true);
+  // Doubling below the 80ms floor is not severe enough.
+  assert.equal(isRttSpike(10, 20), false);
+  // A gradual rise (less than 2×) is not a spike even if RTT is high.
+  assert.equal(isRttSpike(80, 120), false);
+});
 
 test("classifyStreamLagReason ignores mouse coalesce timer jitter for input lag", () => {
   const result = classifyStreamLagReason({

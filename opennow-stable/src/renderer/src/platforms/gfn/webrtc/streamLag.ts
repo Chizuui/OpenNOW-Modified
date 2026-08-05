@@ -21,6 +21,31 @@ export interface ClassifyStreamLagReasonParams {
   backpressureThresholdBytes: number;
 }
 
+/** RTT (ms) at or above this is considered a spike worth surfacing in the HUD. */
+export const RTT_SPIKE_MIN_MS = 80;
+/** RTT must at least double vs the previous sample to be called a spike. */
+export const RTT_SPIKE_MULTIPLIER = 2;
+/**
+ * Packet loss (%) above which the HUD banner should appear. Sub-threshold loss
+ * (1 packet in 10k = 0.01%) is normal noise on real links — the rest of the
+ * app only warns at ≥0.15% (getPacketLossColor) and flags network lag at ≥1%.
+ */
+export const PACKET_LOSS_BANNER_PERCENT = 0.15;
+
+/**
+ * True when the current RTT jumped sharply versus the previous sample — a
+ * sudden "ping tinggi banget tiba-tiba" event, as opposed to a gradual rise.
+ * Mirrors the log-based spike detector in GfnWebRtcClient.collectStats so the
+ * HUD and the exported log agree on what counts as a spike.
+ */
+export function isRttSpike(previousRttMs: number, currentRttMs: number): boolean {
+  return (
+    currentRttMs >= RTT_SPIKE_MIN_MS
+    && previousRttMs > 0
+    && currentRttMs >= previousRttMs * RTT_SPIKE_MULTIPLIER
+  );
+}
+
 /** Classify overlay lag warnings using sustained pressure signals, not timer jitter or normal decode times. */
 export function classifyStreamLagReason(
   params: ClassifyStreamLagReasonParams,

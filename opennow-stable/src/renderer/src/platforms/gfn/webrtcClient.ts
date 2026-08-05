@@ -48,7 +48,7 @@ import type {
   StreamDiagnostics,
   StreamTimeWarning,
 } from "./webrtc/streamDiagnosticsTypes";
-import { classifyStreamLagReason } from "./webrtc/streamLag";
+import { classifyStreamLagReason, isRttSpike } from "./webrtc/streamLag";
 import { chooseAdaptiveMouseFlushInterval } from "./webrtc/mouseInput";
 import {
   averageJitterBufferDelayMs,
@@ -74,6 +74,7 @@ export type {
 } from "./webrtc/streamDiagnosticsTypes";
 export {
   classifyStreamLagReason,
+  isRttSpike,
   type ClassifyStreamLagReasonParams,
 } from "./webrtc/streamLag";
 export {
@@ -315,10 +316,6 @@ export class GfnWebRtcClient {
   private lastNetworkStatsLogAtMs = 0;
   private lastLoggedRttMs = 0;
   private static readonly NETWORK_STATS_LOG_INTERVAL_MS = 10_000;
-  /** Minimum RTT (ms) to be considered a "spike" worth an immediate log line. */
-  private static readonly RTT_SPIKE_MIN_MS = 80;
-  /** RTT must at least double vs the previous sample to be called a spike. */
-  private static readonly RTT_SPIKE_MULTIPLIER = 2;
 
   private keyboardLayout?: KeyboardLayout;
   private autoFullScreenEnabled = true;
@@ -1329,10 +1326,7 @@ export class GfnWebRtcClient {
     {
       const nowMs = performance.now();
       const rttMs = this.diagnostics.rttMs;
-      const rttSpiked =
-        rttMs >= GfnWebRtcClient.RTT_SPIKE_MIN_MS
-        && this.lastLoggedRttMs > 0
-        && rttMs >= this.lastLoggedRttMs * GfnWebRtcClient.RTT_SPIKE_MULTIPLIER;
+      const rttSpiked = isRttSpike(this.lastLoggedRttMs, rttMs);
       const due = nowMs - this.lastNetworkStatsLogAtMs >= GfnWebRtcClient.NETWORK_STATS_LOG_INTERVAL_MS;
       if (due || rttSpiked) {
         this.lastNetworkStatsLogAtMs = nowMs;
