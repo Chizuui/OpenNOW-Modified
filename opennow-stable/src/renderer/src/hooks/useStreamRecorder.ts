@@ -34,10 +34,22 @@ export function useStreamRecorder({
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartTimeRef = useRef(0);
   const recordingTimerRef = useRef<number | undefined>(undefined);
-  const recordingDrawRafRef = useRef<number | undefined>(undefined);
+  const recordingFrameCallbackRef = useRef<number | undefined>(undefined);
+  const recordingVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const thumbnailDataUrlRef = useRef<string | null>(null);
   const recCarouselRef = useRef<HTMLDivElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // The canvas capture track runs its own internal rasterize timer at the
+  // capture rate even when drawImage is never called, so it must be stopped
+  // explicitly or it keeps burning main-thread CPU after recording ends.
+  const stopRecordingVideoTrack = (): void => {
+    const track = recordingVideoTrackRef.current;
+    if (track && track.readyState === "live") {
+      track.stop();
+    }
+    recordingVideoTrackRef.current = null;
+  };
   const recordingApiAvailable =
     typeof window.openNow?.beginRecording === "function" &&
     typeof window.openNow?.sendRecordingChunk === "function" &&
@@ -137,14 +149,25 @@ export function useStreamRecorder({
       recordVideoTrack = capStream.getVideoTracks()[0];
       if (recordVideoTrack) {
         recordVideoTrack.contentHint = "detail";
+        recordingVideoTrackRef.current = recordVideoTrack;
       }
-      const draw = (): void => {
-        recordingDrawRafRef.current = requestAnimationFrame(draw);
-        if (capCtx && video.videoWidth > 0) {
+      // Draw only when a NEW video frame is presented and cap it to the
+      // recording frame rate. The old loop re-queued requestAnimationFrame
+      // unconditionally, so on 120/144 fps streams the main thread ran a
+      // synchronous full-frame drawImage per display refresh — starving the
+      // WebRTC decoder/compositor and dropping stream FPS.
+      let lastDrawMs = 0;
+      const drawLatestFrame = (now: number): void => {
+        recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
+        if (!capCtx || video.videoWidth === 0 || video.readyState < 2) {
+          return;
+        }
+        if (now - lastDrawMs >= 1000 / RECORD_CAP_FPS) {
+          lastDrawMs = now;
           capCtx.drawImage(video, 0, 0, capWidth, capHeight);
         }
       };
-      draw();
+      recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
     }
     const videoTracksForRecord = recordVideoTrack ? [recordVideoTrack] : stream.getVideoTracks();
 
@@ -159,6 +182,12 @@ export function useStreamRecorder({
       recordingId = result.recordingId;
     } catch (error) {
       console.error("[StreamView] Failed to begin recording:", error);
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
+      }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
       audioCtx.close().catch(() => undefined);
       audioCtxRef.current = null;
       setRecordingError("Could not start recording.");
@@ -178,8 +207,14 @@ export function useStreamRecorder({
     let isFirstChunk = true;
     const recorderOptions: MediaRecorderOptions = { mimeType };
     if (recordingBitrateMbps !== null) {
+      // 720p30 never benefits from more than ~12 Mbps; capping avoids burning
+      // main-thread MediaRecorder encode budget on a bitrate the picture can't
+      // use (a major source of stream FPS drops during recording). Auto mode
+      // (null) is intentionally left untouched: Chromium picks a conservative
+      // resolution-based default (~2.5 Mbps for 720p) that's already below the
+      // cap, so overriding it would only add encode load.
       recorderOptions.videoBitsPerSecond =
-        Math.max(1, Math.min(200, Math.round(recordingBitrateMbps))) * 1_000_000;
+        Math.max(1, Math.min(12, Math.round(recordingBitrateMbps))) * 1_000_000;
     }
     const recorder = new MediaRecorder(composed, recorderOptions);
 
@@ -217,10 +252,12 @@ export function useStreamRecorder({
     recorder.onstop = () => {
       window.clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
-      if (recordingDrawRafRef.current) {
-        cancelAnimationFrame(recordingDrawRafRef.current);
-        recordingDrawRafRef.current = undefined;
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
       }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
       const id = recordingIdRef.current;
@@ -250,10 +287,12 @@ export function useStreamRecorder({
     recorder.onerror = () => {
       window.clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
-      if (recordingDrawRafRef.current) {
-        cancelAnimationFrame(recordingDrawRafRef.current);
-        recordingDrawRafRef.current = undefined;
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
       }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
       const id = recordingIdRef.current;
@@ -281,9 +320,12 @@ export function useStreamRecorder({
   useEffect(() => {
     return () => {
       window.clearInterval(recordingTimerRef.current);
-      if (recordingDrawRafRef.current) {
-        cancelAnimationFrame(recordingDrawRafRef.current);
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
       }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
       const recorder = mediaRecorderRef.current;
       const id = recordingIdRef.current;
       if (recorder && recorder.state !== "inactive") {
