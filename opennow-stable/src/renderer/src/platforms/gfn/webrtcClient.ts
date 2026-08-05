@@ -311,6 +311,14 @@ export class GfnWebRtcClient {
   } | null = null;
   private renderFpsCounter = { frames: 0, lastUpdate: 0, fps: 0 };
   private lastEmittedDiagnostics: StreamDiagnostics | null = null;
+  /** Periodic network-diagnostics logging (surfaces in the exported log file). */
+  private lastNetworkStatsLogAtMs = 0;
+  private lastLoggedRttMs = 0;
+  private static readonly NETWORK_STATS_LOG_INTERVAL_MS = 10_000;
+  /** Minimum RTT (ms) to be considered a "spike" worth an immediate log line. */
+  private static readonly RTT_SPIKE_MIN_MS = 80;
+  /** RTT must at least double vs the previous sample to be called a spike. */
+  private static readonly RTT_SPIKE_MULTIPLIER = 2;
 
   private keyboardLayout?: KeyboardLayout;
   private autoFullScreenEnabled = true;
@@ -1311,6 +1319,31 @@ export class GfnWebRtcClient {
     });
     this.diagnostics.lagReason = lagClassification.reason;
     this.diagnostics.lagReasonDetail = lagClassification.detail;
+
+    // ── Periodic network diagnostics ──
+    // WebRTC stats only live in the renderer; the exported log file (main
+    // process) never saw them. Log a compact line every few seconds, plus an
+    // immediate line when RTT doubles into spike territory, so a reported
+    // "ping tinggi banget tiba-tiba" can be verified against packet loss,
+    // jitter, and dropped frames from the log alone.
+    {
+      const nowMs = performance.now();
+      const rttMs = this.diagnostics.rttMs;
+      const rttSpiked =
+        rttMs >= GfnWebRtcClient.RTT_SPIKE_MIN_MS
+        && this.lastLoggedRttMs > 0
+        && rttMs >= this.lastLoggedRttMs * GfnWebRtcClient.RTT_SPIKE_MULTIPLIER;
+      const due = nowMs - this.lastNetworkStatsLogAtMs >= GfnWebRtcClient.NETWORK_STATS_LOG_INTERVAL_MS;
+      if (due || rttSpiked) {
+        this.lastNetworkStatsLogAtMs = nowMs;
+        this.lastLoggedRttMs = rttMs;
+        this.log(
+          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
+        );
+      } else {
+        this.lastLoggedRttMs = rttMs;
+      }
+    }
 
     const shouldLogQueuePressure =
       reliableBufferedAmount > GfnWebRtcClient.RELIABLE_MOUSE_BACKPRESSURE_BYTES / 2

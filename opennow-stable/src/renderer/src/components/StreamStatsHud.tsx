@@ -95,7 +95,9 @@ export function StreamStatsHud({
     ? formatBitrate(stats.targetBitrateKbps)
     : "--";
   const totalUsedText = stats.bitrateKbps > 0 ? formatBitrate(stats.bitrateKbps) : "--";
-  const jitterText = stats.jitterMs > 0 ? `${stats.jitterMs.toFixed(1)}ms` : "--";
+  const jitterText = stats.jitterMs > 0
+    ? `${stats.jitterMs.toFixed(1)}ms`
+    : (stats.rttMs > 0 || stats.framesDecoded > 0 ? "<0.1ms" : "--");
 
   // ── Stream section ──
   const resolutionText = stats.resolution && stats.resolution !== ""
