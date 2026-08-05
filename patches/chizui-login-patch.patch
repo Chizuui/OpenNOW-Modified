@@ -1,0 +1,440 @@
+From 3c7c5d9a6419b5983325b4fcfc67876a2d1463b2 Mon Sep 17 00:00:00 2001
+From: Chizuui <desckun@gmail.com>
+Date: Tue, 21 Jul 2026 05:14:10 +0000
+Subject: [PATCH] feat: apply chizui-login patch on top of latest
+ android-native
+
+---
+ android/app/build.gradle.kts                  |  3 +-
+ .../com/opencloudgaming/opennow/GfnApi.kt     | 95 +++++++++++++++++++
+ .../com/opencloudgaming/opennow/Models.kt     |  3 +
+ .../opencloudgaming/opennow/OpenNowScreens.kt | 11 +++
+ .../opennow/OpenNowSettingsPanels.kt          | 46 +++++++--
+ .../opennow/OpenNowViewModel.kt               | 49 +++++++++-
+ .../opencloudgaming/opennow/Persistence.kt    | 44 +++++++++
+ android/app/src/main/res/values/strings.xml   |  2 +-
+ 8 files changed, 244 insertions(+), 9 deletions(-)
+
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 441dfa93..73c2f8a9 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -55,7 +55,7 @@ android {
+     compileSdk = 37
+ 
+     defaultConfig {
+-        applicationId = "com.opencloudgaming.opennow"
++        applicationId = "com.opencloudgaming.opennow.chizui"
+         minSdk = 23
+         targetSdk = 36
+         versionCode = 66
+@@ -79,6 +79,7 @@ android {
+         release {
+             isMinifyEnabled = true
+             isShrinkResources = true
++            signingConfig = signingConfigs.getByName("debug") // LOCAL TESTING ONLY - do not push
+             buildConfigField("boolean", "APK_UPDATES_SUPPORTED", (!buildingPlayReleaseBundle).toString())
+             proguardFiles(
+                 getDefaultProguardFile("proguard-android-optimize.txt"),
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/GfnApi.kt b/android/app/src/main/java/com/opencloudgaming/opennow/GfnApi.kt
+index 2525ec6b..675ca365 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/GfnApi.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/GfnApi.kt
+@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
++import kotlinx.serialization.Serializable
+ import kotlinx.serialization.json.Json
+ import kotlinx.serialization.json.JsonArray
+ import kotlinx.serialization.json.JsonElement
+@@ -1029,6 +1030,72 @@ class GfnAuthRepository(
+         return true
+     }
+ 
++    suspend fun loginWithChizui(serverUrl: String, promptSelectAccount: Boolean = false): AuthSession {
++        drainExternalOAuthRedirects()
++        val callbackServers = openAvailableCallbackServers()
++        val port = callbackServers.port
++        val oauthUrl = buildString {
++            append(serverUrl.trimEnd('/'))
++            append("/?callback_port=")
++            append(port)
++            if (promptSelectAccount) {
++                append("&prompt=select_account")
++            }
++        }
++        val code = coroutineScope {
++            val codeDeferred = async(Dispatchers.IO) { waitForAuthorizationCode(callbackServers) }
++            val customTabs = CustomTabsIntent.Builder().build()
++            customTabs.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            runCatching {
++                customTabs.launchUrl(context, Uri.parse(oauthUrl))
++            }.onFailure {
++                codeDeferred.cancel()
++                callbackServers.close()
++                throw it
++            }
++            codeDeferred.await()
++        }
++
++        val jwtToken = code.removePrefix("CHIZUI_")
++        val session = fetchChizuiSession(serverUrl, jwtToken)
++        val sessionWithChizui = session.copy(
++            chizuiServerUrl = serverUrl,
++            chizuiJwtToken = jwtToken
++        )
++        authStore.upsertSession(sessionWithChizui)
++        return sessionWithChizui
++    }
++
++    private suspend fun fetchChizuiSession(serverUrl: String, jwtToken: String, gfnUserId: String? = null): AuthSession = withContext(Dispatchers.IO) {
++        val url = buildString {
++            append(serverUrl.trimEnd('/'))
++            append("/api/gfn/tokens")
++            if (!gfnUserId.isNullOrBlank()) {
++                append("?gfn_user_id=")
++                append(gfnUserId)
++            }
++        }
++        val request = Request.Builder()
++            .url(url)
++            .header("Authorization", "Bearer $jwtToken")
++            .get()
++            .build()
++        val (status, body) = http.awaitText(request)
++        if (status != 200) {
++            val errMessage = runCatching {
++                OpenNowJson.decodeFromString<ChizuiErrorResponse>(body).error
++            }.getOrNull() ?: "HTTP error $status"
++            throw IllegalStateException(errMessage)
++        }
++        val response = runCatching {
++            OpenNowJson.decodeFromString<ChizuiTokenResponse>(body)
++        }.getOrElse {
++            throw IllegalStateException("Failed to parse ChizuiLogin session response")
++        }
++        val data = response.data ?: throw IllegalStateException(response.error ?: "Session tokens not found on server")
++        data
++    }
++
+     suspend fun loginWithDeviceCode(provider: LoginProvider, onPrompt: suspend (DeviceLoginPrompt) -> Unit): AuthSession {
+         check(provider.supportsDeviceCodeLogin) { "Code sign-in is only available for NVIDIA accounts." }
+         val deviceCode = requestDeviceCode(provider)
+@@ -1094,6 +1161,21 @@ class GfnAuthRepository(
+     ): AuthSession {
+         val tokens = session.tokens
+         val refreshErrors = mutableListOf<String>()
++
++        val serverUrl = session.chizuiServerUrl
++        val jwtToken = session.chizuiJwtToken
++        val gfnUserId = session.user.userId
++        if (!serverUrl.isNullOrBlank() && !jwtToken.isNullOrBlank()) {
++            runCatching {
++                val refreshed = fetchChizuiSession(serverUrl, jwtToken, gfnUserId)
++                return refreshed.copy(
++                    chizuiServerUrl = serverUrl,
++                    chizuiJwtToken = jwtToken
++                )
++            }.onFailure { error ->
++                refreshErrors += "chizui: ${error.message ?: "Unknown Chizui refresh error"}"
++            }
++        }
+         val refreshClientIds = authenticationRefreshClientIds(
+             savedClientId = tokens.authClientId,
+             browserClientId = CLIENT_ID,
+@@ -3313,3 +3395,16 @@ suspend fun fetchDynamicRegions(
+ 
+ private fun String.normalizedTitleKey(): String = trim().lowercase(Locale.US).replace(Regex("[^a-z0-9]+"), " ").trim()
+ private fun String.isNumeric(): Boolean = all(Char::isDigit)
++
++@Serializable
++private data class ChizuiTokenResponse(
++    val status: String,
++    val data: AuthSession? = null,
++    val error: String? = null
++)
++
++@Serializable
++private data class ChizuiErrorResponse(
++    val error: String
++)
++
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/Models.kt b/android/app/src/main/java/com/opencloudgaming/opennow/Models.kt
+index b2aa18e2..1f5c222d 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/Models.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/Models.kt
+@@ -351,6 +351,7 @@ data class AppSettings(
+     val analyticsConsentAsked: Boolean = false,
+     val allowEscapeToExitFullscreen: Boolean = false,
+     val nativeLowLatencyDecoder: Boolean = false,
++    val chizuiLoginUrl: String = "https://gfn.chizui.dev",
+ )
+ 
+ internal const val MIN_GAME_CARD_SCALE = 0.75f
+@@ -971,6 +972,8 @@ data class AuthSession(
+     val provider: LoginProvider,
+     val tokens: AuthTokens,
+     val user: AuthUser,
++    val chizuiServerUrl: String? = null,
++    val chizuiJwtToken: String? = null,
+ )
+ 
+ data class DeviceLoginPrompt(
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
+index ec5ede41..71cbd636 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
+@@ -1428,6 +1428,17 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                             Text("Use code sign-in")
+                         }
+                     }
++                    Button(
++                        onClick = { viewModel.loginWithChizui() },
++                        enabled = !normalLoginBusy,
++                        colors = ButtonDefaults.buttonColors(
++                            containerColor = MaterialTheme.colorScheme.tertiary,
++                            contentColor = MaterialTheme.colorScheme.onTertiary
++                        )
++                    ) {
++                        Text("Sign in with ChizuiLogin")
++                    }
++
+                     if (tvLogin) {
+                         TvPhoneSignInConnector(state = state, viewModel = viewModel)
+                     }
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt
+index eb81d825..46d580d6 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt
+@@ -498,6 +498,10 @@ internal fun AccountSettingsPanel(state: OpenNowUiState, viewModel: OpenNowViewM
+                 viewModel.selectProvider(provider)
+                 viewModel.login(provider)
+             },
++            onChizuiSelected = {
++                addAccountPromptOpen = false
++                viewModel.loginWithChizui(promptSelectAccount = true)
++            },
+             onDismiss = { addAccountPromptOpen = false },
+         )
+     }
+@@ -604,8 +608,10 @@ private fun AddAccountProviderDialog(
+     providers: List<LoginProvider>,
+     selectedProvider: LoginProvider,
+     onProviderSelected: (LoginProvider) -> Unit,
++    onChizuiSelected: () -> Unit,
+     onDismiss: () -> Unit,
+ ) {
++    var isChizuiSelected by remember { mutableStateOf(false) }
+     var providerChoice by remember(providers, selectedProvider) {
+         mutableStateOf(providers.preferredProvider(selectedProvider))
+     }
+@@ -626,15 +632,33 @@ private fun AddAccountProviderDialog(
+                 )
+                 providers.forEach { provider ->
+                     ProviderChoiceRow(
+-                        provider = provider,
+-                        selected = provider.sameProvider(providerChoice),
+-                        onClick = { providerChoice = provider },
++                        displayName = provider.displayName,
++                        code = provider.code,
++                        selected = !isChizuiSelected && provider.sameProvider(providerChoice),
++                        onClick = {
++                            isChizuiSelected = false
++                            providerChoice = provider
++                        },
+                     )
+                 }
++                ProviderChoiceRow(
++                    displayName = "ChizuiLogin",
++                    code = "Custom token & OAuth provider",
++                    selected = isChizuiSelected,
++                    onClick = {
++                        isChizuiSelected = true
++                    },
++                )
+             }
+         },
+         confirmButton = {
+-            Button(onClick = { onProviderSelected(providerChoice) }) {
++            Button(onClick = {
++                if (isChizuiSelected) {
++                    onChizuiSelected()
++                } else {
++                    onProviderSelected(providerChoice)
++                }
++            }) {
+                 Text("Continue")
+             }
+         },
+@@ -648,6 +672,16 @@ private fun AddAccountProviderDialog(
+ 
+ @Composable
+ private fun ProviderChoiceRow(provider: LoginProvider, selected: Boolean, onClick: () -> Unit) {
++    ProviderChoiceRow(
++        displayName = provider.displayName,
++        code = provider.code,
++        selected = selected,
++        onClick = onClick,
++    )
++}
++
++@Composable
++private fun ProviderChoiceRow(displayName: String, code: String, selected: Boolean, onClick: () -> Unit) {
+     Surface(
+         modifier = Modifier
+             .fillMaxWidth()
+@@ -667,14 +701,14 @@ private fun ProviderChoiceRow(provider: LoginProvider, selected: Boolean, onClic
+         ) {
+             Column(Modifier.weight(1f)) {
+                 Text(
+-                    provider.displayName,
++                    displayName,
+                     color = SettingsText,
+                     fontWeight = FontWeight.SemiBold,
+                     maxLines = 1,
+                     overflow = TextOverflow.Ellipsis,
+                 )
+                 Text(
+-                    provider.code,
++                    code,
+                     color = SettingsTextMuted,
+                     style = MaterialTheme.typography.bodySmall,
+                     maxLines = 1,
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowViewModel.kt b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowViewModel.kt
+index e0309f2f..e3501269 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowViewModel.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowViewModel.kt
+@@ -940,6 +940,48 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
+         }
+     }
+ 
++    fun loginWithChizui(promptSelectAccount: Boolean = false) {
++        loginJob?.cancel()
++        loginJob = viewModelScope.launch {
++            _state.update {
++                it.copy(
++                    error = null,
++                    launchPhase = "Opening ChizuiLogin...",
++                    deviceLoginPrompt = null,
++                )
++            }
++            runCatching {
++                val serverUrl = state.value.settings.chizuiLoginUrl
++                authRepository.loginWithChizui(serverUrl, promptSelectAccount)
++            }
++                .onSuccess { session ->
++                    _state.update {
++                        it.copy(
++                            authSession = session,
++                            selectedProvider = session.provider,
++                            savedAccounts = authStore.state.value.sessions.map { saved -> saved.toSavedAccount() },
++                            launchPhase = "",
++                            deviceLoginPrompt = null,
++                            error = null,
++                            page = defaultLaunchAppPage(),
++                        )
++                    }
++                    OpenNowAnalytics.capture(
++                        event = "user_logged_in_chizui",
++                        properties = mapOf(
++                            "provider" to session.provider.code,
++                            "membership_tier" to session.user.membershipTier,
++                        ),
++                    )
++                    refreshAfterAuth(session)
++                }
++                .onFailure { error ->
++                    if (error is CancellationException) return@onFailure
++                    _state.update { it.copy(error = error.message ?: "ChizuiLogin failed", launchPhase = "", deviceLoginPrompt = null) }
++                }
++        }
++    }
++
+     fun loginWithCode(provider: LoginProvider = state.value.selectedProvider) {
+         if (!provider.supportsDeviceCodeLogin) {
+             login(provider)
+@@ -3384,7 +3426,12 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
+     private fun effectiveStreamingBaseUrl(sessionOverride: AuthSession? = null): String {
+         val settings = state.value.settings
+         val auth = sessionOverride ?: state.value.authSession
+-        return settings.stream.region.trim().ifBlank { auth?.provider?.streamingServiceUrl ?: state.value.selectedProvider.streamingServiceUrl }
++        val isNvidia = auth?.provider?.code?.equals("NVIDIA", ignoreCase = true) == true
++        if (isNvidia) {
++            val region = settings.stream.region.trim()
++            if (region.isNotBlank()) return region
++        }
++        return auth?.provider?.streamingServiceUrl ?: state.value.selectedProvider.streamingServiceUrl
+     }
+ 
+     private fun shouldUsePrintedWasteQueue(auth: AuthSession): Boolean {
+diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/Persistence.kt b/android/app/src/main/java/com/opencloudgaming/opennow/Persistence.kt
+index 5b8a7a39..43efb240 100644
+--- a/android/app/src/main/java/com/opencloudgaming/opennow/Persistence.kt
++++ b/android/app/src/main/java/com/opencloudgaming/opennow/Persistence.kt
+@@ -365,6 +365,50 @@ class SettingsStore(context: Context) {
+         replace(AppSettings())
+     }
+ 
++    private fun AppSettings.normalizedForAndroid(): AppSettings {
++        val compatibleStream = stream.withCodecColorCompatibility()
++        val lowPowerSafe = compatibleStream.copy(
++            codec = compatibleStream.codec,
++            sessionProxyUrl = stream.sessionProxyUrl.trim(),
++            maxBitrateMbps = compatibleStream.maxBitrateMbps.coerceIn(1, 150),
++            fps = compatibleStream.fps.coerceIn(30, 360),
++            streamSharpeningAmount = compatibleStream.streamSharpeningAmount.coerceIn(0f, 1f),
++        )
++        return copy(
++            stream = lowPowerSafe,
++            posterSizeScale = posterSizeScale.coerceIn(MIN_GAME_CARD_SCALE, MAX_GAME_CARD_SCALE),
++            androidTouch = androidTouch.copy(
++                opacity = androidTouch.opacity.coerceIn(0.15f, 1f),
++                scale = androidTouch.scale.coerceIn(0.6f, 1.4f),
++                buttonScale = androidTouch.buttonScale.coerceIn(0.65f, 1.5f),
++                stickScale = androidTouch.stickScale.coerceIn(0.65f, 1.5f),
++                joystickDeadZone = androidTouch.joystickDeadZone.coerceIn(0f, 0.3f),
++                edgePaddingDp = androidTouch.edgePaddingDp.coerceIn(0f, 72f),
++                bottomPaddingDp = androidTouch.bottomPaddingDp.coerceIn(0f, 120f),
++                leftOffsetXDp = androidTouch.leftOffsetXDp.coerceIn(-220f, 220f),
++                leftOffsetYDp = androidTouch.leftOffsetYDp.coerceIn(-160f, 160f),
++                rightOffsetXDp = androidTouch.rightOffsetXDp.coerceIn(-220f, 220f),
++                rightOffsetYDp = androidTouch.rightOffsetYDp.coerceIn(-160f, 160f),
++                offsets = androidTouch.offsets.mapValues { (_, offset) ->
++                    TouchOffset(
++                        x = offset.x.coerceIn(-320f, 320f),
++                        y = offset.y.coerceIn(-320f, 320f)
++                    )
++                },
++            ),
++            streamIntroMusic = streamIntroMusic,
++            queueReadyMusic = queueReadyMusic,
++            legacyCropStreamToFill = false,
++            stretchStreamToFit = stretchStreamToFit,
++            streamPresentationProfileVersion = streamPresentationProfileVersion.coerceAtLeast(STREAM_PRESENTATION_PROFILE_VERSION),
++            nerdCatalogBackgroundUri = nerdCatalogBackgroundUri?.trim()?.takeIf { it.isNotBlank() },
++            tvSafeAreaPaddingDp = tvSafeAreaPaddingDp.coerceIn(0f, 120f),
++            tvLayoutProfileVersion = tvLayoutProfileVersion.coerceAtLeast(0),
++            controllerUiSounds = controllerUiSounds,
++            autoFullScreen = true,
++            chizuiLoginUrl = chizuiLoginUrl.trim(),
++        )
++    }
+ }
+ 
+ class AuthStore(context: Context) {
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+index 05775b2f..f1886456 100644
+--- a/android/app/src/main/res/values/strings.xml
++++ b/android/app/src/main/res/values/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name">OpenNOW</string>
++    <string name="app_name">OpenNOW Chizui</string>
+     <string name="status_starting_opennow">Starting OpenNOW</string>
+     <string name="login_with_provider">Sign in with %1$s</string>
+     <string name="login_tv_start">Sign in on another device with %1$s</string>
+-- 
+2.43.0
+
