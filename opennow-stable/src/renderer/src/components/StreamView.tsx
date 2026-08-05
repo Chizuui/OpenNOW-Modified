@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { AnimatePresence, m } from "motion/react";
+import { AnimatePresence } from "motion/react";
 import type { JSX } from "react";
 import { Maximize, Minimize, LogOut, AlertTriangle } from "lucide-react";
 import { SessionStartedSplash } from "./SessionStartedSplash";
@@ -53,6 +53,7 @@ interface StreamViewProps {
   };
   hideStreamButtons?: boolean;
   serverRegion?: string;
+  userSelectedRegionName?: string;
   antiAfkEnabled: boolean;
   antiAfkAckNonce: number;
   showAntiAfkIndicator: boolean;
@@ -670,18 +671,13 @@ export function StreamView({
           }}
         />
       ) : (
-        <m.video
+        <video
           ref={setVideoRef}
           autoPlay
           playsInline
           muted
           tabIndex={-1}
           className="sv-video"
-          initial={false}
-          animate={streamVideoReady
-            ? { opacity: 1, scale: 1 }
-            : { opacity: 0, scale: 1.008 }}
-          transition={{ duration: 0.9, ease: [0.22, 1, 0.36, 1] }}
           onClick={() => {
             if (localVideoRef.current && document.activeElement !== localVideoRef.current) {
               localVideoRef.current.focus({ preventScroll: true });

@@ -22,8 +22,7 @@ export type DecoderRecoveryAction =
   | "none"
   | "sender_keyframe"
   | "control_channel_keyframe"
-  | "signaling_keyframe"
-  | "bitrate_step_down";
+  | "signaling_keyframe";
 
 export interface DecoderPressureState {
   active: boolean;
@@ -40,7 +39,6 @@ interface DecoderPressureControllerDependencies {
     backlogFrames: number;
     attempt: number;
   }) => Promise<unknown>;
-  setMaxBitrateKbps: (kbps: number) => Promise<void>;
   onStateChange: (state: DecoderPressureState) => void;
   now?: () => number;
 }
@@ -51,7 +49,6 @@ const PRESSURE_CONSECUTIVE_POLLS = 3;
 const STABLE_CONSECUTIVE_POLLS = 6;
 const RECOVERY_COOLDOWN_MS = 1500;
 const KEYFRAME_COOLDOWN_MS = 1200;
-const BITRATE_STEP_FACTOR = 0.85;
 export const DECODER_MIN_RECOVERY_BITRATE_KBPS = 4000;
 
 export function classifyDecoderPressureSample(
@@ -107,8 +104,8 @@ export class DecoderPressureController {
   private lastRecoveryAtMs = 0;
   private lastKeyframeRequestAtMs = 0;
   private negotiatedMaxBitrateKbps = 0;
-  private currentBitrateCeilingKbps = 0;
   private recoveryAction: DecoderRecoveryAction = "none";
+  private lowLatencyTargetsActive = false;
   private readonly receiverLatencyTargets: Record<"video" | "audio", number | null> = {
     video: null,
     audio: null,
@@ -129,7 +126,6 @@ export class DecoderPressureController {
       DECODER_MIN_RECOVERY_BITRATE_KBPS,
       Math.floor(maxBitrateKbps),
     );
-    this.currentBitrateCeilingKbps = this.negotiatedMaxBitrateKbps;
   }
 
   classifySample(sample: DecoderPressureSample): DecoderPressureSignal {
@@ -178,8 +174,8 @@ export class DecoderPressureController {
     this.lastRecoveryAtMs = 0;
     this.lastKeyframeRequestAtMs = 0;
     this.negotiatedMaxBitrateKbps = 0;
-    this.currentBitrateCeilingKbps = 0;
     this.recoveryAction = "none";
+    this.lowLatencyTargetsActive = false;
     this.receiverLatencyTargets.video = null;
     this.receiverLatencyTargets.audio = null;
     this.activeReceivers = [];
@@ -205,9 +201,20 @@ export class DecoderPressureController {
       return;
     }
 
-    this.setPressureMode(true);
+    this.setPressureMode(true, signal.reason === "severe_stall");
     const now = this.dependencies.now?.() ?? performance.now();
     if (now - this.lastRecoveryAtMs < RECOVERY_COOLDOWN_MS) {
+      return;
+    }
+
+    // Backlog/drop pressure without a hard decode stall is usually a transient
+    // decode spike or a short network burst. Interrupting the stream with
+    // keyframes (and the old bitrate step-downs via local-SDP rewrites) just
+    // amplified the lag it was meant to fix — matching the "unexplained lag
+    // with healthy ping" reports. Keep low-latency buffering mode but leave
+    // the stream untouched; only a hard decode stall (frames received, zero
+    // decoded) justifies a keyframe.
+    if (signal.reason !== "severe_stall") {
       return;
     }
 
@@ -215,12 +222,7 @@ export class DecoderPressureController {
       signal.backlogFrames,
       signal.reason,
     );
-    let bitrateReduced = false;
-    if (!keyframeRequested || this.recoveryAttemptCount >= 1) {
-      bitrateReduced = await this.reduceBitrate();
-    }
-
-    if (keyframeRequested || bitrateReduced) {
+    if (keyframeRequested) {
       this.recoveryAttemptCount++;
       this.lastRecoveryAtMs = now;
       this.emitState();
@@ -235,19 +237,33 @@ export class DecoderPressureController {
     });
   }
 
-  private setPressureMode(active: boolean): void {
-    if (this.pressureActive === active) {
+  private setPressureMode(active: boolean, useLowLatencyTargets = false): void {
+    const targetsActive = active && useLowLatencyTargets;
+    if (
+      this.pressureActive === active
+      && this.lowLatencyTargetsActive === targetsActive
+    ) {
       return;
     }
     this.pressureActive = active;
-    this.receiverLatencyTargets.video = active
+    this.lowLatencyTargetsActive = targetsActive;
+    // Only a hard decode stall pins an explicit low-latency jitter target.
+    // Backlog/drop pressure without a stall keeps libwebrtc's adaptive target
+    // so transient jitter is absorbed instead of turning into frame drops.
+    this.receiverLatencyTargets.video = targetsActive
       ? VIDEO_PRESSURE_JITTER_TARGET_MS
       : null;
-    this.receiverLatencyTargets.audio = active
+    this.receiverLatencyTargets.audio = targetsActive
       ? AUDIO_PRESSURE_JITTER_TARGET_MS
       : null;
+    const videoTarget = this.receiverLatencyTargets.video === null
+      ? "adaptive"
+      : `${this.receiverLatencyTargets.video}ms`;
+    const audioTarget = this.receiverLatencyTargets.audio === null
+      ? "adaptive"
+      : `${this.receiverLatencyTargets.audio}ms`;
     this.dependencies.log(
-      `Decoder pressure mode ${active ? "enabled" : "cleared"}; receiver targets video=${this.receiverLatencyTargets.video ?? "adaptive"} audio=${this.receiverLatencyTargets.audio ?? "adaptive"}`,
+      `Decoder pressure mode ${active ? "enabled" : "cleared"}; receiver targets video=${videoTarget} audio=${audioTarget}`,
     );
     for (const { receiver, kind } of this.activeReceivers) {
       this.configureReceiver(receiver, kind);
@@ -336,30 +352,4 @@ export class DecoderPressureController {
     return true;
   }
 
-  private async reduceBitrate(): Promise<boolean> {
-    const pc = this.dependencies.getPeerConnection();
-    if (!pc?.localDescription) {
-      return false;
-    }
-    const current = this.currentBitrateCeilingKbps > 0
-      ? this.currentBitrateCeilingKbps
-      : this.negotiatedMaxBitrateKbps;
-    if (current <= DECODER_MIN_RECOVERY_BITRATE_KBPS) {
-      return false;
-    }
-    const next = Math.max(
-      DECODER_MIN_RECOVERY_BITRATE_KBPS,
-      Math.floor(current * BITRATE_STEP_FACTOR),
-    );
-    if (next >= current) {
-      return false;
-    }
-    await this.dependencies.setMaxBitrateKbps(next);
-    this.currentBitrateCeilingKbps = next;
-    this.recoveryAction = "bitrate_step_down";
-    this.dependencies.log(
-      `Decoder recovery: bitrate ceiling stepped down ${current} -> ${next} kbps`,
-    );
-    return true;
-  }
 }

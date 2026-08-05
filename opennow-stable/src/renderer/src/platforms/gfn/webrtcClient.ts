@@ -411,7 +411,6 @@ export class GfnWebRtcClient {
       getPeerConnection: () => this.pc,
       getControlChannel: () => this.controlChannel,
       requestSignalingKeyframe: (request) => window.openNow.requestKeyframe(request),
-      setMaxBitrateKbps: (kbps) => this.setMaxBitrateKbps(kbps),
       onStateChange: (state) => {
         this.diagnostics.decoderPressureActive = state.active;
         this.diagnostics.decoderRecoveryAttempts = state.recoveryAttempts;

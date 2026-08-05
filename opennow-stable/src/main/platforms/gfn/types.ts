@@ -135,6 +135,8 @@ export interface CloudMatchResponse {
     };
     errorCode?: number;
     gpuType?: string;
+    /** Friendly server location label reported by CloudMatch */
+    serverLocation?: string;
     connectionInfo?: Array<{
       ip?: string;
       port: number;

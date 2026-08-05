@@ -771,7 +771,7 @@ export function App(): JSX.Element {
     const activeRegion = activeUrl && regions.find(
       (region) => region.url.replace(/\/$/, "") === activeUrl,
     );
-    return activeRegion?.name ?? t("settings.region.autoBest");
+    return activeRegion ? activeRegion.name : t("settings.region.autoBest");
   }, [regions, session?.streamingBaseUrl, settings.region, t]);
 
   const {
