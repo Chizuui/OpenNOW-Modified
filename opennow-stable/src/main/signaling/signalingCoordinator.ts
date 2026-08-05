@@ -142,6 +142,16 @@ export class SignalingCoordinator {
       },
     );
 
+    ipcMain.on(
+      IPC_CHANNELS.NATIVE_UPDATE_BITRATE,
+      (_event, maxBitrateKbps: number) => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          return;
+        }
+        this.getNativeStreamerManager().updateBitrateLimit(maxBitrateKbps);
+      },
+    );
+
     ipcMain.handle(
       IPC_CHANNELS.REQUEST_KEYFRAME,
       async (_event, payload: KeyframeRequest) => {

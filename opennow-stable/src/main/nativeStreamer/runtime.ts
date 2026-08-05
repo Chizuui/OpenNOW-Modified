@@ -166,7 +166,7 @@ function configureBundledGstreamerRuntime(
     env.GST_PLUGIN_SCANNER = scanner;
     env.GST_PLUGIN_SCANNER_1_0 = scanner;
   }
-  env.GST_REGISTRY_REUSE_PLUGIN_SCANNER = "no";
+  env.GST_REGISTRY_REUSE_PLUGIN_SCANNER = "yes";
   if (isExistingDirectory(gioModulesDir)) {
     env.GIO_MODULE_DIR = gioModulesDir;
     env.GIO_EXTRA_MODULES = gioModulesDir;
@@ -175,6 +175,11 @@ function configureBundledGstreamerRuntime(
   const registryPath = join(registryDir, `${nativeStreamerPlatformKey(platform, arch)}-registry.bin`);
   mkdirSync(registryDir, { recursive: true });
   env.GST_REGISTRY = registryPath;
+  // If a registry cache exists, load it without re-scanning 800+ plugins on every
+  // process spawn. Re-scanning delays gst-launch/gst-inspect startup by tens of
+  // seconds; with the cache, startup is ~1s. The main process clears this cache
+  // automatically when the GPU driver changes, and manually via Settings.
+  env.GST_REGISTRY_UPDATE = isExistingFile(registryPath) ? "no" : "yes";
   if (platform === "linux") {
     if (isExistingDirectory(libDir)) prependEnvPath(env, "LD_LIBRARY_PATH", libDir);
     if (isExistingDirectory(binDir)) prependEnvPath(env, "LD_LIBRARY_PATH", binDir);

@@ -159,6 +159,9 @@ const api: OpenNowApi = {
   updateNativeShortcuts: (shortcuts) => {
     ipcRenderer.send(IPC_CHANNELS.NATIVE_UPDATE_SHORTCUTS, shortcuts);
   },
+  updateNativeBitrateLimit: (maxBitrateKbps) => {
+    ipcRenderer.send(IPC_CHANNELS.NATIVE_UPDATE_BITRATE, maxBitrateKbps);
+  },
   requestKeyframe: (input: KeyframeRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.REQUEST_KEYFRAME, input),
   onSignalingEvent: (listener: (event: MainToRendererSignalingEvent) => void) => {
@@ -284,6 +287,19 @@ const api: OpenNowApi = {
   getReleaseHighlights: (version?: string): Promise<import("@shared/gfn").ReleaseHighlightsPayload> =>
     ipcRenderer.invoke(IPC_CHANNELS.RELEASE_HIGHLIGHTS_GET, version),
   ackReleaseHighlights: (): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.RELEASE_HIGHLIGHTS_ACK),
+  clearGStreamerCache: (): Promise<{ cleared: boolean; path: string }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GSTREAMER_CLEAR_CACHE),
+  getGStreamerScanStatus: (): Promise<{ registryExists: boolean; registryPath: string }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GSTREAMER_GET_SCAN_STATUS),
+  onGStreamerScanStatus: (listener: (payload: { status: string; reason: string }) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, payload: { status: string; reason: string }) => {
+      listener(payload);
+    };
+    ipcRenderer.on("gstreamer-scan-status", wrapped);
+    return () => {
+      ipcRenderer.off("gstreamer-scan-status", wrapped);
+    };
+  },
   onReleaseHighlightsShow: (listener: (payload: import("@shared/gfn").ReleaseHighlightsPayload) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, payload: import("@shared/gfn").ReleaseHighlightsPayload) => {
       listener(payload);

@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, Cpu, ExternalLink, Keyboard, Monitor, RefreshCcw, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Cpu, ExternalLink, Keyboard, Monitor, RefreshCcw, Trash2, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import type { NativeStreamerStatus, NativeVideoBackendCapability, Settings } from "@shared/gfn";
 import {
@@ -58,6 +58,9 @@ export function SettingsNativeStreamerSection({
   const [nativeStreamerStatusLoading, setNativeStreamerStatusLoading] = useState(false);
   const [probeElapsedSeconds, setProbeElapsedSeconds] = useState(0);
   const probeStartedAtRef = useRef<number | null>(null);
+  const [registryStatus, setRegistryStatus] = useState<{ registryExists: boolean; registryPath: string } | null>(null);
+  const [clearingCache, setClearingCache] = useState(false);
+  const [cacheCleared, setCacheCleared] = useState(false);
   const [nativeStreamerEnablePromptOpen, setNativeStreamerEnablePromptOpen] = useState(false);
   const nativeStreamerEnablePromptConfirmRef = useRef<HTMLButtonElement | null>(null);
   const hostVideoBackends = getHostVideoBackends(nativeStreamerStatus);
@@ -110,6 +113,31 @@ export function SettingsNativeStreamerSection({
   useEffect(() => {
     void refreshNativeStreamerStatus();
   }, [refreshNativeStreamerStatus]);
+
+  // Load current GStreamer registry cache status
+  useEffect(() => {
+    if (!isNativeStreamerPlatform) return;
+    window.openNow
+      .getGStreamerScanStatus()
+      .then(setRegistryStatus)
+      .catch(() => undefined);
+  }, [isNativeStreamerPlatform]);
+
+  const handleClearGStreamerCache = useCallback(async (): Promise<void> => {
+    setClearingCache(true);
+    setCacheCleared(false);
+    try {
+      const result = await window.openNow.clearGStreamerCache();
+      setRegistryStatus((prev) => (prev ? { ...prev, registryExists: false } : prev));
+      setCacheCleared(true);
+      console.log("[Settings] GStreamer cache cleared:", result);
+    } catch (error) {
+      console.error("[Settings] Failed to clear GStreamer cache:", error);
+    } finally {
+      setClearingCache(false);
+      window.setTimeout(() => setCacheCleared(false), 3000);
+    }
+  }, []);
 
   useEffect(() => {
     if (!nativeStreamerStatusLoading) return;
@@ -320,6 +348,36 @@ export function SettingsNativeStreamerSection({
                   </div>
                 ) : null}
               </div>
+
+              {getNativeHostPlatform() === "windows" && (
+                <div className="settings-row settings-row--column">
+                  <div className="settings-row-top settings-row-top--compact">
+                    <label className="settings-label settings-label--wrap">
+                      <span className="settings-label-title">GStreamer Engine Cache</span>
+                    </label>
+                    <button
+                      type="button"
+                      className="settings-icon-button"
+                      onClick={() => void handleClearGStreamerCache()}
+                      disabled={clearingCache}
+                      title="Clear GStreamer plugin registry cache"
+                      aria-label="Clear GStreamer plugin registry cache"
+                    >
+                      {clearingCache ? <MotionSpinner size={15} label="Clearing GStreamer cache" /> : <Trash2 size={15} />}
+                    </button>
+                  </div>
+                  <span className="settings-subtle-hint">
+                    {cacheCleared
+                      ? "Cache cleared — GStreamer will rebuild it in the background on the next launch."
+                      : "Clears the plugin registry cache. GStreamer re-scans automatically on startup and after GPU driver updates. Helpful after driver changes or if plugins stop loading."}
+                  </span>
+                  {registryStatus ? (
+                    <span className="settings-subtle-hint">
+                      {registryStatus.registryExists ? "Cache present — fast startup enabled." : "No cache yet — will be built on next launch."}
+                    </span>
+                  ) : null}
+                </div>
+              )}
 
               <div className="settings-row settings-row--column settings-native-capability-row">
                 <div className="settings-native-capability-header">

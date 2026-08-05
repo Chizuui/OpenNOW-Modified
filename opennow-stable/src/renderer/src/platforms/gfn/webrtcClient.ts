@@ -35,6 +35,7 @@ import {
   extractIceCredentials,
   fixServerIp,
   mungeAnswerSdp,
+  OFFICIAL_MIN_BITRATE_KBPS,
   preferCodec,
   rewriteIceCandidateEndpoint,
   rewriteH265LevelIdByProfile,
@@ -745,24 +746,52 @@ export class GfnWebRtcClient {
   }
 
   /**
-   * Replace the b=AS bandwidth line in video sections of an SDP string.
-   * Unlike mungeAnswerSdp, this is safe to call on an already-munged SDP
-   * because it replaces the existing line rather than injecting a new one.
+   * Rewrite the NVST video bitrate attributes in a local SDP string.
+   * GFN negotiates bitrate via `a=video.initialBitrateKbps`,
+   * `a=vqos.bw.maximumBitrateKbps`, `a=vqos.bw.peakBitrateKbps`, and friends —
+   * not the classic `b=AS` line. Rewriting the actual attributes the server
+   * reads makes the Quick Menu / settings Max Bitrate slider take effect.
+   * Falls back to `b=AS` when present (already-munged answers).
    */
   private replaceVideoBitrateInSdp(sdp: string, maxBitrateKbps: number): string {
+    const startupBitrateKbps = Math.max(
+      OFFICIAL_MIN_BITRATE_KBPS,
+      Math.round(maxBitrateKbps / 4),
+    );
     const lines = sdp.split("\r\n");
     let inVideoSection = false;
-    let bitrateReplaced = false;
     const result: string[] = [];
     for (const line of lines) {
       if (line.startsWith("m=")) {
         inVideoSection = line.startsWith("m=video");
-        bitrateReplaced = false;
       }
-      if (inVideoSection && !bitrateReplaced && line.startsWith("b=AS:")) {
-        result.push(`b=AS:${maxBitrateKbps}`);
-        bitrateReplaced = true;
-        continue;
+      if (inVideoSection) {
+        const [name] = line.split(":", 2);
+        switch (name) {
+          case "a=video.initialBitrateKbps":
+            result.push(`a=video.initialBitrateKbps:${startupBitrateKbps}`);
+            continue;
+          case "a=video.initialPeakBitrateKbps":
+            result.push(`a=video.initialPeakBitrateKbps:${maxBitrateKbps}`);
+            continue;
+          case "a=vqos.bw.maximumBitrateKbps":
+            result.push(`a=vqos.bw.maximumBitrateKbps:${maxBitrateKbps}`);
+            continue;
+          case "a=vqos.bw.peakBitrateKbps":
+            result.push(`a=vqos.bw.peakBitrateKbps:${maxBitrateKbps}`);
+            continue;
+          case "a=vqos.bw.serverPeakBitrateKbps":
+            result.push(`a=vqos.bw.serverPeakBitrateKbps:${maxBitrateKbps}`);
+            continue;
+          case "a=vqos.grc.maximumBitrateKbps":
+            result.push(`a=vqos.grc.maximumBitrateKbps:${maxBitrateKbps}`);
+            continue;
+          case "b=AS":
+            result.push(`b=AS:${maxBitrateKbps}`);
+            continue;
+          default:
+            break;
+        }
       }
       result.push(line);
     }
@@ -770,23 +799,25 @@ export class GfnWebRtcClient {
   }
 
   /**
-   * Update the maximum receive bitrate ceiling mid-stream by replacing b=AS
-   * in the local SDP and re-applying it. Chrome/Electron honours this change
-   * without requiring a full ICE renegotiation.
+   * Update the maximum receive bitrate ceiling mid-stream by rewriting the
+   * NVST bitrate attributes in the local SDP and re-applying it.
+   * Chrome/Electron honours this change without requiring a full ICE
+   * renegotiation.
    */
   public async setMaxBitrateKbps(kbps: number): Promise<void> {
     if (!this.pc || !this.pc.localDescription) {
       return;
     }
+    const normalizedKbps = Math.max(OFFICIAL_MIN_BITRATE_KBPS, Math.floor(kbps));
     const updatedSdp = this.replaceVideoBitrateInSdp(
       this.pc.localDescription.sdp,
-      kbps,
+      normalizedKbps,
     );
     try {
       await this.pc.setLocalDescription(
         new RTCSessionDescription({ type: this.pc.localDescription.type, sdp: updatedSdp }),
       );
-      this.log(`Bitrate ceiling updated to ${kbps} kbps via local SDP`);
+      this.log(`Bitrate ceiling updated to ${normalizedKbps} kbps via local SDP`);
     } catch (err) {
       this.log(`setMaxBitrateKbps failed (non-fatal): ${String(err)}`);
     }
