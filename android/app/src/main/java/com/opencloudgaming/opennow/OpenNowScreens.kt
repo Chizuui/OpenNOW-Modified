@@ -135,6 +135,7 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.Typography
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -262,6 +263,10 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
+import com.opencloudgaming.opennow.screens.tv.TvFeaturedCarousel
+import com.opencloudgaming.opennow.screens.tv.TvImmersiveList
+import com.opencloudgaming.opennow.screens.tv.TvTypographyScheme
+import com.opencloudgaming.opennow.screens.tv.TvWideCard
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -327,7 +332,11 @@ internal fun uiAccentLabel(accent: UiAccent): String = when (accent) {
 }
 
 @Composable
-fun OpenNowTheme(settings: AppSettings, content: @Composable () -> Unit) {
+fun OpenNowTheme(
+    settings: AppSettings,
+    typography: Typography = OpenNowTypography,
+    content: @Composable () -> Unit,
+) {
     val context = LocalContext.current
     val accent = settings.uiAccent.color
     val fallbackScheme = darkColorScheme(
@@ -369,7 +378,7 @@ fun OpenNowTheme(settings: AppSettings, content: @Composable () -> Unit) {
     CompositionLocalProvider(LocalReduceMotion provides reduceMotion) {
         MaterialTheme(
             colorScheme = colorScheme,
-            typography = OpenNowTypography,
+            typography = typography,
             shapes = OpenNowShapes,
             content = content,
         )
@@ -534,7 +543,12 @@ fun OpenNowApp(viewModel: OpenNowViewModel) {
         },
     )
 
-    OpenNowTheme(state.settings) {
+    OpenNowTheme(
+        settings = state.settings,
+        // TV gets the TV Design Kit type scale (titles 32sp, body 24sp, actions 22sp) across every
+        // screen — game details, settings, dialogs and stream chrome — without touching call sites.
+        typography = if (state.androidTvProfile) TvTypographyScheme else OpenNowTypography,
+    ) {
         val primaryColor = MaterialTheme.colorScheme.primary
         CompositionLocalProvider(
             LocalTvLoadingProfile provides state.androidTvProfile,
@@ -2346,7 +2360,12 @@ private fun MainShell(
                                     },
                                     onDetailRouteChange = { settingsDetailRouteOpen = it },
                                 )
-                                AppPage.Stream -> StreamScreen(state, viewModel)
+                                // Keep the in-stream chrome (controls panel over live video, status
+                                // readouts) at the dense phone type scale even on TV — it overlays
+                                // gameplay and must not push fixed-height rows off-screen.
+                                AppPage.Stream -> MaterialTheme(typography = OpenNowTypography) {
+                                    StreamScreen(state, viewModel)
+                                }
                             }
                         }
                         if (showMinimizedQueueDock && showNavigationRail) {
@@ -3341,6 +3360,16 @@ private fun LibraryScreen(
                         tvProfile = tvProfile,
                         modifier = Modifier.weight(1f),
                     )
+                } else if (tvProfile && games.isNotEmpty()) {
+                    // TV Design Kit immersive list — full-width rows with focus-revealed actions.
+                    TvImmersiveList(
+                        games = games,
+                        favoriteIds = state.settings.favoriteGameIds,
+                        onSelect = viewModel::selectGame,
+                        onFavorite = viewModel::updateFavorites,
+                        onPlay = viewModel::play,
+                        modifier = Modifier.weight(1f),
+                    )
                 } else {
                     GameGrid(
                         games,
@@ -4121,18 +4150,27 @@ private fun StoreStartRails(
         // The hero leads, then the rails — the catalog opens on one thing worth looking at rather
         // than on three equally-weighted horizontal strips.
         if (featured.isNotEmpty()) {
-            StoreComingNextCarousel(
-                title = stringResource(R.string.store_coming_next),
-                games = featured,
-                favoriteIds = favoriteIds,
-                settings = settings,
-                tvProfile = tvProfile,
-                controllerActionMode = controllerActionMode,
-                onSelect = onSelect,
-                onFavorite = onFavorite,
-                onPlay = onPlay,
-                onChooseStore = onChooseStore,
-            )
+            if (tvProfile) {
+                // TV Design Kit featured carousel — hero scale typography for the TV experience.
+                TvFeaturedCarousel(
+                    games = featured,
+                    onSelect = onSelect,
+                    onPlay = onPlay,
+                )
+            } else {
+                StoreComingNextCarousel(
+                    title = stringResource(R.string.store_coming_next),
+                    games = featured,
+                    favoriteIds = favoriteIds,
+                    settings = settings,
+                    tvProfile = tvProfile,
+                    controllerActionMode = controllerActionMode,
+                    onSelect = onSelect,
+                    onFavorite = onFavorite,
+                    onPlay = onPlay,
+                    onChooseStore = onChooseStore,
+                )
+            }
         }
         StoreStartRail(R.string.store_continue_playing, startRails.continuePlaying, favoriteIds, settings, tvProfile, controllerActionMode, onSelect, onFavorite, onPlay, onChooseStore)
         StoreStartRail(R.string.store_in_queue, startRails.inQueue, favoriteIds, settings, tvProfile, controllerActionMode, onSelect, onFavorite, onPlay, onChooseStore)
@@ -4434,19 +4472,32 @@ private fun StoreRailSection(
                     contentPadding = PaddingValues(horizontal = contentInset),
                 ) {
                     items(games, key = { storeRailGameKey(it) }) { game ->
-                        StoreRailGameCard(
-                            game = game,
-                            favorite = game.id in favoriteIds,
-                            tvProfile = tvProfile,
-                            expressiveUi = settings.expressiveUi,
-                            controllerBackgroundAnimations = settings.controllerBackgroundAnimations,
-                            width = cardWidth,
-                            controllerActionMode = controllerActionMode,
-                            onSelect = onSelect,
-                            onFavorite = onFavorite,
-                            onPlay = onPlay,
-                            onChooseStore = onChooseStore,
-                        )
+                        if (tvProfile) {
+                            // TV Design Kit wide card — 16:9 landscape cards for the TV rails.
+                            TvWideCard(
+                                game = game,
+                                favorite = game.id in favoriteIds,
+                                width = TV_RAIL_WIDE_CARD_WIDTH,
+                                onClick = { onSelect(game) },
+                                onFavorite = { onFavorite(game.id) },
+                                onPlay = { onPlay(game) },
+                                onChooseStore = { onChooseStore(game) },
+                            )
+                        } else {
+                            StoreRailGameCard(
+                                game = game,
+                                favorite = game.id in favoriteIds,
+                                tvProfile = tvProfile,
+                                expressiveUi = settings.expressiveUi,
+                                controllerBackgroundAnimations = settings.controllerBackgroundAnimations,
+                                width = cardWidth,
+                                controllerActionMode = controllerActionMode,
+                                onSelect = onSelect,
+                                onFavorite = onFavorite,
+                                onPlay = onPlay,
+                                onChooseStore = onChooseStore,
+                            )
+                        }
                     }
                 }
             }
@@ -4786,6 +4837,12 @@ private fun storeRailCardWidth(tvProfile: Boolean, landscapeLayout: Boolean): Dp
         landscapeLayout -> 146.dp
         else -> 142.dp
     }
+
+/**
+ * TV wide cards (16:9, TV Design Kit) are deliberately much larger than the square phone-rail
+ * cards, so the rail shows fewer, richer tiles that read across the room.
+ */
+private val TV_RAIL_WIDE_CARD_WIDTH = 300.dp
 
 @Composable
 private fun BoxScope.ControllerFocusFrame(
