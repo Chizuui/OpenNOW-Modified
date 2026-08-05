@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "native/opennow-streamer"
+]
+resolver = "2"
