@@ -74,8 +74,8 @@ internal fun AppDataSettingsPanel(viewModel: OpenNowViewModel) {
     if (clearCacheConfirmOpen) {
         AlertDialog(
             onDismissRequest = { clearCacheConfirmOpen = false },
-            title = { Text("Clear game cache?") },
-            text = { Text("Cached store, library, and search results will be removed. Your account and settings stay unchanged.") },
+            title = { Text(stringResource(R.string.settings_clear_cache_title)) },
+            text = { Text(stringResource(R.string.settings_clear_cache_body)) },
             confirmButton = {
                 Button(
                     onClick = {
@@ -83,7 +83,7 @@ internal fun AppDataSettingsPanel(viewModel: OpenNowViewModel) {
                         viewModel.clearCatalogCache()
                     },
                 ) {
-                    Text("Clear cache")
+                    Text(stringResource(R.string.settings_clear_cache))
                 }
             },
             dismissButton = {
@@ -96,8 +96,8 @@ internal fun AppDataSettingsPanel(viewModel: OpenNowViewModel) {
     if (resetSettingsConfirmOpen) {
         AlertDialog(
             onDismissRequest = { resetSettingsConfirmOpen = false },
-            title = { Text("Reset settings and app data?") },
-            text = { Text("Accounts, settings, cached games, tutorial state, and local app files will be removed. OpenNOW will relaunch like a fresh install.") },
+            title = { Text(stringResource(R.string.settings_reset_title)) },
+            text = { Text(stringResource(R.string.settings_reset_body)) },
             confirmButton = {
                 Button(
                     onClick = {
@@ -105,7 +105,7 @@ internal fun AppDataSettingsPanel(viewModel: OpenNowViewModel) {
                         viewModel.resetSettings()
                     },
                 ) {
-                    Text("Reset and relaunch")
+                    Text(stringResource(R.string.settings_reset))
                 }
             },
             dismissButton = {
@@ -124,14 +124,14 @@ internal fun AppDataSettingsPanel(viewModel: OpenNowViewModel) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 OutlinedButton(onClick = { clearCacheConfirmOpen = true }, modifier = Modifier.weight(1f)) {
-                    Text("Clear cache", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(stringResource(R.string.settings_clear_cache), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 OutlinedButton(onClick = viewModel::resetStreamTutorial, modifier = Modifier.weight(1f)) {
-                    Text("Reset tutorial", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(stringResource(R.string.settings_reset_tutorial), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
             OutlinedButton(onClick = { resetSettingsConfirmOpen = true }, modifier = Modifier.fillMaxWidth()) {
-                Text("Reset settings", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(stringResource(R.string.settings_reset), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -541,7 +541,7 @@ internal fun AccountSettingsPanel(state: OpenNowUiState, viewModel: OpenNowViewM
                         Text("Active", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                     } else {
                         OutlinedButton(onClick = { viewModel.switchAccount(account.userId) }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)) {
-                            Text("Switch")
+                            Text(stringResource(R.string.settings_account_switch))
                         }
                     }
                 }
@@ -563,10 +563,10 @@ internal fun AccountSettingsPanel(state: OpenNowUiState, viewModel: OpenNowViewM
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(onClick = { addAccountPromptOpen = true }, modifier = Modifier.weight(1f)) { Text("Add account") }
-            OutlinedButton(onClick = viewModel::logout, modifier = Modifier.weight(1f)) { Text("Sign out") }
+            Button(onClick = { addAccountPromptOpen = true }, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.settings_account_add)) }
+            OutlinedButton(onClick = viewModel::logout, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.settings_account_sign_out)) }
         }
-        OutlinedButton(onClick = viewModel::logoutAll, modifier = Modifier.fillMaxWidth()) { Text("Sign out all accounts") }
+        OutlinedButton(onClick = viewModel::logoutAll, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.settings_account_sign_out_all)) }
         AccountPlayTimeStatsPanel(
             subscriptionInfo = state.subscriptionInfo,
             fallbackMembershipTier = state.authSession?.user?.membershipTier,
@@ -617,7 +617,7 @@ private fun AddAccountProviderDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Choose provider") },
+        title = { Text(stringResource(R.string.settings_choose_provider)) },
         text = {
             Column(
                 Modifier
@@ -658,8 +658,7 @@ private fun AddAccountProviderDialog(
                 } else {
                     onProviderSelected(providerChoice)
                 }
-            }) {
-                Text("Continue")
+            }) {                    Text(stringResource(R.string.settings_provider_continue))
             }
         },
         dismissButton = {
@@ -997,8 +996,8 @@ private fun AccountConnectorsPanel(
     disconnecting?.let { connector ->
         AlertDialog(
             onDismissRequest = { disconnecting = null },
-            title = { Text("Disconnect ${connector.label}?") },
-            text = { Text("This removes the linked ${connector.label} account from GeForce NOW. You can connect it again later.") },
+            title = { Text(stringResource(R.string.settings_connector_disconnect_title, connector.label)) },
+            text = { Text(stringResource(R.string.settings_connector_disconnect_body, connector.label)) },
             confirmButton = {
                 Button(
                     onClick = {
@@ -1006,7 +1005,7 @@ private fun AccountConnectorsPanel(
                         onDisconnect(connector)
                     },
                 ) {
-                    Text("Disconnect")
+                    Text(stringResource(R.string.settings_connector_disconnect))
                 }
             },
             dismissButton = {
@@ -1532,7 +1531,7 @@ internal fun DebugLogsPanel(state: OpenNowUiState, viewModel: OpenNowViewModel) 
                 copied = true
             },
         ) {
-            Text("Copy error")
+            Text(stringResource(R.string.settings_copy_error))
         }
     }
     saveError?.let {
@@ -1621,7 +1620,7 @@ internal fun BatteryOptimizationPanel() {
                         }
                     }
                 ) {
-                    Text("Allow")
+                    Text(stringResource(R.string.settings_battery_allow))
                 }
             } else {
                 OutlinedButton(
@@ -1631,7 +1630,7 @@ internal fun BatteryOptimizationPanel() {
                         } catch (_: Exception) {}
                     }
                 ) {
-                    Text("Settings")
+                    Text(stringResource(R.string.settings_battery_settings))
                 }
             }
         }

@@ -676,7 +676,7 @@ private fun SessionReportDialog(
             Modifier
         },
         properties = DialogProperties(usePlatformDefaultWidth = !landscapeLayout),
-        title = { Text("Session report") },
+        title = { Text(stringResource(R.string.session_report_title)) },
         text = {
             if (landscapeLayout) {
                 Row(
@@ -735,7 +735,7 @@ private fun SessionReportDialog(
                 )
             }
         },
-        confirmButton = { Button(onClick = { onDismiss(dontShowAgain) }) { Text("Done") } },
+        confirmButton = { Button(onClick = { onDismiss(dontShowAgain) }) { Text(stringResource(R.string.session_report_done)) } },
     )
 }
 
@@ -1043,8 +1043,8 @@ private fun CompletedSessionBugReportDialog(
     if (confirmationOpen) {
         AlertDialog(
             onDismissRequest = { confirmationOpen = false },
-            title = { Text("Send bug report?") },
-            text = { Text("Send this report and the attached redacted diagnostics to PrintedWaste API?") },
+            title = { Text(stringResource(R.string.bug_report_confirm_title)) },
+            text = { Text(stringResource(R.string.bug_report_confirm_body)) },
             confirmButton = {
                 Button(
                     onClick = {
@@ -1156,11 +1156,11 @@ private fun DiagnosticShareDialog(
     when {
         share.uploading -> AlertDialog(
             onDismissRequest = {},
-            title = { Text("Preparing diagnostics") },
+            title = { Text(stringResource(R.string.diagnostic_preparing)) },
             text = {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     CircularProgressIndicator(Modifier.size(28.dp))
-                    Text("Removing sensitive values and creating a temporary paste…")
+                    Text(stringResource(R.string.diagnostic_removing_sensitive))
                 }
             },
             confirmButton = {},
@@ -1178,12 +1178,12 @@ private fun DiagnosticShareDialog(
                         if (state.androidTvProfile) {
                             if (qrCode != null) {
                                 QrCodeView(qrCode, Modifier.size(240.dp))
-                                Text("Scan this QR code on your phone. The sanitized paste expires within 24 hours.")
+                                Text(stringResource(R.string.diagnostic_qr_scan))
                             } else {
-                                Text("Could not create the QR code. Close this dialog and try again.")
+                                Text(stringResource(R.string.diagnostic_qr_failed))
                             }
                         } else {
-                            Text("Device, account type, stream profile, current status, and the temporary paste URL were copied to the clipboard.")
+                            Text(stringResource(R.string.diagnostic_copied))
                             Text(
                                 share.pasteUrl,
                                 color = MaterialTheme.colorScheme.primary,
@@ -1198,15 +1198,15 @@ private fun DiagnosticShareDialog(
         }
         else -> AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text("Create temporary diagnostics paste?") },
+            title = { Text(stringResource(R.string.diagnostic_create_paste)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("OpenNOW will remove tokens, account identifiers, email addresses, session IDs, and network addresses before uploading.")
+                    Text(stringResource(R.string.diagnostic_remove_explanation))
                     Text("The randomized link is unlisted but not encrypted, and the paste service deletes uploads within 24 hours.", color = TextMuted)
                     share.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
             },
-            confirmButton = { Button(onClick = onUpload) { Text(if (share.error == null) "Sanitize and upload" else "Retry") } },
+            confirmButton = { Button(onClick = onUpload) { Text(if (share.error == null) stringResource(R.string.diagnostic_upload) else stringResource(R.string.diagnostic_retry)) } },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
         )
     }
@@ -1218,8 +1218,7 @@ private fun AnalyticsConsentDialog(
     onDecline: () -> Unit,
 ) {
     AlertDialog(
-        onDismissRequest = onDecline,
-        title = { Text("Share diagnostics?") },
+        onDismissRequest = onDecline,            title = { Text(stringResource(R.string.analytics_share_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
@@ -1234,12 +1233,12 @@ private fun AnalyticsConsentDialog(
         },
         confirmButton = {
             Button(onClick = onAllow) {
-                Text("Share analytics")
+                Text(stringResource(R.string.analytics_share_allow))
             }
         },
         dismissButton = {
             TextButton(onClick = onDecline) {
-                Text("Keep off")
+                Text(stringResource(R.string.analytics_share_decline))
             }
         },
     )
@@ -1454,10 +1453,10 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     if (state.loginToolsVisible) {
         AlertDialog(
             onDismissRequest = viewModel::dismissLoginTools,
-            title = { Text("Sign-in tools") },
+            title = { Text(stringResource(R.string.login_tools_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Use a token to sign in without the browser, or export diagnostics before signing in.")
+                    Text(stringResource(R.string.login_tools_description))
                     Button(
                         onClick = {
                             viewModel.dismissLoginTools()
@@ -1466,7 +1465,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         enabled = !normalLoginBusy,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Sign in with token")
+                        Text(stringResource(R.string.login_with_token))
                     }
                     OutlinedButton(
                         onClick = {
@@ -1505,15 +1504,15 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 tokenInput = ""
                 tokenDialogVisible = false
             },
-            title = { Text("Sign in with token") },
+            title = { Text(stringResource(R.string.login_token_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Paste an NVIDIA access token or token-response JSON. OpenNOW verifies the access token before saving the account.")
+                    Text(stringResource(R.string.login_token_description))
                     OutlinedTextField(
                         value = tokenInput,
                         onValueChange = { tokenInput = it },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Access token") },
+                        label = { Text(stringResource(R.string.login_token_label)) },
                         minLines = 3,
                         maxLines = 6,
                         visualTransformation = PasswordVisualTransformation(),
@@ -8466,7 +8465,7 @@ private fun PhysicalControllerTouchControlsDialog(
 ) {
     AlertDialog(
         onDismissRequest = onOk,
-        title = { Text("Controller detected") },
+        title = { Text(stringResource(R.string.controller_detected_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
@@ -9750,7 +9749,7 @@ private fun BugReportFormInputs(
                 Spacer(Modifier.width(8.dp))
                 Text("Uploading report…")
             } else {
-                Text("Send bug report")
+                Text(stringResource(R.string.bug_report_open_label))
             }
         }
     }
