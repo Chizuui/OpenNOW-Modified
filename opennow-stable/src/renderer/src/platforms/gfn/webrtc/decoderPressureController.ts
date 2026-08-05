@@ -1,3 +1,5 @@
+import { normalizeJitterBufferMode, type JitterBufferMode } from "@shared/gfn";
+
 export interface DecoderPressureSample {
   framesReceived: number;
   framesDecoded: number;
@@ -43,8 +45,32 @@ interface DecoderPressureControllerDependencies {
   now?: () => number;
 }
 
-const VIDEO_PRESSURE_JITTER_TARGET_MS = 30;
-const AUDIO_PRESSURE_JITTER_TARGET_MS = 32;
+const PRESSURE_VIDEO_JITTER_TARGET_MS = 30;
+const PRESSURE_AUDIO_JITTER_TARGET_MS = 32;
+// User-selectable normal-playback jitter buffer floors (video/audio ms).
+// libwebrtc's fully-adaptive buffer shrinks toward a few ms whenever the link
+// looks clean, leaving zero headroom for the next jitter spike — which is
+// exactly the "occasional lag with healthy ping" on long international links
+// (e.g. India → Indonesia). An explicit floor delays frames instead of dropping
+// them, and it grows with the measured RTT so NACK retransmissions (one full
+// RTT) still fit inside.
+//   low      → minimal buffering, lowest latency, jitter-sensitive
+//   balanced → ~2 frames of headroom, good default
+//   smooth   → large headroom that absorbs jitter spikes at the cost of latency
+export const JITTER_BUFFER_PRESETS: Record<JitterBufferMode, {
+  video: number;
+  audio: number;
+}> = {
+  low: { video: 20, audio: 35 },
+  balanced: { video: 35, audio: 50 },
+  smooth: { video: 70, audio: 100 },
+};
+
+const MAX_VIDEO_JITTER_TARGET_MS = 100;
+const VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR = 0.5;
+// Only re-apply receiver tuning when the floor moves by at least this much, so
+// oscillating RTT (43↔45ms) does not churn the jitter buffer target every poll.
+const JITTER_FLOOR_DEADBAND_MS = 5;
 const PRESSURE_CONSECUTIVE_POLLS = 3;
 const STABLE_CONSECUTIVE_POLLS = 6;
 const RECOVERY_COOLDOWN_MS = 1500;
@@ -84,13 +110,23 @@ export function classifyDecoderPressureSample(
     };
   }
 
-  const active = (backlogHigh && (dropRateHigh || dropBurst || decodeSaturated))
-    || (dropBurst && decodeSaturated);
+  // A sudden burst of dropped frames (while the decoder otherwise keeps up) is
+  // the signature of a jitter spike overrunning the buffer. The picture stays
+  // frozen until the next natural keyframe, which reads as "sometimes lags".
+  // Flag it so recovery requests a keyframe immediately instead of waiting.
+  if (dropBurst) {
+    return {
+      active: true,
+      reason: "drop_burst",
+      backlogFrames,
+      dropRatePercent,
+    };
+  }
+
+  const active = backlogHigh && (dropRateHigh || decodeSaturated);
   return {
     active,
-    reason: active
-      ? (backlogHigh ? "backlog_and_drop" : "decode_saturated")
-      : "stable",
+    reason: active ? "backlog_and_drop" : "stable",
     backlogFrames,
     dropRatePercent,
   };
@@ -109,6 +145,14 @@ export class DecoderPressureController {
   private readonly receiverLatencyTargets: Record<"video" | "audio", number | null> = {
     video: null,
     audio: null,
+  };
+  private jitterBufferMode: JitterBufferMode = "balanced";
+  /** Base floors from the active preset; the RTT-adaptive floor grows on top. */
+  private presetJitterTargets: Record<"video" | "audio", number> = {
+    ...JITTER_BUFFER_PRESETS.balanced,
+  };
+  private baseJitterTargets: Record<"video" | "audio", number> = {
+    ...JITTER_BUFFER_PRESETS.balanced,
   };
   private activeReceivers: Array<{
     receiver: RTCRtpReceiver;
@@ -141,19 +185,19 @@ export class DecoderPressureController {
     }
 
     try {
-      const targetMs = this.receiverLatencyTargets[kind];
+      const targetMs = this.effectiveTargetMs(kind);
       const rawReceiver = receiver as unknown as Record<string, unknown>;
       if ("jitterBufferTarget" in receiver) {
         rawReceiver.jitterBufferTarget = targetMs;
         this.dependencies.log(
-          `${kind} receiver: jitterBufferTarget ${targetMs === null ? "adaptive" : `${targetMs}ms`}`,
+          `${kind} receiver: jitterBufferTarget ${targetMs}ms`,
         );
       }
       if ("playoutDelayHint" in receiver) {
-        const playoutDelaySeconds = targetMs === null ? null : targetMs / 1000;
+        const playoutDelaySeconds = targetMs / 1000;
         rawReceiver.playoutDelayHint = playoutDelaySeconds;
         this.dependencies.log(
-          `${kind} receiver: playoutDelayHint ${playoutDelaySeconds === null ? "adaptive" : `${playoutDelaySeconds}s`}`,
+          `${kind} receiver: playoutDelayHint ${playoutDelaySeconds}s`,
         );
       }
       if (kind === "video" && "contentHint" in receiver.track) {
@@ -163,6 +207,62 @@ export class DecoderPressureController {
       this.dependencies.log(
         `Warning: could not apply ${kind} low-latency receiver tuning: ${String(error)}`,
       );
+    }
+  }
+
+  /**
+   * Switch the normal-playback jitter buffer preset. Re-applies the receiver
+   * targets immediately so the change takes effect mid-stream, and resets the
+   * RTT-adaptive floor back to the new preset's base (it grows again on the
+   * next stats poll). No-op when the mode is unchanged.
+   */
+  setJitterBufferMode(mode: JitterBufferMode): void {
+    const normalized = normalizeJitterBufferMode(mode);
+    if (normalized === this.jitterBufferMode) {
+      return;
+    }
+    this.jitterBufferMode = normalized;
+    this.presetJitterTargets = { ...JITTER_BUFFER_PRESETS[normalized] };
+    this.baseJitterTargets = { ...this.presetJitterTargets };
+    this.dependencies.log(
+      `Jitter buffer preset: ${normalized} (video=${this.presetJitterTargets.video}ms audio=${this.presetJitterTargets.audio}ms)`,
+    );
+    for (const { receiver, kind } of this.activeReceivers) {
+      this.configureReceiver(receiver, kind);
+    }
+  }
+
+  /**
+   * Grow the normal-playback jitter buffer floor with the measured RTT so a
+   * NACK retransmission (which takes one full RTT) still lands inside the
+   * buffer instead of dropping the frame and stuttering. The preset's base
+   * floor is the lower bound; the adaptive floor only ever grows from there.
+   * Called once per stats poll; no-op when the floor did not change.
+   */
+  updateJitterFloorFromRtt(rttMs: number): void {
+    if (!Number.isFinite(rttMs) || rttMs <= 0) {
+      return;
+    }
+    const videoFloor = Math.round(
+      Math.min(
+        MAX_VIDEO_JITTER_TARGET_MS,
+        Math.max(this.presetJitterTargets.video, rttMs * VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR),
+      ),
+    );
+    const audioFloor = Math.max(this.presetJitterTargets.audio, videoFloor + 15);
+    if (
+      Math.abs(videoFloor - this.baseJitterTargets.video) < JITTER_FLOOR_DEADBAND_MS
+      && Math.abs(audioFloor - this.baseJitterTargets.audio) < JITTER_FLOOR_DEADBAND_MS
+    ) {
+      return;
+    }
+    this.baseJitterTargets.video = videoFloor;
+    this.baseJitterTargets.audio = audioFloor;
+    this.dependencies.log(
+      `Jitter buffer floor adapted to link RTT ${rttMs}ms: video=${videoFloor}ms audio=${audioFloor}ms`,
+    );
+    for (const { receiver, kind } of this.activeReceivers) {
+      this.configureReceiver(receiver, kind);
     }
   }
 
@@ -178,6 +278,8 @@ export class DecoderPressureController {
     this.lowLatencyTargetsActive = false;
     this.receiverLatencyTargets.video = null;
     this.receiverLatencyTargets.audio = null;
+    this.presetJitterTargets = { ...JITTER_BUFFER_PRESETS[this.jitterBufferMode] };
+    this.baseJitterTargets = { ...this.presetJitterTargets };
     this.activeReceivers = [];
     this.emitState();
   }
@@ -197,7 +299,13 @@ export class DecoderPressureController {
 
     this.stableConsecutivePolls = 0;
     this.pressureConsecutivePolls++;
-    if (this.pressureConsecutivePolls < PRESSURE_CONSECUTIVE_POLLS) {
+
+    // A drop burst is a single-sample event — waiting PRESSURE_CONSECUTIVE_POLLS
+    // (≈3s) would leave the picture frozen for seconds. React immediately; the
+    // keyframe cooldown still prevents spamming. severe_stall keeps the debounce
+    // (it already implies ~2s of received-but-undecoded frames).
+    const urgent = signal.reason === "drop_burst";
+    if (!urgent && this.pressureConsecutivePolls < PRESSURE_CONSECUTIVE_POLLS) {
       return;
     }
 
@@ -211,10 +319,10 @@ export class DecoderPressureController {
     // decode spike or a short network burst. Interrupting the stream with
     // keyframes (and the old bitrate step-downs via local-SDP rewrites) just
     // amplified the lag it was meant to fix — matching the "unexplained lag
-    // with healthy ping" reports. Keep low-latency buffering mode but leave
-    // the stream untouched; only a hard decode stall (frames received, zero
-    // decoded) justifies a keyframe.
-    if (signal.reason !== "severe_stall") {
+    // with healthy ping" reports. Only a hard decode stall (frames received,
+    // zero decoded) or an actual drop burst (picture visibly froze) justifies
+    // a keyframe.
+    if (signal.reason !== "severe_stall" && signal.reason !== "drop_burst") {
       return;
     }
 
@@ -237,6 +345,10 @@ export class DecoderPressureController {
     });
   }
 
+  private effectiveTargetMs(kind: "video" | "audio"): number {
+    return this.receiverLatencyTargets[kind] ?? this.baseJitterTargets[kind];
+  }
+
   private setPressureMode(active: boolean, useLowLatencyTargets = false): void {
     const targetsActive = active && useLowLatencyTargets;
     if (
@@ -248,22 +360,16 @@ export class DecoderPressureController {
     this.pressureActive = active;
     this.lowLatencyTargetsActive = targetsActive;
     // Only a hard decode stall pins an explicit low-latency jitter target.
-    // Backlog/drop pressure without a stall keeps libwebrtc's adaptive target
-    // so transient jitter is absorbed instead of turning into frame drops.
+    // Backlog/drop pressure without a stall keeps the normal jitter floor so
+    // transient jitter is absorbed instead of turning into frame drops.
     this.receiverLatencyTargets.video = targetsActive
-      ? VIDEO_PRESSURE_JITTER_TARGET_MS
+      ? PRESSURE_VIDEO_JITTER_TARGET_MS
       : null;
     this.receiverLatencyTargets.audio = targetsActive
-      ? AUDIO_PRESSURE_JITTER_TARGET_MS
+      ? PRESSURE_AUDIO_JITTER_TARGET_MS
       : null;
-    const videoTarget = this.receiverLatencyTargets.video === null
-      ? "adaptive"
-      : `${this.receiverLatencyTargets.video}ms`;
-    const audioTarget = this.receiverLatencyTargets.audio === null
-      ? "adaptive"
-      : `${this.receiverLatencyTargets.audio}ms`;
     this.dependencies.log(
-      `Decoder pressure mode ${active ? "enabled" : "cleared"}; receiver targets video=${videoTarget} audio=${audioTarget}`,
+      `Decoder pressure mode ${active ? "enabled" : "cleared"}; receiver targets video=${this.effectiveTargetMs("video")}ms audio=${this.effectiveTargetMs("audio")}ms`,
     );
     for (const { receiver, kind } of this.activeReceivers) {
       this.configureReceiver(receiver, kind);

@@ -2,6 +2,22 @@ export type VideoCodec = "H264" | "H265" | "AV1";
 export type VideoAccelerationPreference = "auto" | "hardware" | "software";
 export type StreamClientMode = "web" | "native";
 /**
+ * User-selectable jitter buffer aggressiveness (web mode).
+ * - `"low"`: minimal buffering, lowest latency, most sensitive to jitter spikes.
+ * - `"balanced"`: modest floor (~2 frames) plus RTT-adaptive growth (default).
+ * - `"smooth"": larger floor that absorbs jitter spikes at the cost of latency.
+ */
+export type JitterBufferMode = "low" | "balanced" | "smooth";
+
+export const JITTER_BUFFER_MODES: readonly JitterBufferMode[] = ["low", "balanced", "smooth"] as const;
+
+/** Normalize an unknown persisted value to a valid jitter buffer mode. */
+export function normalizeJitterBufferMode(raw: unknown): JitterBufferMode {
+  return JITTER_BUFFER_MODES.includes(raw as JitterBufferMode)
+    ? (raw as JitterBufferMode)
+    : "balanced";
+}
+/**
  * How the server-side session should present launched games.
  * Mirrors the official client's AppLaunchMode: TV/console clients request
  * "gamepadFriendly" so launchers (e.g. Steam) start in big picture mode.

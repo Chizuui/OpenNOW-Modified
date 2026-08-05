@@ -1366,6 +1366,14 @@ export function App(): JSX.Element {
         // ignore
       }
     }
+    if (key === "jitterBufferMode") {
+      try {
+        // Web mode: apply the preset to the running WebRTC client immediately.
+        (clientRef.current as any)?.setJitterBufferMode?.(value);
+      } catch {
+        // ignore
+      }
+    }
   }, []);
 
   const updateSetting = useCallback(async <K extends keyof Settings>(key: K, value: Settings[K]): Promise<void> => {

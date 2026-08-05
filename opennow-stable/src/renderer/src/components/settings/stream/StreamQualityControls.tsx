@@ -9,6 +9,7 @@ import {
   colorQualityRequiresHevc,
   expandEntitledStreamResolutions,
   getSafeFallbackEntitledResolutions,
+  JITTER_BUFFER_MODES,
   resolveEntitledStreamProfile,
 } from "@shared/gfn";
 import { getCodecDecodeBadgeState, type CodecTestResult } from "../../../lib/codecDiagnostics";
@@ -303,6 +304,35 @@ export function StreamQualityControls({
         />
         <span className="settings-subtle-hint">
           {t("settings.video.recordingBitrateHint")}
+        </span>
+      </div>
+
+      <div className="settings-row settings-row--column">
+        <div className="settings-row-top">
+          <label className="settings-label">{t("settings.video.jitterBuffer")}</label>
+        </div>
+        <div className="settings-chip-row">
+          {JITTER_BUFFER_MODES.map((mode) => {
+            const label = mode === "low"
+              ? t("settings.video.jitterBufferLow")
+              : mode === "smooth"
+                ? t("settings.video.jitterBufferSmooth")
+                : t("settings.video.jitterBufferBalanced");
+            return (
+              <button
+                key={mode}
+                type="button"
+                className={`settings-chip ${settings.jitterBufferMode === mode ? "active" : ""}`}
+                aria-pressed={settings.jitterBufferMode === mode}
+                onClick={() => handleChange("jitterBufferMode", mode)}
+              >
+                <span>{label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <span className="settings-subtle-hint">
+          {t("settings.video.jitterBufferHint")}
         </span>
       </div>
     </>

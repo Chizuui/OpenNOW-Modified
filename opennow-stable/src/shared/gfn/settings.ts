@@ -1,5 +1,6 @@
 import type {
   ColorQuality,
+  JitterBufferMode,
   NativeTransitionDiagnostics,
   StreamClientMode,
   VideoAccelerationPreference,
@@ -54,6 +55,8 @@ export interface Settings {
   posterSizeScale: number;
   fps: number;
   maxBitrateMbps: number;
+  /** Web-mode jitter buffer aggressiveness: low latency / balanced / smooth */
+  jitterBufferMode: JitterBufferMode;
   /** Recording video bitrate in Mbps; null means let MediaRecorder choose automatically */
   recordingBitrateMbps: number | null;
   streamClientMode: StreamClientMode;
@@ -229,6 +232,7 @@ export function createDefaultSettings(platform: string): Settings {
     posterSizeScale: 1.05,
     fps: 60,
     maxBitrateMbps: 75,
+    jitterBufferMode: "balanced",
     recordingBitrateMbps: null,
     streamClientMode: "web",
     nativeStreamerBackend: "gstreamer",
