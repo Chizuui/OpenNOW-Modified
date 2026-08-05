@@ -25,6 +25,7 @@ import com.opencloudgaming.opennow.AndroidUpdateStatus
 import com.opencloudgaming.opennow.OpenNowViewModel
 import com.opencloudgaming.opennow.OpenNowUiState
 import com.opencloudgaming.opennow.formatAndroidUpdateProgress
+import com.opencloudgaming.opennow.isAndroidUpdateCheckBlockedByStream
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import java.text.DateFormat
 import java.util.Date

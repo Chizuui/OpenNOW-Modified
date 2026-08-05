@@ -10,6 +10,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import com.opencloudgaming.opennow.OpenNowMark
 import com.opencloudgaming.opennow.OpenNowViewModel
 import com.opencloudgaming.opennow.OpenNowUiState
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
@@ -47,7 +49,7 @@ internal fun LoadingScreen(text: String) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp)
         ) {
-            com.opencloudgaming.opennow.OpenNowMark(72.dp)
+            OpenNowMark(72.dp)
             CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
             Text(text, color = TextMuted)
         }

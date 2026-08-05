@@ -1911,7 +1911,7 @@ internal fun QrCodeView(qrCode: QrCode, modifier: Modifier = Modifier) {
     }
 }
 
-private fun secondsUntil(deadlineMs: Long): Int =
+internal fun secondsUntil(deadlineMs: Long): Int =
     ((deadlineMs - System.currentTimeMillis()).coerceAtLeast(0L) / 1000L).toInt()
 
 private fun isPhoneLandscape(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
@@ -3603,7 +3603,7 @@ private fun RefreshingGamesPlaceholder(
 
 private val LocalShimmerOffset = staticCompositionLocalOf<State<Float>?> { null }
 private val LocalTvLoadingPulse = staticCompositionLocalOf<State<Float>?> { null }
-private val LocalTvLoadingProfile = staticCompositionLocalOf { false }
+internal val LocalTvLoadingProfile = staticCompositionLocalOf { false }
 private val LocalTouchControllerStyle = staticCompositionLocalOf { TouchControllerStyle.V1 }
 private const val SHIMMER_CYCLE_DURATION_MS = 760
 
@@ -7702,7 +7702,7 @@ private fun StreamSessionTimerMenuRow(
     }
 }
 
-private fun formatSessionTimerDuration(totalSeconds: Int): String {
+internal fun formatSessionTimerDuration(totalSeconds: Int): String {
     val seconds = totalSeconds.coerceAtLeast(0)
     val hours = seconds / 3600
     val minutes = (seconds % 3600) / 60
@@ -9115,7 +9115,7 @@ private fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
 }
 
 @Composable
-private fun BugReportDataDisclosure(
+internal fun BugReportDataDisclosure(
     includeTypedTextWarning: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -9416,7 +9416,7 @@ private fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun BugReportVersionGateCard(
+internal fun BugReportVersionGateCard(
     update: AndroidUpdateState,
     versionCheck: AndroidBugReportVersionCheckState,
     onRetry: () -> Unit,
@@ -11196,7 +11196,7 @@ private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: 
     }
 }
 
-private fun formatRuntimeResolution(resolution: String): String {
+internal fun formatRuntimeResolution(resolution: String): String {
     val parts = resolution.lowercase(Locale.US).split("x", limit = 2)
     return if (parts.size == 2 && parts.all { it.trim().isNotBlank() }) {
         "${parts[0].trim()}x${parts[1].trim()}"
@@ -11205,7 +11205,7 @@ private fun formatRuntimeResolution(resolution: String): String {
     }
 }
 
-private fun formatRuntimeBitrate(bitrateKbps: Int?): String {
+internal fun formatRuntimeBitrate(bitrateKbps: Int?): String {
     val kbps = bitrateKbps ?: return "--"
     return if (kbps >= 1000) {
         "${(kbps / 1000.0).let { kotlin.math.round(it * 10.0) / 10.0 }} Mbps"
@@ -14437,7 +14437,7 @@ private fun regionLabel(region: String): String = when (region) {
 }
 
 @Composable
-private fun ProviderPicker(providers: List<LoginProvider>, selected: LoginProvider, onSelect: (LoginProvider) -> Unit) {
+internal fun ProviderPicker(providers: List<LoginProvider>, selected: LoginProvider, onSelect: (LoginProvider) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         OutlinedButton(onClick = { expanded = true }) { Text(selected.displayName) }
@@ -14606,7 +14606,7 @@ private fun LoadingShimmer(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun OpenNowMark(size: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
+internal fun OpenNowMark(size: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
     Image(
         painter = painterResource(R.drawable.opennow_logo_mark),
         contentDescription = "OpenNOW",

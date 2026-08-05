@@ -460,7 +460,7 @@ private fun updateMessageColor(status: AndroidUpdateStatus): Color =
         else -> SettingsTextMuted
     }
 
-private fun formatAndroidUpdateProgress(progress: AndroidUpdateProgress): String {
+internal fun formatAndroidUpdateProgress(progress: AndroidUpdateProgress): String {
     val bytes = progress.totalBytes?.let { total ->
         "${formatUpdateBytes(progress.transferredBytes)} / ${formatUpdateBytes(total)}"
     } ?: formatUpdateBytes(progress.transferredBytes)
@@ -1233,7 +1233,7 @@ internal fun CodecDiagnosticsPanel(report: RuntimeCodecReport?) {
     }
 }
 
-private fun formatCodecDiagnosticReport(report: RuntimeCodecReport): String = buildString {
+internal fun formatCodecDiagnosticReport(report: RuntimeCodecReport): String = buildString {
     appendLine("OpenNOW Android codec diagnostics")
     appendLine("nativeRuntimeSummary=${report.nativeRuntimeSummary}")
     appendLine("androidTvProfile=${report.androidTvProfile}")

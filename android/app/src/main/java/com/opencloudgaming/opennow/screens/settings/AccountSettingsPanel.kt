@@ -61,13 +61,14 @@ import com.opencloudgaming.opennow.R
 import com.opencloudgaming.opennow.SavedAccount
 import com.opencloudgaming.opennow.StorageAddon
 import com.opencloudgaming.opennow.SubscriptionInfo
-import com.opencloudgaming.opennow.gfn.addStorageUrl
-import com.opencloudgaming.opennow.gfn.accountHelpUrl
-import com.opencloudgaming.opennow.gfn.storageManagementUrl
-import com.opencloudgaming.opennow.gfn.storageResetUrl
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import java.util.Locale
 import kotlin.math.roundToInt
+
+private const val GFN_ADD_STORAGE_URL = "https://gfn.link/addstorage"
+private const val GFN_ACCOUNT_HELP_URL = "https://gfn.link/5399"
+private const val GFN_STORAGE_MANAGEMENT_URL = "https://gfn.link/cloudstorage"
+private const val GFN_STORAGE_RESET_URL = "https://gfn.link/resetstorage"
 
 private val SettingsText = OpenNowPalette.TextPrimary
 private val SettingsTextMuted = OpenNowPalette.TextMuted

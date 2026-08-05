@@ -1,6 +1,7 @@
 package com.opencloudgaming.opennow.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -232,13 +233,13 @@ private fun SessionReportConnection(report: SessionReport) {
                 label = stringResource(R.string.session_report_metric_fps),
                 value = report.averageFps?.let { "%.1f / %d".format(Locale.US, it, report.targetFps) },
                 detail = stringResource(R.string.session_report_fps_detail),
-                quality = report.averageFps?.let(StreamQuality::frameRate(it, report.targetFps)),
+                quality = report.averageFps?.let { StreamQuality.frameRate(it, report.targetFps) },
             ),
             SessionReportMetricData(
                 label = stringResource(R.string.session_report_metric_decode),
                 value = report.averageDecodeMs?.let { "%.1f ms".format(Locale.US, it) },
                 detail = stringResource(R.string.session_report_decode_detail),
-                quality = report.averageDecodeMs?.let(StreamQuality::decode(it, report.targetFps)),
+                quality = report.averageDecodeMs?.let { StreamQuality.decode(it, report.targetFps) },
             ),
         ),
     )
@@ -359,9 +360,4 @@ private fun SessionReportMetric(metric: SessionReportMetricData, modifier: Modif
 private fun normalizeSessionReportResolution(value: String?): Pair<Int, Int>? =
     value?.let(::parseResolutionPixelsOrNull)
 
-// Extension function for clickable
-private fun Modifier.clickable(onClick: () -> Unit): Modifier {
-    return this.then(
-        Modifier.clip(RoundedCornerShape(OpenNowRadius.sm))
-    )
-}
+
