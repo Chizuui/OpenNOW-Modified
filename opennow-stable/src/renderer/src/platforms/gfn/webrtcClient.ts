@@ -2,6 +2,7 @@ import type {
   IceCandidatePayload,
   ColorQuality,
   IceServer,
+  JitterBufferMode,
   SessionInfo,
   VideoCodec,
   MicrophoneMode,
@@ -103,6 +104,8 @@ interface OfferSettings {
   resolution: string;
   fps: number;
   maxBitrateKbps: number;
+  /** Web-mode jitter buffer aggressiveness preset (defaults to balanced). */
+  jitterBufferMode?: JitterBufferMode;
   nativeTransitionDiagnostics?: NativeTransitionDiagnostics;
 }
 
@@ -804,6 +807,12 @@ export class GfnWebRtcClient {
    * Chrome/Electron honours this change without requiring a full ICE
    * renegotiation.
    */
+  /** Update the jitter buffer preset live (applies to current receivers). */
+  public setJitterBufferMode(mode: JitterBufferMode): void {
+    this.decoderPressureController.setJitterBufferMode(mode);
+    this.log(`Jitter buffer mode updated to ${mode}`);
+  }
+
   public async setMaxBitrateKbps(kbps: number): Promise<void> {
     if (!this.pc || !this.pc.localDescription) {
       return;
@@ -824,9 +833,12 @@ export class GfnWebRtcClient {
   }
 
   /**
-   * Keep the receiver on libwebrtc's adaptive jitter target during normal
-   * playback, matching the smooth Android-native path. A small explicit target
-   * is used only while recovering from decoder pressure.
+   * Jitter buffer policy (web mode): keep an explicit user-selectable floor
+   * during normal playback (low/balanced/smooth presets, scaled up with
+   * measured RTT) so jitter spikes on long international links are absorbed
+   * instead of turning into dropped frames. A tighter target is pinned only
+   * while recovering from a hard decode stall. Drop bursts request a keyframe
+   * immediately.
    */
   private log(message: string): void {
     this.options.onLog(message);
@@ -944,6 +956,7 @@ export class GfnWebRtcClient {
     this.currentResolution = settings.resolution;
     this.isHdr = settings.colorQuality.startsWith("10bit");
     this.decoderPressureController.initializeBitrate(settings.maxBitrateKbps);
+    this.decoderPressureController.setJitterBufferMode(settings.jitterBufferMode ?? "balanced");
 
     this.diagnostics.resolution = settings.resolution;
     this.diagnostics.codec = codec;
@@ -1214,6 +1227,11 @@ export class GfnWebRtcClient {
       const rtt = Number(activePair.currentRoundTripTime);
       this.diagnostics.rttMs = Math.round(rtt * 1000 * 10) / 10;
     }
+
+    // Grow the jitter buffer floor with the measured link RTT so NACK
+    // retransmissions (one full RTT) land inside the buffer instead of
+    // dropping the frame and stuttering on high-latency routes.
+    this.decoderPressureController.updateJitterFloorFromRtt(this.diagnostics.rttMs);
 
     const reliableBufferedAmount = this.reliableInputChannel?.bufferedAmount ?? 0;
     const partiallyReliableBufferedAmount = this.partiallyReliableInputChannel?.bufferedAmount ?? 0;

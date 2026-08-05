@@ -271,6 +271,7 @@ export function useSignalingEvents({
               resolution: settings.resolution,
               fps: settings.fps,
               maxBitrateKbps: settings.maxBitrateMbps * 1000,
+              jitterBufferMode: settings.jitterBufferMode,
               nativeTransitionDiagnostics: settings.nativeTransitionDiagnostics,
             });
             setLaunchError(null);

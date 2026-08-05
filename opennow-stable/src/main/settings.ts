@@ -12,6 +12,7 @@ import {
   createDefaultSettings,
   createPlatformShortcutDefaults,
   SHORTCUT_SETTING_KEYS,
+  normalizeJitterBufferMode,
   normalizeNativeExternalRendererForPlatform,
   normalizeStreamClientModeForPlatform,
   normalizeStreamPreferences,
@@ -265,6 +266,11 @@ export class SettingsManager {
     );
     if (settings.transportMode !== transportMode) {
       settings.transportMode = transportMode;
+      migrated = true;
+    }
+    const jitterBufferMode = normalizeJitterBufferMode(settings.jitterBufferMode);
+    if (settings.jitterBufferMode !== jitterBufferMode) {
+      settings.jitterBufferMode = jitterBufferMode;
       migrated = true;
     }
     const nativeVideoBackend = normalizeNativeVideoBackendPreference(settings.nativeVideoBackend);

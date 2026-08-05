@@ -37,15 +37,15 @@ test("decoder recovery tracks pressure but leaves the stream alone for backlog/d
   });
 
   // Non-severe pressure (backlog + drops) must NOT interrupt the stream:
-  // no keyframes, no bitrate churn, and the jitter buffer stays adaptive
-  // so transient jitter is absorbed instead of turning into frame drops.
+  // no keyframes, no bitrate churn, and the jitter buffer keeps its normal
+  // floor so transient jitter is absorbed instead of turning into frame drops.
   await controller.recover(pressureSignal);
   await controller.recover(pressureSignal);
   await controller.recover(pressureSignal);
   assert.equal(keyframeRequests, 0);
   assert.ok(
-    logs.some((line) => line.includes("video=adaptive audio=adaptive")),
-    "backlog/drop pressure keeps adaptive jitter targets",
+    logs.some((line) => line.includes("video=35ms audio=50ms")),
+    "backlog/drop pressure keeps the normal jitter floor",
   );
   assert.deepEqual(states.at(-1), {
     active: true,
@@ -104,6 +104,153 @@ test("decoder recovery requests a keyframe only on a severe decode stall", async
     recoveryAttempts: 1,
     recoveryAction: "signaling_keyframe",
   });
+});
+
+test("drop burst requests a keyframe immediately without the multi-poll debounce", async () => {
+  const states: DecoderPressureState[] = [];
+  const logs: string[] = [];
+  let keyframeRequests = 0;
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {
+      keyframeRequests++;
+    },
+    onStateChange: (state) => states.push(state),
+    now: () => 2_000,
+  });
+
+  const burstSignal: DecoderPressureSignal = {
+    active: true,
+    reason: "drop_burst",
+    backlogFrames: 12,
+    dropRatePercent: 4,
+  };
+
+  // A single drop_burst sample must trigger an immediate keyframe (the picture
+  // is already frozen; waiting ~3s of polls would leave the stutter visible).
+  await controller.recover(burstSignal);
+  assert.equal(keyframeRequests, 1);
+  assert.ok(
+    logs.some((line) => line.includes("keyframe requested (reason=drop_burst")),
+    "drop burst requests a keyframe",
+  );
+
+  // The keyframe cooldown still throttles repeated bursts.
+  await controller.recover(burstSignal);
+  assert.equal(keyframeRequests, 1);
+
+  const stableSignal: DecoderPressureSignal = {
+    active: false,
+    reason: "stable",
+    backlogFrames: 0,
+    dropRatePercent: 0,
+  };
+  for (let index = 0; index < 6; index++) {
+    await controller.recover(stableSignal);
+  }
+  assert.deepEqual(states.at(-1), {
+    active: false,
+    recoveryAttempts: 0,
+    recoveryAction: "none",
+  });
+});
+
+function makeFakeReceiver(kind: "video" | "audio"): RTCRtpReceiver {
+  const receiver: Record<string, unknown> = {
+    jitterBufferTarget: undefined,
+    playoutDelayHint: undefined,
+    track: { kind, contentHint: "" },
+  };
+  return receiver as unknown as RTCRtpReceiver;
+}
+
+test("jitter buffer floor grows with measured RTT and clamps to bounds", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // Low RTT stays at the balanced preset floor; the adaptive floor never
+  // shrinks below the preset base.
+  controller.updateJitterFloorFromRtt(20);
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+  assert.equal(audioReceiver.jitterBufferTarget, 50);
+
+  controller.updateJitterFloorFromRtt(160);
+  assert.equal(videoReceiver.jitterBufferTarget, 80);
+  assert.equal(audioReceiver.jitterBufferTarget, 95);
+  assert.ok(
+    logs.some((line) => line.includes("video=80ms audio=95ms")),
+    "RTT 160ms -> 80ms video floor (0.5x)",
+  );
+
+  // Deadband: a 2ms floor swing (80 -> 82) must NOT re-apply the receiver target.
+  const logCountBefore = logs.length;
+  controller.updateJitterFloorFromRtt(164);
+  assert.equal(
+    logs.length,
+    logCountBefore,
+    "small RTT swings inside the deadband do not churn the jitter target",
+  );
+
+  controller.updateJitterFloorFromRtt(400);
+  assert.equal(videoReceiver.jitterBufferTarget, 100);
+  assert.equal(audioReceiver.jitterBufferTarget, 115);
+  assert.ok(
+    logs.some((line) => line.includes("video=100ms audio=115ms")),
+    "very high RTT caps at the 100ms maximum",
+  );
+});
+
+test("jitter buffer preset switch applies new floors live and resets the RTT floor", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // Default preset is balanced.
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+  assert.equal(audioReceiver.jitterBufferTarget, 50);
+
+  // Switching to "low" applies to receivers immediately.
+  controller.setJitterBufferMode("low");
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+  assert.equal(audioReceiver.jitterBufferTarget, 35);
+
+  // RTT scaling never drops below the preset floor.
+  controller.updateJitterFloorFromRtt(20);
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+  assert.equal(audioReceiver.jitterBufferTarget, 35);
+
+  // "smooth" provides large headroom.
+  controller.setJitterBufferMode("smooth");
+  assert.equal(videoReceiver.jitterBufferTarget, 70);
+  assert.equal(audioReceiver.jitterBufferTarget, 100);
+
+  // Re-setting the same mode is a no-op.
+  const logCountBefore = logs.length;
+  controller.setJitterBufferMode("smooth");
+  assert.equal(logs.length, logCountBefore);
 });
 
 test("input policy preserves native, partially-reliable, and fallback routes", () => {

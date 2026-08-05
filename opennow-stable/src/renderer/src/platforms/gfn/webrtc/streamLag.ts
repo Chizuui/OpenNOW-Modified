@@ -36,7 +36,10 @@ export function classifyStreamLagReason(
   if (params.packetLossPercent >= 1) networkSignals.push(`${params.packetLossPercent.toFixed(1)}% loss`);
   if (params.rttMs >= 75) networkSignals.push(`RTT ${params.rttMs.toFixed(0)}ms`);
   if (params.jitterMs >= 12) networkSignals.push(`jitter ${params.jitterMs.toFixed(1)}ms`);
-  if (params.jitterBufferDelayMs >= 20) networkSignals.push(`buffer ${params.jitterBufferDelayMs.toFixed(1)}ms`);
+  // The client keeps an intentional jitter buffer floor (30-100ms, RTT-scaled),
+  // so a small buffer reading is expected and healthy. Only a buffer that has
+  // grown well past even the maximum floor indicates real congestion.
+  if (params.jitterBufferDelayMs >= 150) networkSignals.push(`buffer ${params.jitterBufferDelayMs.toFixed(1)}ms`);
   if (networkSignals.length > 0) {
     return {
       reason: "network",
