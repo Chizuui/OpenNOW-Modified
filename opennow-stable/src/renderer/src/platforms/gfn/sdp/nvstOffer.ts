@@ -9,7 +9,7 @@ import {
 // repair and frame-state assumptions no longer line up.
 const ENABLE_240_FPS_SPLIT_ENCODE = true;
 const ENABLE_DYNAMIC_SPLIT_ENCODE_UPDATES = true;
-const OFFICIAL_MIN_BITRATE_KBPS = 4000;
+export const OFFICIAL_MIN_BITRATE_KBPS = 4000;
 const HIGH_RESOLUTION_PIXEL_COUNT = 2764800; // 2560x1080 / 1920x1440 class
 const HIGH_BITRATE_PACING_THRESHOLD_KBPS = 42000;
 

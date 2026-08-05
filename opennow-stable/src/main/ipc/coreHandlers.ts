@@ -27,6 +27,9 @@ import {
   setActivity,
   clearActivity,
 } from "../discordRpc";
+import { unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { registerMediaIpcHandlers } from "./mediaHandlers";
 import { getAppBuildInfo } from "../appBuildInfo";
 import { getReleaseHighlightsPayload, normalizeReleaseVersion } from "../releaseHighlights";
@@ -424,6 +427,50 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
       app.getVersion().replace(/^v/, ""),
     );
   });
+
+  ipcMain.handle(
+    IPC_CHANNELS.GSTREAMER_CLEAR_CACHE,
+    async (): Promise<{ cleared: boolean; path: string }> => {
+      if (process.platform !== "win32") {
+        return { cleared: false, path: "" };
+      }
+      try {
+        const platformKey = `${process.platform}-${process.arch}`;
+        const registryPath = join(
+          app.getPath("userData"),
+          "native-streamer",
+          "gstreamer",
+          `${platformKey}-registry.bin`,
+        );
+        if (existsSync(registryPath)) {
+          await unlink(registryPath);
+          console.log("[Main] GStreamer plugin registry cache cleared successfully.");
+          return { cleared: true, path: registryPath };
+        }
+        return { cleared: false, path: registryPath };
+      } catch (err) {
+        console.error("[Main] Failed to clear GStreamer cache:", err);
+        return { cleared: false, path: "" };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.GSTREAMER_GET_SCAN_STATUS,
+    async (): Promise<{ registryExists: boolean; registryPath: string }> => {
+      const platformKey = `${process.platform}-${process.arch}`;
+      const registryPath = join(
+        app.getPath("userData"),
+        "native-streamer",
+        "gstreamer",
+        `${platformKey}-registry.bin`,
+      );
+      return {
+        registryExists: existsSync(registryPath),
+        registryPath,
+      };
+    },
+  );
 
   // Save window size when it changes (skip fullscreen so the saved size
   // stays meaningful for windowed launches, e.g. after console mode)

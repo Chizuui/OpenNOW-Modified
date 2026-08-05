@@ -146,6 +146,9 @@ export interface OpenNowApi {
   setNativeInputPaused(paused: boolean): void;
   updateNativeRenderSurface(input: NativeRenderSurfaceUpdate): void;
   updateNativeShortcuts(shortcuts: NativeStreamerShortcutBindings): void;
+
+  /** Update the native streamer receive bitrate limit mid-session (Kbps) */
+  updateNativeBitrateLimit(maxBitrateKbps: number): void;
   requestKeyframe(input: KeyframeRequest): Promise<void>;
   onSignalingEvent(listener: (event: MainToRendererSignalingEvent) => void): () => void;
   /** Listen for F11 fullscreen toggle from main process */
@@ -267,4 +270,13 @@ export interface OpenNowApi {
 
   /** Subscribe to automatic release-highlights show events from main process */
   onReleaseHighlightsShow(listener: (payload: ReleaseHighlightsPayload) => void): () => void;
+
+  /** Clear the GStreamer plugin registry cache (forces re-scan on next stream) */
+  clearGStreamerCache(): Promise<{ cleared: boolean; path: string }>;
+
+  /** Get current GStreamer registry scan status */
+  getGStreamerScanStatus(): Promise<{ registryExists: boolean; registryPath: string }>;
+
+  /** Subscribe to GStreamer plugin scan status events from the main process */
+  onGStreamerScanStatus(listener: (payload: { status: string; reason: string }) => void): () => void;
 }

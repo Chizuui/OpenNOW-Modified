@@ -46,6 +46,7 @@ export const IPC_CHANNELS = {
   NATIVE_INPUT_MODE_CHANGE: "gfn:native-input-mode-change",
   NATIVE_RENDER_SURFACE: "gfn:native-render-surface",
   NATIVE_UPDATE_SHORTCUTS: "gfn:native-update-shortcuts",
+  NATIVE_UPDATE_BITRATE: "gfn:native-update-bitrate",
   REQUEST_KEYFRAME: "gfn:request-keyframe",
   SIGNALING_EVENT: "gfn:signaling-event",
   TOGGLE_FULLSCREEN: "window:toggle-fullscreen",
@@ -109,6 +110,8 @@ export const IPC_CHANNELS = {
   RELEASE_HIGHLIGHTS_GET: "release-highlights:get",
   RELEASE_HIGHLIGHTS_ACK: "release-highlights:ack",
   RELEASE_HIGHLIGHTS_SHOW: "release-highlights:show",
+  GSTREAMER_CLEAR_CACHE: "gstreamer:clear-cache",
+  GSTREAMER_GET_SCAN_STATUS: "gstreamer:get-scan-status",
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

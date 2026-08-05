@@ -97,6 +97,7 @@ import { ReleaseHighlightsModal } from "./components/ReleaseHighlightsModal";
 import { ErrorReportingConsentModal } from "./components/ErrorReportingConsentModal";
 import { FeedbackModal } from "./components/FeedbackModal";
 import { ModalSurface } from "./components/ui/ModalSurface";
+import { MotionSpinner } from "./components/MotionSpinner";
 import { overlayMotion, pageTransition, streamRevealTransition } from "./components/MotionProvider";
 import { LazyShaderAtmosphere } from "./components/LazyShaderAtmosphere";
 import { syncRendererTelemetry } from "./telemetry/posthog";
@@ -147,6 +148,7 @@ export function App(): JSX.Element {
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedbackSurfacePresent, setFeedbackSurfacePresent] = useState(false);
   const [consentSurfacePresent, setConsentSurfacePresent] = useState(false);
+  const [gstScanState, setGstScanState] = useState<{ status: string; reason: string } | null>(null);
   const activeSessionProxyUrl = useMemo(
     () => getEnabledSessionProxyUrl(settings),
     [settings.sessionProxyEnabled, settings.sessionProxyUrl],
@@ -451,6 +453,34 @@ export function App(): JSX.Element {
   useEffect(() => {
     if (removeAccountConfirmOpen) setRemoveAccountConfirmSurfacePresent(true);
   }, [removeAccountConfirmOpen]);
+
+  // GStreamer plugin scan status listener (registry warm-up / driver re-scan)
+  useEffect(() => {
+    const hideTimerRef = { current: 0 as number | undefined };
+    const unsubscribe = window.openNow.onGStreamerScanStatus(({ status, reason }) => {
+      console.log(`[App] GStreamer scan status: ${status} (reason: ${reason})`);
+      if (status === "scanning") {
+        if (hideTimerRef.current !== undefined) {
+          window.clearTimeout(hideTimerRef.current);
+          hideTimerRef.current = undefined;
+        }
+        setGstScanState({ status, reason });
+      } else {
+        // Keep state briefly so the user sees the result, then clear.
+        // "failed" stays a bit longer so the message is readable.
+        hideTimerRef.current = window.setTimeout(
+          () => setGstScanState(null),
+          status === "failed" ? 4000 : 2000,
+        );
+      }
+    });
+    return () => {
+      unsubscribe();
+      if (hideTimerRef.current !== undefined) {
+        window.clearTimeout(hideTimerRef.current);
+      }
+    };
+  }, []);
 
   const effectiveControllerModeForCatalog = settings.controllerMode || directLaunchConsoleMode;
   const effectiveStreamingBaseUrlForCatalog = settings.region.trim()
@@ -1326,7 +1356,12 @@ export function App(): JSX.Element {
     }
     if (key === "maxBitrateMbps") {
       try {
-        void (clientRef.current as any)?.setMaxBitrateKbps?.((value as number) * 1000);
+        const kbps = (value as number) * 1000;
+        // WebRTC (web mode): rewrite NVST bitrate attributes in the local SDP.
+        void (clientRef.current as any)?.setMaxBitrateKbps?.(kbps);
+        // Native streamer mode: the renderer does not own the peer connection,
+        // so forward the new limit to the main process -> native streamer.
+        window.openNow.updateNativeBitrateLimit(kbps);
       } catch {
         // ignore
       }
@@ -2897,6 +2932,21 @@ export function App(): JSX.Element {
       </SettingsModalHost>
       {logoutConfirmModal}
       {removeAccountConfirmModal}
+      {/* GStreamer Scan Status Toast */}
+      {gstScanState && (
+        <div className={`gst-scan-toast${gstScanState.status === "failed" ? " gst-scan-toast--error" : ""}`}>
+          {gstScanState.status === "failed" ? null : <MotionSpinner size={16} />}
+          <span>
+            {gstScanState.status === "failed"
+              ? "GStreamer engine scan failed — streamer may be slow to start."
+              : gstScanState.reason === "driver-update"
+                ? "GPU driver updated — rebuilding GStreamer engine..."
+                : gstScanState.reason === "first-scan"
+                  ? "First launch — preparing GStreamer engine..."
+                  : "GStreamer background scan in progress..."}
+          </span>
+        </div>
+      )}
       <GameDetailModal
         open={detailsGame !== null}
         game={detailsGame}
