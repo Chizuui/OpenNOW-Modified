@@ -829,10 +829,18 @@ export class GfnWebRtcClient {
   }
 
   public async setMaxBitrateKbps(kbps: number): Promise<void> {
+    const normalizedKbps = Math.max(OFFICIAL_MIN_BITRATE_KBPS, Math.floor(kbps));
+    // The cloud-gaming client is receive-only (it never adds a video track), so
+    // there is usually no video sender to cap via setParameters. The server's
+    // encode ceiling is negotiated in the NVST SDP at session start and cannot
+    // change mid-session — but the HUD target must still reflect the new
+    // setting, otherwise moving the bitrate slider changes nothing visible.
+    this.decoderPressureController.initializeBitrate(normalizedKbps);
+    this.diagnostics.targetBitrateKbps = this.decoderPressureController.targetBitrateKbps;
+    this.emitStats();
     if (!this.pc || !this.pc.localDescription) {
       return;
     }
-    const normalizedKbps = Math.max(OFFICIAL_MIN_BITRATE_KBPS, Math.floor(kbps));
     const videoSender = this.pc.getSenders().find(s => s.track?.kind === 'video');
     if (videoSender) {
       const params = videoSender.getParameters();
@@ -843,7 +851,9 @@ export class GfnWebRtcClient {
       await videoSender.setParameters(params);
       this.log(`Bitrate ceiling updated to ${normalizedKbps} kbps via sender parameters`);
     } else {
-      this.log("Could not find video sender to update bitrate");
+      this.log(
+        `Bitrate target updated to ${normalizedKbps} kbps (HUD); server cap applies at next session negotiation`,
+      );
     }
   }
 
@@ -1411,6 +1421,12 @@ export class GfnWebRtcClient {
     settings?: OfferSettings,
     options?: { electronInputBridge?: boolean },
   ): void {
+    // Preserve the codec WebRTC actually negotiated (which may differ from the
+    // requested one after a fallback) before the peer connection is torn down:
+    // cleanupPeerConnection resets diagnostics and re-applying the requested
+    // codec below would wipe the live codec from the HUD — hiding both the real
+    // codec and its fallback note a few seconds into the session.
+    const negotiatedCodec = this.currentCodec;
     this.cleanupPeerConnection();
     this.nativeInputActive = true;
     // Internal (one-window) mode: Electron owns capture and IPC-forwards packets.
@@ -1433,10 +1449,14 @@ export class GfnWebRtcClient {
     this.diagnostics.nativeRendererActive = true;
     if (settings) {
       this.applyStreamSettingsDiagnostics(settings, settings.codec, true);
+      if (negotiatedCodec && negotiatedCodec !== settings.codec) {
+        this.currentCodec = negotiatedCodec;
+        this.diagnostics.codec = negotiatedCodec;
+      }
     } else {
       this.diagnostics.hardwareAcceleration = describeNativeHardwareAcceleration();
-      this.diagnostics.codec = this.currentCodec || "Native";
-      this.diagnostics.requestedCodec = this.currentCodec || "";
+      this.diagnostics.codec = negotiatedCodec || "Native";
+      this.diagnostics.requestedCodec = negotiatedCodec || "";
     }
     this.diagnostics.lagReason = "stable";
     this.diagnostics.lagReasonDetail = this.nativeElectronInputBridge
