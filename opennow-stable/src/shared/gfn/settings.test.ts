@@ -58,6 +58,6 @@ test("creates fresh platform shortcut collections", () => {
   first.bindings.shortcutToggleStats = "F4";
   first.sidebarToggleAliases.push("Alt+G");
 
-  assert.equal(second.bindings.shortcutToggleStats, "F3");
+  assert.equal(second.bindings.shortcutToggleStats, "Ctrl+N");
   assert.deepEqual(second.sidebarToggleAliases, ["Ctrl+G", "Ctrl+Shift+G"]);
 });
