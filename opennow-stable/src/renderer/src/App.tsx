@@ -47,7 +47,7 @@ import { useQueueAdRuntime } from "./hooks/useQueueAdRuntime";
 import { usePlaytime } from "./utils/usePlaytime";
 import { createStreamDiagnosticsStore, useStreamDiagnosticsSelector } from "./utils/streamDiagnosticsStore";
 import type { StreamStatus } from "./lib/appTypes";
-import { loadStoredCodecResults, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
+import { getCodecToMigrateToAuto, loadStoredCodecResults, resolveStreamProfileCodec, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
 import {
   createSyntheticDirectLaunchGame,
   findDirectLaunchTarget,
@@ -149,6 +149,7 @@ export function App(): JSX.Element {
   const [feedbackSurfacePresent, setFeedbackSurfacePresent] = useState(false);
   const [consentSurfacePresent, setConsentSurfacePresent] = useState(false);
   const [gstScanState, setGstScanState] = useState<{ status: string; reason: string } | null>(null);
+  const [codecMigratedNotice, setCodecMigratedNotice] = useState<{ fromCodec: string } | null>(null);
   const activeSessionProxyUrl = useMemo(
     () => getEnabledSessionProxyUrl(settings),
     [settings.sessionProxyEnabled, settings.sessionProxyUrl],
@@ -670,12 +671,17 @@ export function App(): JSX.Element {
     });
     const streamProfile = entitledProfile ?? SAFE_FALLBACK_STREAM_PROFILE;
 
+    // Resolve "auto" to a concrete codec the device can receive, and re-pin
+    // color quality against the resolved codec, before the preference reaches
+    // main (cloudmatch/native streamer) or the WebRTC client.
+    const resolvedCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+
     return {
       resolution: streamProfile.resolution,
       fps: streamProfile.fps,
       maxBitrateMbps: settings.maxBitrateMbps,
-      codec: settings.codec,
-      colorQuality: settings.colorQuality,
+      codec: resolvedCodecProfile.codec,
+      colorQuality: resolvedCodecProfile.colorQuality,
       keyboardLayout: settings.keyboardLayout,
       gameLanguage: settings.gameLanguage,
       enableL4S: settings.enableL4S,
@@ -935,6 +941,17 @@ export function App(): JSX.Element {
     codecStartupTestAttemptedRef.current = true;
     void runCodecTest();
   }, [codecResults, codecTesting, runCodecTest]);
+
+  useEffect(() => {
+    if (!codecMigratedNotice) {
+      return;
+    }
+    const notice = codecMigratedNotice;
+    const timer = window.setTimeout(() => {
+      setCodecMigratedNotice((current) => (current === notice ? null : current));
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [codecMigratedNotice]);
 
   const shortcuts = useMemo(() => {
     const parseWithFallback = (value: string, fallback: string) => {
@@ -1389,6 +1406,27 @@ export function App(): JSX.Element {
       }
     }
   }, [authSession, loadSubscriptionInfo, previewSetting, settingsLoaded]);
+
+  // Legacy users may have a saved concrete codec (AV1/H.265) that this device
+  // cannot actually receive/decode. Rather than leaving their dropdown choice
+  // silently disabled, migrate the preference to "auto" (which resolves to the
+  // best usable codec at stream time) and surface a one-time toast explaining
+  // the change. The dropdown already blocks unusable codecs, so this effect
+  // only fires for persisted choices loaded from disk.
+  useEffect(() => {
+    if (!settingsLoaded) {
+      return;
+    }
+    const unusable = getCodecToMigrateToAuto(settings.codec, codecResults);
+    if (!unusable) {
+      return;
+    }
+    console.log(
+      `[Codec] Saved codec preference "${unusable}" is not supported on this device; migrating to "auto"`,
+    );
+    void updateSetting("codec", "auto");
+    setCodecMigratedNotice({ fromCodec: unusable });
+  }, [codecResults, settings.codec, settingsLoaded, updateSetting]);
 
   useEffect(() => {
     if (!settingsLoaded || !subscriptionInfo) {
@@ -2952,6 +2990,14 @@ export function App(): JSX.Element {
                 : gstScanState.reason === "first-scan"
                   ? "First launch — preparing GStreamer engine..."
                   : "GStreamer background scan in progress..."}
+          </span>
+        </div>
+      )}
+      {/* Codec preference auto-migration toast */}
+      {codecMigratedNotice && (
+        <div className="codec-migrated-toast" role="status">
+          <span>
+            {t("settings.video.codecMigratedNotice", { codec: codecMigratedNotice.fromCodec })}
           </span>
         </div>
       )}

@@ -7,6 +7,7 @@ export {
   rewriteSdpIceCandidateEndpoints,
 } from "./sdp/ice";
 export {
+  extractNegotiatedVideoCodec,
   preferCodec,
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,

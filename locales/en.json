@@ -416,6 +416,7 @@
       "streamSection": "Stream",
       "resolution": "Resolution",
       "codec": "Codec",
+      "codecFallback": "Fallback from {{requested}}",
       "serverLocation": "Server location"
     },
     "controls": {
@@ -580,6 +581,15 @@
       "resolution": "Resolution",
       "fps": "FPS",
       "codec": "Codec",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "Unsupported",
+      "codecSeeWhy": "See why",
+      "codecUnsupportedReason": "Not supported on this device",
+      "codecAutoHint": "Automatically choose the best codec for this device.",
+      "codecManualHint": "Used when starting a new stream session.",
+      "codecMigratedNotice": "{{codec}} isn't supported on this device — switched to Auto.",
+
+      "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decoder",
       "encoder": "Encoder",
       "colorDepth": "Color Depth",

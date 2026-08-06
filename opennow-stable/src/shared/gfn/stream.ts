@@ -1,4 +1,11 @@
 export type VideoCodec = "H264" | "H265" | "AV1";
+/**
+ * User-facing codec selection. `"auto"` lets the client pick the best codec
+ * the device can actually decode at stream start (mirrors GFN web's
+ * "Auto (AV1)" dropdown). Concrete values are explicit user choices and are
+ * forced even when the device reports them unsupported.
+ */
+export type CodecPreference = "auto" | VideoCodec;
 export type VideoAccelerationPreference = "auto" | "hardware" | "software";
 export type StreamClientMode = "web" | "native";
 /**
@@ -46,21 +53,34 @@ export function colorQualityRequiresHevc(cq: ColorQuality): boolean {
 export const USER_FACING_VIDEO_CODEC_OPTIONS: readonly VideoCodec[] = ["H264", "H265", "AV1"];
 export const USER_FACING_COLOR_QUALITY_OPTIONS: readonly ColorQuality[] = ["8bit_420", "8bit_444", "10bit_420", "10bit_444"];
 
+/** GFN-web ordering for the codec dropdown: Auto, AV1, H.264, H.265. */
+export const CODEC_PREFERENCE_OPTIONS: readonly CodecPreference[] = ["auto", "AV1", "H264", "H265"];
+
+/** Auto-resolution priority (GFN web auto-picks AV1 first). */
+export const AUTO_CODEC_PREFERENCE_ORDER: readonly VideoCodec[] = ["AV1", "H264", "H265"];
+
 export function isSupportedUserFacingCodec(codec: VideoCodec): boolean {
   return USER_FACING_VIDEO_CODEC_OPTIONS.includes(codec);
 }
 
-export function normalizeStreamPreferences(codec: VideoCodec, colorQuality: ColorQuality): {
-  codec: VideoCodec;
+/** Normalize an unknown persisted value to a valid codec preference (defaults to "auto"). */
+export function normalizeCodecPreference(raw: unknown): CodecPreference {
+  return raw === "auto" || isSupportedUserFacingCodec(raw as VideoCodec)
+    ? (raw as CodecPreference)
+    : "auto";
+}
+
+export function normalizeStreamPreferences(codec: CodecPreference, colorQuality: ColorQuality): {
+  codec: CodecPreference;
   colorQuality: ColorQuality;
   migrated: boolean;
 } {
-  const normalizedCodec = isSupportedUserFacingCodec(codec)
-    ? codec
-    : USER_FACING_VIDEO_CODEC_OPTIONS[0];
+  const normalizedCodec = normalizeCodecPreference(codec);
   const normalizedColorQuality = USER_FACING_COLOR_QUALITY_OPTIONS.includes(colorQuality)
     ? colorQuality
     : USER_FACING_COLOR_QUALITY_OPTIONS[0];
+  // "auto" can resolve to H265/AV1 which support 10-bit modes, so only a
+  // concrete H264 choice is pinned back to 8-bit 4:2:0.
   const codecCompatibleColorQuality = normalizedCodec === "H264" ? "8bit_420" : normalizedColorQuality;
 
   return {

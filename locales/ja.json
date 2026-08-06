@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "入力キューのプレッシャー (バッファリングされたバイトと遅延フラッシュ)",
       "inputChannelState": "部分的に信頼できる入力チャネルの状態とキューに入れられたバイト数",
-      "mouseFlushCadence": "マウスのフラッシュ ケイデンスとパケット レート"
+      "mouseFlushCadence": "マウスのフラッシュ ケイデンスとパケット レート",
+      "codecFallback": "{{requested}} からフォールバック"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFKが有効になっています",
@@ -401,6 +402,14 @@
       "resolution": "解像度",
       "fps": "FPS",
       "codec": "コーデック",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "非対応",
+      "codecSeeWhy": "理由を見る",
+      "codecUnsupportedReason": "このデバイスではサポートされていません",
+      "codecAutoHint": "このデバイスに最適なコーデックを自動的に選択します。",
+      "codecManualHint": "新しいストリームセッションの開始時に使用されます。",
+      "codecMigratedNotice": "このデバイスでは{{codec}}をサポートしていないため、Autoに切り替えました。",
+
       "decoder": "デコーダ",
       "encoder": "エンコーダ",
       "colorDepth": "色の濃さ",

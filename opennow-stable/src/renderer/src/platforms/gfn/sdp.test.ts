@@ -11,6 +11,7 @@ test("sdp barrel preserves the public API", () => {
     "buildNvstSdp",
     "extractIceCredentials",
     "extractIceUfragFromOffer",
+    "extractNegotiatedVideoCodec",
     "extractPublicIp",
     "fixServerIp",
     "mungeAnswerSdp",

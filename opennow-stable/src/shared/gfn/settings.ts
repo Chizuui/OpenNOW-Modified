@@ -1,10 +1,10 @@
 import type {
+  CodecPreference,
   ColorQuality,
   JitterBufferMode,
   NativeTransitionDiagnostics,
   StreamClientMode,
   VideoAccelerationPreference,
-  VideoCodec,
 } from "./stream";
 import type {
   NativeStreamerBackendPreference,
@@ -68,7 +68,7 @@ export interface Settings {
   nativeExternalRenderer: boolean;
   transportMode: StreamTransportMode;
   showNativeStreamerStats: boolean;
-  codec: VideoCodec;
+  codec: CodecPreference;
   decoderPreference: VideoAccelerationPreference;
   encoderPreference: VideoAccelerationPreference;
   colorQuality: ColorQuality;
@@ -297,7 +297,7 @@ export function createDefaultSettings(platform: string): Settings {
 }
 
 export const DEFAULT_STREAM_PREFERENCES: Readonly<Pick<Settings, "codec" | "colorQuality">> = Object.freeze({
-  codec: "H264",
+  codec: "auto",
   colorQuality: "8bit_420",
 });
 

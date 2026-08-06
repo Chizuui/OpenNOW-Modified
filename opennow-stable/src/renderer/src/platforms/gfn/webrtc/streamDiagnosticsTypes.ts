@@ -10,7 +10,10 @@ export interface StreamDiagnostics {
 
   // Video stats
   resolution: string;
+  /** Codec actually negotiated for the live stream (from inbound-rtp stats in web mode; native stats otherwise). */
   codec: string;
+  /** Codec requested in settings at session start; differs from `codec` when the client fell back to a supported codec. */
+  requestedCodec: string;
   hardwareAcceleration: string;
   colorCodec: string;
   isHdr: boolean;

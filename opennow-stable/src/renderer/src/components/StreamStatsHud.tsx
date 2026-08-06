@@ -142,6 +142,14 @@ export function StreamStatsHud({
     ? stats.resolution
     : (stats.nativeRendererActive ? "Native renderer" : "--");
   const codecText = [stats.codec, stats.colorCodec].filter((v) => v && v !== "").join(", ") || "--";
+  // True when the live stream negotiated a different codec than the one
+  // requested in settings (e.g. H265 requested but the device can only decode
+  // AV1). Surfacing this makes silent codec fallback visible to the user.
+  const codecFellBack = Boolean(
+    stats.codec
+    && stats.requestedCodec
+    && stats.requestedCodec !== stats.codec,
+  );
 
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
   const hasPacketLoss = stats.packetLossPercent > 0;
@@ -301,6 +309,11 @@ export function StreamStatsHud({
               <span>{t("stream.stats.codec")}</span>
               <span>{codecText}</span>
             </div>
+            {codecFellBack && (
+              <p className="sv-stats-foot">
+                {t("stream.stats.codecFallback", { requested: stats.requestedCodec })}
+              </p>
+            )}
             <div className="sv-stats-row">
               <span>{t("stream.stats.serverLocation")}</span>
               <span>{regionLabel}</span>

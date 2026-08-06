@@ -138,6 +138,66 @@ export function rewriteH265LevelIdByProfile(
 
 interface PreferCodecOptions {
   preferHevcProfileId?: 1 | 2;
+  /**
+   * Soft filtering: keep every payload type in the video m-line and only
+   * reorder so the preferred codec comes first. When false (default) the
+   * m-line is stripped down to the preferred codec (+ its RTX).
+   *
+   * Soft mode is the GFN-web behavior and is required when the requested
+   * codec may not be receivable on this device: with a hard filter the
+   * answer would reject the whole video m-line (port 0, dropped from the
+   * BUNDLE group) and the session would hang on "Waiting for game video..."
+   * instead of falling back to a codec the browser can actually decode.
+   */
+  keepFallbacks?: boolean;
+}
+
+/**
+ * Extract the video codec actually negotiated in a (local answer) SDP.
+ * Mirrors the Rust reference implementation (`extract_negotiated_video_codec`):
+ * walks the video m-line payload types in order and returns the first known
+ * codec name. Returns null when the m-line is missing/rejected (port 0) or
+ * carries no recognizable primary codec.
+ */
+export function extractNegotiatedVideoCodec(sdp: string): VideoCodec | null {
+  const lines = sdp.split(/\r?\n/);
+  const codecByPayloadType = new Map<string, string>();
+  let inVideoSection = false;
+
+  for (const line of lines) {
+    if (line.startsWith("m=video")) {
+      inVideoSection = true;
+      continue;
+    }
+    if (line.startsWith("m=") && inVideoSection) {
+      inVideoSection = false;
+    }
+    if (!inVideoSection || !line.startsWith("a=rtpmap:")) {
+      continue;
+    }
+
+    const [, rest = ""] = line.split("a=rtpmap:");
+    const [pt, codecPart] = rest.split(/\s+/, 2);
+    const codecName = normalizeCodec((codecPart ?? "").split("/")[0] ?? "");
+    if (pt && codecName) {
+      codecByPayloadType.set(pt, codecName);
+    }
+  }
+
+  for (const line of lines) {
+    if (!line.startsWith("m=video")) {
+      continue;
+    }
+    const payloads = line.split(/\s+/).slice(3);
+    for (const pt of payloads) {
+      const codec = codecByPayloadType.get(pt);
+      if (codec === "H264") return "H264";
+      if (codec === "H265") return "H265";
+      if (codec === "AV1") return "AV1";
+    }
+  }
+
+  return null;
 }
 
 export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCodecOptions): string {
@@ -247,9 +307,18 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
   // Do NOT keep FLEXFEC/RED/ULPFEC during hard codec filtering.
   // Chromium can otherwise negotiate a "video" m-line with only FEC payloads
   // when primary codec intersection fails, causing black video with live audio.
+  // Soft mode (keepFallbacks) intentionally keeps them: primary codecs stay in
+  // the m-line too, so the intersection can never collapse to FEC-only.
+  if (options?.keepFallbacks) {
+    for (const pts of payloadTypesByCodec.values()) {
+      for (const pt of pts) {
+        allowed.add(pt);
+      }
+    }
+  }
 
   console.log(`[SDP] preferCodec: preferred ordered payloads [${orderedPreferredPayloads.join(", ")}] for ${codec}`);
-  console.log(`[SDP] preferCodec: keeping payload types [${Array.from(allowed).join(", ")}] for ${codec}`);
+  console.log(`[SDP] preferCodec: keeping payload types [${Array.from(allowed).join(", ")}] for ${codec}${options?.keepFallbacks ? " (keepFallbacks: reorder only)" : ""}`);
 
   const filtered: string[] = [];
   inVideoSection = false;
@@ -259,7 +328,9 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
       inVideoSection = true;
       const parts = line.split(/\s+/);
       const header = parts.slice(0, 3);
-      const available = parts.slice(3).filter((pt) => allowed.has(pt));
+      const available = options?.keepFallbacks
+        ? parts.slice(3)
+        : parts.slice(3).filter((pt) => allowed.has(pt));
       const ordered: string[] = [];
 
       for (const pt of orderedPreferredPayloads) {
@@ -287,6 +358,12 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
         line.startsWith("a=fmtp:") ||
         line.startsWith("a=rtcp-fb:")
       ) {
+        if (options?.keepFallbacks) {
+          // Soft mode: every payload remains in the m-line, so keep every
+          // associated attribute untouched.
+          filtered.push(line);
+          continue;
+        }
         const [, rest = ""] = line.split(":", 2);
         const [pt = ""] = rest.split(/\s+/, 1);
         if (pt && !allowed.has(pt)) {

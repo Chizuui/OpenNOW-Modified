@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Giriş kuyruğu basıncı (arabelleğe alınmış baytlar ve gecikmeli temizleme)",
       "inputChannelState": "Kısmen güvenilir giriş kanalı durumu ve sıraya alınmış baytlar",
-      "mouseFlushCadence": "Fare yıkama temposu ve paket hızı"
+      "mouseFlushCadence": "Fare yıkama temposu ve paket hızı",
+      "codecFallback": "{{requested}} öğesinden geri döndü"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK etkin",
@@ -401,6 +402,14 @@
       "resolution": "Çözünürlük",
       "fps": "FPS",
       "codec": "Kodlayıcı",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "Desteklenmiyor",
+      "codecSeeWhy": "Neden?",
+      "codecUnsupportedReason": "Bu cihazda desteklenmiyor",
+      "codecAutoHint": "Bu cihaz için en iyi codec'i otomatik seç.",
+      "codecManualHint": "Yeni bir akış oturumu başlatılırken kullanılır.",
+      "codecMigratedNotice": "{{codec}} bu cihazda desteklenmiyor — Auto olarak değiştirildi.",
+
       "decoder": "Kod çözücü",
       "encoder": "Kodlayıcı",
       "colorDepth": "Renk Derinliği",

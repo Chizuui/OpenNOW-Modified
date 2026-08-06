@@ -1,4 +1,10 @@
-import type { VideoCodec } from "@shared/gfn";
+import {
+  AUTO_CODEC_PREFERENCE_ORDER,
+  normalizeStreamPreferences,
+  type CodecPreference,
+  type ColorQuality,
+  type VideoCodec,
+} from "@shared/gfn";
 
 export interface CodecTestResult {
   codec: string;
@@ -183,16 +189,19 @@ export async function testCodecSupport(): Promise<CodecTestResult[]> {
       }
     }
 
-    const effectiveDecodeSupported = decodeSupported || webrtcSupported;
-
+    // Keep `decodeSupported` as the raw mediaCapabilities answer: a codec can be
+    // present in the WebRTC receiver capabilities yet not decodable on this
+    // device (e.g. H.265 without the HEVC extension), which is exactly what
+    // GFN web surfaces as "Unsupported". `webrtcSupported` stays as its own
+    // signal and is only used as a fallback when no test results exist.
     results.push({
       codec: config.name,
       webrtcSupported,
-      decodeSupported: effectiveDecodeSupported,
+      decodeSupported,
       hwAccelerated,
       encodeSupported,
       encodeHwAccelerated,
-      decodeVia: effectiveDecodeSupported ? guessDecodeBackend(hwAccelerated) : "Unsupported",
+      decodeVia: decodeSupported ? guessDecodeBackend(hwAccelerated) : "Unsupported",
       encodeVia: encodeSupported ? guessEncodeBackend(encodeHwAccelerated) : "Unsupported",
       profiles,
     });
@@ -232,4 +241,90 @@ export function getCodecDecodeBadgeState(
     return null;
   }
   return result.hwAccelerated ? "gpu" : "cpu";
+}
+
+/**
+ * Synchronous availability check via `RTCRtpReceiver.getCapabilities` — the
+ * same source the WebRTC layer uses to decide which codecs it can receive.
+ */
+export function isWebRtcCodecAvailable(codec: VideoCodec): boolean {
+  try {
+    const caps = RTCRtpReceiver.getCapabilities?.("video");
+    if (!caps) return false;
+    const mime = ({ H264: "video/H264", H265: "video/H265", AV1: "video/AV1" } as const)[codec].toLowerCase();
+    return caps.codecs.some((entry) => entry.mimeType.toLowerCase() === mime);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a codec is usable for streaming. Prefers the diagnostic test results
+ * (decode + WebRTC readiness) and falls back to WebRTC receiver capabilities.
+ */
+export function isCodecUsableForStream(
+  codec: VideoCodec,
+  codecResults: CodecTestResult[] | null,
+): boolean {
+  const result = codecResults?.find((entry) => entry.codec === codec);
+  if (result) {
+    // A codec is usable for STREAMING only when it is BOTH decodable on this
+    // device AND listed in the WebRTC receiver capabilities. `mediaCapabilities`
+    // can report a codec as decodable (e.g. AV1 via software dav1d) while
+    // WebRTC still cannot receive it; picking such a codec used to hard-filter
+    // the offer down to it and the answer would reject the whole video m-line.
+    return result.decodeSupported && result.webrtcSupported;
+  }
+  return isWebRtcCodecAvailable(codec);
+}
+
+/**
+ * Return the saved concrete codec preference that should be migrated to
+ * `"auto"` because it is not usable for streaming on this device. Returns
+ * `null` when the preference is already `"auto"` or when no diagnostic test
+ * results exist yet — a missing/empty result set must never trigger a
+ * migration (avoids false positives while diagnostics are still loading or
+ * failed).
+ */
+export function getCodecToMigrateToAuto(
+  codecPreference: CodecPreference,
+  codecResults: CodecTestResult[] | null,
+): VideoCodec | null {
+  if (codecPreference === "auto" || !codecResults || codecResults.length === 0) {
+    return null;
+  }
+  return isCodecUsableForStream(codecPreference, codecResults) ? null : codecPreference;
+}
+
+/**
+ * Resolve a codec preference into a concrete codec for session negotiation.
+ * `"auto"` picks the first codec the device can actually decode (AV1 → H264 →
+ * H265, mirroring GFN web's "Auto (AV1)"), falling back to H264. An explicit
+ * user choice is always honored, even if the device reports it unsupported.
+ */
+export function resolveEffectiveCodec(preference: CodecPreference): VideoCodec {
+  if (preference !== "auto") {
+    return preference;
+  }
+  return AUTO_CODEC_PREFERENCE_ORDER.find((codec) => isWebRtcCodecAvailable(codec)) ?? "H264";
+}
+
+/**
+ * Resolve a codec preference into a concrete, color-quality-compatible stream
+ * profile. Re-runs the H264 → 8-bit 4:2:0 pinning against the *resolved* codec
+ * so an "auto" pick that lands on H264 on a device without AV1/H265 still
+ * negotiates SDR-compatible color, mirroring `normalizeStreamPreferences`.
+ */
+export function resolveStreamProfileCodec(
+  codecPreference: CodecPreference,
+  colorQuality: ColorQuality,
+): { codec: VideoCodec; colorQuality: ColorQuality } {
+  const resolved = resolveEffectiveCodec(codecPreference);
+  const normalized = normalizeStreamPreferences(resolved, colorQuality);
+  return {
+    // `resolved` is concrete (never "auto"), so the normalization cannot turn
+    // it into "auto" — the cast is safe.
+    codec: normalized.codec as VideoCodec,
+    colorQuality: normalized.colorQuality,
+  };
 }

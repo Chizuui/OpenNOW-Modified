@@ -4,6 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  extractNegotiatedVideoCodec,
   preferCodec,
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,
@@ -88,6 +89,85 @@ test("preferCodec orders the requested H265 profile before other primary payload
 
   assert.match(filtered, /^m=video 9 UDP\/TLS\/RTP\/SAVPF 100 98 99 101\r\n/);
   assert.match(filtered, /\r\n/);
+});
+
+test("preferCodec keepFallbacks keeps all codecs but reorders the preferred one first", () => {
+  const sdp = [
+    "v=0",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111 0",
+    "a=rtpmap:111 opus/48000/2",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 102",
+    "a=rtpmap:96 H264/90000",
+    "a=rtcp-fb:96 nack",
+    "a=rtpmap:97 rtx/90000",
+    "a=fmtp:97 apt=96",
+    "a=rtpmap:98 H265/90000",
+    "a=fmtp:98 profile-id=1;tier-flag=0;level-id=153",
+    "a=rtcp-fb:98 nack pli",
+    "a=rtpmap:99 rtx/90000",
+    "a=fmtp:99 apt=98",
+    "a=rtpmap:100 AV1/90000",
+    "a=rtpmap:101 flexfec-03/90000",
+    "a=rtpmap:102 ulpfec/90000",
+  ].join("\n");
+
+  const filtered = preferCodec(sdp, "AV1", { keepFallbacks: true });
+
+  // AV1 payload moves to the front; every other codec stays in the m-line.
+  assert.match(filtered, /m=video 9 UDP\/TLS\/RTP\/SAVPF 100 96 97 98 99 101 102/);
+  assert.match(filtered, /a=rtpmap:96 H264\/90000/);
+  assert.match(filtered, /a=rtpmap:98 H265\/90000/);
+  assert.match(filtered, /a=rtpmap:100 AV1\/90000/);
+  assert.match(filtered, /a=rtpmap:101 flexfec-03\/90000/);
+  assert.match(filtered, /a=rtpmap:102 ulpfec\/90000/);
+  assert.match(filtered, /a=fmtp:97 apt=96/);
+  assert.match(filtered, /m=audio 9 UDP\/TLS\/RTP\/SAVPF 111 0/);
+});
+
+test("preferCodec default mode stays a hard filter", () => {
+  const sdp = [
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 100",
+    "a=rtpmap:96 H264/90000",
+    "a=rtpmap:100 AV1/90000",
+  ].join("\n");
+
+  const filtered = preferCodec(sdp, "AV1");
+  assert.match(filtered, /m=video 9 UDP\/TLS\/RTP\/SAVPF 100/);
+  assert.doesNotMatch(filtered, /a=rtpmap:96 H264/);
+});
+
+test("extractNegotiatedVideoCodec returns the first negotiated video codec", () => {
+  const answer = [
+    "v=0",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=rtpmap:111 opus/48000/2",
+    "m=video 9 UDP/TLS/RTP/SAVPF 100 102",
+    "a=rtpmap:100 AV1/90000",
+    "a=rtpmap:102 rtx/90000",
+    "a=fmtp:102 apt=100",
+  ].join("\n");
+
+  assert.equal(extractNegotiatedVideoCodec(answer), "AV1");
+});
+
+test("extractNegotiatedVideoCodec honors m-line payload order", () => {
+  const answer = [
+    "m=video 9 UDP/TLS/RTP/SAVPF 98 96",
+    "a=rtpmap:98 H265/90000",
+    "a=rtpmap:96 H264/90000",
+  ].join("\n");
+
+  assert.equal(extractNegotiatedVideoCodec(answer), "H265");
+});
+
+test("extractNegotiatedVideoCodec returns null for a rejected video m-line", () => {
+  const answer = [
+    "m=video 0 UDP/TLS/RTP/SAVPF 0",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=rtpmap:111 opus/48000/2",
+  ].join("\n");
+
+  assert.equal(extractNegotiatedVideoCodec(answer), null);
 });
 
 test("H265 rewriting leaves already-compatible and non-H265 payloads unchanged", () => {

@@ -1,4 +1,4 @@
-import { type JSX } from "react";
+import { useCallback, useRef, useState, type JSX } from "react";
 import type { EntitledResolution, Settings, StreamRegion } from "@shared/gfn";
 import type { CodecTestResult } from "../../../lib/codecDiagnostics";
 import { CodecDiagnosticsSection } from "../stream/CodecDiagnosticsSection";
@@ -40,6 +40,25 @@ export function SettingsStreamSection({
   subscriptionLoading,
   onBlockingOverlayChange,
 }: SettingsStreamSectionProps): JSX.Element {
+  const [codecDiagnosticsOpen, setCodecDiagnosticsOpen] = useState(false);
+  const codecDiagnosticsWrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Reveals the codec diagnostics panel (the "See why" action in the codec
+  // dropdown). Runs the device codec test on first reveal so the user lands on
+  // fresh results instead of an empty panel.
+  const openCodecDiagnostics = useCallback(() => {
+    setCodecDiagnosticsOpen(true);
+    if (!codecResults) {
+      void onRunCodecTest();
+    }
+    window.requestAnimationFrame(() => {
+      codecDiagnosticsWrapRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "nearest",
+      });
+    });
+  }, [codecResults, onRunCodecTest]);
+
   return (
     <>
       <RegionSelectionSection
@@ -56,11 +75,11 @@ export function SettingsStreamSection({
           handleChange={handleChange}
           handlePreview={handlePreview}
           codecResults={codecResults}
-          codecTesting={codecTesting}
           entitledResolutions={entitledResolutions}
           subscriptionInfoLoaded={subscriptionInfoLoaded}
           subscriptionLoading={subscriptionLoading}
           onBlockingOverlayChange={onBlockingOverlayChange}
+          onOpenCodecDiagnostics={openCodecDiagnostics}
         />
       )}
       <CodecDiagnosticsSection
@@ -72,6 +91,9 @@ export function SettingsStreamSection({
         codecResults={codecResults}
         codecTesting={codecTesting}
         onRunCodecTest={onRunCodecTest}
+        advancedOpen={codecDiagnosticsOpen}
+        onAdvancedToggle={() => setCodecDiagnosticsOpen((open) => !open)}
+        wrapRef={codecDiagnosticsWrapRef}
       />
     </>
   );

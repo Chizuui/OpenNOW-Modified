@@ -1,24 +1,28 @@
-import { useCallback, useEffect, useMemo, type JSX } from "react";
+import { useCallback, useEffect, useMemo, type JSX, type ReactNode } from "react";
 import type {
+  CodecPreference,
   ColorQuality,
   EntitledResolution,
   Settings,
-  VideoCodec,
 } from "@shared/gfn";
 import {
+  CODEC_PREFERENCE_OPTIONS,
   colorQualityRequiresHevc,
   expandEntitledStreamResolutions,
   getSafeFallbackEntitledResolutions,
   JITTER_BUFFER_MODES,
   resolveEntitledStreamProfile,
 } from "@shared/gfn";
-import { getCodecDecodeBadgeState, type CodecTestResult } from "../../../lib/codecDiagnostics";
+import {
+  isCodecUsableForStream,
+  resolveEffectiveCodec,
+  type CodecTestResult,
+} from "../../../lib/codecDiagnostics";
 import { useTranslation } from "../../../i18n";
 import { MotionSpinner } from "../../MotionSpinner";
 import { SelectDropdown, type SelectDropdownOption } from "../../ui/SelectDropdown";
 import { SettingRange } from "../SettingRange";
 import {
-  codecOptions,
   colorQualityOptions,
   getFpsForResolution,
   groupResolutions,
@@ -33,10 +37,11 @@ interface StreamQualityControlsProps {
   handleChange: SettingsChangeHandler;
   handlePreview: SettingsChangeHandler;
   codecResults: CodecTestResult[] | null;
-  codecTesting: boolean;
   entitledResolutions: EntitledResolution[];
   subscriptionInfoLoaded: boolean;
   subscriptionLoading: boolean;
+  /** Reveal the codec diagnostics panel (codec dropdown's "See why" action). */
+  onOpenCodecDiagnostics?: () => void;
 }
 
 export function StreamQualityControls({
@@ -44,10 +49,10 @@ export function StreamQualityControls({
   handleChange,
   handlePreview,
   codecResults,
-  codecTesting,
   entitledResolutions,
   subscriptionInfoLoaded,
   subscriptionLoading,
+  onOpenCodecDiagnostics,
 }: StreamQualityControlsProps): JSX.Element {
   const { t } = useTranslation();
   const effectiveEntitledResolutions = useMemo(() => {
@@ -123,12 +128,71 @@ export function StreamQualityControls({
     handleChange("colorQuality", colorQuality);
   }, [handleChange, settings.codec]);
 
-  const handleCodecChange = useCallback((codec: VideoCodec): void => {
+  const handleCodecChange = useCallback((codec: CodecPreference): void => {
     handleChange("codec", codec);
+    // Only an explicit H264 pick is pinned to 8-bit 4:2:0; "auto" can resolve
+    // to H265/AV1 which support the 10-bit / 4:4:4 color modes.
     if (codec === "H264" && settings.colorQuality !== "8bit_420") {
       handleChange("colorQuality", "8bit_420");
     }
   }, [handleChange, settings.colorQuality]);
+
+  const autoPickedCodec = useMemo(() => resolveEffectiveCodec("auto"), []);
+
+  // GFN-web-style codec dropdown: Auto first (with the resolved codec in
+  // parentheses), then the concrete codecs. Codecs the device cannot decode are
+  // disabled, grouped under an "Unsupported" header with a "See why" action
+  // that reveals the codec diagnostics panel.
+  const codecPreferenceOptions = useMemo<Array<{
+    value: string;
+    label: ReactNode;
+    disabled?: boolean;
+    group?: string;
+  }>>(() => {
+    const supported: Array<{ value: string; label: ReactNode; group?: string }> = [];
+    const unsupported: Array<{ value: string; label: ReactNode; disabled?: boolean; group?: string }> = [];
+
+    for (const preference of CODEC_PREFERENCE_OPTIONS) {
+      if (preference === "auto") {
+        supported.push({
+          value: "auto",
+          label: t("settings.video.codecAutoPick", { codec: autoPickedCodec }),
+        });
+        continue;
+      }
+      const usable = isCodecUsableForStream(preference, codecResults);
+      if (usable) {
+        supported.push({ value: preference, label: preference });
+      } else {
+        unsupported.push({
+          value: preference,
+          // Dimmed under the localized "Unsupported" group header (GFN-web style);
+          // hover shows the device-specific reason and "See why" opens diagnostics.
+          label: <span title={t("settings.video.codecUnsupportedReason")}>{preference}</span>,
+          disabled: true,
+          group: t("settings.video.codecUnsupported"),
+        });
+      }
+    }
+
+    if (unsupported.length > 0) {
+      unsupported.push({
+        value: "__see_why__",
+        label: t("settings.video.codecSeeWhy"),
+        group: t("settings.video.codecUnsupported"),
+      });
+    }
+
+    return [...supported, ...unsupported];
+  }, [autoPickedCodec, codecResults, t]);
+
+  const handleCodecPreferenceChange = useCallback((value: string): void => {
+    if (value === "__see_why__") {
+      onOpenCodecDiagnostics?.();
+      return;
+    }
+    handleCodecChange(value as CodecPreference);
+  }, [handleCodecChange, onOpenCodecDiagnostics]);
 
   return (
     <>
@@ -174,32 +238,20 @@ export function StreamQualityControls({
       </div>
 
       <div className="settings-row">
-        <label className="settings-label">{t("settings.video.codec")}</label>
+        <label className="settings-label" htmlFor="settings-stream-codec">{t("settings.video.codec")}</label>
         <div className="settings-row-control">
-          <div className="settings-chip-row">
-            {codecOptions.map((codec) => {
-              const badgeState = getCodecDecodeBadgeState(codec, codecResults, codecTesting);
-              return (
-                <button
-                  key={codec}
-                  className={`settings-chip settings-chip--codec ${settings.codec === codec ? "active" : ""}`}
-                  aria-pressed={settings.codec === codec}
-                  onClick={() => handleCodecChange(codec)}
-                >
-                  <span>{codec}</span>
-                  {badgeState && (
-                    <span className={`settings-inline-badge settings-inline-badge--codec settings-inline-badge--codec-${badgeState}`}>
-                      {badgeState === "gpu"
-                        ? t("settings.video.gpu")
-                        : badgeState === "cpu"
-                          ? t("settings.video.cpu")
-                          : t("settings.video.testing")}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
+          <SelectDropdown
+            id="settings-stream-codec"
+            value={settings.codec}
+            options={codecPreferenceOptions}
+            onChange={handleCodecPreferenceChange}
+            ariaLabel={t("settings.video.codec")}
+          />
+          <span className="settings-subtle-hint">
+            {settings.codec === "auto"
+              ? t("settings.video.codecAutoHint")
+              : t("settings.video.codecManualHint")}
+          </span>
         </div>
       </div>
 

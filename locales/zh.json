@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "输入队列压力（缓冲字节和延迟刷新）",
       "inputChannelState": "部分可靠的输入通道状态和排队字节",
-      "mouseFlushCadence": "鼠标刷新节奏和数据包速率"
+      "mouseFlushCadence": "鼠标刷新节奏和数据包速率",
+      "codecFallback": "从 {{requested}} 回退"
     },
     "controls": {
       "antiAfkEnabled": "防AFK已启用",
@@ -401,6 +402,14 @@
       "resolution": "分辨率",
       "fps": "FPS",
       "codec": "编解码器",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "不支持",
+      "codecSeeWhy": "了解原因",
+      "codecUnsupportedReason": "此设备不支持",
+      "codecAutoHint": "自动为此设备选择最佳编解码器。",
+      "codecManualHint": "启动新的串流会话时使用。",
+      "codecMigratedNotice": "此设备不支持{{codec}}，已自动切换为 Auto。",
+
       "decoder": "解码器",
       "encoder": "编码器",
       "colorDepth": "颜色深度",

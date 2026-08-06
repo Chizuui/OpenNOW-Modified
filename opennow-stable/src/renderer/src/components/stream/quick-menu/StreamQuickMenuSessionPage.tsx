@@ -9,6 +9,8 @@ import {
   MousePointer2,
 } from "lucide-react";
 import type { StatsOverlayPosition, SubscriptionInfo } from "@shared/gfn";
+import type { StreamDiagnosticsStore } from "../../../utils/streamDiagnosticsStore";
+import { useStreamDiagnosticsSelector } from "../../../utils/streamDiagnosticsStore";
 import { RemainingPlaytimeIndicator } from "../../ElapsedSessionIndicators";
 import { useTranslation } from "../../../i18n";
 
@@ -34,6 +36,7 @@ interface StreamQuickMenuSessionPageProps {
   onStatsPositionChange: (value: StatsOverlayPosition) => void;
   sidebarToggleShortcutDisplay: string;
   controllerSidebarShortcutDisplay: string;
+  diagnosticsStore: StreamDiagnosticsStore;
 }
 
 export function StreamQuickMenuSessionPage({
@@ -58,8 +61,21 @@ export function StreamQuickMenuSessionPage({
   onStatsPositionChange,
   sidebarToggleShortcutDisplay,
   controllerSidebarShortcutDisplay,
+  diagnosticsStore,
 }: StreamQuickMenuSessionPageProps): JSX.Element {
   const { t } = useTranslation();
+
+  const negotiatedCodec = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.codec || "",
+  );
+  const requestedCodec = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.requestedCodec || "",
+  );
+  const codecFellBack = Boolean(
+    negotiatedCodec && requestedCodec && negotiatedCodec !== requestedCodec,
+  );
 
   return (
     <div className="sidebar-page sidebar-page--session" role="tabpanel">
@@ -91,6 +107,19 @@ export function StreamQuickMenuSessionPage({
             <strong className="sidebar-metric-value">
               <Clock3 size={14} />
               {sessionTimeRemainingText}
+            </strong>
+          </div>
+        )}
+        {negotiatedCodec && (
+          <div className="sidebar-metric">
+            <span>Stream codec</span>
+            <strong className="sidebar-metric-value">
+              {negotiatedCodec}
+              {codecFellBack && (
+                <small className="sidebar-metric-note" title={`Fallback from ${requestedCodec}`}>
+                  {`fallback from ${requestedCodec}`}
+                </small>
+              )}
             </strong>
           </div>
         )}

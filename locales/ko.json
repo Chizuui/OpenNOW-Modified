@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "입력 큐 압력(버퍼링된 바이트 및 지연된 플러시)",
       "inputChannelState": "부분적으로 신뢰할 수 있는 입력 채널 상태 및 대기 중인 바이트",
-      "mouseFlushCadence": "마우스 플러시 케이던스 및 패킷 속도"
+      "mouseFlushCadence": "마우스 플러시 케이던스 및 패킷 속도",
+      "codecFallback": "{{requested}}에서 폴백"
     },
     "controls": {
       "antiAfkEnabled": "AFK 방지가 활성화되었습니다",
@@ -401,6 +402,14 @@
       "resolution": "해상도",
       "fps": "FPS",
       "codec": "코덱",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "지원되지 않음",
+      "codecSeeWhy": "이유 보기",
+      "codecUnsupportedReason": "이 기기에서 지원되지 않음",
+      "codecAutoHint": "이 기기에 가장 적합한 코덱을 자동으로 선택합니다.",
+      "codecManualHint": "새 스트림 세션 시작 시 사용됩니다.",
+      "codecMigratedNotice": "이 기기에서 {{codec}}을(를) 지원하지 않아 Auto로 전환했습니다.",
+
       "decoder": "디코더",
       "encoder": "인코더",
       "colorDepth": "색상 심도",

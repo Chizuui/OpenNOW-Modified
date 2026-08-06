@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Presión de la cola de entrada (bytes almacenados en búfer y descarga retrasada)",
       "inputChannelState": "Estado del canal de entrada parcialmente confiable y bytes en cola",
-      "mouseFlushCadence": "Cadencia de descarga del mouse y velocidad de paquetes"
+      "mouseFlushCadence": "Cadencia de descarga del mouse y velocidad de paquetes",
+      "codecFallback": "Respaldo desde {{requested}}"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK está habilitado",
@@ -401,6 +402,14 @@
       "resolution": "Resolución",
       "fps": "FPS",
       "codec": "Códec",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "No compatible",
+      "codecSeeWhy": "Ver por qué",
+      "codecUnsupportedReason": "No compatible con este dispositivo",
+      "codecAutoHint": "Elige automáticamente el mejor códec para este dispositivo.",
+      "codecManualHint": "Se usa al iniciar una nueva sesión de streaming.",
+      "codecMigratedNotice": "{{codec}} no es compatible con este dispositivo — se cambió a Auto.",
+
       "decoder": "Decodificador",
       "encoder": "Codificador",
       "colorDepth": "Profundidad de color",

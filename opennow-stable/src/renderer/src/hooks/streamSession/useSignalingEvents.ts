@@ -14,6 +14,7 @@ import { streamStatusToLoadingStage } from "../../lib/sessionState";
 import { mergeNativeStreamStats } from "../../lib/streamDiagnostics";
 import { decideSignalingDisconnect } from "../../lib/streamRecoveryDecisions";
 import { warningMessage, warningTone } from "../../lib/sessionWarnings";
+import { resolveStreamProfileCodec } from "../../lib/codecDiagnostics";
 import { GfnWebRtcClient } from "../../platforms/gfn/webrtcClient";
 import type { StreamDiagnosticsStore } from "../../utils/streamDiagnosticsStore";
 import type { StreamRuntimeState } from "./useStreamRuntimeState";
@@ -175,6 +176,8 @@ export function useSignalingEvents({
         return;
       }
 
+      const resolvedCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+
       nativeStreamingRef.current = true;
       pendingControlledDisconnectsRef.current = 0;
       const isWindowsHost = navigator.platform.toLowerCase().includes("win");
@@ -184,8 +187,8 @@ export function useSignalingEvents({
       client.activateNativeInput(
         protocolVersion,
         {
-          codec: settings.codec,
-          colorQuality: settings.colorQuality,
+          codec: resolvedCodecProfile.codec,
+          colorQuality: resolvedCodecProfile.colorQuality,
           resolution: settings.resolution,
           fps: settings.fps,
           maxBitrateKbps: settings.maxBitrateMbps * 1000,
@@ -265,9 +268,10 @@ export function useSignalingEvents({
           const client = ensureWebRtcClient();
 
           if (client) {
+            const offerCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
             await client.handleOffer(event.sdp, activeSession, {
-              codec: settings.codec,
-              colorQuality: settings.colorQuality,
+              codec: offerCodecProfile.codec,
+              colorQuality: offerCodecProfile.colorQuality,
               resolution: settings.resolution,
               fps: settings.fps,
               maxBitrateKbps: settings.maxBitrateMbps * 1000,

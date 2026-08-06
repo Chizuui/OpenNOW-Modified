@@ -1,5 +1,5 @@
 import { Cpu, SlidersHorizontal, Zap } from "lucide-react";
-import { useState, type JSX } from "react";
+import type { JSX, RefObject } from "react";
 import type { Settings } from "@shared/gfn";
 import {
   shouldShowLinuxHardwareCodecHint,
@@ -19,6 +19,11 @@ interface CodecDiagnosticsSectionProps {
   codecResults: CodecTestResult[] | null;
   codecTesting: boolean;
   onRunCodecTest: () => Promise<void>;
+  /** Controlled open state for the "Advanced" disclosure (lifted so the codec
+   *  dropdown's "See why" action can reveal it). */
+  advancedOpen: boolean;
+  onAdvancedToggle: () => void;
+  wrapRef?: RefObject<HTMLDivElement | null>;
 }
 
 export function CodecDiagnosticsSection({
@@ -30,19 +35,22 @@ export function CodecDiagnosticsSection({
   codecResults,
   codecTesting,
   onRunCodecTest,
+  advancedOpen,
+  onAdvancedToggle,
+  wrapRef,
 }: CodecDiagnosticsSectionProps): JSX.Element | null {
   const { t } = useTranslation();
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const codecTestOpen = codecResults !== null || codecTesting;
 
   if (!showStreamVideo && !showStreamCodecDiagnostics) return null;
 
   return (
-    <div className="settings-advanced-wrap">
+    <div ref={wrapRef} className="settings-advanced-wrap" id="settings-codec-diagnostics">
       <button
         type="button"
         className="settings-advanced-toggle"
-        onClick={() => setAdvancedOpen((open) => !open)}
+        onClick={onAdvancedToggle}
+        aria-expanded={advancedOpen}
       >
         <SlidersHorizontal size={14} />
         Advanced
