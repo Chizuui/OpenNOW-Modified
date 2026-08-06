@@ -303,6 +303,26 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
 
   const preferred = new Set(orderedPreferredPayloads);
 
+  // Pinned fallback payloads, ordered right after the preferred ones. When the
+  // fallback is H265, prefer the requested HEVC profile first (widest decoder
+  // compatibility) just like the primary ordering above.
+  const orderedFallbackPayloads =
+    options?.keepFallbacks && options.fallbackCodec && options.fallbackCodec !== codec
+      ? (options.fallbackCodec === "H265" && options.preferHevcProfileId
+        ? [...(payloadTypesByCodec.get("H265") ?? [])].sort((a, b) => {
+          const pa = fmtpByPayloadType.get(a) ?? "";
+          const pb = fmtpByPayloadType.get(b) ?? "";
+          const score = (fmtp: string): number => {
+            const profile = fmtp.match(/(?:^|;)\s*profile-id=(\d+)/i)?.[1];
+            if (profile === String(options.preferHevcProfileId)) return 0;
+            if (!profile) return 1;
+            return 2;
+          };
+          return score(pa) - score(pb);
+        })
+        : (payloadTypesByCodec.get(options.fallbackCodec) ?? []))
+      : [];
+
   const allowed = new Set<string>(preferred);
 
   // Keep RTX payloads linked to preferred payloads (apt mapping)
@@ -346,10 +366,7 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
           ordered.push(pt);
         }
       }
-      const fallbackPayloads =
-        options?.keepFallbacks && options.fallbackCodec && options.fallbackCodec !== codec
-          ? (payloadTypesByCodec.get(options.fallbackCodec) ?? [])
-          : [];
+      const fallbackPayloads = orderedFallbackPayloads;
       for (const pt of fallbackPayloads) {
         if (!preferred.has(pt) && available.includes(pt) && !ordered.includes(pt)) {
           ordered.push(pt);

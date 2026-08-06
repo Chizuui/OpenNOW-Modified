@@ -315,7 +315,9 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Pression de la file d'attente d'entrée (octets mis en mémoire tampon et vidage retardé)",
       "inputChannelState": "État du canal d'entrée partiellement fiable et octets en file d'attente",
-      "mouseFlushCadence": "Cadence de vidage de la souris et débit de paquets"
+      "mouseFlushCadence": "Cadence de vidage de la souris et débit de paquets",
+      "codecFallback": "{{requested}} n'a pas pu être négocié → {{negotiated}}",
+      "codecFallbackShort": "{{requested}} → {{negotiated}}"
     },
     "controls": {
       "antiAfkEnabled": "L'Anti-AFK est activé",
@@ -408,9 +410,8 @@
       "codecAutoHint": "Choisit automatiquement le meilleur codec pour cet appareil.",
       "codecManualHint": "Utilisé au démarrage d'une nouvelle session.",
       "fallbackCodec": "Codec de secours",
-      "fallbackCodecHint": "Utilis\u00e9 lorsque le codec s\u00e9lectionn\u00e9 ne peut pas \u00eatre n\u00e9goci\u00e9. Auto conserve tous les codecs pris en charge comme secours.",
+      "fallbackCodecHint": "Utilisé lorsque le codec sélectionné ne peut pas être négocié. Auto conserve tous les codecs pris en charge comme secours.",
       "codecMigratedNotice": "{{codec}} n'est pas pris en charge sur cet appareil — passage à Auto.",
-
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Décodeur",
       "encoder": "Encodeur",
@@ -441,7 +442,7 @@
       "quickSyncHint": "H.264 est encodé sur le CPU alors que le décodage GPU fonctionne : l'encodeur matériel (Intel Quick Sync sur les iGPU Intel) n'est pas enregistré. Installez le pilote graphique complet de votre fabricant de GPU pour activer l'encodage matériel.",
       "backendExplainTitle": "Pourquoi ENCODE et DECODE utilisent-ils des backends différents ?",
       "backendExplainBody": "Sous Windows, Chromium utilise deux piles médias différentes : le décodage vidéo matériel (DECODE) passe par D3D11 (DXVA/D3D11VA), tandis que l'encodage vidéo matériel (ENCODE) passe par Media Foundation (MFT). C'est pourquoi un même codec peut afficher des backends différents selon le sens. L'encodage n'est pas utilisé pour le streaming de jeux en cloud : votre PC ne fait que recevoir et décoder le flux vidéo, donc seule la ligne DECODE affecte la qualité du stream.",
-      "gpuDriverLine": "{{gpu}} \u00b7 pilote {{version}}"
+      "gpuDriverLine": "{{gpu}} · pilote {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Le plus compatible",

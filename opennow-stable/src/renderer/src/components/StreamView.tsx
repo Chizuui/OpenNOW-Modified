@@ -79,6 +79,11 @@ interface StreamViewProps {
   streamRevealComplete: boolean;
   gameTitle: string;
   recordingBitrateMbps: number | null;
+  recordingResolution: string;
+  recordingFps: number;
+  onRecordingResolutionChange: (value: string) => void;
+  onRecordingFpsChange: (value: number) => void;
+  onRecordingBitrateMbpsChange: (value: number | null) => void;
   platformStore?: string;
   onToggleFullscreen: () => void;
   onConfirmExit: () => void;
@@ -138,6 +143,11 @@ export function StreamView({
   streamRevealComplete,
   gameTitle,
   recordingBitrateMbps,
+  recordingResolution,
+  recordingFps,
+  onRecordingResolutionChange,
+  onRecordingFpsChange,
+  onRecordingBitrateMbpsChange,
   platformStore,
   onToggleFullscreen,
   onConfirmExit,
@@ -354,6 +364,8 @@ export function StreamView({
     gameTitle,
     micTrack: micTrack ?? null,
     recordingBitrateMbps,
+    recordingResolution,
+    recordingFps,
   });
   const releasePointerLockForMenu = useCallback(() => {
     if (document.pointerLockElement) {
@@ -748,6 +760,11 @@ export function StreamView({
         screenshotGallery={screenshotGallery}
         streamRecorder={streamRecorder}
         recordingBitrateMbps={recordingBitrateMbps}
+        recordingResolution={recordingResolution}
+        recordingFps={recordingFps}
+        onRecordingResolutionChange={onRecordingResolutionChange}
+        onRecordingFpsChange={onRecordingFpsChange}
+        onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
       />
 
       {/* Gradient background when no video */}

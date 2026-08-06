@@ -10,8 +10,15 @@ import {
   Video,
 } from "lucide-react";
 import type { RecordingEntry, ScreenshotEntry } from "@shared/gfn";
+import { SettingRange } from "../../settings/SettingRange";
 import { formatElapsed } from "../../../utils/timeFormat";
 import { formatFileSize } from "../streamFormatters";
+
+const RESOLUTION_OPTIONS = [
+  { value: "720p", label: "720p" },
+  { value: "1080p", label: "1080p" },
+  { value: "1440p", label: "1440p" },
+] as const;
 
 interface StreamQuickMenuMediaPageProps {
   screenshotShortcut: string;
@@ -31,6 +38,11 @@ interface StreamQuickMenuMediaPageProps {
   recordingApiAvailable: boolean;
   usedMimeType: string | null;
   recordingBitrateMbps: number | null;
+  recordingResolution: string;
+  recordingFps: number;
+  onRecordingResolutionChange: (value: string) => void;
+  onRecordingFpsChange: (value: number) => void;
+  onRecordingBitrateMbpsChange: (value: number | null) => void;
   recCarouselRef: RefObject<HTMLDivElement | null>;
   onToggleRecording: () => void;
   onDeleteRecording: (id: string) => void;
@@ -55,6 +67,11 @@ export function StreamQuickMenuMediaPage({
   recordingApiAvailable,
   usedMimeType,
   recordingBitrateMbps,
+  recordingResolution,
+  recordingFps,
+  onRecordingResolutionChange,
+  onRecordingFpsChange,
+  onRecordingBitrateMbpsChange,
   recCarouselRef,
   onToggleRecording,
   onDeleteRecording,
@@ -62,6 +79,92 @@ export function StreamQuickMenuMediaPage({
 }: StreamQuickMenuMediaPageProps): JSX.Element {
   return (
     <div className="sidebar-page" role="tabpanel">
+      <section className="sidebar-section">
+        <div className="sidebar-section-header">
+          <span>Recording Settings</span>
+          <span className="sidebar-section-sub">Applies to the next recording.</span>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Resolution</span>
+            <span className="settings-value-badge">{recordingResolution}</span>
+          </div>
+          <div className="sidebar-chip-row">
+            {RESOLUTION_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                className={`sidebar-chip${recordingResolution === option.value ? " sidebar-chip--active" : ""}`}
+                aria-pressed={recordingResolution === option.value}
+                onClick={() => onRecordingResolutionChange(option.value)}
+              >
+                <span>{option.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Frame Rate</span>
+            <span className="settings-value-badge">{recordingFps} FPS</span>
+          </div>
+          <div className="sidebar-chip-row">
+            {[30, 60].map((fps) => (
+              <button
+                key={fps}
+                type="button"
+                className={`sidebar-chip${recordingFps === fps ? " sidebar-chip--active" : ""}`}
+                aria-pressed={recordingFps === fps}
+                onClick={() => onRecordingFpsChange(fps)}
+              >
+                <span>{fps}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Bitrate</span>
+            <span className="settings-value-badge">
+              {recordingBitrateMbps === null ? "Auto" : `${recordingBitrateMbps} Mbps`}
+            </span>
+          </div>
+          <div className="sidebar-chip-row">
+            <button
+              type="button"
+              className={`sidebar-chip${recordingBitrateMbps === null ? " sidebar-chip--active" : ""}`}
+              aria-pressed={recordingBitrateMbps === null}
+              onClick={() => onRecordingBitrateMbpsChange(null)}
+            >
+              <span>Auto</span>
+            </button>
+            <button
+              type="button"
+              className={`sidebar-chip${recordingBitrateMbps !== null ? " sidebar-chip--active" : ""}`}
+              aria-pressed={recordingBitrateMbps !== null}
+              onClick={() => onRecordingBitrateMbpsChange(recordingBitrateMbps ?? 75)}
+            >
+              <span>Custom</span>
+            </button>
+          </div>
+          <SettingRange
+            id="quick-menu-recording-bitrate"
+            className="settings-slider"
+            min={5}
+            max={200}
+            step={5}
+            value={recordingBitrateMbps ?? 75}
+            disabled={recordingBitrateMbps === null}
+            onPreview={onRecordingBitrateMbpsChange}
+            onCommit={onRecordingBitrateMbpsChange}
+          />
+          <span className="sidebar-hint">
+            Recordings are encoded on the CPU. Higher resolution and FPS raise encode load and
+            can drop stream FPS on weaker machines.
+          </span>
+        </div>
+      </section>
+      <div className="sidebar-separator" aria-hidden="true" />
       <section className="sidebar-section">
         <div className="sidebar-section-header">
           <span>Gallery</span>
@@ -124,9 +227,6 @@ export function StreamQuickMenuMediaPage({
         {usedMimeType && (
           <span className="sidebar-hint sidebar-hint--codec">Codec: {usedMimeType}</span>
         )}
-        <span className="sidebar-hint sidebar-hint--codec">
-          Recording bitrate: {recordingBitrateMbps === null ? "Auto" : `${recordingBitrateMbps} Mbps`}
-        </span>
         <div className="sidebar-row sidebar-row--aligned">
           <span className="sidebar-label">
             {isRecording ? `Recording ${formatElapsed(Math.round(recordingDurationMs / 1000))}` : "Record"}

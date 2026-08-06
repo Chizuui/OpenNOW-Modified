@@ -316,7 +316,8 @@
       "inputQueuePressure": "Presión de la cola de entrada (bytes almacenados en búfer y descarga retrasada)",
       "inputChannelState": "Estado del canal de entrada parcialmente confiable y bytes en cola",
       "mouseFlushCadence": "Cadencia de descarga del mouse y velocidad de paquetes",
-      "codecFallback": "Respaldo desde {{requested}}"
+      "codecFallback": "No se pudo negociar {{requested}} → {{negotiated}}",
+      "codecFallbackShort": "{{requested}} → {{negotiated}}"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK está habilitado",
@@ -408,10 +409,9 @@
       "codecUnsupportedReason": "No compatible con este dispositivo",
       "codecAutoHint": "Elige automáticamente el mejor códec para este dispositivo.",
       "codecManualHint": "Se usa al iniciar una nueva sesión de streaming.",
-      "fallbackCodec": "C\u00f3dec de respaldo",
-      "fallbackCodecHint": "Se usa cuando el c\u00f3dec seleccionado no se puede negociar. Auto mantiene todos los c\u00f3decs compatibles como respaldo.",
+      "fallbackCodec": "Códec de respaldo",
+      "fallbackCodecHint": "Se usa cuando el códec seleccionado no se puede negociar. Auto mantiene todos los códecs compatibles como respaldo.",
       "codecMigratedNotice": "{{codec}} no es compatible con este dispositivo — se cambió a Auto.",
-
       "decoder": "Decodificador",
       "encoder": "Codificador",
       "colorDepth": "Profundidad de color",
@@ -441,7 +441,7 @@
       "quickSyncHint": "H.264 se codifica en la CPU aunque la decodificación por GPU funciona: el codificador de hardware (Intel Quick Sync en iGPU Intel) no está registrado. Instale el controlador de gráficos completo de su fabricante de GPU para habilitar la codificación por hardware.",
       "backendExplainTitle": "¿Por qué ENCODE y DECODE usan backends diferentes?",
       "backendExplainBody": "En Windows, Chromium usa dos pilas multimedia distintas: el DECODE de vídeo por hardware usa D3D11 (DXVA/D3D11VA), mientras que el ENCODE de vídeo por hardware usa Media Foundation (MFT). Por eso el mismo códec puede mostrar backends distintos según la dirección. La codificación no se usa para el streaming de juegos en la nube: tu PC solo recibe y decodifica el flujo de vídeo, así que solo la fila DECODE afecta a la calidad del stream.",
-      "gpuDriverLine": "{{gpu}} \u00b7 controlador {{version}}"
+      "gpuDriverLine": "{{gpu}} · controlador {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Más compatibles",
