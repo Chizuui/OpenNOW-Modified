@@ -17,6 +17,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -78,7 +79,10 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.opencloudgaming.opennow.ui.adaptive.isAtLeastMedium
+import com.opencloudgaming.opennow.ui.adaptive.windowWidthSizeClassOf
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
+import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
@@ -323,39 +327,49 @@ internal fun SettingsScreen(
                 onRefresh = viewModel::refreshSettings,
                 modifier = Modifier.fillMaxSize(),
             ) {
-                LazyColumn(
-                    Modifier
-                        .fillMaxSize()
-                        .background(SettingsBackground),
-                    contentPadding = PaddingValues(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    item {
-                        AnimatedVisibility(visible = showSearch) {
-                            NativeSearchField(
-                                query = searchQuery,
-                                onQueryChange = onSearchQueryChange,
-                                placeholder = stringResource(R.string.search_settings),
-                                focusRequester = searchFocusRequester,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
+                // M3 large screens step the content gutter up to 24dp, matching Home/Store/Library.
+                // The check uses the content width (BoxWithConstraints) exactly like those screens,
+                // not the full window width, so they agree even when the NavigationRail is present.
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val settingsContentGutter = if (windowWidthSizeClassOf(maxWidth).isAtLeastMedium) {
+                        OpenNowSpacing.xl
+                    } else {
+                        OpenNowSpacing.md
                     }
-                    item {
-                        AnimatedContent(targetState = selectedCategory, label = "settings-route") { category ->
-                            SettingsBody(
-                                state = state,
-                                viewModel = viewModel,
-                                tvProfile = tvProfile,
-                                controllerFamily = controllerFamily,
-                                searchQuery = searchQuery,
-                                selectedCategory = category,
-                                categories = categories,
-                                detailFocusRequester = detailFocusRequester,
-                                onSelectCategory = { selectedCategory = it },
-                                onBack = { selectedCategory = null },
-                                showSessionProxyWarning = { showSessionProxyWarning = true },
-                            )
+                    LazyColumn(
+                        Modifier
+                            .fillMaxSize()
+                            .background(SettingsBackground),
+                        contentPadding = PaddingValues(settingsContentGutter),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        item {
+                            AnimatedVisibility(visible = showSearch) {
+                                NativeSearchField(
+                                    query = searchQuery,
+                                    onQueryChange = onSearchQueryChange,
+                                    placeholder = stringResource(R.string.search_settings),
+                                    focusRequester = searchFocusRequester,
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                        }
+                        item {
+                            AnimatedContent(targetState = selectedCategory, label = "settings-route") { category ->
+                                SettingsBody(
+                                    state = state,
+                                    viewModel = viewModel,
+                                    tvProfile = tvProfile,
+                                    controllerFamily = controllerFamily,
+                                    searchQuery = searchQuery,
+                                    selectedCategory = category,
+                                    categories = categories,
+                                    detailFocusRequester = detailFocusRequester,
+                                    onSelectCategory = { selectedCategory = it },
+                                    onBack = { selectedCategory = null },
+                                    showSessionProxyWarning = { showSessionProxyWarning = true },
+                                )
+                            }
                         }
                     }
                 }
