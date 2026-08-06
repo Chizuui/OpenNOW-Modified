@@ -108,7 +108,7 @@ export function StreamQuickMenuControlsPage({
         </div>
         <div className="sidebar-row sidebar-row--column">
           <div className="sidebar-row-top">
-            <span className="sidebar-label">Max Bitrate</span>
+            <span className="sidebar-label">Stream Max Bitrate</span>
             <span className="settings-value-badge">{maxBitrateMbps} Mbps</span>
           </div>
           <SettingRange

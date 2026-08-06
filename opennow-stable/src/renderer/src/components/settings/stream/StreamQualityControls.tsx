@@ -360,6 +360,43 @@ export function StreamQualityControls({
         />
       </div>
 
+      <div className="settings-row">
+        <label className="settings-label" htmlFor="settings-stream-recording-resolution">
+          {t("settings.video.recordingResolution")}
+        </label>
+        <div className="settings-row-control">
+          <SelectDropdown
+            id="settings-stream-recording-resolution"
+            value={settings.recordingResolution}
+            options={[
+              { value: "1440p", label: "1440p" },
+              { value: "1080p", label: "1080p" },
+              { value: "720p", label: "720p" },
+            ]}
+            onChange={(value) => handleChange("recordingResolution", value as string)}
+          />
+        </div>
+      </div>
+
+      <div className="settings-row">
+        <label className="settings-label">{t("settings.video.recordingFps")}</label>
+        <div className="settings-row-control">
+          <div className="settings-chip-row">
+            {[30, 60].map((fps) => (
+              <button
+                key={fps}
+                type="button"
+                className={`settings-chip ${settings.recordingFps === fps ? "active" : ""}`}
+                aria-pressed={settings.recordingFps === fps}
+                onClick={() => handleChange("recordingFps", fps)}
+              >
+                <span>{fps}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
       <div className="settings-row settings-row--column">
         <div className="settings-row-top">
           <label className="settings-label" htmlFor="settings-stream-recording-bitrate">

@@ -62,3 +62,8 @@ result
 vendor/
 !native/opennow-streamer/vendor/
 !native/opennow-streamer/vendor/**
+
+# Claude
+.claude/
+claude-plans/
+.freebuff/

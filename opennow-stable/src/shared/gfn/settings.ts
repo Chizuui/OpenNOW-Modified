@@ -60,6 +60,8 @@ export interface Settings {
   jitterBufferMode: JitterBufferMode;
   /** Recording video bitrate in Mbps; null means let MediaRecorder choose automatically */
   recordingBitrateMbps: number | null;
+  recordingResolution: string;
+  recordingFps: number;
   streamClientMode: StreamClientMode;
   nativeStreamerBackend: NativeStreamerBackendPreference;
   nativeVideoBackend: NativeVideoBackendPreference;
@@ -241,6 +243,8 @@ export function createDefaultSettings(platform: string): Settings {
     maxBitrateMbps: 75,
     jitterBufferMode: "balanced",
     recordingBitrateMbps: null,
+    recordingResolution: "1080p",
+    recordingFps: 60,
     streamClientMode: "web",
     nativeStreamerBackend: "gstreamer",
     nativeVideoBackend: "auto",
