@@ -293,7 +293,7 @@ internal fun gameMatchesLibraryFilters(game: GameInfo, selectedIds: List<String>
 }
 
 // libraryStoreFilterIds (was OpenNowScreens.kt:3502)
-internal fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
+private fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
     val labels = libraryStoreDisplayNames(game)
     return labels
         .mapNotNull { label ->
@@ -305,7 +305,7 @@ internal fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
 }
 
 // LIBRARY_STORE_FILTER_PREFIX (was OpenNowScreens.kt:3513)
-internal const val LIBRARY_STORE_FILTER_PREFIX = "library_store:"
+private const val LIBRARY_STORE_FILTER_PREFIX = "library_store:"
 
 // activeSessionGame (was OpenNowScreens.kt:3516)
 internal fun activeSessionGame(state: OpenNowUiState, active: ActiveSessionInfo): GameInfo? =
@@ -392,7 +392,7 @@ internal fun RefreshingGamesPlaceholder(
 
 // GameGrid (was OpenNowScreens.kt:3927)
 @Composable
-internal fun GameGrid(
+private fun GameGrid(
     games: List<GameInfo>,
     favoriteIds: List<String>,
     settings: AppSettings,

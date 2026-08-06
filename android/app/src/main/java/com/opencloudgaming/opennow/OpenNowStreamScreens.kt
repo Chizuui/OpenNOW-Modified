@@ -1133,7 +1133,7 @@ internal fun shouldShowAndroidTouchControls(
     !tvProfile && touchInputEnabled && touchControlsEnabled && !suppressedByPhysicalController
 
 // SessionTimerDisplay (was OpenNowScreens.kt:7970)
-internal data class SessionTimerDisplay(
+private data class SessionTimerDisplay(
     val label: String,
     val value: String,
     val detail: String,
@@ -1142,13 +1142,13 @@ internal data class SessionTimerDisplay(
 )
 
 // StreamGuideStep (was OpenNowScreens.kt:7978)
-internal enum class StreamGuideStep {
+private enum class StreamGuideStep {
     OpenControls,
     PressDone,
 }
 
 // sessionTimerDisplay (was OpenNowScreens.kt:7983)
-internal fun sessionTimerDisplay(limit: SmartSessionLimit, startedAtMs: Long, nowMs: Long): SessionTimerDisplay {
+private fun sessionTimerDisplay(limit: SmartSessionLimit, startedAtMs: Long, nowMs: Long): SessionTimerDisplay {
     val elapsedSeconds = sessionElapsedSeconds(startedAtMs, nowMs)
     val limitSeconds = limit.limitHours * 60 * 60
     val remainingSeconds = sessionRemainingSeconds(limit, startedAtMs, nowMs)
@@ -1174,7 +1174,7 @@ internal fun sessionTimerDisplay(limit: SmartSessionLimit, startedAtMs: Long, no
 
 // StreamSessionTimerMenuRow (was OpenNowScreens.kt:8007)
 @Composable
-internal fun StreamSessionTimerMenuRow(
+private fun StreamSessionTimerMenuRow(
     limit: SmartSessionLimit,
     startedAtMs: Long,
     nowMs: Long,
@@ -1239,14 +1239,14 @@ internal fun formatSessionTimerDuration(totalSeconds: Int): String {
 }
 
 // formatSessionWarningThreshold (was OpenNowScreens.kt:8071)
-internal fun formatSessionWarningThreshold(thresholdSeconds: Int): String {
+private fun formatSessionWarningThreshold(thresholdSeconds: Int): String {
     val minutes = thresholdSeconds / 60
     return if (minutes == 1) "1 minute" else "$minutes minutes"
 }
 
 // StreamVideoSurface (was OpenNowScreens.kt:8076)
 @Composable
-internal fun StreamVideoSurface(
+private fun StreamVideoSurface(
     client: NativeStreamClient,
     settings: StreamSettings,
     androidTouch: AndroidTouchSettings,
@@ -1479,25 +1479,25 @@ internal fun streamPinchZoomEnabled(
 ): Boolean = touchMouseEnabled && !touchControllerVisible
 
 // streamAspectRatioForPixels (was OpenNowScreens.kt:8306)
-internal fun streamAspectRatioForPixels(pixels: Pair<Int, Int>): Float {
+private fun streamAspectRatioForPixels(pixels: Pair<Int, Int>): Float {
     val (width, height) = pixels
     if (width <= 0 || height <= 0) return 16f / 9f
     return width.toFloat() / height.toFloat()
 }
 
 // isStableDecodedStreamResolution (was OpenNowScreens.kt:8312)
-internal fun isStableDecodedStreamResolution(pixels: Pair<Int, Int>): Boolean =
+private fun isStableDecodedStreamResolution(pixels: Pair<Int, Int>): Boolean =
     pixels.first >= MIN_STABLE_DECODED_STREAM_WIDTH_PX &&
         pixels.second >= MIN_STABLE_DECODED_STREAM_HEIGHT_PX
 
 // MIN_STABLE_DECODED_STREAM_WIDTH_PX (was OpenNowScreens.kt:8316)
-internal const val MIN_STABLE_DECODED_STREAM_WIDTH_PX = 320
+private const val MIN_STABLE_DECODED_STREAM_WIDTH_PX = 320
 
 // MIN_STABLE_DECODED_STREAM_HEIGHT_PX (was OpenNowScreens.kt:8317)
-internal const val MIN_STABLE_DECODED_STREAM_HEIGHT_PX = 180
+private const val MIN_STABLE_DECODED_STREAM_HEIGHT_PX = 180
 
 // clampStreamZoomOffset (was OpenNowScreens.kt:8319)
-internal fun clampStreamZoomOffset(offset: Offset, zoomScale: Float, viewportSize: IntSize): Offset {
+private fun clampStreamZoomOffset(offset: Offset, zoomScale: Float, viewportSize: IntSize): Offset {
     if (zoomScale <= 1.001f || viewportSize.width <= 0 || viewportSize.height <= 0) return Offset.Zero
     val maxX = viewportSize.width * (zoomScale - 1f) / 2f
     val maxY = viewportSize.height * (zoomScale - 1f) / 2f
@@ -1508,7 +1508,7 @@ internal fun clampStreamZoomOffset(offset: Offset, zoomScale: Float, viewportSiz
 }
 
 // androidNullPointerIcon (was OpenNowScreens.kt:8329)
-internal fun androidNullPointerIcon(view: android.view.View): PointerIcon? =
+private fun androidNullPointerIcon(view: android.view.View): PointerIcon? =
     if (Build.VERSION.SDK_INT >= 24) {
         runCatching { PointerIcon.getSystemIcon(view.context, PointerIcon.TYPE_NULL) }
             .onFailure { error -> NativeInputDiagnostics.add("pointer icon unavailable error=${error.javaClass.simpleName}") }
@@ -1518,7 +1518,7 @@ internal fun androidNullPointerIcon(view: android.view.View): PointerIcon? =
     }
 
 // configureAndroidMousePointerCapture (was OpenNowScreens.kt:8338)
-internal fun View.configureAndroidMousePointerCapture(enabled: Boolean, onCaptureInput: () -> Unit = {}, onMotion: (MotionEvent) -> Boolean) {
+private fun View.configureAndroidMousePointerCapture(enabled: Boolean, onCaptureInput: () -> Unit = {}, onMotion: (MotionEvent) -> Boolean) {
     if (Build.VERSION.SDK_INT < 26) return
     if (!enabled) {
         clearAndroidMousePointerCapture()
@@ -1541,7 +1541,7 @@ internal fun View.configureAndroidMousePointerCapture(enabled: Boolean, onCaptur
 }
 
 // clearAndroidMousePointerCapture (was OpenNowScreens.kt:8360)
-internal fun View.clearAndroidMousePointerCapture() {
+private fun View.clearAndroidMousePointerCapture() {
     if (Build.VERSION.SDK_INT < 26) return
     setOnCapturedPointerListener(null)
     runCatching { releasePointerCapture() }
@@ -1549,20 +1549,20 @@ internal fun View.clearAndroidMousePointerCapture() {
 }
 
 // hideAndroidPointerTree (was OpenNowScreens.kt:8367)
-internal fun android.view.View.hideAndroidPointerTree() {
+private fun android.view.View.hideAndroidPointerTree() {
     if (Build.VERSION.SDK_INT < 24) return
     val icon = androidNullPointerIcon(this)
     applyAndroidPointerIconTree(icon)
 }
 
 // showAndroidPointerTree (was OpenNowScreens.kt:8373)
-internal fun android.view.View.showAndroidPointerTree() {
+private fun android.view.View.showAndroidPointerTree() {
     if (Build.VERSION.SDK_INT < 24) return
     applyAndroidPointerIconTree(null)
 }
 
 // applyAndroidPointerIconTree (was OpenNowScreens.kt:8378)
-internal fun android.view.View.applyAndroidPointerIconTree(icon: PointerIcon?) {
+private fun android.view.View.applyAndroidPointerIconTree(icon: PointerIcon?) {
     if (Build.VERSION.SDK_INT < 24) return
     runCatching { pointerIcon = icon }
         .onFailure { error -> NativeInputDiagnostics.add("pointer icon apply failed error=${error.javaClass.simpleName}") }
@@ -1575,7 +1575,7 @@ internal fun android.view.View.applyAndroidPointerIconTree(icon: PointerIcon?) {
 
 // FingerMouseInputLayer (was OpenNowScreens.kt:8389)
 @Composable
-internal fun FingerMouseInputLayer(
+private fun FingerMouseInputLayer(
     enabled: Boolean,
     pinchZoomEnabled: Boolean,
     onZoomGesture: (scaleChange: Float, pan: Offset) -> Unit,
@@ -1652,7 +1652,7 @@ internal fun FingerMouseInputLayer(
 }
 
 // firstTwoPointerDistance (was OpenNowScreens.kt:8466)
-internal fun MotionEvent.firstTwoPointerDistance(): Float {
+private fun MotionEvent.firstTwoPointerDistance(): Float {
     if (pointerCount < 2) return 0f
     val dx = getX(1) - getX(0)
     val dy = getY(1) - getY(0)
@@ -1660,7 +1660,7 @@ internal fun MotionEvent.firstTwoPointerDistance(): Float {
 }
 
 // firstTwoPointerCentroid (was OpenNowScreens.kt:8473)
-internal fun MotionEvent.firstTwoPointerCentroid(): Offset =
+private fun MotionEvent.firstTwoPointerCentroid(): Offset =
     if (pointerCount >= 2) {
         Offset((getX(0) + getX(1)) / 2f, (getY(0) + getY(1)) / 2f)
     } else {
@@ -1669,7 +1669,7 @@ internal fun MotionEvent.firstTwoPointerCentroid(): Offset =
 
 // ActiveSessionDecisionScreen (was OpenNowScreens.kt:8480)
 @Composable
-internal fun ActiveSessionDecisionScreen(
+private fun ActiveSessionDecisionScreen(
     state: OpenNowUiState,
     onResumeSession: () -> Unit,
     onReplaceSession: () -> Unit,
@@ -1742,7 +1742,7 @@ internal fun ActiveSessionDecisionScreen(
 
 // NoActiveStreamScreen (was OpenNowScreens.kt:8552)
 @Composable
-internal fun NoActiveStreamScreen(
+private fun NoActiveStreamScreen(
     canResumeSession: Boolean,
     canEndSession: Boolean,
     onBack: () -> Unit,
@@ -1778,7 +1778,7 @@ internal fun NoActiveStreamScreen(
 
 // StreamFirstLaunchGuide (was OpenNowScreens.kt:8588)
 @Composable
-internal fun StreamFirstLaunchGuide(
+private fun StreamFirstLaunchGuide(
     step: StreamGuideStep,
     controlsOpen: Boolean,
     touchControlsEnabled: Boolean,
@@ -1852,7 +1852,7 @@ internal fun StreamFirstLaunchGuide(
 
 // StreamGuideCard (was OpenNowScreens.kt:8661)
 @Composable
-internal fun StreamGuideCard(
+private fun StreamGuideCard(
     stepLabel: String,
     title: String,
     body: String,
@@ -1910,7 +1910,7 @@ internal fun StreamGuideCard(
 
 // StreamGuideDoneCallout (was OpenNowScreens.kt:8718)
 @Composable
-internal fun StreamGuideDoneCallout(
+private fun StreamGuideDoneCallout(
     controlsOpen: Boolean,
     onOpenControls: () -> Unit,
     onSkip: () -> Unit,
@@ -1953,7 +1953,7 @@ internal fun StreamGuideDoneCallout(
 
 // PhysicalControllerTouchControlsDialog (was OpenNowScreens.kt:8760)
 @Composable
-internal fun PhysicalControllerTouchControlsDialog(
+private fun PhysicalControllerTouchControlsDialog(
     doNotShowAgain: Boolean,
     onDoNotShowAgainChange: (Boolean) -> Unit,
     onOk: () -> Unit,
@@ -2000,7 +2000,7 @@ internal fun PhysicalControllerTouchControlsDialog(
 
 // StreamGuideEdgeCue (was OpenNowScreens.kt:8806)
 @Composable
-internal fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
+private fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
     Box(
         modifier
             .fillMaxHeight()
@@ -2041,7 +2041,7 @@ internal fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
 
 // StreamGuidePoint (was OpenNowScreens.kt:8846)
 @Composable
-internal fun StreamGuidePoint(number: Int, body: String) {
+private fun StreamGuidePoint(number: Int, body: String) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -2067,7 +2067,7 @@ internal fun StreamGuidePoint(number: Int, body: String) {
 }
 
 // StreamControlsPage (was OpenNowScreens.kt:8872)
-internal enum class StreamControlsPage {
+private enum class StreamControlsPage {
     Main,
     StatusBar,
     TouchControls,
@@ -2077,7 +2077,7 @@ internal enum class StreamControlsPage {
 
 // StreamControlsPanel (was OpenNowScreens.kt:8880)
 @Composable
-internal fun StreamControlsPanel(
+private fun StreamControlsPanel(
     gameTitle: String,
     status: String?,
     settings: AppSettings,
@@ -2582,7 +2582,7 @@ internal fun StreamControlsPanel(
 
 // BuiltInGameTouchNotice (was OpenNowScreens.kt:9384)
 @Composable
-internal fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
+private fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
@@ -2722,7 +2722,7 @@ internal fun BugReportDataDisclosure(
 
 // streamTouchPassthrough (was OpenNowScreens.kt:9521)
 @Composable
-internal fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Modifier {
+private fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Modifier {
     val inflatePx = with(LocalDensity.current) { inflate.roundToPx() }
     DisposableEffect(id) {
         onDispose { NativeStreamInputRouter.clearOverlayTouchPassthroughBound(id) }
@@ -2741,17 +2741,17 @@ internal fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Mo
 }
 
 // PASSTHROUGH_ID_PANEL (was OpenNowScreens.kt:9540)
-internal const val PASSTHROUGH_ID_PANEL = "controls-panel"
+private const val PASSTHROUGH_ID_PANEL = "controls-panel"
 
 // PASSTHROUGH_ID_KEYBOARD (was OpenNowScreens.kt:9541)
-internal const val PASSTHROUGH_ID_KEYBOARD = "keyboard-bar"
+private const val PASSTHROUGH_ID_KEYBOARD = "keyboard-bar"
 
 // PASSTHROUGH_ID_EXIT (was OpenNowScreens.kt:9542)
-internal const val PASSTHROUGH_ID_EXIT = "exit-confirmation"
+private const val PASSTHROUGH_ID_EXIT = "exit-confirmation"
 
 // StreamPanelHeader (was OpenNowScreens.kt:9544)
 @Composable
-internal fun StreamPanelHeader(
+private fun StreamPanelHeader(
     page: StreamControlsPage,
     gameTitle: String,
     status: String?,
@@ -2877,7 +2877,7 @@ internal fun StreamPanelHeader(
 
 // StreamPanelHeaderButton (was OpenNowScreens.kt:9668)
 @Composable
-internal fun StreamPanelHeaderButton(
+private fun StreamPanelHeaderButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     content: @Composable RowScope.() -> Unit,
@@ -2898,7 +2898,7 @@ internal fun StreamPanelHeaderButton(
 /** Slides forward going into a sub-page and back coming out of one. */
 
 // streamPanelPageTransition (was OpenNowScreens.kt:9688)
-internal fun streamPanelPageTransition(
+private fun streamPanelPageTransition(
     from: StreamControlsPage,
     to: StreamControlsPage,
     reduceMotion: Boolean,
@@ -2920,7 +2920,7 @@ internal fun streamPanelPageTransition(
 
 // BugReportSubmissionRequirements (was OpenNowScreens.kt:9708)
 @Composable
-internal fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
+private fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
     Text(
         "Bug reports are currently supported only in English. Descriptions must be at least $ANDROID_BUG_REPORT_MIN_DESCRIPTION_CHARS characters and explain what happened. Non-English or non-descriptive reports will be ignored.",
         modifier = modifier.fillMaxWidth(),
@@ -2991,7 +2991,7 @@ internal fun BugReportVersionGateCard(
 // BugReportPreflightDeckView (was OpenNowScreens.kt:9776)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun BugReportPreflightDeckView(
+private fun BugReportPreflightDeckView(
     deck: BugReportPreflightDeck,
     page: Int,
     onPrevious: () -> Unit,
@@ -3171,7 +3171,7 @@ internal fun BugReportPreflightDeckView(
 
 // BugReportFormInputs (was OpenNowScreens.kt:9956)
 @Composable
-internal fun BugReportFormInputs(
+private fun BugReportFormInputs(
     title: String,
     description: String,
     consentChecked: Boolean,
@@ -3275,7 +3275,7 @@ internal fun BugReportFormInputs(
 
 // StreamBugReporter (was OpenNowScreens.kt:10059)
 @Composable
-internal fun StreamBugReporter(
+private fun StreamBugReporter(
     submission: BugReportSubmissionState,
     versionCheck: AndroidBugReportVersionCheckState,
     update: AndroidUpdateState,
@@ -3581,7 +3581,7 @@ internal fun StreamBugReporter(
 }
 
 // mouseModePageItems (was OpenNowScreens.kt:10365)
-internal fun LazyListScope.mouseModePageItems(
+private fun LazyListScope.mouseModePageItems(
     settings: AppSettings,
     controllerMouseEmulationEnabled: Boolean,
     onControllerMouseEmulationToggle: () -> Unit,
@@ -3667,7 +3667,7 @@ internal fun LazyListScope.mouseModePageItems(
 
 // statusBarPageItems (was OpenNowScreens.kt:10450)
 @OptIn(ExperimentalLayoutApi::class)
-internal fun LazyListScope.statusBarPageItems(
+private fun LazyListScope.statusBarPageItems(
     settings: AppSettings,
     statsVisible: Boolean,
     onStatsToggle: () -> Unit,
@@ -3851,7 +3851,7 @@ internal fun LazyListScope.statusBarPageItems(
 
 // StreamPanelKeyButton (was OpenNowScreens.kt:10632)
 @Composable
-internal fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
     OutlinedButton(
         onClick = onClick,
@@ -3873,7 +3873,7 @@ internal fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, 
 
 // TouchLayoutSlider (was OpenNowScreens.kt:10652)
 @Composable
-internal fun TouchLayoutSlider(
+private fun TouchLayoutSlider(
     @StringRes labelRes: Int,
     value: Float,
     min: Float,
@@ -3898,27 +3898,27 @@ internal fun TouchLayoutSlider(
 
 // onOffLabel (was OpenNowScreens.kt:10675)
 @Composable
-internal fun onOffLabel(enabled: Boolean): String =
+private fun onOffLabel(enabled: Boolean): String =
     stringResource(if (enabled) R.string.common_on else R.string.common_off)
 
 // SHARPENING_SLIDER_STEP (was OpenNowScreens.kt:10679)
-internal const val SHARPENING_SLIDER_STEP = 0.05f
+private const val SHARPENING_SLIDER_STEP = 0.05f
 
 // TOUCH_SCALE_SLIDER_STEP (was OpenNowScreens.kt:10680)
-internal const val TOUCH_SCALE_SLIDER_STEP = 0.05f
+private const val TOUCH_SCALE_SLIDER_STEP = 0.05f
 
 // TOUCH_DP_SLIDER_STEP (was OpenNowScreens.kt:10681)
-internal const val TOUCH_DP_SLIDER_STEP = 2f
+private const val TOUCH_DP_SLIDER_STEP = 2f
 
 // JOYSTICK_DEAD_ZONE_STEP (was OpenNowScreens.kt:10682)
-internal const val JOYSTICK_DEAD_ZONE_STEP = 0.01f
+private const val JOYSTICK_DEAD_ZONE_STEP = 0.01f
 
 // DP_UNIT (was OpenNowScreens.kt:10683)
-internal const val DP_UNIT = "dp"
+private const val DP_UNIT = "dp"
 
 // StreamKeyboardBar (was OpenNowScreens.kt:10685)
 @Composable
-internal fun StreamKeyboardBar(
+private fun StreamKeyboardBar(
     text: String,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -3992,12 +3992,12 @@ internal fun StreamKeyboardBar(
 }
 
 // MAX_STREAM_KEYBOARD_TEXT_LENGTH (was OpenNowScreens.kt:10759)
-internal const val MAX_STREAM_KEYBOARD_TEXT_LENGTH = 4096
+private const val MAX_STREAM_KEYBOARD_TEXT_LENGTH = 4096
 
 // StreamStatsPill (was OpenNowScreens.kt:10761)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun StreamStatsPill(
+private fun StreamStatsPill(
     streamStats: StreamRuntimeStats,
     streamSettings: StreamSettings,
     style: StreamStatsStyle,
@@ -4052,7 +4052,7 @@ internal fun StreamStatsPill(
 
 // ActiveStreamModePill (was OpenNowScreens.kt:10816)
 @Composable
-internal fun ActiveStreamModePill(
+private fun ActiveStreamModePill(
     status: ActiveStreamModeStatus,
     recoveryReason: String?,
     bugReportSubmission: BugReportSubmissionState,
@@ -4393,7 +4393,7 @@ internal fun activeStreamModeDisplayChanges(status: ActiveStreamModeStatus): Lis
 }
 
 // onOffLabel (was OpenNowScreens.kt:11155)
-internal fun Boolean.onOffLabel(): String = if (this) "On" else "Off"
+private fun Boolean.onOffLabel(): String = if (this) "On" else "Off"
 
 // ActiveStreamModeCauseAssessment (was OpenNowScreens.kt:11157)
 internal data class ActiveStreamModeCauseAssessment(
@@ -4477,7 +4477,7 @@ internal fun activeStreamModeDeveloperReport(
 
 // StreamStatsMetricItems (was OpenNowScreens.kt:11233)
 @Composable
-internal fun StreamStatsMetricItems(
+private fun StreamStatsMetricItems(
     streamStats: StreamRuntimeStats,
     streamSettings: StreamSettings,
     metrics: StreamStatsMetrics,
@@ -4564,11 +4564,11 @@ internal fun StreamStatsMetricItems(
 /** Shown in place of a metric that has not been measured yet. */
 
 // NO_STAT_VALUE (was OpenNowScreens.kt:11319)
-internal const val NO_STAT_VALUE = "--"
+private const val NO_STAT_VALUE = "--"
 
 // StreamStatsText (was OpenNowScreens.kt:11321)
 @Composable
-internal fun StreamStatsText(
+private fun StreamStatsText(
     value: String,
     modifier: Modifier = Modifier,
     quality: StreamQualityLevel? = null,
@@ -4598,14 +4598,14 @@ internal fun StreamStatsText(
 
 // labelRes (was OpenNowScreens.kt:11350)
 @StringRes
-internal fun StreamQualityLevel.labelRes(): Int = when (this) {
+private fun StreamQualityLevel.labelRes(): Int = when (this) {
     StreamQualityLevel.Good -> R.string.stream_quality_good
     StreamQualityLevel.Fair -> R.string.stream_quality_fair
     StreamQualityLevel.Poor -> R.string.stream_quality_poor
 }
 
 // CompactStreamDeviceStatus (was OpenNowScreens.kt:11357)
-internal data class CompactStreamDeviceStatus(
+private data class CompactStreamDeviceStatus(
     val batteryPercent: Int? = null,
     val batteryCharging: Boolean = false,
     val networkKind: AndroidNetworkKind = AndroidNetworkKind.Unknown,
@@ -4615,7 +4615,7 @@ internal data class CompactStreamDeviceStatus(
 
 // rememberCompactStreamDeviceStatus (was OpenNowScreens.kt:11365)
 @Composable
-internal fun rememberCompactStreamDeviceStatus(): CompactStreamDeviceStatus {
+private fun rememberCompactStreamDeviceStatus(): CompactStreamDeviceStatus {
     val context = LocalContext.current
     val appContext = remember(context) { context.applicationContext }
     var status by remember(appContext) { mutableStateOf(readCompactStreamDeviceStatus(appContext)) }
@@ -4629,7 +4629,7 @@ internal fun rememberCompactStreamDeviceStatus(): CompactStreamDeviceStatus {
 }
 
 // readCompactStreamDeviceStatus (was OpenNowScreens.kt:11379)
-internal fun readCompactStreamDeviceStatus(context: Context): CompactStreamDeviceStatus {
+private fun readCompactStreamDeviceStatus(context: Context): CompactStreamDeviceStatus {
     val diagnostics = AndroidRuntimeDiagnostics.snapshot(context)
     return CompactStreamDeviceStatus(
         batteryPercent = diagnostics.batteryPercent,
@@ -4642,7 +4642,7 @@ internal fun readCompactStreamDeviceStatus(context: Context): CompactStreamDevic
 
 // StreamBatteryIndicator (was OpenNowScreens.kt:11390)
 @Composable
-internal fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
+private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val description = status.batteryPercent?.let { percent ->
         "Battery $percent percent${if (status.batteryCharging) ", charging" else ""}"
     } ?: "Battery unknown"
@@ -4695,7 +4695,7 @@ internal fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier:
 
 // StreamNetworkIndicator (was OpenNowScreens.kt:11442)
 @Composable
-internal fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
+private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val bars = status.networkBars?.coerceIn(0, 4)
     val label = when (status.networkKind) {
         AndroidNetworkKind.Cellular -> status.cellularGeneration ?: status.networkKind.label
@@ -4773,7 +4773,7 @@ internal fun formatRuntimeBitrate(bitrateKbps: Int?): String {
 }
 
 // shouldHideStreamStatusText (was OpenNowScreens.kt:11518)
-internal fun shouldHideStreamStatusText(status: String): Boolean =
+private fun shouldHideStreamStatusText(status: String): Boolean =
     status.trim().replace('_', ' ').let {
         it.equals("Streaming", ignoreCase = true) ||
             it.equals("ICE CONNECTED", ignoreCase = true) ||
@@ -4853,7 +4853,7 @@ internal fun initialStreamConnectionStatus(nativeState: String): InitialStreamCo
 
 // InitialStreamConnectionOverlay (was OpenNowScreens.kt:11594)
 @Composable
-internal fun InitialStreamConnectionOverlay(
+private fun InitialStreamConnectionOverlay(
     gameTitle: String?,
     status: InitialStreamConnectionStatus,
     modifier: Modifier = Modifier,
@@ -4923,7 +4923,7 @@ internal fun InitialStreamConnectionOverlay(
 
 // StreamExitConfirmation (was OpenNowScreens.kt:11663)
 @Composable
-internal fun StreamExitConfirmation(
+private fun StreamExitConfirmation(
     gameTitle: String,
     onKeepPlaying: () -> Unit,
     onExit: () -> Unit,
@@ -5002,7 +5002,7 @@ internal fun StreamExitConfirmation(
 
 // QueueLoadingScreen (was OpenNowScreens.kt:11741)
 @Composable
-internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+private fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     val session = state.streamSession
     val game = state.streamGame
     val ads = sessionAdItems(session?.adState)
@@ -5068,7 +5068,7 @@ internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMod
 
 // QueueAmbientBackdrop (was OpenNowScreens.kt:11806)
 @Composable
-internal fun QueueAmbientBackdrop(
+private fun QueueAmbientBackdrop(
     accent: Color,
     queuePosition: Int?,
     modifier: Modifier = Modifier,
@@ -5180,7 +5180,7 @@ internal fun QueueAmbientBackdrop(
 
 // QueueAmbientOrb (was OpenNowScreens.kt:11917)
 @Composable
-internal fun QueueAmbientOrb(
+private fun QueueAmbientOrb(
     color: Color,
     size: Dp,
     alpha: Float,
@@ -5206,7 +5206,7 @@ internal fun QueueAmbientOrb(
 
 // QueueSignalField (was OpenNowScreens.kt:11942)
 @Composable
-internal fun QueueSignalField(
+private fun QueueSignalField(
     accent: Color,
     queuePosition: Int?,
     phase: Float,
@@ -5242,7 +5242,7 @@ internal fun QueueSignalField(
 
 // AnimatedQueueStatusText (was OpenNowScreens.kt:11977)
 @Composable
-internal fun AnimatedQueueStatusText(
+private fun AnimatedQueueStatusText(
     queueCopy: String,
     queuePosition: Int?,
     compact: Boolean,
@@ -5377,7 +5377,7 @@ internal fun AnimatedQueueStatusText(
 
 // AnimatedQueueNumber (was OpenNowScreens.kt:12111)
 @Composable
-internal fun AnimatedQueueNumber(
+private fun AnimatedQueueNumber(
     currentNumber: String,
     previousNumber: String,
     targetNumber: String,
@@ -5420,7 +5420,7 @@ internal fun AnimatedQueueNumber(
 
 // QueueNumberDigitSlot (was OpenNowScreens.kt:12153)
 @Composable
-internal fun QueueNumberDigitSlot(
+private fun QueueNumberDigitSlot(
     fromDigit: Char?,
     toDigit: Char?,
     digitChanged: Boolean,
@@ -5494,18 +5494,18 @@ internal fun QueueNumberDigitSlot(
 }
 
 // rightAlignedCharAt (was OpenNowScreens.kt:12227)
-internal fun String.rightAlignedCharAt(slotIndex: Int, slotCount: Int): Char? =
+private fun String.rightAlignedCharAt(slotIndex: Int, slotCount: Int): Char? =
     getOrNull(length - slotCount + slotIndex)
 
 // QueueStatusParts (was OpenNowScreens.kt:12230)
-internal data class QueueStatusParts(
+private data class QueueStatusParts(
     val prefix: String,
     val number: String,
     val suffix: String,
 )
 
 // queueStatusParts (was OpenNowScreens.kt:12236)
-internal fun queueStatusParts(queueCopy: String, queuePosition: Int): QueueStatusParts {
+private fun queueStatusParts(queueCopy: String, queuePosition: Int): QueueStatusParts {
     val number = queuePosition.toString()
     val index = queueCopy.indexOf(number)
     if (index < 0) {
@@ -5519,19 +5519,19 @@ internal fun queueStatusParts(queueCopy: String, queuePosition: Int): QueueStatu
 }
 
 // queueUrgency (was OpenNowScreens.kt:12249)
-internal fun queueUrgency(queuePosition: Int?): Float {
+private fun queueUrgency(queuePosition: Int?): Float {
     val position = queuePosition ?: return 0f
     if (position >= 10) return 0f
     return ((10 - position).toFloat() / 9f).coerceIn(0f, 1f)
 }
 
 // activeQueuePosition (was OpenNowScreens.kt:12255)
-internal fun activeQueuePosition(state: OpenNowUiState): Int? =
+private fun activeQueuePosition(state: OpenNowUiState): Int? =
     queueDisplayPosition(state)
 
 // rememberStableQueuePosition (was OpenNowScreens.kt:12258)
 @Composable
-internal fun rememberStableQueuePosition(queuePosition: Int?): Int? {
+private fun rememberStableQueuePosition(queuePosition: Int?): Int? {
     var stableQueuePosition by remember { mutableStateOf(queuePosition) }
     LaunchedEffect(queuePosition) {
         if (queuePosition == stableQueuePosition) return@LaunchedEffect
@@ -5550,11 +5550,11 @@ internal fun queueLaunchStatusText(state: OpenNowUiState, queuePosition: Int?): 
     queuePosition?.let { "Queue position $it" } ?: queueLaunchStatusText(state)
 
 // queueIdleStatusColor (was OpenNowScreens.kt:12276)
-internal fun queueIdleStatusColor(queueCopy: String): Color =
+private fun queueIdleStatusColor(queueCopy: String): Color =
     if (queueCopy.equals("Starting session", ignoreCase = true)) Green else TextMuted
 
 // queueUrgencyColor (was OpenNowScreens.kt:12279)
-internal fun queueUrgencyColor(queuePosition: Int?): Color {
+private fun queueUrgencyColor(queuePosition: Int?): Color {
     val heat = queueUrgency(queuePosition)
     if (heat <= 0f) return TextMuted
     val green = (0.57f - 0.49f * heat).coerceIn(0.06f, 0.57f)
@@ -5564,7 +5564,7 @@ internal fun queueUrgencyColor(queuePosition: Int?): Color {
 
 // QueueStatusPanel (was OpenNowScreens.kt:12287)
 @Composable
-internal fun QueueStatusPanel(
+private fun QueueStatusPanel(
     game: GameInfo?,
     queueCopy: String,
     queuePosition: Int?,
@@ -5630,7 +5630,7 @@ internal fun QueueStatusPanel(
 
 // LandscapeQueuePositionDock (was OpenNowScreens.kt:12352)
 @Composable
-internal fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier = Modifier) {
+private fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier = Modifier) {
     val accent = queueUrgencyColor(queuePosition)
     val heat = queueUrgency(queuePosition)
     val shape = RoundedCornerShape(OpenNowRadius.lg)
@@ -5692,7 +5692,7 @@ internal fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier =
 
 // QueueAdPanel (was OpenNowScreens.kt:12413)
 @Composable
-internal fun QueueAdPanel(
+private fun QueueAdPanel(
     ad: SessionAdInfo,
     mediaUrl: String,
     viewModel: OpenNowViewModel,
@@ -5779,7 +5779,7 @@ internal fun QueueAdPanel(
 
 // QueueAdPlayback (was OpenNowScreens.kt:12499)
 @Composable
-internal fun QueueAdPlayback(
+private fun QueueAdPlayback(
     ad: SessionAdInfo,
     mediaUrl: String,
     playbackKey: String,
@@ -5811,7 +5811,7 @@ internal fun QueueAdPlayback(
 
 // QueueAdHeading (was OpenNowScreens.kt:12530)
 @Composable
-internal fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
+private fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
     Column(Modifier.fillMaxWidth()) {
         Text(
             "Advertisement",
@@ -5833,7 +5833,7 @@ internal fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
 
 // QueueStatusAndActions (was OpenNowScreens.kt:12551)
 @Composable
-internal fun QueueStatusAndActions(
+private fun QueueStatusAndActions(
     queueCopy: String,
     queuePosition: Int?,
     compact: Boolean,
@@ -5923,7 +5923,7 @@ internal fun MinimizedQueueDock(
 
 // MinimizedQueueStatusText (was OpenNowScreens.kt:12639)
 @Composable
-internal fun MinimizedQueueStatusText(
+private fun MinimizedQueueStatusText(
     queueCopy: String,
     queuePosition: Int?,
 ) {
@@ -5945,7 +5945,7 @@ internal fun MinimizedQueueStatusText(
 
 // QueueAdPlayer (was OpenNowScreens.kt:12660)
 @Composable
-internal fun QueueAdPlayer(
+private fun QueueAdPlayer(
     adId: String,
     url: String,
     playbackKey: String,
@@ -6076,11 +6076,11 @@ internal fun QueueAdPlayer(
 }
 
 // QueueAdControlIcon (was OpenNowScreens.kt:12791)
-internal enum class QueueAdControlIcon { Play, Pause, Volume, Muted }
+private enum class QueueAdControlIcon { Play, Pause, Volume, Muted }
 
 // QueueAdIconButton (was OpenNowScreens.kt:12793)
 @Composable
-internal fun QueueAdIconButton(label: String, icon: QueueAdControlIcon, onClick: () -> Unit) {
+private fun QueueAdIconButton(label: String, icon: QueueAdControlIcon, onClick: () -> Unit) {
     IconButton(
         onClick = onClick,
         modifier = Modifier
@@ -6093,7 +6093,7 @@ internal fun QueueAdIconButton(label: String, icon: QueueAdControlIcon, onClick:
 
 // QueueAdControlIconView (was OpenNowScreens.kt:12805)
 @Composable
-internal fun QueueAdControlIconView(icon: QueueAdControlIcon, modifier: Modifier = Modifier) {
+private fun QueueAdControlIconView(icon: QueueAdControlIcon, modifier: Modifier = Modifier) {
     Canvas(modifier) {
         val w = size.width
         val h = size.height
@@ -6136,7 +6136,7 @@ internal fun QueueAdControlIconView(icon: QueueAdControlIcon, modifier: Modifier
 
 // TouchOverlay (was OpenNowScreens.kt:12847)
 @Composable
-internal fun TouchOverlay(
+private fun TouchOverlay(
     client: NativeStreamClient,
     touch: AndroidTouchSettings,
     onButtonTone: () -> Unit,
@@ -6248,7 +6248,7 @@ internal fun TouchOverlay(
 
 // PortraitTouchControls (was OpenNowScreens.kt:12958)
 @Composable
-internal fun PortraitTouchControls(
+private fun PortraitTouchControls(
     client: NativeStreamClient,
     opacity: Float,
     layoutScale: Float,
@@ -6466,7 +6466,7 @@ internal fun PortraitTouchControls(
 
 // LandscapeTouchControls (was OpenNowScreens.kt:13175)
 @Composable
-internal fun BoxScope.LandscapeTouchControls(
+private fun BoxScope.LandscapeTouchControls(
     client: NativeStreamClient,
     opacity: Float,
     layoutScale: Float,
@@ -6696,7 +6696,7 @@ internal fun landscapeTouchTopControlClearanceDp(viewportHeightDp: Float, contro
 
 // TouchControlGroup (was OpenNowScreens.kt:13403)
 @Composable
-internal fun TouchControlGroup(
+private fun TouchControlGroup(
     id: String,
     layoutEditing: Boolean,
     offsetX: Dp,
@@ -6768,7 +6768,7 @@ internal fun TouchControlGroup(
 }
 
 // clampStickOffset (was OpenNowScreens.kt:13475)
-internal fun clampStickOffset(offset: Offset, maxRadius: Float): Offset {
+private fun clampStickOffset(offset: Offset, maxRadius: Float): Offset {
     val distance = sqrt(offset.x * offset.x + offset.y * offset.y)
     if (distance <= maxRadius || distance == 0f) return offset
     val scale = maxRadius / distance
@@ -6787,7 +6787,7 @@ internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
 
 // VirtualStick (was OpenNowScreens.kt:13492)
 @Composable
-internal fun VirtualStick(
+private fun VirtualStick(
     label: String,
     client: NativeStreamClient,
     opacity: Float,
@@ -6890,7 +6890,7 @@ internal fun VirtualStick(
 
 // FaceButtonCluster (was OpenNowScreens.kt:13594)
 @Composable
-internal fun FaceButtonCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
+private fun FaceButtonCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
     val buttonSize = 54.dp * scale
     val distance = buttonSize * 1.05f
     val boxSize = distance * 2 + buttonSize
@@ -6912,7 +6912,7 @@ internal fun FaceButtonCluster(client: NativeStreamClient, opacity: Float, scale
 
 // DpadArrowhead (was OpenNowScreens.kt:13615)
 @Composable
-internal fun DpadArrowhead(
+private fun DpadArrowhead(
     label: String,
     pressed: Boolean,
     opacity: Float,
@@ -6932,7 +6932,7 @@ internal fun DpadArrowhead(
 
 // DpadCluster (was OpenNowScreens.kt:13634)
 @Composable
-internal fun DpadCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
+private fun DpadCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
     val currentOnButtonTone by rememberUpdatedState(onButtonTone)
     val buttonSize = 54.dp * scale
     val distance = buttonSize * 1.05f
@@ -7130,7 +7130,7 @@ internal fun DpadCluster(client: NativeStreamClient, opacity: Float, scale: Floa
 }
 
 // virtualPressInput (was OpenNowScreens.kt:13832)
-internal fun Modifier.virtualPressInput(
+private fun Modifier.virtualPressInput(
     client: NativeStreamClient,
     controlKey: Any,
     onPressedChange: State<(Boolean) -> Unit>,
@@ -7157,7 +7157,7 @@ internal fun Modifier.virtualPressInput(
 
 // GamepadTriggerButton (was OpenNowScreens.kt:13857)
 @Composable
-internal fun GamepadTriggerButton(
+private fun GamepadTriggerButton(
     label: String,
     left: Boolean,
     client: NativeStreamClient,
@@ -7213,7 +7213,7 @@ internal fun GamepadTriggerButton(
 
 // GamepadBumperButton (was OpenNowScreens.kt:13912)
 @Composable
-internal fun GamepadBumperButton(
+private fun GamepadBumperButton(
     label: String,
     mask: Int,
     client: NativeStreamClient,
@@ -7269,7 +7269,7 @@ internal fun GamepadBumperButton(
 
 // GamepadButton (was OpenNowScreens.kt:13967)
 @Composable
-internal fun GamepadButton(
+private fun GamepadButton(
     label: String,
     mask: Int,
     client: NativeStreamClient,
@@ -7458,7 +7458,7 @@ internal fun PrintedWasteSelector(
 
 // PrintedWasteGameSummary (was OpenNowScreens.kt:14309)
 @Composable
-internal fun PrintedWasteGameSummary(
+private fun PrintedWasteGameSummary(
     game: GameInfo,
     modifier: Modifier = Modifier,
 ) {
@@ -7480,7 +7480,7 @@ internal fun PrintedWasteGameSummary(
 
 // PrintedWasteOptionsColumn (was OpenNowScreens.kt:14330)
 @Composable
-internal fun PrintedWasteOptionsColumn(
+private fun PrintedWasteOptionsColumn(
     state: OpenNowUiState,
     zones: List<PrintedWasteZoneOption>,
     selectedZoneId: String?,
@@ -7618,7 +7618,7 @@ internal fun PrintedWasteOptionsColumn(
 
 // RecommendedPrintedWasteCard (was OpenNowScreens.kt:14467)
 @Composable
-internal fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
+private fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(OpenNowRadius.lg),
@@ -7646,7 +7646,7 @@ internal fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
 
 // PrintedWasteZoneRow (was OpenNowScreens.kt:14494)
 @Composable
-internal fun PrintedWasteZoneRow(
+private fun PrintedWasteZoneRow(
     zoneOption: PrintedWasteZoneOption,
     selected: Boolean,
     focused: Boolean,
@@ -7713,7 +7713,7 @@ internal fun PrintedWasteZoneRow(
 
 // QueueMetricPill (was OpenNowScreens.kt:14560)
 @Composable
-internal fun QueueMetricPill(
+private fun QueueMetricPill(
     label: String,
     value: String,
     valueColor: Color = TextPrimary,
@@ -7734,11 +7734,11 @@ internal fun QueueMetricPill(
 }
 
 // isStandardPrintedWasteZone (was OpenNowScreens.kt:14581)
-internal fun isStandardPrintedWasteZone(zoneId: String): Boolean =
+private fun isStandardPrintedWasteZone(zoneId: String): Boolean =
     zoneId.startsWith("NP-") && !zoneId.startsWith("NPA-")
 
 // PrintedWasteZoneOption (was OpenNowScreens.kt:14584)
-internal data class PrintedWasteZoneOption(
+private data class PrintedWasteZoneOption(
     val zoneId: String,
     val zone: PrintedWasteZone,
     val routingUrl: String,
@@ -7746,7 +7746,7 @@ internal data class PrintedWasteZoneOption(
 )
 
 // recommendedPrintedWasteZone (was OpenNowScreens.kt:14591)
-internal fun recommendedPrintedWasteZone(zones: List<PrintedWasteZoneOption>): PrintedWasteZoneOption? {
+private fun recommendedPrintedWasteZone(zones: List<PrintedWasteZoneOption>): PrintedWasteZoneOption? {
     if (zones.isEmpty()) return null
     val pool = zones.filter { it.pingMs != null }.ifEmpty { zones }
     val maxPing = pool.mapNotNull { it.pingMs }.maxOrNull()?.coerceAtLeast(1) ?: 1
@@ -7759,24 +7759,24 @@ internal fun recommendedPrintedWasteZone(zones: List<PrintedWasteZoneOption>): P
 }
 
 // printedWasteScore (was OpenNowScreens.kt:14603)
-internal fun printedWasteScore(zone: PrintedWasteZoneOption, maxPing: Long, maxQueue: Int): Double {
+private fun printedWasteScore(zone: PrintedWasteZoneOption, maxPing: Long, maxQueue: Int): Double {
     val pingScore = ((zone.pingMs ?: maxPing).toDouble() / maxPing.toDouble()) * 0.75
     val queueScore = (zone.zone.QueuePosition.toDouble() / maxQueue.toDouble()) * 0.25
     return pingScore + queueScore
 }
 
 // printedWasteZoneUrl (was OpenNowScreens.kt:14609)
-internal fun printedWasteZoneUrl(zoneId: String): String =
+private fun printedWasteZoneUrl(zoneId: String): String =
     "https://${zoneId.lowercase()}.cloudmatchbeta.nvidiagrid.net/"
 
 // formatPrintedWasteWait (was OpenNowScreens.kt:14612)
-internal fun formatPrintedWasteWait(etaMs: Long): String {
+private fun formatPrintedWasteWait(etaMs: Long): String {
     val minutes = ((etaMs + 59_999L) / 60_000L).coerceAtLeast(1L)
     return if (minutes < 60L) "${minutes}m" else "${minutes / 60L}h ${minutes % 60L}m"
 }
 
 // queueColor (was OpenNowScreens.kt:14617)
-internal fun queueColor(queue: Int): Color = when {
+private fun queueColor(queue: Int): Color = when {
     queue <= 5 -> Green
     queue <= 20 -> Color(0xffc7ef6b)
     queue <= 45 -> Color(0xffffc95a)
@@ -7784,7 +7784,7 @@ internal fun queueColor(queue: Int): Color = when {
 }
 
 // pingColor (was OpenNowScreens.kt:14624)
-internal fun pingColor(pingMs: Long): Color = when {
+private fun pingColor(pingMs: Long): Color = when {
     pingMs <= 60L -> Green
     pingMs <= 120L -> Color(0xffc7ef6b)
     pingMs <= 180L -> Color(0xffffc95a)
@@ -7792,7 +7792,7 @@ internal fun pingColor(pingMs: Long): Color = when {
 }
 
 // regionLabel (was OpenNowScreens.kt:14631)
-internal fun regionLabel(region: String): String = when (region) {
+private fun regionLabel(region: String): String = when (region) {
     "US" -> "North America"
     "CA" -> "Canada"
     "EU" -> "Europe"

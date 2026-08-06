@@ -2294,7 +2294,7 @@ private val LocalShimmerOffset = staticCompositionLocalOf<State<Float>?> { null 
 private val LocalTvLoadingPulse = staticCompositionLocalOf<State<Float>?> { null }
 
 // LocalTvLoadingProfile (was OpenNowScreens.kt:3597)
-internal val LocalTvLoadingProfile = staticCompositionLocalOf { false }
+private val LocalTvLoadingProfile = staticCompositionLocalOf { false }
 
 // LocalTouchControllerStyle (was OpenNowScreens.kt:3598)
 internal val LocalTouchControllerStyle = staticCompositionLocalOf { TouchControllerStyle.V1 }

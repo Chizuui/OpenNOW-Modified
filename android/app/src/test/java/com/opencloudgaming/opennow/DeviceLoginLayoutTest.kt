@@ -1,6 +1,7 @@
 package com.opencloudgaming.opennow
 
 import android.content.res.Configuration
+import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -12,7 +13,7 @@ class DeviceLoginLayoutTest {
             shouldUseSideBySideDeviceLoginLayout(
                 orientation = Configuration.ORIENTATION_LANDSCAPE,
                 preferLandscapeLayout = false,
-                availableWidthDp = 640,
+                availableWidth = 640.dp,
             ),
         )
     }
@@ -23,7 +24,7 @@ class DeviceLoginLayoutTest {
             shouldUseSideBySideDeviceLoginLayout(
                 orientation = Configuration.ORIENTATION_PORTRAIT,
                 preferLandscapeLayout = false,
-                availableWidthDp = 640,
+                availableWidth = 640.dp,
             ),
         )
     }
@@ -34,7 +35,7 @@ class DeviceLoginLayoutTest {
             shouldUseSideBySideDeviceLoginLayout(
                 orientation = Configuration.ORIENTATION_LANDSCAPE,
                 preferLandscapeLayout = false,
-                availableWidthDp = 480,
+                availableWidth = 480.dp,
             ),
         )
     }
@@ -45,7 +46,7 @@ class DeviceLoginLayoutTest {
             shouldUseSideBySideDeviceLoginLayout(
                 orientation = Configuration.ORIENTATION_PORTRAIT,
                 preferLandscapeLayout = true,
-                availableWidthDp = 320,
+                availableWidth = 320.dp,
             ),
         )
     }

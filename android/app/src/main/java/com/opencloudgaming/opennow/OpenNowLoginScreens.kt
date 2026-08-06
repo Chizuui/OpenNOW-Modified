@@ -336,7 +336,7 @@ internal fun shouldUseDedicatedTvPairingLayout(
 
 // TvPhoneSignInConnector (was OpenNowScreens.kt:1571)
 @Composable
-internal fun TvPhoneSignInConnector(
+private fun TvPhoneSignInConnector(
     state: OpenNowUiState,
     viewModel: OpenNowViewModel,
     dedicated: Boolean = false,
@@ -433,7 +433,7 @@ internal fun TvPhoneSignInConnector(
 
 // PairingCodeDisplay (was OpenNowScreens.kt:1667)
 @Composable
-internal fun PairingCodeDisplay(code: String?, compact: Boolean) {
+private fun PairingCodeDisplay(code: String?, compact: Boolean) {
     val digits = code?.takeIf { it.length == 4 && it.all(Char::isDigit) } ?: "----"
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(stringResource(R.string.login_pair_code), color = TextMuted, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
@@ -461,7 +461,7 @@ internal fun PairingCodeDisplay(code: String?, compact: Boolean) {
 
 // TvDeviceLoginScreen (was OpenNowScreens.kt:1694)
 @Composable
-internal fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCancel: () -> Unit) {
+private fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCancel: () -> Unit) {
     BoxWithConstraints(
         modifier = Modifier.fillMaxSize().padding(horizontal = 48.dp, vertical = 36.dp),
         contentAlignment = Alignment.Center,
@@ -591,7 +591,7 @@ internal fun shouldUseSideBySideDeviceLoginLayout(
 
 // DeviceLoginQr (was OpenNowScreens.kt:1821)
 @Composable
-internal fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
+private fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
     qrCode?.let {
         BoxWithConstraints(
             modifier = modifier.fillMaxWidth(),
@@ -605,7 +605,7 @@ internal fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.
 
 // DeviceLoginControls (was OpenNowScreens.kt:1834)
 @Composable
-internal fun DeviceLoginControls(
+private fun DeviceLoginControls(
     launchUrl: String,
     prompt: DeviceLoginPrompt,
     phase: String,
@@ -702,7 +702,7 @@ internal fun QrCodeView(qrCode: QrCode, modifier: Modifier = Modifier) {
 
 // ProviderPicker (was OpenNowScreens.kt:14642)
 @Composable
-internal fun ProviderPicker(providers: List<LoginProvider>, selected: LoginProvider, onSelect: (LoginProvider) -> Unit) {
+private fun ProviderPicker(providers: List<LoginProvider>, selected: LoginProvider, onSelect: (LoginProvider) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         OutlinedButton(onClick = { expanded = true }) { Text(selected.displayName) }

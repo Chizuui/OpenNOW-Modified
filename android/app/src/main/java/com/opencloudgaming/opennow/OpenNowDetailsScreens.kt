@@ -275,7 +275,7 @@ internal fun GameDetailsSheet(
 // GameDetailsTabletTwoPane (was OpenNowScreens.kt:5677)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun GameDetailsTabletTwoPane(
+private fun GameDetailsTabletTwoPane(
     game: GameInfo,
     favorite: Boolean,
     defaultVariantId: String?,
@@ -348,7 +348,7 @@ internal fun GameDetailsTabletTwoPane(
 
 // GameRecommendationRow (was OpenNowScreens.kt:5749)
 @Composable
-internal fun GameRecommendationRow(
+private fun GameRecommendationRow(
     game: GameInfo,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -403,17 +403,17 @@ internal fun GameRecommendationRow(
 /** How far the sheet must be dragged down before letting go dismisses it. */
 
 // SHEET_DISMISS_DRAG_THRESHOLD (was OpenNowScreens.kt:5803)
-internal val SHEET_DISMISS_DRAG_THRESHOLD = 140.dp
+private val SHEET_DISMISS_DRAG_THRESHOLD = 140.dp
 
 /** A fast enough flick dismisses regardless of distance travelled. */
 
 // SHEET_DISMISS_FLING_VELOCITY (was OpenNowScreens.kt:5806)
-internal const val SHEET_DISMISS_FLING_VELOCITY = 1_200f
+private const val SHEET_DISMISS_FLING_VELOCITY = 1_200f
 
 // GameDetailsLandscapeContent (was OpenNowScreens.kt:5808)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun GameDetailsLandscapeContent(
+private fun GameDetailsLandscapeContent(
     game: GameInfo,
     favorite: Boolean,
     defaultVariantId: String?,
@@ -596,7 +596,7 @@ internal fun GameDetailsLandscapeContent(
 
 // GameDetailsCompactInfoContent (was OpenNowScreens.kt:5991)
 @Composable
-internal fun GameDetailsCompactInfoContent(
+private fun GameDetailsCompactInfoContent(
     game: GameInfo,
     defaultVariantId: String?,
     description: String?,
@@ -616,7 +616,7 @@ internal fun GameDetailsCompactInfoContent(
 // GameDetailsScrollableContent (was OpenNowScreens.kt:6009)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun GameDetailsScrollableContent(
+private fun GameDetailsScrollableContent(
     game: GameInfo,
     favorite: Boolean,
     defaultVariantId: String?,
@@ -770,7 +770,7 @@ internal fun GameDetailsScrollableContent(
 
 // LaunchOptionsList (was OpenNowScreens.kt:6163)
 @Composable
-internal fun LaunchOptionsList(
+private fun LaunchOptionsList(
     game: GameInfo,
     defaultVariantId: String?,
     compact: Boolean,
@@ -821,7 +821,7 @@ internal fun LaunchOptionsList(
 // LongPressPlayButton (was OpenNowScreens.kt:6212)
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun LongPressPlayButton(
+private fun LongPressPlayButton(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -907,7 +907,7 @@ internal fun gameDetailsPlayFocusScale(focused: Boolean): Float = if (focused) 1
 internal fun gameDetailsPlayFocusBorderWidthDp(focused: Boolean): Float = if (focused) 4f else 0f
 
 // variantDetailsText (was OpenNowScreens.kt:6297)
-internal fun variantDetailsText(variant: GameVariant): String =
+private fun variantDetailsText(variant: GameVariant): String =
     listOfNotNull(
         variant.libraryStatus?.takeIf { it.isNotBlank() }?.let(::formatGameMetadataLabel),
         variant.supportedControls.takeIf { it.isNotEmpty() }?.joinToString(", ") { formatGameMetadataLabel(it) },
@@ -916,7 +916,7 @@ internal fun variantDetailsText(variant: GameVariant): String =
 
 // ImageCloseButton (was OpenNowScreens.kt:6304)
 @Composable
-internal fun ImageCloseButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun ImageCloseButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
     var focused by remember { mutableStateOf(false) }
     val accent = MaterialTheme.colorScheme.primary
     Surface(
@@ -1015,7 +1015,7 @@ internal fun optimizedNvidiaImageUrl(url: String, width: Int): String {
 }
 
 // wideImageRequestWidth (was OpenNowScreens.kt:6398)
-internal fun wideImageRequestWidth(context: Context): Int {
+private fun wideImageRequestWidth(context: Context): Int {
     val connectivity = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     val capabilities = connectivity?.getNetworkCapabilities(connectivity.activeNetwork)
     val downstreamKbps = capabilities?.linkDownstreamBandwidthKbps ?: 0
@@ -1032,7 +1032,7 @@ internal fun wideImageRequestWidth(context: Context): Int {
 
 // GameImageTitleOverlay (was OpenNowScreens.kt:6413)
 @Composable
-internal fun GameImageTitleOverlay(
+private fun GameImageTitleOverlay(
     game: GameInfo,
     compact: Boolean,
     reserveEndSpace: Boolean,
@@ -1076,7 +1076,7 @@ internal fun GameImageTitleOverlay(
 
 // OwnershipStatusRow (was OpenNowScreens.kt:6457)
 @Composable
-internal fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
+private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
     val ownedStores = ownedStoreLabels(game)
     val shape = RoundedCornerShape(if (compact) 12.dp else 14.dp)
     if (ownedStores.isEmpty()) {
@@ -1127,14 +1127,14 @@ internal fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
 }
 
 // ownedStoreLabels (was OpenNowScreens.kt:6508)
-internal fun ownedStoreLabels(game: GameInfo): List<String> =
+private fun ownedStoreLabels(game: GameInfo): List<String> =
     libraryStoreDisplayNames(game).ifEmpty {
         if (isGameInLibrary(game)) listOf("GeForce NOW") else emptyList()
     }
 
 // GameGenreChips (was OpenNowScreens.kt:6513)
 @Composable
-internal fun GameGenreChips(game: GameInfo, compact: Boolean) {
+private fun GameGenreChips(game: GameInfo, compact: Boolean) {
     val genres = game.genres
         .map { it.trim() }
         .filter { it.isNotBlank() }
@@ -1156,7 +1156,7 @@ internal fun GameGenreChips(game: GameInfo, compact: Boolean) {
 
 // GameScreenshotGallery (was OpenNowScreens.kt:6534)
 @Composable
-internal fun GameScreenshotGallery(game: GameInfo, compact: Boolean) {
+private fun GameScreenshotGallery(game: GameInfo, compact: Boolean) {
     val screenshots = game.screenshotUrls
         .map(String::trim)
         .filter(String::isNotBlank)
@@ -1201,7 +1201,7 @@ internal fun GameScreenshotGallery(game: GameInfo, compact: Boolean) {
 
 // GameDescriptionDisclosure (was OpenNowScreens.kt:6578)
 @Composable
-internal fun GameDescriptionDisclosure(description: String?, compact: Boolean) {
+private fun GameDescriptionDisclosure(description: String?, compact: Boolean) {
     var expanded by remember(description) { mutableStateOf(true) }
     val text = description?.takeIf { it.isNotBlank() } ?: "No description is available for this game yet."
     var focused by remember { mutableStateOf(false) }
@@ -1255,7 +1255,7 @@ internal fun GameDescriptionDisclosure(description: String?, compact: Boolean) {
 }
 
 // formatGameMetadataLabel (was OpenNowScreens.kt:6632)
-internal fun formatGameMetadataLabel(raw: String): String {
+private fun formatGameMetadataLabel(raw: String): String {
     val compact = raw.trim()
         .removePrefix("GFN_")
         .removePrefix("GAME_")
@@ -1281,7 +1281,7 @@ internal fun formatGameMetadataLabel(raw: String): String {
 }
 
 // isNoisyGameTag (was OpenNowScreens.kt:6657)
-internal fun isNoisyGameTag(label: String): Boolean {
+private fun isNoisyGameTag(label: String): Boolean {
     val normalized = label.trim().lowercase(Locale.US)
     return normalized.isBlank() ||
         normalized == "unknown" ||
@@ -1293,7 +1293,7 @@ internal fun isNoisyGameTag(label: String): Boolean {
 
 // CompactDetailRows (was OpenNowScreens.kt:6667)
 @Composable
-internal fun CompactDetailRows(game: GameInfo) {
+private fun CompactDetailRows(game: GameInfo) {
     val rows = gameDetailRows(game).take(4)
     if (rows.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1305,7 +1305,7 @@ internal fun CompactDetailRows(game: GameInfo) {
 
 // DetailRows (was OpenNowScreens.kt:6678)
 @Composable
-internal fun DetailRows(game: GameInfo) {
+private fun DetailRows(game: GameInfo) {
     val rows = gameDetailRows(game)
     if (rows.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1316,14 +1316,14 @@ internal fun DetailRows(game: GameInfo) {
 }
 
 // GameDetailRow (was OpenNowScreens.kt:6689)
-internal data class GameDetailRow(
+private data class GameDetailRow(
     val label: String,
     val value: String,
     val copyValue: String? = null,
 )
 
 // gameDetailRows (was OpenNowScreens.kt:6695)
-internal fun gameDetailRows(game: GameInfo): List<GameDetailRow> =
+private fun gameDetailRows(game: GameInfo): List<GameDetailRow> =
     listOfNotNull(
         game.playabilityState?.takeIf { it.isNotBlank() }?.let { GameDetailRow("Status", formatGameMetadataLabel(it)) },
         gameAppIdForDetails(game)?.let { GameDetailRow("App ID", it, copyValue = it) },
@@ -1333,7 +1333,7 @@ internal fun gameDetailRows(game: GameInfo): List<GameDetailRow> =
     )
 
 // gameAppIdForDetails (was OpenNowScreens.kt:6704)
-internal fun gameAppIdForDetails(game: GameInfo): String? =
+private fun gameAppIdForDetails(game: GameInfo): String? =
     game.launchAppId?.takeIf { it.isNotBlank() }
         ?: game.variants.firstNotNullOfOrNull { variant -> variant.id.takeIf { it.isNotBlank() && it.all(Char::isDigit) } }
         ?: game.uuid?.takeIf { it.isNotBlank() }
@@ -1342,7 +1342,7 @@ internal fun gameAppIdForDetails(game: GameInfo): String? =
 // DetailRow (was OpenNowScreens.kt:6710)
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun DetailRow(row: GameDetailRow, compact: Boolean) {
+private fun DetailRow(row: GameDetailRow, compact: Boolean) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val shape = RoundedCornerShape(if (compact) 10.dp else 12.dp)
@@ -1523,7 +1523,7 @@ internal fun StoreLaunchSelector(
 
 // LaunchGameSummary (was OpenNowScreens.kt:6910)
 @Composable
-internal fun LaunchGameSummary(game: GameInfo, subtitle: String, modifier: Modifier = Modifier) {
+private fun LaunchGameSummary(game: GameInfo, subtitle: String, modifier: Modifier = Modifier) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
         UrlImage(
             game.imageUrl,
@@ -1541,7 +1541,7 @@ internal fun LaunchGameSummary(game: GameInfo, subtitle: String, modifier: Modif
 
 // StoreLaunchOptionsColumn (was OpenNowScreens.kt:6927)
 @Composable
-internal fun StoreLaunchOptionsColumn(
+private fun StoreLaunchOptionsColumn(
     variants: List<GameVariant>,
     selectedVariantId: String?,
     defaultVariantId: String?,
@@ -1622,7 +1622,7 @@ internal fun StoreLaunchOptionsColumn(
 
 // StoreLaunchVariantRow (was OpenNowScreens.kt:7007)
 @Composable
-internal fun StoreLaunchVariantRow(
+private fun StoreLaunchVariantRow(
     variant: GameVariant,
     selected: Boolean,
     savedDefault: Boolean,

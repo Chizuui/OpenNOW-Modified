@@ -196,7 +196,7 @@ internal fun CatalogWallpaperBackdrop(
 }
 
 // drawableRes (was OpenNowScreens.kt:2039)
-internal val CatalogBackgroundPreset.drawableRes: Int
+private val CatalogBackgroundPreset.drawableRes: Int
     get() = when (this) {
         CatalogBackgroundPreset.ColorfulAbstract -> R.drawable.catalog_colorful_abstract_background
         CatalogBackgroundPreset.Original -> R.drawable.catalog_default_background
@@ -204,7 +204,7 @@ internal val CatalogBackgroundPreset.drawableRes: Int
 
 // CatalogBuiltInWallpaperBackdrop (was OpenNowScreens.kt:2045)
 @Composable
-internal fun CatalogBuiltInWallpaperBackdrop(
+private fun CatalogBuiltInWallpaperBackdrop(
     preset: CatalogBackgroundPreset,
     modifier: Modifier = Modifier,
 ) {
@@ -359,7 +359,7 @@ internal fun HomeScreen(
 
 // StoreScrollableControls (was OpenNowScreens.kt:3171)
 @Composable
-internal fun StoreScrollableControls(
+private fun StoreScrollableControls(
     state: OpenNowUiState,
     onSortChange: (String) -> Unit,
     onFilterToggle: (String) -> Unit,
@@ -415,7 +415,7 @@ internal fun StoreCatalogToolbar(
 
 // InlineErrorNotice (was OpenNowScreens.kt:3225)
 @Composable
-internal fun InlineErrorNotice(error: String?) {
+private fun InlineErrorNotice(error: String?) {
     if (error.isNullOrBlank()) return
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -444,7 +444,7 @@ internal fun InlineErrorNotice(error: String?) {
 }
 
 // compactErrorTitle (was OpenNowScreens.kt:3254)
-internal fun compactErrorTitle(error: String): String =
+private fun compactErrorTitle(error: String): String =
     when {
         error.contains("DNS lookup failed", ignoreCase = true) -> "Network lookup failed"
         error.contains("Unable to resolve host", ignoreCase = true) -> "Network lookup failed"
@@ -452,7 +452,7 @@ internal fun compactErrorTitle(error: String): String =
     }
 
 // compactErrorBody (was OpenNowScreens.kt:3261)
-internal fun compactErrorBody(error: String): String =
+private fun compactErrorBody(error: String): String =
     error
         .replace('\n', ' ')
         .replace(Regex("\\s+"), " ")
@@ -460,7 +460,7 @@ internal fun compactErrorBody(error: String): String =
 
 // StoreScrollActionButton (was OpenNowScreens.kt:3267)
 @Composable
-internal fun StoreScrollActionButton(iconRes: Int, contentDescription: String, onClick: () -> Unit) {
+private fun StoreScrollActionButton(iconRes: Int, contentDescription: String, onClick: () -> Unit) {
     Surface(
         shape = CircleShape,
         color = PanelAlt.copy(alpha = 0.96f),
@@ -480,7 +480,7 @@ internal fun StoreScrollActionButton(iconRes: Int, contentDescription: String, o
 
 // StoreGameGrid (was OpenNowScreens.kt:3998)
 @Composable
-internal fun StoreGameGrid(
+private fun StoreGameGrid(
     games: List<GameInfo>,
     favoriteIds: List<String>,
     settings: AppSettings,
@@ -600,7 +600,7 @@ internal fun StoreGameGrid(
 
 // StoreStartRails (was OpenNowScreens.kt:4117)
 @Composable
-internal fun StoreStartRails(
+private fun StoreStartRails(
     games: List<GameInfo>,
     libraryGames: List<GameInfo>,
     favoriteIds: List<String>,
@@ -662,7 +662,7 @@ internal fun StoreStartRails(
 
 // StoreStartRail (was OpenNowScreens.kt:4177)
 @Composable
-internal fun StoreStartRail(
+private fun StoreStartRail(
     @StringRes titleRes: Int,
     games: List<GameInfo>,
     favoriteIds: List<String>,
@@ -697,7 +697,7 @@ internal fun StoreStartRail(
 
 // SectionHeader (was OpenNowScreens.kt:4210)
 @Composable
-internal fun SectionHeader(
+private fun SectionHeader(
     title: String,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
@@ -732,7 +732,7 @@ internal fun SectionHeader(
 // StoreComingNextCarousel (was OpenNowScreens.kt:4243)
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun StoreComingNextCarousel(
+private fun StoreComingNextCarousel(
     title: String,
     games: List<GameInfo>,
     favoriteIds: List<String>,
@@ -919,7 +919,7 @@ internal fun StoreComingNextCarousel(
 
 // StoreRailSection (was OpenNowScreens.kt:4430)
 @Composable
-internal fun StoreRailSection(
+private fun StoreRailSection(
     title: String,
     games: List<GameInfo>,
     favoriteIds: List<String>,
@@ -1005,7 +1005,7 @@ internal fun StoreRailSection(
 // StoreRailGameCard (was OpenNowScreens.kt:4514)
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun StoreRailGameCard(
+private fun StoreRailGameCard(
     game: GameInfo,
     favorite: Boolean,
     tvProfile: Boolean,
@@ -1164,7 +1164,7 @@ internal fun StoreRailGameCard(
  */
 
 // StoreStartRailGroups (was OpenNowScreens.kt:4673)
-internal data class StoreStartRailGroups(
+private data class StoreStartRailGroups(
     val continuePlaying: List<GameInfo>,
     val inQueue: List<GameInfo>,
     val favorites: List<GameInfo>,
@@ -1174,7 +1174,7 @@ internal data class StoreStartRailGroups(
 }
 
 // storeStartRailGroups (was OpenNowScreens.kt:4682)
-internal fun storeStartRailGroups(
+private fun storeStartRailGroups(
     games: List<GameInfo>,
     libraryGames: List<GameInfo>,
     favoriteIds: List<String>,
@@ -1218,7 +1218,7 @@ internal fun comingNextStoreGames(
 }
 
 // isNewOrUpdatedCatalogSection (was OpenNowScreens.kt:4724)
-internal fun GameInfo.isNewOrUpdatedCatalogSection(): Boolean {
+private fun GameInfo.isNewOrUpdatedCatalogSection(): Boolean {
     val section = catalogSectionTitle?.lowercase(Locale.US)?.trim().orEmpty()
     return section.contains("new") ||
         section.contains("recent") ||
@@ -1227,14 +1227,14 @@ internal fun GameInfo.isNewOrUpdatedCatalogSection(): Boolean {
 }
 
 // recentPlaySortKey (was OpenNowScreens.kt:4732)
-internal fun GameInfo.recentPlaySortKey(): String? =
+private fun GameInfo.recentPlaySortKey(): String? =
     listOfNotNull(
         lastPlayed?.takeIf { it.isNotBlank() },
         variants.mapNotNull { it.lastPlayedDate?.takeIf(String::isNotBlank) }.maxOrNull(),
     ).maxOrNull()
 
 // distinctStoreGames (was OpenNowScreens.kt:4738)
-internal fun distinctStoreGames(games: List<GameInfo>): List<GameInfo> {
+private fun distinctStoreGames(games: List<GameInfo>): List<GameInfo> {
     val byKey = linkedMapOf<String, GameInfo>()
     games.forEach { game ->
         byKey.putIfAbsent(storeRailGameKey(game), game)
@@ -1243,31 +1243,31 @@ internal fun distinctStoreGames(games: List<GameInfo>): List<GameInfo> {
 }
 
 // storeRailGameKey (was OpenNowScreens.kt:4746)
-internal fun storeRailGameKey(game: GameInfo): String =
+private fun storeRailGameKey(game: GameInfo): String =
     gameTrackingKey(game)
 
 // STORE_RAIL_GAME_LIMIT (was OpenNowScreens.kt:4749)
-internal const val STORE_RAIL_GAME_LIMIT = 14
+private const val STORE_RAIL_GAME_LIMIT = 14
 
 /** Recently-played is a short list by nature — padding it out defeats the point of the rail. */
 
 // CONTINUE_PLAYING_RAIL_LIMIT (was OpenNowScreens.kt:4752)
-internal const val CONTINUE_PLAYING_RAIL_LIMIT = 12
+private const val CONTINUE_PLAYING_RAIL_LIMIT = 12
 
 /** Five hero pages, five indicator pills. Fourteen was a rash of dots. */
 
 // HERO_CAROUSEL_PAGE_LIMIT (was OpenNowScreens.kt:4755)
-internal const val HERO_CAROUSEL_PAGE_LIMIT = 5
+private const val HERO_CAROUSEL_PAGE_LIMIT = 5
 
 // HERO_CAROUSEL_ADVANCE_MS (was OpenNowScreens.kt:4757)
-internal const val HERO_CAROUSEL_ADVANCE_MS = 6_000L
+private const val HERO_CAROUSEL_ADVANCE_MS = 6_000L
 
 /**
  * Wider on surfaces that are already wide, so the hero stays a banner rather than becoming a wall.
  */
 
 // heroAspectRatio (was OpenNowScreens.kt:4762)
-internal fun heroAspectRatio(tvProfile: Boolean, landscape: Boolean): Float = when {
+private fun heroAspectRatio(tvProfile: Boolean, landscape: Boolean): Float = when {
     tvProfile -> 16f / 6f
     landscape -> 16f / 5f
     else -> 16f / 7f
@@ -1310,7 +1310,7 @@ internal data class GameGridSpec(
 /** How much of the next card stays visible past the last fully-visible one. */
 
 // PEEK_CARD_FRACTION (was OpenNowScreens.kt:4796)
-internal const val PEEK_CARD_FRACTION = 0.28f
+private const val PEEK_CARD_FRACTION = 0.28f
 
 /**
  * Number of catalog cards currently holding focus inside the surrounding grid or rail. A count
@@ -1320,7 +1320,7 @@ internal const val PEEK_CARD_FRACTION = 0.28f
  */
 
 // LocalCatalogFocusCount (was OpenNowScreens.kt:4804)
-internal val LocalCatalogFocusCount = compositionLocalOf<MutableIntState?> { null }
+private val LocalCatalogFocusCount = compositionLocalOf<MutableIntState?> { null }
 
 /**
  * Scopes the focus count to one grid or one rail, so focusing a card in the grid doesn't dim the
@@ -1337,7 +1337,7 @@ internal fun CatalogFocusScope(content: @Composable () -> Unit) {
 /** Alpha applied to unfocused cards while a sibling is focused. TV only. */
 
 // TV_UNFOCUSED_CARD_ALPHA (was OpenNowScreens.kt:4817)
-internal const val TV_UNFOCUSED_CARD_ALPHA = 0.55f
+private const val TV_UNFOCUSED_CARD_ALPHA = 0.55f
 
 /**
  * Registers this card's focus in the surrounding [CatalogFocusScope] and returns the alpha it
@@ -1347,7 +1347,7 @@ internal const val TV_UNFOCUSED_CARD_ALPHA = 0.55f
 
 // rememberCatalogCardAlpha (was OpenNowScreens.kt:4824)
 @Composable
-internal fun rememberCatalogCardAlpha(focused: Boolean, tvProfile: Boolean): Float {
+private fun rememberCatalogCardAlpha(focused: Boolean, tvProfile: Boolean): Float {
     val count = LocalCatalogFocusCount.current
     DisposableEffect(focused, count) {
         if (focused) count?.intValue = (count?.intValue ?: 0) + 1
@@ -1377,7 +1377,7 @@ internal fun rememberCatalogCardAlpha(focused: Boolean, tvProfile: Boolean): Flo
  */
 
 // horizontalBleed (was OpenNowScreens.kt:4853)
-internal fun Modifier.horizontalBleed(bleed: Dp): Modifier = this.layout { measurable, constraints ->
+private fun Modifier.horizontalBleed(bleed: Dp): Modifier = this.layout { measurable, constraints ->
     val extra = bleed.roundToPx() * 2
     val placeable = measurable.measure(
         constraints.copy(
@@ -1404,11 +1404,11 @@ internal fun storeRailCardWidth(tvProfile: Boolean, landscapeLayout: Boolean): D
  */
 
 // TV_RAIL_WIDE_CARD_WIDTH (was OpenNowScreens.kt:4877)
-internal val TV_RAIL_WIDE_CARD_WIDTH = 300.dp
+private val TV_RAIL_WIDE_CARD_WIDTH = 300.dp
 
 // ControllerFocusFrame (was OpenNowScreens.kt:4879)
 @Composable
-internal fun BoxScope.ControllerFocusFrame(
+private fun BoxScope.ControllerFocusFrame(
     visible: Boolean,
     animate: Boolean,
     cornerRadius: Dp,
@@ -1442,7 +1442,7 @@ internal fun BoxScope.ControllerFocusFrame(
 
 // ControllerFocusFrameCanvas (was OpenNowScreens.kt:4912)
 @Composable
-internal fun BoxScope.ControllerFocusFrameCanvas(
+private fun BoxScope.ControllerFocusFrameCanvas(
     accent: Color,
     cornerRadius: Dp,
     pulseProgress: Float?,
@@ -1484,26 +1484,26 @@ internal fun BoxScope.ControllerFocusFrameCanvas(
  */
 
 // GRID_CELL_WIDTH_PORTRAIT (was OpenNowScreens.kt:4953)
-internal val GRID_CELL_WIDTH_PORTRAIT = 96.dp
+private val GRID_CELL_WIDTH_PORTRAIT = 96.dp
 
 // GRID_CELL_WIDTH_LANDSCAPE (was OpenNowScreens.kt:4954)
-internal val GRID_CELL_WIDTH_LANDSCAPE = 112.dp
+private val GRID_CELL_WIDTH_LANDSCAPE = 112.dp
 
 // GRID_CELL_WIDTH_TV (was OpenNowScreens.kt:4955)
-internal val GRID_CELL_WIDTH_TV = 158.dp
+private val GRID_CELL_WIDTH_TV = 158.dp
 
 /** M3 adaptive: tablets keep cards substantial instead of inheriting the tiny phone cell. */
 
 // GRID_CELL_WIDTH_TABLET (was OpenNowScreens.kt:4958)
-internal val GRID_CELL_WIDTH_TABLET = 168.dp
+private val GRID_CELL_WIDTH_TABLET = 168.dp
 
 /** Compact mode shrinks the target cell rather than switching to a separate size table. */
 
 // COMPACT_CELL_WIDTH_FACTOR (was OpenNowScreens.kt:4961)
-internal const val COMPACT_CELL_WIDTH_FACTOR = 0.88f
+private const val COMPACT_CELL_WIDTH_FACTOR = 0.88f
 
 // CATALOG_CONTROLLER_FOCUS_INSET (was OpenNowScreens.kt:4962)
-internal val CATALOG_CONTROLLER_FOCUS_INSET = 8.dp
+private val CATALOG_CONTROLLER_FOCUS_INSET = 8.dp
 
 // gameGridSpec (was OpenNowScreens.kt:4964)
 internal fun gameGridSpec(
@@ -1828,7 +1828,7 @@ internal fun shouldShowCatalogCardTitles(tvProfile: Boolean, enabled: Boolean): 
 
 // GameCardTitleOverlay (was OpenNowScreens.kt:5272)
 @Composable
-internal fun GameCardTitleOverlay(title: String) {
+private fun GameCardTitleOverlay(title: String) {
     Box(
         Modifier
             .fillMaxSize()
@@ -1854,7 +1854,7 @@ internal fun GameCardTitleOverlay(title: String) {
 
 // GameCardArtworkContent (was OpenNowScreens.kt:5296)
 @Composable
-internal fun BoxScope.GameCardArtworkContent(
+private fun BoxScope.GameCardArtworkContent(
     game: GameInfo,
     tvProfile: Boolean,
     thumbnailFavoriteOverlay: Boolean,
@@ -1903,7 +1903,7 @@ internal fun BoxScope.GameCardArtworkContent(
 
 // GameCardMediaCaption (was OpenNowScreens.kt:5343)
 @Composable
-internal fun GameCardMediaCaption(
+private fun GameCardMediaCaption(
     game: GameInfo,
     showCardTitles: Boolean,
     showGameStoreLabels: Boolean,
@@ -1937,7 +1937,7 @@ internal fun GameCardMediaCaption(
 }
 
 // handleCatalogControllerAction (was OpenNowScreens.kt:5377)
-internal fun handleCatalogControllerAction(
+private fun handleCatalogControllerAction(
     event: androidx.compose.ui.input.key.KeyEvent,
     onFavorite: () -> Unit,
     onPlay: () -> Unit,
@@ -1986,7 +1986,7 @@ internal fun ControllerCatalogRailActionHints(modifier: Modifier = Modifier) {
 
 // ControllerCatalogActionHint (was OpenNowScreens.kt:5423)
 @Composable
-internal fun ControllerCatalogActionHint(
+private fun ControllerCatalogActionHint(
     button: String,
     label: String,
     buttonColor: Color,
