@@ -150,6 +150,14 @@ interface PreferCodecOptions {
    * instead of falling back to a codec the browser can actually decode.
    */
   keepFallbacks?: boolean;
+  /**
+   * User-pinned fallback codec (web mode). When `keepFallbacks` is set, this
+   * codec's payload types are ordered directly after the preferred codec's so
+   * the answer prefers it whenever the requested codec cannot be negotiated.
+   * Ignored when equal to the preferred codec or when `keepFallbacks` is
+   * false (the m-line then only carries the preferred codec anyway).
+   */
+  fallbackCodec?: VideoCodec;
 }
 
 /**
@@ -338,8 +346,17 @@ export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCode
           ordered.push(pt);
         }
       }
+      const fallbackPayloads =
+        options?.keepFallbacks && options.fallbackCodec && options.fallbackCodec !== codec
+          ? (payloadTypesByCodec.get(options.fallbackCodec) ?? [])
+          : [];
+      for (const pt of fallbackPayloads) {
+        if (!preferred.has(pt) && available.includes(pt) && !ordered.includes(pt)) {
+          ordered.push(pt);
+        }
+      }
       for (const pt of available) {
-        if (!preferred.has(pt)) {
+        if (!preferred.has(pt) && !ordered.includes(pt)) {
           ordered.push(pt);
         }
       }

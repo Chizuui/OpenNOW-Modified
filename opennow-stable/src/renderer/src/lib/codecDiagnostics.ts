@@ -3,6 +3,7 @@ import {
   normalizeStreamPreferences,
   type CodecPreference,
   type ColorQuality,
+  type GpuBackendInfo,
   type VideoCodec,
 } from "@shared/gfn";
 
@@ -77,31 +78,92 @@ function isLinuxArmClient(): boolean {
   return linux && arm;
 }
 
-function guessDecodeBackend(hwAccelerated: boolean): string {
-  if (!hwAccelerated) return "Software (CPU)";
+function isMacOsClient(): boolean {
   const platform = navigator.platform?.toLowerCase() ?? "";
   const ua = navigator.userAgent?.toLowerCase() ?? "";
-  if (platform.includes("win") || ua.includes("windows")) return "D3D11 (GPU)";
-  if (platform.includes("mac") || ua.includes("macintosh")) return "VideoToolbox (GPU)";
-  if (platform.includes("linux") || ua.includes("linux")) {
+  return platform.includes("mac") || ua.includes("macintosh");
+}
+
+function guessDecodeBackend(): string {
+  if (isWindowsClient()) return "D3D11 (GPU)";
+  if (isMacOsClient()) return "VideoToolbox (GPU)";
+  if (isLinuxClient()) {
     return isLinuxArmClient() ? "V4L2 (GPU)" : "VA-API (GPU)";
   }
   return "Hardware (GPU)";
 }
 
-function guessEncodeBackend(hwAccelerated: boolean): string {
-  if (!hwAccelerated) return "Software (CPU)";
-  const platform = navigator.platform?.toLowerCase() ?? "";
-  const ua = navigator.userAgent?.toLowerCase() ?? "";
-  if (platform.includes("win") || ua.includes("windows")) return "Media Foundation (GPU)";
-  if (platform.includes("mac") || ua.includes("macintosh")) return "VideoToolbox (GPU)";
-  if (platform.includes("linux") || ua.includes("linux")) {
+function guessEncodeBackend(): string {
+  if (isWindowsClient()) return "Media Foundation (GPU)";
+  if (isMacOsClient()) return "VideoToolbox (GPU)";
+  if (isLinuxClient()) {
     return isLinuxArmClient() ? "V4L2 (GPU)" : "VA-API (GPU)";
   }
   return "Hardware (GPU)";
+}
+
+/**
+ * Describe the *actual* decode backend from the GPU process (chrome://gpu
+ * equivalent). Falls back to the platform guess only when the GPU process
+ * report is unavailable (e.g. GPU disabled or IPC failure).
+ */
+export function describeDecodeBackend(
+  hwAccelerated: boolean,
+  gpuInfo: GpuBackendInfo | null,
+): string {
+  if (!hwAccelerated) return "Software (CPU)";
+  if (gpuInfo?.gpuName) return `${gpuInfo.gpuName} (GPU)`;
+  return guessDecodeBackend();
+}
+
+/**
+ * Describe the *actual* encode backend from the GPU process. Encoders always
+ * run through Media Foundation on Windows / VideoToolbox on macOS regardless of
+ * GPU vendor, so when the GPU report is missing we keep the platform guess.
+ */
+export function describeEncodeBackend(
+  encodeHwAccelerated: boolean,
+  gpuInfo: GpuBackendInfo | null,
+): string {
+  if (!encodeHwAccelerated) return "Software (CPU)";
+  if (gpuInfo?.gpuName) return `${gpuInfo.gpuName} (GPU)`;
+  return guessEncodeBackend();
+}
+
+/**
+ * Fetch the active GPU identity + driver version from the GPU process
+ * (chrome://gpu equivalent). Cached per-session in the main process, so this
+ * is cheap to call any time the diagnostics panel is opened. Returns null when
+ * the GPU report is unavailable (GPU disabled, IPC failure, old preload).
+ */
+export async function getGpuBackendInfo(): Promise<GpuBackendInfo | null> {
+  try {
+    const api = window.openNow;
+    if (!api?.getGpuInfo) return null;
+    return await api.getGpuInfo();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the driver subtitle shown at the top of the codec diagnostics panel
+ * (e.g. `Intel · driver 31.0.101.5336`) so users can spot a stale graphics
+ * driver — especially when the Quick Sync hint is displayed. Returns null
+ * when neither a GPU name/vendor nor a driver version is known.
+ */
+export function getGpuDriverSubtitle(
+  gpuInfo: GpuBackendInfo | null,
+): { name: string; version: string | null } | null {
+  if (!gpuInfo) return null;
+  const name = (gpuInfo.vendorName ?? gpuInfo.gpuName ?? "").trim();
+  const version = (gpuInfo.driverVersion ?? "").trim();
+  if (!name && !version) return null;
+  return { name, version: version || null };
 }
 
 export async function testCodecSupport(): Promise<CodecTestResult[]> {
+  const gpuInfo = await getGpuBackendInfo();
   const results: CodecTestResult[] = [];
   const webrtcCaps = RTCRtpReceiver.getCapabilities?.("video");
   const webrtcCodecMimes = new Set(webrtcCaps?.codecs.map((codec) => codec.mimeType.toLowerCase()) ?? []);
@@ -201,8 +263,8 @@ export async function testCodecSupport(): Promise<CodecTestResult[]> {
       hwAccelerated,
       encodeSupported,
       encodeHwAccelerated,
-      decodeVia: decodeSupported ? guessDecodeBackend(hwAccelerated) : "Unsupported",
-      encodeVia: encodeSupported ? guessEncodeBackend(encodeHwAccelerated) : "Unsupported",
+      decodeVia: decodeSupported ? describeDecodeBackend(hwAccelerated, gpuInfo) : "Unsupported",
+      encodeVia: encodeSupported ? describeEncodeBackend(encodeHwAccelerated, gpuInfo) : "Unsupported",
       profiles,
     });
   }
@@ -226,6 +288,33 @@ export function shouldShowLinuxHardwareCodecHint(results: CodecTestResult[] | nu
   return results.some((result) => result.decodeSupported && !result.hwAccelerated)
     || results.some((result) => result.encodeSupported && !result.encodeHwAccelerated)
     || results.some((result) => result.codec === "H265" && !result.decodeSupported);
+}
+
+export function isWindowsClient(): boolean {
+  const platform = navigator.platform?.toLowerCase() ?? "";
+  const ua = navigator.userAgent?.toLowerCase() ?? "";
+  return platform.includes("win") || ua.includes("windows");
+}
+
+/**
+ * Detect the "Quick Sync H.264 encoder MFT not registered" driver case on
+ * Windows: H.264 decodes on the GPU (so the graphics driver is active) but
+ * H.264 encode fell back to software. Chromium can only use Intel Quick Sync
+ * H.264 through the Media Foundation H.264 encoder MFT that ships inside the
+ * full Intel Graphics driver; when only the Windows-Update "basic" driver is
+ * installed the MFT is missing and Chromium silently falls back to OpenH264.
+ */
+export function shouldShowQuickSyncDriverHint(results: CodecTestResult[] | null): boolean {
+  if (!results || results.length === 0 || !isWindowsClient()) {
+    return false;
+  }
+  const h264 = results.find((result) => result.codec === "H264");
+  if (!h264) {
+    return false;
+  }
+  // GPU decode proves the driver/GPU is working; software-only encode is the
+  // symptom of the missing encoder MFT (not of a broken GPU).
+  return h264.decodeSupported && h264.hwAccelerated && h264.encodeSupported && !h264.encodeHwAccelerated;
 }
 
 export function getCodecDecodeBadgeState(

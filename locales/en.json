@@ -587,6 +587,8 @@
       "codecUnsupportedReason": "Not supported on this device",
       "codecAutoHint": "Automatically choose the best codec for this device.",
       "codecManualHint": "Used when starting a new stream session.",
+      "fallbackCodec": "Fallback Codec",
+      "fallbackCodecHint": "Used when the selected codec can't be negotiated. Auto keeps every supported codec as a fallback.",
       "codecMigratedNotice": "{{codec}} isn't supported on this device — switched to Auto.",
 
       "codecFallback": "Fallback from {{requested}}",
@@ -653,7 +655,11 @@
       "decode": "Decode",
       "encode": "Encode",
       "profiles": "Profiles:",
-      "linuxHardwareHint": "Linux AppImage diagnostics use Chromium's WebRTC/MediaCapabilities report. Hardware decode depends on the Chromium build plus your distro GPU/video stack: x64 systems may need VA-API/NVIDIA VA-API drivers, while ARM V4L2 support depends on Chromium/Electron exposing that decoder."
+      "linuxHardwareHint": "Linux AppImage diagnostics use Chromium's WebRTC/MediaCapabilities report. Hardware decode depends on the Chromium build plus your distro GPU/video stack: x64 systems may need VA-API/NVIDIA VA-API drivers, while ARM V4L2 support depends on Chromium/Electron exposing that decoder.",
+      "quickSyncHint": "H.264 encodes on the CPU even though GPU decode works — the hardware encoder (Intel Quick Sync on Intel iGPUs) is not registered. Install the full graphics driver from your GPU vendor to enable hardware encoding.",
+      "backendExplainTitle": "Why do ENCODE and DECODE use different backends?",
+      "backendExplainBody": "On Windows, Chromium uses two different media stacks: hardware video DECODE runs through D3D11 (DXVA/D3D11VA), while hardware video ENCODE runs through Media Foundation (MFT). That's why the same codec can list different backends for each direction. Encoding is not used for cloud gaming streaming — your PC only receives and decodes the video stream, so only the DECODE row affects stream quality.",
+      "gpuDriverLine": "{{gpu}} \u00b7 driver {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Most compatible",

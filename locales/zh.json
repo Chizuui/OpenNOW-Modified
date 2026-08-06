@@ -408,6 +408,8 @@
       "codecUnsupportedReason": "此设备不支持",
       "codecAutoHint": "自动为此设备选择最佳编解码器。",
       "codecManualHint": "启动新的串流会话时使用。",
+      "fallbackCodec": "\u5907\u7528\u7f16\u89e3\u7801\u5668",
+      "fallbackCodecHint": "\u5f53\u6240\u9009\u7f16\u89e3\u7801\u5668\u65e0\u6cd5\u534f\u5546\u65f6\u4f7f\u7528\u3002\u81ea\u52a8\u4f1a\u4fdd\u7559\u6240\u6709\u53d7\u652f\u6301\u7684\u7f16\u89e3\u7801\u5668\u4f5c\u4e3a\u5907\u7528\u3002",
       "codecMigratedNotice": "此设备不支持{{codec}}，已自动切换为 Auto。",
 
       "decoder": "解码器",
@@ -435,7 +437,11 @@
       "notInWebrtc": "不在 WebRTC 中",
       "decode": "解码",
       "encode": "编码",
-      "profiles": "简介："
+      "profiles": "简介：",
+      "quickSyncHint": "尽管 GPU 解码正常，H.264 仍在 CPU 上编码 — 硬件编码器（Intel iGPU 上的 Intel Quick Sync）未注册。请安装 GPU 厂商的完整显卡驱动程序以启用硬件编码。",
+      "backendExplainTitle": "为什么 ENCODE 和 DECODE 使用不同的后端？",
+      "backendExplainBody": "在 Windows 上，Chromium 使用两种不同的媒体栈：硬件视频 DECODE 通过 D3D11（DXVA/D3D11VA）运行，而硬件视频 ENCODE 通过 Media Foundation（MFT）运行。因此同一编解码器可能在不同方向显示不同的后端。编码不用于云游戏流媒体播放 — 您的 PC 只接收并解码视频流，因此只有 DECODE 行会影响流媒体播放质量。",
+      "gpuDriverLine": "{{gpu}} \u00b7 \u9a71\u52a8\u7a0b\u5e8f {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "最兼容",

@@ -408,6 +408,8 @@
       "codecUnsupportedReason": "이 기기에서 지원되지 않음",
       "codecAutoHint": "이 기기에 가장 적합한 코덱을 자동으로 선택합니다.",
       "codecManualHint": "새 스트림 세션 시작 시 사용됩니다.",
+      "fallbackCodec": "\ud3f4\ub9cd \ucf54\ub371",
+      "fallbackCodecHint": "\uc120\ud0dd\ud55c \ucf54\ub371\uc744 \ud611\uc0c1\ud560 \uc218 \uc5c6\uc744 \ub54c \uc0ac\uc6a9\ub429\ub2c8\ub2e4. \uc790\ub3d9\uc740 \uc9c0\uc6d0\ub418\ub294 \ubaa8\ub4e0 \ucf54\ub371\uc744 \ud3f4\ub9cd\uc73c\ub85c \uc720\uc9c0\ud569\ub2c8\ub2e4.",
       "codecMigratedNotice": "이 기기에서 {{codec}}을(를) 지원하지 않아 Auto로 전환했습니다.",
 
       "decoder": "디코더",
@@ -435,7 +437,11 @@
       "notInWebrtc": "WebRTC에 없음",
       "decode": "디코드",
       "encode": "인코딩",
-      "profiles": "프로필:"
+      "profiles": "프로필:",
+      "quickSyncHint": "GPU 디코딩이 작동하는데 H.264가 CPU에서 인코딩됩니다 — 하드웨어 인코더(Intel iGPU의 경우 Intel Quick Sync)가 등록되지 않았습니다. 하드웨어 인코딩을 사용하려면 GPU 제조업체의 전체 그래픽 드라이버를 설치하세요.",
+      "backendExplainTitle": "ENCODE와 DECODE가 서로 다른 백엔드를 사용하는 이유는 무엇인가요?",
+      "backendExplainBody": "Windows에서 Chromium은 두 가지 서로 다른 미디어 스택을 사용합니다. 하드웨어 비디오 DECODE는 D3D11(DXVA/D3D11VA)을 통해 실행되고, 하드웨어 비디오 ENCODE는 Media Foundation(MFT)을 통해 실행됩니다. 그래서 같은 코덱이라도 방향에 따라 다른 백엔드를 표시할 수 있습니다. 인코딩은 클라우드 게이밍 스트리밍에서 사용되지 않습니다. PC는 비디오 스트림을 받아 디코딩만 하므로 스트림 품질에 영향을 줄 수 있는 것은 DECODE 행뿐입니다.",
+      "gpuDriverLine": "{{gpu}} \u00b7 \ub4dc\ub77c\uc774\ubc84 {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "가장 호환성이 좋음",

@@ -124,6 +124,47 @@ test("preferCodec keepFallbacks keeps all codecs but reorders the preferred one 
   assert.match(filtered, /m=audio 9 UDP\/TLS\/RTP\/SAVPF 111 0/);
 });
 
+test("preferCodec keepFallbacks orders a user-pinned fallback codec right after the preferred one", () => {
+  const sdp = [
+    "v=0",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 102",
+    "a=rtpmap:96 H264/90000",
+    "a=rtpmap:97 rtx/90000",
+    "a=fmtp:97 apt=96",
+    "a=rtpmap:98 H265/90000",
+    "a=rtpmap:99 rtx/90000",
+    "a=fmtp:99 apt=98",
+    "a=rtpmap:100 AV1/90000",
+    "a=rtpmap:101 flexfec-03/90000",
+    "a=rtpmap:102 ulpfec/90000",
+  ].join("\n");
+
+  // Preferred AV1 first, pinned H265 primary payload (98) next, then the rest
+  // in offer order (H265's RTX 99 stays in place; it is linked via apt=98).
+  const filtered = preferCodec(sdp, "AV1", {
+    keepFallbacks: true,
+    fallbackCodec: "H265",
+  });
+  assert.match(filtered, /m=video 9 UDP\/TLS\/RTP\/SAVPF 100 98 96 97 99 101 102/);
+  assert.match(filtered, /a=rtpmap:98 H265\/90000/);
+  assert.match(filtered, /a=rtpmap:100 AV1\/90000/);
+  assert.match(filtered, /a=fmtp:99 apt=98/);
+});
+
+test("preferCodec ignores a fallback equal to the preferred codec", () => {
+  const sdp = [
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 100",
+    "a=rtpmap:96 H264/90000",
+    "a=rtpmap:100 AV1/90000",
+  ].join("\n");
+
+  const filtered = preferCodec(sdp, "AV1", {
+    keepFallbacks: true,
+    fallbackCodec: "AV1",
+  });
+  assert.match(filtered, /m=video 9 UDP\/TLS\/RTP\/SAVPF 100 96/);
+});
+
 test("preferCodec default mode stays a hard filter", () => {
   const sdp = [
     "m=video 9 UDP/TLS/RTP/SAVPF 96 100",

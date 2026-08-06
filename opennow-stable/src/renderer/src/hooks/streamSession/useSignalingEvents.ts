@@ -192,6 +192,7 @@ export function useSignalingEvents({
           resolution: settings.resolution,
           fps: settings.fps,
           maxBitrateKbps: settings.maxBitrateMbps * 1000,
+          fallbackCodec: settings.fallbackCodec,
         },
         {
           // Windows internal: RawInput on the child HWND (Electron click-through is flaky).
@@ -276,6 +277,7 @@ export function useSignalingEvents({
               fps: settings.fps,
               maxBitrateKbps: settings.maxBitrateMbps * 1000,
               jitterBufferMode: settings.jitterBufferMode,
+              fallbackCodec: settings.fallbackCodec,
               nativeTransitionDiagnostics: settings.nativeTransitionDiagnostics,
             });
             setLaunchError(null);

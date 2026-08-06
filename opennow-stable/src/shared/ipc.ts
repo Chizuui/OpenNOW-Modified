@@ -111,6 +111,8 @@ export const IPC_CHANNELS = {
   RELEASE_HIGHLIGHTS_SHOW: "release-highlights:show",
   GSTREAMER_CLEAR_CACHE: "gstreamer:clear-cache",
   GSTREAMER_GET_SCAN_STATUS: "gstreamer:get-scan-status",
+  // GPU process backend detection for codec diagnostics
+  GPU_GET_INFO: "gpu:get-info",
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

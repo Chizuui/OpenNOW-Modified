@@ -408,6 +408,8 @@
       "codecUnsupportedReason": "このデバイスではサポートされていません",
       "codecAutoHint": "このデバイスに最適なコーデックを自動的に選択します。",
       "codecManualHint": "新しいストリームセッションの開始時に使用されます。",
+      "fallbackCodec": "\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af\u30b3\u30fc\u30c7\u30c3\u30af",
+      "fallbackCodecHint": "\u9078\u629e\u3057\u305f\u30b3\u30fc\u30c7\u30c3\u30af\u3092\u30cd\u30b4\u30b7\u30a8\u30fc\u30c8\u3067\u304d\u306a\u3044\u5834\u5408\u306b\u4f7f\u7528\u3055\u308c\u307e\u3059\u3002Auto \u3067\u306f\u5bfe\u5fdc\u3057\u3066\u3044\u308b\u3059\u3079\u3066\u306e\u30b3\u30fc\u30c7\u30c3\u30af\u304c\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af\u3068\u3057\u3066\u4fdd\u6301\u3055\u308c\u307e\u3059\u3002",
       "codecMigratedNotice": "このデバイスでは{{codec}}をサポートしていないため、Autoに切り替えました。",
 
       "decoder": "デコーダ",
@@ -435,7 +437,11 @@
       "notInWebrtc": "WebRTC にはありません",
       "decode": "デコード",
       "encode": "エンコード",
-      "profiles": "プロフィール:"
+      "profiles": "プロフィール:",
+      "quickSyncHint": "GPU デコードが機能しているのに H.264 が CPU でエンコードされています — ハードウェア エンコーダー（Intel iGPU では Intel Quick Sync）が登録されていません。ハードウェア エンコードを有効にするには、GPU ベンダーの完全なグラフィックス ドライバーをインストールしてください。",
+      "backendExplainTitle": "ENCODE と DECODE でバックエンドが違うのはなぜですか？",
+      "backendExplainBody": "Windows で Chromium は 2 つの異なるメディアスタックを使用します。ハードウェアの DECODE は D3D11 (DXVA/D3D11VA)、ハードウェアの ENCODE は Media Foundation (MFT) を通ります。このため、同じコーデックでも方向によって異なるバックエンドが表示されます。エンコードはクラウドゲーミングの配信では使われません。あなたの PC は動画ストリームを受け取って解凍するだけなので、配信品質に影響するのは DECODE 行だけです。",
+      "gpuDriverLine": "{{gpu}} \u00b7 \u30c9\u30e9\u30a4\u30d0\u30fc {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "最も互換性のある",

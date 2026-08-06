@@ -1,8 +1,12 @@
 import { Cpu, SlidersHorizontal, Zap } from "lucide-react";
-import type { JSX, RefObject } from "react";
-import type { Settings } from "@shared/gfn";
+import { useEffect, useState, type JSX, type RefObject } from "react";
+import type { GpuBackendInfo, Settings } from "@shared/gfn";
 import {
+  getGpuBackendInfo,
+  getGpuDriverSubtitle,
+  isWindowsClient,
   shouldShowLinuxHardwareCodecHint,
+  shouldShowQuickSyncDriverHint,
   type CodecTestResult,
 } from "../../../lib/codecDiagnostics";
 import { useTranslation } from "../../../i18n";
@@ -41,6 +45,27 @@ export function CodecDiagnosticsSection({
 }: CodecDiagnosticsSectionProps): JSX.Element | null {
   const { t } = useTranslation();
   const codecTestOpen = codecResults !== null || codecTesting;
+  // Active GPU identity + driver version (chrome://gpu equivalent). Shown as a
+  // subtitle above the codec cards so a stale graphics driver is easy to spot
+  // when the Quick Sync hint is displayed. Cached in main, so fetching on open
+  // is cheap.
+  const [gpuSubtitle, setGpuSubtitle] = useState<{ name: string; version: string | null } | null>(null);
+
+  useEffect(() => {
+    if (!codecTestOpen) {
+      setGpuSubtitle(null);
+      return;
+    }
+    let cancelled = false;
+    void getGpuBackendInfo().then((gpuInfo: GpuBackendInfo | null) => {
+      if (!cancelled) {
+        setGpuSubtitle(getGpuDriverSubtitle(gpuInfo));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [codecTestOpen]);
 
   if (!showStreamVideo && !showStreamCodecDiagnostics) return null;
 
@@ -159,9 +184,24 @@ export function CodecDiagnosticsSection({
                 </div>
                 {codecTestOpen && codecResults && (
                   <div className="codec-results">
+                    {gpuSubtitle && (
+                      <div className="codec-gpu-subtitle" title={gpuSubtitle.name}>
+                        {gpuSubtitle.name && gpuSubtitle.version
+                          ? t("settings.codecDiagnostics.gpuDriverLine", {
+                              gpu: gpuSubtitle.name,
+                              version: gpuSubtitle.version,
+                            })
+                          : gpuSubtitle.version ?? gpuSubtitle.name}
+                      </div>
+                    )}
                     {shouldShowLinuxHardwareCodecHint(codecResults) ? (
                       <div className="codec-result-hint">
                         {t("settings.codecDiagnostics.linuxHardwareHint")}
+                      </div>
+                    ) : null}
+                    {shouldShowQuickSyncDriverHint(codecResults) ? (
+                      <div className="codec-result-hint codec-result-hint--driver">
+                        {t("settings.codecDiagnostics.quickSyncHint")}
                       </div>
                     ) : null}
                     {codecResults.map((result) => (
@@ -218,6 +258,19 @@ export function CodecDiagnosticsSection({
                         )}
                       </div>
                     ))}
+                    {/* The D3D11 (decode) vs Media Foundation (encode) split is a
+                        Windows-specific Chromium detail; on macOS/Linux both
+                        directions share one media stack. */}
+                    {isWindowsClient() && (
+                      <details className="codec-backend-note">
+                        <summary className="codec-backend-note-summary">
+                          {t("settings.codecDiagnostics.backendExplainTitle")}
+                        </summary>
+                        <p className="codec-backend-note-body">
+                          {t("settings.codecDiagnostics.backendExplainBody")}
+                        </p>
+                      </details>
+                    )}
                   </div>
                 )}
               </>
