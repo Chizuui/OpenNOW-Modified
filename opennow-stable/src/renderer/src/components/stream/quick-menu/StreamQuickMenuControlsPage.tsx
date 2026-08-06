@@ -27,12 +27,6 @@ interface StreamQuickMenuControlsPageProps {
   onMouseAccelerationChange: (value: number) => void;
   maxBitrateMbps: number;
   onMaxBitrateMbpsChange: (value: number) => void;
-  recordingResolution: string;
-  onRecordingResolutionChange: (value: string) => void;
-  recordingFps: number;
-  onRecordingFpsChange: (value: number) => void;
-  recordingBitrateMbps: number | null;
-  onRecordingBitrateMbpsChange: (value: number | null) => void;
   gstreamerEnabled: boolean;
   videoShader: VideoShaderSettings;
   onVideoShaderChange: (value: VideoShaderSettings) => void;
@@ -50,12 +44,6 @@ export function StreamQuickMenuControlsPage({
   onMouseAccelerationChange,
   maxBitrateMbps,
   onMaxBitrateMbpsChange,
-  recordingResolution,
-  onRecordingResolutionChange,
-  recordingFps,
-  onRecordingFpsChange,
-  recordingBitrateMbps,
-  onRecordingBitrateMbpsChange,
   gstreamerEnabled,
   videoShader,
   onVideoShaderChange,
@@ -134,66 +122,6 @@ export function StreamQuickMenuControlsPage({
             onCommit={onMaxBitrateMbpsChange}
           />
           <span className="sidebar-hint">Matches Stream settings bitrate. Applies live to the active session.</span>
-        </div>
-      </section>
-      <div className="sidebar-separator" aria-hidden="true" />
-      <section className="sidebar-section">
-        <div className="sidebar-section-header">
-          <span>Recording</span>
-          <span className="sidebar-section-sub">Configure local recordings.</span>
-        </div>
-        <div className="sidebar-row sidebar-row--column">
-          <div className="sidebar-row-top">
-            <span className="sidebar-label">Recording Resolution</span>
-            <span className="settings-value-badge">{recordingResolution}</span>
-          </div>
-          <div className="sidebar-chip-row">
-            {["1080p", "720p"].map((res) => (
-              <button
-                key={res}
-                type="button"
-                className={`sidebar-chip${recordingResolution === res ? " sidebar-chip--active" : ""}`}
-                onClick={() => onRecordingResolutionChange(res)}
-              >
-                <span>{res}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="sidebar-row sidebar-row--column">
-          <div className="sidebar-row-top">
-            <span className="sidebar-label">Recording FPS</span>
-            <span className="settings-value-badge">{recordingFps}</span>
-          </div>
-          <div className="sidebar-chip-row">
-            {[30, 60].map((fps) => (
-              <button
-                key={fps}
-                type="button"
-                className={`sidebar-chip${recordingFps === fps ? " sidebar-chip--active" : ""}`}
-                onClick={() => onRecordingFpsChange(fps)}
-              >
-                <span>{fps}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="sidebar-row sidebar-row--column">
-          <div className="sidebar-row-top">
-            <span className="sidebar-label">Recording Bitrate</span>
-            <span className="settings-value-badge">{recordingBitrateMbps === null ? "Auto" : `${recordingBitrateMbps} Mbps`}</span>
-          </div>
-          <SettingRange
-            id="quick-menu-recording-bitrate"
-            className="settings-slider"
-            min={5}
-            max={200}
-            step={5}
-            value={recordingBitrateMbps ?? 75}
-            disabled={recordingBitrateMbps === null}
-            onPreview={(value) => onRecordingBitrateMbpsChange(value)}
-            onCommit={(value) => onRecordingBitrateMbpsChange(value)}
-          />
         </div>
       </section>
       <div className="sidebar-separator" aria-hidden="true" />

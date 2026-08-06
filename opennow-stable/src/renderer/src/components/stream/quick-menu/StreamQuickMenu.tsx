@@ -250,12 +250,6 @@ export function StreamQuickMenu({
                 onMouseAccelerationChange={onMouseAccelerationChange}
                 maxBitrateMbps={maxBitrateMbps}
                 onMaxBitrateMbpsChange={onMaxBitrateMbpsChange}
-                recordingResolution={recordingResolution}
-                onRecordingResolutionChange={onRecordingResolutionChange}
-                recordingFps={recordingFps}
-                onRecordingFpsChange={onRecordingFpsChange}
-                recordingBitrateMbps={recordingBitrateMbps}
-                onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
                 gstreamerEnabled={gstreamerEnabled}
                 videoShader={videoShader}
                 onVideoShaderChange={onVideoShaderChange}
