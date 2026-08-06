@@ -48,6 +48,7 @@ import com.opencloudgaming.opennow.formatRuntimeResolution
 import com.opencloudgaming.opennow.formatSessionTimerDuration
 import com.opencloudgaming.opennow.parseResolutionPixelsOrNull
 import com.opencloudgaming.opennow.R
+import com.opencloudgaming.opennow.ui.adaptive.CONTENT_COMPACT_MAX_WIDTH
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
@@ -316,7 +317,7 @@ private data class SessionReportMetricData(
 @Composable
 private fun SessionReportMetricGrid(metrics: List<SessionReportMetricData>) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val columns = if (maxWidth >= 520.dp) 3 else 2
+        val columns = if (maxWidth >= CONTENT_COMPACT_MAX_WIDTH) 3 else 2
         Column(verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
             metrics.chunked(columns).forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {

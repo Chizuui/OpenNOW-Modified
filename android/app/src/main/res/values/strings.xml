@@ -48,6 +48,7 @@
     <string name="store_in_queue">In queue</string>
     <string name="store_favorites">Favorites</string>
     <string name="store_recommendations">Recommendations</string>
+    <string name="game_details_more_like_this">More like this</string>
     <string name="section_see_all">See all</string>
     <string name="action_play">Play</string>
     <string name="action_continue">Continue</string>

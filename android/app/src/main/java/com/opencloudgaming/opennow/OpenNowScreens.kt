@@ -267,6 +267,12 @@ import com.opencloudgaming.opennow.screens.tv.TvFeaturedCarousel
 import com.opencloudgaming.opennow.screens.tv.TvImmersiveList
 import com.opencloudgaming.opennow.screens.tv.TvTypographyScheme
 import com.opencloudgaming.opennow.screens.tv.TvWideCard
+import com.opencloudgaming.opennow.ui.adaptive.CONTENT_COMPACT_MAX_WIDTH
+import com.opencloudgaming.opennow.ui.adaptive.TWO_PANE_WIDE_PANE_MIN_WIDTH
+import com.opencloudgaming.opennow.ui.adaptive.WIDE_CONTENT_MIN_WIDTH
+import com.opencloudgaming.opennow.ui.adaptive.isAtLeastMedium
+import com.opencloudgaming.opennow.ui.adaptive.windowSizeClassOf
+import com.opencloudgaming.opennow.ui.adaptive.windowWidthSizeClassOf
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -307,7 +313,6 @@ private val TextPrimary = OpenNowPalette.TextPrimary
 private val TextMuted = OpenNowPalette.TextMuted
 private val ChromeScrim = OpenNowPalette.ChromeScrim
 private val TopBarCompactControlHeight = 30.dp
-private const val DEVICE_LOGIN_SIDE_BY_SIDE_MIN_WIDTH_DP = 520
 private const val COMPACT_STREAM_DEVICE_STATUS_REFRESH_MS = 5_000L
 private const val QUEUE_POSITION_VISUAL_SETTLE_MS = 1100L
 private const val ACTIVE_STREAM_MODE_NOTICE_DURATION_MS = 8_000L
@@ -1096,7 +1101,7 @@ private data class SessionReportMetricData(
 @Composable
 private fun SessionReportMetricGrid(metrics: List<SessionReportMetricData>) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val columns = if (maxWidth >= 520.dp) 3 else 2
+        val columns = if (maxWidth >= CONTENT_COMPACT_MAX_WIDTH) 3 else 2
         Column(verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
             metrics.chunked(columns).forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
@@ -1697,7 +1702,7 @@ private fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCanc
         modifier = Modifier.fillMaxSize().padding(horizontal = 48.dp, vertical = 36.dp),
         contentAlignment = Alignment.Center,
     ) {
-        val landscape = maxWidth >= 720.dp
+        val landscape = maxWidth >= WIDE_CONTENT_MIN_WIDTH
         val qrMaxSize = minOf(
             maxWidth * if (landscape) 0.28f else 0.68f,
             maxHeight * if (landscape) 0.58f else 0.38f,
@@ -1732,7 +1737,7 @@ internal fun DeviceLoginPanel(
     val sideBySideLayout = shouldUseSideBySideDeviceLoginLayout(
         orientation = configuration.orientation,
         preferLandscapeLayout = preferLandscapeLayout,
-        availableWidthDp = configuration.screenWidthDp,
+        availableWidth = configuration.screenWidthDp.dp,
     )
     val launchUrl = remember(prompt.verificationUriComplete, prompt.verificationUri) {
         prompt.verificationUriComplete ?: prompt.verificationUri
@@ -1813,10 +1818,10 @@ internal fun DeviceLoginPanel(
 internal fun shouldUseSideBySideDeviceLoginLayout(
     orientation: Int,
     preferLandscapeLayout: Boolean,
-    availableWidthDp: Int,
+    availableWidth: Dp,
 ): Boolean =
     preferLandscapeLayout ||
-        (orientation == Configuration.ORIENTATION_LANDSCAPE && availableWidthDp >= DEVICE_LOGIN_SIDE_BY_SIDE_MIN_WIDTH_DP)
+        (orientation == Configuration.ORIENTATION_LANDSCAPE && availableWidth >= CONTENT_COMPACT_MAX_WIDTH)
 
 @Composable
 private fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
@@ -1929,10 +1934,10 @@ internal fun secondsUntil(deadlineMs: Long): Int =
     ((deadlineMs - System.currentTimeMillis()).coerceAtLeast(0L) / 1000L).toInt()
 
 private fun isPhoneLandscape(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
-    width > height && minOf(width, height) < PHONE_NAV_RAIL_MAX_SMALLEST_WIDTH
+    width > height && windowSizeClassOf(width, height).isPhone
 
 private fun isPhonePortrait(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
-    height >= width && minOf(width, height) < PHONE_NAV_RAIL_MAX_SMALLEST_WIDTH
+    height >= width && windowSizeClassOf(width, height).isPhone
 
 @Composable
 internal fun rememberPhysicalControllerConnected(enabled: Boolean): Boolean {
@@ -2144,7 +2149,10 @@ private fun MainShell(
         val horizontalChrome = maxWidth > maxHeight
         val phoneLandscapeChrome = !tvProfile && !inStream && isPhoneLandscape(maxWidth, maxHeight)
         val portraitChrome = !inStream && maxHeight >= maxWidth
-        val showNavigationRail = !inStream && (tvProfile || phoneLandscapeChrome)
+        // Material 3 adaptive navigation: medium+ screens (tablets, foldables, large phones in
+        // landscape) get the NavigationRail even in portrait, instead of the compact bottom bar.
+        val tabletChrome = !tvProfile && !inStream && windowWidthSizeClassOf(maxWidth).isAtLeastMedium
+        val showNavigationRail = !inStream && (tvProfile || phoneLandscapeChrome || tabletChrome)
         val scrollChromePage = state.page == AppPage.Home || state.page == AppPage.Library
         val tvCatalogChrome = tvProfile && scrollChromePage
         val storeControlsInTopBar = (phoneLandscapeChrome || tvCatalogChrome) && state.page == AppPage.Home
@@ -2396,6 +2404,11 @@ private fun MainShell(
                             connectedTvName = state.localTvConnector.connectedTvName,
                             onPlayOnTv = viewModel::playOnLocalTv,
                             onDismiss = viewModel::clearSelectedGame,
+                            similarGames = similarGamesFor(
+                                game = game,
+                                catalog = state.games.ifEmpty { state.catalogResult.games },
+                            ),
+                            onSelectGame = viewModel::selectGame,
                         )
                     }
                 }
@@ -3070,9 +3083,11 @@ private fun HomeScreen(
                 Modifier
                     .fillMaxSize()
                     .padding(
-                        start = 12.dp,
+                        // M3 large screens step the content gutter up from 12dp to 24dp. Handheld
+                        // only — TV keeps its own gutters from the TV design system.
+                        start = if (!tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium) OpenNowSpacing.xl else 12.dp,
                         top = if (controlsInTopBar) 4.dp else 12.dp,
-                        end = 12.dp,
+                        end = if (!tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium) OpenNowSpacing.xl else 12.dp,
                         bottom = 12.dp,
                     ),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -3327,9 +3342,11 @@ private fun LibraryScreen(
                 Modifier
                     .fillMaxSize()
                     .padding(
-                        start = 12.dp,
+                        // M3 large screens step the content gutter up from 12dp to 24dp. Handheld
+                        // only — TV keeps its own gutters from the TV design system.
+                        start = if (!tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium) OpenNowSpacing.xl else 12.dp,
                         top = if (controlsInTopBar) 4.dp else 12.dp,
-                        end = 12.dp,
+                        end = if (!tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium) OpenNowSpacing.xl else 12.dp,
                         bottom = 12.dp,
                     ),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -3778,6 +3795,7 @@ private fun StoreRailSectionSkeleton(
             val fittedCardWidth = ((maxWidth.value - spacing.value * (visibleCount - 1)) / visibleCount)
                 .coerceAtLeast(1f)
                 .dp
+            val mediaCard = !tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(spacing),
@@ -3787,6 +3805,7 @@ private fun StoreRailSectionSkeleton(
                         width = fittedCardWidth,
                         expressiveUi = expressiveUi,
                         portraitCard = !tvProfile,
+                        mediaCard = mediaCard,
                     )
                 }
             }
@@ -3799,27 +3818,56 @@ private fun StoreRailGameCardSkeleton(
     width: Dp,
     expressiveUi: Boolean,
     portraitCard: Boolean,
+    mediaCard: Boolean,
 ) {
     val shape = RoundedCornerShape(if (expressiveUi) 12.dp else 8.dp)
     Surface(
         modifier = Modifier
             .width(width)
-            .aspectRatio(if (portraitCard) GAME_BOX_ART_ASPECT_RATIO else 1f)
+            .then(
+                // Mirror the real card: the media form gets art + caption, so no whole-card ratio.
+                if (mediaCard) Modifier
+                else Modifier.aspectRatio(if (portraitCard) GAME_BOX_ART_ASPECT_RATIO else 1f),
+            )
             .border(1.dp, Color.White.copy(alpha = 0.08f), shape),
         shape = shape,
         color = Color.Black,
         tonalElevation = 0.dp,
         shadowElevation = 1.dp,
     ) {
-        Box(Modifier.fillMaxSize().clip(shape)) {
-            LoadingShimmer(Modifier.fillMaxSize())
-            if (portraitCard) {
-                SkeletonCircle(
-                    size = 44.dp,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(6.dp),
-                )
+        Column(Modifier.fillMaxWidth().clip(shape)) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (mediaCard) {
+                            Modifier.aspectRatio(if (portraitCard) GAME_BOX_ART_ASPECT_RATIO else 1f)
+                        } else {
+                            Modifier.fillMaxSize()
+                        },
+                    ),
+            ) {
+                LoadingShimmer(Modifier.fillMaxSize())
+                if (portraitCard) {
+                    SkeletonCircle(
+                        size = 44.dp,
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(6.dp),
+                    )
+                }
+            }
+            if (mediaCard) {
+                // Caption placeholder — two lines the height of the real media-card caption.
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = OpenNowSpacing.lg, vertical = OpenNowSpacing.md),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    SkeletonLine(widthFraction = 0.85f, height = 14.dp)
+                    SkeletonLine(widthFraction = 0.5f, height = 11.dp)
+                }
             }
         }
     }
@@ -3990,6 +4038,7 @@ private fun GameGrid(
                         squareCard = gridSpec.squareCards,
                         thumbnailFavoriteOverlay = !tvProfile,
                         controllerActionMode = controllerActionMode,
+                        mediaCard = !tvProfile && !gridSpec.squareCards && windowWidthSizeClassOf(maxWidth).isAtLeastMedium,
                         onSelect = onSelect,
                         onFavorite = onFavorite,
                         onPlay = onPlay,
@@ -4108,6 +4157,7 @@ private fun StoreGameGrid(
                         squareCard = gridSpec.squareCards,
                         thumbnailFavoriteOverlay = !tvProfile,
                         controllerActionMode = controllerActionMode,
+                        mediaCard = !tvProfile && !gridSpec.squareCards && windowWidthSizeClassOf(maxWidth).isAtLeastMedium,
                         onSelect = onSelect,
                         onFavorite = onFavorite,
                         onPlay = onPlay,
@@ -4466,6 +4516,7 @@ private fun StoreRailSection(
                 (visibleCount + PEEK_CARD_FRACTION))
                 .coerceAtLeast(1f)
                 .dp
+            val artworkOnly = shouldUseArtworkOnlyCatalogCards(tvProfile, controllerActionMode)
             CatalogFocusScope {
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(spacing),
@@ -4492,6 +4543,16 @@ private fun StoreRailSection(
                                 controllerBackgroundAnimations = settings.controllerBackgroundAnimations,
                                 width = cardWidth,
                                 controllerActionMode = controllerActionMode,
+                                showGameStoreLabels = !artworkOnly && shouldShowGameStoreLabels(
+                                    tvProfile = tvProfile,
+                                    enabled = settings.showGameStoreLabels,
+                                ),
+                                showCardTitles = !artworkOnly && shouldShowCatalogCardTitles(
+                                    tvProfile = tvProfile,
+                                    enabled = settings.showCardTitles,
+                                ),
+                                // Same M3 media-card form as the grid, so the rail and grid agree.
+                                mediaCard = !tvProfile && windowWidthSizeClassOf(maxWidth).isAtLeastMedium,
                                 onSelect = onSelect,
                                 onFavorite = onFavorite,
                                 onPlay = onPlay,
@@ -4515,6 +4576,10 @@ private fun StoreRailGameCard(
     controllerBackgroundAnimations: Boolean,
     width: Dp,
     controllerActionMode: Boolean,
+    showCardTitles: Boolean,
+    showGameStoreLabels: Boolean,
+    /** Medium+ handhelds render the M3 media-card form: caption inside the card below the art. */
+    mediaCard: Boolean,
     onSelect: (GameInfo) -> Unit,
     onFavorite: (String) -> Unit,
     onPlay: (GameInfo) -> Unit,
@@ -4554,7 +4619,12 @@ private fun StoreRailGameCard(
         modifier = Modifier
             .width(width)
             .padding(vertical = if (tvProfile) CATALOG_CONTROLLER_FOCUS_INSET else 0.dp)
-            .aspectRatio(if (tvProfile) 1f else GAME_BOX_ART_ASPECT_RATIO)
+            .then(
+                // In the media-card form the ratio lives on the art box so the caption can sit
+                // below it; the poster form keeps the ratio on the whole card.
+                if (mediaCard) Modifier
+                else Modifier.aspectRatio(if (tvProfile) 1f else GAME_BOX_ART_ASPECT_RATIO),
+            )
             .graphicsLayer {
                 scaleX = cardScale
                 scaleY = cardScale
@@ -4570,7 +4640,7 @@ private fun StoreRailGameCard(
                 color = when {
                     enhancedControllerFocus -> Color.Transparent
                     focused -> MaterialTheme.colorScheme.primary
-                    else -> Color.White.copy(alpha = 0.08f)
+                    else -> Color.Transparent
                 },
                 shape = shape,
             )
@@ -4588,44 +4658,61 @@ private fun StoreRailGameCard(
                     else -> handleDpadFocusMove(event, focusManager)
                 }
             }
-            .focusable(interactionSource = interaction)
-            .combinedClickable(
-                interactionSource = interaction,
-                indication = null,
-                onClick = { onSelect(game) },
-                onLongClick = { onChooseStore(game) },
-                onLongClickLabel = stringResource(R.string.store_selector_play_long_press),
-            ),
+            .focusable(interactionSource = interaction),
         shape = shape,
         color = OpenNowPalette.ImagePlaceholder,
         tonalElevation = if (focused) 4.dp else 0.dp,
         shadowElevation = if (focused) 8.dp else 1.dp,
     ) {
-        Box(Modifier.fillMaxSize().clip(shape)) {
-            UrlImage(
-                catalogCardImageUrl(game, tvProfile),
-                Modifier.fillMaxSize(),
-                // Crop everywhere — see the note in GameCard.
-                contentScale = ContentScale.Crop,
-            )
-            if (shouldOverlayCatalogCardTitle(tvProfile)) {
-                GameCardTitleOverlay(game.title)
-            }
-            if (shouldShowCatalogCardActions(tvProfile, controllerActionMode)) {
-                FavoriteIconButton(
+        // The whole card is clickable — art and (in the media-card form) caption. Key handling
+        // stays on the Surface modifier above, matching the grid GameCard pattern. The clip keeps
+        // art and caption inside the rounded shape — Surface does not clip its children by itself.
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .then(if (mediaCard) Modifier else Modifier.fillMaxSize())
+                .clip(shape)
+                .combinedClickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = { onSelect(game) },
+                    onLongClick = { onChooseStore(game) },
+                    onLongClickLabel = stringResource(R.string.store_selector_play_long_press),
+                ),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (mediaCard) {
+                            Modifier.aspectRatio(if (tvProfile) 1f else GAME_BOX_ART_ASPECT_RATIO)
+                        } else {
+                            Modifier.fillMaxSize()
+                        },
+                    ),
+            ) {
+                GameCardArtworkContent(
+                    game = game,
+                    tvProfile = tvProfile,
+                    thumbnailFavoriteOverlay = true,
                     favorite = favorite,
-                    onClick = { onFavorite(game.id) },
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(6.dp),
-                    size = actionButtonSize,
+                    controllerActionMode = controllerActionMode,
+                    overlayActionSize = actionButtonSize,
+                    overlayActionPadding = 6.dp,
+                    enhancedControllerFocus = enhancedControllerFocus,
+                    controllerBackgroundAnimations = controllerBackgroundAnimations,
+                    reduceMotion = reduceMotion,
+                    expressiveUi = expressiveUi,
+                    onFavorite = { onFavorite(game.id) },
                 )
             }
-            ControllerFocusFrame(
-                visible = enhancedControllerFocus,
-                animate = controllerBackgroundAnimations,
-                cornerRadius = if (expressiveUi) 12.dp else 8.dp,
-            )
+            if (mediaCard && (showCardTitles || showGameStoreLabels)) {
+                GameCardMediaCaption(
+                    game = game,
+                    showCardTitles = showCardTitles,
+                    showGameStoreLabels = showGameStoreLabels,
+                )
+            }
         }
     }
 }
@@ -4922,6 +5009,9 @@ private val GRID_CELL_WIDTH_PORTRAIT = 96.dp
 private val GRID_CELL_WIDTH_LANDSCAPE = 112.dp
 private val GRID_CELL_WIDTH_TV = 158.dp
 
+/** M3 adaptive: tablets keep cards substantial instead of inheriting the tiny phone cell. */
+private val GRID_CELL_WIDTH_TABLET = 168.dp
+
 /** Compact mode shrinks the target cell rather than switching to a separate size table. */
 private const val COMPACT_CELL_WIDTH_FACTOR = 0.88f
 private val CATALOG_CONTROLLER_FOCUS_INSET = 8.dp
@@ -4935,10 +5025,14 @@ private fun gameGridSpec(
 ): GameGridSpec {
     val horizontalSpacing = if (compact) OpenNowSpacing.sm else OpenNowSpacing.GridGutter
     val verticalSpacing = if (compact) OpenNowSpacing.md else OpenNowSpacing.GridRowGap
-    val horizontalPadding = OpenNowSpacing.ScreenEdge
+    // M3 large screens use 24dp gutters instead of the phone 16dp. Handheld only — the TV
+    // experience keeps its own gutters from the TV design system.
+    val horizontalPadding = if (handheldLayout && windowWidthSizeClassOf(maxWidth).isAtLeastMedium) OpenNowSpacing.xl else OpenNowSpacing.ScreenEdge
 
     val baseCellWidth = when {
         !handheldLayout -> GRID_CELL_WIDTH_TV
+        // M3 adaptive: medium+ screens keep cards substantial rather than shrinking the phone cell.
+        windowWidthSizeClassOf(maxWidth).isAtLeastMedium -> GRID_CELL_WIDTH_TABLET
         landscapeLayout -> GRID_CELL_WIDTH_LANDSCAPE
         else -> GRID_CELL_WIDTH_PORTRAIT
     }
@@ -4996,6 +5090,8 @@ private fun GameCard(
     squareCard: Boolean,
     thumbnailFavoriteOverlay: Boolean,
     controllerActionMode: Boolean,
+    /** Medium+ handhelds render the M3 media-card form: caption inside the card below the art. */
+    mediaCard: Boolean,
     onSelect: (GameInfo) -> Unit,
     onFavorite: (String) -> Unit,
     onPlay: (GameInfo) -> Unit,
@@ -5013,8 +5109,9 @@ private fun GameCard(
         tvProfile = tvProfile,
         controllerActionMode = controllerActionMode,
     )
-    // Touch-handheld captions live outside the poster, so the artwork stays visually clean.
-    val showCaption = handheldPosterCard && (showCardTitles || showGameStoreLabels)
+    // On phones the caption lives outside the poster so the artwork stays clean in the tight grid;
+    // on medium+ screens the media-card form puts it inside the card instead.
+    val showCaption = handheldPosterCard && !mediaCard && (showCardTitles || showGameStoreLabels)
 
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -5060,7 +5157,8 @@ private fun GameCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .then(
-                    if (squareCard) Modifier.aspectRatio(1f)
+                    if (mediaCard) Modifier
+                    else if (squareCard) Modifier.aspectRatio(1f)
                     else Modifier.aspectRatio(GAME_BOX_ART_ASPECT_RATIO),
                 )
                 .onFocusChanged { focused = it.isFocused || it.hasFocus }
@@ -5094,9 +5192,12 @@ private fun GameCard(
             elevation = CardDefaults.cardElevation(defaultElevation = if (focused) 8.dp else 0.dp),
             shape = cardShape,
         ) {
-            Box(
+            // The whole card is clickable — art and (in the media-card form) caption. The
+            // controller key handling stays on the Card modifier above, so focus isn't affected.
+            Column(
                 Modifier
-                    .fillMaxSize()
+                    .fillMaxWidth()
+                    .then(if (mediaCard) Modifier else Modifier.fillMaxSize())
                     .combinedClickable(
                         interactionSource = interaction,
                         indication = null,
@@ -5105,32 +5206,40 @@ private fun GameCard(
                         onLongClickLabel = stringResource(R.string.store_selector_play_long_press),
                     ),
             ) {
-                UrlImage(
-                    catalogCardImageUrl(game, tvProfile),
-                    Modifier.fillMaxSize(),
-                    // Always Crop. The card is already locked to NVIDIA's box-art ratio, so for
-                    // correctly-cut art this is identical to Fit; when the CDN returns something
-                    // off-ratio, Fit pillarboxed it against a flat swatch and Crop simply trims.
-                    contentScale = ContentScale.Crop,
-                )
-                if (shouldOverlayCatalogCardTitle(tvProfile)) {
-                    GameCardTitleOverlay(game.title)
-                }
-                if (thumbnailFavoriteOverlay && shouldShowCatalogCardActions(tvProfile, controllerActionMode)) {
-                    FavoriteIconButton(
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .then(
+                            if (mediaCard) {
+                                if (squareCard) Modifier.aspectRatio(1f)
+                                else Modifier.aspectRatio(GAME_BOX_ART_ASPECT_RATIO)
+                            } else {
+                                Modifier.fillMaxSize()
+                            },
+                        ),
+                ) {
+                    GameCardArtworkContent(
+                        game = game,
+                        tvProfile = tvProfile,
+                        thumbnailFavoriteOverlay = thumbnailFavoriteOverlay,
                         favorite = favorite,
-                        onClick = { onFavorite(game.id) },
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(overlayActionPadding),
-                        size = overlayActionSize,
+                        controllerActionMode = controllerActionMode,
+                        overlayActionSize = overlayActionSize,
+                        overlayActionPadding = overlayActionPadding,
+                        enhancedControllerFocus = enhancedControllerFocus,
+                        controllerBackgroundAnimations = controllerBackgroundAnimations,
+                        reduceMotion = reduceMotion,
+                        expressiveUi = expressiveUi,
+                        onFavorite = { onFavorite(game.id) },
                     )
                 }
-                ControllerFocusFrame(
-                    visible = enhancedControllerFocus,
-                    animate = controllerBackgroundAnimations && !reduceMotion,
-                    cornerRadius = if (expressiveUi) OpenNowRadius.md else OpenNowRadius.sm,
-                )
+                if (mediaCard && (showCardTitles || showGameStoreLabels)) {
+                    GameCardMediaCaption(
+                        game = game,
+                        showCardTitles = showCardTitles,
+                        showGameStoreLabels = showGameStoreLabels,
+                    )
+                }
             }
         }
         if (showCaption) {
@@ -5163,6 +5272,28 @@ private fun GameCard(
             }
         }
     }
+}
+
+/**
+ * Games sharing the most genres with [game], for the tablet "More like this" pane.
+ * The store catalog is the pool; if it has not loaded yet the search/catalog fallback is used.
+ */
+internal fun similarGamesFor(
+    game: GameInfo,
+    catalog: List<GameInfo>,
+    limit: Int = 8,
+): List<GameInfo> {
+    val ownGenres = game.genres.toSet()
+    if (ownGenres.isEmpty()) return emptyList()
+    return catalog
+        .asSequence()
+        .filter { it.id != game.id }
+        .map { candidate -> candidate to candidate.genres.count { it in ownGenres } }
+        .filter { (_, overlap) -> overlap > 0 }
+        .sortedByDescending { (_, overlap) -> overlap }
+        .take(limit)
+        .map { (candidate, _) -> candidate }
+        .toList()
 }
 
 internal fun catalogCardImageUrl(game: GameInfo, tvProfile: Boolean): String? {
@@ -5210,6 +5341,91 @@ private fun GameCardTitleOverlay(title: String) {
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
         )
+    }
+}
+
+/**
+ * The art layer of a [GameCard] — image, optional title overlay, favorite button, and the
+ * controller focus frame. Shared by the phone poster and the tablet media-card forms.
+ */
+@Composable
+private fun BoxScope.GameCardArtworkContent(
+    game: GameInfo,
+    tvProfile: Boolean,
+    thumbnailFavoriteOverlay: Boolean,
+    favorite: Boolean,
+    controllerActionMode: Boolean,
+    overlayActionSize: Dp,
+    overlayActionPadding: Dp,
+    enhancedControllerFocus: Boolean,
+    controllerBackgroundAnimations: Boolean,
+    reduceMotion: Boolean,
+    expressiveUi: Boolean,
+    onFavorite: () -> Unit,
+) {
+    UrlImage(
+        catalogCardImageUrl(game, tvProfile),
+        Modifier.fillMaxSize(),
+        // Always Crop. The card is already locked to NVIDIA's box-art ratio, so for
+        // correctly-cut art this is identical to Fit; when the CDN returns something
+        // off-ratio, Fit pillarboxed it against a flat swatch and Crop simply trims.
+        contentScale = ContentScale.Crop,
+    )
+    if (shouldOverlayCatalogCardTitle(tvProfile)) {
+        GameCardTitleOverlay(game.title)
+    }
+    if (thumbnailFavoriteOverlay && shouldShowCatalogCardActions(tvProfile, controllerActionMode)) {
+        FavoriteIconButton(
+            favorite = favorite,
+            onClick = onFavorite,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(overlayActionPadding),
+            size = overlayActionSize,
+        )
+    }
+    ControllerFocusFrame(
+        visible = enhancedControllerFocus,
+        animate = controllerBackgroundAnimations && !reduceMotion,
+        cornerRadius = if (expressiveUi) OpenNowRadius.md else OpenNowRadius.sm,
+    )
+}
+
+/**
+ * Caption inside the M3 media-card form: title on the first line, store labels on the second.
+ * Rendered below the art (inside the card) instead of outside like the phone poster caption.
+ */
+@Composable
+private fun GameCardMediaCaption(
+    game: GameInfo,
+    showCardTitles: Boolean,
+    showGameStoreLabels: Boolean,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            // M3 card content padding (16dp horizontal, 12dp vertical) per the Design Kit.
+            .padding(horizontal = OpenNowSpacing.lg, vertical = OpenNowSpacing.md),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        if (showCardTitles) {
+            Text(
+                game.title,
+                color = TextPrimary,
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (showGameStoreLabels) {
+            Text(
+                displayStoresForGame(game),
+                color = TextMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }
 
@@ -5367,6 +5583,8 @@ private fun GameDetailsSheet(
     connectedTvName: String?,
     onPlayOnTv: (GameInfo) -> Unit,
     onDismiss: () -> Unit,
+    similarGames: List<GameInfo> = emptyList(),
+    onSelectGame: (GameInfo) -> Unit = {},
 ) {
     val gameFocusRequester = remember(game.id) { FocusRequester() }
     val playFocusRequester = remember(game.id) { FocusRequester() }
@@ -5448,8 +5666,8 @@ private fun GameDetailsSheet(
                     .padding(if (fullScreen) safeAreaPadding else 0.dp),
             ) {
                 val aspect = if (maxHeight.value > 0f) maxWidth.value / maxHeight.value else 1f
-                val landscapeTvLayout = maxWidth >= 720.dp && aspect >= 1.35f
-                val phoneLandscapeLayout = landscapeTvLayout && minOf(maxWidth, maxHeight) < PHONE_NAV_RAIL_MAX_SMALLEST_WIDTH
+                val landscapeTvLayout = maxWidth >= WIDE_CONTENT_MIN_WIDTH && aspect >= 1.35f
+                val phoneLandscapeLayout = landscapeTvLayout && windowSizeClassOf(maxWidth, maxHeight).isPhone
                 if (landscapeTvLayout) {
                     GameDetailsLandscapeContent(
                         game = game,
@@ -5465,6 +5683,25 @@ private fun GameDetailsSheet(
                         playFocusRequester = playFocusRequester,
                         shortHeight = maxHeight <= 620.dp,
                         imageActionsOverlay = phoneLandscapeLayout,
+                    )
+                } else if (!fullScreen && maxWidth >= WIDE_CONTENT_MIN_WIDTH && similarGames.isNotEmpty()) {
+                    // M3 adaptive two-pane: details on the left, "More like this" on the right.
+                    // 720dp gate keeps the left pane usable — below that the sheet stays single-pane.
+                    GameDetailsTabletTwoPane(
+                        game = game,
+                        favorite = favorite,
+                        defaultVariantId = defaultVariantId,
+                        onPlay = onPlay,
+                        onChooseStore = onChooseStore,
+                        onFavorite = onFavorite,
+                        connectedTvName = connectedTvName,
+                        onPlayOnTv = onPlayOnTv,
+                        onDismiss = onDismiss,
+                        gameFocusRequester = gameFocusRequester,
+                        playFocusRequester = playFocusRequester,
+                        similarGames = similarGames,
+                        onSelectGame = onSelectGame,
+                        paneWidth = if (maxWidth >= TWO_PANE_WIDE_PANE_MIN_WIDTH) 360.dp else 300.dp,
                     )
                 } else {
                     GameDetailsScrollableContent(
@@ -5482,6 +5719,136 @@ private fun GameDetailsSheet(
                     )
                 }
             }
+            }
+        }
+    }
+}
+
+/**
+ * M3 adaptive two-pane game details for tablet-sized sheets (>= 600dp wide, portrait): the normal
+ * scrollable details on the left and a "More like this" list on the right. Selecting a suggestion
+ * swaps the sheet to that game via [onSelectGame].
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GameDetailsTabletTwoPane(
+    game: GameInfo,
+    favorite: Boolean,
+    defaultVariantId: String?,
+    onPlay: (GameInfo) -> Unit,
+    onChooseStore: (GameInfo) -> Unit,
+    onFavorite: (String) -> Unit,
+    connectedTvName: String?,
+    onPlayOnTv: (GameInfo) -> Unit,
+    onDismiss: () -> Unit,
+    gameFocusRequester: FocusRequester,
+    playFocusRequester: FocusRequester,
+    similarGames: List<GameInfo>,
+    onSelectGame: (GameInfo) -> Unit,
+    paneWidth: Dp,
+) {
+    Row(Modifier.fillMaxSize().padding(horizontal = OpenNowSpacing.xl)) {
+        Box(Modifier.weight(1f)) {
+            GameDetailsScrollableContent(
+                game = game,
+                favorite = favorite,
+                defaultVariantId = defaultVariantId,
+                onPlay = onPlay,
+                onChooseStore = onChooseStore,
+                onFavorite = onFavorite,
+                connectedTvName = connectedTvName,
+                onPlayOnTv = onPlayOnTv,
+                onDismiss = onDismiss,
+                gameFocusRequester = gameFocusRequester,
+                playFocusRequester = playFocusRequester,
+            )
+        }
+        Box(
+            Modifier
+                .width(1.dp)
+                .fillMaxHeight()
+                .padding(vertical = OpenNowSpacing.lg)
+                .background(OpenNowPalette.PanelHairline),
+        )
+        Column(
+            Modifier
+                .width(paneWidth)
+                .fillMaxHeight()
+                .padding(start = OpenNowSpacing.xl, top = OpenNowSpacing.lg),
+        ) {
+            Text(
+                text = stringResource(R.string.game_details_more_like_this),
+                style = MaterialTheme.typography.titleLarge,
+                color = TextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(OpenNowSpacing.md))
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(end = OpenNowSpacing.md, bottom = 18.dp),
+            ) {
+                items(similarGames, key = { it.id }) { similar ->
+                    GameRecommendationRow(
+                        game = similar,
+                        onClick = { onSelectGame(similar) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Compact selectable row for the tablet "More like this" pane. */
+@Composable
+private fun GameRecommendationRow(
+    game: GameInfo,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var focused by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(OpenNowRadius.md)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(if (focused) OpenNowPalette.Panel else Color.Transparent)
+            .onFocusChanged { focused = it.isFocused || it.hasFocus }
+            .clickable(onClick = onClick)
+            .padding(OpenNowSpacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
+    ) {
+        Box(
+            Modifier
+                .width(128.dp)
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(OpenNowRadius.sm))
+                .background(OpenNowPalette.ImagePlaceholder),
+        ) {
+            UrlImage(
+                url = catalogCardImageUrl(game, tvProfile = false),
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(
+                text = game.title,
+                style = MaterialTheme.typography.titleMedium,
+                color = TextPrimary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            game.publisherName?.takeIf { it.isNotBlank() }?.let { publisher ->
+                Text(
+                    text = publisher,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -5714,8 +6081,8 @@ private fun GameDetailsScrollableContent(
     Column(Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(bottom = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            contentPadding = PaddingValues(bottom = OpenNowSpacing.lg),
+            verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.lg),
         ) {
             item {
                 Box(
@@ -5728,9 +6095,11 @@ private fun GameDetailsScrollableContent(
                         .focusRequester(gameFocusRequester)
                         .focusProperties { down = playFocusRequester }
                         .onFocusChanged { gameFocused = it.isFocused }
+                        // M3: the hero is borderless at rest; a focus ring appears only for
+                        // controller navigation so the resting card stays visually clean.
                         .border(
-                            width = if (gameFocused) 3.dp else 1.dp,
-                            color = if (gameFocused) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.12f),
+                            width = if (gameFocused) 3.dp else 0.dp,
+                            color = if (gameFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
                             shape = RoundedCornerShape(OpenNowRadius.lg),
                         )
                         .clip(RoundedCornerShape(OpenNowRadius.lg))
@@ -5763,7 +6132,10 @@ private fun GameDetailsScrollableContent(
                 }
             }
             item {
-                Column(Modifier.padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(
+                    Modifier.padding(horizontal = OpenNowSpacing.lg),
+                    verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
+                ) {
                     val description = gameDescriptionForDetails(game)
                     OwnershipStatusRow(game = game, compact = false)
                     GameGenreChips(game = game, compact = false)
@@ -14371,7 +14743,7 @@ private fun PrintedWasteZoneRow(
         border = if (selected && listFocused) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
     ) {
         BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val compact = maxWidth < 520.dp
+            val compact = maxWidth < CONTENT_COMPACT_MAX_WIDTH
             if (compact) {
                 Column(
                     Modifier.padding(horizontal = 12.dp, vertical = 10.dp),

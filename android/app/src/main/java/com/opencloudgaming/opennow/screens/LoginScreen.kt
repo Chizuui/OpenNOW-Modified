@@ -71,6 +71,7 @@ import com.opencloudgaming.opennow.LocalTvLoadingProfile
 import com.opencloudgaming.opennow.secondsUntil
 import com.opencloudgaming.opennow.shouldUseSideBySideDeviceLoginLayout
 import com.opencloudgaming.opennow.supportsDeviceCodeLogin
+import com.opencloudgaming.opennow.ui.adaptive.WIDE_CONTENT_MIN_WIDTH
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import kotlinx.coroutines.delay
 
@@ -448,7 +449,7 @@ private fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCanc
         modifier = Modifier.fillMaxSize().padding(horizontal = 48.dp, vertical = 36.dp),
         contentAlignment = Alignment.Center,
     ) {
-        val landscape = maxWidth >= 720.dp
+        val landscape = maxWidth >= WIDE_CONTENT_MIN_WIDTH
         val qrMaxSize = minOf(
             maxWidth * if (landscape) 0.28f else 0.68f,
             maxHeight * if (landscape) 0.58f else 0.38f,
@@ -483,7 +484,7 @@ internal fun DeviceLoginPanel(
     val sideBySideLayout = shouldUseSideBySideDeviceLoginLayout(
         orientation = configuration.orientation,
         preferLandscapeLayout = preferLandscapeLayout,
-        availableWidthDp = configuration.screenWidthDp,
+        availableWidth = configuration.screenWidthDp.dp,
     )
     val launchUrl = remember(prompt.verificationUriComplete, prompt.verificationUri) {
         prompt.verificationUriComplete ?: prompt.verificationUri

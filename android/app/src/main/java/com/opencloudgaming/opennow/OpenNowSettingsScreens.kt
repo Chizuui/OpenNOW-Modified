@@ -92,7 +92,6 @@ internal val SettingsPanelAlt = OpenNowPalette.PanelAlt
 internal val SettingsText = OpenNowPalette.TextPrimary
 internal val SettingsTextMuted = OpenNowPalette.TextMuted
 internal const val DONATE_URL = "https://printedwaste.com/donate"
-internal val PHONE_NAV_RAIL_MAX_SMALLEST_WIDTH = 600.dp
 internal val APP_NAV_RAIL_WIDTH = 80.dp
 internal const val PHONE_ULTRAWIDE_MIN_STREAM_ASPECT = 2.2f
 internal const val PHONE_ULTRAWIDE_MIN_VIEWPORT_ASPECT = 2.0f
