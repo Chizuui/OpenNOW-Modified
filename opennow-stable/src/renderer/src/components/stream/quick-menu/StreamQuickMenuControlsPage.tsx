@@ -121,7 +121,7 @@ export function StreamQuickMenuControlsPage({
             onPreview={onMaxBitrateMbpsChange}
             onCommit={onMaxBitrateMbpsChange}
           />
-          <span className="sidebar-hint">Matches Stream settings bitrate. Applies live to the active session.</span>
+          <span className="sidebar-hint">Sets the stream bitrate cap. Negotiated at session start — the HUD target updates live, full effect on the next stream.</span>
         </div>
       </section>
       <div className="sidebar-separator" aria-hidden="true" />
