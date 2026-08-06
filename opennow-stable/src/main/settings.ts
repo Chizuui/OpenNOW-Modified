@@ -15,6 +15,7 @@ import {
   normalizeJitterBufferMode,
   normalizeNativeExternalRendererForPlatform,
   normalizeStreamClientModeForPlatform,
+  normalizeFallbackCodecPreference,
   normalizeStreamPreferences,
   normalizeTransportModeForPlatform,
   normalizeVideoShaderSettings,
@@ -215,6 +216,12 @@ export class SettingsManager {
       );
       settings.codec = normalized.codec;
       settings.colorQuality = normalized.colorQuality;
+      migrated = true;
+    }
+
+    const fallbackCodec = normalizeFallbackCodecPreference(settings.fallbackCodec);
+    if (settings.fallbackCodec !== fallbackCodec) {
+      settings.fallbackCodec = fallbackCodec;
       migrated = true;
     }
 

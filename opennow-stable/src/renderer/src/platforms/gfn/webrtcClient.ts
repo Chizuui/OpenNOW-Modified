@@ -1,6 +1,7 @@
 import type {
   IceCandidatePayload,
   ColorQuality,
+  FallbackCodecPreference,
   IceServer,
   JitterBufferMode,
   SessionInfo,
@@ -49,6 +50,7 @@ import type {
   StreamDiagnostics,
   StreamTimeWarning,
 } from "./webrtc/streamDiagnosticsTypes";
+import { CODEC_MIME_BY_NAME, buildCodecPreferenceList } from "./webrtc/codecPreferences";
 import { classifyStreamLagReason, isRttSpike } from "./webrtc/streamLag";
 import { chooseAdaptiveMouseFlushInterval } from "./webrtc/mouseInput";
 import {
@@ -108,6 +110,12 @@ interface OfferSettings {
   maxBitrateKbps: number;
   /** Web-mode jitter buffer aggressiveness preset (defaults to balanced). */
   jitterBufferMode?: JitterBufferMode;
+  /**
+   * User-pinned fallback codec for web mode. `"auto"` (default) keeps every
+   * supported GFN primary as a fallback; a concrete value wins whenever the
+   * primary codec cannot be negotiated.
+   */
+  fallbackCodec?: FallbackCodecPreference;
   nativeTransitionDiagnostics?: NativeTransitionDiagnostics;
 }
 
@@ -2019,13 +2027,17 @@ export class GfnWebRtcClient {
 
   /**
    * Apply setCodecPreferences roughly matching GFN web client behavior:
-   * preferred codec + RTX/FlexFEC only (receiver capabilities first).
-   * On failure, retry with sender capabilities appended.
+   * requested codec first (+ RTX/FlexFEC), with the other GFN primary codecs
+   * kept when `keepFallbacks` is set so the answer can fall back to a
+   * decodable codec when the requested one's payload is rejected by
+   * createAnswer. On failure, retry with sender capabilities appended.
    */
   private applyCodecPreferences(
     pc: RTCPeerConnection,
     codec: VideoCodec,
     preferredHevcProfileId?: 1 | 2,
+    keepFallbacks = false,
+    fallbackCodec?: VideoCodec,
   ): void {
     try {
       const transceivers = pc.getTransceivers();
@@ -2045,62 +2057,34 @@ export class GfnWebRtcClient {
 
       const senderCaps = RTCRtpSender.getCapabilities?.("video")?.codecs ?? [];
 
-      // Map our codec name to the MIME type used in WebRTC capabilities
-      const codecMimeMap: Record<string, string> = {
-        H264: "video/H264",
-        H265: "video/H265",
-        AV1: "video/AV1",
-        VP9: "video/VP9",
-        VP8: "video/VP8",
-      };
-      const preferredMime = codecMimeMap[codec];
-      if (!preferredMime) {
-        this.log(`setCodecPreferences: unknown codec "${codec}", skipping`);
-        return;
-      }
-
-      const preferred = receiverCaps.filter(
-        (c) => c.mimeType.toLowerCase() === preferredMime.toLowerCase(),
-      );
-
-      const auxiliary = receiverCaps.filter((c) => {
-        const mime = c.mimeType.toLowerCase();
-        return mime.includes("rtx") || mime.includes("flexfec-03");
+      const codecList = buildCodecPreferenceList(receiverCaps, codec, {
+        preferredHevcProfileId,
+        keepFallbacks,
+        fallbackCodec,
       });
+      const preferredCount = receiverCaps.filter(
+        (c) => c.mimeType.toLowerCase() === CODEC_MIME_BY_NAME[codec].toLowerCase(),
+      ).length;
 
-      if (preferred.length === 0) {
-        this.log(`setCodecPreferences: ${codec} (${preferredMime}) not in receiver capabilities, skipping`);
+      if (codecList.length === 0) {
+        this.log(`setCodecPreferences: ${codec} (${CODEC_MIME_BY_NAME[codec]}) not in receiver capabilities, skipping`);
         return;
       }
-
-      // H265 can be exposed with multiple profiles; prefer profile-id=1 first
-      // for maximum decoder compatibility (reduces macroblocking on some GPUs).
-      if (codec === "H265" && preferredHevcProfileId) {
-        preferred.sort((a, b) => {
-          const getScore = (c: RTCRtpCodec): number => {
-            const fmtp = (c.sdpFmtpLine ?? "").toLowerCase();
-            const match = fmtp.match(/(?:^|;)\s*profile-id=(\d+)/);
-            const profile = match?.[1];
-            if (profile === String(preferredHevcProfileId)) return 0;
-            if (!profile) return 1;
-            return 2;
-          };
-          return getScore(a) - getScore(b);
-        });
+      if (preferredCount === 0) {
+        this.log(
+          `setCodecPreferences: ${codec} not in receiver capabilities; restricting to fallback primaries only`,
+        );
       }
-
-      let codecList = [...preferred, ...auxiliary];
 
       try {
         videoTransceiver.setCodecPreferences(codecList);
         this.log(
-          `setCodecPreferences: set ${codec} (${preferred.length} preferred + ${auxiliary.length} auxiliary receiver codecs)`,
+          `setCodecPreferences: set ${codec} (${codecList.length} codecs${keepFallbacks ? " with fallbacks" : ""})`,
         );
       } catch (e) {
         this.log(`setCodecPreferences: receiver-only failed (${String(e)}), retrying with sender capabilities`);
         try {
-          codecList = codecList.concat(senderCaps);
-          videoTransceiver.setCodecPreferences(codecList);
+          videoTransceiver.setCodecPreferences(codecList.concat(senderCaps));
           this.log(
             `setCodecPreferences: retry succeeded with sender capabilities (+${senderCaps.length})`,
           );
@@ -2379,17 +2363,33 @@ export class GfnWebRtcClient {
       );
     }
     this.log(`Effective codec: ${effectiveCodec} (preferred HEVC profile-id=${preferredHevcProfileId}, browser-supported=${codecSupported})`);
+    // User-pinned fallback codec (web mode): "auto" keeps every GFN primary
+    // as a fallback; a concrete value is ordered first among them so it wins
+    // whenever the primary codec cannot be negotiated on this server.
+    const fallbackVideoCodec = settings.fallbackCodec && settings.fallbackCodec !== "auto"
+      ? settings.fallbackCodec
+      : undefined;
+    if (fallbackVideoCodec) {
+      this.log(
+        `Fallback codec preference: ${fallbackVideoCodec} will be preferred if ${effectiveCodec} is not negotiable`,
+      );
+    }
     this.applyStreamSettingsDiagnostics(settings, effectiveCodec, false);
     this.emitStats();
+    // Always keep fallback codecs in the offer (GFN-web behavior). Receiver
+    // capabilities can list a codec that createAnswer still rejects for a given
+    // server payload (seen with AV1 on the MY YES edge) — with only the
+    // requested codec in the m-line the answer drops the whole video m-line and
+    // the "no video codec negotiated" guard below fails the session. The
+    // requested codec is reordered first and preferred in setCodecPreferences,
+    // so it still wins when it is actually negotiable; otherwise Chromium falls
+    // back to a decodable codec and the NVST SDP / HUD align to the negotiated
+    // codec below.
+    const keepFallbacks = true;
     const filteredOffer = preferCodec(processedOffer, effectiveCodec, {
       preferHevcProfileId: preferredHevcProfileId,
-      // Hard-filter to the single requested codec only when the browser can
-      // actually receive it. Otherwise keep the other codecs in the video
-      // m-line (requested one reordered first) so Chromium can fall back to a
-      // decodable codec — with a hard filter the answer rejects the whole
-      // video m-line (port 0, dropped from BUNDLE) and the session hangs on
-      // "Waiting for game video...".
-      keepFallbacks: !codecSupported,
+      keepFallbacks,
+      fallbackCodec: fallbackVideoCodec,
     });
     this.log(`Filtered offer SDP length: ${filteredOffer.length} chars`);
     this.log("Setting remote description (offer)...");
@@ -2407,7 +2407,7 @@ export class GfnWebRtcClient {
     //     This is the modern WebRTC API — more reliable than SDP munging alone.
     //     Must be called after setRemoteDescription (which creates the transceiver)
     //     but before createAnswer (which generates the answer SDP).
-    this.applyCodecPreferences(pc, effectiveCodec, preferredHevcProfileId);
+    this.applyCodecPreferences(pc, effectiveCodec, preferredHevcProfileId, keepFallbacks, fallbackVideoCodec);
 
     // 4. Create answer, munge SDP, and set local description
     this.log("Creating answer...");

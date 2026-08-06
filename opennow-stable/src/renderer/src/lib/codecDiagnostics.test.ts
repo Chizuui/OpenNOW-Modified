@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  describeDecodeBackend,
+  describeEncodeBackend,
   getCodecToMigrateToAuto,
+  getGpuDriverSubtitle,
   isCodecUsableForStream,
   resolveEffectiveCodec,
   resolveStreamProfileCodec,
   shouldShowLinuxHardwareCodecHint,
+  shouldShowQuickSyncDriverHint,
   type CodecTestResult,
 } from "./codecDiagnostics";
+import type { GpuBackendInfo } from "@shared/gfn";
 
 function withNavigator(platform: string, userAgent: string, run: () => void): void {
   const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
@@ -57,6 +62,120 @@ test("does not show Linux hardware hint for GPU-backed diagnostics", () => {
 test("does not show Linux hardware hint on non-Linux clients", () => {
   withNavigator("Win32", "OpenNOW Windows", () => {
     assert.equal(shouldShowLinuxHardwareCodecHint([codecResult()]), false);
+  });
+});
+
+test("shows Quick Sync driver hint when H264 encodes on CPU but decodes on GPU (Windows)", () => {
+  // The user's exact case: H.264 decode on D3D11 GPU, encode fell back to
+  // software — the Intel H.264 encoder MFT is not registered.
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    const results = [
+      codecResult({
+        codec: "H264",
+        decodeSupported: true,
+        hwAccelerated: true,
+        encodeSupported: true,
+        encodeHwAccelerated: false,
+      }),
+    ];
+    assert.equal(shouldShowQuickSyncDriverHint(results), true);
+  });
+});
+
+test("does not show Quick Sync hint when H264 encode is also hardware", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    const results = [
+      codecResult({
+        codec: "H264",
+        decodeSupported: true,
+        hwAccelerated: true,
+        encodeSupported: true,
+        encodeHwAccelerated: true,
+      }),
+    ];
+    assert.equal(shouldShowQuickSyncDriverHint(results), false);
+  });
+});
+
+test("does not show Quick Sync hint when H264 decode is not GPU-backed", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    const results = [
+      codecResult({
+        codec: "H264",
+        decodeSupported: true,
+        hwAccelerated: false,
+        encodeSupported: true,
+        encodeHwAccelerated: false,
+      }),
+    ];
+    assert.equal(shouldShowQuickSyncDriverHint(results), false);
+  });
+});
+
+test("decode backend label uses the actual GPU name from the GPU process", () => {
+  const gpuInfo: GpuBackendInfo = {
+    gpuName: "Intel(R) UHD Graphics",
+    vendorName: "Intel",
+    driverVersion: "31.0.101",
+    decodeAccelerated: true,
+    encodeAccelerated: true,
+    hardwareDecodeCodecs: ["H264", "H265", "AV1"],
+    hardwareEncodeCodecs: ["H265"],
+  };
+  // Hardware decode → actual GPU model, not the guessed "D3D11".
+  assert.equal(describeDecodeBackend(true, gpuInfo), "Intel(R) UHD Graphics (GPU)");
+  // Software decode stays honest.
+  assert.equal(describeDecodeBackend(false, gpuInfo), "Software (CPU)");
+});
+
+test("decode backend falls back to the platform guess when GPU info is missing", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    assert.equal(describeDecodeBackend(true, null), "D3D11 (GPU)");
+    assert.equal(describeDecodeBackend(false, null), "Software (CPU)");
+  });
+});
+
+test("encode backend label uses the actual GPU name from the GPU process", () => {
+  const gpuInfo: GpuBackendInfo = {
+    gpuName: "Intel(R) UHD Graphics",
+    vendorName: "Intel",
+    driverVersion: "31.0.101",
+    decodeAccelerated: true,
+    encodeAccelerated: true,
+    hardwareDecodeCodecs: ["H264", "H265", "AV1"],
+    hardwareEncodeCodecs: ["H265"],
+  };
+  // Hardware encode → actual GPU model, not the guessed "Media Foundation".
+  assert.equal(describeEncodeBackend(true, gpuInfo), "Intel(R) UHD Graphics (GPU)");
+  assert.equal(describeEncodeBackend(false, gpuInfo), "Software (CPU)");
+});
+
+test("encode backend falls back to the platform guess when GPU info is missing", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    assert.equal(describeEncodeBackend(true, null), "Media Foundation (GPU)");
+    assert.equal(describeEncodeBackend(false, null), "Software (CPU)");
+  });
+});
+
+test("does not show Quick Sync hint without an H264 result or on non-Windows", () => {
+  // No H264 entry.
+  assert.equal(shouldShowQuickSyncDriverHint([
+    codecResult({ codec: "AV1" }),
+  ]), false);
+  // Null / empty results.
+  assert.equal(shouldShowQuickSyncDriverHint(null), false);
+  assert.equal(shouldShowQuickSyncDriverHint([]), false);
+  // Non-Windows client.
+  withNavigator("Linux x86_64", "OpenNOW Linux", () => {
+    assert.equal(shouldShowQuickSyncDriverHint([
+      codecResult({
+        codec: "H264",
+        decodeSupported: true,
+        hwAccelerated: true,
+        encodeSupported: true,
+        encodeHwAccelerated: false,
+      }),
+    ]), false);
   });
 });
 
@@ -129,4 +248,51 @@ test("resolved stream profile pins color quality to the resolved codec", () => {
     codec: "H265",
     colorQuality: "10bit_420",
   });
+});
+
+test("gpu driver subtitle prefers the vendor name with the driver version", () => {
+  const gpuInfo: GpuBackendInfo = {
+    gpuName: "Intel(R) UHD Graphics",
+    vendorName: "Intel",
+    driverVersion: "31.0.101.5336",
+    decodeAccelerated: true,
+    encodeAccelerated: true,
+    hardwareDecodeCodecs: [],
+    hardwareEncodeCodecs: [],
+  };
+  assert.deepEqual(getGpuDriverSubtitle(gpuInfo), {
+    name: "Intel",
+    version: "31.0.101.5336",
+  });
+});
+
+test("gpu driver subtitle falls back to the GPU model without a vendor", () => {
+  const gpuInfo: GpuBackendInfo = {
+    gpuName: "NVIDIA GeForce RTX 3060",
+    vendorName: null,
+    driverVersion: null,
+    decodeAccelerated: true,
+    encodeAccelerated: null,
+    hardwareDecodeCodecs: ["H264"],
+    hardwareEncodeCodecs: [],
+  };
+  // No driver version → name only, so the panel renders a plain label.
+  assert.deepEqual(getGpuDriverSubtitle(gpuInfo), {
+    name: "NVIDIA GeForce RTX 3060",
+    version: null,
+  });
+});
+
+test("gpu driver subtitle returns null when no identity is known", () => {
+  assert.equal(getGpuDriverSubtitle(null), null);
+  const empty: GpuBackendInfo = {
+    gpuName: null,
+    vendorName: null,
+    driverVersion: "",
+    decodeAccelerated: null,
+    encodeAccelerated: null,
+    hardwareDecodeCodecs: [],
+    hardwareEncodeCodecs: [],
+  };
+  assert.equal(getGpuDriverSubtitle(empty), null);
 });

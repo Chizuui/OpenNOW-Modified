@@ -408,6 +408,8 @@
       "codecUnsupportedReason": "Bu cihazda desteklenmiyor",
       "codecAutoHint": "Bu cihaz için en iyi codec'i otomatik seç.",
       "codecManualHint": "Yeni bir akış oturumu başlatılırken kullanılır.",
+      "fallbackCodec": "Yedek codec",
+      "fallbackCodecHint": "Se\u00e7ilen codec anla\u015f\u0131lamad\u0131\u011f\u0131nda kullan\u0131l\u0131r. Auto, desteklenen t\u00fcm codec'leri yedek olarak tutar.",
       "codecMigratedNotice": "{{codec}} bu cihazda desteklenmiyor — Auto olarak değiştirildi.",
 
       "decoder": "Kod çözücü",
@@ -435,7 +437,11 @@
       "notInWebrtc": "WebRTC'de değil",
       "decode": "Kod Çöz",
       "encode": "Kodla",
-      "profiles": "Profiller:"
+      "profiles": "Profiller:",
+      "quickSyncHint": "H.264, GPU kod çözme çalışmasına rağmen CPU üzerinde kodlanıyor — donanım kodlayıcı (Intel iGPU'larda Intel Quick Sync) kayıtlı değil. Donanım kodlamayı etkinleştirmek için GPU üreticinizin tam grafik sürücüsünü yükleyin.",
+      "backendExplainTitle": "ENCODE ve DECODE neden farklı arka uçlar kullanıyor?",
+      "backendExplainBody": "Windows'ta Chromium iki farklı medya yığını kullanır: donanım video DECODE'u D3D11 (DXVA/D3D11VA) üzerinden, donanım video ENCODE'u ise Media Foundation (MFT) üzerinden çalışır. Bu nedenle aynı codec her yön için farklı bir arka uç gösterebilir. Kodlama, bulut oyun akışında kullanılmaz — PC'niz video akışını yalnızca alır ve çözer, bu yüzden akış kalitesini yalnızca DECODE satırı etkiler.",
+      "gpuDriverLine": "{{gpu}} \u00b7 s\u00fcr\u00fcc\u00fc {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "En uyumlu",

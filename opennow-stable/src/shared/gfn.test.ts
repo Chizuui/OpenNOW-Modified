@@ -20,6 +20,7 @@ import {
   NATIVE_STREAMER_WINDOWS_ONLY_MESSAGE,
   getDefaultStreamPreferences,
   normalizeCodecPreference,
+  normalizeFallbackCodecPreference,
   normalizeGameStore,
   normalizeNativeExternalRendererForPlatform,
   normalizeTransportModeForPlatform,
@@ -201,6 +202,7 @@ test("keeps native stream client mode on supported desktop platforms", () => {
 test("defaults streaming to auto codec selection with 8-bit SDR-compatible color quality", () => {
   assert.deepEqual(getDefaultStreamPreferences(), {
     codec: "auto",
+    fallbackCodec: "auto",
     colorQuality: "8bit_420",
   });
 });
@@ -237,6 +239,16 @@ test("unknown codec preferences normalize to auto", () => {
   assert.equal(normalizeCodecPreference("H265"), "H265");
   assert.equal(normalizeCodecPreference("VP9"), "auto");
   assert.equal(normalizeCodecPreference(undefined), "auto");
+});
+
+test("fallback codec preferences normalize to auto by default", () => {
+  assert.equal(normalizeFallbackCodecPreference("auto"), "auto");
+  assert.equal(normalizeFallbackCodecPreference("H264"), "H264");
+  assert.equal(normalizeFallbackCodecPreference("H265"), "H265");
+  assert.equal(normalizeFallbackCodecPreference("AV1"), "AV1");
+  assert.equal(normalizeFallbackCodecPreference("VP9"), "auto");
+  assert.equal(normalizeFallbackCodecPreference(undefined), "auto");
+  assert.equal(normalizeFallbackCodecPreference(null), "auto");
 });
 
 test("reports unsupported native streamer status on unknown platforms only", () => {

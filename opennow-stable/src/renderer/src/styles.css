@@ -7243,6 +7243,15 @@ button.game-card-store-chip.owned.active:hover {
   gap: 12px;
 }
 
+.codec-gpu-subtitle {
+  grid-column: 1 / -1;
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0 0.15rem;
+  letter-spacing: 0.01em;
+}
+
 .codec-result-hint {
   grid-column: 1 / -1;
   color: var(--text-secondary);
@@ -7252,6 +7261,12 @@ button.game-card-store-chip.owned.active:hover {
   border: 1px solid rgba(245, 158, 11, 0.22);
   border-radius: var(--r-md);
   padding: 0.7rem 0.8rem;
+}
+
+.codec-result-hint--driver {
+  background: rgba(59, 130, 246, 0.08);
+  border-color: rgba(59, 130, 246, 0.25);
+  color: var(--ink);
 }
 
 .codec-result-card {
@@ -7267,6 +7282,55 @@ button.game-card-store-chip.owned.active:hover {
 
 .codec-result-card:hover {
   border-color: color-mix(in srgb, var(--ink) 10%, transparent);
+}
+
+.codec-backend-note {
+  grid-column: 1 / -1;
+  background: var(--bg-a);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-md);
+  padding: 0.7rem 0.8rem;
+}
+
+.codec-backend-note-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.codec-backend-note-summary::-webkit-details-marker {
+  display: none;
+}
+
+.codec-backend-note-summary::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--ink-soft);
+  border-bottom: 2px solid var(--ink-soft);
+  transform: rotate(-45deg);
+  transition: transform var(--t-fast);
+  margin-top: -2px;
+}
+
+.codec-backend-note[open] .codec-backend-note-summary::before {
+  transform: rotate(45deg);
+}
+
+.codec-backend-note-body {
+  margin: 0.6rem 0 0;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--panel-border);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
 }
 
 .codec-result-header {

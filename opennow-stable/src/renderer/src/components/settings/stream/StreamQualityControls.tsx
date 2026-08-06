@@ -3,12 +3,14 @@ import type {
   CodecPreference,
   ColorQuality,
   EntitledResolution,
+  FallbackCodecPreference,
   Settings,
 } from "@shared/gfn";
 import {
   CODEC_PREFERENCE_OPTIONS,
   colorQualityRequiresHevc,
   expandEntitledStreamResolutions,
+  FALLBACK_CODEC_PREFERENCE_OPTIONS,
   getSafeFallbackEntitledResolutions,
   JITTER_BUFFER_MODES,
   resolveEntitledStreamProfile,
@@ -194,6 +196,33 @@ export function StreamQualityControls({
     handleCodecChange(value as CodecPreference);
   }, [handleCodecChange, onOpenCodecDiagnostics]);
 
+  // Fallback-codec dropdown (below the codec dropdown): "auto" keeps every
+  // supported GFN primary as a fallback; a concrete codec wins whenever the
+  // primary cannot be negotiated on the server. Codecs this device cannot
+  // decode are disabled under the same "Unsupported" group as the main list.
+  const fallbackCodecOptions = useMemo<SelectDropdownOption[]>(() => {
+    const supported: SelectDropdownOption[] = [];
+    const unsupported: SelectDropdownOption[] = [];
+    for (const preference of FALLBACK_CODEC_PREFERENCE_OPTIONS) {
+      if (preference === "auto") {
+        supported.push({ value: "auto", label: t("app.labels.auto") });
+        continue;
+      }
+      const usable = isCodecUsableForStream(preference, codecResults);
+      if (usable) {
+        supported.push({ value: preference, label: preference });
+      } else {
+        unsupported.push({
+          value: preference,
+          label: <span title={t("settings.video.codecUnsupportedReason")}>{preference}</span>,
+          disabled: true,
+          group: t("settings.video.codecUnsupported"),
+        });
+      }
+    }
+    return [...supported, ...unsupported];
+  }, [codecResults, t]);
+
   return (
     <>
       <div className="settings-row">
@@ -251,6 +280,25 @@ export function StreamQualityControls({
             {settings.codec === "auto"
               ? t("settings.video.codecAutoHint")
               : t("settings.video.codecManualHint")}
+          </span>
+        </div>
+      </div>
+
+      <div className="settings-row">
+        <label className="settings-label" htmlFor="settings-stream-fallback-codec">
+          {t("settings.video.fallbackCodec")}
+        </label>
+        <div className="settings-row-control">
+          <SelectDropdown
+            id="settings-stream-fallback-codec"
+            value={settings.fallbackCodec}
+            options={fallbackCodecOptions}
+            onChange={(value) => handleChange("fallbackCodec", value as FallbackCodecPreference)}
+            ariaLabel={t("settings.video.fallbackCodec")}
+            menuClassName="select-dropdown__menu--grouped"
+          />
+          <span className="settings-subtle-hint">
+            {t("settings.video.fallbackCodecHint")}
           </span>
         </div>
       </div>

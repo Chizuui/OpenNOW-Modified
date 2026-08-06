@@ -6,6 +6,14 @@ export type VideoCodec = "H264" | "H265" | "AV1";
  * forced even when the device reports them unsupported.
  */
 export type CodecPreference = "auto" | VideoCodec;
+/**
+ * User-facing fallback codec selection (web mode). When the requested/auto
+ * codec cannot be negotiated on a given server (e.g. AV1 on some YES edges),
+ * the stream falls back to a decodable codec. `"auto"` keeps every supported
+ * GFN primary as a fallback (GFN-web behavior); a concrete value pins that
+ * codec first so it wins whenever the primary codec fails.
+ */
+export type FallbackCodecPreference = "auto" | VideoCodec;
 export type VideoAccelerationPreference = "auto" | "hardware" | "software";
 export type StreamClientMode = "web" | "native";
 /**
@@ -56,6 +64,14 @@ export const USER_FACING_COLOR_QUALITY_OPTIONS: readonly ColorQuality[] = ["8bit
 /** GFN-web ordering for the codec dropdown: Auto, AV1, H.264, H.265. */
 export const CODEC_PREFERENCE_OPTIONS: readonly CodecPreference[] = ["auto", "AV1", "H264", "H265"];
 
+/** Fallback-codec dropdown ordering: Auto, then most-compatible-first. */
+export const FALLBACK_CODEC_PREFERENCE_OPTIONS: readonly FallbackCodecPreference[] = [
+  "auto",
+  "H264",
+  "H265",
+  "AV1",
+];
+
 /** Auto-resolution priority (GFN web auto-picks AV1 first). */
 export const AUTO_CODEC_PREFERENCE_ORDER: readonly VideoCodec[] = ["AV1", "H264", "H265"];
 
@@ -67,6 +83,13 @@ export function isSupportedUserFacingCodec(codec: VideoCodec): boolean {
 export function normalizeCodecPreference(raw: unknown): CodecPreference {
   return raw === "auto" || isSupportedUserFacingCodec(raw as VideoCodec)
     ? (raw as CodecPreference)
+    : "auto";
+}
+
+/** Normalize an unknown persisted fallback-codec value (defaults to "auto"). */
+export function normalizeFallbackCodecPreference(raw: unknown): FallbackCodecPreference {
+  return raw === "auto" || isSupportedUserFacingCodec(raw as VideoCodec)
+    ? (raw as FallbackCodecPreference)
     : "auto";
 }
 

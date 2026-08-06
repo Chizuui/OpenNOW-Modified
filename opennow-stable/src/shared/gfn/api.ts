@@ -77,6 +77,28 @@ import type {
 } from "./media";
 import type { PrintedWasteQueueData, PrintedWasteServerMapping } from "./printedWaste";
 
+/**
+ * Normalized snapshot of the Chromium GPU process (chrome://gpu equivalent)
+ * used to describe the *actual* video decode/encode backends instead of
+ * guessing from the platform.
+ */
+export interface GpuBackendInfo {
+  /** Active GPU model name, e.g. "Intel(R) UHD Graphics". */
+  gpuName: string | null;
+  /** GPU vendor string, e.g. "Intel", "NVIDIA", "AMD". */
+  vendorName: string | null;
+  /** Active GPU driver version. */
+  driverVersion: string | null;
+  /** Whether the GPU process reports video decode as hardware accelerated. */
+  decodeAccelerated: boolean | null;
+  /** Whether the GPU process reports video encode as hardware accelerated. */
+  encodeAccelerated: boolean | null;
+  /** Codecs the GPU process reports as hardware-decodable (H264, H265, AV1...). */
+  hardwareDecodeCodecs: string[];
+  /** Codecs the GPU process reports as hardware-encodable. */
+  hardwareEncodeCodecs: string[];
+}
+
 /** A raw mouse event captured by the native addon (Windows RawInput). */
 export interface NativeMouseEventPayload {
   /** 0 = relative move, 1 = button, 2 = wheel */
@@ -171,6 +193,8 @@ export interface OpenNowApi {
   readClipboardText(): Promise<string>;
   getSettings(): Promise<Settings>;
   setSetting<K extends keyof Settings>(key: K, value: Settings[K]): Promise<void>;
+  /** Snapshot of the Chromium GPU process for accurate codec backend labels */
+  getGpuInfo(): Promise<GpuBackendInfo>;
   resetSettings(): Promise<Settings>;
   selectNativeStreamerExecutable(): Promise<string | null>;
   getMicrophonePermission(): Promise<MicrophonePermissionResult>;

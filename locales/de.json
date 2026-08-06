@@ -407,6 +407,8 @@
       "codecUnsupportedReason": "Auf diesem Gerät nicht unterstützt",
       "codecAutoHint": "Automatisch den besten Codec für dieses Gerät wählen.",
       "codecManualHint": "Wird beim Start einer neuen Stream-Sitzung verwendet.",
+      "fallbackCodec": "Fallback-Codec",
+      "fallbackCodecHint": "Wird verwendet, wenn der gew\u00e4hlte Codec nicht verhandelt werden kann. Auto beh\u00e4lt jeden unterst\u00fctzten Codec als Fallback.",
       "codecMigratedNotice": "{{codec}} wird auf diesem Gerät nicht unterstützt — auf Auto umgestellt.",
 
       "codecFallback": "Fallback from {{requested}}",
@@ -435,7 +437,11 @@
       "notInWebrtc": "Nicht in WebRTC",
       "decode": "Dekodieren",
       "encode": "Kodieren",
-      "profiles": "Profile:"
+      "profiles": "Profile:",
+      "quickSyncHint": "H.264 wird auf der CPU kodiert, obwohl die GPU-Dekodierung funktioniert — der Hardware-Encoder (bei Intel-iGPUs Intel Quick Sync) ist nicht registriert. Installieren Sie den vollständigen Grafiktreiber Ihres GPU-Herstellers, um Hardware-Kodierung zu aktivieren.",
+      "backendExplainTitle": "Warum nutzen ENCODE und DECODE unterschiedliche Backends?",
+      "backendExplainBody": "Unter Windows verwendet Chromium zwei verschiedene Medien-Stacks: Hardware-Video-DECODE läuft über D3D11 (DXVA/D3D11VA), während Hardware-Video-ENCODE über Media Foundation (MFT) läuft. Deshalb kann derselbe Codec für beide Richtungen unterschiedliche Backends anzeigen. Encoding wird beim Cloud-Gaming-Streaming nicht verwendet — Ihr PC empfängt den Videostream nur und dekodiert ihn. Nur die DECODE-Zeile beeinflusst also die Stream-Qualität.",
+      "gpuDriverLine": "{{gpu}} \u00b7 Treiber {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Am kompatibelsten",

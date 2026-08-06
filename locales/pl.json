@@ -408,6 +408,8 @@
       "codecUnsupportedReason": "Nieobsługiwany na tym urządzeniu",
       "codecAutoHint": "Automatycznie wybierz najlepszy kodek dla tego urządzenia.",
       "codecManualHint": "Używane przy uruchamianiu nowej sesji strumieniowania.",
+      "fallbackCodec": "Kodek zapasowy",
+      "fallbackCodecHint": "U\u017cywany, gdy wybrany kodek nie mo\u017ce zosta\u0107 wynegocjowany. Auto zachowuje ka\u017cdy obs\u0142ugiwany kodek jako zapasowy.",
       "codecMigratedNotice": "{{codec}} nie jest obsługiwany na tym urządzeniu — przełączono na Auto.",
 
       "decoder": "Dekoder",
@@ -435,7 +437,11 @@
       "notInWebrtc": "Nie w WebRTC",
       "decode": "Dekodowanie",
       "encode": "Enkodowanie",
-      "profiles": "Profile:"
+      "profiles": "Profile:",
+      "quickSyncHint": "H.264 jest kodowany na CPU, mimo że dekodowanie GPU działa — enkoder sprzętowy (Intel Quick Sync w iGPU Intel) nie jest zarejestrowany. Zainstaluj pełny sterownik graficzny producenta GPU, aby włączyć kodowanie sprzętowe.",
+      "backendExplainTitle": "Dlaczego ENCODE i DECODE używają różnych backendów?",
+      "backendExplainBody": "W systemie Windows Chromium używa dwóch różnych stosów mediów: sprzętowe DECODE wideo działa przez D3D11 (DXVA/D3D11VA), a sprzętowe ENCODE wideo przez Media Foundation (MFT). Dlatego ten sam kodek może pokazywać różne backendy dla każdego kierunku. Kodowanie nie jest używane w streamingu gier w chmurze — Twój komputer tylko odbiera i dekoduje strumień wideo, więc tylko wiersz DECODE wpływa na jakość streamu.",
+      "gpuDriverLine": "{{gpu}} \u00b7 sterownik {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Najbardziej kompatybilne",

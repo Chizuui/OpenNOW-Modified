@@ -1,6 +1,7 @@
 import type {
   CodecPreference,
   ColorQuality,
+  FallbackCodecPreference,
   JitterBufferMode,
   NativeTransitionDiagnostics,
   StreamClientMode,
@@ -15,7 +16,7 @@ import type {
 import { DEFAULT_KEYBOARD_LAYOUT, type GameLanguage, type KeyboardLayout } from "./keyboard";
 import { DEFAULT_VIDEO_SHADER_SETTINGS, type VideoShaderSettings } from "./videoShader";
 import type { UpdateChannel } from "./updater";
-import { normalizeStreamPreferences } from "./stream";
+import { normalizeFallbackCodecPreference, normalizeStreamPreferences } from "./stream";
 
 export type AppAccentColor = "green" | "blue" | "violet" | "amber" | "rose";
 export type AppTheme = "light" | "dark" | "auto";
@@ -69,6 +70,12 @@ export interface Settings {
   transportMode: StreamTransportMode;
   showNativeStreamerStats: boolean;
   codec: CodecPreference;
+  /**
+   * Codec used when the primary (`codec`) selection cannot be negotiated on
+   * the server (web mode). `"auto"` keeps every supported GFN primary as a
+   * fallback; a concrete value pins that codec first.
+   */
+  fallbackCodec: FallbackCodecPreference;
   decoderPreference: VideoAccelerationPreference;
   encoderPreference: VideoAccelerationPreference;
   colorQuality: ColorQuality;
@@ -244,6 +251,7 @@ export function createDefaultSettings(platform: string): Settings {
     transportMode: "webrtc",
     showNativeStreamerStats: false,
     codec: DEFAULT_STREAM_PREFERENCES.codec,
+    fallbackCodec: DEFAULT_STREAM_PREFERENCES.fallbackCodec,
     decoderPreference: "auto",
     encoderPreference: "auto",
     colorQuality: DEFAULT_STREAM_PREFERENCES.colorQuality,
@@ -296,18 +304,20 @@ export function createDefaultSettings(platform: string): Settings {
   };
 }
 
-export const DEFAULT_STREAM_PREFERENCES: Readonly<Pick<Settings, "codec" | "colorQuality">> = Object.freeze({
+export const DEFAULT_STREAM_PREFERENCES: Readonly<Pick<Settings, "codec" | "colorQuality" | "fallbackCodec">> = Object.freeze({
   codec: "auto",
+  fallbackCodec: "auto",
   colorQuality: "8bit_420",
 });
 
-export function getDefaultStreamPreferences(): Pick<Settings, "codec" | "colorQuality"> {
+export function getDefaultStreamPreferences(): Pick<Settings, "codec" | "colorQuality" | "fallbackCodec"> {
   const normalized = normalizeStreamPreferences(
     DEFAULT_STREAM_PREFERENCES.codec,
     DEFAULT_STREAM_PREFERENCES.colorQuality,
   );
   return {
     codec: normalized.codec,
+    fallbackCodec: normalizeFallbackCodecPreference(DEFAULT_STREAM_PREFERENCES.fallbackCodec),
     colorQuality: normalized.colorQuality,
   };
 }

@@ -20,6 +20,8 @@ import type {
   ThankYouDataResult,
 } from "@shared/gfn";
 import { exportLogs } from "@shared/logger";
+import type { GpuBackendInfo } from "@shared/gfn";
+import { EMPTY_GPU_BACKEND_INFO, getGpuBackendInfo } from "../gpuInfo";
 import { provisionZortosCommunityProxy } from "../community/provisionSessionProxy";
 import {
   connectDiscordRpc,
@@ -219,6 +221,18 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
 
   ipcMain.handle(IPC_CHANNELS.CLIPBOARD_READ_TEXT, async (): Promise<string> => {
     return clipboard.readText();
+  });
+
+  // GPU process backend detection (chrome://gpu equivalent) for accurate
+  // codec diagnostics labels — replaces platform-guessed backend names.
+  // Cached in main (see getGpuBackendInfo) since GPU info is stable per session.
+  ipcMain.handle(IPC_CHANNELS.GPU_GET_INFO, async (): Promise<GpuBackendInfo> => {
+    try {
+      return await getGpuBackendInfo(app);
+    } catch (err) {
+      console.warn("[Main] Failed to collect GPU backend info:", err);
+      return EMPTY_GPU_BACKEND_INFO;
+    }
   });
 
   ipcMain.handle(
