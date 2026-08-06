@@ -34,6 +34,7 @@ import {
 import {
   buildNvstSdp,
   extractIceCredentials,
+  extractNegotiatedVideoCodec,
   fixServerIp,
   mungeAnswerSdp,
   OFFICIAL_MIN_BITRATE_KBPS,
@@ -363,6 +364,7 @@ export class GfnWebRtcClient {
     connectedGamepads: 0,
     resolution: "",
     codec: "",
+    requestedCodec: "",
     hardwareAcceleration: "Chromium GPU decode",
     colorCodec: "",
     isHdr: false,
@@ -886,6 +888,7 @@ export class GfnWebRtcClient {
       connectedGamepads: 0,
       resolution: "",
       codec: "",
+      requestedCodec: "",
       hardwareAcceleration: "Chromium GPU decode",
       colorCodec: "",
       isHdr: false,
@@ -965,6 +968,7 @@ export class GfnWebRtcClient {
 
     this.diagnostics.resolution = settings.resolution;
     this.diagnostics.codec = codec;
+    this.diagnostics.requestedCodec = codec;
     this.diagnostics.hardwareAcceleration = nativeRendererActive
       ? describeNativeHardwareAcceleration()
       : "Chromium GPU decode";
@@ -1424,6 +1428,7 @@ export class GfnWebRtcClient {
     } else {
       this.diagnostics.hardwareAcceleration = describeNativeHardwareAcceleration();
       this.diagnostics.codec = this.currentCodec || "Native";
+      this.diagnostics.requestedCodec = this.currentCodec || "";
     }
     this.diagnostics.lagReason = "stable";
     this.diagnostics.lagReasonDetail = this.nativeElectronInputBridge
@@ -2367,14 +2372,24 @@ export class GfnWebRtcClient {
       }
     }
 
-    if (supported.length > 0 && !supported.includes(settings.codec)) {
-      this.log(`Warning: ${settings.codec} not reported in browser codec list; forcing requested codec anyway`);
+    const codecSupported = supported.length === 0 || supported.includes(effectiveCodec);
+    if (!codecSupported) {
+      this.log(
+        `Warning: ${effectiveCodec} not reported in browser WebRTC receiver codecs (${supported.join(", ")}); keeping fallback codecs in the offer so the session negotiates a decodable codec instead of rejecting video.`,
+      );
     }
-    this.log(`Effective codec: ${effectiveCodec} (preferred HEVC profile-id=${preferredHevcProfileId})`);
+    this.log(`Effective codec: ${effectiveCodec} (preferred HEVC profile-id=${preferredHevcProfileId}, browser-supported=${codecSupported})`);
     this.applyStreamSettingsDiagnostics(settings, effectiveCodec, false);
     this.emitStats();
     const filteredOffer = preferCodec(processedOffer, effectiveCodec, {
       preferHevcProfileId: preferredHevcProfileId,
+      // Hard-filter to the single requested codec only when the browser can
+      // actually receive it. Otherwise keep the other codecs in the video
+      // m-line (requested one reordered first) so Chromium can fall back to a
+      // decodable codec — with a hard filter the answer rejects the whole
+      // video m-line (port 0, dropped from BUNDLE) and the session hangs on
+      // "Waiting for game video...".
+      keepFallbacks: !codecSupported,
     });
     this.log(`Filtered offer SDP length: ${filteredOffer.length} chars`);
     this.log("Setting remote description (offer)...");
@@ -2399,6 +2414,23 @@ export class GfnWebRtcClient {
     const answer = await pc.createAnswer();
     this.log(`Answer created, SDP length: ${answer.sdp?.length ?? 0} chars`);
 
+    // Detect the codec actually negotiated in the answer. When it differs from
+    // the requested one (codec fallback), surface it in the HUD and align the
+    // NVST SDP so the server encodes exactly what WebRTC negotiated.
+    let negotiatedCodec: VideoCodec | null = null;
+    if (answer.sdp) {
+      negotiatedCodec = extractNegotiatedVideoCodec(answer.sdp);
+      if (negotiatedCodec && negotiatedCodec !== effectiveCodec) {
+        this.log(
+          `Warning: requested codec ${effectiveCodec} was not negotiable on this device; negotiated ${negotiatedCodec} instead. Aligning NVST SDP to ${negotiatedCodec}.`,
+        );
+        this.currentCodec = negotiatedCodec;
+        this.diagnostics.codec = negotiatedCodec;
+        this.emitStats();
+        effectiveCodec = negotiatedCodec;
+      }
+    }
+
     // Munge answer SDP: inject b=AS: bitrate limits and stereo=1 for opus
     if (answer.sdp) {
       answer.sdp = mungeAnswerSdp(answer.sdp, settings.maxBitrateKbps);
@@ -2419,7 +2451,6 @@ export class GfnWebRtcClient {
       const lines = finalSdp.split(/\r?\n/);
       let inVideo = false;
       const negotiatedVideoLines: string[] = [];
-      let hasNegotiatedH265 = false;
       for (const line of lines) {
         if (line.startsWith("m=video")) {
           inVideo = true;
@@ -2431,9 +2462,6 @@ export class GfnWebRtcClient {
         }
         if (inVideo && (line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") || line.startsWith("a=rtcp-fb:"))) {
           negotiatedVideoLines.push(line);
-          if (line.startsWith("a=rtpmap:") && /\sH(?:265|EVC)\//i.test(line)) {
-            hasNegotiatedH265 = true;
-          }
         }
       }
       if (negotiatedVideoLines.length > 0) {
@@ -2443,8 +2471,8 @@ export class GfnWebRtcClient {
         }
       }
 
-      if (effectiveCodec === "H265" && !hasNegotiatedH265) {
-        throw new Error("H265 requested but not negotiated in local SDP (no H265 rtpmap in answer)");
+      if (!negotiatedCodec) {
+        throw new Error("No video codec negotiated in local SDP answer (video m-line rejected)");
       }
     }
 

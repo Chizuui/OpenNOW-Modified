@@ -40,6 +40,10 @@ export function buildVideoAccelerationCommandLine(
         "HardwareAcceleratedVideoDecode",
         "VaapiVideoDecoder",
         "MediaFoundationD3D11VideoCapture",
+        // Allow H265/HEVC WebRTC streams to decode via Media Foundation on
+        // machines whose GPU exposes HEVC (Chromium gates this behind the
+        // feature flag; without it H265 falls back to software or fails).
+        "PlatformHEVCDecoderSupport",
       );
     }
     switches["enable-gpu-rasterization"] = true;

@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Давление входной очереди (буферизованные байты и отложенная очистка)",
       "inputChannelState": "Частично надежное состояние входного канала и байты в очереди",
-      "mouseFlushCadence": "Частота нажатия мыши и скорость передачи пакетов"
+      "mouseFlushCadence": "Частота нажатия мыши и скорость передачи пакетов",
+      "codecFallback": "Запасной вариант: {{requested}}"
     },
     "controls": {
       "antiAfkEnabled": "Анти-AFK включен",
@@ -401,6 +402,14 @@
       "resolution": "Разрешение",
       "fps": "ФПС",
       "codec": "Кодек",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "Не поддерживается",
+      "codecSeeWhy": "Почему?",
+      "codecUnsupportedReason": "Не поддерживается на этом устройстве",
+      "codecAutoHint": "Автоматически выбирать лучший кодек для этого устройства.",
+      "codecManualHint": "Используется при запуске новой сессии стриминга.",
+      "codecMigratedNotice": "{{codec}} не поддерживается на этом устройстве — переключено на Auto.",
+
       "decoder": "Декодер",
       "encoder": "Кодер",
       "colorDepth": "Глубина цвета",

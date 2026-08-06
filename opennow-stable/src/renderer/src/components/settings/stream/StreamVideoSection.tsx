@@ -15,11 +15,12 @@ interface StreamVideoSectionProps {
   handleChange: SettingsChangeHandler;
   handlePreview: SettingsChangeHandler;
   codecResults: CodecTestResult[] | null;
-  codecTesting: boolean;
   entitledResolutions: EntitledResolution[];
   subscriptionInfoLoaded: boolean;
   subscriptionLoading: boolean;
   onBlockingOverlayChange?: (blocking: boolean) => void;
+  /** Reveal the codec diagnostics panel (used by the codec dropdown's "See why"). */
+  onOpenCodecDiagnostics?: () => void;
 }
 
 export function StreamVideoSection({
@@ -28,11 +29,11 @@ export function StreamVideoSection({
   handleChange,
   handlePreview,
   codecResults,
-  codecTesting,
   entitledResolutions,
   subscriptionInfoLoaded,
   subscriptionLoading,
   onBlockingOverlayChange,
+  onOpenCodecDiagnostics,
 }: StreamVideoSectionProps): JSX.Element {
   const { t } = useTranslation();
 
@@ -49,10 +50,10 @@ export function StreamVideoSection({
           handleChange={handleChange}
           handlePreview={handlePreview}
           codecResults={codecResults}
-          codecTesting={codecTesting}
           entitledResolutions={entitledResolutions}
           subscriptionInfoLoaded={subscriptionInfoLoaded}
           subscriptionLoading={subscriptionLoading}
+          onOpenCodecDiagnostics={onOpenCodecDiagnostics}
         />
         <SessionProxySettings
           settings={settings}

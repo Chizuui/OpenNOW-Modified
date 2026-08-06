@@ -10,6 +10,7 @@ export function defaultDiagnostics(): StreamDiagnostics {
     connectedGamepads: 0,
     resolution: "",
     codec: "",
+    requestedCodec: "",
     hardwareAcceleration: "",
     colorCodec: "",
     isHdr: false,

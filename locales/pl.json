@@ -315,7 +315,8 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Ciśnienie w kolejce wejściowej (buforowane bajty i spłukiwanie opóźnione)",
       "inputChannelState": "Częściowo niezawodny stan kanału wejściowego i kolejki bajtów",
-      "mouseFlushCadence": "Częstotliwość odświeżania myszy i częstotliwość pakietów"
+      "mouseFlushCadence": "Częstotliwość odświeżania myszy i częstotliwość pakietów",
+      "codecFallback": "Fallback z {{requested}}"
     },
     "controls": {
       "antiAfkEnabled": "Anty-AFK włączone",
@@ -401,6 +402,14 @@
       "resolution": "Rozdzielczość",
       "fps": "FPS",
       "codec": "Kodek",
+      "codecAutoPick": "Auto ({{codec}})",
+      "codecUnsupported": "Nieobsługiwany",
+      "codecSeeWhy": "Dlaczego?",
+      "codecUnsupportedReason": "Nieobsługiwany na tym urządzeniu",
+      "codecAutoHint": "Automatycznie wybierz najlepszy kodek dla tego urządzenia.",
+      "codecManualHint": "Używane przy uruchamianiu nowej sesji strumieniowania.",
+      "codecMigratedNotice": "{{codec}} nie jest obsługiwany na tym urządzeniu — przełączono na Auto.",
+
       "decoder": "Dekoder",
       "encoder": "Enkoder",
       "colorDepth": "Głębia koloru",

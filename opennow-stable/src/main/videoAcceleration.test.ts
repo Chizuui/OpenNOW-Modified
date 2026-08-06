@@ -3,6 +3,42 @@ import test from "node:test";
 
 import { buildVideoAccelerationCommandLine } from "./videoAcceleration";
 
+test("enables Media Foundation HEVC (H265) decode on Windows hardware/auto decode", () => {
+  const commandLine = buildVideoAccelerationCommandLine(
+    { decoderPreference: "auto", encoderPreference: "auto" },
+    "win32",
+    "x64",
+  );
+
+  assert.ok(commandLine.enableFeatures.includes("PlatformHEVCDecoderSupport"));
+  assert.ok(commandLine.enableFeatures.includes("D3D11VideoDecoder"));
+  assert.ok(commandLine.enableFeatures.includes("HardwareAcceleratedVideoDecode"));
+  assert.equal(commandLine.switches["enable-accelerated-video-decode"], true);
+  assert.equal(commandLine.switches["use-angle"], "d3d11");
+});
+
+test("does not enable PlatformHEVCDecoderSupport when Windows software decode is forced", () => {
+  const commandLine = buildVideoAccelerationCommandLine(
+    { decoderPreference: "software", encoderPreference: "software" },
+    "win32",
+    "x64",
+  );
+
+  assert.equal(commandLine.enableFeatures.includes("PlatformHEVCDecoderSupport"), false);
+  assert.equal(commandLine.enableFeatures.includes("D3D11VideoDecoder"), false);
+  assert.equal(commandLine.switches["disable-accelerated-video-decode"], true);
+});
+
+test("does not enable PlatformHEVCDecoderSupport on Linux", () => {
+  const commandLine = buildVideoAccelerationCommandLine(
+    { decoderPreference: "hardware", encoderPreference: "auto" },
+    "linux",
+    "x64",
+  );
+
+  assert.equal(commandLine.enableFeatures.includes("PlatformHEVCDecoderSupport"), false);
+});
+
 test("enables NVIDIA VA-API Chromium flags for Linux desktop hardware decode", () => {
   const commandLine = buildVideoAccelerationCommandLine(
     { decoderPreference: "hardware", encoderPreference: "auto" },

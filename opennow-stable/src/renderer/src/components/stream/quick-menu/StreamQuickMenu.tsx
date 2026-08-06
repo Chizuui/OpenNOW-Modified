@@ -228,6 +228,7 @@ export function StreamQuickMenu({
                 onStatsPositionChange={onStatsPositionChange}
                 sidebarToggleShortcutDisplay={sidebarToggleShortcutDisplay}
                 controllerSidebarShortcutDisplay={controllerSidebarShortcutDisplay}
+                diagnosticsStore={diagnosticsStore}
               />
             )}
 
