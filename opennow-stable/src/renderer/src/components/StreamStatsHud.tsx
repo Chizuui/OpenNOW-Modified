@@ -143,13 +143,20 @@ export function StreamStatsHud({
     : (stats.nativeRendererActive ? "Native renderer" : "--");
   const codecText = [stats.codec, stats.colorCodec].filter((v) => v && v !== "").join(", ") || "--";
   // True when the live stream negotiated a different codec than the one
-  // requested in settings (e.g. H265 requested but the device can only decode
-  // AV1). Surfacing this makes silent codec fallback visible to the user.
+  // requested in settings (e.g. AV1 requested but it couldn't be negotiated, so
+  // the session fell back to H265). Surfacing this makes silent codec fallback
+  // visible to the user, with a short reason showing both endpoints.
   const codecFellBack = Boolean(
     stats.codec
     && stats.requestedCodec
     && stats.requestedCodec !== stats.codec,
   );
+  const codecFallbackText = codecFellBack
+    ? t("stream.stats.codecFallback", { requested: stats.requestedCodec, negotiated: stats.codec })
+    : "";
+  const codecFallbackShortText = codecFellBack
+    ? t("stream.stats.codecFallbackShort", { requested: stats.requestedCodec, negotiated: stats.codec })
+    : "";
 
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
   const hasPacketLoss = stats.packetLossPercent > 0;
@@ -272,9 +279,16 @@ export function StreamStatsHud({
       {kpiRow}
 
       {mode === "compact" ? (
-        <div className="sv-stats-serverbar" title={regionLabel}>
-          {regionLabel}
-        </div>
+        <>
+          <div className="sv-stats-serverbar" title={regionLabel}>
+            {regionLabel}
+          </div>
+          {codecFellBack && (
+            <div className="sv-stats-serverbar sv-stats-serverbar--codec-fallback" title={codecFallbackText}>
+              {codecFallbackShortText}
+            </div>
+          )}
+        </>
       ) : (
         <div className="sv-stats-full">
           <section className="sv-stats-section">
@@ -310,9 +324,7 @@ export function StreamStatsHud({
               <span>{codecText}</span>
             </div>
             {codecFellBack && (
-              <p className="sv-stats-foot">
-                {t("stream.stats.codecFallback", { requested: stats.requestedCodec })}
-              </p>
+              <p className="sv-stats-foot">{codecFallbackText}</p>
             )}
             <div className="sv-stats-row">
               <span>{t("stream.stats.serverLocation")}</span>

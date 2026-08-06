@@ -88,7 +88,20 @@ export function buildCodecPreferenceList(
     if (mime.toLowerCase() === preferredMime.toLowerCase()) {
       continue;
     }
-    fallbacks.push(...receiverCaps.filter((entry) => mimeOf(entry) === mime.toLowerCase()));
+    const entries = receiverCaps.filter((entry) => mimeOf(entry) === mime.toLowerCase());
+    if (pinnedFallback === "H265" && mime.toLowerCase() === "video/h265" && options.preferredHevcProfileId) {
+      entries.sort((a, b) => {
+        const score = (entry: RTCRtpCodec): number => {
+          const fmtp = (entry.sdpFmtpLine ?? "").toLowerCase();
+          const profile = fmtp.match(/(?:^|;)\s*profile-id=(\d+)/)?.[1];
+          if (profile === String(options.preferredHevcProfileId)) return 0;
+          if (!profile) return 1;
+          return 2;
+        };
+        return score(a) - score(b);
+      });
+    }
+    fallbacks.push(...entries);
   }
 
   return [...preferred, ...fallbacks, ...auxiliary];

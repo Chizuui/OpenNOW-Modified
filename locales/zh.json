@@ -316,7 +316,8 @@
       "inputQueuePressure": "输入队列压力（缓冲字节和延迟刷新）",
       "inputChannelState": "部分可靠的输入通道状态和排队字节",
       "mouseFlushCadence": "鼠标刷新节奏和数据包速率",
-      "codecFallback": "从 {{requested}} 回退"
+      "codecFallback": "无法协商 {{requested}} → {{negotiated}}",
+      "codecFallbackShort": "{{requested}} → {{negotiated}}"
     },
     "controls": {
       "antiAfkEnabled": "防AFK已启用",
@@ -408,10 +409,9 @@
       "codecUnsupportedReason": "此设备不支持",
       "codecAutoHint": "自动为此设备选择最佳编解码器。",
       "codecManualHint": "启动新的串流会话时使用。",
-      "fallbackCodec": "\u5907\u7528\u7f16\u89e3\u7801\u5668",
-      "fallbackCodecHint": "\u5f53\u6240\u9009\u7f16\u89e3\u7801\u5668\u65e0\u6cd5\u534f\u5546\u65f6\u4f7f\u7528\u3002\u81ea\u52a8\u4f1a\u4fdd\u7559\u6240\u6709\u53d7\u652f\u6301\u7684\u7f16\u89e3\u7801\u5668\u4f5c\u4e3a\u5907\u7528\u3002",
+      "fallbackCodec": "备用编解码器",
+      "fallbackCodecHint": "当所选编解码器无法协商时使用。自动会保留所有受支持的编解码器作为备用。",
       "codecMigratedNotice": "此设备不支持{{codec}}，已自动切换为 Auto。",
-
       "decoder": "解码器",
       "encoder": "编码器",
       "colorDepth": "颜色深度",
@@ -441,7 +441,7 @@
       "quickSyncHint": "尽管 GPU 解码正常，H.264 仍在 CPU 上编码 — 硬件编码器（Intel iGPU 上的 Intel Quick Sync）未注册。请安装 GPU 厂商的完整显卡驱动程序以启用硬件编码。",
       "backendExplainTitle": "为什么 ENCODE 和 DECODE 使用不同的后端？",
       "backendExplainBody": "在 Windows 上，Chromium 使用两种不同的媒体栈：硬件视频 DECODE 通过 D3D11（DXVA/D3D11VA）运行，而硬件视频 ENCODE 通过 Media Foundation（MFT）运行。因此同一编解码器可能在不同方向显示不同的后端。编码不用于云游戏流媒体播放 — 您的 PC 只接收并解码视频流，因此只有 DECODE 行会影响流媒体播放质量。",
-      "gpuDriverLine": "{{gpu}} \u00b7 \u9a71\u52a8\u7a0b\u5e8f {{version}}"
+      "gpuDriverLine": "{{gpu}} · 驱动程序 {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "最兼容",

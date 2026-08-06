@@ -151,6 +151,30 @@ test("preferCodec keepFallbacks orders a user-pinned fallback codec right after 
   assert.match(filtered, /a=fmtp:99 apt=98/);
 });
 
+test("preferCodec orders pinned H265 fallback payloads by the preferred profile-id", () => {
+  const sdp = [
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 98 99 100 101",
+    "a=rtpmap:96 AV1/90000",
+    "a=rtpmap:98 H265/90000",
+    "a=fmtp:98 profile-id=2;tier-flag=1;level-id=186",
+    "a=rtpmap:99 rtx/90000",
+    "a=fmtp:99 apt=98",
+    "a=rtpmap:100 H265/90000",
+    "a=fmtp:100 profile-id=1;tier-flag=1;level-id=186",
+    "a=rtpmap:101 rtx/90000",
+    "a=fmtp:101 apt=100",
+  ].join("\n");
+
+  const filtered = preferCodec(sdp, "AV1", {
+    keepFallbacks: true,
+    fallbackCodec: "H265",
+    preferHevcProfileId: 1,
+  });
+
+  // AV1 first, then the profile-id=1 H265 payload (100) before profile-id=2 (98).
+  assert.match(filtered, /m=video 9 UDP\/TLS\/RTP\/SAVPF 96 100 98 99 101/);
+});
+
 test("preferCodec ignores a fallback equal to the preferred codec", () => {
   const sdp = [
     "m=video 9 UDP/TLS/RTP/SAVPF 96 100",

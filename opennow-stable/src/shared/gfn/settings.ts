@@ -243,8 +243,12 @@ export function createDefaultSettings(platform: string): Settings {
     maxBitrateMbps: 75,
     jitterBufferMode: "balanced",
     recordingBitrateMbps: null,
-    recordingResolution: "1080p",
-    recordingFps: 60,
+    // Safe defaults matching the canvas recorder's low-encode budget: MediaRecorder
+    // encodes on the same main thread as the WebRTC decoder, so 720p30 is the
+    // default that avoids dropping stream FPS on weak machines. Users can raise
+    // resolution/FPS explicitly (settings or in-game Media tab) at their own cost.
+    recordingResolution: "720p",
+    recordingFps: 30,
     streamClientMode: "web",
     nativeStreamerBackend: "gstreamer",
     nativeVideoBackend: "auto",

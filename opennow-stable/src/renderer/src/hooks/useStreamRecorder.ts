@@ -3,12 +3,20 @@ import type { RefObject } from "react";
 import type { RecordingEntry } from "@shared/gfn";
 import { fitThumbnailSize, selectRecordingMimeType } from "../components/stream/streamRuntimeHelpers";
 
-// Record at ≤720p / 60fps via canvas downscale to keep MediaRecorder encode cost
-// low (it shares the main thread with the WebRTC decoder). GFN uses a GPU encoder
-// off-pipeline; this is the closest the web client can get without new tooling.
-const RECORD_CAP_WIDTH = 1280;
-const RECORD_CAP_HEIGHT = 720;
-const RECORD_CAP_FPS = 30;
+// Record via canvas downscale to keep MediaRecorder encode cost low (it shares
+// the main thread with the WebRTC decoder). GFN uses a GPU encoder off-pipeline;
+// this is the closest the web client can get without new tooling. The cap
+// resolution/FPS are user-selectable via settings (recordingResolution /
+// recordingFps) and default to 720p30.
+const DEFAULT_RECORD_CAP_WIDTH = 1280;
+const DEFAULT_RECORD_CAP_HEIGHT = 720;
+const DEFAULT_RECORD_CAP_FPS = 30;
+
+const RECORD_CAP_BY_RESOLUTION: Record<string, { width: number; height: number }> = {
+  "1440p": { width: 2560, height: 1440 },
+  "1080p": { width: 1920, height: 1080 },
+  "720p": { width: 1280, height: 720 },
+};
 
 interface UseStreamRecorderOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -16,6 +24,8 @@ interface UseStreamRecorderOptions {
   gameTitle: string;
   micTrack: MediaStreamTrack | null;
   recordingBitrateMbps: number | null;
+  recordingResolution: string;
+  recordingFps: number;
 }
 
 export function useStreamRecorder({
@@ -24,6 +34,8 @@ export function useStreamRecorder({
   gameTitle,
   micTrack,
   recordingBitrateMbps,
+  recordingResolution,
+  recordingFps,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [recordings, setRecordings] = useState<RecordingEntry[]>([]);
@@ -126,18 +138,24 @@ export function useStreamRecorder({
       audioCtx.createMediaStreamSource(micStream).connect(audioDest);
     }
 
-    // Record via a canvas downscale (720p@60) instead of re-encoding the raw
-    // 1080p60 stream track. MediaRecorder encodes on the same main thread as the
+    // Record via a canvas downscale (720p30 by default) instead of re-encoding
+    // the raw stream track. MediaRecorder encodes on the same main thread as the
     // WebRTC decoder, so full-res re-encode starves the CPU and makes the stream
     // stutter — and in severe cases drops ICE back to the home screen. Capping
     // pixels keeps encode cost low (GFN-native uses a GPU H.264 encoder off the
-    // frame pipeline; the web client can't, so this is the closest parity).
+    // frame pipeline; the web client can't, so this is the closest parity). The
+    // cap follows the user's recordingResolution/recordingFps settings.
+    const recordCap = RECORD_CAP_BY_RESOLUTION[recordingResolution]
+      ?? { width: DEFAULT_RECORD_CAP_WIDTH, height: DEFAULT_RECORD_CAP_HEIGHT };
+    const recordFps = Number.isFinite(recordingFps) && recordingFps > 0
+      ? Math.min(60, Math.round(recordingFps))
+      : DEFAULT_RECORD_CAP_FPS;
     let recordVideoTrack: MediaStreamTrack | null = null;
     if (video.videoWidth > 0 && video.videoHeight > 0) {
       const scale = Math.min(
         1,
-        RECORD_CAP_WIDTH / video.videoWidth,
-        RECORD_CAP_HEIGHT / video.videoHeight,
+        recordCap.width / video.videoWidth,
+        recordCap.height / video.videoHeight,
       );
       const capWidth = Math.max(1, Math.round(video.videoWidth * scale));
       const capHeight = Math.max(1, Math.round(video.videoHeight * scale));
@@ -145,7 +163,7 @@ export function useStreamRecorder({
       cap.width = capWidth;
       cap.height = capHeight;
       const capCtx = cap.getContext("2d");
-      const capStream = cap.captureStream(RECORD_CAP_FPS);
+      const capStream = cap.captureStream(recordFps);
       recordVideoTrack = capStream.getVideoTracks()[0];
       if (recordVideoTrack) {
         recordVideoTrack.contentHint = "detail";
@@ -162,7 +180,7 @@ export function useStreamRecorder({
         if (!capCtx || video.videoWidth === 0 || video.readyState < 2) {
           return;
         }
-        if (now - lastDrawMs >= 1000 / RECORD_CAP_FPS) {
+        if (now - lastDrawMs >= 1000 / recordFps) {
           lastDrawMs = now;
           capCtx.drawImage(video, 0, 0, capWidth, capHeight);
         }
@@ -314,6 +332,8 @@ export function useStreamRecorder({
     micTrack,
     recordingApiAvailable,
     recordingBitrateMbps,
+    recordingFps,
+    recordingResolution,
     videoRef,
   ]);
 

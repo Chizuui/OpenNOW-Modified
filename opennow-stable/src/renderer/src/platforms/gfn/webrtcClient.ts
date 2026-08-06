@@ -2315,10 +2315,19 @@ export class GfnWebRtcClient {
 
     // 3. Filter to preferred codec — but only if the browser actually supports it
     let effectiveCodec = settings.codec;
+    // User-pinned fallback codec (web mode): "auto" keeps every GFN primary
+    // as a fallback; a concrete value is ordered first among them so it wins
+    // whenever the primary codec cannot be negotiated on this server. Computed
+    // up front because the HEVC compatibility rewrites below must also run when
+    // H265 is only the fallback — otherwise the server's H265 payloads keep
+    // level/tier flags this device can't decode and createAnswer skips them.
+    const fallbackVideoCodec = settings.fallbackCodec && settings.fallbackCodec !== "auto"
+      ? settings.fallbackCodec
+      : undefined;
     const supported = this.getSupportedVideoCodecs();
     this.log(`Browser supported video codecs: ${supported.join(", ") || "unknown"}`);
 
-    if (settings.codec === "H265") {
+    if (settings.codec === "H265" || fallbackVideoCodec === "H265") {
       const hevcProfiles = this.getSupportedHevcProfiles();
       if (hevcProfiles.size > 0) {
         this.log(`Browser HEVC profile-id support: ${Array.from(hevcProfiles).join(", ")}`);
@@ -2351,7 +2360,7 @@ export class GfnWebRtcClient {
       }
       if (hevcProfiles.size > 0 && !hevcProfiles.has(String(preferredHevcProfileId))) {
         this.log(
-          `Warning: requested H265 profile-id=${preferredHevcProfileId} not reported in browser capabilities; forcing H265 anyway per user preference`,
+          `Warning: H265 profile-id=${preferredHevcProfileId} (primary or fallback) not reported in browser capabilities; keeping H265 payloads in the offer anyway`,
         );
       }
     }
@@ -2363,12 +2372,6 @@ export class GfnWebRtcClient {
       );
     }
     this.log(`Effective codec: ${effectiveCodec} (preferred HEVC profile-id=${preferredHevcProfileId}, browser-supported=${codecSupported})`);
-    // User-pinned fallback codec (web mode): "auto" keeps every GFN primary
-    // as a fallback; a concrete value is ordered first among them so it wins
-    // whenever the primary codec cannot be negotiated on this server.
-    const fallbackVideoCodec = settings.fallbackCodec && settings.fallbackCodec !== "auto"
-      ? settings.fallbackCodec
-      : undefined;
     if (fallbackVideoCodec) {
       this.log(
         `Fallback codec preference: ${fallbackVideoCodec} will be preferred if ${effectiveCodec} is not negotiable`,

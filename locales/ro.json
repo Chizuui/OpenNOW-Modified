@@ -315,7 +315,9 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Presiunea cozii de intrare (octeți tamponați și spălare întârziată)",
       "inputChannelState": "Starea canalului de intrare parțial fiabilă și octeții în coadă",
-      "mouseFlushCadence": "Cadena de spălare a mouse-ului și rata de pachete"
+      "mouseFlushCadence": "Cadena de spălare a mouse-ului și rata de pachete",
+      "codecFallback": "{{requested}} nu a putut fi negociat → {{negotiated}}",
+      "codecFallbackShort": "{{requested}} → {{negotiated}}"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK este activat",
@@ -407,10 +409,9 @@
       "codecUnsupportedReason": "Nesuportat pe acest dispozitiv",
       "codecAutoHint": "Alege automat cel mai bun codec pentru acest dispozitiv.",
       "codecManualHint": "Folosit la pornirea unei noi sesiuni de streaming.",
-      "fallbackCodec": "Codec de rezerv\u0103",
-      "fallbackCodecHint": "Folosit c\u00e2nd codecul selectat nu poate fi negociat. Auto p\u0103streaz\u0103 toate codecurile acceptate ca rezerv\u0103.",
+      "fallbackCodec": "Codec de rezervă",
+      "fallbackCodecHint": "Folosit când codecul selectat nu poate fi negociat. Auto păstrează toate codecurile acceptate ca rezervă.",
       "codecMigratedNotice": "{{codec}} nu este acceptat pe acest dispozitiv — s-a comutat pe Auto.",
-
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decodor",
       "encoder": "Codificator",
@@ -441,7 +442,7 @@
       "quickSyncHint": "H.264 este codificat pe CPU chiar dacă decodarea GPU funcționează — encoderul hardware (Intel Quick Sync pe iGPU-urile Intel) nu este înregistrat. Instalați driverul grafic complet de la producătorul GPU pentru a activa codificarea hardware.",
       "backendExplainTitle": "De ce folosesc ENCODE și DECODE backend-uri diferite?",
       "backendExplainBody": "Pe Windows, Chromium folosește două stive media diferite: DECODE-ul video hardware rulează prin D3D11 (DXVA/D3D11VA), în timp ce ENCODE-ul video hardware rulează prin Media Foundation (MFT). De aceea același codec poate afișa backend-uri diferite pentru fiecare direcție. Codificarea nu este folosită în streamingul de jocuri cloud — PC-ul tău doar primește și decodează fluxul video, deci doar rândul DECODE afectează calitatea streamului.",
-      "gpuDriverLine": "{{gpu}} \u00b7 driver {{version}}"
+      "gpuDriverLine": "{{gpu}} · driver {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Cel mai compatibil",

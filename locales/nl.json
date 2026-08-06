@@ -315,7 +315,9 @@
       "timeRemainingShort": "Left",
       "inputQueuePressure": "Invoerwachtrijdruk (gebufferde bytes en vertraagde flush)",
       "inputChannelState": "Gedeeltelijk betrouwbare status van het ingangskanaal en bytes in de wachtrij",
-      "mouseFlushCadence": "Muisspoelcadans en pakketsnelheid"
+      "mouseFlushCadence": "Muisspoelcadans en pakketsnelheid",
+      "codecFallback": "{{requested}} kon niet worden onderhandeld → {{negotiated}}",
+      "codecFallbackShort": "{{requested}} → {{negotiated}}"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK is ingeschakeld",
@@ -410,7 +412,6 @@
       "fallbackCodec": "Fallback-codec",
       "fallbackCodecHint": "Wordt gebruikt wanneer de geselecteerde codec niet kan worden onderhandeld. Auto houdt elke ondersteunde codec als fallback.",
       "codecMigratedNotice": "{{codec}} wordt niet ondersteund op dit apparaat — omgeschakeld naar Auto.",
-
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decoder",
       "encoder": "Encoder",
@@ -441,7 +442,7 @@
       "quickSyncHint": "H.264 wordt op de CPU gecodeerd terwijl GPU-decodering werkt — de hardware-encoder (Intel Quick Sync op Intel iGPU's) is niet geregistreerd. Installeer de volledige grafische driver van uw GPU-leverancier om hardwarecodering in te schakelen.",
       "backendExplainTitle": "Waarom gebruiken ENCODE en DECODE verschillende backends?",
       "backendExplainBody": "Onder Windows gebruikt Chromium twee verschillende mediastacks: hardware-video-DECODE draait via D3D11 (DXVA/D3D11VA), terwijl hardware-video-ENCODE via Media Foundation (MFT) draait. Daarom kan dezelfde codec voor elke richting een ander backend tonen. Encoderen wordt niet gebruikt bij cloud-gaming-streaming — je pc ontvangt de videostream alleen en decodeert deze, dus alleen de DECODE-rij beïnvloedt de streamkwaliteit.",
-      "gpuDriverLine": "{{gpu}} \u00b7 stuurprogramma {{version}}"
+      "gpuDriverLine": "{{gpu}} · stuurprogramma {{version}}"
     },
     "colorQuality": {
       "mostCompatible": "Meest compatibel",

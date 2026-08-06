@@ -7918,6 +7918,15 @@ button.game-card-store-chip.owned.active:hover {
   text-overflow: ellipsis;
 }
 
+/* Compact HUD: codec fell back from the requested one (e.g. AV1 → H265).
+   Sits under the server bar so the codec switch is visible at a glance. */
+.sv-stats-serverbar--codec-fallback {
+  margin-top: 4px;
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: color-mix(in srgb, var(--warning) 78%, #fff);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+}
+
 /* Full: Network + Stream sections */
 .sv-stats-full {
   display: flex;

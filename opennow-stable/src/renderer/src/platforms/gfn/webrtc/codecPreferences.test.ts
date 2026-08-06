@@ -98,6 +98,32 @@ test("user-pinned fallback codec is ordered first among fallbacks", () => {
   ]);
 });
 
+test("pinned H265 fallback entries are ordered by the preferred profile-id", () => {
+  const caps = [
+    codec("video/H264"),
+    codec("video/H265", "profile-id=2;level-id=186"),
+    codec("video/H265", "profile-id=1;level-id=186"),
+    codec("video/AV1"),
+    codec("video/rtx", "apt=100"),
+  ];
+  const list = buildCodecPreferenceList(caps, "AV1", {
+    keepFallbacks: true,
+    fallbackCodec: "H265",
+    preferredHevcProfileId: 1,
+  });
+  // Requested AV1 first, then profile-id=1 H265 before profile-id=2, then H264, then aux.
+  assert.deepEqual(
+    list.map((entry) => `${entry.mimeType.toLowerCase()}|${entry.sdpFmtpLine ?? ""}`),
+    [
+      "video/av1|",
+      "video/h265|profile-id=1;level-id=186",
+      "video/h265|profile-id=2;level-id=186",
+      "video/h264|",
+      "video/rtx|apt=100",
+    ],
+  );
+});
+
 test("pinned fallback equal to the requested codec keeps the default order", () => {
   const caps = [
     codec("video/H264"),

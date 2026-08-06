@@ -61,6 +61,11 @@ interface StreamQuickMenuProps {
   screenshotGallery: ReturnType<typeof useScreenshotGallery>;
   streamRecorder: ReturnType<typeof useStreamRecorder>;
   recordingBitrateMbps: number | null;
+  recordingResolution: string;
+  recordingFps: number;
+  onRecordingResolutionChange: (value: string) => void;
+  onRecordingFpsChange: (value: number) => void;
+  onRecordingBitrateMbpsChange: (value: number | null) => void;
   maxBitrateMbps: number;
   onMaxBitrateMbpsChange: (value: number) => void;
 }
@@ -108,6 +113,11 @@ export function StreamQuickMenu({
   screenshotGallery,
   streamRecorder,
   recordingBitrateMbps,
+  recordingResolution,
+  recordingFps,
+  onRecordingResolutionChange,
+  onRecordingFpsChange,
+  onRecordingBitrateMbpsChange,
   maxBitrateMbps,
   onMaxBitrateMbpsChange,
 }: StreamQuickMenuProps): JSX.Element {
@@ -270,6 +280,11 @@ export function StreamQuickMenu({
                 recordingApiAvailable={streamRecorder.recordingApiAvailable}
                 usedMimeType={streamRecorder.usedMimeType}
                 recordingBitrateMbps={recordingBitrateMbps}
+                recordingResolution={recordingResolution}
+                recordingFps={recordingFps}
+                onRecordingResolutionChange={onRecordingResolutionChange}
+                onRecordingFpsChange={onRecordingFpsChange}
+                onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
                 recCarouselRef={streamRecorder.recCarouselRef}
                 onToggleRecording={() => { void streamRecorder.toggleRecording(); }}
                 onDeleteRecording={(id) => { void streamRecorder.deleteRecording(id); }}
