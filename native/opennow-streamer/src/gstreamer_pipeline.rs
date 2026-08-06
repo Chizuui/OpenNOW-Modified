@@ -2055,6 +2055,14 @@ fn should_prefer_d3d12_for_high_fps(requested_fps: Option<u32>) -> bool {
     requested_fps.is_some_and(|fps| fps >= 200)
 }
 
+/// Whether the native streamer can build a complete RTP decode chain for this
+/// codec on this device (depayloader + parser + decoder + sink all present).
+/// Used by offer preparation to decide whether the requested codec can be
+/// safely hard-filtered, or whether fallback codecs must be kept in the offer.
+pub(crate) fn can_decode_rtp_codec(codec: &str) -> bool {
+    rtp_video_chain_specs(codec, None).is_some()
+}
+
 fn rtp_video_chain_specs(
     encoding: &str,
     requested_fps: Option<u32>,

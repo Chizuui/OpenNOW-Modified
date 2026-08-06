@@ -39,6 +39,19 @@ pub struct NvstParams {
 #[derive(Debug, Clone, Copy)]
 pub struct PreferCodecOptions {
     pub prefer_hevc_profile_id: Option<u8>,
+    /// Soft filtering: keep every payload type in the video m-line and only
+    /// reorder so the preferred codec comes first. When false (default) the
+    /// m-line is stripped down to the preferred codec (+ its RTX / FEC).
+    ///
+    /// Soft mode is required when the requested codec may not be negotiable on
+    /// this device: with a hard filter the answer would reject the whole video
+    /// m-line (port 0, dropped from the BUNDLE group) and the session hangs on
+    /// "Waiting for game video..." instead of falling back to a codec the
+    /// decoder can actually handle. The native pipeline already follows the
+    /// negotiated codec (decode chain from RTP pad caps + NVST SDP rebuild),
+    /// and per RFC 3264 the answerer picks the first payload type it supports
+    /// in offer order — so the requested codec still wins when it is available.
+    pub keep_fallbacks: bool,
 }
 
 pub fn parse_resolution(value: &str) -> Option<(u32, u32)> {
@@ -545,6 +558,17 @@ pub fn prefer_codec(sdp: &str, codec: VideoCodec, options: PreferCodecOptions) -
         }
     }
 
+    // Soft filtering: keep every payload type so webrtcbin can fall back to a
+    // decodable codec when the requested one cannot be negotiated. Primary
+    // codecs stay present, so the intersection can never collapse to FEC-only.
+    if options.keep_fallbacks {
+        for pts in payload_types_by_codec.values() {
+            for pt in pts {
+                allowed.insert(pt.clone());
+            }
+        }
+    }
+
     let mut filtered = Vec::new();
     in_video_section = false;
 
@@ -553,12 +577,16 @@ pub fn prefer_codec(sdp: &str, codec: VideoCodec, options: PreferCodecOptions) -
             in_video_section = true;
             let parts: Vec<&str> = line.split_whitespace().collect();
             let header = &parts[..parts.len().min(3)];
-            let available: Vec<&str> = parts
-                .iter()
-                .skip(3)
-                .copied()
-                .filter(|pt| allowed.contains(*pt))
-                .collect();
+            let available: Vec<&str> = if options.keep_fallbacks {
+                parts.iter().skip(3).copied().collect()
+            } else {
+                parts
+                    .iter()
+                    .skip(3)
+                    .copied()
+                    .filter(|pt| allowed.contains(*pt))
+                    .collect()
+            };
             let mut ordered = Vec::new();
 
             for pt in &ordered_preferred_payloads {
@@ -596,6 +624,12 @@ pub fn prefer_codec(sdp: &str, codec: VideoCodec, options: PreferCodecOptions) -
                 || line.starts_with("a=fmtp:")
                 || line.starts_with("a=rtcp-fb:"))
         {
+            if options.keep_fallbacks {
+                // Soft mode: every payload remains in the m-line, so keep every
+                // associated attribute untouched.
+                filtered.push(line.to_owned());
+                continue;
+            }
             let rest = line
                 .split_once(':')
                 .map(|(_, rest)| rest)
@@ -1323,6 +1357,7 @@ mod tests {
             VideoCodec::H265,
             PreferCodecOptions {
                 prefer_hevc_profile_id: Some(1),
+                keep_fallbacks: false,
             },
         );
         assert!(filtered.contains("m=video 9 UDP/TLS/RTP/SAVPF 98 99 101"));
@@ -1330,6 +1365,65 @@ mod tests {
         assert!(filtered.contains("a=rtpmap:99 rtx/90000"));
         assert!(filtered.contains("a=rtpmap:101 flexfec-03/90000"));
         assert!(filtered.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111"));
+    }
+
+    #[test]
+    fn keeps_fallback_codecs_when_requested_codec_may_be_undecodable() {
+        let sdp = [
+            "v=0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101",
+            "a=rtpmap:96 H264/90000",
+            "a=rtpmap:97 rtx/90000",
+            "a=fmtp:97 apt=96",
+            "a=rtpmap:98 H265/90000",
+            "a=fmtp:98 profile-id=1;level-id=186",
+            "a=rtpmap:99 rtx/90000",
+            "a=fmtp:99 apt=98",
+            "a=rtpmap:100 AV1/90000",
+            "a=rtpmap:101 flexfec-03/90000",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        ]
+        .join("\n");
+
+        let filtered = prefer_codec(
+            &sdp,
+            VideoCodec::AV1,
+            PreferCodecOptions {
+                prefer_hevc_profile_id: None,
+                keep_fallbacks: true,
+            },
+        );
+
+        // AV1 payload reorders to the front; every other codec stays in the
+        // m-line so webrtcbin can fall back to a decodable codec.
+        assert!(filtered.contains("m=video 9 UDP/TLS/RTP/SAVPF 100 96 97 98 99 101"));
+        assert!(filtered.contains("a=rtpmap:96 H264/90000"));
+        assert!(filtered.contains("a=rtpmap:98 H265/90000"));
+        assert!(filtered.contains("a=rtpmap:100 AV1/90000"));
+        assert!(filtered.contains("a=rtpmap:101 flexfec-03/90000"));
+        assert!(filtered.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111"));
+    }
+
+    #[test]
+    fn keeps_strict_single_codec_filter_by_default() {
+        let sdp = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 100",
+            "a=rtpmap:96 H264/90000",
+            "a=rtpmap:100 AV1/90000",
+        ]
+        .join("\n");
+
+        let filtered = prefer_codec(
+            &sdp,
+            VideoCodec::AV1,
+            PreferCodecOptions {
+                prefer_hevc_profile_id: None,
+                keep_fallbacks: false,
+            },
+        );
+
+        assert!(filtered.contains("m=video 9 UDP/TLS/RTP/SAVPF 100"));
+        assert!(!filtered.contains("a=rtpmap:96 H264/90000"));
     }
 
     #[test]
