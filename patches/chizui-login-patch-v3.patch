@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Chizuui <desckun@gmail.com>
-Date: Thu, 06 Aug 2026 03:30:00 +0000
-Subject: [PATCH] feat: chizui-login v3 with M3 login polish
+Date: Thu, 06 Aug 2026 04:10:00 +0000
+Subject: [PATCH] feat: chizui-login v3 with full M3 login polish
 
 diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
 index 441dfa93..73c2f8a9 100644
@@ -170,7 +170,7 @@ index b2aa18e2..1f5c222d 100644
  
  data class DeviceLoginPrompt(
 diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
-index ec5ede41..34423561 100644
+index ec5ede41..3814b3b8 100644
 --- a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
 +++ b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowScreens.kt
 @@ -1329,9 +1329,9 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
@@ -240,6 +240,142 @@ index ec5ede41..34423561 100644
                  }
              }
          }
+@@ -1443,10 +1454,10 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+     if (state.loginToolsVisible) {
+         AlertDialog(
+             onDismissRequest = viewModel::dismissLoginTools,
+-            title = { Text("Sign-in tools") },
++            title = { Text(stringResource(R.string.login_tools_title)) },
+             text = {
+                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+-                    Text("Use a token to sign in without the browser, or export diagnostics before signing in.")
++                    Text(stringResource(R.string.login_tools_description))
+                     Button(
+                         onClick = {
+                             viewModel.dismissLoginTools()
+@@ -1455,7 +1466,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                         enabled = !normalLoginBusy,
+                         modifier = Modifier.fillMaxWidth(),
+                     ) {
+-                        Text("Sign in with token")
++                        Text(stringResource(R.string.login_with_token))
+                     }
+                     OutlinedButton(
+                         onClick = {
+@@ -1469,7 +1480,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                         },
+                         modifier = Modifier.fillMaxWidth(),
+                     ) {
+-                        Text(if (tvLogin) "Export logs with QR" else "Export logs")
++                        Text(if (tvLogin) stringResource(R.string.login_logs_export_qr) else stringResource(R.string.settings_logs_export))
+                     }
+                 }
+             },
+@@ -1494,15 +1505,15 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                 tokenInput = ""
+                 tokenDialogVisible = false
+             },
+-            title = { Text("Sign in with token") },
++            title = { Text(stringResource(R.string.login_token_title)) },
+             text = {
+                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+-                    Text("Paste an NVIDIA access token or token-response JSON. OpenNOW verifies the access token before saving the account.")
++                    Text(stringResource(R.string.login_token_description))
+                     OutlinedTextField(
+                         value = tokenInput,
+                         onValueChange = { tokenInput = it },
+                         modifier = Modifier.fillMaxWidth(),
+-                        label = { Text("Access token") },
++                        label = { Text(stringResource(R.string.login_token_label)) },
+                         minLines = 3,
+                         maxLines = 6,
+                         visualTransformation = PasswordVisualTransformation(),
+@@ -1516,7 +1527,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                         singleLine = false,
+                     )
+                     Text(
+-                        "Only use credentials for an account you control.",
++                        stringResource(R.string.login_token_warning),
+                         color = TextMuted,
+                         style = MaterialTheme.typography.bodySmall,
+                     )
+@@ -1527,7 +1538,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
+                     onClick = submitToken,
+                     enabled = tokenInput.isNotBlank() && !normalLoginBusy,
+                 ) {
+-                    Text("Sign in")
++                    Text(stringResource(R.string.login_sign_in))
+                 }
+             },
+             dismissButton = {
+@@ -1565,7 +1576,7 @@ private fun TvPhoneSignInConnector(
+             enabled = !connector.busy,
+             modifier = modifier,
+         ) {
+-            Text(if (connector.busy) "Starting phone pairing…" else "Sign in from OpenNOW on phone")
++            Text(if (connector.busy) stringResource(R.string.login_pair_starting) else stringResource(R.string.login_pair_start))
+         }
+     } else {
+         val qrCode = remember(connector.pairUri) { connector.pairUri?.let(QrCode::encodeText) }
+@@ -1603,16 +1614,16 @@ private fun TvPhoneSignInConnector(
+                     }
+                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (dedicated) 10.dp else 8.dp)) {
+                         Text(
+-                            if (connector.pairedDeviceName == null) "Pair your phone" else "Phone connected",
++                            if (connector.pairedDeviceName == null) stringResource(R.string.login_pair_title) else stringResource(R.string.login_pair_connected),
+                             color = TextPrimary,
+                             style = if (dedicated) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleMedium,
+                             fontWeight = FontWeight.Bold,
+                         )
+                         Text(
+                             if (connector.pairedDeviceName == null) {
+-                                "Your TV and phone must be on the same Wi-Fi. Scan the QR code with your phone camera; the pairing code expires after five minutes."
++                                stringResource(R.string.login_pair_body)
+                             } else {
+-                                "${connector.pairedDeviceName} can launch games. Approve trust below for settings, overlays, sessions, and account switching."
++                                stringResource(R.string.login_pair_connected_body, connector.pairedDeviceName)
+                             },
+                             color = TextMuted,
+                             style = if (dedicated) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+@@ -1624,13 +1635,13 @@ private fun TvPhoneSignInConnector(
+                         }
+                         if (connector.pairedDeviceName != null) {
+                             SettingSwitch(
+-                                label = "Trust this phone",
++                                label = stringResource(R.string.login_pair_trust_label),
+                                 checked = connector.pairedDeviceTrusted,
+-                                description = "Required before the phone can transfer an account or control TV settings and sessions.",
++                                description = stringResource(R.string.login_pair_trust_description),
+                             ) { trusted -> viewModel.setLocalTvDeviceTrusted(trusted) }
+                         }
+                         OutlinedButton(onClick = viewModel::stopLocalTvConnector) {
+-                            Text(if (connector.pairedDeviceName == null) "Cancel pairing" else "Disconnect phone")
++                            Text(if (connector.pairedDeviceName == null) stringResource(R.string.login_pair_cancel) else stringResource(R.string.login_pair_disconnect))
+                         }
+                     }
+                 }
+@@ -1644,7 +1655,7 @@ private fun TvPhoneSignInConnector(
+ private fun PairingCodeDisplay(code: String?, compact: Boolean) {
+     val digits = code?.takeIf { it.length == 4 && it.all(Char::isDigit) } ?: "----"
+     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+-        Text("PAIRING CODE", color = TextMuted, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
++        Text(stringResource(R.string.login_pair_code), color = TextMuted, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+         Row(horizontalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 8.dp)) {
+             digits.forEach { digit ->
+                 Surface(
+@@ -1835,10 +1846,10 @@ private fun DeviceLoginControls(
+             onClick = {
+                 val opened = openExternalUrl(context, launchUrl)
+                 if (opened) {
+-                    onUrlActionMessage("Opening sign-in URL")
++                    onUrlActionMessage(context.getString(R.string.login_url_opening))
+                 } else {
+                     clipboardManager.setText(AnnotatedString(launchUrl))
+-                    onUrlActionMessage("URL copied")
++                    onUrlActionMessage(context.getString(R.string.login_url_copied))
+                 }
+             },
+             modifier = if (focusCancel) Modifier else Modifier.focusRequester(focusRequester),
 diff --git a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt b/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt
 index eb81d825..46d580d6 100644
 --- a/android/app/src/main/java/com/opencloudgaming/opennow/OpenNowSettingsPanels.kt
@@ -461,7 +597,7 @@ index 5b8a7a39..43efb240 100644
  
  class AuthStore(context: Context) {
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index 05775b2f..805ddf5d 100644
+index 05775b2f..cb4d4944 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
 @@ -1,6 +1,7 @@
@@ -473,7 +609,7 @@ index 05775b2f..805ddf5d 100644
      <string name="status_starting_opennow">Starting OpenNOW</string>
      <string name="login_with_provider">Sign in with %1$s</string>
      <string name="login_tv_start">Sign in on another device with %1$s</string>
-@@ -8,6 +9,11 @@
+@@ -8,6 +9,34 @@
      <string name="login_tv_status">%1$s</string>
      <string name="login_tv_waiting">Waiting for sign-in</string>
      <string name="login_tv_expires">Code expires in %1$d:%2$02d</string>
@@ -482,6 +618,29 @@ index 05775b2f..805ddf5d 100644
 +    <string name="login_use_code">Use code sign-in</string>
 +    <string name="login_logs_exported">Logs exported</string>
 +    <string name="login_logs_export_failed">Could not export logs</string>
++    <string name="login_tools_title">Sign-in tools</string>
++    <string name="login_tools_description">Use a token to sign in without the browser, or export diagnostics before signing in.</string>
++    <string name="login_with_token">Sign in with token</string>
++    <string name="login_token_title">Sign in with token</string>
++    <string name="login_token_description">Paste an NVIDIA access token or token-response JSON. OpenNOW verifies the access token before saving the account.</string>
++    <string name="login_token_label">Access token</string>
++    <string name="login_token_warning">Only use credentials for an account you control.</string>
++    <string name="login_pair_start">Sign in from OpenNOW on phone</string>
++    <string name="login_pair_starting">Starting phone pairing…</string>
++    <string name="login_pair_title">Pair your phone</string>
++    <string name="login_pair_connected">Phone connected</string>
++    <string name="login_pair_body">Your TV and phone must be on the same Wi-Fi. Scan the QR code with your phone camera; the pairing code expires after five minutes.</string>
++    <string name="login_pair_connected_body">%1$s can launch games. Approve trust below for settings, overlays, sessions, and account switching.</string>
++    <string name="login_pair_trust_label">Trust this phone</string>
++    <string name="login_pair_trust_description">Required before the phone can transfer an account or control TV settings and sessions.</string>
++    <string name="login_pair_cancel">Cancel pairing</string>
++    <string name="login_pair_disconnect">Disconnect phone</string>
++    <string name="login_pair_code">PAIRING CODE</string>
++    <string name="login_url_opening">Opening sign-in URL</string>
++    <string name="login_url_copied">URL copied</string>
++    <string name="login_sign_in">Sign in</string>
++    <string name="login_logs_export_qr">Export logs with QR</string>
++    <string name="settings_logs_export">Export logs</string>
      <string name="nav_store">Store</string>
      <string name="nav_search">Search</string>
      <string name="nav_library">Library</string>
