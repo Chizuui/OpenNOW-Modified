@@ -1,6 +1,5 @@
 package com.opencloudgaming.opennow
 
-
 import android.content.res.Configuration
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
@@ -69,10 +68,6 @@ import java.util.Locale
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 
-
-
-
-// LibraryScreen (was OpenNowScreens.kt:3286)
 @Composable
 internal fun LibraryScreen(
     state: OpenNowUiState,
@@ -218,7 +213,6 @@ internal fun LibraryScreen(
     }
 }
 
-// LibraryFilterControls (was OpenNowScreens.kt:3431)
 @Composable
 internal fun LibraryFilterControls(
     gameCount: Int,
@@ -264,7 +258,6 @@ internal fun LibraryFilterControls(
     }
 }
 
-// libraryStoreFilterOptions (was OpenNowScreens.kt:3476)
 internal fun libraryStoreFilterOptions(games: List<GameInfo>): List<CatalogFilterOption> {
     val labelsById = linkedMapOf<String, String>()
     games.forEach { game ->
@@ -285,14 +278,12 @@ internal fun libraryStoreFilterOptions(games: List<GameInfo>): List<CatalogFilte
         }
 }
 
-// gameMatchesLibraryFilters (was OpenNowScreens.kt:3496)
 internal fun gameMatchesLibraryFilters(game: GameInfo, selectedIds: List<String>): Boolean {
     if (selectedIds.isEmpty()) return true
     val gameFilterIds = libraryStoreFilterIds(game).map { it.first }.toSet()
     return selectedIds.any { it in gameFilterIds }
 }
 
-// libraryStoreFilterIds (was OpenNowScreens.kt:3502)
 private fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
     val labels = libraryStoreDisplayNames(game)
     return labels
@@ -304,17 +295,14 @@ private fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
         .distinctBy { it.first }
 }
 
-// LIBRARY_STORE_FILTER_PREFIX (was OpenNowScreens.kt:3513)
 private const val LIBRARY_STORE_FILTER_PREFIX = "library_store:"
 
-// activeSessionGame (was OpenNowScreens.kt:3516)
 internal fun activeSessionGame(state: OpenNowUiState, active: ActiveSessionInfo): GameInfo? =
     (state.games + state.libraryGames).firstOrNull { game ->
         game.launchAppId == active.appId.toString() ||
             game.variants.any { variant -> variant.id == active.appId.toString() }
     }
 
-// activeSessionSummary (was OpenNowScreens.kt:3522)
 internal fun activeSessionSummary(active: ActiveSessionInfo): String =
     listOfNotNull(
         when (active.status) {
@@ -328,7 +316,6 @@ internal fun activeSessionSummary(active: ActiveSessionInfo): String =
         active.sessionId.take(8).takeIf { it.isNotBlank() }?.let { "Session $it" },
     ).joinToString(" - ")
 
-// SearchEmptyState (was OpenNowScreens.kt:3535)
 @Composable
 internal fun SearchEmptyState(
     title: String,
@@ -374,7 +361,6 @@ internal fun SearchEmptyState(
     }
 }
 
-// RefreshingGamesPlaceholder (was OpenNowScreens.kt:3580)
 @Composable
 internal fun RefreshingGamesPlaceholder(
     settings: AppSettings,
@@ -390,7 +376,6 @@ internal fun RefreshingGamesPlaceholder(
     )
 }
 
-// GameGrid (was OpenNowScreens.kt:3927)
 @Composable
 private fun GameGrid(
     games: List<GameInfo>,
@@ -462,7 +447,6 @@ private fun GameGrid(
     }
 }
 
-// gameMatchesSearch (was OpenNowScreens.kt:6753)
 internal fun gameMatchesSearch(game: GameInfo, query: String): Boolean {
     val normalized = query.trim().lowercase()
     if (normalized.isBlank()) return true
@@ -478,13 +462,11 @@ internal fun gameMatchesSearch(game: GameInfo, query: String): Boolean {
     return normalized.split(Regex("\\s+")).all { it in haystack }
 }
 
-// favoriteOrderedGames (was OpenNowScreens.kt:6768)
 internal fun favoriteOrderedGames(games: List<GameInfo>, favoriteIds: List<String>): List<GameInfo> {
     val favorites = games.filter { it.id in favoriteIds }
     return if (favorites.isNotEmpty()) favorites + games.filterNot { it.id in favoriteIds } else games
 }
 
-// SortPicker (was OpenNowScreens.kt:14025)
 @Composable
 internal fun SortPicker(
     options: List<CatalogSortOption>,
@@ -536,7 +518,6 @@ internal fun SortPicker(
     }
 }
 
-// SelectedFilterChips (was OpenNowScreens.kt:14076)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun SelectedFilterChips(options: List<CatalogFilterOption>, selectedIds: List<String>, onToggle: (String) -> Unit) {
@@ -552,15 +533,12 @@ internal fun SelectedFilterChips(options: List<CatalogFilterOption>, selectedIds
     }
 }
 
-// catalogVisibleFilterGroups (was OpenNowScreens.kt:14091)
 internal fun catalogVisibleFilterGroups(groups: List<CatalogFilterGroup>): List<CatalogFilterGroup> =
     groups.filter { it.id in setOf("digital_store", "genre", "subscriptions") }
 
-// catalogFilterOptions (was OpenNowScreens.kt:14094)
 internal fun catalogFilterOptions(groups: List<CatalogFilterGroup>): List<CatalogFilterOption> =
     groups.flatMap { group -> group.options.take(if (group.id == "genre") 10 else group.options.size) }
 
-// FilterMenu (was OpenNowScreens.kt:14097)
 @Composable
 internal fun FilterMenu(
     options: List<CatalogFilterOption>,

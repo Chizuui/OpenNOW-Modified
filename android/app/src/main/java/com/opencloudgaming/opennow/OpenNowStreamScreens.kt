@@ -1,6 +1,5 @@
 package com.opencloudgaming.opennow
 
-
 import android.Manifest
 import android.app.Activity
 import android.content.Context
@@ -216,10 +215,6 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-
-
-
-// StreamScreen (was OpenNowScreens.kt:7059)
 @Composable
 internal fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     val context = LocalContext.current
@@ -1123,7 +1118,6 @@ internal fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     }
 }
 
-// shouldShowAndroidTouchControls (was OpenNowScreens.kt:7962)
 internal fun shouldShowAndroidTouchControls(
     tvProfile: Boolean,
     touchInputEnabled: Boolean,
@@ -1132,7 +1126,6 @@ internal fun shouldShowAndroidTouchControls(
 ): Boolean =
     !tvProfile && touchInputEnabled && touchControlsEnabled && !suppressedByPhysicalController
 
-// SessionTimerDisplay (was OpenNowScreens.kt:7970)
 private data class SessionTimerDisplay(
     val label: String,
     val value: String,
@@ -1141,13 +1134,11 @@ private data class SessionTimerDisplay(
     val warning: Boolean,
 )
 
-// StreamGuideStep (was OpenNowScreens.kt:7978)
 private enum class StreamGuideStep {
     OpenControls,
     PressDone,
 }
 
-// sessionTimerDisplay (was OpenNowScreens.kt:7983)
 private fun sessionTimerDisplay(limit: SmartSessionLimit, startedAtMs: Long, nowMs: Long): SessionTimerDisplay {
     val elapsedSeconds = sessionElapsedSeconds(startedAtMs, nowMs)
     val limitSeconds = limit.limitHours * 60 * 60
@@ -1172,7 +1163,6 @@ private fun sessionTimerDisplay(limit: SmartSessionLimit, startedAtMs: Long, now
     }
 }
 
-// StreamSessionTimerMenuRow (was OpenNowScreens.kt:8007)
 @Composable
 private fun StreamSessionTimerMenuRow(
     limit: SmartSessionLimit,
@@ -1225,7 +1215,6 @@ private fun StreamSessionTimerMenuRow(
     }
 }
 
-// formatSessionTimerDuration (was OpenNowScreens.kt:8059)
 internal fun formatSessionTimerDuration(totalSeconds: Int): String {
     val seconds = totalSeconds.coerceAtLeast(0)
     val hours = seconds / 3600
@@ -1238,13 +1227,11 @@ internal fun formatSessionTimerDuration(totalSeconds: Int): String {
     }
 }
 
-// formatSessionWarningThreshold (was OpenNowScreens.kt:8071)
 private fun formatSessionWarningThreshold(thresholdSeconds: Int): String {
     val minutes = thresholdSeconds / 60
     return if (minutes == 1) "1 minute" else "$minutes minutes"
 }
 
-// StreamVideoSurface (was OpenNowScreens.kt:8076)
 @Composable
 private fun StreamVideoSurface(
     client: NativeStreamClient,
@@ -1442,7 +1429,6 @@ private fun StreamVideoSurface(
     }
 }
 
-// streamRendererAspectRatio (was OpenNowScreens.kt:8273)
 internal fun streamRendererAspectRatio(
     settings: StreamSettings,
     decodedResolution: String?,
@@ -1456,7 +1442,6 @@ internal fun streamRendererAspectRatio(
     return streamAspectRatioForPixels(decodedPixels ?: negotiatedPixels ?: expectedPixels)
 }
 
-// streamStretchScale (was OpenNowScreens.kt:8286)
 internal fun streamStretchScale(
     enabled: Boolean,
     viewportAspectRatio: Float,
@@ -1472,31 +1457,25 @@ internal fun streamStretchScale(
     }
 }
 
-// streamPinchZoomEnabled (was OpenNowScreens.kt:8301)
 internal fun streamPinchZoomEnabled(
     touchMouseEnabled: Boolean,
     touchControllerVisible: Boolean,
 ): Boolean = touchMouseEnabled && !touchControllerVisible
 
-// streamAspectRatioForPixels (was OpenNowScreens.kt:8306)
 private fun streamAspectRatioForPixels(pixels: Pair<Int, Int>): Float {
     val (width, height) = pixels
     if (width <= 0 || height <= 0) return 16f / 9f
     return width.toFloat() / height.toFloat()
 }
 
-// isStableDecodedStreamResolution (was OpenNowScreens.kt:8312)
 private fun isStableDecodedStreamResolution(pixels: Pair<Int, Int>): Boolean =
     pixels.first >= MIN_STABLE_DECODED_STREAM_WIDTH_PX &&
         pixels.second >= MIN_STABLE_DECODED_STREAM_HEIGHT_PX
 
-// MIN_STABLE_DECODED_STREAM_WIDTH_PX (was OpenNowScreens.kt:8316)
 private const val MIN_STABLE_DECODED_STREAM_WIDTH_PX = 320
 
-// MIN_STABLE_DECODED_STREAM_HEIGHT_PX (was OpenNowScreens.kt:8317)
 private const val MIN_STABLE_DECODED_STREAM_HEIGHT_PX = 180
 
-// clampStreamZoomOffset (was OpenNowScreens.kt:8319)
 private fun clampStreamZoomOffset(offset: Offset, zoomScale: Float, viewportSize: IntSize): Offset {
     if (zoomScale <= 1.001f || viewportSize.width <= 0 || viewportSize.height <= 0) return Offset.Zero
     val maxX = viewportSize.width * (zoomScale - 1f) / 2f
@@ -1507,7 +1486,6 @@ private fun clampStreamZoomOffset(offset: Offset, zoomScale: Float, viewportSize
     )
 }
 
-// androidNullPointerIcon (was OpenNowScreens.kt:8329)
 private fun androidNullPointerIcon(view: android.view.View): PointerIcon? =
     if (Build.VERSION.SDK_INT >= 24) {
         runCatching { PointerIcon.getSystemIcon(view.context, PointerIcon.TYPE_NULL) }
@@ -1517,7 +1495,6 @@ private fun androidNullPointerIcon(view: android.view.View): PointerIcon? =
         null
     }
 
-// configureAndroidMousePointerCapture (was OpenNowScreens.kt:8338)
 private fun View.configureAndroidMousePointerCapture(enabled: Boolean, onCaptureInput: () -> Unit = {}, onMotion: (MotionEvent) -> Boolean) {
     if (Build.VERSION.SDK_INT < 26) return
     if (!enabled) {
@@ -1540,7 +1517,6 @@ private fun View.configureAndroidMousePointerCapture(enabled: Boolean, onCapture
     }
 }
 
-// clearAndroidMousePointerCapture (was OpenNowScreens.kt:8360)
 private fun View.clearAndroidMousePointerCapture() {
     if (Build.VERSION.SDK_INT < 26) return
     setOnCapturedPointerListener(null)
@@ -1548,20 +1524,17 @@ private fun View.clearAndroidMousePointerCapture() {
         .onFailure { error -> NativeInputDiagnostics.add("pointer capture release failed error=${error.javaClass.simpleName}") }
 }
 
-// hideAndroidPointerTree (was OpenNowScreens.kt:8367)
 private fun android.view.View.hideAndroidPointerTree() {
     if (Build.VERSION.SDK_INT < 24) return
     val icon = androidNullPointerIcon(this)
     applyAndroidPointerIconTree(icon)
 }
 
-// showAndroidPointerTree (was OpenNowScreens.kt:8373)
 private fun android.view.View.showAndroidPointerTree() {
     if (Build.VERSION.SDK_INT < 24) return
     applyAndroidPointerIconTree(null)
 }
 
-// applyAndroidPointerIconTree (was OpenNowScreens.kt:8378)
 private fun android.view.View.applyAndroidPointerIconTree(icon: PointerIcon?) {
     if (Build.VERSION.SDK_INT < 24) return
     runCatching { pointerIcon = icon }
@@ -1573,7 +1546,6 @@ private fun android.view.View.applyAndroidPointerIconTree(icon: PointerIcon?) {
     }
 }
 
-// FingerMouseInputLayer (was OpenNowScreens.kt:8389)
 @Composable
 private fun FingerMouseInputLayer(
     enabled: Boolean,
@@ -1651,7 +1623,6 @@ private fun FingerMouseInputLayer(
     )
 }
 
-// firstTwoPointerDistance (was OpenNowScreens.kt:8466)
 private fun MotionEvent.firstTwoPointerDistance(): Float {
     if (pointerCount < 2) return 0f
     val dx = getX(1) - getX(0)
@@ -1659,7 +1630,6 @@ private fun MotionEvent.firstTwoPointerDistance(): Float {
     return sqrt(dx * dx + dy * dy)
 }
 
-// firstTwoPointerCentroid (was OpenNowScreens.kt:8473)
 private fun MotionEvent.firstTwoPointerCentroid(): Offset =
     if (pointerCount >= 2) {
         Offset((getX(0) + getX(1)) / 2f, (getY(0) + getY(1)) / 2f)
@@ -1667,7 +1637,6 @@ private fun MotionEvent.firstTwoPointerCentroid(): Offset =
         Offset.Zero
     }
 
-// ActiveSessionDecisionScreen (was OpenNowScreens.kt:8480)
 @Composable
 private fun ActiveSessionDecisionScreen(
     state: OpenNowUiState,
@@ -1740,7 +1709,6 @@ private fun ActiveSessionDecisionScreen(
     }
 }
 
-// NoActiveStreamScreen (was OpenNowScreens.kt:8552)
 @Composable
 private fun NoActiveStreamScreen(
     canResumeSession: Boolean,
@@ -1776,7 +1744,6 @@ private fun NoActiveStreamScreen(
     }
 }
 
-// StreamFirstLaunchGuide (was OpenNowScreens.kt:8588)
 @Composable
 private fun StreamFirstLaunchGuide(
     step: StreamGuideStep,
@@ -1850,7 +1817,6 @@ private fun StreamFirstLaunchGuide(
     }
 }
 
-// StreamGuideCard (was OpenNowScreens.kt:8661)
 @Composable
 private fun StreamGuideCard(
     stepLabel: String,
@@ -1908,7 +1874,6 @@ private fun StreamGuideCard(
     }
 }
 
-// StreamGuideDoneCallout (was OpenNowScreens.kt:8718)
 @Composable
 private fun StreamGuideDoneCallout(
     controlsOpen: Boolean,
@@ -1951,7 +1916,6 @@ private fun StreamGuideDoneCallout(
     }
 }
 
-// PhysicalControllerTouchControlsDialog (was OpenNowScreens.kt:8760)
 @Composable
 private fun PhysicalControllerTouchControlsDialog(
     doNotShowAgain: Boolean,
@@ -1998,7 +1962,6 @@ private fun PhysicalControllerTouchControlsDialog(
     )
 }
 
-// StreamGuideEdgeCue (was OpenNowScreens.kt:8806)
 @Composable
 private fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
     Box(
@@ -2039,7 +2002,6 @@ private fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
     }
 }
 
-// StreamGuidePoint (was OpenNowScreens.kt:8846)
 @Composable
 private fun StreamGuidePoint(number: Int, body: String) {
     Row(
@@ -2066,7 +2028,6 @@ private fun StreamGuidePoint(number: Int, body: String) {
     }
 }
 
-// StreamControlsPage (was OpenNowScreens.kt:8872)
 private enum class StreamControlsPage {
     Main,
     StatusBar,
@@ -2075,7 +2036,6 @@ private enum class StreamControlsPage {
     ReportProblem,
 }
 
-// StreamControlsPanel (was OpenNowScreens.kt:8880)
 @Composable
 private fun StreamControlsPanel(
     gameTitle: String,
@@ -2580,7 +2540,6 @@ private fun StreamControlsPanel(
     }
 }
 
-// BuiltInGameTouchNotice (was OpenNowScreens.kt:9384)
 @Composable
 private fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
     Surface(
@@ -2615,7 +2574,6 @@ private fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
     }
 }
 
-// BugReportDataDisclosure (was OpenNowScreens.kt:9418)
 @Composable
 internal fun BugReportDataDisclosure(
     includeTypedTextWarning: Boolean,
@@ -2720,7 +2678,6 @@ internal fun BugReportDataDisclosure(
  * height would shrink the rect during a transition and leak touches into the game.
  */
 
-// streamTouchPassthrough (was OpenNowScreens.kt:9521)
 @Composable
 private fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Modifier {
     val inflatePx = with(LocalDensity.current) { inflate.roundToPx() }
@@ -2740,16 +2697,12 @@ private fun Modifier.streamTouchPassthrough(id: String, inflate: Dp = 8.dp): Mod
     }
 }
 
-// PASSTHROUGH_ID_PANEL (was OpenNowScreens.kt:9540)
 private const val PASSTHROUGH_ID_PANEL = "controls-panel"
 
-// PASSTHROUGH_ID_KEYBOARD (was OpenNowScreens.kt:9541)
 private const val PASSTHROUGH_ID_KEYBOARD = "keyboard-bar"
 
-// PASSTHROUGH_ID_EXIT (was OpenNowScreens.kt:9542)
 private const val PASSTHROUGH_ID_EXIT = "exit-confirmation"
 
-// StreamPanelHeader (was OpenNowScreens.kt:9544)
 @Composable
 private fun StreamPanelHeader(
     page: StreamControlsPage,
@@ -2875,7 +2828,6 @@ private fun StreamPanelHeader(
  * state here, so the panel used to repeat this onFocusChanged + border pattern per button.
  */
 
-// StreamPanelHeaderButton (was OpenNowScreens.kt:9668)
 @Composable
 private fun StreamPanelHeaderButton(
     onClick: () -> Unit,
@@ -2897,7 +2849,6 @@ private fun StreamPanelHeaderButton(
 
 /** Slides forward going into a sub-page and back coming out of one. */
 
-// streamPanelPageTransition (was OpenNowScreens.kt:9688)
 private fun streamPanelPageTransition(
     from: StreamControlsPage,
     to: StreamControlsPage,
@@ -2918,7 +2869,6 @@ private fun streamPanelPageTransition(
         )
 }
 
-// BugReportSubmissionRequirements (was OpenNowScreens.kt:9708)
 @Composable
 private fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
     Text(
@@ -2930,7 +2880,6 @@ private fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
     )
 }
 
-// BugReportVersionGateCard (was OpenNowScreens.kt:9719)
 @Composable
 internal fun BugReportVersionGateCard(
     update: AndroidUpdateState,
@@ -2988,7 +2937,6 @@ internal fun BugReportVersionGateCard(
     }
 }
 
-// BugReportPreflightDeckView (was OpenNowScreens.kt:9776)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BugReportPreflightDeckView(
@@ -3169,7 +3117,6 @@ private fun BugReportPreflightDeckView(
     }
 }
 
-// BugReportFormInputs (was OpenNowScreens.kt:9956)
 @Composable
 private fun BugReportFormInputs(
     title: String,
@@ -3273,7 +3220,6 @@ private fun BugReportFormInputs(
     }
 }
 
-// StreamBugReporter (was OpenNowScreens.kt:10059)
 @Composable
 private fun StreamBugReporter(
     submission: BugReportSubmissionState,
@@ -3580,7 +3526,6 @@ private fun StreamBugReporter(
     }
 }
 
-// mouseModePageItems (was OpenNowScreens.kt:10365)
 private fun LazyListScope.mouseModePageItems(
     settings: AppSettings,
     controllerMouseEmulationEnabled: Boolean,
@@ -3665,7 +3610,6 @@ private fun LazyListScope.mouseModePageItems(
     }
 }
 
-// statusBarPageItems (was OpenNowScreens.kt:10450)
 @OptIn(ExperimentalLayoutApi::class)
 private fun LazyListScope.statusBarPageItems(
     settings: AppSettings,
@@ -3849,7 +3793,6 @@ private fun LazyListScope.statusBarPageItems(
  * panel needs lives in one place instead of being repeated per button.
  */
 
-// StreamPanelKeyButton (was OpenNowScreens.kt:10632)
 @Composable
 private fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
@@ -3871,7 +3814,6 @@ private fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, o
  * point of the control.
  */
 
-// TouchLayoutSlider (was OpenNowScreens.kt:10652)
 @Composable
 private fun TouchLayoutSlider(
     @StringRes labelRes: Int,
@@ -3896,27 +3838,20 @@ private fun TouchLayoutSlider(
 
 /** "On" / "Off", so the same boolean reads the same way everywhere. */
 
-// onOffLabel (was OpenNowScreens.kt:10675)
 @Composable
 private fun onOffLabel(enabled: Boolean): String =
     stringResource(if (enabled) R.string.common_on else R.string.common_off)
 
-// SHARPENING_SLIDER_STEP (was OpenNowScreens.kt:10679)
 private const val SHARPENING_SLIDER_STEP = 0.05f
 
-// TOUCH_SCALE_SLIDER_STEP (was OpenNowScreens.kt:10680)
 private const val TOUCH_SCALE_SLIDER_STEP = 0.05f
 
-// TOUCH_DP_SLIDER_STEP (was OpenNowScreens.kt:10681)
 private const val TOUCH_DP_SLIDER_STEP = 2f
 
-// JOYSTICK_DEAD_ZONE_STEP (was OpenNowScreens.kt:10682)
 private const val JOYSTICK_DEAD_ZONE_STEP = 0.01f
 
-// DP_UNIT (was OpenNowScreens.kt:10683)
 private const val DP_UNIT = "dp"
 
-// StreamKeyboardBar (was OpenNowScreens.kt:10685)
 @Composable
 private fun StreamKeyboardBar(
     text: String,
@@ -3991,10 +3926,8 @@ private fun StreamKeyboardBar(
     }
 }
 
-// MAX_STREAM_KEYBOARD_TEXT_LENGTH (was OpenNowScreens.kt:10759)
 private const val MAX_STREAM_KEYBOARD_TEXT_LENGTH = 4096
 
-// StreamStatsPill (was OpenNowScreens.kt:10761)
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun StreamStatsPill(
@@ -4050,7 +3983,6 @@ private fun StreamStatsPill(
     }
 }
 
-// ActiveStreamModePill (was OpenNowScreens.kt:10816)
 @Composable
 private fun ActiveStreamModePill(
     status: ActiveStreamModeStatus,
@@ -4326,14 +4258,12 @@ private fun ActiveStreamModePill(
     }
 }
 
-// ActiveStreamModeDisplayChange (was OpenNowScreens.kt:11091)
 internal data class ActiveStreamModeDisplayChange(
     val label: String,
     val requestedValue: String,
     val actualValue: String,
 )
 
-// activeStreamModeDisplayChanges (was OpenNowScreens.kt:11097)
 internal fun activeStreamModeDisplayChanges(status: ActiveStreamModeStatus): List<ActiveStreamModeDisplayChange> {
     val requested = status.requestedProfile
     val actual = status.transportProfile
@@ -4392,15 +4322,12 @@ internal fun activeStreamModeDisplayChanges(status: ActiveStreamModeStatus): Lis
     }
 }
 
-// onOffLabel (was OpenNowScreens.kt:11155)
 private fun Boolean.onOffLabel(): String = if (this) "On" else "Off"
 
-// ActiveStreamModeCauseAssessment (was OpenNowScreens.kt:11157)
 internal data class ActiveStreamModeCauseAssessment(
     val summary: String,
 )
 
-// activeStreamModeCauseAssessment (was OpenNowScreens.kt:11161)
 internal fun activeStreamModeCauseAssessment(
     status: ActiveStreamModeStatus,
     recoveryReason: String?,
@@ -4438,13 +4365,11 @@ internal fun activeStreamModeCauseAssessment(
     return ActiveStreamModeCauseAssessment(summary)
 }
 
-// ActiveStreamModeDeveloperReport (was OpenNowScreens.kt:11198)
 internal data class ActiveStreamModeDeveloperReport(
     val title: String,
     val description: String,
 )
 
-// activeStreamModeDeveloperReport (was OpenNowScreens.kt:11203)
 internal fun activeStreamModeDeveloperReport(
     status: ActiveStreamModeStatus,
     recoveryReason: String?,
@@ -4475,7 +4400,6 @@ internal fun activeStreamModeDeveloperReport(
     )
 }
 
-// StreamStatsMetricItems (was OpenNowScreens.kt:11233)
 @Composable
 private fun StreamStatsMetricItems(
     streamStats: StreamRuntimeStats,
@@ -4563,10 +4487,8 @@ private fun StreamStatsMetricItems(
 
 /** Shown in place of a metric that has not been measured yet. */
 
-// NO_STAT_VALUE (was OpenNowScreens.kt:11319)
 private const val NO_STAT_VALUE = "--"
 
-// StreamStatsText (was OpenNowScreens.kt:11321)
 @Composable
 private fun StreamStatsText(
     value: String,
@@ -4596,7 +4518,6 @@ private fun StreamStatsText(
     )
 }
 
-// labelRes (was OpenNowScreens.kt:11350)
 @StringRes
 private fun StreamQualityLevel.labelRes(): Int = when (this) {
     StreamQualityLevel.Good -> R.string.stream_quality_good
@@ -4604,7 +4525,6 @@ private fun StreamQualityLevel.labelRes(): Int = when (this) {
     StreamQualityLevel.Poor -> R.string.stream_quality_poor
 }
 
-// CompactStreamDeviceStatus (was OpenNowScreens.kt:11357)
 private data class CompactStreamDeviceStatus(
     val batteryPercent: Int? = null,
     val batteryCharging: Boolean = false,
@@ -4613,7 +4533,6 @@ private data class CompactStreamDeviceStatus(
     val cellularGeneration: String? = null,
 )
 
-// rememberCompactStreamDeviceStatus (was OpenNowScreens.kt:11365)
 @Composable
 private fun rememberCompactStreamDeviceStatus(): CompactStreamDeviceStatus {
     val context = LocalContext.current
@@ -4628,7 +4547,6 @@ private fun rememberCompactStreamDeviceStatus(): CompactStreamDeviceStatus {
     return status
 }
 
-// readCompactStreamDeviceStatus (was OpenNowScreens.kt:11379)
 private fun readCompactStreamDeviceStatus(context: Context): CompactStreamDeviceStatus {
     val diagnostics = AndroidRuntimeDiagnostics.snapshot(context)
     return CompactStreamDeviceStatus(
@@ -4640,7 +4558,6 @@ private fun readCompactStreamDeviceStatus(context: Context): CompactStreamDevice
     )
 }
 
-// StreamBatteryIndicator (was OpenNowScreens.kt:11390)
 @Composable
 private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val description = status.batteryPercent?.let { percent ->
@@ -4693,7 +4610,6 @@ private fun StreamBatteryIndicator(status: CompactStreamDeviceStatus, modifier: 
     }
 }
 
-// StreamNetworkIndicator (was OpenNowScreens.kt:11442)
 @Composable
 private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: Modifier = Modifier) {
     val bars = status.networkBars?.coerceIn(0, 4)
@@ -4752,7 +4668,6 @@ private fun StreamNetworkIndicator(status: CompactStreamDeviceStatus, modifier: 
     }
 }
 
-// formatRuntimeResolution (was OpenNowScreens.kt:11500)
 internal fun formatRuntimeResolution(resolution: String): String {
     val parts = resolution.lowercase(Locale.US).split("x", limit = 2)
     return if (parts.size == 2 && parts.all { it.trim().isNotBlank() }) {
@@ -4762,7 +4677,6 @@ internal fun formatRuntimeResolution(resolution: String): String {
     }
 }
 
-// formatRuntimeBitrate (was OpenNowScreens.kt:11509)
 internal fun formatRuntimeBitrate(bitrateKbps: Int?): String {
     val kbps = bitrateKbps ?: return "--"
     return if (kbps >= 1000) {
@@ -4772,7 +4686,6 @@ internal fun formatRuntimeBitrate(bitrateKbps: Int?): String {
     }
 }
 
-// shouldHideStreamStatusText (was OpenNowScreens.kt:11518)
 private fun shouldHideStreamStatusText(status: String): Boolean =
     status.trim().replace('_', ' ').let {
         it.equals("Streaming", ignoreCase = true) ||
@@ -4780,14 +4693,12 @@ private fun shouldHideStreamStatusText(status: String): Boolean =
             it.equals("ICE COMPLETED", ignoreCase = true)
     }
 
-// InitialStreamConnectionStatus (was OpenNowScreens.kt:11525)
 internal data class InitialStreamConnectionStatus(
     val phase: String,
     val title: String,
     val detail: String,
 )
 
-// initialStreamConnectionStatus (was OpenNowScreens.kt:11531)
 internal fun initialStreamConnectionStatus(nativeState: String): InitialStreamConnectionStatus {
     val normalized = nativeState.trim().replace('_', ' ')
     return when {
@@ -4851,7 +4762,6 @@ internal fun initialStreamConnectionStatus(nativeState: String): InitialStreamCo
     }
 }
 
-// InitialStreamConnectionOverlay (was OpenNowScreens.kt:11594)
 @Composable
 private fun InitialStreamConnectionOverlay(
     gameTitle: String?,
@@ -4921,7 +4831,6 @@ private fun InitialStreamConnectionOverlay(
     }
 }
 
-// StreamExitConfirmation (was OpenNowScreens.kt:11663)
 @Composable
 private fun StreamExitConfirmation(
     gameTitle: String,
@@ -5000,7 +4909,6 @@ private fun StreamExitConfirmation(
     }
 }
 
-// QueueLoadingScreen (was OpenNowScreens.kt:11741)
 @Composable
 private fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     val session = state.streamSession
@@ -5066,7 +4974,6 @@ private fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMode
     }
 }
 
-// QueueAmbientBackdrop (was OpenNowScreens.kt:11806)
 @Composable
 private fun QueueAmbientBackdrop(
     accent: Color,
@@ -5178,7 +5085,6 @@ private fun QueueAmbientBackdrop(
     }
 }
 
-// QueueAmbientOrb (was OpenNowScreens.kt:11917)
 @Composable
 private fun QueueAmbientOrb(
     color: Color,
@@ -5204,7 +5110,6 @@ private fun QueueAmbientOrb(
     )
 }
 
-// QueueSignalField (was OpenNowScreens.kt:11942)
 @Composable
 private fun QueueSignalField(
     accent: Color,
@@ -5240,7 +5145,6 @@ private fun QueueSignalField(
     }
 }
 
-// AnimatedQueueStatusText (was OpenNowScreens.kt:11977)
 @Composable
 private fun AnimatedQueueStatusText(
     queueCopy: String,
@@ -5375,7 +5279,6 @@ private fun AnimatedQueueStatusText(
     }
 }
 
-// AnimatedQueueNumber (was OpenNowScreens.kt:12111)
 @Composable
 private fun AnimatedQueueNumber(
     currentNumber: String,
@@ -5418,7 +5321,6 @@ private fun AnimatedQueueNumber(
     }
 }
 
-// QueueNumberDigitSlot (was OpenNowScreens.kt:12153)
 @Composable
 private fun QueueNumberDigitSlot(
     fromDigit: Char?,
@@ -5493,18 +5395,15 @@ private fun QueueNumberDigitSlot(
     }
 }
 
-// rightAlignedCharAt (was OpenNowScreens.kt:12227)
 private fun String.rightAlignedCharAt(slotIndex: Int, slotCount: Int): Char? =
     getOrNull(length - slotCount + slotIndex)
 
-// QueueStatusParts (was OpenNowScreens.kt:12230)
 private data class QueueStatusParts(
     val prefix: String,
     val number: String,
     val suffix: String,
 )
 
-// queueStatusParts (was OpenNowScreens.kt:12236)
 private fun queueStatusParts(queueCopy: String, queuePosition: Int): QueueStatusParts {
     val number = queuePosition.toString()
     val index = queueCopy.indexOf(number)
@@ -5518,18 +5417,15 @@ private fun queueStatusParts(queueCopy: String, queuePosition: Int): QueueStatus
     )
 }
 
-// queueUrgency (was OpenNowScreens.kt:12249)
 private fun queueUrgency(queuePosition: Int?): Float {
     val position = queuePosition ?: return 0f
     if (position >= 10) return 0f
     return ((10 - position).toFloat() / 9f).coerceIn(0f, 1f)
 }
 
-// activeQueuePosition (was OpenNowScreens.kt:12255)
 private fun activeQueuePosition(state: OpenNowUiState): Int? =
     queueDisplayPosition(state)
 
-// rememberStableQueuePosition (was OpenNowScreens.kt:12258)
 @Composable
 private fun rememberStableQueuePosition(queuePosition: Int?): Int? {
     var stableQueuePosition by remember { mutableStateOf(queuePosition) }
@@ -5545,15 +5441,12 @@ private fun rememberStableQueuePosition(queuePosition: Int?): Int? {
     return stableQueuePosition
 }
 
-// queueLaunchStatusText (was OpenNowScreens.kt:12273)
 internal fun queueLaunchStatusText(state: OpenNowUiState, queuePosition: Int?): String =
     queuePosition?.let { "Queue position $it" } ?: queueLaunchStatusText(state)
 
-// queueIdleStatusColor (was OpenNowScreens.kt:12276)
 private fun queueIdleStatusColor(queueCopy: String): Color =
     if (queueCopy.equals("Starting session", ignoreCase = true)) Green else TextMuted
 
-// queueUrgencyColor (was OpenNowScreens.kt:12279)
 private fun queueUrgencyColor(queuePosition: Int?): Color {
     val heat = queueUrgency(queuePosition)
     if (heat <= 0f) return TextMuted
@@ -5562,7 +5455,6 @@ private fun queueUrgencyColor(queuePosition: Int?): Color {
     return Color(red = 1f, green = green, blue = blue, alpha = 1f)
 }
 
-// QueueStatusPanel (was OpenNowScreens.kt:12287)
 @Composable
 private fun QueueStatusPanel(
     game: GameInfo?,
@@ -5628,7 +5520,6 @@ private fun QueueStatusPanel(
     }
 }
 
-// LandscapeQueuePositionDock (was OpenNowScreens.kt:12352)
 @Composable
 private fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier = Modifier) {
     val accent = queueUrgencyColor(queuePosition)
@@ -5690,7 +5581,6 @@ private fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier = 
     }
 }
 
-// QueueAdPanel (was OpenNowScreens.kt:12413)
 @Composable
 private fun QueueAdPanel(
     ad: SessionAdInfo,
@@ -5777,7 +5667,6 @@ private fun QueueAdPanel(
     }
 }
 
-// QueueAdPlayback (was OpenNowScreens.kt:12499)
 @Composable
 private fun QueueAdPlayback(
     ad: SessionAdInfo,
@@ -5809,7 +5698,6 @@ private fun QueueAdPlayback(
     )
 }
 
-// QueueAdHeading (was OpenNowScreens.kt:12530)
 @Composable
 private fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
     Column(Modifier.fillMaxWidth()) {
@@ -5831,7 +5719,6 @@ private fun QueueAdHeading(game: GameInfo?, compact: Boolean) {
     }
 }
 
-// QueueStatusAndActions (was OpenNowScreens.kt:12551)
 @Composable
 private fun QueueStatusAndActions(
     queueCopy: String,
@@ -5875,7 +5762,6 @@ private fun QueueStatusAndActions(
     }
 }
 
-// MinimizedQueueDock (was OpenNowScreens.kt:12594)
 @Composable
 internal fun MinimizedQueueDock(
     state: OpenNowUiState,
@@ -5921,7 +5807,6 @@ internal fun MinimizedQueueDock(
     }
 }
 
-// MinimizedQueueStatusText (was OpenNowScreens.kt:12639)
 @Composable
 private fun MinimizedQueueStatusText(
     queueCopy: String,
@@ -5943,7 +5828,6 @@ private fun MinimizedQueueStatusText(
     }
 }
 
-// QueueAdPlayer (was OpenNowScreens.kt:12660)
 @Composable
 private fun QueueAdPlayer(
     adId: String,
@@ -6075,10 +5959,8 @@ private fun QueueAdPlayer(
     }
 }
 
-// QueueAdControlIcon (was OpenNowScreens.kt:12791)
 private enum class QueueAdControlIcon { Play, Pause, Volume, Muted }
 
-// QueueAdIconButton (was OpenNowScreens.kt:12793)
 @Composable
 private fun QueueAdIconButton(label: String, icon: QueueAdControlIcon, onClick: () -> Unit) {
     IconButton(
@@ -6091,7 +5973,6 @@ private fun QueueAdIconButton(label: String, icon: QueueAdControlIcon, onClick: 
     }
 }
 
-// QueueAdControlIconView (was OpenNowScreens.kt:12805)
 @Composable
 private fun QueueAdControlIconView(icon: QueueAdControlIcon, modifier: Modifier = Modifier) {
     Canvas(modifier) {
@@ -6134,7 +6015,6 @@ private fun QueueAdControlIconView(icon: QueueAdControlIcon, modifier: Modifier 
     }
 }
 
-// TouchOverlay (was OpenNowScreens.kt:12847)
 @Composable
 private fun TouchOverlay(
     client: NativeStreamClient,
@@ -6246,7 +6126,6 @@ private fun TouchOverlay(
     }
 }
 
-// PortraitTouchControls (was OpenNowScreens.kt:12958)
 @Composable
 private fun PortraitTouchControls(
     client: NativeStreamClient,
@@ -6464,7 +6343,6 @@ private fun PortraitTouchControls(
     }
 }
 
-// LandscapeTouchControls (was OpenNowScreens.kt:13175)
 @Composable
 private fun BoxScope.LandscapeTouchControls(
     client: NativeStreamClient,
@@ -6687,14 +6565,12 @@ private fun BoxScope.LandscapeTouchControls(
     }
 }
 
-// landscapeTouchTopControlClearanceDp (was OpenNowScreens.kt:13397)
 internal fun landscapeTouchTopControlClearanceDp(viewportHeightDp: Float, controlScale: Float): Float {
     val viewportBand = (viewportHeightDp * 0.11f).coerceIn(34f, 58f)
     val scaledBand = viewportBand * controlScale.coerceIn(0.75f, 1.35f)
     return scaledBand.coerceIn(30f, 76f)
 }
 
-// TouchControlGroup (was OpenNowScreens.kt:13403)
 @Composable
 private fun TouchControlGroup(
     id: String,
@@ -6767,7 +6643,6 @@ private fun TouchControlGroup(
     }
 }
 
-// clampStickOffset (was OpenNowScreens.kt:13475)
 private fun clampStickOffset(offset: Offset, maxRadius: Float): Offset {
     val distance = sqrt(offset.x * offset.x + offset.y * offset.y)
     if (distance <= maxRadius || distance == 0f) return offset
@@ -6775,7 +6650,6 @@ private fun clampStickOffset(offset: Offset, maxRadius: Float): Offset {
     return Offset(offset.x * scale, offset.y * scale)
 }
 
-// applyTouchJoystickDeadZone (was OpenNowScreens.kt:13482)
 internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
     val clampedValue = value.coerceIn(-1f, 1f)
     val clampedDeadZone = deadZone.coerceIn(0f, 0.95f)
@@ -6785,7 +6659,6 @@ internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
     return if (clampedValue < 0f) -adjusted else adjusted
 }
 
-// VirtualStick (was OpenNowScreens.kt:13492)
 @Composable
 private fun VirtualStick(
     label: String,
@@ -6888,7 +6761,6 @@ private fun VirtualStick(
     }
 }
 
-// FaceButtonCluster (was OpenNowScreens.kt:13594)
 @Composable
 private fun FaceButtonCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
     val buttonSize = 54.dp * scale
@@ -6910,7 +6782,6 @@ private fun FaceButtonCluster(client: NativeStreamClient, opacity: Float, scale:
     }
 }
 
-// DpadArrowhead (was OpenNowScreens.kt:13615)
 @Composable
 private fun DpadArrowhead(
     label: String,
@@ -6930,7 +6801,6 @@ private fun DpadArrowhead(
     )
 }
 
-// DpadCluster (was OpenNowScreens.kt:13634)
 @Composable
 private fun DpadCluster(client: NativeStreamClient, opacity: Float, scale: Float, onButtonTone: () -> Unit) {
     val currentOnButtonTone by rememberUpdatedState(onButtonTone)
@@ -7129,7 +6999,6 @@ private fun DpadCluster(client: NativeStreamClient, opacity: Float, scale: Float
     }
 }
 
-// virtualPressInput (was OpenNowScreens.kt:13832)
 private fun Modifier.virtualPressInput(
     client: NativeStreamClient,
     controlKey: Any,
@@ -7155,7 +7024,6 @@ private fun Modifier.virtualPressInput(
     }
 }
 
-// GamepadTriggerButton (was OpenNowScreens.kt:13857)
 @Composable
 private fun GamepadTriggerButton(
     label: String,
@@ -7211,7 +7079,6 @@ private fun GamepadTriggerButton(
     }
 }
 
-// GamepadBumperButton (was OpenNowScreens.kt:13912)
 @Composable
 private fun GamepadBumperButton(
     label: String,
@@ -7267,7 +7134,6 @@ private fun GamepadBumperButton(
     }
 }
 
-// GamepadButton (was OpenNowScreens.kt:13967)
 @Composable
 private fun GamepadButton(
     label: String,
@@ -7325,7 +7191,6 @@ private fun GamepadButton(
     }
 }
 
-// PrintedWasteSelector (was OpenNowScreens.kt:14179)
 @Composable
 internal fun PrintedWasteSelector(
     state: OpenNowUiState,
@@ -7456,7 +7321,6 @@ internal fun PrintedWasteSelector(
     }
 }
 
-// PrintedWasteGameSummary (was OpenNowScreens.kt:14309)
 @Composable
 private fun PrintedWasteGameSummary(
     game: GameInfo,
@@ -7478,7 +7342,6 @@ private fun PrintedWasteGameSummary(
     }
 }
 
-// PrintedWasteOptionsColumn (was OpenNowScreens.kt:14330)
 @Composable
 private fun PrintedWasteOptionsColumn(
     state: OpenNowUiState,
@@ -7616,7 +7479,6 @@ private fun PrintedWasteOptionsColumn(
     }
 }
 
-// RecommendedPrintedWasteCard (was OpenNowScreens.kt:14467)
 @Composable
 private fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
     Surface(
@@ -7644,7 +7506,6 @@ private fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
     }
 }
 
-// PrintedWasteZoneRow (was OpenNowScreens.kt:14494)
 @Composable
 private fun PrintedWasteZoneRow(
     zoneOption: PrintedWasteZoneOption,
@@ -7711,7 +7572,6 @@ private fun PrintedWasteZoneRow(
     }
 }
 
-// QueueMetricPill (was OpenNowScreens.kt:14560)
 @Composable
 private fun QueueMetricPill(
     label: String,
@@ -7733,11 +7593,9 @@ private fun QueueMetricPill(
     }
 }
 
-// isStandardPrintedWasteZone (was OpenNowScreens.kt:14581)
 private fun isStandardPrintedWasteZone(zoneId: String): Boolean =
     zoneId.startsWith("NP-") && !zoneId.startsWith("NPA-")
 
-// PrintedWasteZoneOption (was OpenNowScreens.kt:14584)
 private data class PrintedWasteZoneOption(
     val zoneId: String,
     val zone: PrintedWasteZone,
@@ -7745,7 +7603,6 @@ private data class PrintedWasteZoneOption(
     val pingMs: Long?,
 )
 
-// recommendedPrintedWasteZone (was OpenNowScreens.kt:14591)
 private fun recommendedPrintedWasteZone(zones: List<PrintedWasteZoneOption>): PrintedWasteZoneOption? {
     if (zones.isEmpty()) return null
     val pool = zones.filter { it.pingMs != null }.ifEmpty { zones }
@@ -7758,24 +7615,20 @@ private fun recommendedPrintedWasteZone(zones: List<PrintedWasteZoneOption>): Pr
     )
 }
 
-// printedWasteScore (was OpenNowScreens.kt:14603)
 private fun printedWasteScore(zone: PrintedWasteZoneOption, maxPing: Long, maxQueue: Int): Double {
     val pingScore = ((zone.pingMs ?: maxPing).toDouble() / maxPing.toDouble()) * 0.75
     val queueScore = (zone.zone.QueuePosition.toDouble() / maxQueue.toDouble()) * 0.25
     return pingScore + queueScore
 }
 
-// printedWasteZoneUrl (was OpenNowScreens.kt:14609)
 private fun printedWasteZoneUrl(zoneId: String): String =
     "https://${zoneId.lowercase()}.cloudmatchbeta.nvidiagrid.net/"
 
-// formatPrintedWasteWait (was OpenNowScreens.kt:14612)
 private fun formatPrintedWasteWait(etaMs: Long): String {
     val minutes = ((etaMs + 59_999L) / 60_000L).coerceAtLeast(1L)
     return if (minutes < 60L) "${minutes}m" else "${minutes / 60L}h ${minutes % 60L}m"
 }
 
-// queueColor (was OpenNowScreens.kt:14617)
 private fun queueColor(queue: Int): Color = when {
     queue <= 5 -> Green
     queue <= 20 -> Color(0xffc7ef6b)
@@ -7783,7 +7636,6 @@ private fun queueColor(queue: Int): Color = when {
     else -> Color(0xffff8d8d)
 }
 
-// pingColor (was OpenNowScreens.kt:14624)
 private fun pingColor(pingMs: Long): Color = when {
     pingMs <= 60L -> Green
     pingMs <= 120L -> Color(0xffc7ef6b)
@@ -7791,7 +7643,6 @@ private fun pingColor(pingMs: Long): Color = when {
     else -> Color(0xffff8d8d)
 }
 
-// regionLabel (was OpenNowScreens.kt:14631)
 private fun regionLabel(region: String): String = when (region) {
     "US" -> "North America"
     "CA" -> "Canada"

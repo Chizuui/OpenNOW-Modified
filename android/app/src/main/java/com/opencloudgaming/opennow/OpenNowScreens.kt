@@ -1,6 +1,5 @@
 package com.opencloudgaming.opennow
 
-
 import android.app.Activity
 import android.content.Context
 import android.content.res.Configuration
@@ -174,43 +173,28 @@ import com.opencloudgaming.opennow.ui.theme.numeric
 import com.opencloudgaming.opennow.ui.theme.tint
 import kotlin.math.sin
 
-
-
-
-// Green (was OpenNowScreens.kt:302)
 internal val Green = OpenNowPalette.AccentDefault
 
-// Background (was OpenNowScreens.kt:303)
 internal val Background = OpenNowPalette.Background
 
-// Panel (was OpenNowScreens.kt:304)
 internal val Panel = OpenNowPalette.Panel
 
-// PanelAlt (was OpenNowScreens.kt:305)
 internal val PanelAlt = OpenNowPalette.PanelAlt
 
-// TextPrimary (was OpenNowScreens.kt:306)
 internal val TextPrimary = OpenNowPalette.TextPrimary
 
-// TextMuted (was OpenNowScreens.kt:307)
 internal val TextMuted = OpenNowPalette.TextMuted
 
-// ChromeScrim (was OpenNowScreens.kt:308)
 private val ChromeScrim = OpenNowPalette.ChromeScrim
 
-// TopBarCompactControlHeight (was OpenNowScreens.kt:309)
 internal val TopBarCompactControlHeight = 30.dp
 
-// COMPACT_STREAM_DEVICE_STATUS_REFRESH_MS (was OpenNowScreens.kt:310)
 internal const val COMPACT_STREAM_DEVICE_STATUS_REFRESH_MS = 5_000L
 
-// QUEUE_POSITION_VISUAL_SETTLE_MS (was OpenNowScreens.kt:311)
 internal const val QUEUE_POSITION_VISUAL_SETTLE_MS = 1100L
 
-// ACTIVE_STREAM_MODE_NOTICE_DURATION_MS (was OpenNowScreens.kt:312)
 internal const val ACTIVE_STREAM_MODE_NOTICE_DURATION_MS = 8_000L
 
-// color (was OpenNowScreens.kt:313)
 internal val UiAccent.color: Color
     get() = when (this) {
         UiAccent.OpenNow -> OpenNowPalette.AccentDefault
@@ -221,7 +205,6 @@ internal val UiAccent.color: Color
         UiAccent.Violet -> OpenNowPalette.AccentViolet
     }
 
-// uiAccentLabel (was OpenNowScreens.kt:323)
 @Composable
 internal fun uiAccentLabel(accent: UiAccent): String = when (accent) {
     UiAccent.OpenNow -> stringResource(R.string.accent_opennow)
@@ -232,7 +215,6 @@ internal fun uiAccentLabel(accent: UiAccent): String = when (accent) {
     UiAccent.Violet -> stringResource(R.string.accent_violet)
 }
 
-// OpenNowTheme (was OpenNowScreens.kt:333)
 @Composable
 fun OpenNowTheme(
     settings: AppSettings,
@@ -287,7 +269,6 @@ fun OpenNowTheme(
     }
 }
 
-// OpenNowApp (was OpenNowScreens.kt:387)
 @Composable
 fun OpenNowApp(viewModel: OpenNowViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -569,7 +550,6 @@ fun OpenNowApp(viewModel: OpenNowViewModel) {
     }
 }
 
-// SessionReportDialog (was OpenNowScreens.kt:668)
 @Composable
 private fun SessionReportDialog(
     report: SessionReport,
@@ -657,7 +637,6 @@ private fun SessionReportDialog(
     )
 }
 
-// SessionReportSummary (was OpenNowScreens.kt:755)
 @Composable
 private fun SessionReportSummary(report: SessionReport, scoreColor: Color) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -702,7 +681,6 @@ private fun SessionReportSummary(report: SessionReport, scoreColor: Color) {
     }
 }
 
-// SessionReportConnection (was OpenNowScreens.kt:799)
 @Composable
 private fun SessionReportConnection(report: SessionReport) {
     Text(stringResource(R.string.session_report_connection), style = MaterialTheme.typography.titleSmall)
@@ -768,7 +746,6 @@ private fun SessionReportConnection(report: SessionReport) {
     )
 }
 
-// SessionReportOutcome (was OpenNowScreens.kt:864)
 @Composable
 private fun SessionReportOutcome(report: SessionReport, onReportBug: () -> Unit) {
     Text("Delivered profile", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
@@ -807,7 +784,6 @@ private fun SessionReportOutcome(report: SessionReport, onReportBug: () -> Unit)
     }
 }
 
-// CompletedSessionBugReportDialog (was OpenNowScreens.kt:902)
 @Composable
 private fun CompletedSessionBugReportDialog(
     submission: BugReportSubmissionState,
@@ -986,7 +962,6 @@ private fun CompletedSessionBugReportDialog(
     }
 }
 
-// SessionReportMetricData (was OpenNowScreens.kt:1080)
 private data class SessionReportMetricData(
     val label: String,
     /** Null when the metric was never measured. */
@@ -1003,7 +978,6 @@ private data class SessionReportMetricData(
  * row end up different heights.
  */
 
-// SessionReportMetricGrid (was OpenNowScreens.kt:1095)
 @Composable
 private fun SessionReportMetricGrid(metrics: List<SessionReportMetricData>) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -1020,7 +994,6 @@ private fun SessionReportMetricGrid(metrics: List<SessionReportMetricData>) {
     }
 }
 
-// SessionReportMetric (was OpenNowScreens.kt:1111)
 @Composable
 private fun SessionReportMetric(metric: SessionReportMetricData, modifier: Modifier = Modifier) {
     val notMeasured = stringResource(R.string.session_report_not_measured)
@@ -1053,7 +1026,6 @@ private fun SessionReportMetric(metric: SessionReportMetricData, modifier: Modif
     }
 }
 
-// SessionReportFindingRow (was OpenNowScreens.kt:1143)
 @Composable
 private fun SessionReportFindingRow(finding: SessionReportFinding) {
     val titleColor = if (finding.kind == SessionReportFindingKind.Warning) OpenNowPalette.StatusFair else Green
@@ -1063,11 +1035,9 @@ private fun SessionReportFindingRow(finding: SessionReportFinding) {
     }
 }
 
-// normalizeSessionReportResolution (was OpenNowScreens.kt:1152)
 private fun normalizeSessionReportResolution(value: String?): Pair<Int, Int>? =
     value?.let(::parseResolutionPixelsOrNull)
 
-// DiagnosticShareDialog (was OpenNowScreens.kt:1155)
 @Composable
 private fun DiagnosticShareDialog(
     state: OpenNowUiState,
@@ -1141,7 +1111,6 @@ private fun DiagnosticShareDialog(
     }
 }
 
-// AnalyticsConsentDialog (was OpenNowScreens.kt:1228)
 @Composable
 private fun AnalyticsConsentDialog(
     onAllow: () -> Unit,
@@ -1175,7 +1144,6 @@ private fun AnalyticsConsentDialog(
     )
 }
 
-// AndroidUpdatePromptDialog (was OpenNowScreens.kt:1261)
 @Composable
 private fun AndroidUpdatePromptDialog(
     update: AndroidUpdateState,
@@ -1235,21 +1203,17 @@ private fun AndroidUpdatePromptDialog(
     )
 }
 
-// secondsUntil (was OpenNowScreens.kt:1928)
 internal fun secondsUntil(deadlineMs: Long): Int =
     ((deadlineMs - System.currentTimeMillis()).coerceAtLeast(0L) / 1000L).toInt()
 
-// isPhoneLandscape (was OpenNowScreens.kt:1931)
 internal fun isPhoneLandscape(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
     width > height && windowSizeClassOf(width, height).isPhone
 
-// rememberPhysicalControllerConnected (was OpenNowScreens.kt:1935)
 @Composable
 internal fun rememberPhysicalControllerConnected(enabled: Boolean): Boolean {
     return rememberPhysicalControllerFamily(enabled) != null
 }
 
-// rememberPhysicalControllerFamily (was OpenNowScreens.kt:1940)
 @Composable
 internal fun rememberPhysicalControllerFamily(enabled: Boolean): AndroidControllerFamily? {
     val context = LocalContext.current.applicationContext
@@ -1277,7 +1241,6 @@ internal fun rememberPhysicalControllerFamily(enabled: Boolean): AndroidControll
     return family
 }
 
-// connectedPhysicalControllerFamily (was OpenNowScreens.kt:1967)
 private fun connectedPhysicalControllerFamily(): AndroidControllerFamily? {
     val families = InputDevice.getDeviceIds()
         .asSequence()
@@ -1286,13 +1249,11 @@ private fun connectedPhysicalControllerFamily(): AndroidControllerFamily? {
     return families.firstOrNull { it != AndroidControllerFamily.Generic } ?: families.firstOrNull()
 }
 
-// CatalogWallpaperSelection (was OpenNowScreens.kt:1975)
 internal sealed interface CatalogWallpaperSelection {
     data class BuiltIn(val preset: CatalogBackgroundPreset) : CatalogWallpaperSelection
     data class Custom(val source: String) : CatalogWallpaperSelection
 }
 
-// MainShell (was OpenNowScreens.kt:2058)
 @Composable
 private fun MainShell(
     state: OpenNowUiState,
@@ -1664,14 +1625,12 @@ private fun MainShell(
     }
 }
 
-// shouldRestoreTvNavigationFocus (was OpenNowScreens.kt:2429)
 internal fun shouldRestoreTvNavigationFocus(
     previouslyInStream: Boolean,
     currentlyInStream: Boolean,
     tvProfile: Boolean,
 ): Boolean = tvProfile && previouslyInStream && !currentlyInStream
 
-// AppNavigationRail (was OpenNowScreens.kt:2435)
 @Composable
 private fun AppNavigationRail(
     state: OpenNowUiState,
@@ -1791,11 +1750,9 @@ private fun AppNavigationRail(
     }
 }
 
-// shouldShowLocalTvConnectionDot (was OpenNowScreens.kt:2554)
 internal fun shouldShowLocalTvConnectionDot(tvProfile: Boolean, pairedDeviceName: String?): Boolean =
     tvProfile && !pairedDeviceName.isNullOrBlank()
 
-// shouldShowSettingsBackRail (was OpenNowScreens.kt:2557)
 internal fun shouldShowSettingsBackRail(
     tvProfile: Boolean,
     settingsPageOpen: Boolean,
@@ -1803,7 +1760,6 @@ internal fun shouldShowSettingsBackRail(
     detailRouteOpen: Boolean,
 ): Boolean = !tvProfile && settingsPageOpen && horizontalChrome && detailRouteOpen
 
-// AppNavigationRailItem (was OpenNowScreens.kt:2564)
 @Composable
 private fun AppNavigationRailItem(
     selected: Boolean,
@@ -1870,7 +1826,6 @@ private fun AppNavigationRailItem(
     }
 }
 
-// TopBarMusicControl (was OpenNowScreens.kt:2630)
 private data class TopBarMusicControl(
     val visible: Boolean,
     val playing: Boolean,
@@ -1878,7 +1833,6 @@ private data class TopBarMusicControl(
     val onToggle: () -> Unit,
 )
 
-// BottomNavItem (was OpenNowScreens.kt:2637)
 @Composable
 private fun RowScope.BottomNavItem(selected: Boolean, onClick: () -> Unit, iconRes: Int, label: String) {
     NavigationBarItem(
@@ -1902,7 +1856,6 @@ private fun RowScope.BottomNavItem(selected: Boolean, onClick: () -> Unit, iconR
     )
 }
 
-// TopStatusBar (was OpenNowScreens.kt:2660)
 @Composable
 private fun TopStatusBar(
     state: OpenNowUiState,
@@ -1968,7 +1921,6 @@ private fun TopStatusBar(
     }
 }
 
-// TopStatusDetails (was OpenNowScreens.kt:2725)
 @Composable
 private fun TopStatusDetails(
     state: OpenNowUiState,
@@ -2008,7 +1960,6 @@ private fun TopStatusDetails(
     }
 }
 
-// TopBarMusicButton (was OpenNowScreens.kt:2764)
 @Composable
 private fun TopBarMusicButton(control: TopBarMusicControl) {
     val description = when {
@@ -2041,7 +1992,6 @@ private fun TopBarMusicButton(control: TopBarMusicControl) {
     }
 }
 
-// MusicBars (was OpenNowScreens.kt:2796)
 @Composable
 private fun MusicBars(playing: Boolean, modifier: Modifier = Modifier) {
     val transition = rememberInfiniteTransition(label = "top-bar-music-bars")
@@ -2076,7 +2026,6 @@ private fun MusicBars(playing: Boolean, modifier: Modifier = Modifier) {
     }
 }
 
-// streamStatusSummary (was OpenNowScreens.kt:2830)
 private fun streamStatusSummary(stream: StreamSettings): String =
     listOf(
         formatTopBarResolution(stream.resolution),
@@ -2085,7 +2034,6 @@ private fun streamStatusSummary(stream: StreamSettings): String =
         "${stream.fps} FPS",
     ).filter { it.isNotBlank() }.joinToString(" • ")
 
-// formatTopBarResolution (was OpenNowScreens.kt:2838)
 private fun formatTopBarResolution(resolution: String): String {
     val parts = resolution.lowercase(Locale.US).split("x", limit = 2)
     return if (parts.size == 2 && parts.all { it.trim().isNotBlank() }) {
@@ -2095,7 +2043,6 @@ private fun formatTopBarResolution(resolution: String): String {
     }
 }
 
-// NativeSearchField (was OpenNowScreens.kt:2847)
 @Composable
 internal fun NativeSearchField(
     query: String,
@@ -2202,7 +2149,6 @@ internal fun NativeSearchField(
     }
 }
 
-// handleDpadFocusMove (was OpenNowScreens.kt:2953)
 internal fun handleDpadFocusMove(event: androidx.compose.ui.input.key.KeyEvent, focusManager: FocusManager): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     val direction = when (event.key) {
@@ -2215,12 +2161,10 @@ internal fun handleDpadFocusMove(event: androidx.compose.ui.input.key.KeyEvent, 
     return focusManager.moveFocus(direction)
 }
 
-// lockedFocusGroup (was OpenNowScreens.kt:2965)
 internal fun Modifier.lockedFocusGroup(): Modifier =
     focusProperties { onExit = { cancelFocusChange() } }
         .focusGroup()
 
-// isNavigationToneKey (was OpenNowScreens.kt:2969)
 private fun isNavigationToneKey(event: androidx.compose.ui.input.key.KeyEvent): Boolean =
     event.type == KeyEventType.KeyDown &&
         event.key in setOf(
@@ -2230,7 +2174,6 @@ private fun isNavigationToneKey(event: androidx.compose.ui.input.key.KeyEvent): 
             Key.DirectionRight,
         )
 
-// handleVerticalDpadFocusMove (was OpenNowScreens.kt:2978)
 internal fun handleVerticalDpadFocusMove(event: androidx.compose.ui.input.key.KeyEvent, focusManager: FocusManager): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     val direction = when (event.key) {
@@ -2250,7 +2193,6 @@ internal fun handleVerticalDpadFocusMove(event: androidx.compose.ui.input.key.Ke
  * move focus sideways instead of changing the value.
  */
 
-// handleSliderDpadInput (was OpenNowScreens.kt:2996)
 internal fun handleSliderDpadInput(
     event: androidx.compose.ui.input.key.KeyEvent,
     value: Float,
@@ -2278,7 +2220,6 @@ internal fun handleSliderDpadInput(
     }
 }
 
-// isTvActivateKey (was OpenNowScreens.kt:3023)
 internal fun isTvActivateKey(event: androidx.compose.ui.input.key.KeyEvent): Boolean =
     event.type == KeyEventType.KeyUp &&
         event.key in setOf(
@@ -2287,22 +2228,16 @@ internal fun isTvActivateKey(event: androidx.compose.ui.input.key.KeyEvent): Boo
             Key.NumPadEnter,
         )
 
-// LocalShimmerOffset (was OpenNowScreens.kt:3595)
 private val LocalShimmerOffset = staticCompositionLocalOf<State<Float>?> { null }
 
-// LocalTvLoadingPulse (was OpenNowScreens.kt:3596)
 private val LocalTvLoadingPulse = staticCompositionLocalOf<State<Float>?> { null }
 
-// LocalTvLoadingProfile (was OpenNowScreens.kt:3597)
 private val LocalTvLoadingProfile = staticCompositionLocalOf { false }
 
-// LocalTouchControllerStyle (was OpenNowScreens.kt:3598)
 internal val LocalTouchControllerStyle = staticCompositionLocalOf { TouchControllerStyle.V1 }
 
-// SHIMMER_CYCLE_DURATION_MS (was OpenNowScreens.kt:3599)
 private const val SHIMMER_CYCLE_DURATION_MS = 760
 
-// GameGridSkeleton (was OpenNowScreens.kt:3601)
 @Composable
 internal fun GameGridSkeleton(
     settings: AppSettings,
@@ -2397,7 +2332,6 @@ internal fun GameGridSkeleton(
     }
 }
 
-// StoreStartRailsSkeleton (was OpenNowScreens.kt:3695)
 @Composable
 private fun StoreStartRailsSkeleton(
     settings: AppSettings,
@@ -2421,7 +2355,6 @@ private fun StoreStartRailsSkeleton(
     }
 }
 
-// StoreRailSectionSkeleton (was OpenNowScreens.kt:3718)
 @Composable
 private fun StoreRailSectionSkeleton(
     expressiveUi: Boolean,
@@ -2465,7 +2398,6 @@ private fun StoreRailSectionSkeleton(
     }
 }
 
-// StoreRailGameCardSkeleton (was OpenNowScreens.kt:3761)
 @Composable
 private fun StoreRailGameCardSkeleton(
     width: Dp,
@@ -2528,7 +2460,6 @@ private fun StoreRailGameCardSkeleton(
 
 /** Mirrors [GameCard]'s layout exactly, so nothing shifts when real content replaces it. */
 
-// GameCardSkeleton (was OpenNowScreens.kt:3822)
 @Composable
 private fun GameCardSkeleton(
     squareCard: Boolean,
@@ -2579,7 +2510,6 @@ private fun GameCardSkeleton(
     }
 }
 
-// SkeletonLine (was OpenNowScreens.kt:3872)
 @Composable
 private fun SkeletonLine(widthFraction: Float, height: Dp = 9.dp) {
     LoadingShimmer(
@@ -2590,7 +2520,6 @@ private fun SkeletonLine(widthFraction: Float, height: Dp = 9.dp) {
     )
 }
 
-// SkeletonCircle (was OpenNowScreens.kt:3882)
 @Composable
 private fun SkeletonCircle(size: Dp, modifier: Modifier = Modifier) {
     LoadingShimmer(
@@ -2600,7 +2529,6 @@ private fun SkeletonCircle(size: Dp, modifier: Modifier = Modifier) {
     )
 }
 
-// SwipeToRefreshContainer (was OpenNowScreens.kt:3891)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SwipeToRefreshContainer(
@@ -2637,7 +2565,6 @@ internal fun SwipeToRefreshContainer(
     }
 }
 
-// UrlImageState (was OpenNowScreens.kt:14661)
 private sealed interface UrlImageState {
     data object Empty : UrlImageState
     data object Loading : UrlImageState
@@ -2645,7 +2572,6 @@ private sealed interface UrlImageState {
     data object Loaded : UrlImageState
 }
 
-// imageDataForSource (was OpenNowScreens.kt:14668)
 internal fun imageDataForSource(source: String): Any? {
     val key = source.trim()
     if (key.isBlank()) return null
@@ -2659,7 +2585,6 @@ internal fun imageDataForSource(source: String): Any? {
     }
 }
 
-// UrlImage (was OpenNowScreens.kt:14681)
 @Composable
 internal fun UrlImage(
     url: String?,
@@ -2719,7 +2644,6 @@ internal fun UrlImage(
     }
 }
 
-// LoadingShimmer (was OpenNowScreens.kt:14740)
 @Composable
 private fun LoadingShimmer(modifier: Modifier = Modifier) {
     // Use the shared shimmer offset from GameGridSkeleton if available; fall back to a
@@ -2791,7 +2715,6 @@ private fun LoadingShimmer(modifier: Modifier = Modifier) {
     )
 }
 
-// OpenNowMark (was OpenNowScreens.kt:14811)
 @Composable
 internal fun OpenNowMark(size: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
     Image(
@@ -2804,7 +2727,6 @@ internal fun OpenNowMark(size: androidx.compose.ui.unit.Dp, modifier: Modifier =
     )
 }
 
-// OpenNowAppIcon (was OpenNowScreens.kt:14823)
 @Composable
 private fun OpenNowAppIcon(size: androidx.compose.ui.unit.Dp) {
     Image(
@@ -2815,7 +2737,6 @@ private fun OpenNowAppIcon(size: androidx.compose.ui.unit.Dp) {
     )
 }
 
-// label (was OpenNowScreens.kt:14833)
 internal val ColorQuality.label: String
     get() = when (this) {
         ColorQuality.EightBit420 -> "8-bit 4:2:0"
@@ -2824,7 +2745,6 @@ internal val ColorQuality.label: String
         ColorQuality.TenBit444 -> "10-bit 4:4:4"
     }
 
-// GameCardOverlayGradient (was OpenNowScreens.kt:14841)
 internal val GameCardOverlayGradient = Brush.verticalGradient(
     colors = listOf(Color.Transparent, Color.Transparent, Color.Black.copy(alpha = 0.95f))
 )

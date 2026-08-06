@@ -1,6 +1,5 @@
 package com.opencloudgaming.opennow
 
-
 import android.content.Context
 import android.content.res.Configuration
 import android.content.Intent
@@ -79,10 +78,6 @@ import kotlin.math.min
 import kotlin.math.floor
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 
-
-
-
-// LoginScreen (was OpenNowScreens.kt:1321)
 @Composable
 internal fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     val signInFocusRequester = remember { FocusRequester() }
@@ -326,7 +321,6 @@ internal fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
     }
 }
 
-// shouldUseDedicatedTvPairingLayout (was OpenNowScreens.kt:1564)
 internal fun shouldUseDedicatedTvPairingLayout(
     tvProfile: Boolean,
     hosting: Boolean,
@@ -334,7 +328,6 @@ internal fun shouldUseDedicatedTvPairingLayout(
     availableHeightDp: Float,
 ): Boolean = tvProfile && hosting && (availableHeightDp < 500f || availableWidthDp < 760f)
 
-// TvPhoneSignInConnector (was OpenNowScreens.kt:1571)
 @Composable
 private fun TvPhoneSignInConnector(
     state: OpenNowUiState,
@@ -431,7 +424,6 @@ private fun TvPhoneSignInConnector(
     connector.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 }
 
-// PairingCodeDisplay (was OpenNowScreens.kt:1667)
 @Composable
 private fun PairingCodeDisplay(code: String?, compact: Boolean) {
     val digits = code?.takeIf { it.length == 4 && it.all(Char::isDigit) } ?: "----"
@@ -459,7 +451,6 @@ private fun PairingCodeDisplay(code: String?, compact: Boolean) {
     }
 }
 
-// TvDeviceLoginScreen (was OpenNowScreens.kt:1694)
 @Composable
 private fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCancel: () -> Unit) {
     BoxWithConstraints(
@@ -484,7 +475,6 @@ private fun TvDeviceLoginScreen(prompt: DeviceLoginPrompt, phase: String, onCanc
     }
 }
 
-// DeviceLoginPanel (was OpenNowScreens.kt:1718)
 @Composable
 internal fun DeviceLoginPanel(
     prompt: DeviceLoginPrompt,
@@ -580,7 +570,6 @@ internal fun DeviceLoginPanel(
     }
 }
 
-// shouldUseSideBySideDeviceLoginLayout (was OpenNowScreens.kt:1813)
 internal fun shouldUseSideBySideDeviceLoginLayout(
     orientation: Int,
     preferLandscapeLayout: Boolean,
@@ -589,7 +578,6 @@ internal fun shouldUseSideBySideDeviceLoginLayout(
     preferLandscapeLayout ||
         (orientation == Configuration.ORIENTATION_LANDSCAPE && availableWidth >= CONTENT_COMPACT_MAX_WIDTH)
 
-// DeviceLoginQr (was OpenNowScreens.kt:1821)
 @Composable
 private fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.Dp, modifier: Modifier = Modifier) {
     qrCode?.let {
@@ -603,7 +591,6 @@ private fun DeviceLoginQr(qrCode: QrCode?, qrMaxSize: androidx.compose.ui.unit.D
     }
 }
 
-// DeviceLoginControls (was OpenNowScreens.kt:1834)
 @Composable
 private fun DeviceLoginControls(
     launchUrl: String,
@@ -664,7 +651,6 @@ private fun DeviceLoginControls(
     }
 }
 
-// openExternalUrl (was OpenNowScreens.kt:1894)
 internal fun openExternalUrl(context: android.content.Context, url: String): Boolean {
     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     return runCatching {
@@ -673,7 +659,6 @@ internal fun openExternalUrl(context: android.content.Context, url: String): Boo
     }.getOrDefault(false)
 }
 
-// QrCodeView (was OpenNowScreens.kt:1902)
 @Composable
 internal fun QrCodeView(qrCode: QrCode, modifier: Modifier = Modifier) {
     Canvas(
@@ -700,7 +685,6 @@ internal fun QrCodeView(qrCode: QrCode, modifier: Modifier = Modifier) {
     }
 }
 
-// ProviderPicker (was OpenNowScreens.kt:14642)
 @Composable
 private fun ProviderPicker(providers: List<LoginProvider>, selected: LoginProvider, onSelect: (LoginProvider) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
