@@ -1004,7 +1004,7 @@ private fun CompletedSessionBugReportDialog(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
+                                .clip(RoundedCornerShape(OpenNowRadius.sm))
                                 .clickable(enabled = !submission.uploading) {
                                     consentChecked = !consentChecked
                                 },
@@ -1237,7 +1237,8 @@ private fun AnalyticsConsentDialog(
     onDecline: () -> Unit,
 ) {
     AlertDialog(
-        onDismissRequest = onDecline,            title = { Text(stringResource(R.string.analytics_share_title)) },
+        onDismissRequest = onDecline,
+        title = { Text(stringResource(R.string.analytics_share_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
@@ -1390,7 +1391,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(if (compactForPhonePairing) 12.dp else 24.dp),
+                    .padding(if (compactForPhonePairing) OpenNowSpacing.md else OpenNowSpacing.xl),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
@@ -1398,15 +1399,15 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     size = if (compactForPhonePairing) 56.dp else 88.dp,
                     modifier = Modifier.clickable(onClick = viewModel::recordLoginIconTap),
                 )
-                Spacer(Modifier.height(if (compactForPhonePairing) 8.dp else 20.dp))
+                Spacer(Modifier.height(if (compactForPhonePairing) OpenNowSpacing.sm else 20.dp))
                 Text(
-                    "OpenNOW",
+                    stringResource(R.string.login_opennow_title),
                     color = TextPrimary,
                     style = if (compactForPhonePairing) MaterialTheme.typography.headlineLarge else MaterialTheme.typography.displaySmall,
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "Native Android GeForce NOW client",
+                    stringResource(R.string.login_opennow_subtitle),
                     color = TextMuted,
                     style = if (compactForPhonePairing) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
                 )
@@ -1443,7 +1444,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     }
                     if (!tvLogin && deviceCodeLoginAvailable) {
                         TextButton(onClick = { viewModel.loginWithCode() }, enabled = !normalLoginBusy) {
-                            Text("Use code sign-in")
+                            Text(stringResource(R.string.login_use_code))
                         }
                     }
                     Button(
@@ -1454,7 +1455,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                             contentColor = MaterialTheme.colorScheme.onTertiary
                         )
                     ) {
-                        Text("Sign in with ChizuiLogin")
+                        Text(stringResource(R.string.login_with_chizui))
                     }
 
                     if (tvLogin) {
@@ -1463,7 +1464,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 }
                 if (state.error != null) {
                     Spacer(Modifier.height(14.dp))
-                    Text(state.error.orEmpty(), color = Color(0xffff9f9f))
+                    Text(state.error.orEmpty(), color = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -1545,7 +1546,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         singleLine = false,
                     )
                     Text(
-                        "Only use credentials for an account you control.",
+                        stringResource(R.string.login_token_warning),
                         color = TextMuted,
                         style = MaterialTheme.typography.bodySmall,
                     )
