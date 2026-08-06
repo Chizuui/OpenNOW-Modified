@@ -29,7 +29,7 @@ test("buildNvstSdp includes stream quality and partially reliable input paramete
     "a=video.clientViewportHt:1440",
     "a=video.maxFPS:120",
     "a=video.initialBitrateKbps:20000",
-    "a=video.initialPeakBitrateKbps:20000",
+    "a=video.initialPeakBitrateKbps:80000", // peak mirrors maxBitrate (not the startup rate)
     "a=vqos.bw.maximumBitrateKbps:80000",
     "a=vqos.bw.minimumBitrateKbps:4000",
     "a=vqos.bw.peakBitrateKbps:80000",
@@ -79,12 +79,14 @@ test("buildNvstSdp applies the official 90 FPS capture profile", () => {
   });
 
   const lines = new Set(sdp.split(/\r?\n/));
+  // The 90 FPS capture profile quirks below stay active, but maxFPS is forced
+  // to 120 regardless of the requested FPS (see buildNvstSdp "ponytail" note).
   for (const line of [
-    "a=video.maxFPS:90",
+    "a=video.maxFPS:120",
     "a=video.framePacing.pid.minTargetFrameTimeUs:10555",
     "a=vqos.dfc.enable:1",
     "a=vqos.dfc.dfcAlgoVersion:1",
-    "a=vqos.dfc.minTargetFps:60",
+    "a=vqos.dfc.minTargetFps:100",
     "a=video.fbcDynamicFpsGrabTimeoutMs:9",
     "a=vqos.resControl.cpmRtc.decodeTimeThresholdMs:11",
   ]) {
