@@ -78,7 +78,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
@@ -140,9 +139,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScaffoldDefaults
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -197,7 +194,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.zIndex
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.FocusRequester
@@ -276,8 +272,6 @@ import com.opencloudgaming.opennow.ui.adaptive.windowWidthSizeClassOf
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
-import java.text.DateFormat
-import java.util.Date
 import java.util.Locale
 import kotlin.math.min
 import kotlin.math.floor
@@ -1323,16 +1317,6 @@ private fun AndroidUpdatePromptDialog(
     )
 }
 
-@Composable
-private fun LoadingScreen(text: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            OpenNowMark(72.dp)
-            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-            Text(text, color = TextMuted)
-        }
-    }
-}
 
 @Composable
 private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
@@ -1348,9 +1332,9 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                 output.write(pendingLogText.toByteArray(Charsets.UTF_8))
             } ?: error("Could not open log file")
         }.onSuccess {
-            Toast.makeText(context, "Logs exported", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.login_logs_exported), Toast.LENGTH_SHORT).show()
         }.onFailure { error ->
-            Toast.makeText(context, error.message ?: "Could not export logs", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, error.message ?: context.getString(R.string.login_logs_export_failed), Toast.LENGTH_LONG).show()
         }
     }
     val tvLogin = state.androidTvProfile
@@ -1499,7 +1483,10 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(if (tvLogin) "Export logs with QR" else "Export logs")
+                        Text(
+                            if (tvLogin) stringResource(R.string.login_logs_export_qr)
+                            else stringResource(R.string.settings_logs_export),
+                        )
                     }
                 }
             },
@@ -1557,7 +1544,7 @@ private fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                     onClick = submitToken,
                     enabled = tokenInput.isNotBlank() && !normalLoginBusy,
                 ) {
-                    Text("Sign in")
+                    Text(stringResource(R.string.login_sign_in))
                 }
             },
             dismissButton = {
@@ -1595,7 +1582,10 @@ private fun TvPhoneSignInConnector(
             enabled = !connector.busy,
             modifier = modifier,
         ) {
-            Text(if (connector.busy) "Starting phone pairing…" else "Sign in from OpenNOW on phone")
+            Text(
+                if (connector.busy) stringResource(R.string.login_pair_starting)
+                else stringResource(R.string.login_pair_start),
+            )
         }
     } else {
         val qrCode = remember(connector.pairUri) { connector.pairUri?.let(QrCode::encodeText) }
@@ -1633,16 +1623,17 @@ private fun TvPhoneSignInConnector(
                     }
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (dedicated) 10.dp else 8.dp)) {
                         Text(
-                            if (connector.pairedDeviceName == null) "Pair your phone" else "Phone connected",
+                            if (connector.pairedDeviceName == null) stringResource(R.string.login_pair_title)
+                            else stringResource(R.string.login_pair_connected),
                             color = TextPrimary,
                             style = if (dedicated) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                         )
                         Text(
                             if (connector.pairedDeviceName == null) {
-                                "Your TV and phone must be on the same Wi-Fi. Scan the QR code with your phone camera; the pairing code expires after five minutes."
+                                stringResource(R.string.login_pair_body)
                             } else {
-                                "${connector.pairedDeviceName} can launch games. Approve trust below for settings, overlays, sessions, and account switching."
+                                stringResource(R.string.login_pair_connected_body, connector.pairedDeviceName)
                             },
                             color = TextMuted,
                             style = if (dedicated) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
@@ -1654,13 +1645,16 @@ private fun TvPhoneSignInConnector(
                         }
                         if (connector.pairedDeviceName != null) {
                             SettingSwitch(
-                                label = "Trust this phone",
+                                label = stringResource(R.string.login_pair_trust_label),
                                 checked = connector.pairedDeviceTrusted,
-                                description = "Required before the phone can transfer an account or control TV settings and sessions.",
+                                description = stringResource(R.string.login_pair_trust_description),
                             ) { trusted -> viewModel.setLocalTvDeviceTrusted(trusted) }
                         }
                         OutlinedButton(onClick = viewModel::stopLocalTvConnector) {
-                            Text(if (connector.pairedDeviceName == null) "Cancel pairing" else "Disconnect phone")
+                            Text(
+                                if (connector.pairedDeviceName == null) stringResource(R.string.login_pair_cancel)
+                                else stringResource(R.string.login_pair_disconnect),
+                            )
                         }
                     }
                 }
@@ -1674,7 +1668,7 @@ private fun TvPhoneSignInConnector(
 private fun PairingCodeDisplay(code: String?, compact: Boolean) {
     val digits = code?.takeIf { it.length == 4 && it.all(Char::isDigit) } ?: "----"
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("PAIRING CODE", color = TextMuted, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+        Text(stringResource(R.string.login_pair_code), color = TextMuted, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
         Row(horizontalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 8.dp)) {
             digits.forEach { digit ->
                 Surface(
@@ -1865,10 +1859,10 @@ private fun DeviceLoginControls(
             onClick = {
                 val opened = openExternalUrl(context, launchUrl)
                 if (opened) {
-                    onUrlActionMessage("Opening sign-in URL")
+                    onUrlActionMessage(context.getString(R.string.login_url_opening))
                 } else {
                     clipboardManager.setText(AnnotatedString(launchUrl))
-                    onUrlActionMessage("URL copied")
+                    onUrlActionMessage(context.getString(R.string.login_url_copied))
                 }
             },
             modifier = if (focusCancel) Modifier else Modifier.focusRequester(focusRequester),
@@ -1937,8 +1931,6 @@ internal fun secondsUntil(deadlineMs: Long): Int =
 private fun isPhoneLandscape(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
     width > height && windowSizeClassOf(width, height).isPhone
 
-private fun isPhonePortrait(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp): Boolean =
-    height >= width && windowSizeClassOf(width, height).isPhone
 
 @Composable
 internal fun rememberPhysicalControllerConnected(enabled: Boolean): Boolean {
@@ -3520,54 +3512,6 @@ private fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
 
 private const val LIBRARY_STORE_FILTER_PREFIX = "library_store:"
 
-@Composable
-private fun ActiveSessionResumeCard(
-    state: OpenNowUiState,
-    onResumeActiveSession: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val active = state.activeSession ?: return
-    val game = activeSessionGame(state, active)
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        color = PanelAlt.copy(alpha = 0.92f),
-        tonalElevation = 3.dp,
-    ) {
-        Row(
-            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            UrlImage(
-                game?.imageUrl,
-                Modifier
-                    .width(44.dp)
-                    .height(58.dp)
-                    .clip(RoundedCornerShape(10.dp)),
-            )
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Resume cloud session", color = TextPrimary, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    game?.title ?: "App ${active.appId}",
-                    color = TextMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    activeSessionSummary(active),
-                    color = TextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Button(onClick = onResumeActiveSession, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)) {
-                Text(stringResource(R.string.action_resume), maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-    }
-}
 
 private fun activeSessionGame(state: OpenNowUiState, active: ActiveSessionInfo): GameInfo? =
     (state.games + state.libraryGames).firstOrNull { game ->
@@ -6509,26 +6453,6 @@ private fun GameImageTitleOverlay(
     }
 }
 
-@Composable
-private fun GameTitleBlock(game: GameInfo, compact: Boolean) {
-    Column(verticalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 5.dp)) {
-        Text(
-            game.title,
-            color = TextPrimary,
-            style = if (compact) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold,
-            maxLines = if (compact) 2 else 3,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            game.publisherName?.takeIf { it.isNotBlank() } ?: "Unknown publisher",
-            color = TextMuted,
-            style = MaterialTheme.typography.bodyMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
 
 @Composable
 private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
@@ -7642,7 +7566,7 @@ private fun StreamScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                             doneButtonTone()
                             touchLayoutEditing = false
                         },
-                        shape = RoundedCornerShape(999.dp),
+                        shape = RoundedCornerShape(OpenNowRadius.full),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.primary,
                         ),
@@ -8095,7 +8019,7 @@ private fun StreamSessionTimerMenuRow(
     Column(
         modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(OpenNowRadius.md))
             .background(Color.White.copy(alpha = 0.06f))
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(7.dp),
@@ -8118,7 +8042,7 @@ private fun StreamSessionTimerMenuRow(
             Modifier
                 .fillMaxWidth()
                 .height(4.dp)
-                .clip(RoundedCornerShape(999.dp))
+                .clip(RoundedCornerShape(OpenNowRadius.full))
                 .background(Color.White.copy(alpha = 0.12f)),
         ) {
             Box(
@@ -8660,59 +8584,6 @@ private fun NoActiveStreamScreen(
     }
 }
 
-@Composable
-private fun StreamControlLauncher(
-    controlsOpen: Boolean,
-    status: String?,
-    onToggle: () -> Unit,
-    onExit: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier
-            .padding(top = 10.dp, end = 10.dp)
-            .onGloballyPositioned { coordinates ->
-                val bounds = coordinates.boundsInRoot()
-                NativeStreamInputRouter.setUiTouchPassthroughBounds(
-                    bounds.left.roundToInt(),
-                    bounds.top.roundToInt(),
-                    bounds.right.roundToInt(),
-                    bounds.bottom.roundToInt(),
-                )
-            },
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (status != null) {
-            Surface(
-                shape = RoundedCornerShape(999.dp),
-                color = Panel.copy(alpha = 0.8f),
-                tonalElevation = 3.dp,
-            ) {
-                Text(
-                    status,
-                    color = TextMuted,
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                )
-            }
-        }
-        Button(onClick = onToggle, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
-            Text(if (controlsOpen) "Close" else "Controls")
-        }
-        OutlinedButton(onClick = onExit, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
-            Text("Exit")
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            NativeStreamInputRouter.clearUiTouchPassthroughBounds()
-        }
-    }
-}
 
 @Composable
 private fun StreamFirstLaunchGuide(
@@ -8905,7 +8776,7 @@ private fun PhysicalControllerTouchControlsDialog(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
+                        .clip(RoundedCornerShape(OpenNowRadius.md))
                         .clickable { onDoNotShowAgainChange(!doNotShowAgain) }
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -8951,7 +8822,7 @@ private fun StreamGuideEdgeCue(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .align(Alignment.CenterStart)
                 .padding(start = 14.dp),
-            shape = RoundedCornerShape(999.dp),
+            shape = RoundedCornerShape(OpenNowRadius.full),
             color = MaterialTheme.colorScheme.primary.copy(alpha = 0.92f),
             tonalElevation = 6.dp,
         ) {
@@ -8977,7 +8848,7 @@ private fun StreamGuidePoint(number: Int, body: String) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(OpenNowRadius.md))
             .background(Color.White.copy(alpha = 0.06f))
             .padding(horizontal = 12.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -9916,7 +9787,7 @@ private fun BugReportPreflightDeckView(
     val accent = when (card.tone) {
         BugReportPreflightTone.Healthy -> Green
         BugReportPreflightTone.Notice -> MaterialTheme.colorScheme.primary
-        BugReportPreflightTone.Warning -> Color(0xffffc266)
+        BugReportPreflightTone.Warning -> OpenNowPalette.StatusNotice
     }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -9946,7 +9817,7 @@ private fun BugReportPreflightDeckView(
                     Modifier
                         .height(4.dp)
                         .weight(1f)
-                        .clip(RoundedCornerShape(999.dp))
+                        .clip(RoundedCornerShape(OpenNowRadius.full))
                         .background(if (index <= page) accent else Color.White.copy(alpha = 0.10f)),
                 )
             }
@@ -9961,7 +9832,7 @@ private fun BugReportPreflightDeckView(
             val targetAccent = when (targetCard.tone) {
                 BugReportPreflightTone.Healthy -> Green
                 BugReportPreflightTone.Notice -> MaterialTheme.colorScheme.primary
-                BugReportPreflightTone.Warning -> Color(0xffffc266)
+                BugReportPreflightTone.Warning -> OpenNowPalette.StatusNotice
             }
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -9998,7 +9869,7 @@ private fun BugReportPreflightDeckView(
                         ) {
                             targetCard.facts.forEach { fact ->
                                 Surface(
-                                    shape = RoundedCornerShape(999.dp),
+                                    shape = RoundedCornerShape(OpenNowRadius.full),
                                     color = PanelAlt,
                                     border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
                                 ) {
@@ -10998,7 +10869,7 @@ private fun ActiveStreamModePill(
                     detailsOpen = true
                 }
                 .focusable(),
-            shape = RoundedCornerShape(999.dp),
+            shape = RoundedCornerShape(OpenNowRadius.full),
             color = Color(0xff4a2f0b).copy(alpha = 0.88f),
             tonalElevation = 0.dp,
         ) {
@@ -11029,7 +10900,7 @@ private fun ActiveStreamModePill(
                 ) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(OpenNowRadius.md),
                         color = OpenNowPalette.StatusNotice.copy(alpha = 0.10f),
                         contentColor = TextPrimary,
                         border = BorderStroke(1.dp, OpenNowPalette.StatusNotice.copy(alpha = 0.32f)),
@@ -12473,7 +12344,7 @@ private fun QueueStatusPanel(
         }
         error?.let {
             Spacer(Modifier.height(12.dp))
-            Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+            Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
         }
     }
 }
@@ -12482,7 +12353,7 @@ private fun QueueStatusPanel(
 private fun LandscapeQueuePositionDock(queuePosition: Int, modifier: Modifier = Modifier) {
     val accent = queueUrgencyColor(queuePosition)
     val heat = queueUrgency(queuePosition)
-    val shape = RoundedCornerShape(16.dp)
+    val shape = RoundedCornerShape(OpenNowRadius.lg)
     Box(
         modifier
             .fillMaxWidth(0.92f)
@@ -12589,7 +12460,7 @@ private fun QueueAdPanel(
                         onCancel = onCancel,
                     )
                     error?.let {
-                        Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+                        Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
                     }
                 }
             }
@@ -12618,7 +12489,7 @@ private fun QueueAdPanel(
                     onCancel = onCancel,
                 )
                 error?.let {
-                    Text(it, color = Color(0xffff9f9f), textAlign = TextAlign.Center)
+                    Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
                 }
             }
         }
@@ -12865,7 +12736,7 @@ private fun QueueAdPlayer(
     }
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(OpenNowRadius.sm))
             .clickable { controlsVisible = true },
     ) {
         AndroidView(
@@ -12883,7 +12754,7 @@ private fun QueueAdPlayer(
             Row(
                 modifier = Modifier
                     .padding(bottom = 12.dp)
-                    .clip(RoundedCornerShape(999.dp))
+                    .clip(RoundedCornerShape(OpenNowRadius.full))
                     .background(Color.Black.copy(alpha = 0.58f))
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -13581,7 +13452,7 @@ private fun TouchControlGroup(
             ) {
                 Surface(
                     color = MaterialTheme.colorScheme.primary.copy(alpha = 0.9f),
-                    shape = RoundedCornerShape(999.dp),
+                    shape = RoundedCornerShape(OpenNowRadius.full),
                     modifier = Modifier.padding(top = 4.dp),
                 ) {
                     Text(
@@ -13617,44 +13488,6 @@ internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
     return if (clampedValue < 0f) -adjusted else adjusted
 }
 
-@Composable
-private fun StickWithThumbButton(
-    stickLabel: String,
-    thumbLabel: String,
-    thumbMask: Int,
-    client: NativeStreamClient,
-    opacity: Float,
-    diameter: Dp,
-    buttonScale: Float,
-    mode: TouchJoystickMode = TouchJoystickMode.Fixed,
-    deadZone: Float = 0f,
-    onButtonTone: () -> Unit,
-    onChange: (Float, Float) -> Unit,
-) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        GamepadPillButton(
-            label = thumbLabel,
-            mask = thumbMask,
-            client = client,
-            opacity = opacity,
-            width = 56.dp * buttonScale,
-            height = 34.dp * buttonScale,
-            onPressTone = onButtonTone,
-        )
-        VirtualStick(
-            label = stickLabel,
-            client = client,
-            opacity = opacity,
-            diameter = diameter,
-            mode = mode,
-            deadZone = deadZone,
-            onChange = onChange,
-        )
-    }
-}
 
 @Composable
 private fun VirtualStick(
@@ -14188,66 +14021,6 @@ private fun GamepadButton(
     }
 }
 
-@Composable
-private fun GamepadPillButton(
-    label: String,
-    mask: Int,
-    client: NativeStreamClient,
-    opacity: Float,
-    width: androidx.compose.ui.unit.Dp,
-    height: androidx.compose.ui.unit.Dp,
-    onPressTone: () -> Unit = {},
-) {
-    val currentOnPressTone by rememberUpdatedState(onPressTone)
-    var pressed by remember { mutableStateOf(false) }
-    val currentOnPressedChange = rememberUpdatedState<(Boolean) -> Unit> { down ->
-        if (down != pressed) {
-            client.setVirtualButton(mask, down)
-            pressed = down
-            if (down) currentOnPressTone()
-        }
-    }
-    val style = LocalTouchControllerStyle.current
-    val buttonColor = if (style == TouchControllerStyle.V2) {
-        Color.Transparent
-    } else {
-        Color.Black.copy(alpha = opacity * 0.6f)
-    }
-    val pressedColor = if (style == TouchControllerStyle.V2) {
-        Color.White.copy(alpha = opacity * 0.15f)
-    } else {
-        Color.White.copy(alpha = opacity * 0.2f)
-    }
-    val borderColor = if (style == TouchControllerStyle.V2) {
-        if (pressed) Color.White.copy(alpha = opacity * 0.9f) else Color.White.copy(alpha = opacity * 0.5f)
-    } else {
-        Color.White.copy(alpha = opacity * 0.4f)
-    }
-    val borderWidth = if (style == TouchControllerStyle.V2 && pressed) 2.dp else 1.dp
-    Box(
-        Modifier
-            .width(width)
-            .height(height)
-            .clip(RoundedCornerShape(999.dp))
-            .background(if (pressed) pressedColor else buttonColor)
-            .border(borderWidth, borderColor, RoundedCornerShape(999.dp))
-            .virtualPressInput(client, mask, currentOnPressedChange),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            label,
-            fontWeight = FontWeight.SemiBold,
-            color = Color.White.copy(alpha = opacity * 0.9f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-    DisposableEffect(client, mask) {
-        onDispose {
-            client.setVirtualButton(mask, false)
-        }
-    }
-}
 
 @Composable
 private fun SortPicker(
@@ -14260,7 +14033,7 @@ private fun SortPicker(
     val labels = options.ifEmpty { listOf(CatalogSortOption("relevance", "Relevance", "")) }
     val selectedLabel = labels.firstOrNull { it.id == selected }?.label ?: labels.first().label
     var expanded by remember { mutableStateOf(false) }
-    val controlShape = RoundedCornerShape(999.dp)
+    val controlShape = RoundedCornerShape(OpenNowRadius.full)
     val controlColor = Color.White.copy(alpha = 0.1f)
     Box(modifier) {
         OutlinedButton(
@@ -14329,7 +14102,7 @@ private fun FilterMenu(
     compact: Boolean = false,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val filterControlShape = RoundedCornerShape(999.dp)
+    val filterControlShape = RoundedCornerShape(OpenNowRadius.full)
     val filterControlColor = Color.White.copy(alpha = 0.1f)
     Box {
         OutlinedButton(
@@ -14367,13 +14140,13 @@ private fun FilterMenu(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
+                                    .clip(RoundedCornerShape(OpenNowRadius.sm))
                                     .onFocusChanged { rowFocused = it.isFocused }
                                     .background(if (rowFocused) Color.White.copy(alpha = 0.08f) else Color.Transparent)
                                     .border(
                                         width = 1.dp,
                                         color = if (rowFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                        shape = RoundedCornerShape(8.dp)
+                                        shape = RoundedCornerShape(OpenNowRadius.sm)
                                     )
                                     .clickable { onToggle(option.id) }
                                     .padding(horizontal = 8.dp, vertical = 6.dp),
@@ -14504,7 +14277,7 @@ private fun PrintedWasteSelector(
                                 Modifier
                                     .width(98.dp)
                                     .aspectRatio(16f / 9f)
-                                    .clip(RoundedCornerShape(12.dp)),
+                                    .clip(RoundedCornerShape(OpenNowRadius.md)),
                             )
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
@@ -14545,7 +14318,7 @@ private fun PrintedWasteGameSummary(
             Modifier
                 .fillMaxWidth()
                 .aspectRatio(16f / 9f)
-                .clip(RoundedCornerShape(16.dp)),
+                .clip(RoundedCornerShape(OpenNowRadius.lg)),
         )
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(game.title, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -14601,7 +14374,7 @@ private fun PrintedWasteOptionsColumn(
         } else if (state.printedWasteError != null) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(state.printedWasteError, color = Color(0xffff9f9f))
+                    Text(state.printedWasteError, color = MaterialTheme.colorScheme.error)
                     OutlinedButton(onClick = onRetry) { Text("Retry") }
                 }
             }
@@ -14695,7 +14468,7 @@ private fun PrintedWasteOptionsColumn(
 private fun RecommendedPrintedWasteCard(zoneOption: PrintedWasteZoneOption) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(OpenNowRadius.lg),
         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
     ) {
         Row(
@@ -14731,14 +14504,14 @@ private fun PrintedWasteZoneRow(
         modifier = Modifier
             .fillMaxWidth()
             .focusProperties { canFocus = false }
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(OpenNowRadius.md))
             .border(
                 width = 2.dp,
                 color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(OpenNowRadius.md)
             )
             .clickable { onClick() },
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(OpenNowRadius.md),
         color = if (focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.28f) else if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else PanelAlt,
         tonalElevation = if (selected) 2.dp else 0.dp,
         border = if (selected && listFocused) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,

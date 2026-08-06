@@ -1041,7 +1041,7 @@ private fun SettingsContent(
 
 @Composable
 private fun LowPowerStreamWarning(reasons: List<String>) {
-    val warningColor = Color(0xffffc266)
+    val warningColor = OpenNowPalette.StatusNotice
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),

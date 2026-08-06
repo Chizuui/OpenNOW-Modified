@@ -389,6 +389,27 @@
     <string name="login_token_label">Access token</string>
     <string name="login_token_warning">Only use credentials for an account you control.</string>
 
+    <!-- Login: TV to phone pairing -->
+    <string name="login_pair_start">Sign in from OpenNOW on phone</string>
+    <string name="login_pair_starting">Starting phone pairing…</string>
+    <string name="login_pair_title">Pair your phone</string>
+    <string name="login_pair_connected">Phone connected</string>
+    <string name="login_pair_body">Your TV and phone must be on the same Wi-Fi. Scan the QR code with your phone camera; the pairing code expires after five minutes.</string>
+    <string name="login_pair_connected_body">%1$s can launch games. Approve trust below for settings, overlays, sessions, and account switching.</string>
+    <string name="login_pair_trust_label">Trust this phone</string>
+    <string name="login_pair_trust_description">Required before the phone can transfer an account or control TV settings and sessions.</string>
+    <string name="login_pair_cancel">Cancel pairing</string>
+    <string name="login_pair_disconnect">Disconnect phone</string>
+    <string name="login_pair_code">PAIRING CODE</string>
+
+    <!-- Login: device-code URL actions and tools -->
+    <string name="login_url_opening">Opening sign-in URL</string>
+    <string name="login_url_copied">URL copied</string>
+    <string name="login_sign_in">Sign in</string>
+    <string name="login_logs_export_qr">Export logs with QR</string>
+    <string name="login_logs_exported">Logs exported</string>
+    <string name="login_logs_export_failed">Could not export logs</string>
+
     <!-- Settings Panels -->
     <string name="settings_clear_cache_title">Clear game cache?</string>
     <string name="settings_clear_cache_body">Cached store, library, and search results will be removed. Your account and settings stay unchanged.</string>
