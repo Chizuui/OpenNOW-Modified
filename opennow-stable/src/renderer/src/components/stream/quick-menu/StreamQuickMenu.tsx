@@ -68,6 +68,12 @@ interface StreamQuickMenuProps {
   onRecordingBitrateMbpsChange: (value: number | null) => void;
   maxBitrateMbps: number;
   onMaxBitrateMbpsChange: (value: number) => void;
+  recordingResolution: string;
+  onRecordingResolutionChange: (value: string) => void;
+  recordingFps: number;
+  onRecordingFpsChange: (value: number) => void;
+  recordingBitrateMbps: number | null;
+  onRecordingBitrateMbpsChange: (value: number | null) => void;
 }
 
 export function StreamQuickMenu({
@@ -120,6 +126,12 @@ export function StreamQuickMenu({
   onRecordingBitrateMbpsChange,
   maxBitrateMbps,
   onMaxBitrateMbpsChange,
+  recordingResolution,
+  onRecordingResolutionChange,
+  recordingFps,
+  onRecordingFpsChange,
+  recordingBitrateMbps,
+  onRecordingBitrateMbpsChange,
 }: StreamQuickMenuProps): JSX.Element {
   const micMeterRef = useRef<HTMLCanvasElement | null>(null);
   useMicMeter(micMeterRef, micTrack, open && microphoneMode !== "disabled");
