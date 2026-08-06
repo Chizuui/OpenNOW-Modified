@@ -833,17 +833,17 @@ export class GfnWebRtcClient {
       return;
     }
     const normalizedKbps = Math.max(OFFICIAL_MIN_BITRATE_KBPS, Math.floor(kbps));
-    const updatedSdp = this.replaceVideoBitrateInSdp(
-      this.pc.localDescription.sdp,
-      normalizedKbps,
-    );
-    try {
-      await this.pc.setLocalDescription(
-        new RTCSessionDescription({ type: this.pc.localDescription.type, sdp: updatedSdp }),
-      );
-      this.log(`Bitrate ceiling updated to ${normalizedKbps} kbps via local SDP`);
-    } catch (err) {
-      this.log(`setMaxBitrateKbps failed (non-fatal): ${String(err)}`);
+    const videoSender = this.pc.getSenders().find(s => s.track?.kind === 'video');
+    if (videoSender) {
+      const params = videoSender.getParameters();
+      if (!params.encodings) {
+        params.encodings = [{}];
+      }
+      params.encodings[0].maxBitrate = normalizedKbps * 1000;
+      await videoSender.setParameters(params);
+      this.log(`Bitrate ceiling updated to ${normalizedKbps} kbps via sender parameters`);
+    } else {
+      this.log("Could not find video sender to update bitrate");
     }
   }
 

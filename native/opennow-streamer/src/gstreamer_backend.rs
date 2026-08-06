@@ -513,12 +513,20 @@ impl NativeStreamerBackend for GstreamerBackend {
         let max_bitrate_kbps = normalize_bitrate_kbps(max_bitrate_kbps);
         update_context_bitrate_limit(&mut self.active_context, max_bitrate_kbps);
 
+        let mut message = format!(
+            "Updated native bitrate limit to {max_bitrate_kbps} Kbps. The active GFN server bitrate cap is negotiated in NVST SDP and will apply on the next native offer/reconnect."
+        );
+        if let Some(context) = self.active_context.as_ref() {
+            if let Some(pipeline) = self.pipeline.as_ref() {
+                pipeline.configure_stats(context, max_bitrate_kbps);
+                message = format!("Updated native bitrate limit to {max_bitrate_kbps} Kbps.");
+            }
+        }
+
         BackendReply {
             events: vec![Event::Log {
                 level: "info",
-                message: format!(
-                    "Updated native bitrate limit to {max_bitrate_kbps} Kbps. The active GFN server bitrate cap is negotiated in NVST SDP and will apply on the next native offer/reconnect."
-                ),
+                message,
             }],
             response: Some(Response::Ok { id: command.id }),
             should_continue: true,
