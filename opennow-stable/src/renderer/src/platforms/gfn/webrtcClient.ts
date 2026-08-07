@@ -40,6 +40,7 @@ import {
   mungeAnswerSdp,
   OFFICIAL_MIN_BITRATE_KBPS,
   preferCodec,
+  resolveNegotiationCandidates,
   rewriteIceCandidateEndpoint,
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,
@@ -2347,7 +2348,28 @@ export class GfnWebRtcClient {
     const supported = this.getSupportedVideoCodecs();
     this.log(`Browser supported video codecs: ${supported.join(", ") || "unknown"}`);
 
-    if (settings.codec === "H265" || fallbackVideoCodec === "H265") {
+    // Ordered list of codecs to attempt, primary first. Computed up front so
+    // the HEVC compatibility rewrites below also run whenever H265 is a retry
+    // candidate (e.g. primary H264 + auto fallback) — otherwise the server's
+    // H265 payloads keep level/tier flags this device can't decode and
+    // createAnswer rejects the whole video m-line again.
+    const negotiationCandidates = resolveNegotiationCandidates(
+      effectiveCodec,
+      fallbackVideoCodec,
+      supported,
+    );
+    this.log(`Negotiation codec candidates: ${negotiationCandidates.join(" -> ")}`);
+    if (negotiationCandidates.length === 0) {
+      throw new Error(
+        `No negotiable video codec (browser receiver capabilities support none of H264/H265/AV1: ${supported.join(", ")})`,
+      );
+    }
+
+    if (
+      settings.codec === "H265"
+      || fallbackVideoCodec === "H265"
+      || negotiationCandidates.includes("H265")
+    ) {
       const hevcProfiles = this.getSupportedHevcProfiles();
       if (hevcProfiles.size > 0) {
         this.log(`Browser HEVC profile-id support: ${Array.from(hevcProfiles).join(", ")}`);
@@ -2403,55 +2425,98 @@ export class GfnWebRtcClient {
     // capabilities can list a codec that createAnswer still rejects for a given
     // server payload (seen with AV1 on the MY YES edge) — with only the
     // requested codec in the m-line the answer drops the whole video m-line and
-    // the "no video codec negotiated" guard below fails the session. The
-    // requested codec is reordered first and preferred in setCodecPreferences,
-    // so it still wins when it is actually negotiable; otherwise Chromium falls
-    // back to a decodable codec and the NVST SDP / HUD align to the negotiated
-    // codec below.
+    // the session hangs on "Waiting for game video...". The requested codec is
+    // reordered first and preferred in setCodecPreferences, so it still wins
+    // when it is actually negotiable; otherwise Chromium falls back to a
+    // decodable codec. If even that produces no video m-line (some YES edges),
+    // the negotiation loop below retries the whole answer with the next codec
+    // in the fallback order instead of failing the session immediately.
     const keepFallbacks = true;
-    const filteredOffer = preferCodec(processedOffer, effectiveCodec, {
-      preferHevcProfileId: preferredHevcProfileId,
-      keepFallbacks,
-      fallbackCodec: fallbackVideoCodec,
-    });
-    this.log(`Filtered offer SDP length: ${filteredOffer.length} chars`);
-    this.log("Setting remote description (offer)...");
-    await pc.setRemoteDescription({ type: "offer", sdp: filteredOffer });
-    this.log("Remote description set successfully");
-    await this.flushQueuedCandidates();
 
-    // Attach microphone track to the correct transceiver after remote description is set
-    if (this.micManager) {
-      this.micManager.setPeerConnection(pc);
-      await this.micManager.attachTrackToPeerConnection();
+    let answer: RTCSessionDescriptionInit | null = null;
+    let negotiatedCodec: VideoCodec | null = null;
+    let micAttached = false;
+
+    for (const candidate of negotiationCandidates) {
+      const filteredOffer = preferCodec(processedOffer, candidate, {
+        preferHevcProfileId: preferredHevcProfileId,
+        keepFallbacks,
+        fallbackCodec: fallbackVideoCodec,
+      });
+      this.log(`Negotiation attempt: ${candidate} (filtered offer ${filteredOffer.length} chars)`);
+
+      // Each retry re-applies the offer on the same peer connection. The
+      // previous attempt only reached createAnswer (never setLocalDescription),
+      // so roll back to stable before applying the next filtered offer. A
+      // rollback failure is not fatal: the follow-up setRemoteDescription is
+      // what really matters, so log and keep going.
+      if (pc.signalingState !== "stable") {
+        this.log(`Rolling back signaling state (${pc.signalingState}) before re-attempt`);
+        try {
+          await pc.setLocalDescription({ type: "rollback" });
+        } catch (rollbackError) {
+          this.log(`Rollback failed (${String(rollbackError)}); continuing retry attempt`);
+        }
+      }
+
+      this.log("Setting remote description (offer)...");
+      await pc.setRemoteDescription({ type: "offer", sdp: filteredOffer });
+      this.log(`Remote description set successfully for ${candidate}`);
+      await this.flushQueuedCandidates();
+
+      // Attach microphone track to the correct transceiver after remote
+      // description is set. Only once: retries re-negotiate the same peer
+      // connection and would otherwise add duplicate mic senders.
+      if (!micAttached && this.micManager) {
+        this.micManager.setPeerConnection(pc);
+        await this.micManager.attachTrackToPeerConnection();
+        micAttached = true;
+      }
+
+      // Apply setCodecPreferences on the video transceiver to reinforce the
+      // codec choice. This is the modern WebRTC API — more reliable than SDP
+      // munging alone. Must be called after setRemoteDescription (which
+      // creates the transceiver) but before createAnswer (which generates the
+      // answer SDP).
+      this.applyCodecPreferences(pc, candidate, preferredHevcProfileId, keepFallbacks, fallbackVideoCodec);
+
+      this.log(`Creating answer for ${candidate}...`);
+      const candidateAnswer = await pc.createAnswer();
+      this.log(`Answer created for ${candidate}, SDP length: ${candidateAnswer.sdp?.length ?? 0} chars`);
+
+      const negotiated = candidateAnswer.sdp
+        ? extractNegotiatedVideoCodec(candidateAnswer.sdp)
+        : null;
+      if (!negotiated) {
+        this.log(
+          `Warning: video m-line rejected while negotiating ${candidate}; retrying with the next codec`,
+        );
+        continue;
+      }
+
+      answer = candidateAnswer;
+      negotiatedCodec = negotiated;
+      this.log(`Negotiated ${negotiated} in the answer`);
+      break;
     }
 
-    // 3b. Apply setCodecPreferences on the video transceiver to reinforce codec choice.
-    //     This is the modern WebRTC API — more reliable than SDP munging alone.
-    //     Must be called after setRemoteDescription (which creates the transceiver)
-    //     but before createAnswer (which generates the answer SDP).
-    this.applyCodecPreferences(pc, effectiveCodec, preferredHevcProfileId, keepFallbacks, fallbackVideoCodec);
+    if (!answer || !negotiatedCodec) {
+      throw new Error(
+        `No video codec negotiated in local SDP answer (video m-line rejected for all candidates: ${negotiationCandidates.join(", ")})`,
+      );
+    }
 
-    // 4. Create answer, munge SDP, and set local description
-    this.log("Creating answer...");
-    const answer = await pc.createAnswer();
-    this.log(`Answer created, SDP length: ${answer.sdp?.length ?? 0} chars`);
-
-    // Detect the codec actually negotiated in the answer. When it differs from
-    // the requested one (codec fallback), surface it in the HUD and align the
-    // NVST SDP so the server encodes exactly what WebRTC negotiated.
-    let negotiatedCodec: VideoCodec | null = null;
-    if (answer.sdp) {
-      negotiatedCodec = extractNegotiatedVideoCodec(answer.sdp);
-      if (negotiatedCodec && negotiatedCodec !== effectiveCodec) {
-        this.log(
-          `Warning: requested codec ${effectiveCodec} was not negotiable on this device; negotiated ${negotiatedCodec} instead. Aligning NVST SDP to ${negotiatedCodec}.`,
-        );
-        this.currentCodec = negotiatedCodec;
-        this.diagnostics.codec = negotiatedCodec;
-        this.emitStats();
-        effectiveCodec = negotiatedCodec;
-      }
+    // When the negotiated codec differs from the requested one (codec
+    // fallback), surface it in the HUD and align the NVST SDP so the server
+    // encodes exactly what WebRTC negotiated.
+    if (negotiatedCodec !== effectiveCodec) {
+      this.log(
+        `Warning: requested codec ${effectiveCodec} was not negotiable on this device; negotiated ${negotiatedCodec} instead. Aligning NVST SDP to ${negotiatedCodec}.`,
+      );
+      this.currentCodec = negotiatedCodec;
+      this.diagnostics.codec = negotiatedCodec;
+      this.emitStats();
+      effectiveCodec = negotiatedCodec;
     }
 
     // Munge answer SDP: inject b=AS: bitrate limits and stereo=1 for opus
@@ -2492,10 +2557,6 @@ export class GfnWebRtcClient {
         for (const l of negotiatedVideoLines) {
           this.log(`  SDP< ${l}`);
         }
-      }
-
-      if (!negotiatedCodec) {
-        throw new Error("No video codec negotiated in local SDP answer (video m-line rejected)");
       }
     }
 

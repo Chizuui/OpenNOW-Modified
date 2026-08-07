@@ -16,6 +16,7 @@ test("sdp barrel preserves the public API", () => {
     "fixServerIp",
     "mungeAnswerSdp",
     "preferCodec",
+    "resolveNegotiationCandidates",
     "rewriteH265LevelIdByProfile",
     "rewriteH265TierFlag",
     "rewriteIceCandidateEndpoint",
