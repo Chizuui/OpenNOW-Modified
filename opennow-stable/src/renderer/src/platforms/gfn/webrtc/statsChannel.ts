@@ -29,9 +29,9 @@ export function parseStatsChannelGameFps(buf: ArrayBuffer): StatsChannelGameFps 
   if (bytes[0] === 3) {
     if (bytes.length < 2) return null;
     offset = 1;
-  } else if (bytes[0] !== 4) {
-    return null;
   }
+  // type-4: byte 0 adalah VERSION (4 atau 5), bukan gate tetap — cek via
+  // version di bawah supaya paket v5 type-4 valid tidak dibuang.
   if (bytes.length - offset < 33) return null;
   try {
     const view = new DataView(buf);

@@ -44,6 +44,14 @@ test("stats channel game FPS parses type-3 messages (1-byte header), v4 and v5",
   assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(3, 5, 90.0)), { version: 5, fps: 90 });
 });
 
+test("stats channel game FPS parses type-4 v5 messages (payload at byte 0)", () => {
+  // Regresi: gate lama menolak bytes[0] !== 4, padahal untuk type-4 byte 0
+  // adalah VERSION (bisa 5). Paket v5 type-4 valid harus tetap ke-parse supaya
+  // gameFps server-side tidak hilang di HUD.
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(4, 5, 240.3)), { version: 5, fps: 240 });
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(4, 5, 90.0)), { version: 5, fps: 90 });
+});
+
 test("stats channel game FPS rejects unknown types, old versions, and malformed payloads", () => {
   assert.equal(parseStatsChannelGameFps(buildStatsChannelMessage(5, 5, 240)), null); // unknown type
   assert.equal(parseStatsChannelGameFps(buildStatsChannelMessage(3, 3, 60)), null); // version < 4

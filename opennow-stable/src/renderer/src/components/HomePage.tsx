@@ -774,8 +774,147 @@ export const HomePage = memo(function HomePage({
           ? t("home.count.shownSupported", { shown: games.length, supported: supportedCount })
           : t("home.count.shown", { shown: games.length });
 
+  const [desktopHeroIndex, setDesktopHeroIndex] = useState(() => 0);
+  const [desktopHeroDirection, setDesktopHeroDirection] = useState(1);
+  const desktopHeroPool = useMemo(() => {
+    const candidates = games.filter((game) => getControllerStoreImageCandidates(game, true)[0] || getControllerStoreLogoUrl(game));
+    if (candidates.length <= 5) return candidates;
+    const shuffled = [...candidates];
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled.slice(0, 5);
+  }, [games]);
+  const heroCount = desktopHeroPool.length;
+  const safeHeroIndex = heroCount > 0 ? desktopHeroIndex % heroCount : 0;
+  const desktopHeroGame = desktopHeroPool[safeHeroIndex];
+  const desktopHeroImageUrl = desktopHeroGame ? getControllerStoreImageCandidates(desktopHeroGame, true)[0] : undefined;
+  const desktopHeroLogoUrl = desktopHeroGame ? getControllerStoreLogoUrl(desktopHeroGame) : undefined;
+  const desktopHeroSelectedVariantId = desktopHeroGame ? selectedVariantByGameId[desktopHeroGame.id] : undefined;
+  const desktopHeroSelectedVariant = desktopHeroGame ? getSelectedVariant(desktopHeroGame, desktopHeroSelectedVariantId) : undefined;
+  const desktopHeroNeedsOwnership = desktopHeroGame ? gameNeedsPurchase(desktopHeroGame, desktopHeroSelectedVariantId) : false;
+  const desktopHeroMarkingOwned = Boolean(desktopHeroNeedsOwnership && desktopHeroSelectedVariant?.id && markOwnedInFlightByVariantId[desktopHeroSelectedVariant.id]);
+
+  const heroCountRef = useRef(heroCount);
+  heroCountRef.current = heroCount;
+
+  const advanceHero = (nextIndex: number, direction: number) => {
+    setDesktopHeroDirection(direction);
+    setDesktopHeroIndex(((nextIndex % heroCountRef.current) + heroCountRef.current) % heroCountRef.current);
+  };
+
+  useEffect(() => {
+    if (desktopHeroPool.length <= 1) return undefined;
+    const interval = window.setInterval(() => {
+      setDesktopHeroDirection(1);
+      setDesktopHeroIndex((i) => (i + 1) % heroCountRef.current);
+    }, 10000);
+    return () => window.clearInterval(interval);
+  }, [desktopHeroPool.length]);
+
+  const heroVariants = {
+    enter: (dir: number) => ({ opacity: 0, x: dir > 0 ? 32 : -32 }),
+    center: { opacity: 1, x: 0 },
+    exit: (dir: number) => ({ opacity: 0, x: dir > 0 ? -32 : 32 }),
+  };
+
+  const heroImageVariants = {
+    enter: (dir: number) => ({ opacity: 0, x: dir > 0 ? 44 : -44 }),
+    center: { opacity: 1, x: 0 },
+    exit: (dir: number) => ({ opacity: 0, x: dir > 0 ? -44 : 44 }),
+  };
+
   return (
     <div className="home-page">
+      {desktopHeroGame && (
+        <section className="desktop-hero" aria-label={desktopHeroGame.title}>
+          <div className="desktop-hero-placeholder" />
+          <AnimatePresence initial={false} custom={desktopHeroDirection} mode="popLayout">
+            <m.img
+              key={desktopHeroImageUrl ?? "placeholder"}
+              src={desktopHeroImageUrl}
+              alt=""
+              className="desktop-hero-image loaded"
+              custom={desktopHeroDirection}
+              variants={heroImageVariants}
+              initial="enter"
+              animate="center"
+              exit="exit"
+              transition={{ type: "tween", ease: "easeInOut", duration: 0.4 }}
+            />
+          </AnimatePresence>
+          <div className="desktop-hero-scrim" />
+          <AnimatePresence initial={false} custom={desktopHeroDirection} mode="popLayout">
+            <m.div
+              key={desktopHeroGame.id}
+              className="desktop-hero-content"
+              custom={desktopHeroDirection}
+              variants={heroVariants}
+              initial="enter"
+              animate="center"
+              exit="exit"
+              transition={{ type: "tween", ease: "easeInOut", duration: 0.35 }}
+            >
+              {desktopHeroLogoUrl ? <img key={desktopHeroLogoUrl} src={desktopHeroLogoUrl} alt={desktopHeroGame.title} className="desktop-hero-logo" /> : <h1>{desktopHeroGame.title}</h1>}
+              <p className="desktop-hero-meta">{getPrimaryStoreName(desktopHeroGame, desktopHeroSelectedVariantId)} / {getPrimaryGenre(desktopHeroGame)}</p>
+              <div className="desktop-hero-actions">
+                <button
+                  type="button"
+                  className="desktop-hero-primary"
+                  onClick={() => onOpenDetails(desktopHeroGame)}
+                >
+                  {t("app.actions.details")}
+                </button>
+                {desktopHeroNeedsOwnership && (
+                  <button
+                    type="button"
+                    className="desktop-hero-secondary"
+                    onClick={() => {
+                      if (desktopHeroNeedsOwnership) {
+                        (onMarkGameOwned ?? onBuyGame)?.(desktopHeroGame, desktopHeroSelectedVariantId);
+                      }
+                    }}
+                    disabled={desktopHeroMarkingOwned}
+                  >
+                    {desktopHeroMarkingOwned ? t("app.status.markingOwned") : t("app.actions.markAsOwned")}
+                  </button>
+                )}
+              </div>
+            </m.div>
+          </AnimatePresence>
+          {heroCount > 1 && (
+            <>
+              <button
+                type="button"
+                className="desktop-hero-arrow desktop-hero-arrow--prev"
+                aria-label={t("app.actions.back")}
+                onClick={() => advanceHero(safeHeroIndex - 1, -1)}
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                className="desktop-hero-arrow desktop-hero-arrow--next"
+                aria-label={t("app.actions.continue")}
+                onClick={() => advanceHero(safeHeroIndex + 1, 1)}
+              >
+                ›
+              </button>
+              <div className="desktop-hero-dots" aria-hidden="true">
+                {Array.from({ length: heroCount }).map((_, dotIndex) => (
+                  <span
+                    key={dotIndex}
+                    className={dotIndex === safeHeroIndex ? "active" : ""}
+                    onClick={() => advanceHero(dotIndex, dotIndex >= safeHeroIndex ? 1 : -1)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
       <header className="home-toolbar">
         <div className="home-search">
           <Search className="home-search-icon" size={16} />
