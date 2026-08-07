@@ -133,6 +133,47 @@ class VirtualCursorTest {
         assertEquals(StreamPoint(960f, 540f), cursor.position)
     }
 
+    /**
+     * The post-PiP direct-click regression, stated as a property. After a lifecycle interrupt the
+     * model may be parked at a stale position (raw mouse input during PiP, or the game itself moved
+     * the host cursor). The next tap must re-anchor from the top-left boundary so it lands exactly
+     * on target, and subsequent smooth taps keep working from that freshly-synced origin.
+     */
+    @Test
+    fun lifecycleInterruptReanchorsTheNextTapAndKeepsTheModelAccurate() {
+        val width = 1920
+        val height = 1080
+        val cursor = VirtualCursor()
+        cursor.onStreamSize(width, height)
+        val host = FakeHost(960f, 540f)
+
+        // Direct click moves the host cursor to a target through the smooth relative path.
+        host.apply(cursor.consumeDeltaTo(StreamPoint(1400f, 700f)))
+        assertEquals(1400f, host.x, 0.5f)
+        assertEquals(700f, host.y, 0.5f)
+
+        // Lifecycle interrupt: the model is parked where it was, but the host cursor has drifted
+        // elsewhere on its own (external mouse during PiP, the game moving the cursor).
+        cursor.forget()
+        cursor.onStreamSize(width, height)
+        host.x = 500f
+        host.y = 300f
+
+        // The next tap re-anchors: clamp to (0,0), then move to the mapped target.
+        cursor.reanchorDeltasTo(StreamPoint(100f, 200f)).forEach { delta ->
+            host.applyClamped(delta, width, height)
+        }
+
+        assertEquals(100f, host.x, 0.5f)
+        assertEquals(200f, host.y, 0.5f)
+        assertEquals(StreamPoint(100f, 200f), cursor.position)
+
+        // Subsequent smooth taps stay exact from the freshly-synced origin.
+        host.apply(cursor.consumeDeltaTo(StreamPoint(900f, 800f)))
+        assertEquals(900f, host.x, 0.5f)
+        assertEquals(800f, host.y, 0.5f)
+    }
+
     @Test
     fun subPixelMovesAreNotSent() {
         val cursor = VirtualCursor()

@@ -228,9 +228,11 @@ class AndroidTvUiBehaviorTest {
     }
 
     @Test
-    fun allAndroidDevicesUseStableAudioBuffering() {
+    fun phonesUseLowLatencyAudioWhileTvKeepsStableBuffering() {
+        // Low-latency AudioTrack on phones keeps the audio pipeline tight (no audible audio delay);
+        // Android TV keeps the conservative non-low-latency path for its audio HAL quirks.
+        assertTrue(shouldUseLowLatencyStreamAudio(androidTvProfile = false))
         assertFalse(shouldUseLowLatencyStreamAudio(androidTvProfile = true))
-        assertFalse(shouldUseLowLatencyStreamAudio(androidTvProfile = false))
     }
 
     @Test

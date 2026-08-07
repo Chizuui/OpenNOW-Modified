@@ -11288,6 +11288,13 @@ private fun StreamStatsMetricItems(
             quality = fps?.let { StreamQuality.frameRate(it.toDouble(), targetFps) },
             contentDescription = stringResource(R.string.stream_stats_cd_fps, fps ?: targetFps),
         )
+        val gameFps = streamStats.gameFps
+        StreamStatsText(
+            value = "Game ${gameFps ?: targetFps}",
+            modifier = itemModifier,
+            quality = gameFps?.let { StreamQuality.frameRate(it.toDouble(), targetFps) },
+            contentDescription = "Game FPS: ${gameFps ?: targetFps}",
+        )
     }
     if (metrics.ping) {
         val ping = streamStats.pingMs

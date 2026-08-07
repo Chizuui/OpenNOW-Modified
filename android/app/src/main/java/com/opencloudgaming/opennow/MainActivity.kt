@@ -96,6 +96,7 @@ class MainActivity : ComponentActivity() {
             openNowApplication.awaitStartupData()
             startupDataReady = true
             viewModel.setAndroidPictureInPictureActive(isAndroidPictureInPictureActive())
+            NativeStreamInputRouter.setPictureInPictureActive(isAndroidPictureInPictureActive())
             pendingExternalLaunchIntent?.let(viewModel::handleExternalLaunchIntent)
             pendingExternalLaunchIntent = null
             viewModel.state.collect { state ->
@@ -132,6 +133,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         if (startupDataReady) {
             viewModel.setAndroidPictureInPictureActive(isAndroidPictureInPictureActive())
+            NativeStreamInputRouter.setPictureInPictureActive(isAndroidPictureInPictureActive())
         }
         if (streamSystemUiActive) {
             applyStreamSystemUi(true, force = true)
@@ -187,6 +189,7 @@ class MainActivity : ComponentActivity() {
         if (startupDataReady) {
             viewModel.setAndroidPictureInPictureActive(isInPictureInPictureMode)
         }
+        NativeStreamInputRouter.setPictureInPictureActive(isInPictureInPictureMode)
         NativeStreamInputRouter.releaseTouchMouseForLifecycle()
     }
 

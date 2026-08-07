@@ -1024,6 +1024,8 @@ object NativeStreamInputRouter {
     private var systemBackHandler: (() -> Unit)? = null
     @Volatile
     private var streamUiActive = false
+    @Volatile
+    private var pictureInPictureActive = false
     private val nativeUiTouchRouting = NativeUiTouchRoutingState()
     private val touchMouseState = TouchMouseState()
 
@@ -1068,8 +1070,17 @@ object NativeStreamInputRouter {
      * Releases any button we are holding so it cannot stick down on the host. The next direct tap
      * establishes its own origin, so lifecycle changes cannot leave a stale click offset behind.
      */
+    fun setPictureInPictureActive(active: Boolean) {
+        pictureInPictureActive = active
+    }
+
     fun releaseTouchMouseForLifecycle() {
         touchMouseState.reset(client)
+        // The host cursor is trusted not to move just because our window resized, but raw input
+        // paths that bypass direct click (external mouse during PiP) or the game itself can still
+        // move it while the model is parked. Re-anchor the next direct-click DOWN so the first tap
+        // after a lifecycle interrupt is placed from a known origin instead of a stale one.
+        touchMouseState.markDirectClickForReanchor()
         releaseAllNativeTouches()
         nativeUiTouchRouting.endPointerGesture()
     }
@@ -1473,6 +1484,12 @@ object NativeStreamInputRouter {
     }
 
     fun dispatchExternalMouseTouch(event: MotionEvent, width: Int, height: Int): Boolean {
+        if (pictureInPictureActive) {
+            // While the PiP window is tiny the raw-mouse path would move the host cursor without
+            // the direct-click model tracking it, leaving every post-PiP tap offset. The model is
+            // parked during PiP instead; the next direct-click DOWN re-anchors it to a known origin.
+            return false
+        }
         if (streamUiActive) return false
         if (!event.isExternalMousePointerEvent()) return false
         if (mouseDirectClick) return false // Handled in dispatchTouch instead
@@ -1518,6 +1535,11 @@ object NativeStreamInputRouter {
     }
 
     fun dispatchMotion(event: MotionEvent): Boolean {
+        if (pictureInPictureActive && event.isExternalMousePointerEvent()) {
+            // Keep the host cursor frozen while the PiP window is focused so the retained direct
+            // click model cannot desync. Gamepad motion keeps flowing to the host.
+            return false
+        }
         if (streamUiActive && event.isExternalMousePointerEvent()) {
             return false
         }
@@ -3007,10 +3029,11 @@ internal data class CursorDelta(val dx: Int, val dy: Int)
  * Our model of where the host's cursor sits while a direct-click drag is active.
  *
  * The protocol has no absolute-positioning packet — [InputEncoder.INPUT_MOUSE_REL] is all there is.
- * At the start of every tap, [reanchorDeltasTo] first sends the largest supported negative movement
- * so the desktop clamps the cursor to its top-left boundary, then sends the target coordinates from
- * that known origin. That removes the old assumption that the host cursor started in the centre,
- * which left every direct click offset whenever a game had moved it elsewhere.
+ * When the model is known to be out of sync (after a lifecycle interrupt), [reanchorDeltasTo] first
+ * sends the largest supported negative movement so the desktop clamps the cursor to its top-left
+ * boundary, then sends the target coordinates from that known origin. That removes the assumption
+ * that the host cursor is where the model thinks it is, which left every direct click offset
+ * whenever a game or raw input had moved it elsewhere.
  */
 internal class VirtualCursor {
     private var x = 0f
@@ -3033,8 +3056,8 @@ internal class VirtualCursor {
             if (!initialized) return
         }
         if (!initialized) {
-            // Direct click reanchors before pressing; this temporary value only keeps the generic
-            // relative cursor model well-defined until that first DOWN arrives.
+            // Direct click re-anchors after a lifecycle interrupt; this temporary value only keeps
+            // the generic relative cursor model well-defined until that first DOWN arrives.
             x = width / 2f
             y = height / 2f
             initialized = true
@@ -3121,10 +3144,17 @@ private class TouchMouseState {
     private var isScrollGesture = false
     private var scrollAccumulator = 0f
     private var scrollGestureOccurred = false
+    /**
+     * Set by [NativeStreamInputRouter.releaseTouchMouseForLifecycle]; consumed by the next direct
+     * click DOWN, which re-anchors the host cursor at the top-left boundary instead of trusting a
+     * model that may have desynced while the app was interrupted (PiP, background).
+     */
+    private var reanchorOnNextDirectClick = false
 
     /**
-     * Tears down the in-flight gesture. The cursor model is retained only for an active drag; every
-     * new direct-click DOWN independently reanchors at the host boundary before moving to its target.
+     * Tears down the in-flight gesture. The cursor model is retained so the next direct-click tap
+     * keeps its origin; only [markDirectClickForReanchor] (set by a lifecycle interrupt such as PiP
+     * or backgrounding) makes the next DOWN snap the host cursor to the top-left boundary first.
      */
     fun reset(client: NativeStreamClient?) {
         // Correct for both modes now that direct click also maintains `selecting`. Widening this
@@ -3140,6 +3170,15 @@ private class TouchMouseState {
         isScrollGesture = false
         scrollAccumulator = 0f
         scrollGestureOccurred = false
+    }
+
+    /**
+     * Marks the next direct-click DOWN for a one-shot re-anchor. Deliberately not cleared by
+     * [reset]: the PiP-exit sequence calls reset (via setMouseDirectClick) after the lifecycle
+     * release, so clearing here would swallow the marker before the first tap arrives.
+     */
+    fun markDirectClickForReanchor() {
+        reanchorOnNextDirectClick = true
     }
 
     /** Clears any position retained from the previous stream client. */
@@ -3225,8 +3264,19 @@ private class TouchMouseState {
                             presentationTranslationX = presentationTranslationX,
                             presentationTranslationY = presentationTranslationY,
                         )
-                        // Move cursor smoothly to target without forced reanchoring.
-                        moveVirtualCursorTo(target, client)
+                        if (reanchorOnNextDirectClick) {
+                            // Lifecycle interrupt (PiP, background): the retained model may no
+                            // longer match the host cursor. Snap it to the top-left boundary and
+                            // move to target so the model is exact again; fall back to a smooth
+                            // move if the model is not in a re-anchorable state.
+                            reanchorOnNextDirectClick = false
+                            if (!reanchorVirtualCursorTo(target, client)) {
+                                moveVirtualCursorTo(target, client)
+                            }
+                        } else {
+                            // Move cursor smoothly to target without forced reanchoring.
+                            moveVirtualCursorTo(target, client)
+                        }
 
                         selecting = client.setTouchMouseButton(true)
                         if (!selecting) {
@@ -7976,12 +8026,16 @@ class InputEncoder {
 private fun timestampUs(): Long = SystemClock.elapsedRealtimeNanos() / 1000L
 
 /**
- * WebRTC's low-latency AudioTrack path can race teardown and dereference a released AudioTrack.
- * Stable buffering is preferable to a process crash on both handheld and TV devices.
+ * Low-latency AudioTrack on phones; conservative (non-low-latency) buffering on Android TV.
+ *
+ * Low-latency was previously disabled everywhere because WebRTC's playout thread could race
+ * teardown and dereference a released AudioTrack. That race is contained by the strict teardown
+ * ordering in [NativeStreamClient.finishRelease]: peer connection close, factory dispose, and audio
+ * device module release all run in sequence on the single-threaded teardown executor, so playout is
+ * stopped before the module is released. Phones keep the shorter buffer (avoids the audible audio
+ * delay regression); TV keeps the conservative path for its audio HAL quirks.
  */
-internal fun shouldUseLowLatencyStreamAudio(
-    @Suppress("UNUSED_PARAMETER") androidTvProfile: Boolean,
-): Boolean = false
+internal fun shouldUseLowLatencyStreamAudio(androidTvProfile: Boolean): Boolean = !androidTvProfile
 
 internal fun shouldRunControllerMouseLoop(
     controllerMouseAssistActive: Boolean,
