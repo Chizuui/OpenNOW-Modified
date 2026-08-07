@@ -43,10 +43,11 @@ export function buildRequestedStreamingFeatures(
     codec: codecWireValue(settings.codec),
     // No client vsync preference in the fork (GFN streams client-side vsync off).
     vsync: false,
-    // Deliberate fork choice: keep dynamic streaming off (resolution/FPS lock)
-    // to match nvstOffer's dynamicStreamingMode:0 (prevents mid-session SSRC
-    // switches the fork does not handle). The official client defaults to 3.
-    dynamicStreamingMode: 0,
+    // Official client default (desiredFeatures.dynamicStreamingMode ?? 3).
+    // Aligned with nvstOffer's dynamicStreamingMode:3 so the server runs the
+    // same dynamic-streaming profile as the web app. The renderer handles
+    // mid-session track (SSRC) replacement, so mode 3 is safe.
+    dynamicStreamingMode: 3,
     // STEREO (matches audioMode: 2); official mapping: stereo=2, 5.1=6, 7.1=8.
     audioChannelCount: 2,
   };

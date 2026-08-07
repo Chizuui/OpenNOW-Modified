@@ -131,7 +131,9 @@ export async function createMainWindow(
     });
   });
   window.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    if (level < 2) return;
+    // level 1 = console.log: forward it too so WebRTC/stream diagnostics
+    // (Network stats, bwe, SDP builder lines) show up in exported logs.
+    if (level < 1) return;
     console.error(`[renderer:console:${level}]`, message, sourceId ? `(${sourceId}:${line})` : "");
   });
 

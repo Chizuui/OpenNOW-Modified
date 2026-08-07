@@ -121,7 +121,7 @@ test("CloudMatch uses official streaming feature enum values", () => {
     maxBitrateKbps: 75000,
     codec: 2, // H265 -> 2
     vsync: false,
-    dynamicStreamingMode: 0,
+    dynamicStreamingMode: 3, // official default
     audioChannelCount: 2,
   });
 });
@@ -268,7 +268,7 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.maxBitrateKbps, 75000);
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.codec, 2); // H265 -> 2
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.vsync, false);
-    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.dynamicStreamingMode, 0);
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.dynamicStreamingMode, 3); // official default
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.audioChannelCount, 2);
     assert.equal(capturedRequestBody.sessionRequestData.appLaunchMode, 2);
     assert.equal(capturedRequestBody.sessionRequestData.enablePersistingInGameSettings, false);

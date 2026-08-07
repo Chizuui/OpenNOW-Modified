@@ -46,9 +46,9 @@ test("buildNvstSdp includes stream quality and partially reliable input paramete
     "a=video.dynamicRangeMode:1",
     "a=vqos.drc.enable:0",
     "a=vqos.dfc.enable:1",
+    "a=vqos.dfc.adjustResAndFps:1", // official mode-3 high-FPS case
     "a=vqos.dfc.qpMaxResThresholdAdj:20",
     "a=vqos.grc.qpMaxResThresholdAdj:20",
-    "a=vqos.resControl.cpmRtc.enable:0",
     "a=ri.partialReliableThresholdMs:16",
     "a=ri.hidDeviceMask:128",
     "a=ri.enablePartiallyReliableTransferGamepad:15",
@@ -149,6 +149,13 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
   assert.equal(lines.has("a=vqos.bw.minimumBitrateKbps:4000"), true);
   assert.equal(lines.has("a=video.maxFPS:60"), true);
   assert.equal(lines.has("a=video.encoderCscMode:3"), true);
+  // Official web client, 60 FPS + dynamicStreamingMode=3: mode 3 + drc.enable:1.
+  assert.equal(lines.has("a=vqos.dynamicStreamingMode:3"), true);
+  assert.equal(lines.has("a=vqos.drc.enable:1"), true);
+  // Official web client sends featureMask:3 (CPM enabled); the old fork-only
+  // cpmRtc.enable:0 / minResolutionPercent:100 / resolutionChangeHoldonMs:999999
+  // lock attrs are gone (zero hits in the play.geforcenow.com bundle).
+  assert.equal(lines.has("a=vqos.resControl.cpmRtc.featureMask:3"), true);
   // Fork-only attributes the official web client never sends — guard against
   // regressions (the BWE ones made the server throttle to the bitrate floor).
   // Prefix match on the full line so "a=foo" also catches "a=foo:123".
@@ -159,6 +166,9 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
     "a=vqos.bw.peakBitrateKbps",
     "a=vqos.grc.maximumBitrateKbps",
     "a=vqos.grc.enable",
+    "a=vqos.resControl.cpmRtc.enable",
+    "a=vqos.resControl.cpmRtc.minResolutionPercent",
+    "a=vqos.resControl.cpmRtc.resolutionChangeHoldonMs",
     "a=vqos.calculateAvgVideoStreamingBitrate",
     "a=vqos.dfc.adjustResAndFps",
     "a=vqos.drc.enable:0", // 60 FPS sessions send no drc/dfc (high-FPS only)

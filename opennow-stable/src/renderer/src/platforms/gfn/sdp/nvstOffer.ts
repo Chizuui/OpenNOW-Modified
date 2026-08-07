@@ -78,8 +78,12 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=vqos.fec.repairMinPercent:5",
     "a=vqos.fec.repairPercent:5",
     "a=vqos.fec.repairMaxPercent:35",
-    // Official dynamicStreamingMode=0 path disables server resolution/FPS switching.
-    "a=vqos.dynamicStreamingMode:0",
+    // Official web client defaults to dynamicStreamingMode=3 (full dynamic
+    // streaming: DRC + DFC + bitrate envelope). The fork previously locked 0
+    // to prevent mid-session SSRC switches, but the renderer now handles track
+    // replacement (peerMediaLifecycleController), so align with the official
+    // default and let the server's BWE drive the bitrate like the web app.
+    "a=vqos.dynamicStreamingMode:3",
     // Official web client always sends vqos.bllFec.enable:0 (backward-lossless
     // FEC off). drc.enable / dfc.enable are NOT emitted for 60 FPS sessions —
     // the official DFC/DRC helper only writes them for high-FPS (see below).
@@ -90,11 +94,11 @@ export function buildNvstSdp(params: NvstParams): string {
 
   if (isHighFps) {
     lines.push(
-      // Official web client, dynamicStreamingMode=0 + high FPS: drc.enable:0,
+      // Official web client, dynamicStreamingMode=3 + high FPS: drc.enable:0,
       // dfc.enable:1, decodeFpsAdjPercent:85, targetDownCooldownMs:250,
       // dfcAlgoVersion 2 (120/240) / 1 (90), minTargetFps 100 (120/240) / 60
-      // (90), resControl.dfc.useClientFpsPerf:0. No adjustResAndFps line —
-      // the official only emits it for dynamicStreamingMode 2/3.
+      // (90), resControl.dfc.useClientFpsPerf:0, and dfc.adjustResAndFps:1
+      // (the mode-3 case sets it for high-FPS sessions).
       "a=vqos.drc.enable:0",
       "a=vqos.dfc.enable:1",
       "a=vqos.dfc.decodeFpsAdjPercent:85",
@@ -102,10 +106,15 @@ export function buildNvstSdp(params: NvstParams): string {
       `a=vqos.dfc.dfcAlgoVersion:${is120Fps || is240Fps ? 2 : 1}`,
       `a=vqos.dfc.minTargetFps:${is90Fps ? 60 : 100}`,
       "a=vqos.resControl.dfc.useClientFpsPerf:0",
+      "a=vqos.dfc.adjustResAndFps:1",
+    );
+  } else {
+    // Official web client, 60 FPS + dynamicStreamingMode=3: only drc.enable:1
+    // is emitted (the mode-3 case enables DRC for non-high-FPS sessions).
+    lines.push(
+      "a=vqos.drc.enable:1",
     );
   }
-  // 60 FPS sessions: the official client emits NO drc.enable / dfc.enable
-  // attributes, letting the server fall back to its defaults — mirror that.
 
   // Video encoder settings
   lines.push(
@@ -160,18 +169,17 @@ export function buildNvstSdp(params: NvstParams): string {
     }
   }
 
-  // Out-of-focus handling + disable CPM-based resolution changes
+  // Out-of-focus handling + CPM resolution control (official web client).
+  // The official bundle emits cpmRtc.featureMask:3 when the CPM path is
+  // enabled (web default) and never sends cpmRtc.enable / minResolutionPercent
+  // / resolutionChangeHoldonMs — those fork-only locks disabled the server's
+  // CPM resolution control, which fights dynamicStreamingMode:3 and pins the
+  // BWE to the 4000 kbps floor (~5 Mbps) instead of ramping to the ceiling.
   lines.push(
     "a=vqos.adjustStreamingFpsDuringOutOfFocus:1",
     "a=vqos.resControl.cpmRtc.ignoreOutOfFocusWindowState:1",
     "a=vqos.resControl.perfHistory.rtcIgnoreOutOfFocusWindowState:1",
-    // Disable CPM-based resolution changes (prevents SSRC switches)
-    "a=vqos.resControl.cpmRtc.featureMask:0",
-    "a=vqos.resControl.cpmRtc.enable:0",
-    // Never scale down resolution
-    "a=vqos.resControl.cpmRtc.minResolutionPercent:100",
-    // Infinite cooldown to prevent resolution changes
-    "a=vqos.resControl.cpmRtc.resolutionChangeHoldonMs:999999",
+    "a=vqos.resControl.cpmRtc.featureMask:3",
   );
 
   // Packet pacing group/delay + NACK queues (official Nvsc defaults).
