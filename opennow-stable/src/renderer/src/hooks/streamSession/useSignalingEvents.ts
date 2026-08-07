@@ -103,7 +103,12 @@ export function useSignalingEvents({
         clipboardPaste: settings.clipboardPaste,
         readClipboardText: readStreamClipboardText,
         onLog: (line: string) => console.log(`[WebRTC] ${line}`),
-        onStats: (stats) => diagnosticsStore.set(stats),
+        onStats: (stats) => {
+          // Keep client-side pipeline state (shaderActive) owned by StreamView
+          // alive across the client's wholesale diagnostics snapshots.
+          const snapshot = diagnosticsStore.getSnapshot();
+          diagnosticsStore.set({ ...stats, shaderActive: snapshot.shaderActive });
+        },
         onTimeWarning: (warning) => {
           setRemoteStreamWarning({
             code: warning.code,

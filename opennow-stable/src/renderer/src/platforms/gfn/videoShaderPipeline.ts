@@ -119,6 +119,11 @@ interface ShaderUniforms {
   time: WebGLUniformLocation | null;
 }
 
+export interface VideoShaderPipelineOptions {
+  /** Fires whenever the pipeline's active state flips (e.g. WebGL context loss). */
+  onActiveChange?: (active: boolean) => void;
+}
+
 export class VideoShaderPipeline {
   private readonly canvas: HTMLCanvasElement;
   private gl: WebGL2RenderingContext | null = null;
@@ -136,11 +141,15 @@ export class VideoShaderPipeline {
   private hasRenderedFrame = false;
   private readonly startTimeMs = performance.now();
 
+  private readonly onActiveChange: ((active: boolean) => void) | undefined;
+
   constructor(
     private readonly videoElement: HTMLVideoElement,
     initialSettings: VideoShaderSettings,
+    options?: VideoShaderPipelineOptions,
   ) {
     this.settings = { ...initialSettings };
+    this.onActiveChange = options?.onActiveChange;
     this.canvas = document.createElement("canvas");
     this.canvas.className = "sv-shader-canvas";
     this.canvas.style.position = "absolute";
@@ -197,6 +206,7 @@ export class VideoShaderPipeline {
       return;
     }
     this.active = shouldRun;
+    this.onActiveChange?.(shouldRun);
     if (shouldRun) {
       if (!this.gl && !this.initGl()) {
         this.active = false;

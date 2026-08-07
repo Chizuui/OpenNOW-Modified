@@ -50,6 +50,7 @@ export function defaultDiagnostics(): StreamDiagnostics {
     decoderPressureActive: false,
     decoderRecoveryAttempts: 0,
     decoderRecoveryAction: "none",
+    shaderActive: false,
     nativeRequestedFps: undefined,
     nativeCapsFramerate: undefined,
     nativeQueueMode: undefined,

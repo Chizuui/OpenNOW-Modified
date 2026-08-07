@@ -158,6 +158,10 @@ export function StreamStatsHud({
     ? t("stream.stats.codecFallbackShort", { requested: stats.requestedCodec, negotiated: stats.codec })
     : "";
 
+  // Client-side WebGL post-processing (video shader) is actively applying a
+  // visible effect to stream frames — extra GPU load, especially on iGPUs.
+  const shaderActive = stats.shaderActive === true;
+
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
   const hasPacketLoss = stats.packetLossPercent > 0;
   // Banner threshold is coarser than the alert dot: sub-0.15% loss is normal
@@ -183,6 +187,9 @@ export function StreamStatsHud({
     );
     const hwLine = [stats.hardwareAcceleration, stats.gpuType].filter(Boolean).join(" · ");
     if (hwLine) lines.push(hwLine);
+    if (shaderActive) {
+      lines.push("Shader FX active (WebGL post-processing)");
+    }
     if (stats.decoderPressureActive || stats.decoderRecoveryAttempts > 0) {
       lines.push(
         `Decoder recovery ${stats.decoderPressureActive ? "active" : "idle"} · attempts ${stats.decoderRecoveryAttempts} · action ${stats.decoderRecoveryAction}`,
@@ -288,6 +295,14 @@ export function StreamStatsHud({
               {codecFallbackShortText}
             </div>
           )}
+          {shaderActive && (
+            <div
+              className="sv-stats-serverbar sv-stats-serverbar--shader"
+              title="Client-side WebGL post-processing is applying a visible effect to the stream frames"
+            >
+              Shader FX on
+            </div>
+          )}
         </>
       ) : (
         <div className="sv-stats-full">
@@ -325,6 +340,12 @@ export function StreamStatsHud({
             </div>
             {codecFellBack && (
               <p className="sv-stats-foot">{codecFallbackText}</p>
+            )}
+            {shaderActive && (
+              <div className="sv-stats-row">
+                <span>Shader FX</span>
+                <span>On</span>
+              </div>
             )}
             <div className="sv-stats-row">
               <span>{t("stream.stats.serverLocation")}</span>

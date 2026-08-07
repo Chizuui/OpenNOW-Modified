@@ -7927,6 +7927,15 @@ button.game-card-store-chip.owned.active:hover {
   background: color-mix(in srgb, var(--warning) 8%, transparent);
 }
 
+/* Compact HUD: client-side WebGL post-processing is actively applying an
+   effect to the stream frames (extra GPU load on weak iGPUs). */
+.sv-stats-serverbar--shader {
+  margin-top: 4px;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: color-mix(in srgb, var(--accent) 80%, #fff);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
 /* Full: Network + Stream sections */
 .sv-stats-full {
   display: flex;
@@ -9731,6 +9740,42 @@ button.game-card-store-chip.owned.active:hover {
 
 .sidebar-button:active {
   background: var(--chip);
+}
+
+/* Quick-menu banner shown only while the WebGL video-shader pipeline is
+   actively applying a visible effect to the stream frames (extra GPU load on
+   weak iGPUs). One tap turns the pipeline off for the session. */
+.sidebar-shader-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 2px 16px 12px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.sidebar-shader-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sidebar-shader-banner-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: color-mix(in srgb, var(--accent) 85%, #fff);
+}
+
+.sidebar-shader-banner-sub {
+  font-size: 0.62rem;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sidebar-screenshot-button {
