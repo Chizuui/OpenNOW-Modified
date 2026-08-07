@@ -118,6 +118,11 @@ test("CloudMatch uses official streaming feature enum values", () => {
     prefilterSharpness: 0,
     prefilterNoiseReduction: 0,
     hudStreamingMode: 0,
+    maxBitrateKbps: 75000,
+    codec: 2, // H265 -> 2
+    vsync: false,
+    dynamicStreamingMode: 0,
+    audioChannelCount: 2,
   });
 });
 
@@ -161,6 +166,11 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
       requestedStreamingFeatures: {
         bitDepth?: number;
         chromaFormat?: number;
+        maxBitrateKbps?: number;
+        codec?: number;
+        vsync?: boolean;
+        dynamicStreamingMode?: number;
+        audioChannelCount?: number;
       };
     };
   };
@@ -255,6 +265,11 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
     assert.equal(capturedRequestBody.sessionRequestData.clientRequestMonitorSettings[0]?.framesPerSecond, 90);
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.bitDepth, 1);
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.chromaFormat, 1);
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.maxBitrateKbps, 75000);
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.codec, 2); // H265 -> 2
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.vsync, false);
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.dynamicStreamingMode, 0);
+    assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.audioChannelCount, 2);
     assert.equal(capturedRequestBody.sessionRequestData.appLaunchMode, 2);
     assert.equal(capturedRequestBody.sessionRequestData.enablePersistingInGameSettings, false);
     assert.equal(capturedRequestBody.sessionRequestData.networkTestSessionId, "nettest-1");

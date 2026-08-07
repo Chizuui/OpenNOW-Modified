@@ -1,4 +1,4 @@
-import type { AppLaunchMode, SessionCreateRequest, StreamSettings } from "@shared/gfn";
+import type { AppLaunchMode, CodecPreference, SessionCreateRequest, StreamSettings } from "@shared/gfn";
 import { DEFAULT_MINIMUM_FPS_FOR_REFLEX_WITHOUT_VRR } from "@shared/cloudGsync";
 
 import type { CloudMatchRequest } from "./types";
@@ -36,7 +36,37 @@ export function buildRequestedStreamingFeatures(
     prefilterSharpness: 0,
     prefilterNoiseReduction: 0,
     hudStreamingMode: 0,
+    // ── Aligned with the official client's requestedStreamingFeatures ──
+    // Bitrate preference in Kbps (official multiplies the Mbps setting by 1000).
+    maxBitrateKbps: Math.round(settings.maxBitrateMbps * 1000),
+    // Official wire codec id (H264=1, H265=2, AV1=3, 0 when "auto").
+    codec: codecWireValue(settings.codec),
+    // No client vsync preference in the fork (GFN streams client-side vsync off).
+    vsync: false,
+    // Deliberate fork choice: keep dynamic streaming off (resolution/FPS lock)
+    // to match nvstOffer's dynamicStreamingMode:0 (prevents mid-session SSRC
+    // switches the fork does not handle). The official client defaults to 3.
+    dynamicStreamingMode: 0,
+    // STEREO (matches audioMode: 2); official mapping: stereo=2, 5.1=6, 7.1=8.
+    audioChannelCount: 2,
   };
+}
+
+/**
+ * Official wire codec ids for requestedStreamingFeatures (mirrors the
+ * official client's `sr()`: H264=1, H265=2, AV1=3, unknown/auto=0).
+ */
+export function codecWireValue(codec: CodecPreference): number {
+  switch (codec) {
+    case "H264":
+      return 1;
+    case "H265":
+      return 2;
+    case "AV1":
+      return 3;
+    default:
+      return 0; // "auto"
+  }
 }
 
 export function shouldRequestReflex(settings: StreamSettings): boolean {

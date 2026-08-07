@@ -11,10 +11,52 @@ import {
   classifyStreamLagReason,
   evaluateControllerOverlayShortcutGate,
   isRttSpike,
+  parseStatsChannelGameFps,
   quantizeMouseDeltaWithResidual,
   subsampleCoalescedPointerEvents,
 } from "./webrtcClient";
 import { INPUT_KEY_DOWN, INPUT_MOUSE_REL } from "./inputProtocol";
+
+function buildStatsChannelMessage(type: number, version: number, avgGameFps: number): ArrayBuffer {
+  // Full v4/v5 payload is 74 bytes (l4sState byte at 73 in v5); type 3 adds a
+  // 1-byte header in front (byte 0 = 3, version at byte 1). Type 4 carries the
+  // payload directly, so byte 0 IS the version (== 4 in practice).
+  const offset = type === 3 ? 1 : 0;
+  const buf = new ArrayBuffer(74 + offset);
+  const view = new DataView(buf);
+  if (type === 3) view.setUint8(0, 3);
+  view.setUint8(offset, version);
+  view.setFloat64(offset + 25, avgGameFps, true); // little-endian, like the official client
+  return buf;
+}
+
+test("stats channel game FPS parses type-4 messages (payload at byte 0)", () => {
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(4, 4, 119.7)), { version: 4, fps: 120 });
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(4, 4, 60.2)), { version: 4, fps: 60 });
+});
+
+test("stats channel game FPS parses type-3 messages (1-byte header), v4 and v5", () => {
+  // Official clients dispatch byte 0 as a TYPE: 3 = header + payload (version
+  // at byte 1, avgGameFps at 26); 4 = payload directly. v5 only appends an
+  // l4sState byte at payload offset 73, which does not move offset 25.
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(3, 4, 119.7)), { version: 4, fps: 120 });
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(3, 5, 240.3)), { version: 5, fps: 240 });
+  assert.deepEqual(parseStatsChannelGameFps(buildStatsChannelMessage(3, 5, 90.0)), { version: 5, fps: 90 });
+});
+
+test("stats channel game FPS rejects unknown types, old versions, and malformed payloads", () => {
+  assert.equal(parseStatsChannelGameFps(buildStatsChannelMessage(5, 5, 240)), null); // unknown type
+  assert.equal(parseStatsChannelGameFps(buildStatsChannelMessage(3, 3, 60)), null); // version < 4
+  assert.equal(parseStatsChannelGameFps(new ArrayBuffer(10)), null);
+  assert.equal(parseStatsChannelGameFps(new ArrayBuffer(0)), null);
+  assert.equal(parseStatsChannelGameFps(new ArrayBuffer(74)), null); // type 0
+  // NaN / out-of-range values are rejected
+  const nan = buildStatsChannelMessage(4, 4, 60);
+  new DataView(nan).setFloat64(25, Number.NaN, true);
+  assert.equal(parseStatsChannelGameFps(nan), null);
+  const tooHigh = buildStatsChannelMessage(4, 4, 600);
+  assert.equal(parseStatsChannelGameFps(tooHigh), null);
+});
 
 test("decoder pressure requires a coupled backlog, drop burst, or decode saturation", () => {
   const stable = classifyDecoderPressureSample({

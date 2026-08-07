@@ -24,6 +24,8 @@ export function defaultDiagnostics(): StreamDiagnostics {
     packetLossPercent: 0,
     jitterMs: 0,
     rttMs: 0,
+    transportType: "unknown",
+    localCandidateType: "",
     framesReceived: 0,
     framesDecoded: 0,
     framesDropped: 0,

@@ -76,6 +76,10 @@ export type {
   StreamLagReason,
   StreamTimeWarning,
 } from "./webrtc/streamDiagnosticsTypes";
+import { parseStatsChannelGameFps } from "./webrtc/statsChannel";
+export {
+  parseStatsChannelGameFps,
+} from "./webrtc/statsChannel";
 export {
   classifyStreamLagReason,
   isRttSpike,
@@ -322,6 +326,8 @@ export class GfnWebRtcClient {
   } | null = null;
   private renderFpsCounter = { frames: 0, lastUpdate: 0, fps: 0 };
   private lastEmittedDiagnostics: StreamDiagnostics | null = null;
+
+  private statsChannelVersionLogged = false;
   /** Periodic network-diagnostics logging (surfaces in the exported log file). */
   private lastNetworkStatsLogAtMs = 0;
   private lastLoggedRttMs = 0;
@@ -386,6 +392,8 @@ export class GfnWebRtcClient {
     packetLossPercent: 0,
     jitterMs: 0,
     rttMs: 0,
+    transportType: "unknown",
+    localCandidateType: "",
     framesReceived: 0,
     framesDecoded: 0,
     framesDropped: 0,
@@ -774,6 +782,8 @@ export class GfnWebRtcClient {
    * Falls back to `b=AS` when present (already-munged answers).
    */
   private replaceVideoBitrateInSdp(sdp: string, maxBitrateKbps: number): string {
+    // Keep in sync with buildNvstSdp: initial = max(4000, max/4), matching
+    // the official GFN web client's bitrate formula.
     const startupBitrateKbps = Math.max(
       OFFICIAL_MIN_BITRATE_KBPS,
       Math.round(maxBitrateKbps / 4),
@@ -792,20 +802,15 @@ export class GfnWebRtcClient {
             result.push(`a=video.initialBitrateKbps:${startupBitrateKbps}`);
             continue;
           case "a=video.initialPeakBitrateKbps":
-            result.push(`a=video.initialPeakBitrateKbps:${maxBitrateKbps}`);
+            result.push(`a=video.initialPeakBitrateKbps:${startupBitrateKbps}`);
             continue;
           case "a=vqos.bw.maximumBitrateKbps":
             result.push(`a=vqos.bw.maximumBitrateKbps:${maxBitrateKbps}`);
             continue;
-          case "a=vqos.bw.peakBitrateKbps":
-            result.push(`a=vqos.bw.peakBitrateKbps:${maxBitrateKbps}`);
-            continue;
-          case "a=vqos.bw.serverPeakBitrateKbps":
-            result.push(`a=vqos.bw.serverPeakBitrateKbps:${maxBitrateKbps}`);
-            continue;
-          case "a=vqos.grc.maximumBitrateKbps":
-            result.push(`a=vqos.grc.maximumBitrateKbps:${maxBitrateKbps}`);
-            continue;
+          // NOTE: the fork-only peakBitrateKbps / serverPeakBitrateKbps /
+          // grc.maximumBitrateKbps attributes are intentionally NOT rewritten
+          // here — the official web client never sends them and they made the
+          // server throttle to the bitrate floor.
           case "b=AS":
             result.push(`b=AS:${maxBitrateKbps}`);
             continue;
@@ -921,6 +926,8 @@ export class GfnWebRtcClient {
       packetLossPercent: 0,
       jitterMs: 0,
       rttMs: 0,
+      transportType: "unknown",
+      localCandidateType: "",
       framesReceived: 0,
       framesDecoded: 0,
       framesDropped: 0,
@@ -1109,6 +1116,38 @@ export class GfnWebRtcClient {
         codecs.set(codecId, stats);
       }
     }
+
+    // Resolve the active ICE transport (UDP vs TCP) + local candidate type so
+    // the HUD and exported logs can tell when the stream fell back to TCP — a
+    // classic symptom of an ISP blocking/throttling UDP, which caps the stream
+    // at a low hard bitrate that no SDP bitrate tuning can lift. The transport
+    // entry is authoritative; the local-candidate protocol is a fallback for
+    // older Chromium builds that omit the transport entry.
+    let transportType: "udp" | "tcp" | "unknown" = "unknown";
+    let localCandidateType = "";
+    if (activePair) {
+      const localCandidateId = activePair.localCandidateId as string | undefined;
+      const transportId = activePair.transportId as string | undefined;
+      for (const entry of report.values()) {
+        const stats = entry as unknown as Record<string, unknown>;
+        if (entry.type === "transport" && transportId && stats.id === transportId) {
+          const protocol = String(stats.protocol ?? "").toLowerCase();
+          if (protocol === "udp" || protocol === "tcp") {
+            transportType = protocol;
+          }
+        } else if (entry.type === "local-candidate" && localCandidateId && stats.id === localCandidateId) {
+          if (transportType === "unknown") {
+            const protocol = String(stats.protocol ?? "").toLowerCase();
+            if (protocol === "udp" || protocol === "tcp") {
+              transportType = protocol;
+            }
+          }
+          localCandidateType = String(stats.candidateType ?? "");
+        }
+      }
+    }
+    this.diagnostics.transportType = transportType;
+    this.diagnostics.localCandidateType = localCandidateType;
 
     // Process video track stats
     if (inboundVideo) {
@@ -1357,7 +1396,7 @@ export class GfnWebRtcClient {
         this.lastNetworkStatsLogAtMs = nowMs;
         this.lastLoggedRttMs = rttMs;
         this.log(
-          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
+          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps transport=${this.diagnostics.transportType}${this.diagnostics.localCandidateType ? `/${this.diagnostics.localCandidateType}` : ""} lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
         );
       } else {
         this.lastLoggedRttMs = rttMs;
@@ -1683,32 +1722,14 @@ export class GfnWebRtcClient {
   }
 
   private handleStatsChannelMessage(buf: ArrayBuffer): void {
-    const bytes = new Uint8Array(buf);
-    if (!bytes || bytes.length < 1) return;
-    try {
-      // Mirrors Android handleStatsChannelMessage: first byte is a type
-      // (3 = 1-byte header + stats payload, 4 = stats payload directly).
-      let offset = 0;
-      if (bytes[0] === 3) {
-        if (bytes.length < 2) return;
-        offset = 1;
-      } else if (bytes[0] !== 4) {
-        return;
-      }
-      if (bytes.length - offset < 33) return;
-      const view = new DataView(buf);
-      const version = view.getUint8(offset);
-      if (version >= 4) {
-        const avgGameFps = view.getFloat64(offset + 25, true); // little-endian
-        if (avgGameFps > 0 && avgGameFps <= 360) {
-          const fps = Math.round(avgGameFps);
-          this.diagnostics.gameFps = fps;
-          this.emitStats();
-        }
-      }
-    } catch (err) {
-      // ignore parse errors
+    const parsed = parseStatsChannelGameFps(buf);
+    if (parsed === null) return;
+    if (!this.statsChannelVersionLogged) {
+      this.statsChannelVersionLogged = true;
+      this.log(`Stats channel: protocol version ${parsed.version}, gameFps=${parsed.fps}`);
     }
+    this.diagnostics.gameFps = parsed.fps;
+    this.emitStats();
   }
 
   private createDataChannels(pc: RTCPeerConnection): void {
