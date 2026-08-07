@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   extractNegotiatedVideoCodec,
   preferCodec,
+  resolveNegotiationCandidates,
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,
 } from "./codec";
@@ -249,4 +250,45 @@ test("H265 rewriting leaves already-compatible and non-H265 payloads unchanged",
     sdp,
     replacements: 0,
   });
+});
+
+test("resolveNegotiationCandidates orders primary then GFN-web fallbacks", () => {
+  assert.deepEqual(resolveNegotiationCandidates("AV1"), ["AV1", "H264", "H265"]);
+  assert.deepEqual(resolveNegotiationCandidates("H265"), ["H265", "H264", "AV1"]);
+});
+
+test("resolveNegotiationCandidates pins the user fallback right after the primary", () => {
+  assert.deepEqual(
+    resolveNegotiationCandidates("AV1", "H265"),
+    ["AV1", "H265", "H264"],
+  );
+});
+
+test("resolveNegotiationCandidates dedupes a fallback equal to the primary", () => {
+  assert.deepEqual(
+    resolveNegotiationCandidates("H265", "H265"),
+    ["H265", "H264", "AV1"],
+  );
+});
+
+test("resolveNegotiationCandidates drops codecs the browser cannot decode", () => {
+  assert.deepEqual(
+    resolveNegotiationCandidates("AV1", undefined, ["H264", "H265"]),
+    ["H264", "H265"],
+  );
+  assert.deepEqual(
+    resolveNegotiationCandidates("AV1", "H265", ["H264", "H265"]),
+    ["H265", "H264"],
+  );
+  assert.deepEqual(
+    resolveNegotiationCandidates("AV1", undefined, ["H264"]),
+    ["H264"],
+  );
+});
+
+test("resolveNegotiationCandidates keeps every candidate when support is unknown", () => {
+  assert.deepEqual(
+    resolveNegotiationCandidates("AV1", "H265", []),
+    ["AV1", "H265", "H264"],
+  );
 });

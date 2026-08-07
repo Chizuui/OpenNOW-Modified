@@ -6,6 +6,7 @@
  * adding new code; `@shared/gfn` remains the stable barrel export.
  */
 export * from "./stream";
+export * from "./sdpValidation";
 export * from "./keyboard";
 export * from "./nativeStreamer";
 export * from "./videoShader";

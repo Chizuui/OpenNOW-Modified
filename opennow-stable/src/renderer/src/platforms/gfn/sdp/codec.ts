@@ -1,4 +1,7 @@
 import type { VideoCodec } from "@shared/gfn";
+// Canonical implementation lives in @shared/gfn/sdpValidation so the
+// main-process native streamer path can validate answers with the same logic.
+export { extractNegotiatedVideoCodec } from "@shared/gfn/sdpValidation";
 
 function normalizeCodec(name: string): string {
   const upper = name.toUpperCase();
@@ -161,51 +164,38 @@ interface PreferCodecOptions {
 }
 
 /**
- * Extract the video codec actually negotiated in a (local answer) SDP.
- * Mirrors the Rust reference implementation (`extract_negotiated_video_codec`):
- * walks the video m-line payload types in order and returns the first known
- * codec name. Returns null when the m-line is missing/rejected (port 0) or
- * carries no recognizable primary codec.
+ * Ordered list of codecs to attempt during answer negotiation, primary first.
+ * The user-pinned fallback (when concrete) comes right after the primary, then
+ * the GFN-web fallback order (H264 → H265 → AV1) as a safety net. When the
+ * browser reports a non-empty receiver-capability list, codecs it cannot
+ * decode are skipped entirely — createAnswer would reject their payloads and
+ * drop the whole video m-line (the "Waiting for game video..." hang).
  */
-export function extractNegotiatedVideoCodec(sdp: string): VideoCodec | null {
-  const lines = sdp.split(/\r?\n/);
-  const codecByPayloadType = new Map<string, string>();
-  let inVideoSection = false;
+export function resolveNegotiationCandidates(
+  effectiveCodec: VideoCodec,
+  fallbackCodec?: VideoCodec,
+  supported: readonly string[] = [],
+): VideoCodec[] {
+  const candidates: VideoCodec[] = [];
+  const push = (codec: VideoCodec): void => {
+    if (!candidates.includes(codec)) {
+      candidates.push(codec);
+    }
+  };
 
-  for (const line of lines) {
-    if (line.startsWith("m=video")) {
-      inVideoSection = true;
-      continue;
-    }
-    if (line.startsWith("m=") && inVideoSection) {
-      inVideoSection = false;
-    }
-    if (!inVideoSection || !line.startsWith("a=rtpmap:")) {
-      continue;
-    }
-
-    const [, rest = ""] = line.split("a=rtpmap:");
-    const [pt, codecPart] = rest.split(/\s+/, 2);
-    const codecName = normalizeCodec((codecPart ?? "").split("/")[0] ?? "");
-    if (pt && codecName) {
-      codecByPayloadType.set(pt, codecName);
-    }
+  push(effectiveCodec);
+  if (fallbackCodec) {
+    push(fallbackCodec);
   }
+  push("H264");
+  push("H265");
+  push("AV1");
 
-  for (const line of lines) {
-    if (!line.startsWith("m=video")) {
-      continue;
-    }
-    const payloads = line.split(/\s+/).slice(3);
-    for (const pt of payloads) {
-      const codec = codecByPayloadType.get(pt);
-      if (codec === "H264") return "H264";
-      if (codec === "H265") return "H265";
-      if (codec === "AV1") return "AV1";
-    }
+  if (supported.length > 0) {
+    const supportedSet = new Set(supported.map((c) => c.toUpperCase() as VideoCodec));
+    return candidates.filter((c) => supportedSet.has(c));
   }
-
-  return null;
+  return candidates;
 }
 
 export function preferCodec(sdp: string, codec: VideoCodec, options?: PreferCodecOptions): string {

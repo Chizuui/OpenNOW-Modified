@@ -24,6 +24,16 @@ export function StatsOverlay({
   const showPacketLoss = stats.packetLossPercent > 0;
   const hasData = stats.resolution !== "" || stats.bitrateKbps > 0;
 
+  // GAME = server-reported average game FPS (stats_channel), falling back to
+  // the decode rate, then the render rate — same chain as the HUD KPI. The
+  // decode rate alone can mislead (it tracks what the client decodes, not what
+  // the game actually runs at).
+  const gameFps = stats.gameFps !== undefined && stats.gameFps > 0
+    ? String(stats.gameFps)
+    : (stats.decodeFps !== undefined && stats.decodeFps > 0
+      ? String(stats.decodeFps)
+      : (stats.renderFps > 0 ? String(stats.renderFps) : "--"));
+
   if (!hasData) {
     return (
       <div className="sovl">
@@ -40,7 +50,7 @@ export function StatsOverlay({
         {/* Resolution & FPS */}
         <div className="sovl-pill">
           <Monitor size={13} className="sovl-icon" />
-          <span className="sovl-val">{stats.resolution} @ {stats.decodeFps} FPS</span>
+          <span className="sovl-val">{stats.resolution} @ {gameFps} FPS</span>
         </div>
 
         {/* Bitrate */}

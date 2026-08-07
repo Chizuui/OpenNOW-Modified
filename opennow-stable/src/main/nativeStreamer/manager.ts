@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import {
+  answerHasVideoCodec,
   createUnsupportedNativeStreamerStatus,
+  extractNegotiatedVideoCodec,
   isNativeStreamerSupportedPlatform,
   NATIVE_STREAMER_WINDOWS_ONLY_MESSAGE,
   type IceCandidatePayload,
@@ -186,6 +188,19 @@ export class NativeStreamerManager {
       if (response.type !== "answer") {
         throw new Error(`Native streamer returned ${response.type} instead of answer.`);
       }
+
+      // Validate the native answer actually negotiated a video codec. A broken
+      // answer that dropped the video m-line (port 0 / missing from the BUNDLE
+      // group) would hang the session on "Waiting for game video..."; throwing
+      // here makes SignalingCoordinator fall back to the web streamer for this
+      // session instead.
+      if (!answerHasVideoCodec(response.answer.sdp)) {
+        throw new Error(
+          "Native streamer answer has no video codec (video m-line rejected).",
+        );
+      }
+      const negotiatedCodec = extractNegotiatedVideoCodec(response.answer.sdp);
+      console.log(`[NativeStreamer] Answer negotiated video codec: ${negotiatedCodec}`);
 
       await this.options.sendAnswer(response.answer);
       this.answerInFlight = false;

@@ -9,6 +9,7 @@ export {
 export {
   extractNegotiatedVideoCodec,
   preferCodec,
+  resolveNegotiationCandidates,
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,
 } from "./sdp/codec";
