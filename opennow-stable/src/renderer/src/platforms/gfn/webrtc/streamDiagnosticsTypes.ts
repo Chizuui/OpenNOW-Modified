@@ -79,6 +79,15 @@ export interface StreamDiagnostics {
   nativeRequestedStreamingFeaturesSummary?: string;
   nativeFinalizedStreamingFeaturesSummary?: string;
 
+  // Client-side post-processing (video shader pipeline)
+  /**
+   * True while the WebGL2 post-processing pipeline is actively applying a
+   * visible effect to stream frames. Owned by StreamView (which creates the
+   * pipeline), NOT by the WebRTC client — callers that replace the snapshot
+   * wholesale (e.g. onStats in useSignalingEvents) must preserve this field.
+   */
+  shaderActive: boolean;
+
   // Microphone state
   micState: MicState;
   micEnabled: boolean;

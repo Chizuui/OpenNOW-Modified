@@ -406,15 +406,35 @@ export function StreamView({
       : videoShader;
     if (!shaderPipelineRef.current) {
       if (!effective.enabled) return;
-      shaderPipelineRef.current = new VideoShaderPipeline(video, effective);
+      shaderPipelineRef.current = new VideoShaderPipeline(video, effective, {
+        // Also covers runtime deactivation (e.g. WebGL context loss), which
+        // StreamView would otherwise never learn about.
+        onActiveChange: (active) => {
+          const current = diagnosticsStore.getSnapshot();
+          if (current.shaderActive !== active) {
+            diagnosticsStore.set({ ...current, shaderActive: active });
+          }
+        },
+      });
     } else {
       shaderPipelineRef.current.updateSettings(effective);
+    }
+    // Mirror the pipeline's real activation (a visible effect is being applied)
+    // into diagnostics so the HUD can surface the WebGL post-processing load.
+    const active = shaderPipelineRef.current.isActive();
+    const snapshot = diagnosticsStore.getSnapshot();
+    if (snapshot.shaderActive !== active) {
+      diagnosticsStore.set({ ...snapshot, shaderActive: active });
     }
   }, [videoShader, gstreamerEnabled, nativeRendererActive]);
 
   useEffect(() => () => {
     shaderPipelineRef.current?.dispose();
     shaderPipelineRef.current = null;
+    const snapshot = diagnosticsStore.getSnapshot();
+    if (snapshot.shaderActive) {
+      diagnosticsStore.set({ ...snapshot, shaderActive: false });
+    }
   }, []);
 
   const setVideoRef = useCallback((element: HTMLVideoElement | null) => {

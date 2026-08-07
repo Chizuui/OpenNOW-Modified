@@ -5,6 +5,7 @@ import { Gauge, Images, Keyboard, LogOut, Save, SlidersHorizontal, Trash2, X } f
 import type { MicrophoneMode, StatsOverlayPosition, SubscriptionInfo, VideoShaderSettings } from "@shared/gfn";
 import SideBar from "../../SideBar";
 import type { StreamDiagnosticsStore } from "../../../utils/streamDiagnosticsStore";
+import { useStreamDiagnosticsSelector } from "../../../utils/streamDiagnosticsStore";
 import { useMicMeter } from "../../../hooks/useMicMeter";
 import type { useScreenshotGallery } from "../../../hooks/useScreenshotGallery";
 import type { useStreamRecorder } from "../../../hooks/useStreamRecorder";
@@ -135,6 +136,12 @@ export function StreamQuickMenu({
 }: StreamQuickMenuProps): JSX.Element {
   const micMeterRef = useRef<HTMLCanvasElement | null>(null);
   useMicMeter(micMeterRef, micTrack, open && microphoneMode !== "disabled");
+  // Live WebGL pipeline state (true only while the shader is actively applying
+  // a visible effect — matches the HUD indicator, not just the enabled flag).
+  const shaderActive = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.shaderActive === true,
+  );
   const shortcutEditor = useStreamQuickMenuShortcuts({
     shortcuts,
     isMacClient,
@@ -226,6 +233,24 @@ export function StreamQuickMenu({
                 <span>Keys</span>
               </button>
             </div>
+
+            {/* One-tap kill switch for the WebGL post-processing pipeline,
+                shown only while it is actively loading the GPU. */}
+            {shaderActive && (
+              <div className="sidebar-shader-banner">
+                <div className="sidebar-shader-banner-text">
+                  <span className="sidebar-shader-banner-title">Shader FX active</span>
+                  <span className="sidebar-shader-banner-sub">WebGL post-processing · extra GPU load</span>
+                </div>
+                <button
+                  type="button"
+                  className="sidebar-button"
+                  onClick={() => onVideoShaderChange({ ...videoShader, enabled: false })}
+                >
+                  <span>Turn off</span>
+                </button>
+              </div>
+            )}
 
             {activeTab === "session" && (
               <StreamQuickMenuSessionPage
