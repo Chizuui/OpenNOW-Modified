@@ -323,7 +323,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             native/opennow-streamer/target
-          key: ${{ runner.os }}-${{ matrix.label }}-cargo-${{ hashFiles('native/opennow-streamer/Cargo.lock') }}
+          # The fork's root Cargo.toml is a workspace, so cargo resolves the
+          # ROOT Cargo.lock. Hash it so dependency changes invalidate the
+          # cache; fall back to the crate lock for the upstream layout.
+          key: ${{ runner.os }}-${{ matrix.label }}-cargo-${{ hashFiles('Cargo.lock', 'native/opennow-streamer/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.label }}-cargo-
 
