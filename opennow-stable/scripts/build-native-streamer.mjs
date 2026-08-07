@@ -459,6 +459,18 @@ console.log(
 );
 
 const buildEnv = { ...process.env };
+
+// When the crate is a member of a Rust workspace (the fork's root Cargo.toml
+// declares `native/opennow-streamer` as a member), cargo emits artifacts into
+// the workspace root's target/ dir instead of the crate's own target/ dir,
+// which breaks this script's binary lookup (and the app's discovery code).
+// Pin the target directory to the crate so the binary always lands where this
+// script expects it, on every platform and in CI. This is a no-op for the
+// upstream crate-only layout. Callers may override via CARGO_TARGET_DIR.
+if (!buildEnv.CARGO_TARGET_DIR) {
+  buildEnv.CARGO_TARGET_DIR = join(crateRoot, "target");
+}
+
 let gstreamerSdkRoot = null;
 if (hasFeature(nativeFeatures, "gstreamer")) {
   gstreamerSdkRoot = configureGstreamerSdk(buildEnv);

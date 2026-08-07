@@ -1,0 +1,791 @@
+name: OpenNOW Desktop Multi-Platform Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository (owner/repo)'
+        required: true
+        default: 'Chizuui/OpenNOW-Modified'
+      branch:
+        description: 'Branch'
+        required: true
+        default: 'redesign-desktop-editorial-dark'
+      build_type:
+        description: 'Build Type (informational - packaging always produces a release build)'
+        required: true
+        type: choice
+        options:
+          - Release
+          - Debug
+      publish_release:
+        description: 'Publish GitHub Release'
+        required: false
+        type: boolean
+        default: true
+      release_type:
+        description: 'Release Type'
+        required: true
+        type: choice
+        options:
+          - Release
+          - Release Candidate
+          - Beta
+          - Alpha
+      release_tag:
+        description: 'Release Tag (spaces are replaced with dashes automatically)'
+        required: true
+      release_title:
+        description: 'Release Title'
+        required: true
+      commit_links:
+        description: 'Commit links (pipe-separated: link1 | link2 | link3)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: "22"
+  RUST_VERSION: "stable"
+  # Pinned versions proven by the repo's own release.yml. Do NOT scrape the
+  # version index - the pinned Windows .exe installer and macOS universal .pkg
+  # are far more reliable than msiexec + latest-version guessing.
+  GSTREAMER_VERSION: "1.28.2"
+  GSTREAMER_WINDOWS_VERSION: "1.28.3"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+  ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+  npm_config_audit: "false"
+  npm_config_fund: "false"
+
+concurrency:
+  group: opennow-desktop-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # Setup & Prepare
+  # ============================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    name: Prepare Build
+    outputs:
+      repo: ${{ steps.parse.outputs.repo }}
+      branch: ${{ steps.parse.outputs.branch }}
+      build_type: ${{ steps.parse.outputs.build_type }}
+      release_tag_clean: ${{ steps.parse.outputs.release_tag_clean }}
+
+    steps:
+      - name: Parse inputs
+        id: parse
+        run: |
+          # GitHub release tags cannot contain spaces - sanitize for both the
+          # release tag and for artifact filenames.
+          REPO="${{ github.event.inputs.repository }}"
+          echo "repo=${REPO}" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+          echo "build_type=${{ github.event.inputs.build_type }}" >> $GITHUB_OUTPUT
+          TAG_CLEAN=$(echo "${{ github.event.inputs.release_tag }}" | tr ' ' '-')
+          echo "release_tag_clean=${TAG_CLEAN}" >> $GITHUB_OUTPUT
+
+          echo "✓ Repository: ${REPO}"
+          echo "✓ Branch: ${{ github.event.inputs.branch }}"
+          echo "✓ Build Type: ${{ github.event.inputs.build_type }}"
+          echo "✓ Release Tag: ${{ github.event.inputs.release_tag }} -> ${TAG_CLEAN}"
+          echo "✓ Release Title: ${{ github.event.inputs.release_title }}"
+
+  # ============================================================================
+  # Job 1: Windows Build (x64)
+  # ============================================================================
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    name: Build Windows (x64)
+    timeout-minutes: 120
+
+    steps:
+      # NOTE: the default GITHUB_TOKEN only has access to the repo this
+      # workflow RUNS in. Checking out a different (private) repository via the
+      # `repository` input requires a PAT, e.g. checkout with
+      # token: ${{ secrets.PAT }}. Public repos and same-repo runs work as-is.
+      - name: Checkout OpenNOW
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repo }}
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: opennow-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          # NOTE: the workspace root has NO package-lock.json. Pointing
+          # setup-node at a missing lock file makes the cache step fail.
+          cache-dependency-path: opennow-source/opennow-stable/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            opennow-source/native/opennow-streamer/target
+          key: windows-x64-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          restore-keys: |
+            windows-x64-cargo-
+
+      - name: Cache Windows GStreamer SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\gstreamer
+            ${{ github.workspace }}\.cache\gstreamer-windows
+          key: gstreamer-windows-${{ env.GSTREAMER_WINDOWS_VERSION }}
+
+      - name: Install Windows GStreamer SDK
+        shell: pwsh
+        run: |
+          $installRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $roots = @(
+            $installRoot,
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+          )
+          $searchBases = @("C:\gstreamer", "C:\Program Files\gstreamer")
+          $script:gstreamerPcPaths = @()
+          $script:lastInstallerExitCode = $null
+          function Test-GStreamerRoot([string] $candidate) {
+            return [bool]($candidate -and
+              (Test-Path (Join-Path $candidate "lib\pkgconfig\gstreamer-1.0.pc")) -and
+              ((Test-Path (Join-Path $candidate "bin\pkg-config.exe")) -or (Test-Path (Join-Path $candidate "bin\pkgconf.exe"))))
+          }
+          function Find-GStreamerRoot {
+            $script:gstreamerPcPaths = @()
+            foreach ($candidate in $roots) {
+              if (Test-GStreamerRoot $candidate) { return $candidate }
+            }
+            foreach ($base in $searchBases) {
+              if (-not (Test-Path $base)) { continue }
+              $pcFiles = @(Get-ChildItem -Path $base -Filter "gstreamer-1.0.pc" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\lib\pkgconfig\gstreamer-1.0.pc" })
+              foreach ($pc in $pcFiles) {
+                $script:gstreamerPcPaths += $pc.FullName
+                $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $pc.FullName))
+                if (Test-GStreamerRoot $root) { return $root }
+              }
+            }
+            return $null
+          }
+          function Get-GStreamerInstaller([string] $fileName, [string] $downloadDir, [string[]] $urlBases) {
+            New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+            $output = Join-Path $downloadDir $fileName
+            $partial = "$output.part"
+            if ((Test-Path $output) -and ((Get-Item $output).Length -gt 0)) {
+              Write-Host "Using cached GStreamer installer: $output"
+              return $output
+            }
+            foreach ($base in $urlBases) {
+              $url = "$base/$fileName"
+              Write-Host "Downloading GStreamer installer from $url"
+              if ((Test-Path $partial) -and ((Get-Item $partial).Length -eq 0)) { Remove-Item -Force $partial }
+              $process = Start-Process -FilePath "curl.exe" -ArgumentList @(
+                "--fail", "--location", "--retry", "8", "--retry-all-errors",
+                "--retry-delay", "5", "--connect-timeout", "30", "--continue-at", "-",
+                "--output", $partial, $url
+              ) -Wait -PassThru -NoNewWindow
+              if ($process.ExitCode -eq 0 -and (Test-Path $partial) -and ((Get-Item $partial).Length -gt 0)) {
+                Move-Item -Force $partial $output
+                return $output
+              }
+              Write-Host "GStreamer installer download failed from $url with curl exit code $($process.ExitCode)."
+              if ((Test-Path $partial) -and ((Get-Item $partial).Length -eq 0)) { Remove-Item -Force $partial }
+            }
+            if (Test-Path $partial) {
+              Write-Host "Removing incomplete GStreamer installer download: $partial"
+              Remove-Item -Force $partial
+            }
+            return $null
+          }
+          function Install-GStreamerSdk([string] $version) {
+            # The official Cerbero .exe (Inno Setup) installer with /TYPE=devel
+            # installs runtime + dev files together and is far more reliable
+            # than installing two MSIs with msiexec.
+            $urlBases = @(
+              "https://gstreamer.freedesktop.org/data/pkg/windows/$version/msvc",
+              "https://gstreamer.freedesktop.org/pkg/windows/$version/msvc"
+            )
+            $downloadDir = Join-Path $env:GITHUB_WORKSPACE ".cache\gstreamer-windows\$version"
+            $installer = Get-GStreamerInstaller "gstreamer-1.0-msvc-x86_64-$version.exe" $downloadDir $urlBases
+            if (-not $installer) { return $false }
+            $install = Start-Process -FilePath $installer -ArgumentList @(
+              "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+              "/TYPE=devel", "/DIR=$installRoot"
+            ) -Wait -PassThru -NoNewWindow
+            $script:lastInstallerExitCode = $install.ExitCode
+            if ($install.ExitCode -ne 0) { return $false }
+            return [bool](Find-GStreamerRoot)
+          }
+          $root = Find-GStreamerRoot
+          if ($root) {
+            Write-Host "Using cached GStreamer Windows SDK: $root"
+          } elseif (-not (Install-GStreamerSdk $env:GSTREAMER_WINDOWS_VERSION)) {
+            [void](Find-GStreamerRoot)
+            Write-Host "GStreamer explicit roots searched: $($roots -join ', ')"
+            Write-Host "GStreamer recursive search bases: $($searchBases -join ', ')"
+            Write-Host "Discovered gstreamer-1.0.pc paths: $(if ($script:gstreamerPcPaths.Count) { $script:gstreamerPcPaths -join ', ' } else { 'none' })"
+            Write-Error "Failed to install/discover GStreamer Windows SDK version $env:GSTREAMER_WINDOWS_VERSION. Installer exit code: $script:lastInstallerExitCode."
+            exit 1
+          }
+          $root = Find-GStreamerRoot
+          Write-Host "GStreamer explicit roots searched: $($roots -join ', ')"
+          Write-Host "GStreamer recursive search bases: $($searchBases -join ', ')"
+          Write-Host "Discovered gstreamer-1.0.pc paths: $(if ($script:gstreamerPcPaths.Count) { $script:gstreamerPcPaths -join ', ' } else { 'none' })"
+          if (-not $root) {
+            Write-Error "GStreamer SDK root not found. Checked: $($roots -join ', '). Expected lib\pkgconfig\gstreamer-1.0.pc and bin\pkg-config.exe or bin\pkgconf.exe."
+            exit 1
+          }
+          $gstInspect = Join-Path $root "bin\gst-inspect-1.0.exe"
+          if (-not (Test-Path $gstInspect)) {
+            Write-Error "gst-inspect-1.0.exe not found in $root\bin after GStreamer install."
+            exit 1
+          }
+          $h264Decoders = @("avdec_h264", "d3d11h264dec", "d3d12h264dec")
+          $availableH264Decoders = @()
+          foreach ($decoder in $h264Decoders) {
+            $inspect = Start-Process -FilePath $gstInspect -ArgumentList @($decoder) -Wait -PassThru -NoNewWindow
+            if ($inspect.ExitCode -eq 0) {
+              $availableH264Decoders += $decoder
+              Write-Host "GStreamer decoder available: $decoder"
+            } else {
+              Write-Host "GStreamer decoder unavailable: $decoder"
+            }
+          }
+          if ($availableH264Decoders.Count -eq 0) {
+            Write-Error "GStreamer Windows SDK installed, but no H.264 decoder plugins were found among: $($h264Decoders -join ', ')"
+            exit 1
+          }
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build patched Windows GStreamer D3D11 plugin
+        shell: pwsh
+        run: ./scripts/build-patched-gstreamer-d3d11.ps1 -GStreamerRoot "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -Version "$env:GSTREAMER_WINDOWS_VERSION"
+        working-directory: opennow-source/opennow-stable
+
+      - name: Install dependencies
+        working-directory: opennow-source/opennow-stable
+        # npm install (not npm ci) so a stale/edited package-lock.json on a
+        # modified fork cannot fail the build. The postinstall script still
+        # downloads the correct Electron binary.
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: TypeScript check
+        working-directory: opennow-source/opennow-stable
+        run: npm run typecheck
+
+      # Build the native raw-mouse addon (src-native) - packaged via
+      # extraResources build/Release/opennow_input.node. Uses input:rebuild
+      # (node-gyp rebuild = configure + build) so a fresh checkout works.
+      # Requires the node-gyp toolchain (VS Build Tools / Xcode CLT /
+      # build-essential + X11 deps).
+      - name: Build native input addon
+        working-directory: opennow-source/opennow-stable
+        run: npm run input:rebuild
+
+      - name: Build Electron renderer
+        working-directory: opennow-source/opennow-stable
+        run: npm run build
+        env:
+          CI: true
+
+      - name: Build native streamer
+        working-directory: opennow-source/opennow-stable
+        run: npm run native:build
+        env:
+          RUST_BACKTRACE: 1
+          OPENNOW_NATIVE_STREAMER_FEATURES: gstreamer
+          OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "1"
+          # Must match nativeStreamerPlatformKey() in the app at runtime:
+          # win32-x64, darwin-x64, darwin-arm64, linux-x64
+          OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: win32-x64
+
+      - name: Package installers
+        working-directory: opennow-source/opennow-stable
+        run: npx electron-builder --publish never --win nsis portable --x64
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: opennow-source/opennow-stable/dist-release/*.exe
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: List artifacts
+        if: always()
+        working-directory: opennow-source/opennow-stable
+        run: |
+          Write-Host "=== Windows Build Artifacts ==="
+          $artifacts = Get-ChildItem -Path "dist-release" -Filter "*.exe" -ErrorAction SilentlyContinue
+          if ($artifacts) {
+            $artifacts | ForEach-Object { Write-Host "✓ $($_.Name) ($('{0:N2}' -f ($_.Length/1MB)) MB)" }
+          } else {
+            Write-Host "⚠ No .exe artifacts found"
+          }
+        shell: pwsh
+
+  # ============================================================================
+  # Job 2: macOS Build (Intel x64 + Apple Silicon arm64)
+  # ============================================================================
+  build-macos:
+    needs: prepare
+    runs-on: macos-latest
+    name: Build macOS (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x64
+            target: x86_64-apple-darwin
+            platform_key: darwin-x64
+            builder_arch: --x64
+          - label: arm64
+            target: aarch64-apple-darwin
+            platform_key: darwin-arm64
+            builder_arch: --arm64
+
+    steps:
+      - name: Checkout OpenNOW
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repo }}
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: opennow-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: opennow-source/opennow-stable/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            opennow-source/native/opennow-streamer/target
+          key: macos-${{ matrix.target }}-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          restore-keys: |
+            macos-${{ matrix.target }}-cargo-
+
+      - name: Cache macOS GStreamer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/gstreamer-macos
+          key: gstreamer-macos-${{ env.GSTREAMER_VERSION }}
+
+      - name: Install macOS GStreamer (universal .pkg)
+        # Homebrew on macos-latest (arm64) only ships arm64 dylibs, so building
+        # the x86_64 Rust target would fail at link time. The official Cerbero
+        # UNIVERSAL .pkg contains both architectures, which makes cross-compiling
+        # the x86_64 target on the arm64 runner work.
+        run: |
+          primary_base="https://gstreamer.freedesktop.org/data/pkg/macos/${GSTREAMER_VERSION}"
+          mirror_base="https://gstreamer.freedesktop.org/pkg/macos/${GSTREAMER_VERSION}"
+          cache_dir="${GITHUB_WORKSPACE}/.cache/gstreamer-macos/${GSTREAMER_VERSION}"
+          mkdir -p "$cache_dir"
+          runtime="$cache_dir/gstreamer-1.0-${GSTREAMER_VERSION}-universal.pkg"
+          devel="$cache_dir/gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg"
+          download_pkg() {
+            local name="$1"
+            local destination="$2"
+            local partial="${destination}.part"
+            if [ -s "$destination" ]; then
+              return 0
+            fi
+            rm -f "$partial"
+            if ! curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --continue-at - --output "$partial" "$primary_base/$name"; then
+              curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --continue-at - --output "$partial" "$mirror_base/$name"
+            fi
+            test -s "$partial"
+            mv "$partial" "$destination"
+          }
+          download_pkg "gstreamer-1.0-${GSTREAMER_VERSION}-universal.pkg" "$runtime"
+          download_pkg "gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg" "$devel"
+          test -s "$runtime"
+          test -s "$devel"
+          sudo installer -pkg "$runtime" -target /
+          sudo installer -pkg "$devel" -target /
+          root="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+          echo "GSTREAMER_1_0_ROOT_MACOS=$root" >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$root/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        working-directory: opennow-source/opennow-stable
+        # npm install (not npm ci) so a stale/edited package-lock.json on a
+        # modified fork cannot fail the build. The postinstall script still
+        # downloads the correct Electron binary.
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: TypeScript check
+        working-directory: opennow-source/opennow-stable
+        run: npm run typecheck
+
+      # Build the native raw-mouse addon (src-native) - packaged via
+      # extraResources build/Release/opennow_input.node. Uses input:rebuild
+      # (node-gyp rebuild = configure + build) so a fresh checkout works.
+      # Requires the node-gyp toolchain (VS Build Tools / Xcode CLT /
+      # build-essential + X11 deps).
+      - name: Build native input addon
+        working-directory: opennow-source/opennow-stable
+        run: npm run input:rebuild
+
+      - name: Build Electron renderer
+        working-directory: opennow-source/opennow-stable
+        run: npm run build
+        env:
+          CI: true
+
+      # NOTE: building the x64 target on the arm64 macos-latest runner works
+      # because the GStreamer universal .pkg ships both architectures AND the
+      # runner has Rosetta 2 (the native:build script actually spawns the x64
+      # binary to verify it). If GitHub ever drops Rosetta from macos-latest,
+      # move the x64 leg to an Intel runner (macos-13).
+      - name: Build native streamer
+        working-directory: opennow-source/opennow-stable
+        run: npm run native:build
+        env:
+          RUST_BACKTRACE: full
+          OPENNOW_NATIVE_STREAMER_FEATURES: gstreamer
+          OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "1"
+          OPENNOW_NATIVE_STREAMER_TARGET: ${{ matrix.target }}
+          OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: ${{ matrix.platform_key }}
+
+      - name: Package installers
+        working-directory: opennow-source/opennow-stable
+        run: npx electron-builder --publish never --mac dmg zip ${{ matrix.builder_arch }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.label }}
+          path: |
+            opennow-source/opennow-stable/dist-release/*.dmg
+            opennow-source/opennow-stable/dist-release/*.zip
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: List artifacts
+        if: always()
+        working-directory: opennow-source/opennow-stable
+        run: |
+          echo "=== macOS Build Artifacts (${{ matrix.label }}) ==="
+          ls -lh dist-release/*.{dmg,zip} 2>/dev/null || echo "⚠ No artifacts found"
+
+  # ============================================================================
+  # Job 3: Linux Build (x64)
+  # ============================================================================
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    name: Build Linux (x64)
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout OpenNOW
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repo }}
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: opennow-source
+
+      - name: Update APT packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot \
+            rpm \
+            build-essential \
+            pkg-config \
+            python3 \
+            libx11-dev \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-tools \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-nice \
+            gstreamer1.0-vaapi \
+            gstreamer1.0-gl \
+            gstreamer1.0-x \
+            gstreamer1.0-alsa \
+            libva2 \
+            libva-drm2 \
+            libvulkan1 \
+            mesa-vulkan-drivers
+
+      - name: Verify GStreamer
+        run: |
+          echo "🧪 Verifying GStreamer installation..."
+          gst-launch-1.0 --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: opennow-source/opennow-stable/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            opennow-source/native/opennow-streamer/target
+          key: linux-x64-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          restore-keys: |
+            linux-x64-cargo-
+
+      - name: Install dependencies
+        working-directory: opennow-source/opennow-stable
+        # npm install (not npm ci) so a stale/edited package-lock.json on a
+        # modified fork cannot fail the build. The postinstall script still
+        # downloads the correct Electron binary.
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: TypeScript check
+        working-directory: opennow-source/opennow-stable
+        run: npm run typecheck
+
+      # Build the native raw-mouse addon (src-native) - packaged via
+      # extraResources build/Release/opennow_input.node. Uses input:rebuild
+      # (node-gyp rebuild = configure + build) so a fresh checkout works.
+      # Requires the node-gyp toolchain (VS Build Tools / Xcode CLT /
+      # build-essential + X11 deps).
+      - name: Build native input addon
+        working-directory: opennow-source/opennow-stable
+        run: npm run input:rebuild
+
+      - name: Build Electron renderer
+        working-directory: opennow-source/opennow-stable
+        run: npm run build
+        env:
+          CI: true
+
+      - name: Build native streamer
+        working-directory: opennow-source/opennow-stable
+        run: npm run native:build
+        env:
+          RUST_BACKTRACE: full
+          OPENNOW_NATIVE_STREAMER_FEATURES: gstreamer
+          # Linux deliberately does NOT bundle a private GStreamer runtime;
+          # it uses distro packages so VAAPI/Vulkan plugins match the host.
+          OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "0"
+          OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: linux-x64
+
+      - name: Package installers
+        working-directory: opennow-source/opennow-stable
+        run: npx electron-builder --publish never --linux AppImage deb --x64
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            opennow-source/opennow-stable/dist-release/*.AppImage
+            opennow-source/opennow-stable/dist-release/*.deb
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: List artifacts
+        if: always()
+        working-directory: opennow-source/opennow-stable
+        run: |
+          echo "=== Linux Build Artifacts ==="
+          ls -lh dist-release/*.{AppImage,deb} 2>/dev/null || echo "⚠ No artifacts found"
+
+  # ============================================================================
+  # Job 4: Create Release & Upload Artifacts
+  # NOTE: no `if: always()` - this job only runs when ALL three builds succeed,
+  # so a failed build can never publish an empty release.
+  # ============================================================================
+  release:
+    needs: [prepare, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    name: Create Release
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify artifacts exist
+        run: |
+          count=$(find release-artifacts -type f | wc -l)
+          echo "Found $count release file(s)."
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No build artifacts were produced - refusing to continue."
+            exit 1
+          fi
+          ls -lh release-artifacts/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # A single-quoted heredoc would write $(date ...) literally, so
+          # substitute the timestamp with sed after the heredoc instead.
+          BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          cat > release_notes.md << 'EOF'
+          # OpenNOW Desktop - ${{ github.event.inputs.release_title }}
+
+          **Release Type**: ${{ github.event.inputs.release_type }}
+          **Build Date**: __BUILD_DATE__
+          **Build**: ${{ github.run_number }}
+
+          ## Build Artifacts
+
+          ### Windows (x64)
+          - NSIS Installer (.exe)
+          - Portable Executable (.exe)
+
+          ### macOS
+          - DMG + ZIP (Intel x86_64)
+          - DMG + ZIP (Apple Silicon ARM64)
+
+          ### Linux (x64)
+          - AppImage (portable)
+          - Debian Package (.deb)
+
+          ## Installation
+
+          **Windows**: Run the .exe installer or extract the portable version.
+
+          **macOS**: Mount the .dmg and drag to Applications, or extract the .zip.
+
+          **Linux**:
+          ```bash
+          chmod +x OpenNOW-*.AppImage && ./OpenNOW-*.AppImage
+          # OR
+          sudo dpkg -i OpenNOW-*.deb && sudo apt-get install -f
+          ```
+
+          ## Build Information
+
+          - **Repository**: ${{ github.event.inputs.repository }}
+          - **Branch**: ${{ github.event.inputs.branch }}
+          - **Build Type**: ${{ github.event.inputs.build_type }}
+          - **Release Tag**: ${{ needs.prepare.outputs.release_tag_clean }}
+          - **Triggered by**: GitHub Actions
+
+          EOF
+
+          sed -i "s/__BUILD_DATE__/$BUILD_DATE/" release_notes.md
+
+          # Add commit links if provided
+          if [ -n "${{ github.event.inputs.commit_links }}" ]; then
+            echo "" >> release_notes.md
+            echo "## Commit References" >> release_notes.md
+            echo "" >> release_notes.md
+
+            # Parse pipe-separated links
+            IFS='|' read -ra LINKS <<< "${{ github.event.inputs.commit_links }}"
+            for link in "${LINKS[@]}"; do
+              link=$(echo "$link" | xargs)  # trim whitespace
+              if [ -n "$link" ]; then
+                echo "- [$link]($link)" >> release_notes.md
+              fi
+            done
+          fi
+
+          cat release_notes.md
+
+      # Upload the workflow artifact BEFORE publishing so a failed upload can
+      # never leave a half-published release.
+      - name: Upload to workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opennow-desktop-${{ needs.prepare.outputs.release_tag_clean }}-${{ github.run_number }}
+          path: release-artifacts/
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.event.inputs.publish_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          # softprops/action-gh-release publishes to the repository the
+          # workflow runs in (it cannot publish to another repo with the
+          # default GITHUB_TOKEN). The tag is the sanitized one - GitHub
+          # release tags cannot contain spaces.
+          tag_name: ${{ needs.prepare.outputs.release_tag_clean }}
+          name: ${{ github.event.inputs.release_title }}
+          body_path: release_notes.md
+          files: release-artifacts/**
+          draft: false
+          prerelease: ${{ github.event.inputs.release_type != 'Release' }}
+          fail_on_unmatched_files: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## ✓ OpenNOW Desktop Multi-Platform Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.event.inputs.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.event.inputs.branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Type**: ${{ github.event.inputs.build_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag**: ${{ needs.prepare.outputs.release_tag_clean }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Title**: ${{ github.event.inputs.release_title }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d release-artifacts ] && [ "$(ls -A release-artifacts)" ]; then
+            find release-artifacts -type f -exec bash -c 'echo "- $(basename {}): $(du -h {} | cut -f1)"' \; | sort >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠ No artifacts generated" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Release" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.publish_release }}" == "true" ]; then
+            echo "✓ Release created: ${{ github.event.inputs.repository }}/releases/tag/${{ needs.prepare.outputs.release_tag_clean }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "📦 Artifacts available in workflow artifacts (release not published)" >> $GITHUB_STEP_SUMMARY
+          fi
