@@ -80,26 +80,32 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=vqos.fec.repairMaxPercent:35",
     // Official dynamicStreamingMode=0 path disables server resolution/FPS switching.
     "a=vqos.dynamicStreamingMode:0",
-    "a=vqos.drc.enable:0",
-    "a=vqos.calculateAvgVideoStreamingBitrate:1",
+    // Official web client always sends vqos.bllFec.enable:0 (backward-lossless
+    // FEC off). drc.enable / dfc.enable are NOT emitted for 60 FPS sessions —
+    // the official DFC/DRC helper only writes them for high-FPS (see below).
+    // vqos.calculateAvgVideoStreamingBitrate was a fork-only extra (zero hits
+    // in the play.geforcenow.com bundle) and is dropped for parity.
+    "a=vqos.bllFec.enable:0",
   ];
 
   if (isHighFps) {
     lines.push(
+      // Official web client, dynamicStreamingMode=0 + high FPS: drc.enable:0,
+      // dfc.enable:1, decodeFpsAdjPercent:85, targetDownCooldownMs:250,
+      // dfcAlgoVersion 2 (120/240) / 1 (90), minTargetFps 100 (120/240) / 60
+      // (90), resControl.dfc.useClientFpsPerf:0. No adjustResAndFps line —
+      // the official only emits it for dynamicStreamingMode 2/3.
+      "a=vqos.drc.enable:0",
       "a=vqos.dfc.enable:1",
       "a=vqos.dfc.decodeFpsAdjPercent:85",
       "a=vqos.dfc.targetDownCooldownMs:250",
       `a=vqos.dfc.dfcAlgoVersion:${is120Fps || is240Fps ? 2 : 1}`,
       `a=vqos.dfc.minTargetFps:${is90Fps ? 60 : 100}`,
       "a=vqos.resControl.dfc.useClientFpsPerf:0",
-      "a=vqos.dfc.adjustResAndFps:0",
-    );
-  } else {
-    lines.push(
-      "a=vqos.dfc.enable:0",
-      "a=vqos.dfc.adjustResAndFps:0",
     );
   }
+  // 60 FPS sessions: the official client emits NO drc.enable / dfc.enable
+  // attributes, letting the server fall back to its defaults — mirror that.
 
   // Video encoder settings
   lines.push(
@@ -251,12 +257,18 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=video.encoderHdrCscMode:4",
     `a=video.dynamicRangeMode:${bitDepth === 10 ? 1 : 0}`,
     `a=video.bitDepth:${bitDepth}`,
-    // Official web client pins video.minQp:14 for SDR H265 (lower QP = higher
-    // quality ceiling); AV1 uses minQp:25 in its block above.
-    ...(params.codec === "H265" && bitDepth === 8 ? ["a=video.minQp:14"] : []),
-    // Disable server-side scaling and prefilter (prevents resolution downgrade)
+    // Official web client sets video.minQp:14 only for 10-bit H265 (verified
+    // against the vendor bundle: `10===To && "H265"===tn`); 8-bit H265 sends
+    // no minQp. AV1 pins minQp:25 in its block above.
+    ...(params.codec === "H265" && bitDepth === 10 ? ["a=video.minQp:14"] : []),
+    // Disable server-side scaling and prefilter (prevents resolution downgrade).
+    // Official web client sends the full prefilterParams set — mode OFF,
+    // model 0, denoise 0, sharpness 0 — the fork previously sent only model.
     `a=video.scalingFeature1:${isAv1 ? 1 : 0}`,
+    "a=video.prefilterParams.prefilterMode:0",
     "a=video.prefilterParams.prefilterModel:0",
+    "a=video.prefilterParams.denoiseLevel:0",
+    "a=video.prefilterParams.sharpnessLevel:0",
     // Audio track (receive-only from server)
     // NOTE: the official web client sends NO aqos.* / audio.* attributes here
     // (verified against the play.geforcenow.com bundle dump) — the fork's

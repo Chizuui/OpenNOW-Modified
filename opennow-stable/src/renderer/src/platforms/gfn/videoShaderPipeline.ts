@@ -162,6 +162,13 @@ export class VideoShaderPipeline {
     this.canvas.style.display = "none";
     videoElement.insertAdjacentElement("afterend", this.canvas);
 
+    // Register context-loss/restore listeners once here (not in initGl, which
+    // re-runs after a restore). Without restore handling the pipeline died
+    // permanently on the first GPU/driver hiccup (raw video with no filter),
+    // and loss/restore cycles flashed between filtered and raw video.
+    this.canvas.addEventListener("webglcontextlost", this.onContextLost);
+    this.canvas.addEventListener("webglcontextrestored", this.onContextRestored);
+
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => this.syncCanvasSize());
       this.resizeObserver.observe(videoElement);
@@ -223,12 +230,14 @@ export class VideoShaderPipeline {
   }
 
   private initGl(): boolean {
+    // NOTE: `desynchronized: true` was removed — on Windows/Chromium it routes
+    // the canvas through a fast-path compositor that can drop the layer
+    // intermittently, flashing the raw video through (visible flicker).
     const gl = this.canvas.getContext("webgl2", {
       alpha: false,
       antialias: false,
       depth: false,
       stencil: false,
-      desynchronized: true,
       powerPreference: "high-performance",
     });
     if (!gl) {
@@ -295,21 +304,34 @@ export class VideoShaderPipeline {
     };
     gl.uniform1i(this.uniforms.frame, 0);
 
-    this.canvas.addEventListener("webglcontextlost", this.onContextLost);
-
     this.gl = gl;
     this.program = program;
     this.texture = texture;
     return true;
   }
 
-  private readonly onContextLost = (event: Event): void => {
-    event.preventDefault();
-    console.warn("[VideoShader] WebGL context lost; shader pipeline disabled");
+  private readonly onContextLost = (): void => {
+    // Deliberately do NOT preventDefault: that blocks the browser from ever
+    // restoring the context when the GPU process recovers (driver reset/TDR),
+    // leaving the pipeline dead for the whole session. Without it Chromium
+    // fires webglcontextrestored on recovery and we re-init below.
+    console.warn("[VideoShader] WebGL context lost; pausing shader pipeline (auto-restore enabled)");
     this.contextFailed = true;
     this.gl = null;
     this.program = null;
     this.texture = null;
+    this.stopRenderLoop();
+    this.canvas.style.display = "none";
+    this.hasRenderedFrame = false;
+    this.applyActivation();
+  };
+
+  private readonly onContextRestored = (): void => {
+    console.log("[VideoShader] WebGL context restored; re-initializing shader pipeline");
+    if (this.disposed) {
+      return;
+    }
+    this.contextFailed = false;
     this.applyActivation();
   };
 

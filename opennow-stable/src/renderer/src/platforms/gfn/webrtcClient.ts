@@ -268,6 +268,33 @@ async function toBytes(data: string | Blob | ArrayBuffer): Promise<Uint8Array> {
   return new Uint8Array(arrayBuffer);
 }
 
+/**
+ * Pull the NVST video bitrate attributes out of a server SDP (offer), if the
+ * server included them. Tells us from the exported log whether a low used
+ * bitrate is a server-side cap baked into the offer, or a runtime server-BWE
+ * collapse (the periodic Network stats line shows the live numbers).
+ */
+function extractVideoBitrateAttributes(sdp: string): {
+  initialBitrateKbps?: number;
+  initialPeakBitrateKbps?: number;
+  maximumBitrateKbps?: number;
+  minimumBitrateKbps?: number;
+  maxFps?: number;
+} | null {
+  const find = (attr: string): number | undefined => {
+    const match = sdp.match(new RegExp(`a=${attr.replace(/\./g, "\\.")}:(\\d+)`, "i"));
+    return match?.[1] !== undefined ? Number.parseInt(match[1], 10) : undefined;
+  };
+  const result = {
+    initialBitrateKbps: find("video.initialBitrateKbps"),
+    initialPeakBitrateKbps: find("video.initialPeakBitrateKbps"),
+    maximumBitrateKbps: find("vqos.bw.maximumBitrateKbps"),
+    minimumBitrateKbps: find("vqos.bw.minimumBitrateKbps"),
+    maxFps: find("video.maxFPS"),
+  };
+  return Object.values(result).some((value) => value !== undefined) ? result : null;
+}
+
 export class GfnWebRtcClient {
   private readonly inputEncoder = new InputEncoder();
 
@@ -1396,7 +1423,7 @@ export class GfnWebRtcClient {
         this.lastNetworkStatsLogAtMs = nowMs;
         this.lastLoggedRttMs = rttMs;
         this.log(
-          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps transport=${this.diagnostics.transportType}${this.diagnostics.localCandidateType ? `/${this.diagnostics.localCandidateType}` : ""} lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
+          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps bwe=${availableKbps}kbps transport=${this.diagnostics.transportType}${this.diagnostics.localCandidateType ? `/${this.diagnostics.localCandidateType}` : ""} lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
         );
       } else {
         this.lastLoggedRttMs = rttMs;
@@ -2444,6 +2471,20 @@ export class GfnWebRtcClient {
     }
     this.applyStreamSettingsDiagnostics(settings, effectiveCodec, false);
     this.emitStats();
+    // Diagnostic: log the bitrate attributes the server suggested in its own
+    // offer (if any). A low maximumBitrateKbps here means the cap is baked
+    // into the session; otherwise a low used bitrate during the session is a
+    // runtime server-BWE collapse (visible via the periodic Network stats line).
+    {
+      const offered = extractVideoBitrateAttributes(offerSdp);
+      if (offered) {
+        this.log(
+          `Server offer video bitrate: initial=${offered.initialBitrateKbps ?? "?"} initialPeak=${offered.initialPeakBitrateKbps ?? "?"} max=${offered.maximumBitrateKbps ?? "?"} min=${offered.minimumBitrateKbps ?? "?"} maxFPS=${offered.maxFps ?? "?"}`,
+        );
+      } else {
+        this.log("Server offer contains no NVST video bitrate attributes (fork builds them from settings)");
+      }
+    }
     // Always keep fallback codecs in the offer (GFN-web behavior). Receiver
     // capabilities can list a codec that createAnswer still rejects for a given
     // server payload (seen with AV1 on the MY YES edge) — with only the
