@@ -3259,6 +3259,217 @@ body,
   transform: scaleX(1);
 }
 
+.desktop-hero {
+  position: relative;
+  flex-shrink: 0;
+  height: min(clamp(220px, 30vh, 420px), calc(100% * 0.5625));
+  overflow: hidden;
+  background: var(--bg-a);
+  width: 100%;
+}
+
+.desktop-hero-image,
+.desktop-hero-placeholder,
+.desktop-hero-scrim {
+  position: absolute;
+  inset: 0;
+}
+
+.desktop-hero-image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center top;
+  opacity: 0;
+  animation: desktop-hero-fade-in 600ms ease forwards;
+}
+
+.desktop-hero-image.loaded {
+  opacity: 1;
+}
+
+@keyframes desktop-hero-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.desktop-hero-placeholder {
+  background:
+    radial-gradient(800px 320px at 65% 45%, rgba(var(--accent-rgb), 0.22), transparent 70%),
+    radial-gradient(500px 200px at 30% 70%, rgba(var(--accent-rgb), 0.09), transparent),
+    linear-gradient(150deg, #071116 0%, #0a161e 35%, #0d1a24 60%, #020607 100%);
+}
+
+.desktop-hero-scrim {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 0.02) 40%, rgba(0, 0, 0, 0.55) 80%, rgba(0, 0, 0, 0.86) 95%, var(--bg-a) 100%),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.45) 0%, rgba(0, 0, 0, 0.15) 35%, rgba(0, 0, 0, 0.03) 62%, rgba(0, 0, 0, 0.10) 100%);
+}
+
+.desktop-hero-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: clamp(36px, 2.4vw, 52px);
+  height: clamp(36px, 2.4vw, 52px);
+  border: 0;
+  border-radius: 50%;
+  background: rgba(10, 12, 14, 0.55);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: clamp(16px, 1.1vw, 24px);
+  font-weight: 700;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+
+.desktop-hero-arrow:hover {
+  background: rgba(18, 22, 26, 0.78);
+  color: #fff;
+}
+
+.desktop-hero-arrow:active {
+  transform: translateY(-50%) scale(0.94);
+}
+
+.desktop-hero-arrow--prev {
+  left: clamp(10px, 1.2vw, 28px);
+}
+
+.desktop-hero-arrow--next {
+  right: clamp(10px, 1.2vw, 28px);
+}
+
+.desktop-hero-dots {
+  position: absolute;
+  bottom: clamp(10px, 1.5vh, 24px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  gap: clamp(8px, 0.6vw, 14px);
+}
+
+.desktop-hero-dots span {
+  display: block;
+  width: clamp(42px, 2vw, 72px);
+  height: clamp(3px, 0.25vh, 5px);
+  border: none;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.28);
+  transition: background var(--t-fast), transform var(--t-fast);
+  cursor: pointer;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.desktop-hero-dots span.active {
+  background: #4ee887;
+  transform: scaleX(1.2);
+}
+
+.desktop-hero-content {
+  position: absolute;
+  left: clamp(28px, 4.4vw, 140px);
+  right: clamp(28px, 4.4vw, 140px);
+  bottom: clamp(36px, 5.2vh, 92px);
+  z-index: 1;
+}
+
+.desktop-hero-content h1 {
+  margin: 0 0 clamp(10px, 1.8vh, 26px);
+  max-width: min(520px, 46vw);
+  color: #fff;
+  font-size: clamp(1.5rem, 2.6vw, 3.6rem);
+  font-weight: 850;
+  line-height: 0.98;
+  letter-spacing: -0.03em;
+  text-shadow: 0 5px 18px rgba(0, 0, 0, 0.6);
+}
+
+.desktop-hero-logo {
+  display: block;
+  width: min(30vw, 360px);
+  max-height: clamp(60px, 9vh, 108px);
+  margin: 0 0 clamp(10px, 1.6vh, 24px);
+  object-fit: contain;
+  object-position: left bottom;
+  filter: drop-shadow(0 5px 15px rgba(0, 0, 0, 0.65));
+}
+
+.desktop-hero-meta {
+  margin: 0 0 clamp(10px, 1.6vh, 22px);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: clamp(0.76rem, 0.66vw, 0.94rem);
+  font-weight: 600;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.7);
+}
+
+.desktop-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: clamp(10px, 0.8vw, 18px);
+}
+
+.desktop-hero-primary,
+.desktop-hero-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: calc(var(--r-sm, 6px) + 2px);
+  font-family: inherit;
+  font-weight: 750;
+  cursor: pointer;
+  transition: transform var(--t-fast), filter var(--t-fast);
+}
+
+.desktop-hero-primary {
+  min-width: 0;
+  min-height: clamp(36px, 3vh, 48px);
+  padding: 0 clamp(22px, 1.6vw, 34px);
+  border: 2px solid #4ee887;
+  background: #4ee887;
+  color: #020804;
+  font-size: clamp(0.86rem, 0.72vw, 1rem);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  box-shadow: 0 8px 24px rgba(78, 232, 135, 0.28);
+}
+
+.desktop-hero-primary:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.07);
+  box-shadow: 0 12px 30px rgba(78, 232, 135, 0.36);
+}
+
+.desktop-hero-secondary {
+  min-width: 0;
+  min-height: clamp(32px, 2.6vh, 42px);
+  padding: 0 clamp(18px, 1.3vw, 28px);
+  border: 1.5px solid rgba(255, 255, 255, 0.16);
+  background: rgba(28, 36, 42, 0.72);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: clamp(0.78rem, 0.62vw, 0.9rem);
+  font-weight: 700;
+  backdrop-filter: blur(8px);
+}
+
+.desktop-hero-secondary:hover {
+  background: rgba(40, 50, 58, 0.85);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.desktop-hero-secondary:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .controller-library-strip {
   min-height: 0;
   flex: 1;

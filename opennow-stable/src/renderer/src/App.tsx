@@ -1458,16 +1458,17 @@ export function App(): JSX.Element {
       }
       const recommended = recommendedStreamFps(refreshRate);
       const defaultFps = createDefaultSettings(RUNTIME_PLATFORM).fps;
-      markFpsAutoResolved();
       if (shouldAutoUpgradeStreamFps(settings.fps, defaultFps, recommended)) {
         console.log(
           `[DisplayRefresh] Detected ${refreshRate}Hz display; auto-upgrading stream FPS from ${settings.fps} to ${recommended} (like GFN web)`,
         );
         await updateSetting("fps", recommended);
       }
+      // Tulis flag setelah keputusan final agar gagal update tidak mengunci retry.
+      markFpsAutoResolved();
     })();
     // Run once after settings load; the decision is persisted via
-    // markFpsAutoResolved + updateSetting.
+    // markFpsAutoResolved (after final decision) + updateSetting.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional narrow deps
   }, [settingsLoaded, updateSetting]);
 
