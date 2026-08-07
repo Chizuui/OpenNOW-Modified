@@ -770,7 +770,15 @@ export class DomInputCaptureController {
       if (this.mouseFlushIntervalMs <= 0 || elapsed >= this.mouseFlushIntervalMs) {
         flushMouse();
         if (hasPendingMouseMovement()) {
-          scheduleMouseBatchFlush();
+          // Defer the follow-up flush instead of rescheduling synchronously:
+          // when flushMouse cannot drain the batch (e.g. input not ready while
+          // the quick menu / pause overlay is open) a sync reschedule recurses
+          // until "Maximum call stack size exceeded". A timer lets the loop
+          // yield and keeps pending deltas until input becomes ready again.
+          this.mouseFlushTimer = window.setTimeout(() => {
+            this.mouseFlushTimer = null;
+            scheduleMouseBatchFlush();
+          }, 0);
         }
         return;
       }
@@ -798,7 +806,12 @@ export class DomInputCaptureController {
       if (this.mouseFlushIntervalMs <= 0 || elapsed >= this.mouseFlushIntervalMs) {
         flushMouse();
         if (hasPendingMouseMovement()) {
-          scheduleMouseBatchFlush();
+          // Same deferred follow-up as scheduleMouseBatchFlush — never reschedule
+          // synchronously or an undrainable batch overflows the stack.
+          this.mouseFlushTimer = window.setTimeout(() => {
+            this.mouseFlushTimer = null;
+            scheduleMouseBatchFlush();
+          }, 0);
         }
       } else {
         scheduleMouseBatchFlush();
