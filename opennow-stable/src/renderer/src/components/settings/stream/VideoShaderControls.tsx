@@ -61,6 +61,13 @@ export function VideoShaderControls({
           ? t("settings.videoFilters.nativeUnavailable")
           : t("settings.videoFilters.hint")}
       </span>
+      {/* Performance explanation is always visible so the disable option is
+          findable even when the filters are currently turned off. */}
+      {settings.streamClientMode !== "native" && (
+        <span className="settings-subtle-hint">
+          {t("settings.videoFilters.performanceNote")}
+        </span>
+      )}
       {settings.videoShader.enabled && (
         <>
           {VIDEO_SHADER_CONTROLS.map((control) => (
@@ -124,9 +131,6 @@ export function VideoShaderControls({
               <span>{t("settings.videoFilters.disableAll")}</span>
             </button>
           </div>
-          <span className="settings-subtle-hint">
-            {t("settings.videoFilters.performanceNote")}
-          </span>
         </>
       )}
     </div>
