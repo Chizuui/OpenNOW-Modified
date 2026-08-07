@@ -563,6 +563,13 @@ jobs:
       - name: Install dependencies
         run: npm ci --prefer-offline --no-audit --progress=false
 
+      # Build the native raw-mouse addon (src-native) so packaged builds ship
+      # the cross-platform input hook (Windows RawInput / macOS CGEventTap /
+      # Linux X11 grab). Uses input:rebuild (node-gyp rebuild) so a fresh
+      # checkout works. Requires the node-gyp toolchain present on the runners.
+      - name: Build native input addon
+        run: npm run input:rebuild
+
       - name: Sync package version
         shell: bash
         run: node scripts/sync-release-version.mjs "$RELEASE_VERSION"

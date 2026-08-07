@@ -15,9 +15,12 @@ import {
 import { captureMainException } from "../telemetry/posthog";
 import { isAppNavigationUrl, openExternalHttpUrl } from "./externalUrl";
 
-// Native RawInput mouse addon (Windows). Captures raw mouse + confines the
-// cursor so Escape never releases anything (we don't use browser pointer-lock).
-// Events arrive via an N-API ThreadSafeFunction callback — no UDP, no keyboard hook.
+// Native raw-mouse addon (Windows RawInput / macOS CGEventTap / Linux X11
+// grab). Captures raw mouse + confines the cursor so Escape never releases
+// anything (we don't use browser pointer-lock). Events arrive via an N-API
+// ThreadSafeFunction callback — no UDP, no keyboard hook. On Linux Wayland or
+// missing macOS permissions grabMouse() returns false and the renderer falls
+// back to DOM pointer lock.
 interface NativeMouseEvent {
   kind: number;   // 0 = move, 1 = button, 2 = wheel
   dx: number;

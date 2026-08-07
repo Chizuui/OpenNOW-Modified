@@ -1,8 +1,16 @@
 #include <napi.h>
-#include "win_input_hook.h"
-#include <windows.h>
 
-// Thread-safe function used to marshal mouse events from the RawInput worker
+#include "mouse_event.h"
+
+#ifdef _WIN32
+#include "win_input_hook.h"
+#elif defined(__APPLE__)
+#include "mac_input_hook.h"
+#else
+#include "linux_input_hook.h"
+#endif
+
+// Thread-safe function used to marshal mouse events from the OS capture worker
 // thread back onto the JS thread. One JS callback receives every event.
 static Napi::ThreadSafeFunction g_tsfn;
 static bool g_tsfnActive = false;
@@ -30,30 +38,65 @@ static void OnMouseEvent(const MouseEvent& ev) {
     }
 }
 
-// grabMouse(hwndBuffer: Buffer, onEvent: Function) -> boolean
-// hwndBuffer is Electron's window.getNativeWindowHandle() (pointer-sized bytes).
+// ---------------------------------------------------------------------------
+// Platform dispatch. `data` points at the window-handle bytes returned by
+// Electron's getNativeWindowHandle(): HWND (Windows), NSView* (macOS), X11
+// Window id (Linux).
+// ---------------------------------------------------------------------------
+static bool IsPlatformHookRunning() {
+#ifdef _WIN32
+    return WinInputHook::IsRunning();
+#elif defined(__APPLE__)
+    return MacInputHook::IsRunning();
+#else
+    return LinuxInputHook::IsRunning();
+#endif
+}
+
+static bool StartPlatformHook(void* data, size_t size, MouseEventCallback cb) {
+#ifdef _WIN32
+    HWND hwnd = nullptr;
+    if (size >= sizeof(HWND)) {
+        hwnd = *reinterpret_cast<HWND*>(data);
+    }
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    return WinInputHook::Start(hwnd, std::move(cb));
+#elif defined(__APPLE__)
+    return MacInputHook::Start(data, size, std::move(cb));
+#else
+    return LinuxInputHook::Start(data, size, std::move(cb));
+#endif
+}
+
+static void StopPlatformHook() {
+#ifdef _WIN32
+    WinInputHook::Stop();
+#elif defined(__APPLE__)
+    MacInputHook::Stop();
+#else
+    LinuxInputHook::Stop();
+#endif
+}
+
+// grabMouse(handleBuffer: Buffer, onEvent: Function) -> boolean
+// handleBuffer is Electron's window.getNativeWindowHandle() (pointer-sized
+// bytes: HWND / NSView* / X11 Window id).
 Napi::Value GrabMouse(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     if (info.Length() < 2 || !info[0].IsBuffer() || !info[1].IsFunction()) {
-        Napi::TypeError::New(env, "Expected (Buffer hwnd, Function onEvent)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected (Buffer handle, Function onEvent)").ThrowAsJavaScriptException();
         return env.Null();
     }
 
-    if (WinInputHook::IsRunning()) {
+    if (IsPlatformHookRunning()) {
         // Already grabbing — treat as success (idempotent).
         return Napi::Boolean::New(env, true);
     }
 
     Napi::Buffer<uint8_t> handleBuffer = info[0].As<Napi::Buffer<uint8_t>>();
-    HWND hwnd = nullptr;
-    if (handleBuffer.Length() >= sizeof(HWND)) {
-        hwnd = *reinterpret_cast<HWND*>(handleBuffer.Data());
-    }
-    if (!hwnd || !IsWindow(hwnd)) {
-        Napi::TypeError::New(env, "Invalid window handle").ThrowAsJavaScriptException();
-        return env.Null();
-    }
 
     g_tsfn = Napi::ThreadSafeFunction::New(
         env,
@@ -63,7 +106,11 @@ Napi::Value GrabMouse(const Napi::CallbackInfo& info) {
         1);  // one thread will call
     g_tsfnActive = true;
 
-    bool ok = WinInputHook::Start(hwnd, OnMouseEvent);
+    bool ok = StartPlatformHook(
+        handleBuffer.Data(),
+        handleBuffer.Length(),
+        [](const MouseEvent& ev) { OnMouseEvent(ev); });
+
     if (!ok) {
         g_tsfnActive = false;
         g_tsfn.Release();
@@ -74,7 +121,7 @@ Napi::Value GrabMouse(const Napi::CallbackInfo& info) {
 // releaseMouse() -> null
 Napi::Value ReleaseMouse(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    WinInputHook::Stop();
+    StopPlatformHook();
     if (g_tsfnActive) {
         g_tsfnActive = false;
         g_tsfn.Release();
@@ -83,7 +130,7 @@ Napi::Value ReleaseMouse(const Napi::CallbackInfo& info) {
 }
 
 void CleanupHook(void* /*arg*/) {
-    WinInputHook::Stop();
+    StopPlatformHook();
     if (g_tsfnActive) {
         g_tsfnActive = false;
         g_tsfn.Release();
