@@ -29,6 +29,14 @@ export interface StreamDiagnostics {
   packetLossPercent: number;
   jitterMs: number;
   rttMs: number;
+  /**
+   * Transport of the active ICE candidate pair: "udp" | "tcp" | "unknown".
+   * TCP means Chromium fell back because UDP is unreachable (e.g. an ISP
+   * blocking/throttling UDP) — a common cause of a low hard bitrate ceiling.
+   */
+  transportType: "udp" | "tcp" | "unknown";
+  /** Local ICE candidate type of the active pair (host/srflx/prflx/relay). */
+  localCandidateType: string;
 
   // Frame counters
   framesReceived: number;

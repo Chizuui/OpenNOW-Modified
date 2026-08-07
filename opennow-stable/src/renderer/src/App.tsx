@@ -49,6 +49,13 @@ import { createStreamDiagnosticsStore, useStreamDiagnosticsSelector } from "./ut
 import type { StreamStatus } from "./lib/appTypes";
 import { getCodecToMigrateToAuto, loadStoredCodecResults, resolveStreamProfileCodec, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
 import {
+  detectDisplayRefreshRate,
+  hasResolvedAutoFps,
+  markFpsAutoResolved,
+  recommendedStreamFps,
+  shouldAutoUpgradeStreamFps,
+} from "./lib/displayRefreshRate";
+import {
   createSyntheticDirectLaunchGame,
   findDirectLaunchTarget,
 } from "./lib/directLaunch";
@@ -1427,6 +1434,42 @@ export function App(): JSX.Element {
     void updateSetting("codec", "auto");
     setCodecMigratedNotice({ fromCodec: unusable });
   }, [codecResults, settings.codec, settingsLoaded, updateSetting]);
+
+  // Auto-detect the display refresh rate and fill the DEFAULT stream FPS
+  // (mirrors GFN web: a >=117Hz display gets a 120 FPS session, >=233Hz gets
+  // 240). Runs once after settings load; explicit user choices (including an
+  // explicit 60) are never overridden. The entitlement-clamp effect below
+  // keeps the result within the membership's entitled resolutions.
+  const fpsAutoDetectionStartedRef = useRef(false);
+  useEffect(() => {
+    if (!settingsLoaded || fpsAutoDetectionStartedRef.current) {
+      return;
+    }
+    fpsAutoDetectionStartedRef.current = true;
+    if (hasResolvedAutoFps()) {
+      return;
+    }
+    void (async () => {
+      const refreshRate = await detectDisplayRefreshRate();
+      if (refreshRate <= 0) {
+        // Measurement failed (hidden window, moved window, timeout). The flag is
+        // not marked resolved, so the next app launch retries the detection.
+        return;
+      }
+      const recommended = recommendedStreamFps(refreshRate);
+      const defaultFps = createDefaultSettings(RUNTIME_PLATFORM).fps;
+      markFpsAutoResolved();
+      if (shouldAutoUpgradeStreamFps(settings.fps, defaultFps, recommended)) {
+        console.log(
+          `[DisplayRefresh] Detected ${refreshRate}Hz display; auto-upgrading stream FPS from ${settings.fps} to ${recommended} (like GFN web)`,
+        );
+        await updateSetting("fps", recommended);
+      }
+    })();
+    // Run once after settings load; the decision is persisted via
+    // markFpsAutoResolved + updateSetting.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional narrow deps
+  }, [settingsLoaded, updateSetting]);
 
   useEffect(() => {
     if (!settingsLoaded || !subscriptionInfo) {

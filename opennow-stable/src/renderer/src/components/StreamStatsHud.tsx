@@ -138,6 +138,13 @@ export function StreamStatsHud({
     ? formatBitrate(stats.targetBitrateKbps)
     : "--";
   const totalUsedText = stats.bitrateKbps > 0 ? formatBitrate(stats.bitrateKbps) : "--";
+  // Active ICE transport — "UDP" normally; "TCP" means Chromium fell back
+  // because UDP is unreachable (ISP blocking/throttling), which caps the
+  // stream at a low hard bitrate. Hidden in native mode (no WebRTC ICE).
+  const transportKnown = !stats.nativeRendererActive && stats.transportType !== "unknown";
+  const transportText = stats.transportType === "unknown"
+    ? "--"
+    : `${stats.transportType.toUpperCase()}${stats.localCandidateType ? ` · ${stats.localCandidateType}` : ""}`;
   const jitterText = stats.jitterMs > 0
     ? `${stats.jitterMs.toFixed(1)}ms`
     : (stats.rttMs > 0 || stats.framesDecoded > 0 ? "<0.1ms" : "--");
@@ -207,6 +214,9 @@ export function StreamStatsHud({
         ? `GStreamer enabled · ${stats.nativeRendererActive ? "in use" : "not active"}`
         : "GStreamer disabled · Chromium WebRTC",
     );
+    if (!stats.nativeRendererActive && stats.transportType !== "unknown") {
+      lines.push(`ICE ${transportText} candidate`);
+    }
     const hwLine = [stats.hardwareAcceleration, stats.gpuType].filter(Boolean).join(" · ");
     if (hwLine) lines.push(hwLine);
     if (shaderActive) {
@@ -226,7 +236,7 @@ export function StreamStatsHud({
       lines.push(`Lag source ${getLagReasonLabel(stats.lagReason).toLowerCase()} · ${stats.lagReasonDetail}`);
     }
     return lines;
-  }, [gstreamerEnabled, hasLagIssue, stats]);
+  }, [gstreamerEnabled, hasLagIssue, stats, transportText]);
 
   const kpiRow = (
     <div className="sv-stats-kpis">
@@ -348,6 +358,12 @@ export function StreamStatsHud({
               <span>{t("stream.stats.totalUsed")}</span>
               <span>{totalUsedText}</span>
             </div>
+            {transportKnown && (
+              <div className="sv-stats-row">
+                <span>Transport</span>
+                <span>{transportText}</span>
+              </div>
+            )}
           </section>
 
           <section className="sv-stats-section">
