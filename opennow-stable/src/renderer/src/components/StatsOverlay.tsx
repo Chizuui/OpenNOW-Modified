@@ -33,6 +33,8 @@ export function StatsOverlay({
     : (stats.decodeFps !== undefined && stats.decodeFps > 0
       ? String(stats.decodeFps)
       : (stats.renderFps > 0 ? String(stats.renderFps) : "--"));
+  // STREAM = frames rendered on this device (local display rate).
+  const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
 
   if (!hasData) {
     return (
@@ -47,10 +49,15 @@ export function StatsOverlay({
   return (
     <div className="sovl">
       <div className="sovl-body">
-        {/* Resolution & FPS */}
-        <div className="sovl-pill">
+        {/* Game FPS (server-reported) & Stream FPS (local render rate) */}
+        <div className="sovl-pill" title={t("stream.stats.game")}>
           <Monitor size={13} className="sovl-icon" />
+          <span className="sovl-badge">{t("stream.stats.game")}</span>
           <span className="sovl-val">{stats.resolution} @ {gameFps} FPS</span>
+        </div>
+        <div className="sovl-pill" title={t("stream.stats.stream")}>
+          <span className="sovl-badge">{t("stream.stats.stream")}</span>
+          <span className="sovl-val">{streamFps} FPS</span>
         </div>
 
         {/* Bitrate */}
