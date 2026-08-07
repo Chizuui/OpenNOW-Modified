@@ -134,6 +134,10 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
 
+      # The fork's root Cargo.toml is a workspace, so cargo resolves the ROOT
+      # Cargo.lock, not the crate's (which is stale/unused). Hash the root lock
+      # so dependency changes invalidate the cache; fall back to the crate lock
+      # for the upstream crate-only layout.
       - name: Cache Rust dependencies
         uses: actions/cache@v4
         with:
@@ -141,7 +145,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             opennow-source/native/opennow-streamer/target
-          key: windows-x64-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          key: windows-x64-cargo-${{ hashFiles('opennow-source/Cargo.lock', 'opennow-source/native/opennow-streamer/Cargo.lock') }}
           restore-keys: |
             windows-x64-cargo-
 
@@ -318,6 +322,27 @@ jobs:
           # win32-x64, darwin-x64, darwin-arm64, linux-x64
           OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: win32-x64
 
+      # Guard: fail early with a clear diagnostic if the native streamer binary
+      # was not produced (the script's bare "did not produce" error gives no
+      # hint about where cargo actually placed the artifact).
+      - name: Verify native streamer artifact
+        working-directory: opennow-source
+        run: |
+          $exe = "native/opennow-streamer/target/release/opennow-streamer.exe"
+          $pkg = "native/opennow-streamer/bin/win32-x64/opennow-streamer.exe"
+          if ((Test-Path $exe) -and (Test-Path $pkg)) {
+            Write-Host "✓ Native streamer present: $exe"
+            Write-Host "✓ Packaged copy present: $pkg"
+          } else {
+            Write-Host "::error::Native streamer artifact missing. Expected: $exe (and packaged copy $pkg)."
+            Write-Host "=== target dirs ==="
+            Get-ChildItem -Path "native/opennow-streamer/target/release" -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object { Write-Host "  crate target/release: $($_.Name)" }
+            Get-ChildItem -Path "target/release" -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object { Write-Host "  workspace-root target/release: $($_.Name)" }
+            Write-Host "Hint: if the binary is under the workspace-root target/, cargo used the root Cargo workspace layout. CARGO_TARGET_DIR is pinned to the crate dir in scripts/build-native-streamer.mjs - if that regression returns, check that pin."
+            exit 1
+          }
+        shell: pwsh
+
       - name: Package installers
         working-directory: opennow-source/opennow-stable
         run: npx electron-builder --publish never --win nsis portable --x64
@@ -342,6 +367,80 @@ jobs:
             $artifacts | ForEach-Object { Write-Host "✓ $($_.Name) ($('{0:N2}' -f ($_.Length/1MB)) MB)" }
           } else {
             Write-Host "⚠ No .exe artifacts found"
+          }
+        shell: pwsh
+
+  # ============================================================================
+  # Job 1b: Windows Build (ARM64) - Electron package only.
+  # Mirrors release.yml: the native streamer/addon are NOT cross-built for
+  # win-arm64 (no cross toolchain in CI). electron-builder skips missing
+  # extraResources sources with a warning, so this is safe. x64 installers run
+  # on ARM64 Windows via emulation when native support is not available.
+  # ============================================================================
+  build-windows-arm64:
+    needs: prepare
+    runs-on: windows-latest
+    name: Build Windows (ARM64)
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout OpenNOW
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repo }}
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: opennow-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: opennow-source/opennow-stable/package-lock.json
+
+      - name: Install dependencies
+        working-directory: opennow-source/opennow-stable
+        # npm install (not npm ci) so a stale/edited package-lock.json on a
+        # modified fork cannot fail the build. The postinstall script still
+        # downloads the correct Electron binary (x64 here; electron-builder
+        # fetches the arm64 Electron dist for the --arm64 target itself).
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: TypeScript check
+        working-directory: opennow-source/opennow-stable
+        run: npm run typecheck
+
+      - name: Build Electron renderer
+        working-directory: opennow-source/opennow-stable
+        run: npm run build
+        env:
+          CI: true
+
+      # No native streamer / input addon for win-arm64 (matches release.yml).
+      - name: Package installers
+        working-directory: opennow-source/opennow-stable
+        run: npx electron-builder --publish never --win nsis portable --arm64
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload Windows ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: opennow-source/opennow-stable/dist-release/*-arm64.exe
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: List artifacts
+        if: always()
+        working-directory: opennow-source/opennow-stable
+        run: |
+          Write-Host "=== Windows ARM64 Build Artifacts ==="
+          $artifacts = Get-ChildItem -Path "dist-release" -Filter "*-arm64.exe" -ErrorAction SilentlyContinue
+          if ($artifacts) {
+            $artifacts | ForEach-Object { Write-Host "✓ $($_.Name) ($('{0:N2}' -f ($_.Length/1MB)) MB)" }
+          } else {
+            Write-Host "⚠ No ARM64 .exe artifacts found"
           }
         shell: pwsh
 
@@ -393,7 +492,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             opennow-source/native/opennow-streamer/target
-          key: macos-${{ matrix.target }}-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          key: macos-${{ matrix.target }}-cargo-${{ hashFiles('opennow-source/Cargo.lock', 'opennow-source/native/opennow-streamer/Cargo.lock') }}
           restore-keys: |
             macos-${{ matrix.target }}-cargo-
 
@@ -480,6 +579,25 @@ jobs:
           OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "1"
           OPENNOW_NATIVE_STREAMER_TARGET: ${{ matrix.target }}
           OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: ${{ matrix.platform_key }}
+
+      # Guard: fail early with a clear diagnostic if the native streamer binary
+      # was not produced for this target.
+      - name: Verify native streamer artifact
+        working-directory: opennow-source
+        run: |
+          BIN="native/opennow-streamer/target/${{ matrix.target }}/release/opennow-streamer"
+          PKG="native/opennow-streamer/bin/${{ matrix.platform_key }}/opennow-streamer"
+          if [ -f "$BIN" ] && [ -f "$PKG" ]; then
+            echo "✓ Native streamer present: $BIN"
+            echo "✓ Packaged copy present: $PKG"
+          else
+            echo "::error::Native streamer artifact missing. Expected: $BIN (and packaged copy $PKG)."
+            echo "=== target dirs ==="
+            find native/opennow-streamer/target -maxdepth 4 -type f -name opennow-streamer 2>/dev/null | head -20
+            [ -d target/release ] && ls -la target/release | head -20
+            echo "Hint: if the binary is under the workspace-root target/, cargo used the root Cargo workspace layout. CARGO_TARGET_DIR is pinned to the crate dir in scripts/build-native-streamer.mjs - if that regression returns, check that pin."
+            exit 1
+          fi
 
       - name: Package installers
         working-directory: opennow-source/opennow-stable
@@ -576,7 +694,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             opennow-source/native/opennow-streamer/target
-          key: linux-x64-cargo-${{ hashFiles('opennow-source/native/opennow-streamer/Cargo.lock') }}
+          key: linux-x64-cargo-${{ hashFiles('opennow-source/Cargo.lock', 'opennow-source/native/opennow-streamer/Cargo.lock') }}
           restore-keys: |
             linux-x64-cargo-
 
@@ -617,6 +735,25 @@ jobs:
           OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "0"
           OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: linux-x64
 
+      # Guard: fail early with a clear diagnostic if the native streamer binary
+      # was not produced.
+      - name: Verify native streamer artifact
+        working-directory: opennow-source
+        run: |
+          BIN="native/opennow-streamer/target/release/opennow-streamer"
+          PKG="native/opennow-streamer/bin/linux-x64/opennow-streamer"
+          if [ -f "$BIN" ] && [ -f "$PKG" ]; then
+            echo "✓ Native streamer present: $BIN"
+            echo "✓ Packaged copy present: $PKG"
+          else
+            echo "::error::Native streamer artifact missing. Expected: $BIN (and packaged copy $PKG)."
+            echo "=== target dirs ==="
+            find native/opennow-streamer/target -maxdepth 4 -type f -name opennow-streamer 2>/dev/null | head -20
+            [ -d target/release ] && ls -la target/release | head -20
+            echo "Hint: if the binary is under the workspace-root target/, cargo used the root Cargo workspace layout. CARGO_TARGET_DIR is pinned to the crate dir in scripts/build-native-streamer.mjs - if that regression returns, check that pin."
+            exit 1
+          fi
+
       - name: Package installers
         working-directory: opennow-source/opennow-stable
         run: npx electron-builder --publish never --linux AppImage deb --x64
@@ -641,12 +778,173 @@ jobs:
           ls -lh dist-release/*.{AppImage,deb} 2>/dev/null || echo "⚠ No artifacts found"
 
   # ============================================================================
+  # Job 3b: Linux Build (ARM64) - native on an arm64 runner
+  # GitHub-hosted arm64 runners (ubuntu-24.04-arm) are available for public
+  # repos; for a private repo, use a self-hosted arm64 runner or drop this job.
+  # ============================================================================
+  build-linux-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    name: Build Linux (ARM64)
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout OpenNOW
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repo }}
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: opennow-source
+
+      - name: Update APT packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot \
+            build-essential \
+            pkg-config \
+            python3 \
+            libx11-dev \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-tools \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-nice \
+            gstreamer1.0-vaapi \
+            gstreamer1.0-gl \
+            gstreamer1.0-x \
+            gstreamer1.0-alsa \
+            libva2 \
+            libva-drm2 \
+            libvulkan1 \
+            mesa-vulkan-drivers
+
+      - name: Verify GStreamer
+        run: |
+          echo "🧪 Verifying GStreamer installation..."
+          gst-launch-1.0 --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: opennow-source/opennow-stable/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            opennow-source/native/opennow-streamer/target
+          key: linux-arm64-cargo-${{ hashFiles('opennow-source/Cargo.lock', 'opennow-source/native/opennow-streamer/Cargo.lock') }}
+          restore-keys: |
+            linux-arm64-cargo-
+
+      - name: Install dependencies
+        working-directory: opennow-source/opennow-stable
+        # npm install (not npm ci) so a stale/edited package-lock.json on a
+        # modified fork cannot fail the build. The postinstall script still
+        # downloads the correct Electron binary (arm64 on this runner).
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: TypeScript check
+        working-directory: opennow-source/opennow-stable
+        run: npm run typecheck
+
+      # Build the native raw-mouse addon (src-native) - packaged via
+      # extraResources build/Release/opennow_input.node. Uses input:rebuild
+      # (node-gyp rebuild = configure + build) so a fresh checkout works.
+      - name: Build native input addon
+        working-directory: opennow-source/opennow-stable
+        run: npm run input:rebuild
+
+      - name: Build Electron renderer
+        working-directory: opennow-source/opennow-stable
+        run: npm run build
+        env:
+          CI: true
+
+      - name: Build native streamer
+        working-directory: opennow-source/opennow-stable
+        run: npm run native:build
+        env:
+          RUST_BACKTRACE: full
+          OPENNOW_NATIVE_STREAMER_FEATURES: gstreamer
+          # Linux deliberately does NOT bundle a private GStreamer runtime;
+          # it uses distro packages so VAAPI/Vulkan plugins match the host.
+          OPENNOW_BUNDLE_GSTREAMER_RUNTIME: "0"
+          OPENNOW_NATIVE_STREAMER_PLATFORM_KEY: linux-arm64
+
+      # Guard: fail early with a clear diagnostic if the native streamer binary
+      # was not produced.
+      - name: Verify native streamer artifact
+        working-directory: opennow-source
+        run: |
+          BIN="native/opennow-streamer/target/release/opennow-streamer"
+          PKG="native/opennow-streamer/bin/linux-arm64/opennow-streamer"
+          if [ -f "$BIN" ] && [ -f "$PKG" ]; then
+            echo "✓ Native streamer present: $BIN"
+            echo "✓ Packaged copy present: $PKG"
+          else
+            echo "::error::Native streamer artifact missing. Expected: $BIN (and packaged copy $PKG)."
+            echo "=== target dirs ==="
+            find native/opennow-streamer/target -maxdepth 4 -type f -name opennow-streamer 2>/dev/null | head -20
+            [ -d target/release ] && ls -la target/release | head -20
+            echo "Hint: if the binary is under the workspace-root target/, cargo used the root Cargo workspace layout. CARGO_TARGET_DIR is pinned to the crate dir in scripts/build-native-streamer.mjs - if that regression returns, check that pin."
+            exit 1
+          fi
+
+      # electron-builder's bundled fpm cannot build arm64 debs; use system fpm
+      # like release.yml does.
+      - name: Install FPM for ARM64 deb build
+        run: |
+          sudo apt-get install -y --no-install-recommends ruby ruby-dev build-essential
+          sudo gem install fpm --no-document
+
+      - name: Package installers
+        working-directory: opennow-source/opennow-stable
+        run: npx electron-builder --publish never --linux AppImage deb --arm64
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          USE_SYSTEM_FPM: "true"
+
+      - name: Upload Linux ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: |
+            opennow-source/opennow-stable/dist-release/*-arm64.AppImage
+            opennow-source/opennow-stable/dist-release/*-arm64.deb
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: List artifacts
+        if: always()
+        working-directory: opennow-source/opennow-stable
+        run: |
+          echo "=== Linux ARM64 Build Artifacts ==="
+          ls -lh dist-release/*-arm64.{AppImage,deb} 2>/dev/null || echo "⚠ No artifacts found"
+
+  # ============================================================================
   # Job 4: Create Release & Upload Artifacts
-  # NOTE: no `if: always()` - this job only runs when ALL three builds succeed,
+  # NOTE: no `if: always()` - this job only runs when ALL builds succeed,
   # so a failed build can never publish an empty release.
   # ============================================================================
   release:
-    needs: [prepare, build-windows, build-macos, build-linux]
+    needs: [prepare, build-windows, build-windows-arm64, build-macos, build-linux, build-linux-arm64]
     runs-on: ubuntu-latest
     name: Create Release
 
@@ -682,17 +980,17 @@ jobs:
 
           ## Build Artifacts
 
-          ### Windows (x64)
-          - NSIS Installer (.exe)
-          - Portable Executable (.exe)
+          ### Windows
+          - NSIS Installer + Portable (x64)
+          - NSIS Installer + Portable (ARM64)
 
           ### macOS
           - DMG + ZIP (Intel x86_64)
           - DMG + ZIP (Apple Silicon ARM64)
 
-          ### Linux (x64)
-          - AppImage (portable)
-          - Debian Package (.deb)
+          ### Linux
+          - AppImage + .deb (x64)
+          - AppImage + .deb (ARM64)
 
           ## Installation
 
