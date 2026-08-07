@@ -111,7 +111,22 @@ export function VideoShaderControls({
             >
               <span>{t("settings.videoFilters.reset")}</span>
             </button>
+            <button
+              type="button"
+              className="settings-chip"
+              onClick={() => {
+                handleChange("videoShader", {
+                  ...settings.videoShader,
+                  enabled: false,
+                });
+              }}
+            >
+              <span>{t("settings.videoFilters.disableAll")}</span>
+            </button>
           </div>
+          <span className="settings-subtle-hint">
+            {t("settings.videoFilters.performanceNote")}
+          </span>
         </>
       )}
     </div>

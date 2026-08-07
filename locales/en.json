@@ -643,9 +643,11 @@
       "contrast": "Contrast",
       "brightness": "Brightness",
       "vibrance": "Vibrance",
-      "filmGrain": "Film Grain",
-      "reset": "Reset to defaults"
-    },
+  "filmGrain": "Film Grain",
+  "reset": "Reset to defaults",
+  "disableAll": "Turn off all filters",
+  "performanceNote": "Shader filters run WebGL post-processing on every stream frame — extra GPU load that can lower the stream FPS on weaker integrated graphics. Turn them off to lighten the load."
+},
     "codecDiagnostics": {
       "advanced": "Advanced - Codec Diagnostics",
       "title": "Codec Diagnostics",

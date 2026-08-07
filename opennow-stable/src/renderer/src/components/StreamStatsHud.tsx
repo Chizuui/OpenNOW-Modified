@@ -65,8 +65,10 @@ export function StreamStatsHud({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [rttSpikeActive, setRttSpikeActive] = useState(false);
   const [rttSpikeValueMs, setRttSpikeValueMs] = useState(0);
+  const [codecFallbackVisible, setCodecFallbackVisible] = useState(false);
   const lastRttRef = useRef(0);
   const rttSpikeTimerRef = useRef<number | undefined>(undefined);
+  const codecFallbackTimerRef = useRef<number | undefined>(undefined);
 
   // Detect sudden RTT spikes (≥2× previous sample, ≥80ms) so the HUD can show
   // a visible "ping tinggi tiba-tiba" banner instead of relying on the log.
@@ -97,6 +99,9 @@ export function StreamStatsHud({
     return () => {
       if (rttSpikeTimerRef.current !== undefined) {
         window.clearTimeout(rttSpikeTimerRef.current);
+      }
+      if (codecFallbackTimerRef.current !== undefined) {
+        window.clearTimeout(codecFallbackTimerRef.current);
       }
     };
   }, []);
@@ -157,6 +162,23 @@ export function StreamStatsHud({
   const codecFallbackShortText = codecFellBack
     ? t("stream.stats.codecFallbackShort", { requested: stats.requestedCodec, negotiated: stats.codec })
     : "";
+
+  // Transient codec-fallback notice: the yellow pill (compact) and the
+  // fallback line (full) appear for a few seconds once a fallback is detected,
+  // then auto-hide for the session — the negotiated codec stays visible in the
+  // Codec row, so the notice is a heads-up, not a permanent sticker.
+  useEffect(() => {
+    if (codecFellBack) {
+      setCodecFallbackVisible(true);
+      if (codecFallbackTimerRef.current !== undefined) {
+        window.clearTimeout(codecFallbackTimerRef.current);
+      }
+      codecFallbackTimerRef.current = window.setTimeout(() => {
+        setCodecFallbackVisible(false);
+        codecFallbackTimerRef.current = undefined;
+      }, 5000);
+    }
+  }, [codecFellBack]);
 
   // Client-side WebGL post-processing (video shader) is actively applying a
   // visible effect to stream frames — extra GPU load, especially on iGPUs.
@@ -290,7 +312,7 @@ export function StreamStatsHud({
           <div className="sv-stats-serverbar" title={regionLabel}>
             {regionLabel}
           </div>
-          {codecFellBack && (
+          {codecFallbackVisible && (
             <div className="sv-stats-serverbar sv-stats-serverbar--codec-fallback" title={codecFallbackText}>
               {codecFallbackShortText}
             </div>
@@ -338,7 +360,7 @@ export function StreamStatsHud({
               <span>{t("stream.stats.codec")}</span>
               <span>{codecText}</span>
             </div>
-            {codecFellBack && (
+            {codecFallbackVisible && (
               <p className="sv-stats-foot">{codecFallbackText}</p>
             )}
             {shaderActive && (
