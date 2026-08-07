@@ -188,6 +188,17 @@ export function StreamQuickMenuControlsPage({
                     <span>Reset</span>
                   </button>
                 </div>
+                <div className="sidebar-row sidebar-row--aligned">
+                  <span className="sidebar-label">Disable Filters</span>
+                  <button
+                    type="button"
+                    className="sidebar-button"
+                    onClick={() => onVideoShaderChange({ ...videoShader, enabled: false })}
+                  >
+                    <span>Turn off</span>
+                  </button>
+                </div>
+                <span className="sidebar-hint">Shader filters run WebGL post-processing on every frame — extra GPU load that can lower FPS on weaker integrated graphics. Turn them off to lighten the load.</span>
               </>
             )}
           </>
