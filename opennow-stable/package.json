@@ -1,15 +1,15 @@
 {
   "name": "openow-chizui",
-  "version": "0.5.3",
-  "description": "Electron-based OpenNOW stable client",
+  "version": "0.5.4",
+  "description": "Electron-based OpenNOW stable client ( FORK VER )",
   "author": {
-    "name": "zortos293",
-    "email": "zortos293@users.noreply.github.com"
+    "name": "chizuui",
+    "email": "chizuui@users.noreply.github.com"
   },
-  "homepage": "https://github.com/OpenCloudGaming/OpenNOW",
+  "homepage": "https://github.com/Chizuui/OpenNOW",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OpenCloudGaming/OpenNOW.git"
+    "url": "https://github.com/Chizuui/OpenNOW.git"
   },
   "private": true,
   "type": "module",
