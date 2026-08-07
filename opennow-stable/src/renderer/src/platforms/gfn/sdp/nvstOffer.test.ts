@@ -151,6 +151,7 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
   assert.equal(lines.has("a=video.encoderCscMode:3"), true);
   // Fork-only attributes the official web client never sends — guard against
   // regressions (the BWE ones made the server throttle to the bitrate floor).
+  // Prefix match on the full line so "a=foo" also catches "a=foo:123".
   for (const absent of [
     "a=vqos.bw.enableBandwidthEstimation",
     "a=vqos.bw.disableBitrateLimit",
@@ -158,6 +159,10 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
     "a=vqos.bw.peakBitrateKbps",
     "a=vqos.grc.maximumBitrateKbps",
     "a=vqos.grc.enable",
+    "a=vqos.calculateAvgVideoStreamingBitrate",
+    "a=vqos.dfc.adjustResAndFps",
+    "a=vqos.drc.enable:0", // 60 FPS sessions send no drc/dfc (high-FPS only)
+    "a=vqos.dfc.enable:0",
     "a=video.framePacing.mode",
     "a=video.adaptiveQuantization.spatialAQSetting",
     "a=vqos.relaxMaxBitrate.overrideAvgBitrateThresholdPercent",
@@ -177,7 +182,8 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
     "a=ri.timestampsEnabled",
     "a=ri.useMultipleGamepads",
   ]) {
-    assert.equal(lines.has(absent), false, `fork-only attribute still sent: ${absent}`);
+    const leaked = [...lines].some((line) => line.startsWith(absent));
+    assert.equal(leaked, false, `fork-only attribute still sent: ${absent}`);
   }
   assert.equal(lines.has("a=video.bitDepth:8"), true);
   assert.equal(lines.has("a=ri.hidDeviceMask:4294967295"), true);

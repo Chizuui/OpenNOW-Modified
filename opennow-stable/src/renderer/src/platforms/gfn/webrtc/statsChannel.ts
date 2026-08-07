@@ -29,9 +29,14 @@ export function parseStatsChannelGameFps(buf: ArrayBuffer): StatsChannelGameFps 
   if (bytes[0] === 3) {
     if (bytes.length < 2) return null;
     offset = 1;
+  } else if (bytes[0] !== 4) {
+    // Byte 0 is a TYPE discriminator in BOTH official clients (web and the
+    // Windows app share the same onmessage dispatcher): 3 = 1-byte header +
+    // payload, 4 = payload directly, anything else is dropped with an error.
+    // There is no "type-4 v5" frame — a type-4 frame's byte 0 is the version
+    // 4 itself. v5 frames arrive as type 3 with version 5 at byte 1.
+    return null;
   }
-  // type-4: byte 0 adalah VERSION (4 atau 5), bukan gate tetap — cek via
-  // version di bawah supaya paket v5 type-4 valid tidak dibuang.
   if (bytes.length - offset < 33) return null;
   try {
     const view = new DataView(buf);
