@@ -22,7 +22,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <thread>
 
 namespace {
@@ -30,7 +29,10 @@ namespace {
 std::thread g_worker;
 std::atomic<bool> g_running{false};
 std::atomic<CFRunLoopRef> g_runLoop{nullptr};
-std::atomic<CGEventTapRef> g_tap{nullptr};
+// CGEventTapRef is (and has always been) a typedef of CFMachPortRef, and
+// newer macOS SDKs no longer declare the typedef - use the underlying CF
+// type directly so this compiles on any SDK.
+std::atomic<CFMachPortRef> g_tap{nullptr};
 // Discards the very first move event after grab, whose delta is the jump from
 // the pre-grab cursor position to the grab position.
 std::atomic<bool> g_firstMotion{true};
@@ -68,7 +70,7 @@ CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef 
     (void)refcon;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-        CGEventTapRef tap = g_tap.load();
+        CFMachPortRef tap = g_tap.load();
         if (tap) {
             CGEventTapEnable(tap, true);
         }
@@ -148,18 +150,18 @@ CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef 
             break;
         }
         case kCGEventScrollWheel: {
-            // Point delta is in lines (1 line = 1 notch). Normalize to the
-            // physical wheel direction (games expect +120 = wheel up, matching
-            // Windows WHEEL_DELTA): when "natural scrolling" is enabled the
-            // event reports the inverted direction, flagged per event.
-            double lines = CGEventGetDoubleValueField(event, kCGScrollWheelEventPointDeltaAxis1);
-            bool invertedFromDevice = CGEventGetIntegerValueField(
-                                          event,
-                                          kCGScrollWheelEventIsDirectionInvertedFromDevice) != 0;
-            double physicalLines = invertedFromDevice ? -lines : lines;
+            // kCGScrollWheelEventDeltaAxis1 is the raw device delta in the
+            // physical wheel direction (positive = wheel up, in lines of 1
+            // notch), unaffected by the user's "natural scrolling" preference.
+            // Scale to Windows-style WHEEL_DELTA units (+120 per notch) so
+            // games see the same signs as on Windows. The dedicated inversion
+            // flag (kCGScrollWheelEventIsDirectionInvertedFromDevice) is no
+            // longer declared in newer macOS SDKs, so raw device deltas are
+            // used directly instead.
+            int64_t deviceDelta = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
             MouseEvent mouseEvent = {};
             mouseEvent.kind = 2;
-            mouseEvent.wheel = (int32_t)llround(physicalLines * 120.0);
+            mouseEvent.wheel = (int32_t)(deviceDelta * 120);
             if (mouseEvent.wheel != 0) {
                 g_callback(mouseEvent);
             }
@@ -184,7 +186,9 @@ void WorkerMain(void* handle, size_t handleSize) {
         | CGEventMaskBit(kCGEventOtherMouseUp)
         | CGEventMaskBit(kCGEventScrollWheel);
 
-    CGEventTapRef tap = CGEventTapCreate(
+    // CGEventTapCreate returns CFMachPortRef (CGEventTapRef is a removed
+    // typedef in newer SDKs; the CF type is what every API here accepts).
+    CFMachPortRef tap = CGEventTapCreate(
         kCGHIDEventTap,
         kCGHeadInsertEventTap,
         kCGEventTapOptionDefault,
