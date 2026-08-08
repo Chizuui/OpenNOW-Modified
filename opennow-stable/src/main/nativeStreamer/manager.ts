@@ -60,6 +60,7 @@ interface NativeStreamerManagerOptions extends NativeStreamerCallbacks {
   getCloudGsyncMode(): NativeStreamerFeatureMode;
   getD3dFullscreenMode(): NativeStreamerFeatureMode;
   getExternalRendererEnabled(): boolean;
+  getStackedRendererEnabled(): boolean;
 }
 
 interface PendingRequest {
@@ -480,6 +481,9 @@ export class NativeStreamerManager {
       videoBackendPreference,
       externalRendererEnabled: process.platform === "win32"
         ? this.options.getExternalRendererEnabled()
+        : false,
+      stackedRendererEnabled: process.platform === "win32"
+        ? this.options.getStackedRendererEnabled()
         : false,
       cloudGsyncMode: this.options.getCloudGsyncMode(),
       d3dFullscreenMode: this.options.getD3dFullscreenMode(),

@@ -436,6 +436,57 @@ fn split_lines_lossless(sdp: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether the video m-line of `sdp` advertises the given codec (via `a=rtpmap:`).
+pub fn sdp_contains_codec(sdp: &str, codec: VideoCodec) -> bool {
+    let target = codec.as_str();
+    let mut in_video_section = false;
+    for line in split_lines_lossless(sdp) {
+        if line.starts_with("m=video") {
+            in_video_section = true;
+            continue;
+        }
+        if line.starts_with("m=") && in_video_section {
+            in_video_section = false;
+        }
+        if !in_video_section || !line.starts_with("a=rtpmap:") {
+            continue;
+        }
+        let rest = line.strip_prefix("a=rtpmap:").unwrap_or_default();
+        if let Some(codec_part) = rest.split_whitespace().nth(1) {
+            if normalize_codec(codec_part.split('/').next().unwrap_or_default()) == target {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Human-readable dump of the video m-line plus its `a=rtpmap:` lines, for
+/// diagnosing codec negotiation mismatches (e.g. H265/AV1 `not-negotiated`
+/// receive failures where the server sends a payload the answer did not map).
+pub fn describe_video_payloads(sdp: &str) -> String {
+    let mut in_video_section = false;
+    let mut out = String::new();
+    for line in split_lines_lossless(sdp) {
+        if line.starts_with("m=video") {
+            in_video_section = true;
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str(line);
+            continue;
+        }
+        if line.starts_with("m=") && in_video_section {
+            break;
+        }
+        if in_video_section && line.starts_with("a=rtpmap:") {
+            out.push_str(" | ");
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 pub fn prefer_codec(sdp: &str, codec: VideoCodec, options: PreferCodecOptions) -> String {
     let ending = line_ending(sdp);
     let lines = split_lines_lossless(sdp);
@@ -688,6 +739,113 @@ pub fn munge_answer_sdp(sdp: &str, max_bitrate_kbps: u32) -> String {
     }
 
     result.join(ending)
+}
+
+/// Remove H265 fmtp parameters that GStreamer's `rtph265depay` cannot accept.
+///
+/// GFN echoes `profile-id`, `level-id`, and `tier-flag` from its offer into
+/// the negotiated answer, and the bundled GStreamer 1.29.x `rtph265depay`
+/// rejects receive-pad caps carrying those fields (`not-negotiated` right after
+/// the first RTP packet, killing the session). The fields are redundant — the
+/// depayloader reconstructs profile/level from the in-band VPS/SPS/PPS — so
+/// strip them from the offer handed to webrtcbin; the answer (and therefore
+/// the receive-pad caps) then never carries them. H264's `profile-level-id`
+/// and AV1's offer have no such fields, so only H265/HEVC fmtp lines change.
+/// Fmtp lines whose parameters are all H265-only are dropped entirely.
+pub fn sanitize_h265_fmtp_for_gstreamer(sdp: &str) -> String {
+    let ending = line_ending(sdp);
+    split_lines_lossless(sdp)
+        .into_iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("a=fmtp:") else {
+                return Some(line.to_owned());
+            };
+            let Some((pt, params)) = rest.split_once(' ') else {
+                // Bare `a=fmtp:<pt>` with no parameters; nothing to strip.
+                return Some(line.to_owned());
+            };
+            let stripped = strip_h265_fmtp_params(params);
+            if stripped.is_empty() {
+                // All parameters were H265-only and got stripped; drop the line
+                // so webrtcbin cannot re-derive the rejected caps fields.
+                None
+            } else if stripped == params {
+                Some(line.to_owned())
+            } else {
+                Some(format!("a=fmtp:{pt} {stripped}"))
+            }
+        })
+        .filter_map(|line| line)
+        .collect::<Vec<_>>()
+        .join(ending)
+}
+
+/// The fmtp parameter string of the first H265 fmtp line in `sdp` (e.g.
+/// `profile-id=1; level-id=153; tier-flag=1`), used to restore server-facing
+/// parity on the answer after `sanitize_h265_fmtp_for_gstreamer` stripped it.
+/// H265 fmtp lines are recognized by the H265-only `profile-id=` parameter
+/// (H264 uses `profile-level-id=`).
+pub fn extract_h265_fmtp_params(sdp: &str) -> Option<String> {
+    split_lines_lossless(sdp).into_iter().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("a=fmtp:")?;
+        let (_, params) = rest.split_once(' ')?;
+        if params.contains("profile-id=") {
+            Some(params.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// Re-add H265 fmtp parameters to an answer that webrtcbin generated from a
+/// sanitized offer, so the SDP sent to the server keeps the parameters GFN
+/// expects in the answer (`a=fmtp:<pt> <params>` after each H265 rtpmap line).
+pub fn restore_h265_fmtp_params(sdp: &str, params: &str) -> String {
+    let ending = line_ending(sdp);
+    let lines = split_lines_lossless(sdp);
+    let h265_payloads: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("a=rtpmap:")?;
+            let (pt, codec) = rest.split_once(' ')?;
+            (codec.trim().starts_with("H265/")).then_some(pt)
+        })
+        .collect();
+    let mut result = Vec::with_capacity(lines.len() + h265_payloads.len());
+    for line in &lines {
+        result.push((*line).to_owned());
+        if let Some(pt) = line
+            .trim()
+            .strip_prefix("a=rtpmap:")
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(pt, _)| pt)
+        {
+            let already_has_fmtp = lines
+                .iter()
+                .any(|other| other.trim().starts_with(&format!("a=fmtp:{pt} ")));
+            if h265_payloads.contains(&pt) && !already_has_fmtp {
+                result.push(format!("a=fmtp:{pt} {params}"));
+            }
+        }
+    }
+    result.join(ending)
+}
+
+/// Drop the H265-only fmtp parameters (`profile-id`, `level-id`, `tier-flag`)
+/// from a parameter string, keeping every other parameter intact.
+fn strip_h265_fmtp_params(params: &str) -> String {
+    params
+        .split(';')
+        .map(str::trim)
+        .filter(|token| {
+            !token.starts_with("profile-id=")
+                && !token.starts_with("level-id=")
+                && !token.starts_with("tier-flag=")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub fn build_nvst_sdp(params: &NvstParams) -> String {
@@ -1333,6 +1491,74 @@ mod tests {
         assert!(munged.contains("m=video 9 UDP/TLS/RTP/SAVPF 96\nb=AS:75000"));
         assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\nb=AS:128"));
         assert!(munged.contains("a=fmtp:111 minptime=10;useinbandfec=1;stereo=1"));
+    }
+
+    #[test]
+    fn sanitizes_h265_fmtp_for_gstreamer() {
+        let sdp = [
+            "v=0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 103 107 96",
+            "a=rtpmap:103 H265/90000",
+            "a=fmtp:103 profile-id=1; level-id=153; tier-flag=1",
+            "a=rtpmap:107 H265/90000",
+            "a=fmtp:107 profile-id=1; level-id=153; tier-flag=1",
+            "a=rtpmap:96 H264/90000",
+            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+        ]
+        .join("\n");
+        let sanitized = sanitize_h265_fmtp_for_gstreamer(&sdp);
+        // H265 fmtp lines fully stripped of the rejected params are dropped;
+        // rtpmap lines and the H264 fmtp stay untouched.
+        assert!(!sanitized.contains("profile-id=1"));
+        assert!(!sanitized.contains("level-id=153"));
+        assert!(!sanitized.contains("tier-flag=1"));
+        assert!(!sanitized.contains("a=fmtp:103"));
+        assert!(!sanitized.contains("a=fmtp:107"));
+        assert!(sanitized.contains("a=rtpmap:103 H265/90000"));
+        assert!(sanitized.contains("a=rtpmap:107 H265/90000"));
+        assert!(sanitized.contains("profile-level-id=42001f"));
+    }
+
+    #[test]
+    fn extracts_h265_fmtp_params() {
+        let sdp = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 103",
+            "a=rtpmap:103 H265/90000",
+            "a=fmtp:103 profile-id=1; level-id=153; tier-flag=1",
+        ]
+        .join("\n");
+        assert_eq!(
+            extract_h265_fmtp_params(&sdp).as_deref(),
+            Some("profile-id=1; level-id=153; tier-flag=1")
+        );
+        // H264-only fmtp (profile-level-id) is not treated as H265.
+        let h264 = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "a=rtpmap:96 H264/90000",
+            "a=fmtp:96 profile-level-id=42001f",
+        ]
+        .join("\n");
+        assert_eq!(extract_h265_fmtp_params(&h264), None);
+    }
+
+    #[test]
+    fn restores_h265_fmtp_params_on_answer() {
+        let answer = [
+            "v=0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 103 107 98",
+            "a=rtpmap:103 H265/90000",
+            "a=rtpmap:107 H265/90000",
+            "a=rtpmap:98 FLEXFEC-03/90000",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        ]
+        .join("\n");
+        let restored = restore_h265_fmtp_params(&answer, "profile-id=1; level-id=153; tier-flag=1");
+        assert!(restored.contains("a=fmtp:103 profile-id=1; level-id=153; tier-flag=1"));
+        assert!(restored.contains("a=fmtp:107 profile-id=1; level-id=153; tier-flag=1"));
+        assert!(restored.contains("a=rtpmap:98 FLEXFEC-03/90000"));
+        // No fmtp inserted for non-H265 payloads (flexfec, audio).
+        assert!(!restored.contains("a=fmtp:98"));
+        assert!(!restored.contains("a=fmtp:111"));
     }
 
     #[test]

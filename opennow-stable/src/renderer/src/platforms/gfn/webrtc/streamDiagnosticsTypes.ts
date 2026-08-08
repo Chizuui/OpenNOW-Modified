@@ -6,6 +6,8 @@ export interface StreamDiagnostics {
   connectionState: RTCPeerConnectionState | "closed";
   inputReady: boolean;
   nativeRendererActive: boolean;
+  /** GFN-style stacked renderer: video in a native window behind the transparent shell, DOM overlays still shown */
+  nativeStackedRenderer: boolean;
   connectedGamepads: number;
 
   // Video stats

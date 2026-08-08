@@ -149,16 +149,166 @@ pub(crate) fn update_external_renderer_surface(surface: &NativeRenderSurface) {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn update_external_renderer_surface(_surface: &NativeRenderSurface) {}
 
+/// GFN-style stacked renderer: keep the video sink's own top-level window,
+/// size/position it to the stream rect (screen coordinates, derived from the
+/// BrowserWindow client rect) and stack it directly below the Electron
+/// window. No fullscreen, no foreground stealing, no RawInput capture — the
+/// DOM overlay stays interactive above the video.
+#[cfg(target_os = "windows")]
+pub(crate) fn apply_stacked_renderer_surface(
+    surface: &NativeRenderSurface,
+    sink_window_handle: usize,
+) {
+    unsafe {
+        win32_renderer_window::apply_stacked_renderer_surface(surface, sink_window_handle);
+    }
+}
+
+/// Mark that the first decoded video frame arrived and, when the sink window
+/// + BrowserWindow pair are known, position + show the sink right away
+/// (GFN-parity: the video only becomes visible at its final rect, never at
+/// GStreamer's default window position). Returns true when the sink is now
+/// visible + positioned; false when the stacked guard must retry (the sink
+/// window is created at the first present, just after the first-buffer probe).
+#[cfg(target_os = "windows")]
+pub(crate) fn reveal_stacked_renderer_window() -> bool {
+    unsafe { win32_renderer_window::reveal_stacked_renderer_window() }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn reveal_stacked_renderer_window() -> bool {
+    false
+}
+
+/// Record that the first-video-buffer probe delivered the streaming event
+/// directly (used when the sink was already revealed at probe time).
+#[cfg(target_os = "windows")]
+pub(crate) fn stacked_mark_streaming_event_sent() {
+    win32_renderer_window::stacked_mark_streaming_event_sent();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn stacked_mark_streaming_event_sent() {}
+
+/// Keep the stacked video sink aligned to the BrowserWindow while it moves or
+/// resizes. The renderer only publishes surface updates on DOM resize/
+/// fullscreen/visibility changes — dragging the shell never fires one — so a
+/// WinEvent hook (EVENT_OBJECT_LOCATIONCHANGE) mirrors the browser rect into
+/// the sink window the instant it moves, re-asserting z-order (sink stays
+/// directly below the Electron window). Falls back to a slow poller only if
+/// the hook cannot be installed.
+#[cfg(target_os = "windows")]
+pub(crate) fn start_stacked_renderer_window_guard(
+    event_sender: Option<Sender<Event>>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        win32_renderer_window::set_stacked_guard_log_sender(event_sender.clone());
+        // A new stacked session starts with the sink hidden (until its first
+        // decoded frame) and the streaming event unsent.
+        win32_renderer_window::reset_stacked_first_frame_state();
+        let hooked = unsafe { win32_renderer_window::arm_stacked_renderer_event_hook() };
+        if hooked {
+            send_log(
+                &event_sender,
+                "info",
+                "Stacked renderer window guard active: video follows BrowserWindow move/resize via WinEvent hook."
+                    .to_owned(),
+            );
+            // Guard against a stop that raced ahead of arm() (thread id not yet
+            // recorded, so no WM_QUIT was posted): exit immediately instead of
+            // blocking on the message loop forever.
+            if stop.load(Ordering::SeqCst) {
+                unsafe {
+                    win32_renderer_window::disarm_stacked_renderer_event_hook();
+                }
+                return;
+            }
+            // Periodic safety net (see STACKED_GUARD_TIMER_MS): re-run the style
+            // + position + z-order assertions even when WinEvents are missed.
+            unsafe {
+                win32_renderer_window::arm_stacked_guard_timer();
+            }
+            // Event-driven sync. The hook callback is delivered on this thread's
+            // message loop; keep pumping messages until WM_QUIT (posted by
+            // stop_stacked_renderer_window_guard). WM_TIMER from the guard timer
+            // is handled inline.
+            loop {
+                let mut msg = unsafe { std::mem::zeroed() };
+                let result = unsafe { win32_renderer_window::get_message(&mut msg) };
+                if result <= 0 {
+                    break;
+                }
+                if unsafe { win32_renderer_window::stacked_guard_message_is_timer(&msg) } {
+                    unsafe {
+                        win32_renderer_window::stacked_guard_tick();
+                    }
+                }
+            }
+            unsafe {
+                win32_renderer_window::disarm_stacked_renderer_event_hook();
+            }
+            return;
+        }
+
+        // Hook unavailable: fall back to a slow position poller.
+        let mut logged = false;
+        while !stop.load(Ordering::SeqCst) {
+            unsafe {
+                win32_renderer_window::sync_stacked_renderer_window_position();
+            }
+            if !logged {
+                send_log(
+                    &event_sender,
+                    "info",
+                    "Stacked renderer window guard active (polling fallback): video follows BrowserWindow position."
+                        .to_owned(),
+                );
+                logged = true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// Stop the stacked window guard (WinEvent hook thread) if one is running.
+/// Safe to call when no stacked session is active — no-op.
+#[cfg(target_os = "windows")]
+pub(crate) fn stop_stacked_renderer_window_guard() {
+    unsafe {
+        win32_renderer_window::request_stacked_event_hook_stop();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn stop_stacked_renderer_window_guard() {}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn start_stacked_renderer_window_guard(
+    _event_sender: Option<Sender<Event>>,
+    _stop: Arc<AtomicBool>,
+) {
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn apply_stacked_renderer_surface(
+    _surface: &NativeRenderSurface,
+    _sink_window_handle: usize,
+) {}
+
 #[cfg(target_os = "windows")]
 pub(crate) mod win32_renderer_window {
+    use crate::gstreamer_config::use_stacked_renderer;
     use crate::gstreamer_input::NativeWindowInputEvent;
     use crate::protocol::NativeRenderRect;
-    use crate::protocol::{NativeStreamerShortcutAction, NativeStreamerShortcutBindings};
+    use crate::protocol::{
+        Event, NativeRenderSurface, NativeStreamerShortcutAction, NativeStreamerShortcutBindings,
+    };
     use crate::shortcuts::NativeShortcutMatcher;
     use std::collections::{HashMap, HashSet};
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::{Mutex, OnceLock};
     use std::thread;
@@ -167,6 +317,7 @@ pub(crate) mod win32_renderer_window {
     type Bool = i32;
     type Dword = u32;
     type Hcursor = *mut c_void;
+    type Hhook = *mut c_void;
     type Hmonitor = *mut c_void;
     type Hrawinput = *mut c_void;
     type Hwnd = *mut c_void;
@@ -175,10 +326,21 @@ pub(crate) mod win32_renderer_window {
     type Uint = u32;
     type Wparam = usize;
 
+    type WinEventProc = unsafe extern "system" fn(
+        h_win_event_hook: Hhook,
+        event: Dword,
+        hwnd: Hwnd,
+        id_object: i32,
+        id_child: i32,
+        id_event_thread: Dword,
+        dwms_event_time: Dword,
+    );
+
     const GWL_STYLE: i32 = -16;
     const GWL_EXSTYLE: i32 = -20;
     const GWLP_WNDPROC: i32 = -4;
     const GW_OWNER: Uint = 4;
+    const GW_HWNDPREV: Uint = 3;
     const HTCLIENT: isize = 1;
     const HWND_NOTOPMOST: Hwnd = -2isize as Hwnd;
     const MA_ACTIVATE: isize = 1;
@@ -231,7 +393,29 @@ pub(crate) mod win32_renderer_window {
     const WM_SETCURSOR: Uint = 0x0020;
     const WM_KILLFOCUS: Uint = 0x0008;
     const WM_ACTIVATE: Uint = 0x0006;
+    const WM_QUIT: Uint = 0x0012;
+    const WM_TIMER: Uint = 0x0113;
     const WA_INACTIVE: usize = 0;
+    // WinEvent hook for the stacked renderer: fires whenever the BrowserWindow
+    // moves or resizes, replacing the old 30 ms position poller with an
+    // event-driven sync (cross-process safe — the callback runs on this
+    // streamer's own message loop, never touching Electron's wndproc).
+    // MOVESIZEEND is a final burst after a drag/resize/fullscreen transition
+    // settles, catching any last-position drift the location-change stream
+    // missed.
+    const EVENT_OBJECT_CREATE: Dword = 0x8000;
+    const EVENT_OBJECT_LOCATIONCHANGE: Dword = 0x800B;
+    const EVENT_SYSTEM_MOVESIZEEND: Dword = 0x000B;
+    const EVENT_SYSTEM_FOREGROUND: Dword = 0x0003;
+    const WINEVENT_OUTOFCONTEXT: Dword = 0x0000;
+    // Periodic stacked-guard safety net: WinEvents cover browser move/resize
+    // and sink creation, but the sink window can be created before the first
+    // renderer surface publish populates STACKED_TARGET, and GStreamer can
+    // re-apply its default overlapped style when it recreates the window. A
+    // slow thread timer re-runs the same assertions so a border or a stale
+    // z-order can never linger.
+    const STACKED_GUARD_TIMER_ID: usize = 0x4E53;
+    const STACKED_GUARD_TIMER_MS: u32 = 400;
     const WM_KEYDOWN: Uint = 0x0100;
     const WM_KEYUP: Uint = 0x0101;
     const WM_SYSKEYDOWN: Uint = 0x0104;
@@ -253,11 +437,16 @@ pub(crate) mod win32_renderer_window {
     const WS_THICKFRAME: isize = 0x0004_0000;
     const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_APPWINDOW: isize = 0x0004_0000;
     const WS_EX_TRANSPARENT: isize = 0x0000_0020;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const SWP_HIDEWINDOW: u32 = 0x0080;
+    const SW_HIDE: i32 = 0;
+    const SW_SHOWNOACTIVATE: i32 = 4;
     const SW_MINIMIZE: i32 = 6;
     const ESCAPE_SCANCODE: u16 = 0x0001;
     const ESCAPE_HOLD_TO_MINIMIZE: Duration = Duration::from_secs(5);
@@ -273,14 +462,34 @@ pub(crate) mod win32_renderer_window {
         area: i64,
     }
 
+    /// Internal state for the EnumWindows callback that finds the streamer's
+    /// own video-sink window when the sink does not expose a GstVideoOverlay
+    /// window handle.
+    struct Found {
+        hwnd: Hwnd,
+    }
+
     #[derive(Clone, Copy)]
     struct RenderTargetSurface {
         hwnd: isize,
         client_rect: Rect,
     }
 
-    #[repr(C)]
     #[derive(Clone, Copy)]
+    struct StackedTarget {
+        /// HWNDs stored as isize (not raw pointers) so the struct stays
+        /// Send/Sync for the static OnceLock slots — same pattern as
+        /// CAPTURED_HWND / PROTECTED_HWND in this module.
+        sink_hwnd: isize,
+        browser_hwnd: isize,
+        /// Last rect pushed to the sink, so repeat location-change events
+        /// (fired in bursts during a drag/resize/fullscreen transition) don't
+        /// spam SetWindowPos.
+        last_rect: Option<Rect>,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq)]
     struct Rect {
         left: i32,
         top: i32,
@@ -293,6 +502,18 @@ pub(crate) mod win32_renderer_window {
     struct Point {
         x: i32,
         y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Msg {
+        hwnd: Hwnd,
+        message: Uint,
+        w_param: Wparam,
+        l_param: Lparam,
+        time: Dword,
+        pt: Point,
+        l_private: Dword,
     }
 
     #[repr(C)]
@@ -368,6 +589,31 @@ pub(crate) mod win32_renderer_window {
     static ESCAPE_KEY_PRESS: OnceLock<Mutex<Option<EscapeKeyPress>>> = OnceLock::new();
     static SHORTCUT_MATCHER: OnceLock<Mutex<NativeShortcutMatcher>> = OnceLock::new();
     static RENDER_TARGET_SURFACE: OnceLock<Mutex<Option<RenderTargetSurface>>> = OnceLock::new();
+    static STACKED_TARGET: OnceLock<Mutex<Option<StackedTarget>>> = OnceLock::new();
+    /// Latest surface published by the renderer. The stacked guard re-applies
+    /// it after the sink window is (re)created: the first publish can race
+    /// ahead of window creation, and the renderer only publishes on DOM events
+    /// — without this, the sink would sit at GStreamer's default window
+    /// position until an overlay forces the next publish (the launch blur).
+    static STACKED_PENDING_SURFACE: OnceLock<Mutex<Option<NativeRenderSurface>>> = OnceLock::new();
+    /// Set once the first decoded video frame has arrived. Until then the sink
+    /// is kept hidden (the shell is still opaque, so a visible window would
+    /// only flash through once the shell goes transparent).
+    static STACKED_FIRST_FRAME_REVEALED: OnceLock<AtomicBool> = OnceLock::new();
+    /// One-shot: the first-video-buffer probe normally sends the streaming
+    /// event, but defers it when the sink window does not exist yet (it is
+    /// created at the first present, just after the probe). The stacked guard
+    /// sends it the moment the sink is revealed, so the shell's transparent
+    /// flip never precedes a visible, correctly-positioned video window.
+    static STACKED_STREAMING_EVENT_SENT: OnceLock<AtomicBool> = OnceLock::new();
+    // Hook handles as isize so the static Mutex slot stays Sync (raw *mut c_void
+    // is not Send). Matches the HWND-as-isize pattern used by the other slots.
+    static STACKED_EVENT_HOOK: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+    static STACKED_EVENT_HOOK_THREAD: OnceLock<Mutex<Option<Dword>>> = OnceLock::new();
+    /// Optional event sender used to surface stacked sink window transitions
+    /// (style changes, SetWindowPos calls) in the Electron log, so flicker or
+    /// border regressions can be matched against what the guard actually did.
+    static STACKED_GUARD_LOG: OnceLock<Mutex<Option<Sender<Event>>>> = OnceLock::new();
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -394,6 +640,7 @@ pub(crate) mod win32_renderer_window {
             header_size: u32,
         ) -> u32;
         fn GetKeyState(virtual_key: i32) -> i16;
+        fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: Uint, max: Uint) -> Bool;
         fn GetWindow(hwnd: Hwnd, command: Uint) -> Hwnd;
         fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
         fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
@@ -401,6 +648,12 @@ pub(crate) mod win32_renderer_window {
         fn IsIconic(hwnd: Hwnd) -> Bool;
         fn IsWindowVisible(hwnd: Hwnd) -> Bool;
         fn MonitorFromWindow(hwnd: Hwnd, flags: Dword) -> Hmonitor;
+        fn PostThreadMessageW(
+            thread_id: Dword,
+            message: Uint,
+            wparam: Wparam,
+            lparam: Lparam,
+        ) -> Bool;
         fn RegisterRawInputDevices(devices: *const RawInputDevice, count: u32, size: u32) -> Bool;
         fn ReleaseCapture() -> Bool;
         fn SetCapture(hwnd: Hwnd) -> Hwnd;
@@ -417,13 +670,871 @@ pub(crate) mod win32_renderer_window {
             cy: i32,
             flags: u32,
         ) -> Bool;
+        fn SetWinEventHook(
+            event_min: Dword,
+            event_max: Dword,
+            module: *mut c_void,
+            callback: Option<WinEventProc>,
+            process_id: Dword,
+            thread_id: Dword,
+            flags: Dword,
+        ) -> Hhook;
         fn ShowWindow(hwnd: Hwnd, command: i32) -> Bool;
         fn ShowCursor(show: Bool) -> i32;
+        fn UnhookWinEvent(hook: Hhook) -> Bool;
+        fn IsWindow(hwnd: Hwnd) -> Bool;
+        fn GetForegroundWindow() -> Hwnd;
+        fn SetTimer(
+            hwnd: Hwnd,
+            id: usize,
+            elapse: u32,
+            timer_proc: Option<unsafe extern "system" fn(Hwnd, Uint, usize, Dword)>,
+        ) -> usize;
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThreadId() -> Dword;
+    }
+
+    /// Route diagnostics for the stacked renderer window (style/SetWindowPos
+    /// transitions) back to the Electron log when a guard sender is attached.
+    /// Safe to call with None; clears any previous sender.
+    pub fn set_stacked_guard_log_sender(sender: Option<Sender<Event>>) {
+        if let Ok(mut current) = STACKED_GUARD_LOG.get_or_init(|| Mutex::new(None)).lock() {
+            *current = sender;
+        }
+    }
+
+    fn stacked_guard_log(level: &'static str, message: String) {
+        let Some(sender) = STACKED_GUARD_LOG
+            .get()
+            .and_then(|sender| sender.lock().ok().and_then(|sender| sender.clone()))
+        else {
+            eprintln!("[NativeStreamer] {message}");
+            return;
+        };
+        let _ = sender.send(Event::Log { level, message });
+    }
+
+    /// Log at most one message per category within `interval`, so periodic
+    /// paths (e.g. the 400 ms guard tick) cannot flood the session log.
+    fn stacked_guard_log_throttled(
+        category: &'static str,
+        level: &'static str,
+        message: String,
+        interval: Duration,
+    ) {
+        static LAST_LOGGED: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+        let now = Instant::now();
+        let mut last_logged = LAST_LOGGED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last_logged
+            .get(category)
+            .is_some_and(|previous| now.duration_since(*previous) < interval)
+        {
+            return;
+        }
+        last_logged.insert(category, now);
+        stacked_guard_log(level, message);
+    }
+
+    /// Whether a message from the stacked guard message loop is the periodic
+    /// WM_TIMER tick.
+    pub unsafe fn stacked_guard_message_is_timer(msg: &Msg) -> bool {
+        msg.message == WM_TIMER
+    }
+
+    /// Arm the periodic stacked-guard safety-net timer on the current thread.
+    /// A NULL hWnd timer posts WM_TIMER to the calling thread's message queue
+    /// — the same queue the WinEvent hooks use — so the guard loop sees it via
+    /// GetMessageW. Windows cleans the timer up when the thread exits.
+    pub unsafe fn arm_stacked_guard_timer() {
+        SetTimer(
+            null_mut(),
+            STACKED_GUARD_TIMER_ID,
+            STACKED_GUARD_TIMER_MS,
+            None,
+        );
+    }
+
+    /// Reset the stacked reveal state at the start of a stacked session: a new
+    /// session starts with the sink hidden (until its first decoded frame) and
+    /// the streaming event unsent. The pending surface is deliberately kept —
+    /// it is overwritten by the next renderer publish, and a stale copy is
+    /// harmless because applies always read the live BrowserWindow rect.
+    pub fn reset_stacked_first_frame_state() {
+        STACKED_FIRST_FRAME_REVEALED
+            .get_or_init(|| AtomicBool::new(false))
+            .store(false, Ordering::SeqCst);
+        STACKED_STREAMING_EVENT_SENT
+            .get_or_init(|| AtomicBool::new(false))
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn stacked_first_frame_revealed() -> bool {
+        STACKED_FIRST_FRAME_REVEALED
+            .get()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    fn stacked_mark_first_frame_revealed() {
+        STACKED_FIRST_FRAME_REVEALED
+            .get_or_init(|| AtomicBool::new(false))
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Mark that the streaming event was delivered to the renderer (used by
+    /// the first-video-buffer probe when it sends the event directly).
+    pub fn stacked_mark_streaming_event_sent() {
+        STACKED_STREAMING_EVENT_SENT
+            .get_or_init(|| AtomicBool::new(false))
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Mark that the first decoded video frame arrived and, if the sink window
+    /// and BrowserWindow pair are known, position + show the sink right away
+    /// (GFN-parity: the video only becomes visible once it can appear at the
+    /// final rect — no default-position flash through the transparent shell).
+    /// Returns true when the sink is now visible + positioned; false when the
+    /// caller must retry later (window not created yet, or no surface publish
+    /// has populated the target pair).
+    pub unsafe fn reveal_stacked_renderer_window() -> bool {
+        stacked_mark_first_frame_revealed();
+        let target_slot = STACKED_TARGET.get_or_init(|| Mutex::new(None));
+        let Ok(mut target_guard) = target_slot.lock() else {
+            return false;
+        };
+        let Some(target) = target_guard.as_mut() else {
+            return false;
+        };
+        let browser_hwnd = target.browser_hwnd as Hwnd;
+        let Some(sink_hwnd) = resolve_stacked_sink_hwnd(target) else {
+            return false;
+        };
+        let mut window_rect = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(browser_hwnd, &mut window_rect) == 0 {
+            return false;
+        }
+        enforce_stacked_renderer_window_style(sink_hwnd);
+        SetWindowPos(
+            sink_hwnd,
+            browser_hwnd,
+            window_rect.left,
+            window_rect.top,
+            window_rect.right.saturating_sub(window_rect.left),
+            window_rect.bottom.saturating_sub(window_rect.top),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        target.last_rect = Some(window_rect);
+        stacked_guard_log(
+            "info",
+            format!(
+                "Stacked sink revealed at first decoded frame: rect=({},{} {}x{}) below browser; sink=0x{:X}",
+                window_rect.left,
+                window_rect.top,
+                window_rect.right.saturating_sub(window_rect.left),
+                window_rect.bottom.saturating_sub(window_rect.top),
+                sink_hwnd as usize
+            ),
+        );
+        true
+    }
+
+    /// If the first decoded frame arrived but the probe could not show the
+    /// sink yet (window not created at probe time), retry the reveal now that
+    /// a window exists and — once it succeeds — deliver the deferred streaming
+    /// event, so the renderer's transparent-shell flip never precedes a
+    /// visible, correctly-positioned video window.
+    unsafe fn maybe_finish_stacked_reveal() {
+        let revealed = stacked_first_frame_revealed();
+        let sent = STACKED_STREAMING_EVENT_SENT
+            .get()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if !revealed || sent {
+            return;
+        }
+        if !reveal_stacked_renderer_window() {
+            return;
+        }
+        stacked_mark_streaming_event_sent();
+        let message = if use_stacked_renderer() {
+            "Native video frames reached the external low-latency GStreamer renderer window."
+        } else {
+            "Native video frames reached the internal child-surface GStreamer renderer."
+        };
+        let sender = STACKED_GUARD_LOG
+            .get()
+            .and_then(|sender| sender.lock().ok().and_then(|sender| sender.clone()));
+        if let Some(sender) = sender {
+            let _ = sender.send(Event::Status {
+                status: "streaming",
+                message: Some(message.to_owned()),
+            });
+        }
+    }
+
+    /// Periodic stacked-guard assertion: keep the sink borderless + hidden from
+    /// alt-tab, aligned to the BrowserWindow, and directly below it in z-order.
+    /// WinEvents cover the common cases, but the sink window can be created
+    /// before the first surface publish populates STACKED_TARGET (that race
+    /// left a bordered, alt-tab-visible video window until an overlay opened),
+    /// and GStreamer can re-apply its default overlapped style when it recreates
+    /// the window. The slow timer guarantees the border cannot linger and the
+    /// video cannot stay stuck behind another window.
+    pub unsafe fn stacked_guard_tick() {
+        // Prefer the cached sink HWND; rediscover our own top-level window when
+        // the cached one is gone (GStreamer recreated it) or not known yet (the
+        // first surface publish has not populated STACKED_TARGET).
+        let sink_hwnd = match STACKED_TARGET
+            .get()
+            .and_then(|target| target.lock().ok().and_then(|target| *target))
+            .map(|target| target.sink_hwnd as Hwnd)
+        {
+            Some(hwnd) if IsWindow(hwnd) != 0 => hwnd,
+            _ => match find_first_own_window() {
+                Some(hwnd) => hwnd,
+                None => return,
+            },
+        };
+        // If the sink window exists but STACKED_TARGET was never populated
+        // (the first surface publish raced ahead of window creation and the
+        // renderer has not published since), re-apply the latest stored
+        // surface: this positions the sink (+ shows it once the first frame
+        // reveals it) without waiting for the next renderer publish — the gap
+        // that left the video at GStreamer's default position for the first
+        // ~tens of seconds of a session.
+        let target_empty = STACKED_TARGET
+            .get()
+            .and_then(|target| target.lock().ok().and_then(|target| *target))
+            .is_none();
+        if target_empty {
+            let pending = STACKED_PENDING_SURFACE
+                .get()
+                .and_then(|pending| pending.lock().ok().and_then(|pending| pending.clone()));
+            if let Some(pending) = pending {
+                apply_stacked_renderer_surface(&pending, sink_hwnd as usize);
+            }
+        }
+        enforce_stacked_renderer_window_style(sink_hwnd);
+        sync_stacked_renderer_window_position();
+        // Re-assert z-order when the shell is the foreground window (alt-tab
+        // back) OR the sink ended up hidden: a missed visibility flip can
+        // leave the sink SW_HIDDEN while the shell is visible and foreground,
+        // which shows the shell alone as blank until an overlay forces a
+        // re-apply. The EVENT_SYSTEM_FOREGROUND hook is the primary trigger;
+        // this periodic path is the safety net. Skip when the sink is already
+        // directly below the BrowserWindow (GetWindow GW_HWNDPREV) — while
+        // streaming normally that is the steady state, so without this check
+        // every 400 ms tick would issue a SetWindowPos (DWM churn on a
+        // window that is actively presenting).
+        let browser_hwnd = STACKED_TARGET
+            .get()
+            .and_then(|target| target.lock().ok().and_then(|target| *target))
+            .map(|target| target.browser_hwnd as Hwnd);
+        let browser_foreground = browser_hwnd.is_some_and(|hwnd| hwnd == GetForegroundWindow());
+        let already_below = browser_hwnd
+            .is_some_and(|browser| GetWindow(sink_hwnd, GW_HWNDPREV) as Hwnd == browser);
+        if !already_below && (browser_foreground || IsWindowVisible(sink_hwnd) == 0) {
+            reassert_stacked_renderer_window_zorder();
+        }
+        // If the first decoded frame arrived but the probe could not show the
+        // sink yet (window created just after the probe), reveal it now and
+        // deliver the deferred streaming event.
+        maybe_finish_stacked_reveal();
+    }
+
+    /// Keep the sink window borderless and invisible to alt-tab/taskbar.
+    /// GStreamer's d3d11videosink creates its window lazily when the first
+    /// frame renders and re-applies its default overlapped style on recreation
+    /// (codec change, state flips), so a caption can peek through the
+    /// transparent shell and the sink can appear as a second alt-tab entry.
+    /// This is idempotent and cheap, so it can run from the guard hook on
+    /// every relevant event without flicker.
+    unsafe fn enforce_stacked_renderer_window_style(sink_hwnd: Hwnd) {
+        // Never steal focus, never appear in alt-tab/taskbar, and remove
+        // WS_EX_APPWINDOW (which forces a taskbar entry) in case GStreamer
+        // ever sets it.
+        let ex_style = GetWindowLongPtrW(sink_hwnd, GWL_EXSTYLE);
+        let desired_ex = (ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
+        if desired_ex != ex_style {
+            SetWindowLongPtrW(sink_hwnd, GWL_EXSTYLE, desired_ex);
+            stacked_guard_log_throttled(
+                "sink-exstyle",
+                "info",
+                format!(
+                    "Stacked sink ex-style changed: 0x{:08X} -> 0x{:08X} (added NOACTIVATE/TOOLWINDOW, cleared APPWINDOW)",
+                    ex_style as u32,
+                    desired_ex as u32,
+                ),
+                Duration::from_millis(1000),
+            );
+        }
+
+        // Strip the caption/frame so the sink is borderless.
+        let style = GetWindowLongPtrW(sink_hwnd, GWL_STYLE);
+        let borderless =
+            style & !(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+        if borderless != style {
+            SetWindowLongPtrW(sink_hwnd, GWL_STYLE, borderless);
+            SetWindowPos(
+                sink_hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            stacked_guard_log_throttled(
+                "sink-style",
+                "info",
+                format!(
+                    "Stacked sink style changed: 0x{:08X} -> 0x{:08X} (caption/frame stripped) + FRAMECHANGED",
+                    style as u32,
+                    borderless as u32,
+                ),
+                Duration::from_millis(1000),
+            );
+        }
+    }
+
+    /// Resolve the current sink HWND, re-discovering it if GStreamer recreated
+    /// the window since it was cached. Returns None when no sink exists yet.
+    unsafe fn resolve_stacked_sink_hwnd(target: &mut StackedTarget) -> Option<Hwnd> {
+        let cached = target.sink_hwnd as Hwnd;
+        if IsWindow(cached) != 0 {
+            return Some(cached);
+        }
+        let Some(found) = find_first_own_window() else {
+            return None;
+        };
+        target.sink_hwnd = found as isize;
+        Some(found)
+    }
+
+    /// Position the video sink's own window to the stream rect and stack it
+    /// directly below the Electron window. The rect arrives in BrowserWindow
+    /// client coordinates, so it is translated to screen coordinates first.
+    pub unsafe fn apply_stacked_renderer_surface(
+        surface: &NativeRenderSurface,
+        sink_window_handle: usize,
+    ) {
+        // Remember the latest surface so the stacked guard can re-apply it
+        // after the sink window is (re)created — the first renderer publish
+        // can race ahead of window creation, and the renderer only publishes
+        // on DOM events, so without this the sink would stay at GStreamer's
+        // default position until an overlay forced the next publish.
+        if let Ok(mut pending) = STACKED_PENDING_SURFACE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *pending = Some(surface.clone());
+        }
+
+        let sink_hwnd = if sink_window_handle != 0 {
+            sink_window_handle as Hwnd
+        } else {
+            // The renderer re-publishes the same surface every frame via rAF,
+            // and the sink handle is stable for the whole session — reuse the
+            // cached pair instead of running EnumWindows 60 times per second.
+            let cached = STACKED_TARGET
+                .get()
+                .and_then(|target| target.lock().ok().and_then(|target| *target))
+                .map(|target| target.sink_hwnd as Hwnd)
+                .filter(|hwnd| IsWindow(*hwnd) != 0);
+            match cached {
+                Some(hwnd) => hwnd,
+                None => {
+                    let Some(found) = find_first_own_window() else {
+                        return;
+                    };
+                    found
+                }
+            }
+        };
+
+        let Some(browser_hwnd) = surface
+            .window_handle
+            .as_deref()
+            .and_then(|window_handle| super::parse_window_handle(window_handle).ok())
+            .map(|window_handle| window_handle as Hwnd)
+        else {
+            return;
+        };
+
+        // Surface publishes arrive on every renderer event (overlay open,
+        // resize, fullscreen, visibility) — log the transitions so a flicker
+        // can be matched against what actually changed in the sink window.
+        stacked_guard_log_throttled(
+            "apply-entry",
+            "info",
+            format!(
+                "Stacked renderer surface apply: sink=0x{:X} visible={}",
+                sink_hwnd as usize, surface.visible,
+            ),
+            Duration::from_millis(500),
+        );
+
+        // Never steal focus, hide from alt-tab/taskbar, and strip the
+        // caption/frame so the sink is borderless: when the shell is fullscreen
+        // the sink must cover the whole monitor edge to edge, and a leftover
+        // title bar or resize border would peek through the transparent shell
+        // around the video. Mirrors protect_renderer_window's styling. Cheap
+        // (two reads + compares) so it can run on every surface publish.
+        enforce_stacked_renderer_window_style(sink_hwnd);
+
+        if !surface.visible {
+            ShowWindow(sink_hwnd, SW_HIDE);
+            stacked_guard_log(
+                "info",
+                format!(
+                    "Stacked sink hidden (surface not visible); sink=0x{:X}",
+                    sink_hwnd as usize
+                ),
+            );
+            STACKED_TARGET
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .ok()
+                .map(|mut target| *target = None);
+            return;
+        }
+
+        // Remember the pair so the stacked guard thread can keep the sink
+        // aligned to the BrowserWindow while it moves or resizes (surface
+        // updates only arrive on DOM resize/fullscreen/visibility changes,
+        // never while the user drags the window). Preserve last_rect across
+        // publishes — the renderer re-publishes the same surface on every
+        // resize/fullscreen/visibility event, and resetting it here would
+        // defeat the SetWindowPos dedup below (churn/flicker).
+        let target = STACKED_TARGET.get_or_init(|| Mutex::new(None));
+        if let Ok(mut current) = target.lock() {
+            match current.as_mut() {
+                Some(existing) => {
+                    existing.sink_hwnd = sink_hwnd as isize;
+                    existing.browser_hwnd = browser_hwnd as isize;
+                }
+                None => {
+                    *current = Some(StackedTarget {
+                        sink_hwnd: sink_hwnd as isize,
+                        browser_hwnd: browser_hwnd as isize,
+                        last_rect: None,
+                    });
+                }
+            }
+        }
+
+        // The sink window mirrors the BrowserWindow's full outer rect so the
+        // video fills the whole shell (the sink letterboxes it to the stream
+        // aspect ratio) and stays perfectly aligned while the window moves or
+        // resizes. hWndInsertAfter = browser window => the sink sits directly
+        // below the Electron window in z-order, visible through its shell.
+        // Dedupe against the last applied rect: the renderer re-publishes the
+        // same surface on every frame via rAF while streaming, and each
+        // SetWindowPos z-order reset here is a flicker candidate.
+        let mut window_rect = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(browser_hwnd, &mut window_rect) == 0 {
+            return;
+        }
+        let mut last_rect = None;
+        if let Ok(current) = target.lock() {
+            last_rect = current.as_ref().and_then(|target| target.last_rect);
+        }
+        // Until the first decoded frame reveals the sink, position it but keep
+        // it hidden: the shell is still opaque (connecting screen), and a
+        // visible window at GStreamer's default position would flash through
+        // once the shell goes transparent — which must not happen until the
+        // sink is shown at the final rect (reveal_stacked_renderer_window).
+        let reveal_flags = if stacked_first_frame_revealed() {
+            SWP_NOACTIVATE | SWP_SHOWWINDOW
+        } else {
+            SWP_NOACTIVATE | SWP_HIDEWINDOW
+        };
+        if last_rect != Some(window_rect) {
+            SetWindowPos(
+                sink_hwnd,
+                browser_hwnd,
+                window_rect.left,
+                window_rect.top,
+                window_rect.right.saturating_sub(window_rect.left),
+                window_rect.bottom.saturating_sub(window_rect.top),
+                reveal_flags,
+            );
+            stacked_guard_log(
+                "info",
+                format!(
+                    "Stacked sink SetWindowPos (apply): rect=({},{} {}x{}) insert_after=browser flags=0x{:X} revealed={}",
+                    window_rect.left,
+                    window_rect.top,
+                    window_rect.right.saturating_sub(window_rect.left),
+                    window_rect.bottom.saturating_sub(window_rect.top),
+                    reveal_flags,
+                    stacked_first_frame_revealed(),
+                ),
+            );
+        }
+        if let Ok(mut current) = target.lock() {
+            if let Some(target) = current.as_mut() {
+                target.last_rect = Some(window_rect);
+            }
+        }
+    }
+
+    /// Re-assert the sink directly below the BrowserWindow without touching
+    /// geometry. Non-activatable tool windows do not participate in Windows
+    /// activation, so alt-tabbing away and back can leave the video stuck
+    /// behind other apps — the transparent shell alone then shows blank.
+    /// EVENT_SYSTEM_FOREGROUND fires when the shell regains the foreground;
+    /// this pulls the sink back on top of whatever got stacked in between.
+    pub unsafe fn reassert_stacked_renderer_window_zorder() {
+        let target_slot = STACKED_TARGET.get_or_init(|| Mutex::new(None));
+        let Ok(mut target_guard) = target_slot.lock() else {
+            return;
+        };
+        let Some(target) = target_guard.as_mut() else {
+            return;
+        };
+        let browser_hwnd = target.browser_hwnd as Hwnd;
+        let Some(sink_hwnd) = resolve_stacked_sink_hwnd(target) else {
+            return;
+        };
+        if IsIconic(browser_hwnd) != 0 {
+            ShowWindow(sink_hwnd, SW_HIDE);
+            stacked_guard_log_throttled(
+                "sink-minimized",
+                "info",
+                format!(
+                    "Stacked sink hidden (browser minimized); sink=0x{:X}",
+                    sink_hwnd as usize
+                ),
+                Duration::from_secs(2),
+            );
+            return;
+        }
+        // Until the first decoded frame reveals the sink it must stay hidden
+        // (z-order is irrelevant while invisible, and SWP_SHOWWINDOW here would
+        // defeat the hold-hidden launch sequence).
+        if !stacked_first_frame_revealed() {
+            return;
+        }
+        // Keep the sink borderless / hidden from alt-tab while we are here.
+        enforce_stacked_renderer_window_style(sink_hwnd);
+        SetWindowPos(
+            sink_hwnd,
+            browser_hwnd,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        stacked_guard_log_throttled(
+            "sink-zorder",
+            "info",
+            format!(
+                "Stacked sink z-order re-asserted below browser (sink=0x{:X} browser=0x{:X})",
+                sink_hwnd as usize, browser_hwnd as usize,
+            ),
+            Duration::from_secs(2),
+        );
+    }
+
+    /// Re-apply the stacked sink position from the BrowserWindow's live outer
+    /// rect. Polled by the stacked guard thread so dragging/resizing the shell
+    /// keeps the video perfectly aligned (WM_MOVE/WM_SIZE are not observable
+    /// from the renderer, so no surface update fires for them).
+    pub unsafe fn sync_stacked_renderer_window_position() {
+        let target_slot = STACKED_TARGET.get_or_init(|| Mutex::new(None));
+        let Ok(mut target_guard) = target_slot.lock() else {
+            return;
+        };
+        let Some(target) = target_guard.as_mut() else {
+            return;
+        };
+
+        let mut window_rect = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let browser_hwnd = target.browser_hwnd as Hwnd;
+        let Some(sink_hwnd) = resolve_stacked_sink_hwnd(target) else {
+            return;
+        };
+        if GetWindowRect(browser_hwnd, &mut window_rect) == 0 {
+            return;
+        }
+        if IsIconic(browser_hwnd) != 0 {
+            // Browser minimized: keep the sink hidden too.
+            ShowWindow(sink_hwnd, SW_HIDE);
+            return;
+        }
+        // Keep the sink borderless / hidden from alt-tab while we are here.
+        enforce_stacked_renderer_window_style(sink_hwnd);
+        // Dedupe: location-change events fire in bursts while dragging/resizing
+        // (and during fullscreen transitions), so skip SetWindowPos when the
+        // browser rect has not actually changed.
+        // Keep the sink hidden until the first decoded frame reveals it (see
+        // apply_stacked_renderer_surface) — positioning alone must not show a
+        // default-style window through the still-opaque shell.
+        let reveal_flags = if stacked_first_frame_revealed() {
+            SWP_NOACTIVATE | SWP_SHOWWINDOW
+        } else {
+            SWP_NOACTIVATE | SWP_HIDEWINDOW
+        };
+        if target.last_rect == Some(window_rect) {
+            return;
+        }
+        target.last_rect = Some(window_rect);
+        SetWindowPos(
+            sink_hwnd,
+            browser_hwnd,
+            window_rect.left,
+            window_rect.top,
+            window_rect.right.saturating_sub(window_rect.left),
+            window_rect.bottom.saturating_sub(window_rect.top),
+            reveal_flags,
+        );
+        stacked_guard_log(
+            "info",
+            format!(
+                "Stacked sink SetWindowPos (sync): rect=({},{} {}x{}) insert_after=browser flags=0x{:X} revealed={}",
+                window_rect.left,
+                window_rect.top,
+                window_rect.right.saturating_sub(window_rect.left),
+                window_rect.bottom.saturating_sub(window_rect.top),
+                reveal_flags,
+                stacked_first_frame_revealed(),
+            ),
+        );
+    }
+
+    /// Register WinEvent hooks for EVENT_OBJECT_LOCATIONCHANGE and
+    /// EVENT_SYSTEM_MOVESIZEEND so the sink follows the BrowserWindow the
+    /// instant it moves/resizes/finishes a fullscreen transition — no polling.
+    /// The callback runs on this streamer's own message loop (OUTOFCONTEXT),
+    /// so nothing is injected into the Electron process.
+    pub unsafe fn arm_stacked_renderer_event_hook() -> bool {
+        if STACKED_EVENT_HOOK
+            .get()
+            .is_some_and(|hook| hook.lock().map(|hook| !hook.is_empty()).unwrap_or(false))
+        {
+            return true;
+        }
+
+        // Span CREATE..LOCATIONCHANGE so the sink gets styled the moment
+        // GStreamer creates/recreates it (not only when it later moves).
+        let location_hook = SetWinEventHook(
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            null_mut(),
+            Some(stacked_window_event_hook),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        let move_size_end_hook = SetWinEventHook(
+            EVENT_SYSTEM_MOVESIZEEND,
+            EVENT_SYSTEM_MOVESIZEEND,
+            null_mut(),
+            Some(stacked_window_event_hook),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        // Alt-tabbing back to the app makes the shell the foreground window.
+        // The sink is a non-activatable tool window, so Windows activation
+        // alone does not bring the video forward — re-assert its z-order.
+        let foreground_hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(stacked_window_event_hook),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if location_hook.is_null() && move_size_end_hook.is_null() && foreground_hook.is_null() {
+            return false;
+        }
+        let hooks = [location_hook, move_size_end_hook, foreground_hook]
+            .into_iter()
+            .filter(|hook| !hook.is_null())
+            .map(|hook| hook as isize)
+            .collect::<Vec<_>>();
+        if let Ok(mut current) = STACKED_EVENT_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+        {
+            *current = hooks;
+        }
+        if let Ok(mut current) = STACKED_EVENT_HOOK_THREAD
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *current = Some(GetCurrentThreadId());
+        }
+        true
+    }
+
+    pub unsafe fn disarm_stacked_renderer_event_hook() {
+        let hooks = STACKED_EVENT_HOOK
+            .get()
+            .and_then(|hook| hook.lock().ok().map(|mut hook| std::mem::take(&mut *hook)))
+            .unwrap_or_default();
+        if let Ok(mut current) = STACKED_EVENT_HOOK_THREAD
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *current = None;
+        }
+        for hook in hooks {
+            UnhookWinEvent(hook as Hhook);
+        }
+    }
+
+    unsafe extern "system" fn stacked_window_event_hook(
+        _hook: Hhook,
+        event: Dword,
+        hwnd: Hwnd,
+        _id_object: i32,
+        _id_child: i32,
+        _id_event_thread: Dword,
+        _dwms_event_time: Dword,
+    ) {
+        // Sink-originated events first: GStreamer created/recreated/reshowed
+        // its own window, which re-applies the default overlapped (bordered,
+        // taskbar) style. Re-assert borderless + alt-tab invisibility
+        // immediately so a caption never peeks through the transparent shell
+        // and the video never shows up as a second alt-tab entry. This must not
+        // depend on STACKED_TARGET: the sink window is created when the first
+        // frame renders, which can precede the first renderer surface publish
+        // (that race left the border visible at launch until an overlay was
+        // opened). In stacked mode the sink is the only top-level window this
+        // process creates, so any own-process, ownerless window lifecycle
+        // event belongs to it.
+        let sink_lifecycle_event = (EVENT_OBJECT_CREATE..=EVENT_OBJECT_LOCATIONCHANGE)
+            .contains(&event)
+            || event == EVENT_SYSTEM_MOVESIZEEND;
+        if sink_lifecycle_event {
+            let mut window_process_id: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut window_process_id);
+            if window_process_id == GetCurrentProcessId() && GetWindow(hwnd, GW_OWNER).is_null() {
+                enforce_stacked_renderer_window_style(hwnd);
+                if let Ok(mut current) = STACKED_TARGET.get_or_init(|| Mutex::new(None)).lock() {
+                    if let Some(current) = current.as_mut() {
+                        current.sink_hwnd = hwnd as isize;
+                    }
+                }
+                // The sink was just created/recreated. The first renderer
+                // surface publish can race ahead of window creation (the
+                // launch flash: video at GStreamer's default small/windowed
+                // position for ~a second before the next publish positions
+                // it). Re-apply the latest stored surface so the sink is
+                // positioned the instant the window exists — the renderer
+                // may not publish again until an overlay opens, and that gap
+                // left the video at the default position for the first ~tens
+                // of seconds of a session. This also reveals the sink (show +
+                // position) once the first decoded frame has arrived, and
+                // delivers the streaming event the probe deferred, so the
+                // shell never goes transparent before the video is visible.
+                let pending = STACKED_PENDING_SURFACE
+                    .get()
+                    .and_then(|pending| pending.lock().ok().and_then(|pending| pending.clone()));
+                if let Some(pending) = pending {
+                    apply_stacked_renderer_surface(&pending, hwnd as usize);
+                }
+                sync_stacked_renderer_window_position();
+                reassert_stacked_renderer_window_zorder();
+                maybe_finish_stacked_reveal();
+                return;
+            }
+        }
+
+        // Browser-window events (Electron process) need the tracked target.
+        let Some(target) = STACKED_TARGET
+            .get()
+            .and_then(|target| target.lock().ok().and_then(|target| *target))
+        else {
+            return;
+        };
+        if hwnd as isize == target.browser_hwnd {
+            if event == EVENT_SYSTEM_FOREGROUND {
+                // Shell regained the foreground (e.g. alt-tab back): re-assert
+                // the sink's z-order even though the rect may be unchanged.
+                reassert_stacked_renderer_window_zorder();
+            } else {
+                sync_stacked_renderer_window_position();
+            }
+        }
+    }
+
+    /// Wake the stacked event-hook thread (from the stop path) so its message
+    /// loop exits and the hook is torn down promptly.
+    pub unsafe fn request_stacked_event_hook_stop() {
+        let Some(thread_id) = STACKED_EVENT_HOOK_THREAD
+            .get()
+            .and_then(|thread| thread.lock().ok().and_then(|thread| *thread))
+        else {
+            return;
+        };
+        PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+    }
+
+    /// Blocking message pump for the stacked guard thread. Returns the
+    /// GetMessageW result (0 on WM_QUIT, negative on error, positive on a
+    /// delivered message) so the caller can decide when to exit.
+    pub unsafe fn get_message(msg: &mut Msg) -> i32 {
+        GetMessageW(msg, null_mut(), 0, 0) as i32
+    }
+
+    /// Fallback when the sink does not expose a window handle: any top-level
+    /// window owned by this streamer process (the sink is the only one this
+    /// process creates in stacked mode). Visibility is deliberately NOT
+    /// required — the first surface update can arrive before the sink has
+    /// painted its first frame, and the apply path shows the window anyway.
+    fn find_first_own_window() -> Option<Hwnd> {
+        let mut found = None::<Found>;
+        unsafe {
+            EnumWindows(
+                Some(collect_own_window_candidate),
+                &mut found as *mut Option<Found> as Lparam,
+            );
+        }
+        found.map(|found| found.hwnd)
+    }
+
+    unsafe extern "system" fn collect_own_window_candidate(
+        hwnd: Hwnd,
+        lparam: Lparam,
+    ) -> Bool {
+        let found = &mut *(lparam as *mut Option<Found>);
+        let mut window_process_id: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut window_process_id);
+        if window_process_id == GetCurrentProcessId()
+            && GetWindow(hwnd, GW_OWNER).is_null()
+        {
+            *found = Some(Found { hwnd });
+            return 0;
+        }
+        1
     }
 
     pub unsafe fn set_render_target_surface(target: Option<(usize, NativeRenderRect)>) {

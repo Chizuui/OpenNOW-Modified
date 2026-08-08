@@ -407,6 +407,50 @@ body,
   display: none;
 }
 
+/* GFN-style stacked native renderer: the DOM shell goes transparent so the
+   video window behind the BrowserWindow shows through; the StreamView layer
+   only paints overlays above it. */
+.app-container--stacked-native {
+  background: transparent;
+}
+
+.app-container--stacked-native .sv {
+  background: transparent;
+}
+
+/* Stacked mode: the native video window lives behind the BrowserWindow, so the
+   regular app chrome (navbar, library content) must not paint over it. The
+   StreamView layer is transparent in this mode — hiding the shell underneath
+   lets the sink window's video show through, the same way the opaque .sv cover
+   hides the shell in internal mode. */
+.app-container--stacked-native .app-shell {
+  display: none;
+}
+
+/* html/body/#root still paint an opaque obsidian background (--bg-a) that
+   would hide the native video window behind the BrowserWindow. The class is
+   toggled on <html> only while a stacked session streams, so the library keeps
+   its normal background at all other times. */
+html.stacked-native-active,
+html.stacked-native-active body,
+html.stacked-native-active #root {
+  background: transparent !important;
+}
+
+/* Stacked mode renders the video in a separate OS window behind this
+   transparent BrowserWindow, so Chromium's backdrop-filter has nothing to
+   blur (it only samples this window's own surface). Computing it anyway forces
+   the compositor to re-render the whole transparent surface when an overlay
+   opens — which shows up as flicker over the video. Kill the blur entirely
+   while stacked streaming; the semi-transparent overlay cards look identical
+   without it. */
+html.stacked-native-active *,
+html.stacked-native-active *::before,
+html.stacked-native-active *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
 /* While streaming, fade the brand out for an immersive, video-first chrome.
    Window controls stay interactive — quitting/minimizing a session still
    needs to be one click away. Also drop below the stream view layer so the

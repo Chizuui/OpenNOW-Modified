@@ -187,6 +187,10 @@ export function StreamView({
     diagnosticsStore,
     (stats) => stats.nativeRendererActive,
   );
+  const nativeStackedRenderer = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.nativeStackedRenderer,
+  );
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localAudioRef = useRef<HTMLAudioElement | null>(null);
   const shaderPipelineRef = useRef<VideoShaderPipeline | null>(null);
@@ -226,7 +230,9 @@ export function StreamView({
   const streamVideoReady = streamHasVideo || videoElementHasFrame;
   const [sessionReadySplashVisible, setSessionReadySplashVisible] = useState(false);
   const sessionReadySplashShownRef = useRef(false);
-  const showStatsHud = statsMode !== "off" && !nativeRendererActive && !isConnecting;
+  // Stacked mode keeps the video in a native window behind the transparent
+  // shell, so DOM overlays (stats HUD etc.) must stay visible above it.
+  const showStatsHud = statsMode !== "off" && (!nativeRendererActive || nativeStackedRenderer) && !isConnecting;
 
   useEffect(() => {
     if (isConnecting) {
@@ -394,6 +400,19 @@ export function StreamView({
     onConfirmExit,
     onBeforeOpen: releasePointerLockForMenu,
   });
+  // Latest overlay/state values read by the native surface publisher. The
+  // publish effect below mounts once (empty deps) so its observers/listeners
+  // are never recreated when the quick menu / exit prompt / stats visibility
+  // toggles — recreating them used to tear down and re-publish the surface,
+  // which made the native side hide + wipe the stacked sink's cached rect
+  // (flicker + surface rect churn on overlay open).
+  const surfaceStateRef = useRef({
+    showSideBar,
+    exitOpen: exitPrompt.open,
+    statsMode,
+    showNativeStats,
+  });
+  const publishSurfaceRef = useRef<(() => void) | null>(null);
   const suppressVideoFocusOnSidebarCloseRef = useRef(false);
 
   // Video shader post-processing pipeline (embedded WebRTC path only; the
@@ -473,7 +492,13 @@ export function StreamView({
       const rect = element.getBoundingClientRect();
       const width = Math.round(rect.width * dpr);
       const height = Math.round(rect.height * dpr);
-      const visible = width >= 2 && height >= 2 && !showSideBar && !exitPrompt.open;
+      const { showSideBar, exitOpen, statsMode, showNativeStats } = surfaceStateRef.current;
+      // In stacked mode the native video window lives behind the transparent
+      // shell for the whole session, so it must stay visible while overlays
+      // (sidebar, exit prompt) are open — they float above it. Only a hidden
+      // document (minimized window) suppresses it, handled by the branch above.
+      const stacked = diagnosticsStore.getSnapshot().nativeStackedRenderer;
+      const visible = width >= 2 && height >= 2 && (stacked || (!showSideBar && !exitOpen));
       updateSurface({
         deviceScaleFactor: dpr,
         visible,
@@ -509,9 +534,11 @@ export function StreamView({
     document.addEventListener("visibilitychange", schedule);
     window.visualViewport?.addEventListener("resize", schedule);
     window.visualViewport?.addEventListener("scroll", schedule);
+    publishSurfaceRef.current = schedule;
     schedule();
 
     return () => {
+      publishSurfaceRef.current = null;
       if (frame !== 0) {
         window.cancelAnimationFrame(frame);
       }
@@ -521,6 +548,9 @@ export function StreamView({
       document.removeEventListener("visibilitychange", schedule);
       window.visualViewport?.removeEventListener("resize", schedule);
       window.visualViewport?.removeEventListener("scroll", schedule);
+      // Real unmount (session end): release the surface. Overlay/state changes
+      // never reach here anymore — the trigger effect below re-publishes in
+      // place, so the sink window is never hidden/re-created on menu open.
       updateSurface({
         rect: null,
         visible: false,
@@ -528,7 +558,25 @@ export function StreamView({
         showStats: false,
       });
     };
-  }, [exitPrompt.open, showNativeStats, showSideBar, statsMode]);
+  }, []);
+
+  // Overlay/state changed: refresh the refs the mount-once publish effect reads
+  // and re-publish in place. No teardown, no null-surface publish — the native
+  // side keeps the stacked sink visible and its cached rect intact, so the
+  // dedup skips the SetWindowPos entirely. isStreaming is included so the
+  // surface is re-published when video actually starts: the very first publish
+  // can run before the native sink window exists (the launch flash where the
+  // video sits at GStreamer's default position until some later event), and
+  // re-publishing here makes the native side position the sink immediately.
+  useEffect(() => {
+    surfaceStateRef.current = {
+      showSideBar,
+      exitOpen: exitPrompt.open,
+      statsMode,
+      showNativeStats,
+    };
+    publishSurfaceRef.current?.();
+  }, [exitPrompt.open, isStreaming, showNativeStats, showSideBar, statsMode]);
 
   useEffect(() => {
     const handlePointerLockChange = () => {
