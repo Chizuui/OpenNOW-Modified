@@ -148,13 +148,6 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
   const originalFetch = globalThis.fetch;
   const originalWarn = console.warn;
   const calls: string[] = [];
-  type CapturedNetworkTestRequestBody = {
-    netTestRequestData: {
-      netTestProfile: {
-        framesPerSecond: number;
-      };
-    };
-  };
   type CapturedSessionRequestBody = {
     sessionRequestData: {
       networkTestSessionId?: string | null;
@@ -174,7 +167,6 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
       };
     };
   };
-  let networkTestRequestBody: CapturedNetworkTestRequestBody | null = null;
   let requestBody: CapturedSessionRequestBody | null = null;
   const expectedSessionUrl = `https://np-lax-01.cloudmatchbeta.nvidiagrid.net/v2/session?${new URLSearchParams({
     keyboardLayout: resolveGfnKeyboardLayout(DEFAULT_KEYBOARD_LAYOUT, process.platform),
@@ -195,18 +187,6 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
           { key: "US West", value: "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/" },
           { key: "US East", value: "https://np-ash-01.cloudmatchbeta.nvidiagrid.net/" },
         ],
-      }), { status: 200 });
-    }
-
-    if (url === "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/v2/nettestsession") {
-      networkTestRequestBody = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({
-        requestStatus: { statusCode: 1, statusDescription: "SUCCESS_STATUS", serverId: "NP-LAX-01" },
-        netTestSession: {
-          sessionId: "nettest-1",
-          connectionInfo: [{ ip: "127.0.0.1", port: 443, appLevelProtocol: 5 }],
-          netTestThresholds: {},
-        },
       }), { status: 200 });
     }
 
@@ -252,14 +232,12 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
 
     assert.equal(session.streamingBaseUrl, "https://np-lax-01.cloudmatchbeta.nvidiagrid.net");
     assert.equal(session.enablePersistingInGameSettings, false);
+    // The official web client does not create or forward a network test
+    // session into createSession (networkTestSessionId is null).
     assert.deepEqual(calls, [
       "https://prod.cloudmatchbeta.nvidiagrid.net/v2/serverInfo",
-      "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/v2/nettestsession",
       expectedSessionUrl,
     ]);
-    const capturedNetworkTestRequestBody = networkTestRequestBody as CapturedNetworkTestRequestBody | null;
-    assert.ok(capturedNetworkTestRequestBody);
-    assert.equal(capturedNetworkTestRequestBody.netTestRequestData.netTestProfile.framesPerSecond, 90);
     const capturedRequestBody = requestBody as CapturedSessionRequestBody | null;
     assert.ok(capturedRequestBody);
     assert.equal(capturedRequestBody.sessionRequestData.clientRequestMonitorSettings[0]?.framesPerSecond, 90);
@@ -272,7 +250,7 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
     assert.equal(capturedRequestBody.sessionRequestData.requestedStreamingFeatures.audioChannelCount, 2);
     assert.equal(capturedRequestBody.sessionRequestData.appLaunchMode, 2);
     assert.equal(capturedRequestBody.sessionRequestData.enablePersistingInGameSettings, false);
-    assert.equal(capturedRequestBody.sessionRequestData.networkTestSessionId, "nettest-1");
+    assert.equal(capturedRequestBody.sessionRequestData.networkTestSessionId, null);
   } finally {
     globalThis.fetch = originalFetch;
     console.warn = originalWarn;
@@ -307,17 +285,6 @@ test("CloudMatch retries transient serverInfo failures before creating a session
           { key: "gfn-regions", value: "US West" },
           { key: "US West", value: "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/" },
         ],
-      }), { status: 200 });
-    }
-
-    if (url === "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/v2/nettestsession") {
-      return new Response(JSON.stringify({
-        requestStatus: { statusCode: 1, statusDescription: "SUCCESS_STATUS", serverId: "NP-LAX-01" },
-        netTestSession: {
-          sessionId: "nettest-retry",
-          connectionInfo: [{ ip: "127.0.0.1", port: 443, appLevelProtocol: 5 }],
-          netTestThresholds: {},
-        },
       }), { status: 200 });
     }
 
@@ -360,10 +327,11 @@ test("CloudMatch retries transient serverInfo failures before creating a session
     });
 
     assert.equal(session.streamingBaseUrl, "https://np-lax-01.cloudmatchbeta.nvidiagrid.net");
+    // No /v2/nettestsession call: the official web client never forwards a
+    // network test session into createSession.
     assert.deepEqual(calls, [
       "https://prod.cloudmatchbeta.nvidiagrid.net/v2/serverInfo",
       "https://prod.cloudmatchbeta.nvidiagrid.net/v2/serverInfo",
-      "https://np-lax-01.cloudmatchbeta.nvidiagrid.net/v2/nettestsession",
       expectedSessionUrl,
     ]);
   } finally {
@@ -391,17 +359,6 @@ test("CloudMatch only sends in-game settings persistence when user opt-in and ga
 
   globalThis.fetch = (async (input, init) => {
     const url = String(input);
-    if (url === "https://np-test.example.test/v2/nettestsession") {
-      return new Response(JSON.stringify({
-        requestStatus: { statusCode: 1, statusDescription: "SUCCESS_STATUS", serverId: "NP-TEST" },
-        netTestSession: {
-          sessionId: "nettest-persistence",
-          connectionInfo: [{ ip: "127.0.0.1", port: 443, appLevelProtocol: 5 }],
-          netTestThresholds: {},
-        },
-      }), { status: 200 });
-    }
-
     if (url !== expectedSessionUrl) {
       throw new Error(`Unexpected fetch: ${url}`);
     }
