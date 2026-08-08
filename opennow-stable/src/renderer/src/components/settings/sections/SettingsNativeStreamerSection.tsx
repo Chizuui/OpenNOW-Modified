@@ -201,6 +201,22 @@ export function SettingsNativeStreamerSection({
     handleChange("nativeD3dFullscreenMode", "auto");
   }, [handleChange]);
 
+  type NativeRenderMode = "internal" | "external" | "stacked";
+  const activeNativeRenderMode: NativeRenderMode = settings.nativeStackedRenderer
+    ? "stacked"
+    : settings.nativeExternalRenderer
+      ? "external"
+      : "internal";
+
+  const setNativeRenderMode = useCallback((mode: NativeRenderMode) => {
+    // Stacked keeps nativeExternalRenderer OFF: StreamView relies on it to
+    // render the transparent DOM video hole that owns pointer lock (the sink
+    // window is WS_EX_NOACTIVATE and can never take OS focus). The Rust side
+    // forces the external window flag on its own when stacked is enabled.
+    handleChange("nativeStackedRenderer", mode === "stacked");
+    handleChange("nativeExternalRenderer", mode === "external");
+  }, [handleChange]);
+
   return (
     <>
       {showSection && (
@@ -546,11 +562,29 @@ export function SettingsNativeStreamerSection({
                 <div className="settings-row settings-row--column">
                   <label className="settings-label">{t("settings.nativeStreamer.renderMode")}</label>
                   <div className="settings-chip-row">
-                    <button type="button" className={`settings-chip ${!settings.nativeExternalRenderer ? "active" : ""}`} aria-pressed={!settings.nativeExternalRenderer} onClick={() => handleChange("nativeExternalRenderer", false)}>
+                    <button
+                      type="button"
+                      className={`settings-chip ${activeNativeRenderMode === "internal" ? "active" : ""}`}
+                      aria-pressed={activeNativeRenderMode === "internal"}
+                      onClick={() => setNativeRenderMode("internal")}
+                    >
                       <span>{t("settings.nativeStreamer.renderModeInternal")}</span>
                     </button>
-                    <button type="button" className={`settings-chip ${settings.nativeExternalRenderer ? "active" : ""}`} aria-pressed={settings.nativeExternalRenderer} onClick={() => handleChange("nativeExternalRenderer", true)}>
+                    <button
+                      type="button"
+                      className={`settings-chip ${activeNativeRenderMode === "external" ? "active" : ""}`}
+                      aria-pressed={activeNativeRenderMode === "external"}
+                      onClick={() => setNativeRenderMode("external")}
+                    >
                       <span>{t("settings.nativeStreamer.renderModeExternal")}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-chip ${activeNativeRenderMode === "stacked" ? "active" : ""}`}
+                      aria-pressed={activeNativeRenderMode === "stacked"}
+                      onClick={() => setNativeRenderMode("stacked")}
+                    >
+                      <span>{t("settings.nativeStreamer.renderModeStacked")}</span>
                     </button>
                   </div>
                   <span className="settings-subtle-hint">{t("settings.nativeStreamer.renderModeHint")}</span>

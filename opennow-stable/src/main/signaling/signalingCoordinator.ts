@@ -357,6 +357,8 @@ export class SignalingCoordinator {
         this.deps.settingsManager?.get("nativeD3dFullscreenMode") ?? "auto",
       getExternalRendererEnabled: () =>
         this.deps.settingsManager?.get("nativeExternalRenderer") ?? false,
+      getStackedRendererEnabled: () =>
+        this.deps.settingsManager?.get("nativeStackedRenderer") ?? false,
       emit: (event) => this.emitToRenderer(event),
       sendAnswer: async (payload) => {
         if (!this.signalingClient) {

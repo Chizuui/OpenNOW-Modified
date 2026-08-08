@@ -1,5 +1,5 @@
 use crate::gstreamer_backend::send_log;
-use crate::gstreamer_config::use_external_renderer_window;
+use crate::gstreamer_config::{use_external_renderer_window, use_stacked_renderer};
 use crate::gstreamer_pipeline::{configure_queue, set_property_if_supported};
 use crate::gstreamer_transitions::{
     format_transition_summary, resolve_queue_mode, TransitionSnapshot, TransitionTelemetry,
@@ -1434,16 +1434,34 @@ pub(crate) fn watch_first_sink_buffer(
         );
 
         if label == "video" && !reported.swap(true, Ordering::SeqCst) {
-            if let Some(event_sender) = &sender {
-                let message = if use_external_renderer_window() {
-                    "Native video frames reached the external low-latency GStreamer renderer window."
-                } else {
-                    "Native video frames reached the internal child-surface GStreamer renderer."
-                };
-                let _ = event_sender.send(Event::Status {
-                    status: "streaming",
-                    message: Some(message.to_owned()),
-                });
+            // GFN-parity launch: the sink stays hidden until the first decoded
+            // frame, then is shown + positioned (reveal) BEFORE the renderer
+            // learns streaming started — so the transparent-shell flip never
+            // precedes a visible, correctly-positioned video window (the
+            // launch blur / desktop flash). The sink window is created at the
+            // first present, just after this probe, so the reveal usually
+            // cannot complete here; in stacked mode the guard finishes it (and
+            // then delivers this event) the moment the window exists.
+            let revealed_now = crate::gstreamer_platform::reveal_stacked_renderer_window();
+            // Deferral is a Windows-only stacked-mode concept: the sink window
+            // is created at the first present, after this probe, and the guard
+            // reveals it (then delivers this event) once it exists. On other
+            // platforms the no-op reveal always reports false, so never defer
+            // there or the event would never be sent.
+            let deferred = cfg!(target_os = "windows") && !revealed_now && use_stacked_renderer();
+            if !deferred {
+                crate::gstreamer_platform::stacked_mark_streaming_event_sent();
+                if let Some(event_sender) = &sender {
+                    let message = if use_external_renderer_window() {
+                        "Native video frames reached the external low-latency GStreamer renderer window."
+                    } else {
+                        "Native video frames reached the internal child-surface GStreamer renderer."
+                    };
+                    let _ = event_sender.send(Event::Status {
+                        status: "streaming",
+                        message: Some(message.to_owned()),
+                    });
+                }
             }
         }
 
@@ -1457,15 +1475,23 @@ pub(crate) fn watch_rtp_video_bitrate(
     event_sender: &Option<Sender<Event>>,
 ) {
     let sender = event_sender.clone();
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, info| {
         if let Some(buffer) = info.buffer() {
             video_liveness.record_encoded_buffer(buffer.size());
             if video_liveness.log_first_encoded_once() {
+                // The pad caps expose the actual RTP payload type + encoding the
+                // server picked. If that differs from the negotiated codec
+                // (e.g. H265/AV1 `not-negotiated` receive failures), this line
+                // shows exactly what the server is sending.
+                let caps = probe_pad
+                    .current_caps()
+                    .map(|caps| caps.to_string())
+                    .unwrap_or_else(|| "unknown caps".to_owned());
                 send_log(
                     &sender,
                     "info",
                     format!(
-                        "First encoded RTP video buffer arrived; size={} bytes.",
+                        "First encoded RTP video buffer arrived; size={} bytes; pad_caps={caps}",
                         buffer.size()
                     ),
                 );
@@ -1547,9 +1573,16 @@ pub(crate) fn watch_video_caps_transitions(
         };
 
         if old_caps.is_none() {
-            *old_caps = Some(caps);
-            *old_framerate = framerate;
-            *old_memory_mode = memory_mode;
+            *old_caps = Some(caps.clone());
+            *old_framerate = framerate.clone();
+            *old_memory_mode = memory_mode.clone();
+            if source == "decoder" {
+                send_log(
+                    &sender,
+                    "info",
+                    format!("Native decoded video caps: {caps}"),
+                );
+            }
             return gst::PadProbeReturn::Ok;
         }
 

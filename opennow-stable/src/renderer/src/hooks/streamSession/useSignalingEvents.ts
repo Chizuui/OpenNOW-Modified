@@ -186,8 +186,13 @@ export function useSignalingEvents({
       nativeStreamingRef.current = true;
       pendingControlledDisconnectsRef.current = 0;
       const isWindowsHost = navigator.platform.toLowerCase().includes("win");
+      // Stacked mode keeps the BrowserWindow as the focused, interactive shell
+      // (the sink window is WS_EX_NOACTIVATE and can never take OS focus), so
+      // input MUST flow through Electron's DOM capture → IPC bridge, exactly
+      // like the internal child-surface mode.
       const electronInputBridge =
-        /linux/i.test(`${navigator.platform} ${navigator.userAgent}`)
+        settings.nativeStackedRenderer
+        || /linux/i.test(`${navigator.platform} ${navigator.userAgent}`)
         || (!settings.nativeExternalRenderer && !isWindowsHost);
       client.activateNativeInput(
         protocolVersion,
@@ -207,11 +212,12 @@ export function useSignalingEvents({
         },
       );
       // The external native window exclusively owns Escape through RawInput.
-      // Internal mode leaves Escape with Electron so it can prevent Chromium's
-      // fullscreen exit and forward one synthetic tap to the native streamer.
+      // Internal AND stacked mode leave Escape with Electron so it can prevent
+      // Chromium's fullscreen exit and forward one synthetic tap to the native
+      // streamer (the stacked sink never receives focus).
       window.openNow.notifyNativeInputModeChange(
         true,
-        isWindowsHost && settings.nativeExternalRenderer,
+        isWindowsHost && settings.nativeExternalRenderer && !settings.nativeStackedRenderer,
       );
       setLaunchError(null);
       setStreamStatus("streaming");
@@ -324,14 +330,18 @@ export function useSignalingEvents({
             /* best-effort */
           }
         } else if (event.type === "native-stream-stats") {
-          diagnosticsStore.set(mergeNativeStreamStats(
-            diagnosticsStore.getSnapshot(),
-            event.stats,
-          ));
+          diagnosticsStore.set({
+            ...mergeNativeStreamStats(
+              diagnosticsStore.getSnapshot(),
+              event.stats,
+            ),
+            nativeStackedRenderer: settings.nativeStackedRenderer,
+          });
         } else if (event.type === "native-stream-transition") {
           diagnosticsStore.set({
             ...diagnosticsStore.getSnapshot(),
             nativeRendererActive: true,
+            nativeStackedRenderer: settings.nativeStackedRenderer,
             nativeTransitionSummary: event.transition.summary,
             nativeRequestedFps: event.transition.requestedFps,
             nativeCapsFramerate: event.transition.capsFramerate,

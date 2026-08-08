@@ -1198,6 +1198,46 @@ export function App(): JSX.Element {
     void setSessionFullscreen(true);
   }, [sessionFullscreen, setSessionFullscreen, settings.autoFullScreen, settings.streamClientMode, streamStatus]);
 
+  // Stacked native mode is a fullscreen-first design (GFN-style: the video
+  // sink window sits behind the transparent shell edge to edge). Force the
+  // window fullscreen the moment the session streams so it never appears as a
+  // bordered windowed shell at launch. One-shot per session: an explicit exit
+  // (Escape-hold, quick-menu Windowed toggle) is respected and not re-forced.
+  const stackedFullscreenForcedRef = useRef(false);
+  useEffect(() => {
+    if (isStreaming && settings.nativeStackedRenderer) {
+      if (
+        !stackedFullscreenForcedRef.current &&
+        !sessionFullscreen &&
+        !document.fullscreenElement
+      ) {
+        stackedFullscreenForcedRef.current = true;
+        void setSessionFullscreen(true);
+      }
+    } else {
+      stackedFullscreenForcedRef.current = false;
+    }
+  }, [isStreaming, sessionFullscreen, setSessionFullscreen, settings.nativeStackedRenderer]);
+
+  // Alt-tab away and back can leave the shell windowed (focus loss drops
+  // fullscreen, and DOM pointer-lock re-acquisition fails while unfocused — the
+  // "stuck windowed" state). When the window regains focus mid-stream, re-enter
+  // fullscreen. Focus events never fire for in-app exits (Escape-hold, quick-
+  // menu Windowed toggle), so those explicit choices are still respected.
+  useEffect(() => {
+    if (!(isStreaming && settings.nativeStackedRenderer)) {
+      return undefined;
+    }
+    const onFocus = (): void => {
+      if (!sessionFullscreen && !document.fullscreenElement) {
+        stackedFullscreenForcedRef.current = true;
+        void setSessionFullscreen(true);
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [isStreaming, sessionFullscreen, setSessionFullscreen, settings.nativeStackedRenderer]);
+
   // Anti-AFK interval
   useEffect(() => {
     if (!isStreaming) {
@@ -1346,6 +1386,15 @@ export function App(): JSX.Element {
       document.body.classList.remove("low-perf-mode");
     }
   }, [settings.lowPerformanceMode]);
+
+  // Stacked native: the whole page must go transparent while the session
+  // streams, or the opaque html/body background hides the native video window
+  // that sits behind the BrowserWindow. Toggled only during an active session
+  // so the library keeps its normal background at all other times.
+  useEffect(() => {
+    const stackedNativeActive = isStreaming && settings.nativeStackedRenderer;
+    document.documentElement.classList.toggle("stacked-native-active", stackedNativeActive);
+  }, [isStreaming, settings.nativeStackedRenderer]);
 
 
   const previewSetting = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]): void => {
@@ -2713,7 +2762,7 @@ export function App(): JSX.Element {
   const catalogSurfaceActive = !shellBlocked;
 
   return (
-    <div className={`app-container${effectiveControllerMode ? " app-container--controller" : ""}${showCatalogAtmosphere ? " app-container--atmosphere" : ""}${sessionFullscreen || document.fullscreenElement ? " app-container--fullscreen" : ""}`} style={getAppStyle(settings.posterSizeScale)}>
+    <div className={`app-container${effectiveControllerMode ? " app-container--controller" : ""}${showCatalogAtmosphere ? " app-container--atmosphere" : ""}${sessionFullscreen || document.fullscreenElement ? " app-container--fullscreen" : ""}${isStreaming && settings.nativeStackedRenderer ? " app-container--stacked-native" : ""}`} style={getAppStyle(settings.posterSizeScale)}>
       <TitleBar streaming={isStreaming && streamVideoReady} fullscreen={sessionFullscreen || document.fullscreenElement !== null} />
       <div
         className="app-shell"

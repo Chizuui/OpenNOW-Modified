@@ -69,6 +69,8 @@ export interface Settings {
   nativeCloudGsyncMode: NativeStreamerFeatureMode;
   nativeD3dFullscreenMode: NativeStreamerFeatureMode;
   nativeExternalRenderer: boolean;
+  /** GFN-style stacked video window behind a transparent Electron shell */
+  nativeStackedRenderer: boolean;
   transportMode: StreamTransportMode;
   showNativeStreamerStats: boolean;
   codec: CodecPreference;
@@ -256,6 +258,7 @@ export function createDefaultSettings(platform: string): Settings {
     nativeCloudGsyncMode: "auto",
     nativeD3dFullscreenMode: "auto",
     nativeExternalRenderer: false,
+    nativeStackedRenderer: false,
     transportMode: "webrtc",
     showNativeStreamerStats: false,
     codec: DEFAULT_STREAM_PREFERENCES.codec,

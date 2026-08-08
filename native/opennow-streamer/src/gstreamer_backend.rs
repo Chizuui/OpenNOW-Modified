@@ -19,7 +19,7 @@ use crate::protocol::{
 };
 use crate::sdp::{
     build_nvst_sdp_for_answer, extract_negotiated_video_codec, munge_answer_sdp,
-    rewrite_ice_candidate_endpoint,
+    restore_h265_fmtp_params, rewrite_ice_candidate_endpoint,
 };
 use std::sync::mpsc::Sender;
 
@@ -358,7 +358,18 @@ impl NativeStreamerBackend for GstreamerBackend {
                 .then_some(&prepared.nvst_params.credentials),
             prepared.nvst_params.partial_reliable_threshold_ms,
         ) {
-            Ok(answer_sdp) => munge_answer_sdp(&answer_sdp, prepared.nvst_params.max_bitrate_kbps),
+            Ok(answer_sdp) => {
+                let munged = munge_answer_sdp(&answer_sdp, prepared.nvst_params.max_bitrate_kbps);
+                // The offer handed to webrtcbin had H265 fmtp parameters
+                // stripped (rtph265depay rejects them in the receive caps); put
+                // them back on the answer sent to GFN so the server sees the
+                // fmtp it expects in the answer.
+                if let Some(h265_fmtp) = prepared.h265_fmtp_params.as_deref() {
+                    restore_h265_fmtp_params(&munged, h265_fmtp)
+                } else {
+                    munged
+                }
+            }
             Err(message) => {
                 return BackendReply {
                     events,
@@ -400,6 +411,29 @@ impl NativeStreamerBackend for GstreamerBackend {
                     ),
                 });
             }
+        }
+
+        // Diagnostic: dump the answer's video payload types and codec mappings
+        // so a `not-negotiated` H265/AV1 receive failure can be matched against
+        // the payload types the server actually sends.
+        {
+            let video_section = answer_sdp
+                .lines()
+                .skip_while(|line| !line.starts_with("m=video"))
+                .take_while(|line| !line.starts_with("m=") || line.starts_with("m=video"));
+            let video_mline = video_section
+                .clone()
+                .find(|line| line.starts_with("m=video"))
+                .unwrap_or_default()
+                .to_owned();
+            let video_rtpmaps = video_section
+                .filter(|line| line.starts_with("a=rtpmap:"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            events.push(Event::Log {
+                level: "debug",
+                message: format!("Answer video payload: {video_mline}; rtpmap: {video_rtpmaps}"),
+            });
         }
 
         let nvst_sdp = match build_nvst_sdp_for_answer(&prepared.nvst_params, &answer_sdp) {
@@ -581,10 +615,11 @@ mod tests {
         caps_framerate_summary, sink_stats_summary, VideoStallAction, VideoStallTracker,
     };
     use crate::gstreamer_pipeline::{
-        backend_runs_on_platform, configure_stats_overlay_element,
-        default_rtp_video_api_priority, effective_present_max_fps, format_video_chain_selection,
-        init_gstreamer, preferred_rtp_video_apis_for, resolve_gstreamer_stun_server,
-        rtp_video_chain_definition, RtpVideoApi, RtpVideoChainRole,
+        align_windows_vulkan_download_factory, backend_runs_on_platform,
+        configure_stats_overlay_element, default_rtp_video_api_priority, effective_present_max_fps,
+        format_video_chain_selection, init_gstreamer, post_decode_caps_for,
+        preferred_rtp_video_apis_for, resolve_gstreamer_stun_server, rtp_video_chain_definition,
+        RtpVideoApi, RtpVideoChainRole,
     };
     use crate::gstreamer_transitions::resolve_queue_mode;
     use crate::protocol::{IceServer, NativeQueueMode, StreamSettings, VideoCodec};
@@ -769,13 +804,25 @@ mod tests {
     fn maps_rtp_video_codecs_to_explicit_gpu_decode_chains() {
         let h265 =
             rtp_video_chain_definition("H265", RtpVideoApi::D3D11).expect("H265 D3D11 chain");
-        assert_eq!(h265[0].factory, "rtph265depay");
-        assert_eq!(h265[3].factory, "d3d11h265dec");
-        assert_eq!(h265[4].factory, "dwritetextoverlay");
-        assert_eq!(h265[6].factory, "d3d11videosink");
-        assert!(!h265
-            .iter()
-            .any(|spec| spec.role == RtpVideoChainRole::PostDecodeCapsFilter));
+        // GStreamer 1.29.x `rtph265depay` rejects receive-pad caps carrying the
+        // H265 fmtp fields (`profile-id`/`level-id`/`tier-flag`); the chain
+        // strips them with a capsfilter ahead of the depayloader.
+        assert_eq!(h265[0].factory, "capsfilter");
+        assert_eq!(h265[0].role, RtpVideoChainRole::ReceiveCapsFilter);
+        assert_eq!(
+            h265[0].caps.as_deref(),
+            Some("application/x-rtp, encoding-name=H265")
+        );
+        assert_eq!(h265[1].factory, "rtph265depay");
+        assert_eq!(h265[4].factory, "d3d11h265dec");
+        // AV1/H265 take the safe present path: download + videoconvert to
+        // system NV12 instead of zero-copy D3DMemory presentation.
+        assert_eq!(h265[5].factory, "d3d11download");
+        assert_eq!(h265[6].factory, "videoconvert");
+        assert_eq!(h265[7].role, RtpVideoChainRole::PostDecodeCapsFilter);
+        assert_eq!(h265[7].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(h265[8].factory, "dwritetextoverlay");
+        assert_eq!(h265[10].factory, "d3d11videosink");
 
         let h264 =
             rtp_video_chain_definition("h264", RtpVideoApi::D3D12).expect("H264 D3D12 chain");
@@ -786,12 +833,22 @@ mod tests {
         assert!(!h264
             .iter()
             .any(|spec| spec.role == RtpVideoChainRole::PostDecodeCapsFilter));
+        assert!(!h264
+            .iter()
+            .any(|spec| spec.role == RtpVideoChainRole::ReceiveCapsFilter));
 
         let av1 = rtp_video_chain_definition("AV1", RtpVideoApi::D3D11).expect("AV1 D3D11 chain");
         assert_eq!(av1[0].factory, "rtpav1depay");
         assert_eq!(av1[3].factory, "d3d11av1dec");
-        assert_eq!(av1[4].factory, "dwritetextoverlay");
-        assert_eq!(av1[6].factory, "d3d11videosink");
+        assert_eq!(av1[4].factory, "d3d11download");
+        assert_eq!(av1[5].factory, "videoconvert");
+        assert_eq!(av1[6].role, RtpVideoChainRole::PostDecodeCapsFilter);
+        assert_eq!(av1[6].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(av1[7].factory, "dwritetextoverlay");
+        assert_eq!(av1[9].factory, "d3d11videosink");
+        assert!(!av1
+            .iter()
+            .any(|spec| spec.role == RtpVideoChainRole::ReceiveCapsFilter));
     }
 
     #[test]
@@ -801,12 +858,126 @@ mod tests {
         let d3d12 =
             rtp_video_chain_definition("H264", RtpVideoApi::D3D12).expect("H264 D3D12 chain");
 
-        assert!(!d3d11
+        // No capsfilter demands a D3D memory type without zero-copy being
+        // requested; the AV1/H265 safe-present capsfilter is system NV12.
+        assert!(!d3d11.iter().any(|spec| spec
+            .caps
+            .as_deref()
+            .is_some_and(|caps| caps.contains("memory:"))));
+        assert!(!d3d12.iter().any(|spec| spec
+            .caps
+            .as_deref()
+            .is_some_and(|caps| caps.contains("memory:"))));
+    }
+
+    #[test]
+    fn post_decode_caps_stay_memory_only_with_safe_present_for_ten_bit_codecs() {
+        // post_decode_caps_for no longer forces format=NV12: the D3D DXVA
+        // decoders refuse to convert 10-bit→8-bit internally (not-negotiated
+        // for a 10-bit stream), so the caps stay memory-only and the safe
+        // present path does the conversion with download + videoconvert.
+        let d3d11_av1 =
+            post_decode_caps_for(RtpVideoApi::D3D11, "AV1", "video/x-raw(memory:D3D11Memory)");
+        assert_eq!(d3d11_av1, "video/x-raw(memory:D3D11Memory)");
+        let d3d12_h265 = post_decode_caps_for(
+            RtpVideoApi::D3D12,
+            "H265",
+            "video/x-raw(memory:D3D12Memory)",
+        );
+        assert_eq!(d3d12_h265, "video/x-raw(memory:D3D12Memory)");
+        let d3d11_h264 = post_decode_caps_for(
+            RtpVideoApi::D3D11,
+            "H264",
+            "video/x-raw(memory:D3D11Memory)",
+        );
+        assert_eq!(d3d11_h264, "video/x-raw(memory:D3D11Memory)");
+
+        // The chain routes AV1/H265 through download + videoconvert to system
+        // NV12 instead of presenting the D3D texture zero-copy.
+        let chain =
+            rtp_video_chain_definition("AV1", RtpVideoApi::D3D12).expect("AV1 D3D12 chain");
+        assert!(chain
             .iter()
-            .any(|spec| spec.role == RtpVideoChainRole::PostDecodeCapsFilter));
-        assert!(!d3d12
+            .any(|spec| spec.factory == "d3d12download"));
+        assert!(chain.iter().any(|spec| spec.factory == "videoconvert"));
+        assert!(chain.iter().any(|spec| {
+            spec.role == RtpVideoChainRole::PostDecodeCapsFilter
+                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+        }));
+
+        // H264 keeps the zero-copy D3D path (no download/convert stage).
+        let h264 =
+            rtp_video_chain_definition("H264", RtpVideoApi::D3D12).expect("H264 D3D12 chain");
+        assert!(!h264.iter().any(|spec| spec.factory == "d3d12download"));
+        assert!(!h264.iter().any(|spec| spec.factory == "videoconvert"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn software_av1_decoder_override_removes_d3d_download_stage() {
+        // Simulate OPENNOW_NATIVE_AV1_DECODER=dav1d on a D3D12 backend: the
+        // decoder replacement happens in rtp_video_chain_specs, then
+        // align_windows_vulkan_download_factory must drop the D3D download
+        // stage (dav1ddec outputs system memory) while keeping the
+        // videoconvert + NV12 capsfilter so the D3D sink still receives
+        // 8-bit NV12 it can upload.
+        let mut specs =
+            rtp_video_chain_definition("AV1", RtpVideoApi::D3D12).expect("AV1 D3D12 chain");
+        for spec in &mut specs {
+            if spec.role == RtpVideoChainRole::Decoder {
+                spec.factory = "dav1ddec";
+            }
+        }
+        align_windows_vulkan_download_factory(&mut specs, "dav1ddec");
+
+        assert!(!specs
             .iter()
-            .any(|spec| spec.role == RtpVideoChainRole::PostDecodeCapsFilter));
+            .any(|spec| spec.factory == "d3d12download" || spec.factory == "d3d11download"));
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory),
+            Some("dav1ddec")
+        );
+        assert!(specs.iter().any(|spec| spec.factory == "videoconvert"));
+        assert!(specs.iter().any(|spec| {
+            spec.role == RtpVideoChainRole::PostDecodeCapsFilter
+                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+        }));
+        assert_eq!(
+            specs.last().map(|spec| spec.factory),
+            Some("d3d12videosink")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn software_h265_decoder_override_keeps_convert_stage() {
+        let mut specs =
+            rtp_video_chain_definition("H265", RtpVideoApi::D3D11).expect("H265 D3D11 chain");
+        for spec in &mut specs {
+            if spec.role == RtpVideoChainRole::Decoder {
+                spec.factory = "avdec_h265";
+            }
+        }
+        align_windows_vulkan_download_factory(&mut specs, "avdec_h265");
+
+        assert!(!specs
+            .iter()
+            .any(|spec| spec.factory == "d3d11download" || spec.factory == "d3d12download"));
+        assert!(specs.iter().any(|spec| spec.factory == "videoconvert"));
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory),
+            Some("avdec_h265")
+        );
+        assert_eq!(
+            specs.last().map(|spec| spec.factory),
+            Some("d3d11videosink")
+        );
     }
 
     #[test]

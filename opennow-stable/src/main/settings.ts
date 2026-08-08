@@ -266,6 +266,21 @@ export class SettingsManager {
       settings.nativeExternalRenderer = nativeExternalRenderer;
       migrated = true;
     }
+    if (typeof settings.nativeStackedRenderer !== "boolean") {
+      settings.nativeStackedRenderer = false;
+      migrated = true;
+    }
+    // Older builds let users enable Stacked and External together, which is a
+    // contradictory state: Stacked is its own render mode and must not imply
+    // the floating external window (StreamView needs the transparent DOM video
+    // hole for pointer lock when stacked). Resolve to pure stacked.
+    if (settings.nativeStackedRenderer && settings.nativeExternalRenderer) {
+      console.warn(
+        "[Settings] Migrating conflicting render mode (Stacked + External) to Stacked.",
+      );
+      settings.nativeExternalRenderer = false;
+      migrated = true;
+    }
     const transportMode = normalizeTransportModeForPlatform(
       settings.transportMode === "nvst" ? "nvst" : "webrtc",
       process.platform,

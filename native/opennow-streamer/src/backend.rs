@@ -5,10 +5,11 @@ use crate::protocol::{
     PROTOCOL_VERSION,
 };
 use crate::sdp::{
-    duplicate_session_webrtc_attributes_to_media, extract_ice_credentials, fix_server_ip,
-    parse_resolution, prefer_codec, rewrite_sdp_ice_candidate_endpoints,
-    sanitize_ice_pwd_for_gstreamer, summarize_media_transport_attributes, NvstParams,
-    PreferCodecOptions,
+    describe_video_payloads, duplicate_session_webrtc_attributes_to_media,
+    extract_h265_fmtp_params, extract_ice_credentials, fix_server_ip, parse_resolution,
+    prefer_codec, rewrite_sdp_ice_candidate_endpoints, sanitize_h265_fmtp_for_gstreamer,
+    sanitize_ice_pwd_for_gstreamer, sdp_contains_codec, summarize_media_transport_attributes,
+    NvstParams, PreferCodecOptions,
 };
 use std::env;
 use std::sync::mpsc::Sender;
@@ -120,7 +121,19 @@ pub struct PreparedNativeOffer {
     pub gstreamer_framerate_adjusted: bool,
     pub media_connection_ice_replacements: usize,
     pub nvst_params: NvstParams,
+    /// The codec the user asked for, before any H264 fallback for server
+    /// offers that do not carry the requested codec.
+    pub requested_codec: VideoCodec,
     pub media_connection_info: Option<MediaConnectionInfo>,
+    /// Whether the full RTP decode chain (depayloader + parser + decoder +
+    /// sink) for the negotiated codec is available; drives hard vs soft offer
+    /// filtering in `prefer_codec`.
+    pub codec_available: bool,
+    /// Original H265 fmtp parameter string from the server offer (e.g.
+    /// `profile-id=1; level-id=153; tier-flag=1`), restored on the wire answer
+    /// for server parity after `sanitize_h265_fmtp_for_gstreamer` stripped it
+    /// from the offer webrtcbin sees.
+    pub h265_fmtp_params: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +175,18 @@ pub fn prepare_native_offer(
             (fixed_offer_sdp, 0)
         };
     let fixed_offer_sdp = duplicate_session_webrtc_attributes_to_media(&fixed_offer_sdp);
-    let codec = resolve_native_codec(context.settings.codec);
+    let requested_codec = resolve_native_codec(context.settings.codec);
+    // When the requested codec is missing from the server offer, do not leave
+    // the video m-line unfiltered: GStreamer's webrtcbin would answer with
+    // H265, and GFN servers that never advertised it send a stream that does
+    // not match the negotiated answer (`not-negotiated` on the receive path,
+    // killing the session). Fall back to H264, which these servers always
+    // offer and reliably send.
+    let codec = if sdp_contains_codec(&fixed_offer_sdp, requested_codec) {
+        requested_codec
+    } else {
+        VideoCodec::H264
+    };
     let codec_available = native_codec_available(codec);
     let fixed_offer_sdp = prefer_codec(
         &fixed_offer_sdp,
@@ -173,6 +197,14 @@ pub fn prepare_native_offer(
         align_video_sdp_framerate_for_gstreamer(&fixed_offer_sdp, context.settings.fps);
     let (gstreamer_offer_sdp, gstreamer_ice_pwd_replacements) =
         sanitize_ice_pwd_for_gstreamer(&gstreamer_framerate_offer_sdp);
+    // H265 fmtp parameters (`profile-id`, `level-id`, `tier-flag`) echo into
+    // the negotiated receive-pad caps, which the bundled GStreamer's
+    // `rtph265depay` rejects (`not-negotiated` right after the first RTP
+    // packet). Strip them from the offer webrtcbin sees so the answer — and
+    // therefore the receive caps — never carry them; the original parameter
+    // string is captured and restored on the wire answer for server parity.
+    let h265_fmtp_params = extract_h265_fmtp_params(&fixed_offer_sdp);
+    let gstreamer_offer_sdp = sanitize_h265_fmtp_for_gstreamer(&gstreamer_offer_sdp);
     let credentials = extract_ice_credentials(&fixed_offer_sdp);
     let nvst_params = NvstParams {
         width,
@@ -196,7 +228,10 @@ pub fn prepare_native_offer(
         gstreamer_framerate_adjusted,
         media_connection_ice_replacements,
         nvst_params,
+        requested_codec,
         media_connection_info: context.session.media_connection_info.clone(),
+        codec_available,
+        h265_fmtp_params,
     })
 }
 
@@ -338,6 +373,21 @@ pub fn prepared_offer_events(prepared: &PreparedNativeOffer) -> Vec<Event> {
             prepared.original_sdp_len,
             prepared.fixed_offer_sdp.len(),
         ),
+    }, Event::Log {
+        level: "debug",
+        message: format!(
+            "Native offer codec decision: requested={} resolved={} decode_chain_available={} gstreamer_video_mline={}",
+            codec_label(prepared.requested_codec),
+            codec_label(nvst.codec),
+            prepared.codec_available,
+            video_media_line(&prepared.gstreamer_offer_sdp).unwrap_or_else(|| "<missing>".to_owned()),
+        ),
+    }, Event::Log {
+        level: "debug",
+        message: format!(
+            "Native offer video payloads: {}",
+            describe_video_payloads(&prepared.gstreamer_offer_sdp),
+        ),
     }];
 
     if prepared.gstreamer_framerate_adjusted {
@@ -395,6 +445,12 @@ pub fn prepared_offer_events(prepared: &PreparedNativeOffer) -> Vec<Event> {
     }
 
     events
+}
+
+fn video_media_line(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .find(|line| line.starts_with("m=video"))
+        .map(str::to_owned)
 }
 
 pub fn normalize_bitrate_kbps(value: u32) -> u32 {
@@ -749,6 +805,45 @@ mod tests {
                 .gstreamer_offer_sdp
                 .contains("a=rtpmap:97 rtx/90000"));
         }
+    }
+
+    #[test]
+    fn falls_back_to_h264_when_requested_codec_missing_from_offer() {
+        let offer = [
+            "v=0",
+            "a=group:BUNDLE 0 1",
+            "a=ice-ufrag:user",
+            "a=ice-pwd:pass",
+            "a=fingerprint:sha-256 AA:BB",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=rtpmap:111 OPUS/48000/2",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99",
+            "a=rtpmap:96 H264/90000",
+            "a=rtpmap:97 rtx/90000",
+            "a=fmtp:97 apt=96",
+            "a=rtpmap:98 H265/90000",
+            "a=rtpmap:99 rtx/90000",
+            "a=fmtp:99 apt=98",
+        ]
+        .join("\n");
+
+        let mut ctx = context("1920x1080");
+        ctx.settings.codec = VideoCodec::AV1;
+        let prepared = prepare_native_offer(&ctx, &offer).expect("valid offer");
+
+        // AV1 was requested but never advertised: fall back to H264 instead of
+        // leaving the m-line unfiltered, which would let webrtcbin answer with
+        // H265 and the server would send a stream that does not match the
+        // negotiated answer (`not-negotiated` on the receive path).
+        assert_eq!(prepared.requested_codec, VideoCodec::AV1);
+        assert_eq!(prepared.nvst_params.codec, VideoCodec::H264);
+        assert!(prepared
+            .gstreamer_offer_sdp
+            .contains("m=video 9 UDP/TLS/RTP/SAVPF 96 97"));
+        assert!(prepared
+            .gstreamer_offer_sdp
+            .contains("a=rtpmap:96 H264/90000"));
+        assert!(!prepared.gstreamer_offer_sdp.contains("H265"));
     }
 
     #[test]

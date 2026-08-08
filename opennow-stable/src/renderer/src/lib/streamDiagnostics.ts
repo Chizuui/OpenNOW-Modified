@@ -7,6 +7,7 @@ export function defaultDiagnostics(): StreamDiagnostics {
     connectionState: "closed",
     inputReady: false,
     nativeRendererActive: false,
+    nativeStackedRenderer: false,
     connectedGamepads: 0,
     resolution: "",
     codec: "",

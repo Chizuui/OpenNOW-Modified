@@ -1,9 +1,11 @@
 use crate::gstreamer_backend::send_log;
 use crate::gstreamer_config::{
     automatic_present_max_fps, requested_video_backend, use_external_renderer_window,
-    use_internal_renderer, vrr_present_max_fps, zero_copy_requested, EXTERNAL_RENDERER_ENV,
-    NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV, NATIVE_VIDEO_API_ENV,
-    NATIVE_VIDEO_BACKEND_ENV, PRESENT_LIMITER_AUTO_SENTINEL, PRESENT_LIMITER_VRR_SENTINEL,
+    av1_decoder_preference, h265_decoder_preference, use_internal_renderer, use_stacked_renderer,
+    vrr_present_max_fps, zero_copy_requested, CodecDecoderPreference,
+    EXTERNAL_RENDERER_ENV, NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV,
+    NATIVE_VIDEO_API_ENV, NATIVE_VIDEO_BACKEND_ENV, PRESENT_LIMITER_AUTO_SENTINEL,
+    PRESENT_LIMITER_VRR_SENTINEL,
 };
 #[cfg(target_os = "windows")]
 use crate::gstreamer_input::NativeWindowInputBridge;
@@ -17,8 +19,9 @@ use crate::gstreamer_liveness::{
     watch_video_sink_caps_transitions, watch_video_sink_rate, VideoLivenessMonitor,
 };
 use crate::gstreamer_platform::{
-    primary_display_refresh_hz, release_native_input_capture, start_external_renderer_window_guard,
-    update_external_renderer_surface,
+    apply_stacked_renderer_surface, primary_display_refresh_hz, release_native_input_capture,
+    start_external_renderer_window_guard, start_stacked_renderer_window_guard,
+    stop_stacked_renderer_window_guard, update_external_renderer_surface,
 };
 #[cfg(target_os = "windows")]
 use crate::gstreamer_platform::arm_internal_child_input;
@@ -75,6 +78,7 @@ pub(crate) enum DecodedMediaKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RtpVideoChainRole {
+    ReceiveCapsFilter,
     Depayloader,
     Parser,
     PreDecodeQueue,
@@ -350,12 +354,44 @@ impl GstreamerRenderState {
     }
 
     fn apply(&self, event_sender: &Option<Sender<Event>>) {
-        if use_external_renderer_window() {
-            let sink_ready = self.video_sink.lock().ok().and_then(|sink| sink.clone());
-            let Some(_sink) = sink_ready else {
-                return;
-            };
+        let sink_ready = self.video_sink.lock().ok().and_then(|sink| sink.clone());
+        let Some(_sink) = sink_ready else {
+            // Wait for the video sink to exist before deciding how to render.
+            return;
+        };
 
+        if use_stacked_renderer() {
+            if let Some(surface) = self.surface.lock().ok().and_then(|surface| surface.clone()) {
+                // gstreamer-video 0.25 has no public getter for the overlay's
+                // window handle, so pass 0 and let the platform layer find the
+                // streamer's own top-level window via EnumWindows (the sink is
+                // the only window this process owns in stacked mode).
+                apply_stacked_renderer_surface(&surface, 0);
+            }
+            if !self
+                .external_window_guard_started
+                .swap(true, Ordering::SeqCst)
+            {
+                self.external_window_guard_stop
+                    .store(false, Ordering::SeqCst);
+                start_stacked_renderer_window_guard(
+                    event_sender.clone(),
+                    self.external_window_guard_stop.clone(),
+                );
+            }
+            if !self.internal_renderer_logged.swap(true, Ordering::SeqCst) {
+                send_log(
+                    event_sender,
+                    "info",
+                    format!(
+                        "Using stacked native GStreamer renderer window (video behind transparent Electron shell); set {EXTERNAL_RENDERER_ENV}=0 for the internal child-surface renderer."
+                    ),
+                );
+            }
+            return;
+        }
+
+        if use_external_renderer_window() {
             if let Some(surface) = self.surface.lock().ok().and_then(|surface| surface.clone()) {
                 update_external_renderer_surface(&surface);
             }
@@ -381,11 +417,6 @@ impl GstreamerRenderState {
             }
             return;
         }
-
-        let sink_ready = self.video_sink.lock().ok().and_then(|sink| sink.clone());
-        let Some(_sink) = sink_ready else {
-            return;
-        };
 
         let surface = self.surface.lock().ok().and_then(|surface| surface.clone());
         let Some(surface) = surface else {
@@ -1135,6 +1166,7 @@ impl GstreamerPipeline {
         self.skip_webrtc_video.store(false, Ordering::SeqCst);
         self.video_liveness.set_stats_overlay_visible(false);
         self.render_state.stop_external_renderer_window_guard();
+        stop_stacked_renderer_window_guard();
         self.render_state.destroy_internal_renderer();
         #[cfg(target_os = "windows")]
         if let Some(mut bridge) = self.native_window_input_bridge.take() {
@@ -1796,6 +1828,45 @@ fn rtp_video_parser_factory(codec: &str) -> Option<&'static str> {
     }
 }
 
+/// Post-decode capsfilter caps for the D3D11/D3D12 memory path.
+///
+/// Returns the memory caps unchanged. 10-bit-capable codecs (AV1, H265/HEVC)
+/// no longer force `format=NV12` here: the D3D DXVA decoders refuse to convert
+/// 10-bit → 8-bit internally (`not-negotiated` when the output caps demand
+/// NV12 for a 10-bit stream). The conversion is instead done by the explicit
+/// download + videoconvert stage those codecs get in
+/// `rtp_video_chain_definition` and the Vulkan-internal chain.
+pub(crate) fn post_decode_caps_for(
+    _video_api: RtpVideoApi,
+    _codec: &str,
+    memory_caps: &str,
+) -> String {
+    memory_caps.to_owned()
+}
+
+/// Capsfilter spec for H265/HEVC receive chains.
+///
+/// GStreamer's `rtph265depay` (observed in the bundled 1.29.x runtime)
+/// rejects receive-pad caps that carry the H265 fmtp parameters (`profile-id`,
+/// `level-id`, `tier-flag`) which GFN echoes from its offer into the
+/// negotiated caps — the receive pad fails with `not-negotiated` right after
+/// the first RTP packet arrives, killing the whole session. H264's equivalent
+/// fmtp fields are accepted by `rtph264depay`, and AV1's offer carries no such
+/// fields, so only H265/HEVC needs this filter. The depayloader reconstructs
+/// profile/level from the in-band VPS/SPS/PPS, so stripping the fields costs
+/// nothing.
+fn h265_receive_caps_strip_filter(codec: &str) -> Option<RtpVideoChainSpec> {
+    if matches!(codec, "H265" | "HEVC") {
+        Some(RtpVideoChainSpec::with_caps(
+            "capsfilter",
+            RtpVideoChainRole::ReceiveCapsFilter,
+            "application/x-rtp, encoding-name=H265",
+        ))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn rtp_video_chain_definition(
     encoding: &str,
     video_api: RtpVideoApi,
@@ -1807,27 +1878,60 @@ pub(crate) fn rtp_video_chain_definition(
         return windows_vulkan_present_chain_definition(codec.as_str());
     }
 
-    let mut specs = vec![
-        RtpVideoChainSpec::new(
-            rtp_video_depayloader_factory(codec.as_str())?,
-            RtpVideoChainRole::Depayloader,
-        ),
-        RtpVideoChainSpec::new(
-            rtp_video_parser_factory(codec.as_str())?,
-            RtpVideoChainRole::Parser,
-        ),
-        RtpVideoChainSpec::new("queue", RtpVideoChainRole::PreDecodeQueue),
-        RtpVideoChainSpec::new(
-            video_api.decoder_factory(codec.as_str())?,
-            RtpVideoChainRole::Decoder,
-        ),
-    ];
+    let mut specs = Vec::with_capacity(8);
+    if let Some(filter) = h265_receive_caps_strip_filter(codec.as_str()) {
+        specs.push(filter);
+    }
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_depayloader_factory(codec.as_str())?,
+        RtpVideoChainRole::Depayloader,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_parser_factory(codec.as_str())?,
+        RtpVideoChainRole::Parser,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "queue",
+        RtpVideoChainRole::PreDecodeQueue,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        video_api.decoder_factory(codec.as_str())?,
+        RtpVideoChainRole::Decoder,
+    ));
 
-    if let Some(memory_caps) = video_api.memory_caps() {
+    let is_ten_bit_capable = matches!(codec.as_str(), "AV1" | "H265" | "HEVC");
+    let is_d3d = matches!(video_api, RtpVideoApi::D3D11 | RtpVideoApi::D3D12);
+    if is_ten_bit_capable && is_d3d {
+        // D3D DXVA textures for 10-bit-capable codecs (AV1, H265/HEVC) cannot
+        // be presented through the zero-copy D3DMemory path: the
+        // d3d11/d3d12videosink renders them as full-frame gray/pink garbage,
+        // and the DXVA decoders refuse to convert 10-bit→8-bit themselves
+        // (`not-negotiated` when the output caps demand NV12). Route these
+        // codecs through system memory — download the D3D texture, convert
+        // P010→NV12 with videoconvert, and present 8-bit NV12 that the sink
+        // uploads itself. 8-bit streams pass through unchanged.
+        let download = match video_api {
+            RtpVideoApi::D3D12 => "d3d12download",
+            _ => "d3d11download",
+        };
+        specs.push(RtpVideoChainSpec::new(
+            download,
+            RtpVideoChainRole::PostDecodeConverter,
+        ));
+        specs.push(RtpVideoChainSpec::new(
+            "videoconvert",
+            RtpVideoChainRole::PostDecodeConverter,
+        ));
         specs.push(RtpVideoChainSpec::with_caps(
             "capsfilter",
             RtpVideoChainRole::PostDecodeCapsFilter,
-            memory_caps,
+            "video/x-raw,format=NV12",
+        ));
+    } else if let Some(memory_caps) = video_api.memory_caps() {
+        specs.push(RtpVideoChainSpec::with_caps(
+            "capsfilter",
+            RtpVideoChainRole::PostDecodeCapsFilter,
+            post_decode_caps_for(video_api, codec.as_str(), memory_caps),
         ));
     }
     if let Some(converter) = video_api.post_decode_converter_factory() {
@@ -1887,20 +1991,49 @@ fn windows_vulkan_internal_present_chain_definition(codec: &str) -> Option<Vec<R
     } else {
         RtpVideoApi::D3D11
     };
-    let mut specs = vec![
-        RtpVideoChainSpec::new(
-            rtp_video_depayloader_factory(codec)?,
-            RtpVideoChainRole::Depayloader,
-        ),
-        RtpVideoChainSpec::new(rtp_video_parser_factory(codec)?, RtpVideoChainRole::Parser),
-        RtpVideoChainSpec::new("queue", RtpVideoChainRole::PreDecodeQueue),
-        RtpVideoChainSpec::new(decoder, RtpVideoChainRole::Decoder),
-    ];
-    if let Some(memory_caps) = memory_api.memory_caps() {
+    let mut specs = Vec::with_capacity(8);
+    if let Some(filter) = h265_receive_caps_strip_filter(codec) {
+        specs.push(filter);
+    }
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_depayloader_factory(codec)?,
+        RtpVideoChainRole::Depayloader,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_parser_factory(codec)?,
+        RtpVideoChainRole::Parser,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "queue",
+        RtpVideoChainRole::PreDecodeQueue,
+    ));
+    specs.push(RtpVideoChainSpec::new(decoder, RtpVideoChainRole::Decoder));
+    if matches!(codec, "AV1" | "H265" | "HEVC") {
+        // Same safe present path as the main D3D chain: 10-bit-capable DXVA
+        // textures present as gray/pink garbage through zero-copy D3DMemory.
+        let download = if prefer_d3d12 {
+            "d3d12download"
+        } else {
+            "d3d11download"
+        };
+        specs.push(RtpVideoChainSpec::new(
+            download,
+            RtpVideoChainRole::PostDecodeConverter,
+        ));
+        specs.push(RtpVideoChainSpec::new(
+            "videoconvert",
+            RtpVideoChainRole::PostDecodeConverter,
+        ));
         specs.push(RtpVideoChainSpec::with_caps(
             "capsfilter",
             RtpVideoChainRole::PostDecodeCapsFilter,
-            memory_caps,
+            "video/x-raw,format=NV12",
+        ));
+    } else if let Some(memory_caps) = memory_api.memory_caps() {
+        specs.push(RtpVideoChainSpec::with_caps(
+            "capsfilter",
+            RtpVideoChainRole::PostDecodeCapsFilter,
+            post_decode_caps_for(memory_api, codec, memory_caps),
         ));
     }
     specs.push(RtpVideoChainSpec::new(
@@ -1919,28 +2052,55 @@ fn windows_vulkan_internal_present_chain_definition(codec: &str) -> Option<Vec<R
 #[cfg(target_os = "windows")]
 fn windows_vulkan_external_present_chain_definition(codec: &str) -> Option<Vec<RtpVideoChainSpec>> {
     let decoder = RtpVideoApi::Vulkan.decoder_factory(codec)?;
-    Some(vec![
-        RtpVideoChainSpec::new(
-            rtp_video_depayloader_factory(codec)?,
-            RtpVideoChainRole::Depayloader,
-        ),
-        RtpVideoChainSpec::new(rtp_video_parser_factory(codec)?, RtpVideoChainRole::Parser),
-        RtpVideoChainSpec::new("queue", RtpVideoChainRole::PreDecodeQueue),
-        RtpVideoChainSpec::new(decoder, RtpVideoChainRole::Decoder),
-        // Composite diagnostics while frames are still in the DXVA/D3D path.
-        // dwritetextoverlay cannot consume VulkanImage memory after upload.
-        RtpVideoChainSpec::new("dwritetextoverlay", RtpVideoChainRole::StatsOverlay),
-        RtpVideoChainSpec::new("d3d11download", RtpVideoChainRole::PostDecodeConverter),
-        RtpVideoChainSpec::new("videoconvert", RtpVideoChainRole::PostDecodeConverter),
-        RtpVideoChainSpec::with_caps(
-            "capsfilter",
-            RtpVideoChainRole::PostDecodeCapsFilter,
-            "video/x-raw,format=RGBA",
-        ),
-        RtpVideoChainSpec::new("vulkanupload", RtpVideoChainRole::PostDecodeConverter),
-        RtpVideoChainSpec::new("queue", RtpVideoChainRole::PostDecodeQueue),
-        RtpVideoChainSpec::new(RtpVideoApi::Vulkan.sink_factory(), RtpVideoChainRole::Sink),
-    ])
+    let mut specs = Vec::with_capacity(10);
+    if let Some(filter) = h265_receive_caps_strip_filter(codec) {
+        specs.push(filter);
+    }
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_depayloader_factory(codec)?,
+        RtpVideoChainRole::Depayloader,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        rtp_video_parser_factory(codec)?,
+        RtpVideoChainRole::Parser,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "queue",
+        RtpVideoChainRole::PreDecodeQueue,
+    ));
+    specs.push(RtpVideoChainSpec::new(decoder, RtpVideoChainRole::Decoder));
+    // Composite diagnostics while frames are still in the DXVA/D3D path.
+    // dwritetextoverlay cannot consume VulkanImage memory after upload.
+    specs.push(RtpVideoChainSpec::new(
+        "dwritetextoverlay",
+        RtpVideoChainRole::StatsOverlay,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "d3d11download",
+        RtpVideoChainRole::PostDecodeConverter,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "videoconvert",
+        RtpVideoChainRole::PostDecodeConverter,
+    ));
+    specs.push(RtpVideoChainSpec::with_caps(
+        "capsfilter",
+        RtpVideoChainRole::PostDecodeCapsFilter,
+        "video/x-raw,format=RGBA",
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "vulkanupload",
+        RtpVideoChainRole::PostDecodeConverter,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        "queue",
+        RtpVideoChainRole::PostDecodeQueue,
+    ));
+    specs.push(RtpVideoChainSpec::new(
+        RtpVideoApi::Vulkan.sink_factory(),
+        RtpVideoChainRole::Sink,
+    ));
+    Some(specs)
 }
 
 fn preferred_rtp_video_apis(requested_fps: Option<u32>) -> Vec<RtpVideoApi> {
@@ -2092,18 +2252,23 @@ fn rtp_video_chain_specs(
         })
 }
 
-fn align_windows_vulkan_download_factory(specs: &mut Vec<RtpVideoChainSpec>, decoder: &str) {
+pub(crate) fn align_windows_vulkan_download_factory(
+    specs: &mut Vec<RtpVideoChainSpec>,
+    decoder: &str,
+) {
     #[cfg(target_os = "windows")]
     {
         let download = if decoder.starts_with("d3d12") {
             Some("d3d12download")
         } else if decoder.starts_with("d3d11") {
             Some("d3d11download")
-        } else if decoder.starts_with("nv") {
-            // NVDEC Windows outputs system memory in our bundle; skip D3D download.
-            None
         } else {
-            return;
+            // NVDEC Windows outputs system memory in our bundle, and software
+            // decoders (dav1ddec / avdec_*) always output system memory; a D3D
+            // download stage cannot accept either. Drop the download element;
+            // the existing videoconvert + NV12 capsfilter still normalize the
+            // system-memory frames for the D3D sink.
+            None
         };
 
         match download {
@@ -2220,9 +2385,39 @@ fn insert_requested_fps_capssetter(specs: &mut Vec<RtpVideoChainSpec>, requested
 
 fn select_decoder_factory(video_api: RtpVideoApi, codec: &str) -> Option<&'static str> {
     let primary = video_api.decoder_factory(codec)?;
+    // Per-codec override first: OPENNOW_NATIVE_AV1_DECODER / H265. Some Windows
+    // D3D DXVA decoders are broken on specific GPUs (e.g. Intel UHD AV1
+    // hardware decode corrupts every frame), so users can force dav1ddec or
+    // avdec_h265. A missing override factory is ignored, falling back to the
+    // normal selection below.
+    if let Some(forced) = forced_decoder_factory(codec) {
+        if decoder_factory_usable(forced) {
+            return Some(forced);
+        }
+    }
     std::iter::once(primary)
         .chain(video_api.fallback_decoder_factories(codec).iter().copied())
         .find(|factory| decoder_factory_usable(factory))
+}
+
+/// Honor the `OPENNOW_NATIVE_AV1_DECODER` / `OPENNOW_NATIVE_H265_DECODER`
+/// overrides, mapping each preference to a concrete decoder factory.
+fn forced_decoder_factory(codec: &str) -> Option<&'static str> {
+    match codec.to_ascii_uppercase().as_str() {
+        "AV1" => match av1_decoder_preference() {
+            CodecDecoderPreference::Auto => None,
+            CodecDecoderPreference::D3D12 => Some("d3d12av1dec"),
+            CodecDecoderPreference::D3D11 => Some("d3d11av1dec"),
+            CodecDecoderPreference::Software => Some("dav1ddec"),
+        },
+        "H265" | "HEVC" => match h265_decoder_preference() {
+            CodecDecoderPreference::Auto => None,
+            CodecDecoderPreference::D3D12 => Some("d3d12h265dec"),
+            CodecDecoderPreference::D3D11 => Some("d3d11h265dec"),
+            CodecDecoderPreference::Software => Some("avdec_h265"),
+        },
+        _ => None,
+    }
 }
 
 fn decoder_factory_usable(factory: &'static str) -> bool {
@@ -2493,6 +2688,15 @@ fn configure_rtp_video_chain_element(
     d3d_fullscreen_sink: bool,
 ) {
     match spec.role {
+        RtpVideoChainRole::ReceiveCapsFilter => {
+            if let Some(caps) = spec
+                .caps
+                .as_deref()
+                .and_then(|caps| caps.parse::<gst::Caps>().ok())
+            {
+                element.set_property("caps", &caps);
+            }
+        }
         RtpVideoChainRole::Depayloader => {
             set_property_if_supported(element, "request-keyframe", true);
             // Hard-waiting after packet loss can freeze the visible frame while RTP is still flowing.

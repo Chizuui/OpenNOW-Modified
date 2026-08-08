@@ -110,7 +110,16 @@ export async function createMainWindow(
     minHeight: 680,
     ...(startFullscreen ? { fullscreen: true } : {}),
     autoHideMenuBar: true,
-    backgroundColor: "#0f172a",
+    // Windows: a transparent shell is only needed while the GFN-style stacked
+    // native renderer is enabled (the native video window sits behind the
+    // BrowserWindow and must show through). Keeping the window opaque by
+    // default preserves the DWM maximize/snap animation and Win+Arrow
+    // shortcuts, which transparent windows on Windows lose. The `transparent`
+    // flag is fixed at window creation, so enabling Stacked Render mode only
+    // takes effect on the next app launch.
+    ...(process.platform === "win32" && settings.nativeStackedRenderer === true
+      ? { transparent: true, backgroundColor: "#00000000", hasShadow: false }
+      : { backgroundColor: "#0f172a" }),
     // Frameless window with a custom title bar (GFN-style chrome). On macOS
     // keep the native traffic lights via a hidden title bar instead.
     ...(process.platform === "darwin"

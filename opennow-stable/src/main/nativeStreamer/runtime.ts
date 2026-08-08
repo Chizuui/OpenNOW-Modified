@@ -25,6 +25,7 @@ export interface NativeStreamerRuntimeEnvironmentOptions {
   backendPreference: NativeStreamerBackendPreference;
   videoBackendPreference: NativeVideoBackendPreference;
   externalRendererEnabled: boolean;
+  stackedRendererEnabled?: boolean;
   cloudGsyncMode: NativeStreamerFeatureMode;
   d3dFullscreenMode: NativeStreamerFeatureMode;
 }
@@ -221,7 +222,16 @@ export function createNativeStreamerRuntimeEnvironment(
       env.GST_V4L2_ENABLE_PROBE = "1";
     }
   } else if (options.platform === "win32") {
-    env.OPENNOW_NATIVE_EXTERNAL_RENDERER = options.externalRendererEnabled ? "1" : "0";
+    if (options.stackedRendererEnabled) {
+      // GFN-style: the sink keeps its own window, positioned behind the
+      // transparent Electron shell. The sink needs a native window, so the
+      // legacy external flag is forced on while the mode picks "stacked".
+      env.OPENNOW_NATIVE_EXTERNAL_RENDERER = "1";
+      env.OPENNOW_NATIVE_RENDER_MODE = "stacked";
+    } else {
+      env.OPENNOW_NATIVE_EXTERNAL_RENDERER = options.externalRendererEnabled ? "1" : "0";
+      delete env.OPENNOW_NATIVE_RENDER_MODE;
+    }
     env.OPENNOW_NATIVE_D3D_ALLOW_TEARING = "1";
   }
   env.OPENNOW_NATIVE_CLOUD_GSYNC = nativeStreamerFeatureModeToEnvValue(options.cloudGsyncMode);

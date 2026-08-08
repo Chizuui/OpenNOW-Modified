@@ -851,6 +851,13 @@ export class DomInputCaptureController {
         }
       } catch {}
 
+      // Never lock while the window is not actually focused (mid alt-tab, or
+      // focus was lost without a blur event yet) — the request would fail with
+      // WrongDocumentError and the retry loop would fight the user's switch.
+      if (typeof document.hasFocus === "function" && !document.hasFocus()) {
+        return;
+      }
+
       if (autoLockPending || isPointerLockActive() || !mouseInStreamView || !this.dependencies.isInputReady()) {
         return;
       }
@@ -1403,6 +1410,13 @@ export class DomInputCaptureController {
       lastAbsX = null;
       lastAbsY = null;
       this.releasePressedKeys("window blur");
+      // Free the cursor for the app the user alt-tabbed to: Chromium on
+      // Windows keeps pointer lock across focus loss, so without this the
+      // mouse stays hidden and locked to the stream while working elsewhere.
+      // Re-acquisition on return is handled by onWindowFocus -> tryAutoLock.
+      if (document.pointerLockElement) {
+        document.exitPointerLock();
+      }
       // Pause forwarding while window is not focused (host overlay pause is separate).
       // In native mode the renderer sink can be a separate no-activate window,
       // so a focus transition is not enough reason to stop controller polling.
@@ -1429,7 +1443,14 @@ export class DomInputCaptureController {
       focusPointerLockTarget();
       void this.dependencies.refreshClipboardAvailability();
       // Auto-lock: acquire pointer lock when the user switches back to the app.
-      tryAutoLock();
+      // Defer briefly so a still-in-flight focus/fullscreen transition (the
+      // tail end of an alt-tab) cannot reject the request (WrongDocumentError).
+      window.setTimeout(() => {
+        if (typeof document.hasFocus === "function" && !document.hasFocus()) {
+          return;
+        }
+        tryAutoLock();
+      }, 150);
     };
 
     // Re-assert the keyboard lock on entering fullscreen. When leaving fullscreen,
