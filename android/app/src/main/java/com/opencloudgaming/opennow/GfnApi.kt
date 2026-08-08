@@ -1158,11 +1158,16 @@ class GfnAuthRepository(
             codeDeferred.await()
         }
 
-        val jwtToken = code.removePrefix("CHIZUI_")
-        val session = fetchChizuiSession(serverUrl, jwtToken)
+        val rawCode = code.removePrefix("CHIZUI_")
+        val token = if (rawCode.startsWith("ctc_")) {
+            exchangeChizuiCode(serverUrl, rawCode, port)
+        } else {
+            rawCode // legacy JWT (server lama, fallback)
+        }
+        val session = fetchChizuiSession(serverUrl, token)
         val sessionWithChizui = session.copy(
             chizuiServerUrl = serverUrl,
-            chizuiJwtToken = jwtToken
+            chizuiJwtToken = token
         )
         authStore.upsertSession(sessionWithChizui)
         return sessionWithChizui
@@ -1198,6 +1203,37 @@ class GfnAuthRepository(
         data
     }
 
+    // Tukar one-time code (ctc_, sekali pakai, TTL 10 menit) menjadi session
+    // token (czs_) via POST /api/auth/exchange (AUTH_MIGRATION.md §6.1).
+    private suspend fun exchangeChizuiCode(serverUrl: String, code: String, callbackPort: Int): String {
+        val request = Request.Builder()
+            .url("${serverUrl.trimEnd('/')}/api/auth/exchange")
+            .post(OpenNowJson.encodeToString(ChizuiExchangeRequest(code, callbackPort)).toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        val (status, body) = http.awaitText(request)
+        if (status == 404 || status == 405) {
+            // Server lama tanpa endpoint exchange → treat code sebagai JWT legacy
+            return code
+        }
+        if (status != 200) {
+            val err = runCatching { OpenNowJson.decodeFromString<ChizuiErrorResponse>(body).error }.getOrNull()
+                ?: "HTTP error $status"
+            throw IllegalStateException(err)
+        }
+        val resp = OpenNowJson.decodeFromString<ChizuiExchangeResponse>(body)
+        return resp.token ?: throw IllegalStateException(resp.error ?: "Exchange failed")
+    }
+
+    // Best-effort revoke session token aplikasi di server (gagal → abaikan).
+    private suspend fun revokeChizuiSession(serverUrl: String, token: String) {
+        val request = Request.Builder()
+            .url("${serverUrl.trimEnd('/')}/api/auth/revoke")
+            .header("Authorization", "Bearer $token")
+            .post(ByteArray(0).toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        http.awaitText(request) // response status diabaikan (best-effort)
+    }
+
     suspend fun loginWithDeviceCode(provider: LoginProvider, onPrompt: suspend (DeviceLoginPrompt) -> Unit): AuthSession {
         check(provider.supportsDeviceCodeLogin) { "Code sign-in is only available for NVIDIA accounts." }
         val deviceCode = requestDeviceCode(provider)
@@ -1219,7 +1255,20 @@ class GfnAuthRepository(
 
     suspend fun logout(userId: String? = null) {
         val activeId = userId ?: authStore.activeSession()?.user?.userId
-        if (activeId != null) authStore.removeSession(activeId)
+        if (activeId != null) {
+            // Best-effort revoke session ChizuiLogin di server (gagal → abaikan,
+            // tetap hapus lokal). Session token czs_ bisa di-revoke; legacy JWT
+            // stateless tidak → server membalas sukses tanpa tindakan.
+            runCatching {
+                val session = authStore.state.value.sessions.firstOrNull { it.user.userId == activeId }
+                val serverUrl = session?.chizuiServerUrl
+                val token = session?.chizuiJwtToken
+                if (!serverUrl.isNullOrBlank() && !token.isNullOrBlank()) {
+                    revokeChizuiSession(serverUrl, token)
+                }
+            }
+            authStore.removeSession(activeId)
+        }
     }
 
     fun logoutAll() = authStore.clear()
@@ -3845,5 +3894,18 @@ private data class ChizuiTokenResponse(
 @Serializable
 private data class ChizuiErrorResponse(
     val error: String
+)
+
+@Serializable
+private data class ChizuiExchangeRequest(
+    val code: String,
+    val callbackPort: Int,
+)
+
+@Serializable
+private data class ChizuiExchangeResponse(
+    val status: String,
+    val token: String? = null,
+    val error: String? = null,
 )
 
