@@ -1,11 +1,12 @@
-import { Search, LayoutGrid, ArrowUpDown, Filter, ChevronDown, Gamepad2, Menu } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { LayoutGrid, ArrowUpDown, Filter, ChevronDown, Gamepad2, Menu } from "lucide-react";
+import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { JSX } from "react";
 import { AnimatePresence, m } from "motion/react";
 import { isOwnedLibraryStatus } from "@shared/gfn";
 import type { CatalogFilterGroup, CatalogSortOption, GameInfo, GamePanelResult, GameVariant } from "@shared/gfn";
 import { getStoreDisplayName, getStoreIconComponent } from "./GameCard";
-import { GameCardListItem, useCatalogCardActionsRef } from "./GameCardListItem";
+import { GameCardListItem, useCatalogCardActionsRef, type CatalogCardActions } from "./GameCardListItem";
+import { ScrollToTopFab } from "./ScrollToTopFab";
 import { appendImageType, appendUnique } from "../lib/controllerCatalogUi";
 import { useTranslation } from "../i18n";
 import { controllerButton, readControllerGamepadButtons } from "../utils/controllerGamepad";
@@ -148,6 +149,92 @@ function getPrimaryStoreName(game: GameInfo, selectedVariantId?: string): string
   return getStoreDisplayName(store);
 }
 
+function HomeGenreRow({
+  genre,
+  games,
+  isSelected,
+  selectedVariantId,
+  actionsRef,
+  onSeeAll,
+}: {
+  genre: string;
+  games: GameInfo[];
+  isSelected: (gameId: string) => boolean;
+  selectedVariantId: (gameId: string) => string | undefined;
+  actionsRef: RefObject<CatalogCardActions>;
+  onSeeAll: (genre: string) => void;
+}): JSX.Element {
+  const { t } = useTranslation();
+  const trackRef = useRef<HTMLDivElement | null>(null);
+
+  const scrollTrack = (direction: number): void => {
+    const track = trackRef.current;
+    if (!track) return;
+    const amount = Math.max(320, track.clientWidth * 0.6);
+    track.scrollBy({ left: direction * amount, behavior: "smooth" });
+  };
+
+  return (
+    <section className="home-genre-row" aria-label={genre}>
+      <div className="home-genre-row-header">
+        <div className="home-genre-row-heading">
+          <h2 className="home-genre-row-title">{genre}</h2>
+          <span className="home-genre-row-count">{t("library.gameCount", { count: games.length })}</span>
+        </div>
+        <div className="home-genre-row-controls">
+          <button
+            type="button"
+            className="home-genre-row-arrow"
+            aria-label={t("app.actions.back")}
+            onClick={() => scrollTrack(-1)}
+          >
+            ‹
+          </button>
+          <button
+            type="button"
+            className="home-genre-row-arrow"
+            aria-label={t("app.actions.continue")}
+            onClick={() => scrollTrack(1)}
+          >
+            ›
+          </button>
+          <button type="button" className="home-genre-see-all" onClick={() => onSeeAll(genre)}>
+            {t("home.seeAll")}
+          </button>
+        </div>
+      </div>
+      <div
+        className="home-genre-track"
+        ref={trackRef}
+        tabIndex={0}
+        role="region"
+        aria-label={genre}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            scrollTrack(-1);
+          } else if (event.key === "ArrowRight") {
+            event.preventDefault();
+            scrollTrack(1);
+          }
+        }}
+      >
+        {games.slice(0, 18).map((game) => (
+          <div className="home-genre-card" key={game.id}>
+            <GameCardListItem
+              game={game}
+              isSelected={isSelected(game.id)}
+              selectedVariantId={selectedVariantId(game.id)}
+              surface="home"
+              actionsRef={actionsRef}
+            />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ControllerStoreTile({
   game,
   selectedVariantId,
@@ -269,6 +356,7 @@ export const HomePage = memo(function HomePage({
   const [focusedRowIndex, setFocusedRowIndex] = useState(0);
   const [focusedColumnIndex, setFocusedColumnIndex] = useState(0);
   const [controllerSearchOpen, setControllerSearchOpen] = useState(false);
+  const pageRef = useRef<HTMLDivElement | null>(null);
   const rowRefs = useRef<Array<HTMLDivElement | null>>([]);
   const controllerSearchInputRef = useRef<HTMLInputElement | null>(null);
   const gamepadPreviousButtonsRef = useRef(0);
@@ -776,7 +864,57 @@ export const HomePage = memo(function HomePage({
 
   const [desktopHeroIndex, setDesktopHeroIndex] = useState(() => 0);
   const [desktopHeroDirection, setDesktopHeroDirection] = useState(1);
+  const [genreView, setGenreView] = useState<string | null>(null);
+
+  const genreSections = useMemo(() => {
+    const byGenre = new Map<string, GameInfo[]>();
+    for (const game of games) {
+      const genre = getPrimaryGenre(game);
+      const list = byGenre.get(genre);
+      if (list) list.push(game);
+      else byGenre.set(genre, [game]);
+    }
+    return [...byGenre.entries()]
+      .map(([genre, list]) => ({ genre, games: list }))
+      .sort((a, b) => {
+        // Deprioritize the "no real genre" fallback bucket to the end
+        const aReal = a.games.some((game) => (game.genres?.length ?? 0) > 0);
+        const bReal = b.games.some((game) => (game.genres?.length ?? 0) > 0);
+        if (aReal !== bReal) return aReal ? -1 : 1;
+        return b.games.length - a.games.length;
+      });
+  }, [games]);
+  const genreViewSection = useMemo(
+    () => genreSections.find((section) => section.genre === genreView),
+    [genreSections, genreView],
+  );
+  // Guard against a stale genreView when the catalog refreshes and the genre disappears
+  const effectiveGenreView = genreViewSection ? genreView : null;
+  const genreViewGames = genreViewSection?.games ?? [];
+  const genreViewItems = useMemo(
+    () => genreViewGames.map((game) => (
+      <GameCardListItem
+        key={game.id}
+        game={game}
+        isSelected={game.id === selectedGameId}
+        selectedVariantId={selectedVariantByGameId[game.id]}
+        surface="home"
+        actionsRef={catalogActionsRef}
+      />
+    )),
+    [catalogActionsRef, genreViewGames, selectedGameId, selectedVariantByGameId],
+  );
+  const isBrowsingGenres = searchQuery.trim() === "" && activeFilterCount === 0;
+  const genreViewCountLabel = effectiveGenreView
+    ? t("library.gameCount", { count: genreViewGames.length })
+    : null;
   const desktopHeroPool = useMemo(() => {
+    if (storeHeroGames.length > 0) {
+      // Prefer the storefront's featured games, preserving their curated order
+      const candidates = storeHeroGames.filter((game) => getControllerStoreImageCandidates(game, true)[0] || getControllerStoreLogoUrl(game));
+      return candidates.slice(0, 5);
+    }
+    // Fallback: pick a few from the current catalog when no featured data exists
     const candidates = games.filter((game) => getControllerStoreImageCandidates(game, true)[0] || getControllerStoreLogoUrl(game));
     if (candidates.length <= 5) return candidates;
     const shuffled = [...candidates];
@@ -785,7 +923,7 @@ export const HomePage = memo(function HomePage({
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
     return shuffled.slice(0, 5);
-  }, [games]);
+  }, [games, storeHeroGames]);
   const heroCount = desktopHeroPool.length;
   const safeHeroIndex = heroCount > 0 ? desktopHeroIndex % heroCount : 0;
   const desktopHeroGame = desktopHeroPool[safeHeroIndex];
@@ -826,8 +964,9 @@ export const HomePage = memo(function HomePage({
   };
 
   return (
-    <div className="home-page">
-      {desktopHeroGame && (
+    <div className="home-page" ref={pageRef}>
+      <ScrollToTopFab containerRef={pageRef} />
+      {desktopHeroGame && !effectiveGenreView && (
         <section className="desktop-hero" aria-label={desktopHeroGame.title}>
           <div className="desktop-hero-placeholder" />
           <AnimatePresence initial={false} custom={desktopHeroDirection} mode="popLayout">
@@ -916,18 +1055,7 @@ export const HomePage = memo(function HomePage({
       )}
 
       <header className="home-toolbar">
-        <div className="home-search">
-          <Search className="home-search-icon" size={16} />
-          <input
-            type="text"
-            className="home-search-input"
-            placeholder={t("home.searchPlaceholder")}
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-          />
-        </div>
-
-        {visibleFilterGroups.length > 0 && (
+        {!effectiveGenreView && visibleFilterGroups.length > 0 && (
           <details className="home-filter-dropdown">
             <summary className="home-filter-dropdown-trigger">
               <span className="home-filter-dropdown-label">
@@ -962,7 +1090,7 @@ export const HomePage = memo(function HomePage({
           </details>
         )}
 
-        {sortOptions.length > 0 && (
+        {!effectiveGenreView && sortOptions.length > 0 && (
           <div className="home-sort">
             <ArrowUpDown size={14} />
             <SelectDropdown
@@ -976,7 +1104,7 @@ export const HomePage = memo(function HomePage({
         )}
 
         <span className="home-count">
-          {countLabel}
+          {genreViewCountLabel ?? countLabel}
         </span>
       </header>
 
@@ -995,6 +1123,57 @@ export const HomePage = memo(function HomePage({
                 ? t("home.empty.tryAdjustingSearch")
                 : t("home.empty.checkBackLater")}
             </p>
+          </div>
+        ) : isBrowsingGenres && effectiveGenreView ? (
+          <div className="home-genre-view">
+            <div className="home-genre-view-header">
+              <button
+                type="button"
+                className="home-genre-view-back"
+                onClick={() => setGenreView(null)}
+              >
+                ← {t("home.backToAll")}
+              </button>
+              <div className="home-genre-view-heading">
+                <h2>{effectiveGenreView}</h2>
+                <p>{t("library.gameCount", { count: genreViewGames.length })}</p>
+              </div>
+            </div>
+            <div className="game-grid">
+              {genreViewItems}
+            </div>
+          </div>
+        ) : isBrowsingGenres ? (
+          <div className="home-genre-browser">
+            {genreSections.slice(0, 6).map((section) => (
+              <HomeGenreRow
+                key={section.genre}
+                genre={section.genre}
+                games={section.games}
+                isSelected={(gameId) => gameId === selectedGameId}
+                selectedVariantId={(gameId) => selectedVariantByGameId[gameId]}
+                actionsRef={catalogActionsRef}
+                onSeeAll={setGenreView}
+              />
+            ))}
+            {genreSections.length > 0 && (
+              <section className="home-category-section" aria-label={t("home.browseCategories")}>
+                <h2 className="home-category-title">{t("home.browseCategories")}</h2>
+                <div className="home-category-chips">
+                  {genreSections.map((section) => (
+                    <button
+                      key={section.genre}
+                      type="button"
+                      className="home-category-chip"
+                      onClick={() => setGenreView(section.genre)}
+                    >
+                      <span className="home-category-chip-label">{section.genre}</span>
+                      <span className="home-category-chip-count">{section.games.length}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
           </div>
         ) : (
           <div className="game-grid">

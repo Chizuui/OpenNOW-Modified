@@ -184,6 +184,16 @@ export interface OpenNowApi {
   setFullscreen(v: boolean): Promise<void>;
   toggleFullscreen(): Promise<void>;
   togglePointerLock(): Promise<void>;
+  /** Minimize the main window (custom frameless window controls) */
+  minimizeWindow(): void;
+  /** Toggle maximize/restore; resolves with the resulting maximized state */
+  toggleMaximizeWindow(): Promise<boolean>;
+  /** Get the current maximized state of the main window */
+  getMaximizeWindowState(): Promise<boolean>;
+  /** Close the main window */
+  closeWindow(): void;
+  /** Subscribe to maximize/restore changes from the main process */
+  onMaximizeWindowStateChanged(listener: (maximized: boolean) => void): () => void;
   /** Notify main process that pointer lock state changed (active = true/false). */
   notifyPointerLockChange(active: boolean, suppressEscapeFullscreenGrace?: boolean): void;
   /** Tell main whether an active native session owns keyboard input through RawInput. */

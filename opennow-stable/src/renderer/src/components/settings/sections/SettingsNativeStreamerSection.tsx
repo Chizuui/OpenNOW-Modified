@@ -281,6 +281,27 @@ export function SettingsNativeStreamerSection({
 
               <div className="settings-row settings-row--column">
                 <div className="settings-row-top settings-row-top--compact">
+                  <label className="settings-label settings-label--wrap" htmlFor="settings-native-external-renderer">
+                    <span className="settings-label-title">{t("settings.nativeStreamer.externalRenderer")}</span>
+                  </label>
+                  <label className="settings-toggle">
+                    <input
+                      id="settings-native-external-renderer"
+                      type="checkbox"
+                      checked={settings.nativeExternalRenderer}
+                      disabled={!supportsNativeExternalRenderer}
+                      onChange={(e) => handleChange("nativeExternalRenderer", e.target.checked)}
+                    />
+                    <span className="settings-toggle-track" />
+                  </label>
+                </div>
+                <span className="settings-subtle-hint">
+                  {t("settings.nativeStreamer.externalRendererHint")}
+                </span>
+              </div>
+
+              <div className="settings-row settings-row--column">
+                <div className="settings-row-top settings-row-top--compact">
                   <label className="settings-label settings-label--wrap">
                     <span className="settings-label-title">{t("settings.nativeStreamer.streamerStatus")}</span>
                   </label>

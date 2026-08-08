@@ -62,6 +62,7 @@
 :root {
   color-scheme: dark;
   --game-poster-scale: 1.05;
+  --game-poster-width: clamp(200px, calc(260px * var(--game-poster-scale, 1)), 340px);
 
   /* Backgrounds — layered obsidian-charcoal */
   --bg-a: #101014;
@@ -145,6 +146,7 @@
 
   /* Layout */
   --navbar-h: 48px;
+  --titlebar-h: 40px;
 }
 
 [data-theme="light"] {
@@ -248,6 +250,7 @@ body,
 
 .app-container--controller {
   --navbar-h: 118px;
+  --titlebar-h: 0px;
   background:
     radial-gradient(1200px 520px at 6% 86%, rgba(var(--accent-rgb), 0.12), transparent 62%),
     linear-gradient(180deg, #020303 0%, #050606 45%, #030303 100%);
@@ -255,7 +258,7 @@ body,
 
 .auth-refresh-notice {
   position: fixed;
-  top: calc(var(--navbar-h) + 10px);
+  top: calc(var(--navbar-h) + var(--titlebar-h) + 10px);
   left: 50%;
   transform: translateX(-50%);
   z-index: 1200;
@@ -288,7 +291,7 @@ body,
    ====================================================== */
 .navbar {
   position: fixed;
-  top: 0;
+  top: var(--titlebar-h);
   left: 0;
   right: 0;
   height: var(--navbar-h);
@@ -298,7 +301,123 @@ body,
   padding: 0 16px;
   background: var(--bg-a);
   border-bottom: 1px solid var(--panel-border);
-  z-index: 1000;
+  /* Above the launch/loading layer (1090) so search + profile stay usable
+     while the rig boots; drops below the stream view once video is live
+     (see .navbar--streaming) — mirrors the title bar treatment. */
+  z-index: 1092;
+}
+
+/* ═══ CUSTOM TITLE BAR (frameless) ═══════════════════════════════ */
+.titlebar {
+  height: 40px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  -webkit-app-region: drag;
+  user-select: none;
+  -webkit-user-select: none;
+  padding-left: 14px;
+  border-bottom: 1px solid var(--panel-border);
+  /* Above the launch/loading layer (1090) so the brand stays visible while
+     the rig is being set up; drops below the stream view once video is live
+     (see .titlebar--streaming). */
+  position: relative;
+  z-index: 1095;
+}
+
+.titlebar--darwin {
+  /* Leave room for the native macOS traffic lights */
+  padding-left: 78px;
+}
+
+.titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  transition: opacity 260ms var(--ease);
+}
+
+.titlebar-logo {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
+.titlebar-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-btn {
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--ink-soft);
+  cursor: default;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.titlebar-btn:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink);
+}
+
+.titlebar-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.titlebar-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.titlebar-close:active {
+  background: #c50f1f;
+  color: #fff;
+}
+
+/* Controller mode is a fullscreen TV UI; hide the window chrome */
+.app-container--controller .titlebar {
+  display: none;
+}
+
+/* Native/DOM fullscreen: drop the title bar entirely and collapse the
+   offset so navbar + content fill the screen edge-to-edge. */
+.app-container--fullscreen {
+  --titlebar-h: 0px;
+}
+
+.titlebar--fullscreen {
+  display: none;
+}
+
+/* While streaming, fade the brand out for an immersive, video-first chrome.
+   Window controls stay interactive — quitting/minimizing a session still
+   needs to be one click away. Also drop below the stream view layer so the
+   live video covers the chrome entirely. */
+.titlebar--streaming {
+  z-index: 1065;
+}
+
+.titlebar--streaming .titlebar-brand {
+  opacity: 0;
+  pointer-events: none;
 }
 
 [data-translucent="true"] .navbar {
@@ -311,6 +430,189 @@ body,
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
+}
+
+.navbar-menu-container {
+  position: relative;
+  display: flex;
+}
+
+.navbar-hamburger {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: background var(--t-normal), color var(--t-normal), border-color var(--t-normal);
+}
+
+.navbar-hamburger:hover {
+  background: var(--bg-c);
+  color: var(--ink);
+  border-color: var(--panel-border);
+}
+
+.navbar-hamburger:active {
+  transform: scale(0.94);
+}
+
+.navbar-section-title {
+  margin-left: 6px;
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.navbar-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 224px;
+  padding: 6px;
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-md);
+  background: var(--panel);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  z-index: 1100;
+  animation: navbar-menu-in 140ms ease-out;
+}
+
+@keyframes navbar-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.navbar-menu-header {
+  padding: 8px 10px 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.navbar-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-normal), color var(--t-normal);
+}
+
+.navbar-menu-item:hover {
+  background: var(--bg-c);
+  color: var(--ink);
+}
+
+.navbar-menu-item.active {
+  color: var(--accent);
+}
+
+.navbar-menu-check {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+.navbar-menu-divider {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--panel-border);
+}
+
+.navbar-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 12px;
+}
+
+.navbar-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 420px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  background: var(--bg-c);
+  transition: border-color var(--t-normal), background var(--t-normal);
+}
+
+.navbar-search:focus-within {
+  border-color: var(--accent);
+  background: var(--card);
+}
+
+.navbar-search-icon {
+  flex-shrink: 0;
+  color: var(--ink-faint);
+}
+
+.navbar-search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+
+.navbar-search-input::placeholder {
+  color: var(--ink-faint);
+}
+
+.navbar-search-clear {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: background var(--t-normal), color var(--t-normal);
+}
+
+.navbar-search-clear:hover {
+  background: color-mix(in srgb, var(--ink) 22%, transparent);
+  color: var(--ink);
+}
+
+.navbar--controller .navbar-hamburger,
+.navbar--controller .navbar-center,
+.navbar--controller .navbar-section-title {
+  display: none;
+}
+
+/* Live video covers the navbar like the title bar */
+.navbar--streaming {
+  z-index: 1062;
 }
 
 .navbar-brand {
@@ -1947,7 +2249,9 @@ body,
   max-width: 1600px;
   margin: 0 auto;
   gap: 16px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .controller-store-page {
@@ -2277,44 +2581,6 @@ body,
   gap: 12px;
   flex-shrink: 0;
   flex-wrap: wrap;
-}
-
-.home-search {
-  flex: 1;
-  position: relative;
-  min-width: 260px;
-  max-width: 340px;
-}
-
-.home-search-icon {
-  position: absolute;
-  left: 11px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--ink-muted);
-  pointer-events: none;
-}
-
-.home-search-input {
-  width: 100%;
-  padding: 7px 12px 7px 34px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--panel-border);
-  background: var(--card);
-  color: var(--ink);
-  font-size: 0.82rem;
-  font-family: inherit;
-  outline: none;
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
-}
-
-.home-search-input::placeholder {
-  color: var(--ink-muted);
-}
-
-.home-search-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-surface);
 }
 
 .home-sort,
@@ -2687,9 +2953,7 @@ body,
 
 .home-grid-area {
   flex: 1;
-  overflow-y: auto;
   min-height: 0;
-  padding-right: 2px;
 }
 
 .home-empty-state {
@@ -2734,7 +2998,9 @@ body,
   max-width: 1600px;
   margin: 0 auto;
   gap: 16px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .library-toolbar {
@@ -2761,44 +3027,6 @@ body,
   font-weight: 700;
   margin: 0;
   white-space: nowrap;
-}
-
-.library-search {
-  flex: 1;
-  position: relative;
-  min-width: 260px;
-  max-width: 340px;
-}
-
-.library-search-icon {
-  position: absolute;
-  left: 11px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--ink-muted);
-  pointer-events: none;
-}
-
-.library-search-input {
-  width: 100%;
-  padding: 7px 12px 7px 34px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--panel-border);
-  background: var(--card);
-  color: var(--ink);
-  font-size: 0.82rem;
-  font-family: inherit;
-  outline: none;
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
-}
-
-.library-search-input::placeholder {
-  color: var(--ink-muted);
-}
-
-.library-search-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-surface);
 }
 
 .library-count {
@@ -3004,9 +3232,7 @@ body,
 
 .library-grid-area {
   flex: 1;
-  overflow-y: auto;
   min-height: 0;
-  padding-right: 2px;
 }
 
 .library-game-wrapper {
@@ -3945,6 +4171,268 @@ button.controller-hint {
   .controller-bottom-hints {
     gap: 14px;
   }
+}
+
+/* ======================================================
+   GENRE BROWSER  (Home: rows per genre + category chips)
+   ====================================================== */
+.home-genre-browser {
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+  padding-bottom: 20px;
+}
+
+.home-genre-row {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.home-genre-row-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.home-genre-row-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.home-genre-row-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-genre-row-count {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.home-genre-row-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.home-genre-row-arrow {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--panel-border);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--card) 82%, transparent);
+  color: var(--ink-soft);
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color var(--t-normal), color var(--t-normal), background var(--t-normal);
+}
+
+.home-genre-row-arrow:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: var(--card);
+}
+
+.home-genre-row-arrow:active {
+  transform: scale(0.94);
+}
+
+.home-genre-see-all {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background var(--t-normal), color var(--t-normal);
+}
+
+.home-genre-see-all:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.home-genre-track {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  padding: 2px 2px 10px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.home-genre-track::-webkit-scrollbar {
+  display: none;
+}
+
+.home-genre-card {
+  flex: 0 0 auto;
+  width: var(--game-poster-width);
+  scroll-snap-align: start;
+  min-width: 0;
+}
+
+.home-category-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 6px;
+}
+
+.home-category-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+.home-category-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.home-category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color var(--t-normal), color var(--t-normal), background var(--t-normal), transform 120ms ease;
+}
+
+.home-category-chip:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  transform: translateY(-1px);
+}
+
+.home-category-chip:active {
+  transform: scale(0.97);
+}
+
+.home-category-chip-count {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink-faint);
+}
+
+/* Genre full-list view (See All / category chip) */
+.home-genre-view {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding-bottom: 20px;
+}
+
+.home-genre-view-header {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.home-genre-view-back {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color var(--t-normal), color var(--t-normal);
+}
+
+.home-genre-view-back:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.home-genre-view-heading h2 {
+  font-size: 1.6rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.home-genre-view-heading p {
+  margin-top: 2px;
+  font-size: 0.85rem;
+  color: var(--ink-faint);
+}
+
+/* ======================================================
+   SCROLL TO TOP FAB
+   ====================================================== */
+.scroll-to-top-fab {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 1040;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--panel-border);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--ink-soft);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity var(--t-normal), transform var(--t-normal), border-color var(--t-normal), color var(--t-normal), background var(--t-normal);
+}
+
+.scroll-to-top-fab.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.scroll-to-top-fab:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: var(--card);
+}
+
+.scroll-to-top-fab:active {
+  transform: translateY(0) scale(0.94);
 }
 
 /* ======================================================
@@ -8821,6 +9309,15 @@ button.game-card-store-chip.owned.active:hover {
   align-items: center;
   justify-content: center;
   padding: 24px;
+  /* Leave room for the title bar + navbar that stay visible above the
+     loading layer, so the NOW LOADING header lines up cleanly below them. */
+  padding-top: calc(var(--titlebar-h) + var(--navbar-h) + 24px);
+}
+
+.app-container--controller .sload {
+  /* Controller mode hides the title bar and uses its own tall navbar;
+     keep the TV loading UI centered without extra offset. */
+  padding-top: 24px;
 }
 
 .sload-backdrop {
@@ -11259,6 +11756,9 @@ button.game-card-store-chip.owned.active:hover {
 .stream-loading-transition {
   position: fixed;
   inset: 0;
+  /* Above the stream view layer (1080) so its overlays stay hidden while
+     queueing/setting up — the loading screen covers everything until the
+     video reveal. Title bar/navbar sit above this while loading. */
   z-index: 1090;
   transform-origin: 50% 50%;
 }

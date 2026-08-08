@@ -1,5 +1,5 @@
 import type { ActiveSessionInfo, AuthUser, SavedAccount, SubscriptionInfo } from "@shared/gfn";
-import { House, Library, Settings, User, Timer, HardDrive, X, PlayCircle, Square, ChevronDown, Check, Plus, Store as StoreIcon, MessageSquareText } from "lucide-react";
+import { Menu, Search, Library, Settings, User, Timer, HardDrive, X, PlayCircle, Square, ChevronDown, Check, Plus, Store as StoreIcon, MessageSquareText } from "lucide-react";
 import { useEffect, useRef, useState, type JSX } from "react";
 import { useTranslation } from "../i18n";
 import { OpenNowLogoMark } from "./OpenNowLogoMark";
@@ -9,6 +9,8 @@ import { ModalSurface } from "./ui/ModalSurface";
 interface NavbarProps {
   currentPage: "home" | "library" | "settings";
   onNavigate: (page: "home" | "library" | "settings") => void;
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
   user: AuthUser | null;
   subscription: SubscriptionInfo | null;
   activeSession: ActiveSessionInfo | null;
@@ -25,6 +27,7 @@ interface NavbarProps {
   onOpenFeedback?: () => void;
   onBlockingOverlayChange?: (blocking: boolean) => void;
   controllerMode?: boolean;
+  streaming?: boolean;
 }
 
 type NavbarModalType = "time" | "storage" | null;
@@ -39,6 +42,8 @@ function getTierDisplay(tier: string): { labelKey: string; className: string } {
 export function Navbar({
   currentPage,
   onNavigate,
+  searchQuery,
+  onSearchChange,
   user,
   subscription,
   activeSession,
@@ -55,10 +60,13 @@ export function Navbar({
   onOpenFeedback,
   onBlockingOverlayChange,
   controllerMode = false,
+  streaming = false,
 }: NavbarProps): JSX.Element {
   const { t } = useTranslation();
   const [modalType, setModalType] = useState<NavbarModalType>(null);
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuContainerRef = useRef<HTMLDivElement | null>(null);
   const accountContainerRef = useRef<HTMLDivElement | null>(null);
   const accountButtonRef = useRef<HTMLButtonElement | null>(null);
   const modalCloseButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -76,10 +84,16 @@ export function Navbar({
         { id: "settings", page: "settings" as const, label: t("navigation.settings"), icon: Settings },
       ]
     : [
-        { id: "home", page: "home" as const, label: t("navigation.home"), icon: House },
+        { id: "store", page: "home" as const, label: t("navigation.home"), icon: StoreIcon },
         { id: "library", page: "library" as const, label: t("navigation.library"), icon: Library },
         { id: "settings", page: "settings" as const, label: t("navigation.settings"), icon: Settings },
       ];
+  const activeNavItem = navItems.find((item) =>
+    controllerMode
+      ? item.id === (currentPage === "home" ? "store" : currentPage)
+      : item.page === currentPage,
+  );
+  const searchVisible = !controllerMode && currentPage !== "settings";
 
   const tierInfo = user ? getTierDisplay(user.membershipTier) : null;
   const formatHours = (value: number): string => {
@@ -172,6 +186,24 @@ export function Navbar({
     window.addEventListener("mousedown", onDocumentPointerDown);
     return () => window.removeEventListener("mousedown", onDocumentPointerDown);
   }, [accountDropdownOpen]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDocumentPointerDown = (event: MouseEvent) => {
+      if (!(event.target instanceof Node) || !menuContainerRef.current?.contains(event.target)) {
+        setMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", onDocumentPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onDocumentPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
 
   const closeModal = (): void => setModalType(null);
   const openModal = (
@@ -302,45 +334,118 @@ export function Navbar({
     : null;
 
   return (
-    <nav className={`navbar${controllerMode ? " navbar--controller" : ""}`}>
+    <nav className={`navbar${controllerMode ? " navbar--controller" : ""}${streaming ? " navbar--streaming" : ""}`}>
       <div className="navbar-left">
+        {!controllerMode && (
+          <div className="navbar-menu-container" ref={menuContainerRef}>
+            <button
+              type="button"
+              className="navbar-hamburger"
+              onClick={() => setMenuOpen((previous) => !previous)}
+              aria-label={t("navbar.menu")}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+            >
+              <Menu size={18} />
+            </button>
+            {menuOpen && (
+              <div className="navbar-menu" role="menu" aria-label={t("navbar.menu")}>
+                <div className="navbar-menu-header">{t("navbar.menu")}</div>
+                {navItems.map((item) => {
+                  const Icon = item.icon;
+                  const isActive = currentPage === item.page;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      role="menuitem"
+                      className={`navbar-menu-item${isActive ? " active" : ""}`}
+                      onClick={() => {
+                        onNavigate(item.page);
+                        setMenuOpen(false);
+                      }}
+                    >
+                      <Icon size={16} />
+                      <span>{item.label}</span>
+                      {isActive && <Check size={14} className="navbar-menu-check" />}
+                    </button>
+                  );
+                })}
+                {onOpenFeedback && (
+                  <>
+                    <div className="navbar-menu-divider" aria-hidden="true" />
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="navbar-menu-item"
+                      onClick={() => {
+                        onOpenFeedback();
+                        setMenuOpen(false);
+                      }}
+                    >
+                      <MessageSquareText size={16} />
+                      <span>{t("navbar.sendFeedback")}</span>
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         <div className="navbar-brand">
           <OpenNowLogoMark className="opennow-logo-mark" />
         </div>
         <span className="navbar-logo-text">OpenNOW</span>
-        {onOpenFeedback && !controllerMode && (
-          <button
-            type="button"
-            className="navbar-feedback-btn"
-            onClick={onOpenFeedback}
-            title={t("navbar.sendFeedback")}
-            aria-label={t("navbar.sendFeedback")}
-          >
-            <MessageSquareText size={14} />
-            <span>{t("navbar.sendFeedback")}</span>
-          </button>
+        {!controllerMode && activeNavItem && (
+          <span className="navbar-section-title">{activeNavItem.label}</span>
         )}
       </div>
 
-      <div className="navbar-nav">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = controllerMode
-            ? item.id === (currentPage === "home" ? "store" : currentPage)
-            : currentPage === item.page;
+      {searchVisible && (
+        <div className="navbar-center">
+          <div className="navbar-search">
+            <Search className="navbar-search-icon" size={15} />
+            <input
+              type="text"
+              className="navbar-search-input"
+              placeholder={t("navbar.searchPlaceholder")}
+              value={searchQuery}
+              onChange={(event) => onSearchChange(event.target.value)}
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                className="navbar-search-clear"
+                onClick={() => onSearchChange("")}
+                aria-label={t("navbar.clearSearch")}
+                title={t("navbar.clearSearch")}
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
-          return (
-            <button
-              key={item.id}
-              onClick={() => onNavigate(item.page)}
-              className={`navbar-link ${isActive ? "active" : ""}`}
-            >
-              <Icon size={16} />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-      </div>
+      {controllerMode && (
+        <div className="navbar-nav">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const isActive = item.id === (currentPage === "home" ? "store" : currentPage);
+
+            return (
+              <button
+                key={item.id}
+                onClick={() => onNavigate(item.page)}
+                className={`navbar-link ${isActive ? "active" : ""}`}
+              >
+                <Icon size={16} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       <div className="navbar-right">
         {activeSession && !controllerMode && (

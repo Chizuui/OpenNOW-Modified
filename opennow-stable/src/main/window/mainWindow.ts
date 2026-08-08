@@ -111,6 +111,14 @@ export async function createMainWindow(
     ...(startFullscreen ? { fullscreen: true } : {}),
     autoHideMenuBar: true,
     backgroundColor: "#0f172a",
+    // Frameless window with a custom title bar (GFN-style chrome). On macOS
+    // keep the native traffic lights via a hidden title bar instead.
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hidden" as const,
+          trafficLightPosition: { x: 12, y: 10 },
+        }
+      : { frame: false }),
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -122,6 +130,14 @@ export async function createMainWindow(
     },
   });
   deps.setMainWindow(window);
+
+  const emitMaximizeState = (maximized: boolean): void => {
+    if (!window.isDestroyed()) {
+      window.webContents.send(IPC_CHANNELS.WINDOW_MAXIMIZE_STATE_CHANGED, maximized);
+    }
+  };
+  window.on("maximize", () => emitMaximizeState(true));
+  window.on("unmaximize", () => emitMaximizeState(false));
 
   window.webContents.on("render-process-gone", (_event, details) => {
     console.error("[Main] Renderer process gone:", details);

@@ -206,6 +206,22 @@ const api: OpenNowApi = {
   toggleFullscreen: () => ipcRenderer.invoke(IPC_CHANNELS.TOGGLE_FULLSCREEN),
   setFullscreen: (v: boolean) => ipcRenderer.invoke(IPC_CHANNELS.SET_FULLSCREEN, v),
   togglePointerLock: () => ipcRenderer.invoke(IPC_CHANNELS.TOGGLE_POINTER_LOCK),
+  minimizeWindow: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_MINIMIZE),
+  toggleMaximizeWindow: (): Promise<boolean> =>
+    ipcRenderer.invoke(IPC_CHANNELS.WINDOW_TOGGLE_MAXIMIZE),
+  getMaximizeWindowState: (): Promise<boolean> =>
+    ipcRenderer.invoke(IPC_CHANNELS.WINDOW_GET_MAXIMIZE_STATE),
+  closeWindow: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_CLOSE),
+  onMaximizeWindowStateChanged: (listener: (maximized: boolean) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, maximized: boolean) => {
+      listener(maximized);
+    };
+
+    ipcRenderer.on(IPC_CHANNELS.WINDOW_MAXIMIZE_STATE_CHANGED, wrapped);
+    return () => {
+      ipcRenderer.off(IPC_CHANNELS.WINDOW_MAXIMIZE_STATE_CHANGED, wrapped);
+    };
+  },
   getSettings: () => ipcRenderer.invoke(IPC_CHANNELS.SETTINGS_GET),
   setSetting: <K extends keyof Settings>(key: K, value: Settings[K]) =>
     ipcRenderer.invoke(IPC_CHANNELS.SETTINGS_SET, key, value),
