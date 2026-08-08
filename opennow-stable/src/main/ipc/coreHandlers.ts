@@ -136,6 +136,36 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
     }
   });
 
+  // Custom frameless window controls
+  ipcMain.on(IPC_CHANNELS.WINDOW_MINIMIZE, () => {
+    const mainWindow = deps.getMainWindow();
+    mainWindow?.minimize();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WINDOW_TOGGLE_MAXIMIZE, async (): Promise<boolean> => {
+    const mainWindow = deps.getMainWindow();
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return false;
+    }
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+    return mainWindow.isMaximized();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WINDOW_GET_MAXIMIZE_STATE, async (): Promise<boolean> => {
+    return deps.getMainWindow()?.isMaximized() ?? false;
+  });
+
+  ipcMain.on(IPC_CHANNELS.WINDOW_CLOSE, () => {
+    const mainWindow = deps.getMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
+
   ipcMain.handle(
     IPC_CHANNELS.SET_FULLSCREEN,
     async (_event, value: boolean) => {

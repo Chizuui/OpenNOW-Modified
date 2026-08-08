@@ -22,6 +22,7 @@ import { pageTransition } from "./MotionProvider";
 import { SelectDropdown } from "./ui/SelectDropdown";
 import { LibraryControllerView } from "./library/LibraryControllerView";
 import { MotionSpinner } from "./MotionSpinner";
+import { ScrollToTopFab } from "./ScrollToTopFab";
 
 const CONTROLLER_HERO_ROTATION_MS = 8000;
 const CONTROLLER_MOVE_REPEAT_MS = 140;
@@ -85,6 +86,7 @@ export const LibraryPage = memo(function LibraryPage({
     onSelectGameVariant,
     onOpenDetails,
   });
+  const pageRef = useRef<HTMLDivElement | null>(null);
   const [controllerHeroIndex, setControllerHeroIndex] = useState(0);
   const [detailsGame, setDetailsGame] = useState<GameInfo | null>(null);
   const [controllerStoreFilterId, setControllerStoreFilterId] = useState("library");
@@ -580,22 +582,12 @@ export const LibraryPage = memo(function LibraryPage({
   }
 
   return (
-    <div className="library-page">
+    <div className="library-page" ref={pageRef}>
+      <ScrollToTopFab containerRef={pageRef} />
       <header className="library-toolbar">
         <div className="library-title">
           <Library className="library-title-icon" size={22} />
           <h1>{t("library.title")}</h1>
-        </div>
-
-        <div className="library-search">
-          <Search className="library-search-icon" size={16} />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            placeholder={t("library.searchPlaceholder")}
-            className="library-search-input"
-          />
         </div>
 
         {libraryFilterGroups.length > 0 && (

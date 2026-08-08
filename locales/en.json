@@ -8,6 +8,7 @@
     "description": "Cloud gaming, open source.",
     "actions": {
       "add": "Add",
+      "scrollToTop": "Scroll to top",
       "back": "Back",
       "browse": "Browse",
       "cancel": "Cancel",
@@ -154,9 +155,11 @@
     "home": "Store",
     "library": "Library",
     "settings": "Settings"
-  },
-  "home": {
-    "searchPlaceholder": "Search games...",
+  },    "home": {
+      "searchPlaceholder": "Search games...",
+      "seeAll": "See All",
+      "browseCategories": "Browse Categories",
+      "backToAll": "Back to All Games",
     "filters": "Filters",
     "sortAriaLabel": "Sort games",
     "count": {
@@ -902,7 +905,9 @@
       "transportModeWebrtc": "WebRTC (Default)",
       "transportModeNvst": "NVST (Experimental)",
       "transportModeHint": "WebRTC is the supported path. NVST (experimental) uses classic RTSPS + UDP video (Moonlight-hypothesis scaffold) while keyboard/mouse/controller stay on WebRTC SCTP datachannels. First live sessions may need SRTP/pcap validation.",
-      "transportModeWindowsOnlyHint": "NVST transport is Windows-only for now. This platform always uses WebRTC."
+      "transportModeWindowsOnlyHint": "NVST transport is Windows-only for now. This platform always uses WebRTC.",
+      "externalRenderer": "External Renderer Window",
+      "externalRendererHint": "Renders the stream in a separate fullscreen window (Electron overlays are hidden). Turning this off embeds video into the OpenNOW window via HWND, which currently covers the UI. Windows-only experimental setting; applies to new native sessions."
     },
     "thanks": {
       "title": "Thanks for helping OpenNOW grow",
@@ -925,6 +930,9 @@
   },
   "navbar": {
     "sendFeedback": "Feedback",
+    "menu": "Menu",
+    "searchPlaceholder": "Search games, stores, or genres",
+    "clearSearch": "Clear search",
     "subscriptionDetails": "Subscription details",
     "playtimeDetails": "Playtime Details",
     "storageDetails": "Storage Details",

@@ -91,6 +91,7 @@ import { useTranslation } from "./i18n";
 // UI Components
 import { LoginScreen } from "./components/LoginScreen";
 import { Navbar } from "./components/Navbar";
+import { TitleBar } from "./components/TitleBar";
 import { HomePage } from "./components/HomePage";
 import { LibraryPage } from "./components/LibraryPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
@@ -146,6 +147,14 @@ export function App(): JSX.Element {
   const [currentPage, setCurrentPage] = useState<AppPage>("home");
   const [pageBeforeSettings, setPageBeforeSettings] = useState<AppPage>("home");
   const [sessionFullscreen, setSessionFullscreenState] = useState(false);
+
+  useEffect(() => {
+    const onFullscreenChange = (): void => {
+      setSessionFullscreenState(document.fullscreenElement !== null);
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
   // Settings State
   const [settings, setSettings] = useState<Settings>(() => createDefaultSettings(RUNTIME_PLATFORM));
@@ -2704,7 +2713,8 @@ export function App(): JSX.Element {
   const catalogSurfaceActive = !shellBlocked;
 
   return (
-    <div className={`app-container${effectiveControllerMode ? " app-container--controller" : ""}${showCatalogAtmosphere ? " app-container--atmosphere" : ""}`} style={getAppStyle(settings.posterSizeScale)}>
+    <div className={`app-container${effectiveControllerMode ? " app-container--controller" : ""}${showCatalogAtmosphere ? " app-container--atmosphere" : ""}${sessionFullscreen || document.fullscreenElement ? " app-container--fullscreen" : ""}`} style={getAppStyle(settings.posterSizeScale)}>
+      <TitleBar streaming={isStreaming && streamVideoReady} fullscreen={sessionFullscreen || document.fullscreenElement !== null} />
       <div
         className="app-shell"
         inert={shellBlocked ? true : undefined}
@@ -2742,6 +2752,9 @@ export function App(): JSX.Element {
       <Navbar
         currentPage={currentPage}
         onNavigate={handleNavigate}
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        streaming={isStreaming && streamVideoReady}
         user={authSession.user}
         subscription={subscriptionInfo}
         activeSession={navbarActiveSession}
