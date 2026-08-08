@@ -116,6 +116,25 @@ export function StreamStatsHud({
       ? String(stats.decodeFps)
       : (stats.renderFps > 0 ? String(stats.renderFps) : "--"));
   const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
+  // ── Frame pipeline (server-sent vs locally decoded) ──
+  // receiveFps = what the server sent, decodeFps = what the local decoder
+  // produced. A decode rate well below the RX rate (or a decode time over the
+  // 16.7ms 60fps budget) means the local decoder is the bottleneck — the
+  // server and network are fine.
+  const receiveFpsText = stats.receiveFps > 0 ? `${stats.receiveFps} fps` : "--";
+  // "0 fps" only when the server is sending but nothing is being decoded — that
+  // is the decoder-stall signal this section exists to surface. Plain "--" is
+  // reserved for "no data yet" (both rates zero at stream start).
+  const decodeFpsText = stats.decodeFps > 0
+    ? `${stats.decodeFps} fps`
+    : (stats.receiveFps > 0 ? "0 fps" : "--");
+  const decodeTimeText = stats.decodeTimeMs > 0 ? `${stats.decodeTimeMs.toFixed(1)} ms` : "--";
+  // Decode lagging the RX rate by >3fps, or decodeFps 0 while frames still
+  // arrive (stall): the local decoder is the bottleneck. The `decodeFps > 0`
+  // guard is intentionally absent so the stall case (0 < rx - 3) warns too.
+  const decodeFallingBehind =
+    stats.receiveFps > 0 && stats.decodeFps < stats.receiveFps - 3;
+  const decodeOverBudget = stats.decodeTimeMs > 16.7;
   const rttColor = getRttColor(stats.rttMs);
   const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";
 
@@ -338,6 +357,22 @@ export function StreamStatsHud({
         </>
       ) : (
         <div className="sv-stats-full">
+          <section className="sv-stats-section">
+            <h4 className="sv-stats-section-title">{t("stream.stats.framePipeline")}</h4>
+            <div className="sv-stats-row" title={t("stream.stats.serverRxHint")}>
+              <span>{t("stream.stats.serverRx")}</span>
+              <span>{receiveFpsText}</span>
+            </div>
+            <div className="sv-stats-row" title={t("stream.stats.localDecodeHint")}>
+              <span>{t("stream.stats.localDecode")}</span>
+              <span style={{ color: decodeFallingBehind ? "var(--warning)" : undefined }}>{decodeFpsText}</span>
+            </div>
+            <div className="sv-stats-row" title={t("stream.stats.frameDecodeTimeHint")}>
+              <span>{t("stream.stats.frameDecodeTime")}</span>
+              <span style={{ color: decodeOverBudget ? "var(--warning)" : undefined }}>{decodeTimeText}</span>
+            </div>
+          </section>
+
           <section className="sv-stats-section">
             <h4 className="sv-stats-section-title">{t("stream.stats.network")}</h4>
             <p className="sv-stats-subhead">{t("stream.stats.stability")}</p>

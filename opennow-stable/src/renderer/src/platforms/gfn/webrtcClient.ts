@@ -57,6 +57,7 @@ import { chooseAdaptiveMouseFlushInterval } from "./webrtc/mouseInput";
 import {
   averageJitterBufferDelayMs,
   codecLabelFromMimeType,
+  computeIntervalFrameRates,
   detectGpuType,
 } from "./webrtc/streamStatsHelpers";
 import {
@@ -349,6 +350,7 @@ export class GfnWebRtcClient {
     framesDropped: number;
     packetsReceived: number;
     packetsLost: number;
+    totalDecodeTime: number;
     atMs: number;
   } | null = null;
   private renderFpsCounter = { frames: 0, lastUpdate: 0, fps: 0 };
@@ -413,6 +415,7 @@ export class GfnWebRtcClient {
     bitrateKbps: 0,
     targetBitrateKbps: 0,
     decodeFps: 0,
+    receiveFps: 0,
     renderFps: 0,
     packetsLost: 0,
     packetsReceived: 0,
@@ -947,6 +950,7 @@ export class GfnWebRtcClient {
       bitrateKbps: 0,
       targetBitrateKbps: 0,
       decodeFps: 0,
+      receiveFps: 0,
       renderFps: 0,
       packetsLost: 0,
       packetsReceived: 0,
@@ -1184,6 +1188,7 @@ export class GfnWebRtcClient {
       framesDropped = Number(inboundVideo.framesDropped ?? 0);
       const packetsReceived = Number(inboundVideo.packetsReceived ?? 0);
       const packetsLost = Number(inboundVideo.packetsLost ?? 0);
+      const totalDecodeTime = Number(inboundVideo.totalDecodeTime ?? 0);
       const prevSample = this.lastStatsSample;
 
       // Calculate bitrate
@@ -1204,6 +1209,29 @@ export class GfnWebRtcClient {
             ? (lostDelta / totalPackets) * 100
             : 0;
         }
+
+        // Frame rates from per-interval deltas: receiveFps is what the server
+        // sent, decodeFps is what the local decoder actually produced.
+        // Chromium's raw framesPerSecond is a coarse sliding window that dips
+        // (30/45/0) on static frames and lags behind the real rate, so deltas
+        // over the ~1s poll window are both accurate and stable.
+        if (timeDeltaMs > 0) {
+          const rates = computeIntervalFrameRates({
+            framesReceived,
+            framesDecoded,
+            totalDecodeTime,
+            prevFramesReceived: prevSample.framesReceived,
+            prevFramesDecoded: prevSample.framesDecoded,
+            prevTotalDecodeTime: prevSample.totalDecodeTime,
+            timeDeltaMs,
+            prevReceiveFps: this.diagnostics.receiveFps,
+            prevDecodeFps: this.diagnostics.decodeFps,
+            prevDecodeTimeMs: this.diagnostics.decodeTimeMs,
+          });
+          this.diagnostics.receiveFps = rates.receiveFps;
+          this.diagnostics.decodeFps = rates.decodeFps;
+          this.diagnostics.decodeTimeMs = rates.decodeTimeMs;
+        }
       }
 
       // Store current values for next delta calculation
@@ -1214,6 +1242,7 @@ export class GfnWebRtcClient {
         framesDropped,
         packetsReceived,
         packetsLost,
+        totalDecodeTime,
         atMs: now,
       };
 
@@ -1230,9 +1259,6 @@ export class GfnWebRtcClient {
         this.videoDecodeStallWarningSent = true;
         this.log("Warning: inbound video packets received but 0 frames decoded (decoder stall)");
       }
-
-      // Decode FPS
-      this.diagnostics.decodeFps = Math.round(Number(inboundVideo.framesPerSecond ?? 0));
 
       // Cumulative packet stats
       this.diagnostics.packetsLost = packetsLost;
@@ -1279,16 +1305,15 @@ export class GfnWebRtcClient {
         }
       }
 
-      // Get decode timing if available
-      const totalDecodeTime = Number(inboundVideo.totalDecodeTime ?? 0);
-      const totalInterFrameDelay = Number(inboundVideo.totalInterFrameDelay ?? 0);
-      const framesDecodedForTiming = Number(inboundVideo.framesDecoded ?? 1);
-
-      if (framesDecodedForTiming > 0) {
-        this.diagnostics.decodeTimeMs = Math.round((totalDecodeTime / framesDecodedForTiming) * 1000 * 10) / 10;
+      // First stats sample: no interval deltas yet, fall back to the lifetime
+      // average decode time so the HUD has a value immediately.
+      if (!prevSample && framesDecoded > 0) {
+        this.diagnostics.decodeTimeMs = Math.round((totalDecodeTime / framesDecoded) * 1000 * 10) / 10;
       }
 
       // Estimate render time from inter-frame delay
+      const totalInterFrameDelay = Number(inboundVideo.totalInterFrameDelay ?? 0);
+      const framesDecodedForTiming = Number(inboundVideo.framesDecoded ?? 1);
       if (totalInterFrameDelay > 0 && framesDecodedForTiming > 1) {
         const avgFrameDelay = totalInterFrameDelay / (framesDecodedForTiming - 1);
         this.diagnostics.renderTimeMs = Math.round(avgFrameDelay * 1000 * 10) / 10;
@@ -1423,7 +1448,7 @@ export class GfnWebRtcClient {
         this.lastNetworkStatsLogAtMs = nowMs;
         this.lastLoggedRttMs = rttMs;
         this.log(
-          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps bwe=${availableKbps}kbps transport=${this.diagnostics.transportType}${this.diagnostics.localCandidateType ? `/${this.diagnostics.localCandidateType}` : ""} lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
+          `Network stats: rtt=${rttMs.toFixed(1)}ms jitter=${this.diagnostics.jitterMs.toFixed(1)}ms loss=${this.diagnostics.packetLossPercent.toFixed(2)}% drops=${this.diagnostics.framesDropped} rx=${this.diagnostics.receiveFps}fps dec=${this.diagnostics.decodeFps}fps decTime=${this.diagnostics.decodeTimeMs.toFixed(1)}ms decoded=${this.diagnostics.framesDecoded} bitrate=${this.diagnostics.bitrateKbps}kbps bwe=${availableKbps}kbps transport=${this.diagnostics.transportType}${this.diagnostics.localCandidateType ? `/${this.diagnostics.localCandidateType}` : ""} lag=${this.diagnostics.lagReason}${rttSpiked ? " [RTT SPIKE]" : ""}`,
         );
       } else {
         this.lastLoggedRttMs = rttMs;

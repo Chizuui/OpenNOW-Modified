@@ -8175,7 +8175,6 @@ button.game-card-store-chip.owned.active:hover {
   color: color-mix(in srgb, var(--accent) 80%, #fff);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
-
 /* Full: Network + Stream sections */
 .sv-stats-full {
   display: flex;

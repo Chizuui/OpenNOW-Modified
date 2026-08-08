@@ -20,6 +20,8 @@ export interface StreamDiagnostics {
   bitrateKbps: number;
   targetBitrateKbps: number;
   decodeFps: number;
+  /** Frames received from the network per second (≈ server-sent rate), computed from per-interval deltas. */
+  receiveFps: number;
   renderFps: number;
   gameFps?: number;
 
