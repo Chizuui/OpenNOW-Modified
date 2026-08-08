@@ -48,7 +48,6 @@ import {
 import {
   buildClaimRequestBody,
   buildSessionRequestBody,
-  createNetworkTestSession,
 } from "./cloudmatchSessionRequest";
 import {
   echoedSessionAppLaunchMode,
@@ -100,20 +99,20 @@ export async function createSession(input: SessionCreateRequest): Promise<Sessio
     deviceId,
     input.proxyUrl,
   );
-  const networkTestSessionId = await createNetworkTestSession({
-    base,
-    token: input.token,
-    clientId,
-    deviceId,
-    settings: input.settings,
-    proxyUrl: input.proxyUrl,
-  });
-  const body = buildSessionRequestBody(input, deviceId, networkTestSessionId);
+  // The official web client sends networkTestSessionId: null — it never
+  // forwards a network test session into createSession. The fork previously
+  // POSTed /v2/nettestsession and forwarded that id without ever connecting to
+  // the test socket to measure bandwidth; the server sizes the stream's bitrate
+  // budget from the network test it receives, so an unrun test pinned sessions
+  // at the minimum budget (~5 Mbps) in both transports. Match
+  // play.geforcenow.com: don't create or forward a test session here.
+  const body = buildSessionRequestBody(input, deviceId, null);
   console.log(
     `[CloudMatch] createSession in-game settings persistence: user=${input.enablePersistingInGameSettings === true}, ` +
     `gameSupport=${input.supportsInGameSettingsPersistence === true}, ` +
     `sent=${body.sessionRequestData.enablePersistingInGameSettings}, ` +
-    `networkTestSessionId=${networkTestSessionId ?? "none"}`,
+    `networkTestSessionId=none (official web parity), ` +
+    `requestedCodec=${body.sessionRequestData.requestedStreamingFeatures.codec ?? "n/a"}`,
   );
 
   const keyboardLayout = resolveGfnKeyboardLayout(input.settings.keyboardLayout ?? DEFAULT_KEYBOARD_LAYOUT, process.platform);

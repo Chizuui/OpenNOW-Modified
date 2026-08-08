@@ -257,11 +257,13 @@ export function buildNvstSdp(params: NvstParams): string {
     `a=video.initialPeakBitrateKbps:${startupBitrate}`,
     `a=vqos.bw.maximumBitrateKbps:${maxBitrate}`,
     `a=vqos.bw.minimumBitrateKbps:${OFFICIAL_MIN_BITRATE_KBPS}`,
-    // Encoder settings — encoderCscMode 3 (SDR) / 4 (HDR) and encoderHdrCscMode:4
-    // match the official web client; dynamicRangeMode mirrors sdrHdrMode.
+    // Encoder settings — encoderCscMode is always 3 on desktop web (the official
+    // bundle computes it as `TIZEN ? 2 : 3`; the fork's old 4 for 10-bit was a
+    // fork-only value the server does not expect). encoderHdrCscMode:4 and
+    // dynamicRangeMode mirror the official client for HDR content.
     "a=video.maxNumReferenceFrames:4",
     "a=video.mapRtpTimestampsToFrames:1",
-    `a=video.encoderCscMode:${bitDepth === 10 ? 4 : 3}`,
+    "a=video.encoderCscMode:3",
     "a=video.encoderHdrCscMode:4",
     `a=video.dynamicRangeMode:${bitDepth === 10 ? 1 : 0}`,
     `a=video.bitDepth:${bitDepth}`,

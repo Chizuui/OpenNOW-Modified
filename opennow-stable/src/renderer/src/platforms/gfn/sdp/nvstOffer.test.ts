@@ -41,7 +41,7 @@ test("buildNvstSdp includes stream quality and partially reliable input paramete
     "a=video.rtpNackQueueMaxPackets:512",
     "a=video.rtpNackMaxPacketCount:25",
     "a=video.bitDepth:10",
-    "a=video.encoderCscMode:4", // HDR/10-bit → CSC mode 4 (official web)
+    "a=video.encoderCscMode:3", // desktop web always 3 (official: TIZEN ? 2 : 3)
     "a=video.encoderHdrCscMode:4",
     "a=video.dynamicRangeMode:1",
     "a=vqos.drc.enable:0",
