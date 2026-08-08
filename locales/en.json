@@ -419,7 +419,14 @@
       "codec": "Codec",
       "codecFallback": "{{requested}} couldn't be negotiated → {{negotiated}}",
       "serverLocation": "Server location",
-      "codecFallbackShort": "{{requested}} → {{negotiated}}"
+      "codecFallbackShort": "{{requested}} → {{negotiated}}",
+      "framePipeline": "Frame pipeline",
+      "serverRx": "Server RX",
+      "serverRxHint": "Frames arriving from the server per second",
+      "localDecode": "Local decode",
+      "localDecodeHint": "Frames decoded locally per second — below the RX rate means the local decoder is the bottleneck",
+      "frameDecodeTime": "Decode time",
+      "frameDecodeTimeHint": "Average time to decode one frame — above 16.7ms cannot sustain 60fps"
     },
     "controls": {
       "antiAfkEnabled": "Anti-AFK is enabled",

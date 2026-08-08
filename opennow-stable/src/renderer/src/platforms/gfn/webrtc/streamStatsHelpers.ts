@@ -102,3 +102,69 @@ export function averageJitterBufferDelayMs(
   }
   return Math.round((jitterBufferDelaySeconds / jitterBufferEmittedCount) * 1000 * 10) / 10;
 }
+
+export interface IntervalFrameRates {
+  /** Frames received from the network per second (≈ server-sent rate). */
+  receiveFps: number;
+  /** Frames decoded locally per second. */
+  decodeFps: number;
+  /** Average milliseconds to decode one frame over the interval. */
+  decodeTimeMs: number;
+}
+
+export interface IntervalFrameRateParams {
+  framesReceived: number;
+  framesDecoded: number;
+  totalDecodeTime: number;
+  prevFramesReceived: number;
+  prevFramesDecoded: number;
+  prevTotalDecodeTime: number;
+  timeDeltaMs: number;
+  prevReceiveFps: number;
+  prevDecodeFps: number;
+  prevDecodeTimeMs: number;
+}
+
+/**
+ * Frame rates from per-interval WebRTC inbound-rtp deltas. `receiveFps` is
+ * what the server sent, `decodeFps` is what the local decoder produced.
+ * Chromium's raw `framesPerSecond` is a coarse sliding window that dips
+ * (30/45/0) on static frames and lags behind the real rate, so deltas over
+ * the ~1s poll window are both accurate and stable.
+ *
+ * Behavior on quiet intervals:
+ * - Nothing new arrived (static frame): both rates keep their last value.
+ * - Frames arriving but none decoded: decodeFps drops to 0 — the decoder is
+ *   genuinely behind (stall/backlog), so the HUD must not show a stale rate.
+ */
+export function computeIntervalFrameRates(params: IntervalFrameRateParams): IntervalFrameRates {
+  if (params.timeDeltaMs <= 0) {
+    return {
+      receiveFps: params.prevReceiveFps,
+      decodeFps: params.prevDecodeFps,
+      decodeTimeMs: params.prevDecodeTimeMs,
+    };
+  }
+
+  const receivedDelta = Math.max(0, params.framesReceived - params.prevFramesReceived);
+  const decodedDelta = Math.max(0, params.framesDecoded - params.prevFramesDecoded);
+
+  const receiveFps = receivedDelta > 0
+    ? Math.round((receivedDelta * 1000) / params.timeDeltaMs)
+    : params.prevReceiveFps;
+
+  let decodeFps = params.prevDecodeFps;
+  if (decodedDelta > 0) {
+    decodeFps = Math.round((decodedDelta * 1000) / params.timeDeltaMs);
+  } else if (receivedDelta > 0) {
+    decodeFps = 0;
+  }
+
+  let decodeTimeMs = params.prevDecodeTimeMs;
+  const decodeTimeDelta = params.totalDecodeTime - params.prevTotalDecodeTime;
+  if (decodedDelta > 0 && decodeTimeDelta > 0) {
+    decodeTimeMs = Math.round((decodeTimeDelta / decodedDelta) * 1000 * 10) / 10;
+  }
+
+  return { receiveFps, decodeFps, decodeTimeMs };
+}
