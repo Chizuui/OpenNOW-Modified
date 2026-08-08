@@ -1,4 +1,4 @@
-import type { AppLaunchMode, CodecPreference, SessionCreateRequest, StreamSettings } from "@shared/gfn";
+import type { AppLaunchMode, CodecPreference, SessionCreateRequest, StreamSettings, VideoCodec } from "@shared/gfn";
 import { DEFAULT_MINIMUM_FPS_FOR_REFLEX_WITHOUT_VRR } from "@shared/cloudGsync";
 
 import type { CloudMatchRequest } from "./types";
@@ -20,6 +20,8 @@ export function buildRequestedStreamingFeatures(
   bitDepth: number,
   chromaFormat: number,
   _hdrEnabled: boolean,
+  /** Codecs this client can actually decode (hardware-aware, WebRTC-receivable). */
+  supportedCodecs?: readonly VideoCodec[],
 ): CloudMatchRequest["sessionRequestData"]["requestedStreamingFeatures"] {
   const cloudGsync = settings.enableCloudGsync;
 
@@ -39,8 +41,14 @@ export function buildRequestedStreamingFeatures(
     // ── Aligned with the official client's requestedStreamingFeatures ──
     // Bitrate preference in Kbps (official multiplies the Mbps setting by 1000).
     maxBitrateKbps: Math.round(settings.maxBitrateMbps * 1000),
-    // Official wire codec id (H264=1, H265=2, AV1=3, 0 when "auto").
-    codec: codecWireValue(settings.codec),
+    // Official wire codec id (H264=1, H265=2, AV1=3, 0 when "auto"), resolved
+    // down the official preference ladder against the codecs this client can
+    // actually decode (the official bundle intersects its preference ladder
+    // with its hardware-aware decode capability list before sending).
+    codec: resolveRequestedCodecWireValue(
+      codecWireValue(settings.codec),
+      (supportedCodecs ?? []).map(codecWireValue),
+    ),
     // No client vsync preference in the fork (GFN streams client-side vsync off).
     vsync: false,
     // Official client default (desiredFeatures.dynamicStreamingMode ?? 3).
@@ -68,6 +76,36 @@ export function codecWireValue(codec: CodecPreference): number {
     default:
       return 0; // "auto"
   }
+}
+
+/**
+ * Official codec preference ladders (wire ids), verified against the
+ * play.geforcenow.com bundle: the requested codec is intersected with the
+ * codecs the client can actually decode — AV1→[3,2,1], H265→[2,1], H264→[1],
+ * auto→[0] (auto leaves the choice to the server).
+ */
+const OFFICIAL_CODEC_LADDERS: Record<number, readonly number[]> = {
+  0: [0],
+  1: [1],
+  2: [2, 1],
+  3: [3, 2, 1],
+};
+
+/**
+ * Resolve a requested codec wire id down the official preference ladder
+ * against the wire ids of the codecs this client can decode. With no
+ * capability data the explicit preference is kept unchanged (legacy behavior).
+ */
+export function resolveRequestedCodecWireValue(
+  preferenceWireValue: number,
+  supportedCodecWireValues: readonly number[],
+): number {
+  const ladder = OFFICIAL_CODEC_LADDERS[preferenceWireValue] ?? [preferenceWireValue];
+  if (supportedCodecWireValues.length === 0) {
+    return ladder[0];
+  }
+  const supported = new Set(supportedCodecWireValues);
+  return ladder.find((value) => supported.has(value)) ?? ladder[0];
 }
 
 export function shouldRequestReflex(settings: StreamSettings): boolean {

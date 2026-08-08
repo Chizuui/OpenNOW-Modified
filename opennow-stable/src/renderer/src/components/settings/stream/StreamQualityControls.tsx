@@ -5,6 +5,7 @@ import type {
   EntitledResolution,
   FallbackCodecPreference,
   Settings,
+  VideoCodec,
 } from "@shared/gfn";
 import {
   CODEC_PREFERENCE_OPTIONS,
@@ -16,8 +17,10 @@ import {
   resolveEntitledStreamProfile,
 } from "@shared/gfn";
 import {
+  getCodecDecodeBadgeState,
   isCodecUsableForStream,
   resolveEffectiveCodec,
+  resolveSupportedStreamCodecs,
   type CodecTestResult,
 } from "../../../lib/codecDiagnostics";
 import { useTranslation } from "../../../i18n";
@@ -141,6 +144,48 @@ export function StreamQualityControls({
 
   const autoPickedCodec = useMemo(() => resolveEffectiveCodec("auto"), []);
 
+  // GPU/CPU decode badge next to each concrete codec option (mirrors the
+  // diagnostics panel's powerEfficient result) so users can see at a glance
+  // whether the device decodes a codec in hardware before picking it.
+  const codecLabelWithDecodeBadge = useCallback(
+    (codec: VideoCodec): ReactNode => {
+      const badge = getCodecDecodeBadgeState(codec, codecResults, false);
+      if (!badge) return codec;
+      return (
+        <span className="codec-option-label">
+          <span>{codec}</span>
+          <span className={`codec-option-badge ${badge}`}>
+            {badge === "gpu" ? t("settings.video.gpu") : t("settings.video.cpu")}
+          </span>
+        </span>
+      );
+    },
+    [codecResults, t],
+  );
+
+  // When the selected concrete codec only decodes on the CPU, the session
+  // request is resolved down the official ladder (AV1→H265→H264) — surface
+  // that so users understand why the requested codec can differ from their
+  // pick (and why the stream may look softer than expected).
+  const codecDowngradeHint = useMemo<string | null>(() => {
+    if (settings.codec === "auto" || !codecResults || codecResults.length === 0) {
+      return null;
+    }
+    const badge = getCodecDecodeBadgeState(settings.codec, codecResults, false);
+    if (badge !== "cpu") return null;
+    // Mirror the createSession ladder resolution: the first ladder entry the
+    // client can actually decode wins (AV1→H265→H264, H265→H264). Computing
+    // it from the same supported-codec list the renderer sends to createSession
+    // keeps the hint accurate even when the intermediate codec is also
+    // undecodable (e.g. H265 without the HEVC extension → request lands on H264).
+    const ladder: readonly VideoCodec[] =
+      settings.codec === "AV1" ? ["H265", "H264"] : settings.codec === "H265" ? ["H264"] : [];
+    const supported = new Set(resolveSupportedStreamCodecs(codecResults));
+    const fallback = ladder.find((candidate) => supported.has(candidate)) ?? null;
+    if (!fallback) return null;
+    return t("settings.video.codecCpuDecodeHint", { codec: settings.codec, fallback });
+  }, [codecResults, settings.codec, t]);
+
   // GFN-web-style codec dropdown: Auto first (with the resolved codec in
   // parentheses), then the concrete codecs. Codecs the device cannot decode are
   // disabled, grouped under an "Unsupported" header with a "See why" action
@@ -164,7 +209,7 @@ export function StreamQualityControls({
       }
       const usable = isCodecUsableForStream(preference, codecResults);
       if (usable) {
-        supported.push({ value: preference, label: preference });
+        supported.push({ value: preference, label: codecLabelWithDecodeBadge(preference) });
       } else {
         unsupported.push({
           value: preference,
@@ -210,7 +255,7 @@ export function StreamQualityControls({
       }
       const usable = isCodecUsableForStream(preference, codecResults);
       if (usable) {
-        supported.push({ value: preference, label: preference });
+        supported.push({ value: preference, label: codecLabelWithDecodeBadge(preference) });
       } else {
         unsupported.push({
           value: preference,
@@ -281,6 +326,9 @@ export function StreamQualityControls({
               ? t("settings.video.codecAutoHint")
               : t("settings.video.codecManualHint")}
           </span>
+          {codecDowngradeHint && (
+            <span className="settings-input-hint">{codecDowngradeHint}</span>
+          )}
         </div>
       </div>
 

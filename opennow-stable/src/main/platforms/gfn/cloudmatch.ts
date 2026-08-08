@@ -63,6 +63,7 @@ import {
 export {
   appLaunchModeWireValue,
   buildRequestedStreamingFeatures,
+  resolveRequestedCodecWireValue,
   shouldEnableInGameSettingsPersistence,
   shouldRequestReflex,
 } from "./cloudmatchFeatures";
@@ -112,7 +113,9 @@ export async function createSession(input: SessionCreateRequest): Promise<Sessio
     `gameSupport=${input.supportsInGameSettingsPersistence === true}, ` +
     `sent=${body.sessionRequestData.enablePersistingInGameSettings}, ` +
     `networkTestSessionId=none (official web parity), ` +
-    `requestedCodec=${body.sessionRequestData.requestedStreamingFeatures.codec ?? "n/a"}`,
+    `codecPreference=${input.settings.codec ?? "n/a"}, ` +
+    `requestedCodec=${body.sessionRequestData.requestedStreamingFeatures.codec ?? "n/a"}, ` +
+    `supportedCodecs=${(input.supportedCodecs ?? []).join(",") || "n/a"}`,
   );
 
   const keyboardLayout = resolveGfnKeyboardLayout(input.settings.keyboardLayout ?? DEFAULT_KEYBOARD_LAYOUT, process.platform);

@@ -417,3 +417,55 @@ export function resolveStreamProfileCodec(
     colorQuality: normalized.colorQuality,
   };
 }
+
+/**
+ * Client codec capability list for the createSession codec ladder, mirroring
+ * the official play.geforcenow.com bundle. A codec is advertised when it is
+ * decodable AND present in the WebRTC receiver capabilities; AV1 additionally
+ * requires hardware decode (`powerEfficient`) — the bundle's AV1 probe
+ * (`Ki()`) refuses software AV1, while H264/H265 are not hardware-gated there.
+ * Falls back to the synchronous WebRTC capability check when no probe results
+ * exist yet. Never returns an empty list (H.264 decode is universally
+ * available, and an empty list would disable ladder resolution in the
+ * session request).
+ */
+export function resolveSupportedStreamCodecs(results: CodecTestResult[] | null): VideoCodec[] {
+  const candidates: readonly VideoCodec[] = ["H264", "H265", "AV1"];
+  const supported: VideoCodec[] = [];
+  for (const codec of candidates) {
+    const result = results?.find((entry) => entry.codec === codec);
+    let usable: boolean;
+    if (result) {
+      const decodable = result.decodeSupported && result.webrtcSupported;
+      usable = codec === "AV1" ? decodable && result.hwAccelerated : decodable;
+    } else {
+      usable = isWebRtcCodecAvailable(codec);
+    }
+    if (usable) {
+      supported.push(codec);
+    }
+  }
+  return supported.length > 0 ? supported : ["H264"];
+}
+
+let launchProbePromise: Promise<CodecTestResult[] | null> | null = null;
+
+/**
+ * Codec probe results for the current renderer session: returns the stored
+ * results when available, otherwise runs the full hardware-aware probe once
+ * (cached for the session) so createSession always has capability data to
+ * resolve the requested codec against. Resolves null only when probing fails.
+ */
+export function getOrRunCodecSupport(): Promise<CodecTestResult[] | null> {
+  const stored = loadStoredCodecResults();
+  if (stored && stored.length > 0) {
+    return Promise.resolve(stored);
+  }
+  launchProbePromise ??= testCodecSupport()
+    .then((results) => {
+      saveStoredCodecResults(results);
+      return results;
+    })
+    .catch(() => loadStoredCodecResults());
+  return launchProbePromise;
+}

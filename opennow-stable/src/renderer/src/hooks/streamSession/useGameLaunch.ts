@@ -11,6 +11,10 @@ import type {
 } from "@shared/gfn";
 import { isSessionAdsRequired } from "@shared/gfn";
 import { discordGameImageUrl } from "@shared/discord";
+import {
+  getOrRunCodecSupport,
+  resolveSupportedStreamCodecs,
+} from "../../lib/codecDiagnostics";
 
 import { chooseAccountLinked, getEpicOwnershipLaunchError } from "../../lib/launchOwnership";
 import {
@@ -261,6 +265,12 @@ export function useGameLaunch({
 
       const sessionProxyUrl = activeSessionProxyUrl;
 
+      // Codecs this client can actually decode (hardware-aware), used by the
+      // main process to resolve the requested codec down the official
+      // preference ladder (AV1→H265→H264) before createSession — matching the
+      // official client which never requests a codec it cannot decode.
+      const supportedCodecs = resolveSupportedStreamCodecs(await getOrRunCodecSupport());
+
       // Create new session
       const newSession = await window.openNow.createSession({
         token: token || undefined,
@@ -275,6 +285,7 @@ export function useGameLaunch({
         proxyUrl: sessionProxyUrl,
         zone: "prod",
         settings: streamSettings,
+        supportedCodecs,
       });
 
       setSession(newSession);
