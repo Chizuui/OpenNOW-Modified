@@ -7018,7 +7018,6 @@ private fun StreamScreen(
 
     LaunchedEffect(client, tvProfile) {
         client.updateAndroidTvProfile(tvProfile)
-        client.updateControllerMouseAssistAutoArm(tvProfile)
     }
 
     LaunchedEffect(streamReady, session?.sessionId, controlsOpen) {

@@ -3723,9 +3723,7 @@ class NativeStreamClient(
     private var lastLeftStickY = 0
     private var lastRightStickX = 0
     private var lastRightStickY = 0
-    private var controllerMouseAutoArmOnStart = false
     private var controllerMouseAssistActive = false
-    private var controllerMouseAssistAutoArmed = false
     private var controllerMouseEmulationActive = false
     private var controllerMouseMoveLogged = false
     private var controllerMouseLeftButtonDown = false
@@ -3996,13 +3994,6 @@ class NativeStreamClient(
         NativeStreamInputRouter.setStretchToFit(stretchToFit)
     }
 
-    fun updateControllerMouseAssistAutoArm(enabled: Boolean) {
-        controllerMouseAutoArmOnStart = enabled
-        if (!enabled) {
-            setControllerMouseAssistActive(false)
-        }
-    }
-
     fun updateAndroidTvProfile(enabled: Boolean) {
         if (androidTvProfile == enabled) return
         androidTvProfile = enabled
@@ -4099,7 +4090,6 @@ class NativeStreamClient(
             settings.microphoneMode == MicrophoneMode.Disabled || microphoneMuted,
         )
         closeTransport(clearInputState = false)
-        armControllerMouseAssistForSession()
         recordStreamDiagnostic(
             "start session=${streamDiagnosticId(session.sessionId)} status=${session.status} server=${session.serverIp.take(96)} signaling=${signalingUrlForDiagnostics(session.signalingUrl, session.sessionId)} settings=${settings.resolution}/${settings.fps}/${settings.codec} bitrate=${settings.maxBitrateMbps} microphone=${settings.microphoneMode.name}",
         )
@@ -4206,7 +4196,6 @@ class NativeStreamClient(
         physicalRightStickY = 0f
         controllerScrollAccumulator = 0f
         controllerMouseAssistActive = false
-        controllerMouseAssistAutoArmed = false
         controllerMouseEmulationActive = false
         controllerMouseMoveLogged = false
         controllerMouseLeftButtonDown = false
@@ -4642,25 +4631,15 @@ class NativeStreamClient(
         return reliableSent || partialSent
     }
 
-    private fun armControllerMouseAssistForSession() {
-        if (!controllerMouseAutoArmOnStart) return
-        controllerMouseAssistActive = true
-        controllerMouseAssistAutoArmed = true
-        controllerMouseMoveLogged = false
-        emitControllerMouseAssistChanged(true)
-        NativeInputDiagnostics.add("controller mouse assist auto-armed for Android TV")
-    }
-
-    private fun setControllerMouseAssistActive(active: Boolean, autoArmed: Boolean = false) {
-        if (controllerMouseAssistActive == active && controllerMouseAssistAutoArmed == (autoArmed && active)) return
+    private fun setControllerMouseAssistActive(active: Boolean) {
+        if (controllerMouseAssistActive == active) return
         if (!active) releaseControllerMouseButtons()
         controllerMouseAssistActive = active
-        controllerMouseAssistAutoArmed = autoArmed && active
         updateControllerMouseLoop()
         controllerMouseMoveLogged = false
         sendCurrentGamepadState()
         emitControllerMouseAssistChanged(active)
-        NativeInputDiagnostics.add("controller mouse assist ${if (active) "enabled" else "disabled"} auto=$controllerMouseAssistAutoArmed")
+        NativeInputDiagnostics.add("controller mouse assist ${if (active) "enabled" else "disabled"}")
     }
 
     private fun emitControllerMouseAssistChanged(active: Boolean) {
@@ -4691,9 +4670,6 @@ class NativeStreamClient(
             else -> return false
         }
         val sent = sendMouseButton(button = button, pressed = pressed, source = "controller mouse")
-        if (!pressed && controllerMouseAssistAutoArmed && button == 1) {
-            setControllerMouseAssistActive(false)
-        }
         return sent
     }
 
@@ -6309,7 +6285,7 @@ class NativeStreamClient(
         val sent = sendTouchMouseMove(delta.dx, delta.dy)
         if (sent && !controllerMouseMoveLogged) {
             controllerMouseMoveLogged = true
-            NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} auto=$controllerMouseAssistAutoArmed emulation=$controllerMouseEmulationActive")
+            NativeInputDiagnostics.add("controller mouse move sent dx=${delta.dx} dy=${delta.dy} emulation=$controllerMouseEmulationActive")
         }
         return sent
     }
