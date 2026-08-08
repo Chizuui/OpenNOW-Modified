@@ -93,8 +93,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "OpenCloudGaming",
-        "repo": "OpenNOW"
+        "owner": "Chizuui",
+        "repo": "Builder-apps"
       }
     ],
     "npmRebuild": false,

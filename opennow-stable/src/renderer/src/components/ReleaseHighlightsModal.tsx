@@ -158,7 +158,7 @@ export function ReleaseHighlightsModal({
   }
   const retainedPayload = retainedPayloadRef.current;
   const githubReleaseUrl = retainedPayload
-    ? `https://github.com/OpenCloudGaming/OpenNOW/releases/tag/v${retainedPayload.version}`
+    ? `https://github.com/Chizuui/Builder-apps/releases/tag/v${retainedPayload.version}-Mod`
     : "";
 
   return (

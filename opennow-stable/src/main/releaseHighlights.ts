@@ -4,7 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { ReleaseHighlightsPayload } from "@shared/gfn";
 import { pickRuntimeGitHubToken } from "./githubRuntimeToken";
 
-const GITHUB_API_BASE = "https://api.github.com/repos/OpenCloudGaming/OpenNOW";
+const GITHUB_API_BASE = "https://api.github.com/repos/Chizuui/Builder-apps";
 const FETCH_TIMEOUT_MS = 8000;
 const CACHE_FILE = "release-notes-cache.json";
 const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -134,40 +134,51 @@ interface GitHubRelease {
 }
 
 async function fetchFromGitHub(version: string): Promise<string | null> {
-  const tag = version.startsWith("v") ? version : `v${version}`;
-  const url = `${GITHUB_API_BASE}/releases/tags/${encodeURIComponent(tag)}`;
+  // The PC fork publishes releases to Builder-apps with `v{version}-Mod` tags
+  // (e.g. `v0.5.4-Mod`). Try the fork tag first, then the plain tag as a
+  // fallback for upstream-style releases.
+  const candidateTags = [
+    version.startsWith("v") ? version : `v${version}-Mod`,
+    version.startsWith("v") ? version : `v${version}`,
+  ];
 
-  const headers: HeadersInit = {
-    Accept: "application/vnd.github+json",
-    "User-Agent": `OpenNOW/${version} (electron)`,
-  };
+  for (const tag of candidateTags) {
+    const url = `${GITHUB_API_BASE}/releases/tags/${encodeURIComponent(tag)}`;
 
-  const token = pickRuntimeGitHubToken();
-  if (token) {
-    (headers as Record<string, string>)["Authorization"] = `token ${token}`;
-  }
+    const headers: HeadersInit = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": `OpenNOW/${version} (electron)`,
+    };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const token = pickRuntimeGitHubToken();
+    if (token) {
+      (headers as Record<string, string>)["Authorization"] = `token ${token}`;
+    }
 
-  try {
-    const response = await fetch(url, { headers, signal: controller.signal });
-    if (!response.ok) {
-      console.warn(`[ReleaseHighlights] GitHub API returned ${response.status} for ${tag}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, { headers, signal: controller.signal });
+      if (!response.ok) {
+        console.warn(`[ReleaseHighlights] GitHub API returned ${response.status} for ${tag}`);
+        continue;
+      }
+      const data = (await response.json()) as GitHubRelease;
+      return data.body ?? null;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        console.warn("[ReleaseHighlights] GitHub fetch timed out");
+      } else {
+        console.warn("[ReleaseHighlights] GitHub fetch failed:", error);
+      }
       return null;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = (await response.json()) as GitHubRelease;
-    return data.body ?? null;
-  } catch (error) {
-    if ((error as Error).name === "AbortError") {
-      console.warn("[ReleaseHighlights] GitHub fetch timed out");
-    } else {
-      console.warn("[ReleaseHighlights] GitHub fetch failed:", error);
-    }
-    return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
