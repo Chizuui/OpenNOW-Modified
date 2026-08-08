@@ -67,6 +67,13 @@ export interface SessionCreateRequest {
   existingSessionStrategy?: ExistingSessionStrategy;
   zone: string;
   settings: StreamSettings;
+  /**
+   * Codecs this client can actually decode (hardware-aware, WebRTC-receivable).
+   * The official client intersects its requested codec preference ladder with
+   * this list before sending requestedStreamingFeatures.codec. Omit or empty
+   * keeps the raw preference (no capability data available).
+   */
+  supportedCodecs?: readonly VideoCodec[];
   proxyUrl?: string;
 }
 

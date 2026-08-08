@@ -7580,6 +7580,35 @@ button.game-card-store-chip.owned.active:hover {
   border: 1px solid var(--panel-border);
 }
 
+.codec-option-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.codec-option-badge {
+  font-size: 0.66rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.codec-option-badge.gpu {
+  color: var(--success);
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.2);
+}
+
+.codec-option-badge.cpu {
+  color: var(--warning);
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.25);
+}
+
 .codec-result-rows {
   display: flex;
   flex-direction: column;

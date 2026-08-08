@@ -9,6 +9,7 @@ import {
   isCodecUsableForStream,
   resolveEffectiveCodec,
   resolveStreamProfileCodec,
+  resolveSupportedStreamCodecs,
   shouldShowLinuxHardwareCodecHint,
   shouldShowQuickSyncDriverHint,
   type CodecTestResult,
@@ -177,6 +178,32 @@ test("does not show Quick Sync hint without an H264 result or on non-Windows", (
       }),
     ]), false);
   });
+});
+
+test("supported stream codecs gate AV1 on hardware decode like the official bundle", () => {
+  // Software-only AV1 (powerEfficient=false) is excluded, mirroring the
+  // official probe Ki(); H265/H264 stay available when decodable.
+  assert.deepEqual(resolveSupportedStreamCodecs([
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: true, webrtcSupported: true, hwAccelerated: false }),
+    codecResult({ codec: "AV1", decodeSupported: true, webrtcSupported: true, hwAccelerated: false }),
+  ]), ["H264", "H265"]);
+  // Hardware AV1 decode → AV1 is advertised.
+  assert.deepEqual(resolveSupportedStreamCodecs([
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: true, webrtcSupported: true, hwAccelerated: true }),
+  ]), ["H264", "H265", "AV1"]);
+  // Not decodable (e.g. H265 without the HEVC extension) → excluded.
+  assert.deepEqual(resolveSupportedStreamCodecs([
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: false, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: false, webrtcSupported: true }),
+  ]), ["H264"]);
+  // No probe results → sync WebRTC fallback; in the Node test env every check
+  // fails so the list floors to H264 (never empty, so ladder resolution stays
+  // active in the session request).
+  assert.deepEqual(resolveSupportedStreamCodecs(null), ["H264"]);
 });
 
 test("explicit codec preference is honored even when the device reports it unsupported", () => {

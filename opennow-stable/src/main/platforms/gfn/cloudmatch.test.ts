@@ -17,6 +17,7 @@ import {
   createSession,
   extractServerInfoRegionBases,
   getActiveSessions,
+  resolveRequestedCodecWireValue,
 } from "./cloudmatch";
 
 function makeSettings(overrides: Partial<StreamSettings> = {}): StreamSettings {
@@ -126,6 +127,37 @@ test("CloudMatch uses official streaming feature enum values", () => {
   });
 });
 
+test("CloudMatch resolves codec preference down the official ladder", () => {
+  // AV1 preference with only H265/H264 decodable → H265.
+  assert.equal(resolveRequestedCodecWireValue(3, [2, 1]), 2);
+  // AV1 preference with only H264 decodable → H264.
+  assert.equal(resolveRequestedCodecWireValue(3, [1]), 1);
+  // AV1 preference with hardware AV1 → AV1.
+  assert.equal(resolveRequestedCodecWireValue(3, [3, 2, 1]), 3);
+  // H265 preference with only H264 decodable → H264.
+  assert.equal(resolveRequestedCodecWireValue(2, [1]), 1);
+  // H264 preference is never downgraded.
+  assert.equal(resolveRequestedCodecWireValue(1, [2, 3]), 1);
+  // Auto (0) always leaves the choice to the server.
+  assert.equal(resolveRequestedCodecWireValue(0, [2, 1]), 0);
+  // No capability data → keep the explicit preference (legacy behavior).
+  assert.equal(resolveRequestedCodecWireValue(3, []), 3);
+});
+
+test("CloudMatch buildRequestedStreamingFeatures uses hardware-aware supportedCodecs", () => {
+  const av1Only = buildRequestedStreamingFeatures(makeSettings({ codec: "AV1" }), 0, 0, false, ["AV1", "H265", "H264"]);
+  assert.equal(av1Only.codec, 3);
+
+  const av1SoftwareOnly = buildRequestedStreamingFeatures(makeSettings({ codec: "AV1" }), 0, 0, false, ["H265", "H264"]);
+  assert.equal(av1SoftwareOnly.codec, 2);
+
+  const h265Unavailable = buildRequestedStreamingFeatures(makeSettings({ codec: "AV1" }), 0, 0, false, ["H264"]);
+  assert.equal(h265Unavailable.codec, 1);
+
+  const noData = buildRequestedStreamingFeatures(makeSettings({ codec: "AV1" }), 0, 0, false);
+  assert.equal(noData.codec, 3);
+});
+
 test("CloudMatch extracts local serverInfo region before fallback regions", () => {
   const bases = extractServerInfoRegionBases({
     metaData: [
@@ -228,6 +260,7 @@ test("CloudMatch resolves default prod endpoint to serverInfo local region befor
       accountLinked: true,
       zone: "prod",
       settings: makeSettings({ fps: 90, colorQuality: "10bit_444", enableL4S: true, appLaunchMode: "gamepadFriendly" }),
+      supportedCodecs: ["AV1", "H265", "H264"],
     });
 
     assert.equal(session.streamingBaseUrl, "https://np-lax-01.cloudmatchbeta.nvidiagrid.net");
