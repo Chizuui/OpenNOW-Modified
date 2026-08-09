@@ -135,10 +135,10 @@ try {
   const runtimeVersion = readRuntimeVersion(runtimeRoot);
   const vendorDir = resolveVendorDir(runtimeVersion);
   if (!vendorDir) {
-    console.warn(
-      `No compatible vendored Windows GStreamer Vulkan plugins were found for runtime ${runtimeVersion ?? "unknown"}. Skipping Vulkan plugin injection.`,
+    throw new Error(
+      `No compatible vendored Windows GStreamer Vulkan plugins were found for runtime ${runtimeVersion ?? "unknown"}. `
+      + `Expected artifacts under ${vendorRoot}/<gstreamer-version>/.`,
     );
-    process.exit(0);
   }
 
   injectVulkanPlugins(runtimeRoot, vendorDir);
