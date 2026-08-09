@@ -509,6 +509,10 @@ pub(crate) struct GstreamerVideoTap {
     /// The video sink the tee feeds.
     pub(crate) sink: gst::Element,
     pub(crate) video_api: RtpVideoApi,
+    /// Whether the chain actually negotiated D3D memory. This is derived from
+    /// the chain caps, not the global zero-copy preference: H264-D3D12 now
+    /// deliberately downloads to system memory even when the preference is on.
+    pub(crate) zero_copy: bool,
 }
 
 impl GstreamerVideoTap {
@@ -610,7 +614,7 @@ pub(crate) struct GstreamerRecordingState {
 }
 
 impl GstreamerRecordingState {
-    fn start(&self) -> Result<(), String> {
+    pub(crate) fn start(&self) -> Result<(), String> {
         self.eos_seen.store(false, Ordering::SeqCst);
         // Set active before opening the valve so the chunk probe never drops
         // the first muxer output (ftyp + moov).
@@ -640,7 +644,7 @@ impl GstreamerRecordingState {
         Ok(())
     }
 
-    fn stop(&self, finalize: bool) -> Result<(), String> {
+    pub(crate) fn stop(&self, finalize: bool) -> Result<(), String> {
         // Stop new frames entering the branch first; buffers already inside
         // (queue → encoder → muxer) keep flowing.
         self.valve.set_property("drop", true);
@@ -1167,6 +1171,11 @@ impl GstreamerPipeline {
                 "NVST Annex-B decode chain unavailable for {encoding}; install GStreamer plugins or set {NATIVE_VIDEO_BACKEND_ENV}=software."
             )
         })?;
+        let zero_copy = specs.iter().any(|spec| {
+            spec.caps
+                .as_deref()
+                .is_some_and(|caps| caps.contains("memory:D3D"))
+        });
         // Drop RTP depayloader — appsrc feeds assembled Annex-B AUs.
         specs.retain(|spec| spec.role != RtpVideoChainRole::Depayloader);
         if specs
@@ -1264,6 +1273,7 @@ impl GstreamerPipeline {
                         before_sink,
                         sink: sink_element,
                         video_api,
+                        zero_copy,
                     });
                 }
                 send_log(
@@ -1867,7 +1877,7 @@ impl GstreamerPipeline {
     /// Lazily build the screenshot grab branch, hot-plugging the video tap tee
     /// first if it does not exist yet.
     fn build_screenshot_grab(&self) -> Result<GstreamerScreenshotGrab, String> {
-        let (tee, video_api) = {
+        let (tee, video_api, zero_copy) = {
             let mut tap_slot = self
                 .video_tap
                 .lock()
@@ -1876,15 +1886,25 @@ impl GstreamerPipeline {
                 "Screenshot capture is not ready: the native video chain has no video tap (waiting for game video)."
                     .to_owned()
             })?;
-            (tap.ensure_tee(&self.pipeline)?, tap.video_api)
+            (
+                tap.ensure_tee(&self.pipeline)?,
+                tap.video_api,
+                tap.zero_copy,
+            )
         };
-        insert_screenshot_grab_branch(&self.pipeline, &tee, video_api, &self.event_sender)
+        insert_screenshot_grab_branch(
+            &self.pipeline,
+            &tee,
+            video_api,
+            zero_copy,
+            &self.event_sender,
+        )
     }
 
     /// Start a native recording: open (or build, if missing/spent) the
     /// H.264/MP4 recording branch on the shared video tap.
     pub(crate) fn start_recording(&self) -> Result<(), String> {
-        let (tee, video_api) = {
+        let (tee, video_api, zero_copy) = {
             let mut tap_slot = self
                 .video_tap
                 .lock()
@@ -1895,7 +1915,11 @@ impl GstreamerPipeline {
             })?;
             // Hot-plug the tap tee lazily (after the sink is presenting) on
             // first use; subsequent recordings reuse the same tee.
-            (tap.ensure_tee(&self.pipeline)?, tap.video_api)
+            (
+                tap.ensure_tee(&self.pipeline)?,
+                tap.video_api,
+                tap.zero_copy,
+            )
         };
         let pipeline = self.pipeline.clone();
 
@@ -1919,6 +1943,7 @@ impl GstreamerPipeline {
                 &pipeline,
                 &tee,
                 video_api,
+                zero_copy,
                 &self.game_audio_tap,
                 &self.mic_audio_tap,
                 self.event_sender.clone(),
@@ -3200,15 +3225,20 @@ pub(crate) fn rtp_video_chain_definition(
 
     let is_ten_bit_capable = matches!(codec.as_str(), "AV1" | "H265" | "HEVC");
     let is_d3d = matches!(video_api, RtpVideoApi::D3D11 | RtpVideoApi::D3D12);
-    if is_ten_bit_capable && is_d3d {
-        // D3D DXVA textures for 10-bit-capable codecs (AV1, H265/HEVC) cannot
-        // be presented through the zero-copy D3DMemory path: the
-        // d3d11/d3d12videosink renders them as full-frame gray/pink garbage,
-        // and the DXVA decoders refuse to convert 10-bit→8-bit themselves
-        // (`not-negotiated` when the output caps demand NV12). Route these
-        // codecs through system memory — download the D3D texture, convert
-        // P010→NV12 with videoconvert, and present 8-bit NV12 that the sink
-        // uploads itself. 8-bit streams pass through unchanged.
+    // Keep D3D11 H264 zero-copy available, but avoid the D3D12 H264 zero-copy
+    // path. The field log showed d3d12h264dec producing D3D12Memory correctly
+    // for the first frame, then stopping decode while RTP continued flowing
+    // (decoded=0, sink=0, rendered=33). The download + system-memory path is
+    // already used successfully for H265/AV1 and avoids that driver/sink
+    // present deadlock. Ten-bit codecs still require the same path on both
+    // D3D backends because d3d11/d3d12videosink cannot reliably present their
+    // native D3D textures.
+    let needs_safe_system_memory_present =
+        is_d3d && (is_ten_bit_capable || video_api == RtpVideoApi::D3D12);
+    if needs_safe_system_memory_present {
+        // Download the D3D texture, convert to 8-bit NV12, and let the sink
+        // upload system memory. This also makes the H264 D3D12 path resilient
+        // to the mid-stream zero-copy stall observed in production.
         let download = match video_api {
             RtpVideoApi::D3D12 => "d3d12download",
             _ => "d3d11download",
@@ -4075,6 +4105,11 @@ fn link_rtp_video_pad(
             "Explicit low-latency decode chain is unavailable for RTP {encoding}; install the platform GStreamer plugin packages or set {NATIVE_VIDEO_BACKEND_ENV}=software to force software decode."
         )
     })?;
+    let zero_copy = specs.iter().any(|spec| {
+        spec.caps
+            .as_deref()
+            .is_some_and(|caps| caps.contains("memory:D3D"))
+    });
     video_liveness.update_hardware_acceleration(format!("GStreamer {}", video_api.label()));
     video_liveness.set_stats_overlay(None);
     let mut elements = Vec::with_capacity(specs.len());
@@ -4172,6 +4207,7 @@ fn link_rtp_video_pad(
                     before_sink,
                     sink: sink_element,
                     video_api,
+                    zero_copy,
                 });
             }
             send_log(
@@ -4637,6 +4673,7 @@ fn insert_screenshot_grab_branch(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     video_api: RtpVideoApi,
+    zero_copy: bool,
     event_sender: &Option<Sender<Event>>,
 ) -> Result<GstreamerScreenshotGrab, String> {
     let valve = make_element("valve")?;
@@ -4675,7 +4712,7 @@ fn insert_screenshot_grab_branch(
 
     // D3D paths with zero-copy produce texture-backed frames; download them to
     // system memory first (videoconvert/pngenc cannot import D3D memory).
-    let download_factory = match (video_api, zero_copy_requested()) {
+    let download_factory = match (video_api, zero_copy) {
         (RtpVideoApi::D3D11, true) => Some("d3d11download"),
         (RtpVideoApi::D3D12, true) => Some("d3d12download"),
         _ => None,
@@ -4743,6 +4780,7 @@ pub(crate) fn insert_recording_branch(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     video_api: RtpVideoApi,
+    zero_copy: bool,
     game_audio_tap: &Arc<Mutex<Option<gst::Element>>>,
     mic_audio_tap: &Arc<Mutex<Option<gst::Element>>>,
     event_sender: Option<Sender<Event>>,
@@ -4790,7 +4828,7 @@ pub(crate) fn insert_recording_branch(
 
     // D3D paths with zero-copy produce texture-backed frames; download them to
     // system memory first (videoconvert/x264enc cannot import D3D memory).
-    let download_factory = match (video_api, zero_copy_requested()) {
+    let download_factory = match (video_api, zero_copy) {
         (RtpVideoApi::D3D11, true) => Some("d3d11download"),
         (RtpVideoApi::D3D12, true) => Some("d3d12download"),
         _ => None,
@@ -4858,7 +4896,10 @@ pub(crate) fn insert_recording_branch(
         }
     }
     let mut audio_elements: Vec<gst::Element> = Vec::new();
-    // Per-track chains: (tap tee, [resample, convert, capsfilter], valve, encoder).
+    // Per-track chains: (tap tee, [queue, resample, convert, capsfilter], valve, encoder).
+    // The queue is intentionally leaky: mp4mux can remain PAUSED until the
+    // first buffers arrive, and an audio branch must never propagate that
+    // temporary back-pressure through the live game-audio tee.
     let mut audio_track_chains: Vec<(gst::Element, Vec<gst::Element>, gst::Element, gst::Element)> =
         Vec::new();
     let audio_valves: Vec<gst::Element> = if audio_taps.is_empty() {
@@ -4874,6 +4915,11 @@ pub(crate) fn insert_recording_branch(
             .parse()
             .map_err(|error| format!("Invalid recording audio caps: {error}"))?;
         for tap_tee in &audio_taps {
+            let tap_queue = make_element("queue")?;
+            tap_queue.set_property_from_str("leaky", "downstream");
+            tap_queue.set_property("max-size-buffers", AUDIO_QUEUE_MAX_BUFFERS);
+            tap_queue.set_property("max-size-bytes", 0u32);
+            tap_queue.set_property("max-size-time", 0u64);
             let tap_resample = make_element("audioresample")?;
             let tap_convert = make_element("audioconvert")?;
             let tap_caps_element = make_element("capsfilter")?;
@@ -4882,6 +4928,7 @@ pub(crate) fn insert_recording_branch(
             tap_valve.set_property("drop", true);
             let tap_aac = make_element("voaacenc")?;
             for element in [
+                &tap_queue,
                 &tap_resample,
                 &tap_convert,
                 &tap_caps_element,
@@ -4892,7 +4939,7 @@ pub(crate) fn insert_recording_branch(
             }
             audio_track_chains.push((
                 tap_tee.clone(),
-                vec![tap_resample, tap_convert, tap_caps_element],
+                vec![tap_queue, tap_resample, tap_convert, tap_caps_element],
                 tap_valve,
                 tap_aac,
             ));
@@ -4963,7 +5010,7 @@ pub(crate) fn insert_recording_branch(
     // track), all before any element goes PLAYING.
     for (_, chain, valve, aac) in &audio_track_chains {
         chain[0].link(&chain[1]).map_err(|error| {
-            format!("Failed to link recording audio resample -> convert: {error:?}")
+            format!("Failed to link recording audio queue -> resample: {error:?}")
         })?;
         chain[1].link(&chain[2]).map_err(|error| {
             format!("Failed to link recording audio convert -> caps: {error:?}")
@@ -4988,21 +5035,20 @@ pub(crate) fn insert_recording_branch(
     // transition. Requesting fresh tap-tee pads mid-transition makes the
     // already-PLAYING tap tees push into flushing pads → FLUSHING upstream →
     // the game chain stalls after a few buffers (field: game-audio tap
-    // contributed nothing to recordings). Wait for the normalize chains + the
-    // muxer to actually reach PLAYING before linking the fresh pads: the
-    // chains reach PLAYING immediately, and the muxer can reach PLAYING via
-    // caps negotiation from the fixed capsfilters even with the track valves
-    // closed (data drops there). The appsink stays PAUSED until the first
-    // buffer, which is expected. Video-only recordings skip the wait entirely
-    // (no fresh audio pads to race).
+    // contributed nothing to recordings). Wait only for the per-track input
+    // chains, not mp4mux: an aggregator with a closed valve and no requested
+    // audio pads is expected to remain PAUSED until its first buffers arrive.
+    // Including mp4mux here used to block start-recording for 10 seconds,
+    // causing the Electron request timeout. The leaky input queue makes it
+    // safe to link fresh pads while the muxer is still waiting for preroll.
     if !audio_track_chains.is_empty() {
-        let mut pre_link_elements: Vec<gst::Element> = audio_track_chains
+        let pre_link_elements: Vec<gst::Element> = audio_track_chains
             .iter()
             .flat_map(|(_, chain, valve, _)| chain.iter().chain(std::iter::once(valve)))
             .cloned()
             .collect();
-        pre_link_elements.push(muxer.clone());
-        let transition_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let transition_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(1_000);
         loop {
             let all_playing = pre_link_elements
                 .iter()
@@ -5022,14 +5068,14 @@ pub(crate) fn insert_recording_branch(
                 &event_sender,
                 "warn",
                 format!(
-                    "Recording branch elements did not reach PLAYING before audio tap link: {not_playing:?}."
+                    "Recording audio input elements did not reach PLAYING before tap link; proceeding without blocking live media: {not_playing:?}."
                 ),
             );
         }
     }
 
     // Request a fresh pad from each audio tap tee and link it into the track's
-    // resample sink. A tap tee that fails to provide/link a pad is skipped
+    // decoupling queue sink. A tap tee that fails to provide/link a pad is skipped
     // with a warning so one bad audio source can never abort the whole
     // recording (video still records).
     let mut audio_taps_linked: Vec<(gst::Element, gst::Pad)> = Vec::new();
@@ -5045,10 +5091,10 @@ pub(crate) fn insert_recording_branch(
             );
             continue;
         };
-        let resample_sink = chain[0]
+        let queue_sink = chain[0]
             .static_pad("sink")
-            .ok_or_else(|| "Recording audio resample has no sink pad.".to_owned())?;
-        if let Err(error) = request_pad.link(&resample_sink) {
+            .ok_or_else(|| "Recording audio queue has no sink pad.".to_owned())?;
+        if let Err(error) = request_pad.link(&queue_sink) {
             send_log(
                 &event_sender,
                 "warn",
@@ -5135,7 +5181,7 @@ pub(crate) fn insert_recording_branch(
     };
     if !audio_valves.is_empty() {
         chain_desc.push_str(&format!(
-            " | {} audio track(s): tap → resample → convert → caps → valve → voaacenc → mp4mux",
+            " | {} audio track(s): tap → queue → resample → convert → caps → valve → voaacenc → mp4mux",
             audio_valves.len()
         ));
     }

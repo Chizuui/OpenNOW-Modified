@@ -965,11 +965,15 @@ mod tests {
             rtp_video_chain_definition("h264", RtpVideoApi::D3D12).expect("H264 D3D12 chain");
         assert_eq!(h264[0].factory, "rtph264depay");
         assert_eq!(h264[3].factory, "d3d12h264dec");
-        assert_eq!(h264[4].factory, "dwritetextoverlay");
-        assert_eq!(h264[6].factory, "d3d12videosink");
-        assert!(!h264
-            .iter()
-            .any(|spec| spec.role == RtpVideoChainRole::PostDecodeCapsFilter));
+        // D3D12 H264 uses the safe system-memory present path: the field
+        // regression showed zero-copy decoding stop after the first frame
+        // while encoded RTP continued to arrive.
+        assert_eq!(h264[4].factory, "d3d12download");
+        assert_eq!(h264[5].factory, "videoconvert");
+        assert_eq!(h264[6].role, RtpVideoChainRole::PostDecodeCapsFilter);
+        assert_eq!(h264[6].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(h264[7].factory, "dwritetextoverlay");
+        assert_eq!(h264[9].factory, "d3d12videosink");
         assert!(!h264
             .iter()
             .any(|spec| spec.role == RtpVideoChainRole::ReceiveCapsFilter));
@@ -1039,11 +1043,24 @@ mod tests {
                 && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
         }));
 
-        // H264 keeps the zero-copy D3D path (no download/convert stage).
+        // H264 on D3D12 uses the same safe system-memory path. This guards
+        // against reintroducing the zero-copy stall seen in the field.
         let h264 =
             rtp_video_chain_definition("H264", RtpVideoApi::D3D12).expect("H264 D3D12 chain");
-        assert!(!h264.iter().any(|spec| spec.factory == "d3d12download"));
-        assert!(!h264.iter().any(|spec| spec.factory == "videoconvert"));
+        assert!(h264.iter().any(|spec| spec.factory == "d3d12download"));
+        assert!(h264.iter().any(|spec| spec.factory == "videoconvert"));
+        assert!(h264.iter().any(|spec| {
+            spec.role == RtpVideoChainRole::PostDecodeCapsFilter
+                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+        }));
+
+        // D3D11 H264 remains eligible for zero-copy; only the problematic
+        // D3D12 H264 path is forced through the safe present chain.
+        let d3d11_h264 =
+            rtp_video_chain_definition("H264", RtpVideoApi::D3D11).expect("H264 D3D11 chain");
+        assert!(!d3d11_h264
+            .iter()
+            .any(|spec| spec.factory == "d3d11download"));
     }
 
     #[test]
