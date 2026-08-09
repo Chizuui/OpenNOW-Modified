@@ -149,6 +149,7 @@ pub(crate) struct VideoLivenessState {
     last_sink_ms: AtomicU64,
     last_audio_ms: AtomicU64,
     first_startup_audio_ms: AtomicU64,
+    first_startup_encoded_ms: AtomicU64,
     decoded_total: AtomicU64,
     sink_total: AtomicU64,
     /// Decode finish timestamps, popped one per sink present to measure the
@@ -192,6 +193,7 @@ impl VideoLivenessState {
             last_sink_ms: AtomicU64::new(0),
             last_audio_ms: AtomicU64::new(0),
             first_startup_audio_ms: AtomicU64::new(0),
+            first_startup_encoded_ms: AtomicU64::new(0),
             decoded_total: AtomicU64::new(0),
             sink_total: AtomicU64::new(0),
             decode_timestamps: Mutex::new(VecDeque::new()),
@@ -263,6 +265,7 @@ impl VideoLivenessState {
             .store(false, Ordering::Relaxed);
         self.first_encoded_logged.store(false, Ordering::Relaxed);
         self.first_startup_audio_ms.store(0, Ordering::Relaxed);
+        self.first_startup_encoded_ms.store(0, Ordering::Relaxed);
         self.transition_flush_escalation_enabled.store(
             settings
                 .native_transition_diagnostics
@@ -285,9 +288,20 @@ impl VideoLivenessState {
     }
 
     pub(crate) fn record_encoded_buffer(&self, size: usize) {
-        self.last_encoded_ms.store(self.now_ms(), Ordering::Relaxed);
+        let now_ms = self.now_ms();
+        self.last_encoded_ms.store(now_ms, Ordering::Relaxed);
         self.encoded_bytes_total
             .fetch_add(size as u64, Ordering::Relaxed);
+        // First video RTP timestamp — the startup recovery keys off encoded
+        // video activity (not audio) so a decode stall on a silent screen
+        // (GFN Opus DTX sends no audio RTP during silence) still gets a
+        // keyframe request.
+        let _ = self.first_startup_encoded_ms.compare_exchange(
+            0,
+            now_ms,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn record_audio_buffer(&self) {
@@ -1010,26 +1024,28 @@ fn maybe_recover_video_startup(
     event_sender: &Option<Sender<Event>>,
 ) {
     let now_ms = state.now_ms();
-    let last_audio_ms = state.last_audio_ms.load(Ordering::Relaxed);
-    let first_audio_ms = state.first_startup_audio_ms.load(Ordering::Relaxed);
     let last_encoded_ms = state.last_encoded_ms.load(Ordering::Relaxed);
-    if first_audio_ms == 0
-        || last_audio_ms == 0
-        || now_ms.saturating_sub(last_audio_ms) > VIDEO_STARTUP_KEYFRAME_MS
+    let first_encoded_ms = state.first_startup_encoded_ms.load(Ordering::Relaxed);
+    // Gate the startup recovery on the ENCODED VIDEO RTP being live instead
+    // of audio: GFN game audio is Opus with DTX, so silent moments (loading
+    // screens, quiet menus) carry no audio RTP at all — keying off audio let
+    // a video decode stall on a silent screen run forever with no keyframe
+    // request (the 22:33 packaged-build regression: video RTP flowed at
+    // ~3 Mbps while d3d12h265dec produced zero frames, and the recovery never
+    // fired because last_audio_ms had gone stale). The encoded RTP counter is
+    // the direct proof the session's video path is alive.
+    if first_encoded_ms == 0
+        || now_ms.saturating_sub(last_encoded_ms) > VIDEO_STARTUP_KEYFRAME_MS
     {
         return;
     }
-    let audio_active_ms = now_ms.saturating_sub(first_audio_ms);
+    let encoded_active_ms = now_ms.saturating_sub(first_encoded_ms);
 
     let decoded_total = state.decoded_total.load(Ordering::Relaxed);
     let sink_total = state.sink_total.load(Ordering::Relaxed);
-    let encoded_age = if last_encoded_ms == 0 {
-        "never".to_owned()
-    } else {
-        format!("{}ms", now_ms.saturating_sub(last_encoded_ms))
-    };
+    let encoded_age = format!("{}ms", now_ms.saturating_sub(last_encoded_ms));
 
-    if audio_active_ms >= VIDEO_STARTUP_KEYFRAME_MS
+    if encoded_active_ms >= VIDEO_STARTUP_KEYFRAME_MS
         && !state
             .startup_keyframe_requested
             .swap(true, Ordering::Relaxed)
@@ -1038,20 +1054,20 @@ fn maybe_recover_video_startup(
             event_sender,
             "warn",
             format!(
-                "Native video startup has no rendered frame after {audio_active_ms}ms of active audio; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Requesting keyframe."
+                "Native video startup has no rendered frame after {encoded_active_ms}ms of incoming RTP; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Requesting keyframe."
             ),
         );
         request_upstream_key_unit(state, event_sender);
     }
 
-    if audio_active_ms >= VIDEO_STARTUP_RESYNC_MS
+    if encoded_active_ms >= VIDEO_STARTUP_RESYNC_MS
         && !state.startup_resync_requested.swap(true, Ordering::Relaxed)
     {
         send_log(
             event_sender,
             "warn",
             format!(
-                "Native video startup still has no rendered frame after {audio_active_ms}ms of active audio; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Requesting keyframe and GStreamer latency resync."
+                "Native video startup still has no rendered frame after {encoded_active_ms}ms of incoming RTP; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Requesting keyframe and GStreamer latency resync."
             ),
         );
         request_upstream_key_unit(state, event_sender);
@@ -1064,14 +1080,14 @@ fn maybe_recover_video_startup(
         }
     }
 
-    if audio_active_ms >= VIDEO_STARTUP_FATAL_MS
+    if encoded_active_ms >= VIDEO_STARTUP_FATAL_MS
         && !state.startup_fatal_reported.swap(true, Ordering::Relaxed)
     {
         send_log(
             event_sender,
             "error",
             format!(
-                "Native video startup still has no rendered frame after {audio_active_ms}ms of active audio; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Treating startup as failed instead of restarting the WebRTC pipeline."
+                "Native video startup still has no rendered frame after {encoded_active_ms}ms of incoming RTP; startupAge={now_ms}ms encodedAge={encoded_age} decoded={decoded_total} sink={sink_total}. Treating startup as failed instead of restarting the WebRTC pipeline."
             ),
         );
         request_upstream_key_unit(state, event_sender);
