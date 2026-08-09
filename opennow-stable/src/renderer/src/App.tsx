@@ -1246,6 +1246,14 @@ export function App(): JSX.Element {
     applyTranslucentUI(settings.translucentUI);
   }, [settings.translucentUI]);
 
+  useEffect(() => {
+    if (settings.lowPerformanceMode) {
+      document.body.classList.add("low-perf-mode");
+    } else {
+      document.body.classList.remove("low-perf-mode");
+    }
+  }, [settings.lowPerformanceMode]);
+
 
   const previewSetting = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]): void => {
     setSettings((prev) => (Object.is(prev[key], value) ? prev : { ...prev, [key]: value }));
