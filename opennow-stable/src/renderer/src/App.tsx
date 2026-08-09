@@ -1717,7 +1717,24 @@ export function App(): JSX.Element {
     void updateSetting("microphoneMode", value).catch((error) => {
       console.warn("Failed to persist microphone mode setting:", error);
     });
-  }, [updateSetting]);
+    // Mid-session, the native streamer owns the mic (WASAPI → Opus over the
+    // negotiated mic m-line). A persisted setting alone never reaches it, so
+    // a quick-menu mode change would otherwise leave the mic dead until the
+    // next session. Push the new state immediately and mirror it in
+    // diagnostics so the mic badge stays accurate.
+    if (streamStatus === "streaming") {
+      const snapshot = diagnosticsStore.getSnapshot();
+      if (snapshot.nativeRendererActive) {
+        const enabled = value !== "disabled";
+        diagnosticsStore.set({
+          ...diagnosticsStore.getSnapshot(),
+          micState: enabled ? "started" : "stopped",
+          micEnabled: enabled,
+        });
+        window.openNow?.setNativeMicrophoneEnabled?.(enabled);
+      }
+    }
+  }, [diagnosticsStore, streamStatus, updateSetting]);
 
   const resolveSessionClaimAppId = useCallback((existingSession: ActiveSessionInfo): string => {
     const trackedAppId = signalingRecoveryRef.current.appId;

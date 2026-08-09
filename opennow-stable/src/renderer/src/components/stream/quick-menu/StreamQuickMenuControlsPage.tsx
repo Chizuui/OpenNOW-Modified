@@ -3,6 +3,7 @@ import type { MicrophoneMode, VideoShaderSettings } from "@shared/gfn";
 import { SettingRange } from "../../settings/SettingRange";
 import { DEFAULT_VIDEO_SHADER_SETTINGS } from "@shared/gfn";
 import type { StreamDiagnosticsStore } from "../../../utils/streamDiagnosticsStore";
+import { useStreamDiagnosticsSelector } from "../../../utils/streamDiagnosticsStore";
 import { SidebarMicMutedBadge } from "../StreamEmptyStates";
 
 const MICROPHONE_MODES = [
@@ -53,6 +54,15 @@ export function StreamQuickMenuControlsPage({
   micTrack,
   micMeterRef,
 }: StreamQuickMenuControlsPageProps): JSX.Element {
+  // In native mode the renderer has no MediaStream mic track (the native
+  // streamer captures WASAPI and sends Opus itself), so `micTrack` is always
+  // null there and the mic state lives in the diagnostics store. Use the
+  // store's micEnabled for the "not active" hint instead of assuming a null
+  // track means the mic is dead.
+  const nativeMicActive = useStreamDiagnosticsSelector(
+    diagnosticsStore,
+    (stats) => stats.nativeRendererActive === true && (stats.micEnabled ?? false) === true,
+  );
   return (
     <div className="sidebar-page" role="tabpanel">
       <section className="sidebar-section">
@@ -244,7 +254,9 @@ export function StreamQuickMenuControlsPage({
               className="mic-meter-canvas"
               aria-label="Microphone send level (what others hear)"
             />
-            {!micTrack && <span className="sidebar-hint">Mic not active — check mode and permissions.</span>}
+            {!micTrack && !nativeMicActive && (
+              <span className="sidebar-hint">Mic not active — check mode and permissions.</span>
+            )}
           </div>
         )}
       </section>
