@@ -28,6 +28,22 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+/** UTF-8-safe base64 decode (the payloads carry JSON control messages). */
+export function decodeBase64Utf8(value: string): string {
+  const bytes = Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+/** UTF-8-safe base64 encode (JSON control message replies). */
+export function encodeBase64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
 export async function readStreamClipboardText(): Promise<string> {
   try {
     const browserClipboard = navigator.clipboard;

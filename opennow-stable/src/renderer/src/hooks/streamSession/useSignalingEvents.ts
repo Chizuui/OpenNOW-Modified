@@ -16,6 +16,12 @@ import { decideSignalingDisconnect } from "../../lib/streamRecoveryDecisions";
 import { warningMessage, warningTone } from "../../lib/sessionWarnings";
 import { resolveStreamProfileCodec } from "../../lib/codecDiagnostics";
 import { GfnWebRtcClient } from "../../platforms/gfn/webrtcClient";
+import { dispatchNativeDataChannelMessage } from "../../lib/nativeDataChannelRegistry";
+import {
+  GFN_CONTROL_CHANNEL_LABEL,
+  installClipboardControlChannelHandler,
+} from "../../platforms/gfn/controlChannel";
+import { DEFAULT_CLIPBOARD_MAX_BYTES } from "../../platforms/gfn/clipboardProtocol";
 import type { StreamDiagnosticsStore } from "../../utils/streamDiagnosticsStore";
 import type { StreamRuntimeState } from "./useStreamRuntimeState";
 
@@ -365,6 +371,14 @@ export function useSignalingEvents({
           if (settings.clipboardPaste && (!nativeStreamingRef.current || nativeInputBridgeReady)) {
             void sendStreamClipboardPaste(clientRef.current);
           }
+        } else if (event.type === "native-data-channel-message") {
+          // Generic relay: native streamer forwards every non-native remote
+          // data channel verbatim; registered handlers (clipboard control
+          // channel, etc.) decide what to do per label.
+          dispatchNativeDataChannelMessage({
+            label: event.label,
+            payloadBase64: event.payloadBase64,
+          });
         } else if (event.type === "native-input-capture-changed") {
           setNativeInputCaptureActive(event.captured);
           // When the native streamer captures input itself (stacked sink
@@ -563,5 +577,24 @@ export function useSignalingEvents({
 
     return () => unsubscribe();
   }, [attemptSessionRecovery, diagnosticsStore, handleExpectedNativeSessionClose, markDiscordStreamStarted, nativeInputBridgeReady, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
+
+  // Register the control-channel clipboard handler for the lifetime of this
+  // session (native relay; web registers its own copy when the control channel
+  // opens). Other server-initiated data channel features can register their own
+  // handlers against the same registry.
+  useEffect(
+    () =>
+      installClipboardControlChannelHandler({
+        enabled: () => settings.clipboardPaste,
+        maxBytes: DEFAULT_CLIPBOARD_MAX_BYTES,
+        readClipboardText: readStreamClipboardText,
+        sendReply: (payloadBase64) =>
+          window.openNow.sendNativeDataChannelMessage(
+            GFN_CONTROL_CHANNEL_LABEL,
+            payloadBase64,
+          ),
+      }),
+    [settings.clipboardPaste],
+  );
 
 }

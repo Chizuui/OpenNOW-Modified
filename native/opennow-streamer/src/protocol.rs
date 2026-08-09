@@ -38,6 +38,12 @@ pub struct CommandEnvelope {
     /// the capture valve without finalizing).
     #[serde(default)]
     pub finalize: Option<bool>,
+    /// For `send-data-channel-message`: the remote data channel label to send
+    /// on (e.g. GFN's `control_channel`) and the base64 payload.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default, rename = "payloadBase64")]
+    pub payload_base64: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -651,6 +657,16 @@ pub enum Event {
     },
     #[serde(rename = "clipboard-paste")]
     ClipboardPaste,
+    /// A message received on a remote WebRTC data channel that is not one of
+    /// the natively-handled channels (input handshake / stats). Base64 payload
+    /// + label, relayed verbatim so the renderer can implement protocols like
+    /// GFN's clipboard `control_channel` (server-initiated paste requests).
+    #[serde(rename = "data-channel-message")]
+    DataChannelMessage {
+        label: String,
+        #[serde(rename = "payloadBase64")]
+        payload_base64: String,
+    },
     #[serde(rename = "input-capture-changed")]
     InputCaptureChanged { captured: bool },
     #[serde(rename = "video-stall")]
@@ -844,6 +860,34 @@ mod tests {
         });
         let command: CommandEnvelope = serde_json::from_value(value).expect("deserialize");
         assert_eq!(command.finalize, Some(true));
+    }
+
+    #[test]
+    fn data_channel_message_command_parses_label_and_payload() {
+        let value = serde_json::json!({
+            "id": "dc-1",
+            "type": "send-data-channel-message",
+            "label": "control_channel",
+            "payloadBase64": "eyJjdXN0b21NZXNzYWdlIjoie30ifQ=="
+        });
+        let command: CommandEnvelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(command.label.as_deref(), Some("control_channel"));
+        assert_eq!(
+            command.payload_base64.as_deref(),
+            Some("eyJjdXN0b21NZXNzYWdlIjoie30ifQ==")
+        );
+    }
+
+    #[test]
+    fn data_channel_message_event_serializes_camel_case() {
+        let event = Event::DataChannelMessage {
+            label: "control_channel".to_owned(),
+            payload_base64: "Y2xpcGJvYXJkLXJlcGx5".to_owned(),
+        };
+        let value = serde_json::to_value(event).expect("serializes");
+        assert_eq!(value["type"], "data-channel-message");
+        assert_eq!(value["label"], "control_channel");
+        assert_eq!(value["payloadBase64"], "Y2xpcGJvYXJkLXJlcGx5");
     }
 
     #[test]

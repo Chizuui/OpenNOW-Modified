@@ -209,6 +209,16 @@ export class SignalingCoordinator {
     );
 
     ipcMain.handle(
+      IPC_CHANNELS.NATIVE_DATA_CHANNEL_SEND,
+      async (_event, label: string, payloadBase64: string): Promise<void> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          throw new Error("Native streamer is not active for this session.");
+        }
+        await this.getNativeStreamerManager().sendDataChannelMessage(label, payloadBase64);
+      },
+    );
+
+    ipcMain.handle(
       IPC_CHANNELS.REQUEST_KEYFRAME,
       async (_event, payload: KeyframeRequest) => {
         if (!this.signalingClient) {

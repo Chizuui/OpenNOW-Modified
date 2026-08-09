@@ -129,6 +129,9 @@ fn handle_command(
         "stop-recording" => {
             return write_reply(backend.stop_recording(command));
         }
+        "send-data-channel-message" => {
+            return write_reply(backend.send_data_channel_message(command));
+        }
         "stop" => {
             return write_reply(backend.stop(command));
         }

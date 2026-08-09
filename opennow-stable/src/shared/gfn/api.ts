@@ -243,6 +243,12 @@ export interface OpenNowApi {
   /** Abort the native recording without finalizing the file. */
   abortNativeRecording(): Promise<void>;
 
+  /**
+   * Send a base64 message on a remote WebRTC data channel of the native
+   * streamer (e.g. GFN `control_channel` clipboard responses).
+   */
+  sendNativeDataChannelMessage(label: string, payloadBase64: string): Promise<void>;
+
   /** List recent screenshots from the persistent screenshot directory */
   listScreenshots(): Promise<ScreenshotEntry[]>;
 

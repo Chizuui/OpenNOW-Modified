@@ -27,11 +27,22 @@ import {
   CLIPBOARD_CLIENT_ADDED_DATA,
   CLIPBOARD_CLIENT_DATA_RESPONSE,
   CLIPBOARD_CLIENT_REMOVED_DATA,
-  isClipboardServerDataRequest,
-  parseClipboardControlMessage,
+  DEFAULT_CLIPBOARD_MAX_BYTES,
   validateClipboardText,
   type ClipboardTracingData,
 } from "./clipboardProtocol";
+import {
+  dispatchNativeDataChannelMessage,
+} from "../../lib/nativeDataChannelRegistry";
+import {
+  decodeBase64Utf8,
+  encodeBase64Utf8,
+} from "../../lib/streamSessionHelpers";
+import {
+  GFN_CONTROL_CHANNEL_LABEL,
+  installClipboardControlChannelHandler,
+  installTimerNotificationHandler,
+} from "./controlChannel";
 import {
   buildNvstSdp,
   extractIceCredentials,
@@ -124,8 +135,6 @@ interface OfferSettings {
   fallbackCodec?: FallbackCodecPreference;
   nativeTransitionDiagnostics?: NativeTransitionDiagnostics;
 }
-
-const DEFAULT_CLIPBOARD_MAX_BYTES = 1024 * 1024;
 
 function hevcPreferredProfileId(colorQuality: ColorQuality): 1 | 2 {
   // 10-bit modes should prefer HEVC Main10 profile-id=2.
@@ -382,6 +391,8 @@ export class GfnWebRtcClient {
   private clipboardPasteEnabled = false;
   private clipboardMaxBytes = DEFAULT_CLIPBOARD_MAX_BYTES;
   private lastAdvertisedClipboardAvailable: boolean | null = null;
+  /** Registry handler cleanups active while the control channel is open. */
+  private controlChannelHandlerCleanups: Array<() => void> = [];
 
   private partialReliableThresholdMs = GfnWebRtcClient.DEFAULT_PARTIAL_RELIABLE_THRESHOLD_MS;
   private riInputCapabilities: RiInputCapabilities = {
@@ -791,16 +802,6 @@ export class GfnWebRtcClient {
 
     this.controlChannel.send(JSON.stringify(buildClipboardControlMessage(pasteType, { text, tracingData })));
     return true;
-  }
-
-  private async handleClipboardServerRequest(tracingData?: ClipboardTracingData): Promise<void> {
-    const text = await this.readClipboardTextForPaste();
-    this.sendClipboardControlMessage(
-      text ? CLIPBOARD_CLIENT_DATA_RESPONSE : CLIPBOARD_CLIENT_REMOVED_DATA,
-      text,
-      tracingData,
-    );
-    this.lastAdvertisedClipboardAvailable = Boolean(text);
   }
 
   public suppressNextSyntheticEscapeOnPointerLockLoss(durationMs = 1000): void {
@@ -1978,20 +1979,13 @@ export class GfnWebRtcClient {
     };
   }
 
-  private mapTimerNotificationCode(rawCode: number): StreamTimeWarning["code"] | null {
-    // Mirrors official client behavior from timerNotification -> StreamWarningType.
-    if (rawCode === 1 || rawCode === 2) {
-      return 1;
-    }
-    if (rawCode === 4) {
-      return 2;
-    }
-    if (rawCode === 6) {
-      return 3;
-    }
-    return null;
-  }
 
+  /**
+   * Route a control-channel message into the shared feature registry. The
+   * clipboard + timer handlers are registered while the channel is open (see
+   * `registerControlChannelHandlers`), so server-initiated features live in
+   * one place and both web and native transports dispatch through it.
+   */
   private async onControlChannelMessage(data: string | Blob | ArrayBuffer): Promise<void> {
     let payloadText: string;
     if (typeof data === "string") {
@@ -2004,44 +1998,59 @@ export class GfnWebRtcClient {
       return;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(payloadText);
-    } catch {
-      return;
-    }
+    dispatchNativeDataChannelMessage({
+      label: GFN_CONTROL_CHANNEL_LABEL,
+      payloadBase64: encodeBase64Utf8(payloadText),
+    });
+  }
 
-    const clipboardPayload = parseClipboardControlMessage(parsed);
-    if (isClipboardServerDataRequest(clipboardPayload)) {
-      void this.handleClipboardServerRequest(clipboardPayload?.tracingData);
-      return;
-    }
+  /**
+   * Register this client's control-channel feature handlers against the shared
+   * registry. Only active while a control channel is open (web mode) — the
+   * native mode renderer client never opens one, so its native relay dispatch
+   * is handled by the session-level clipboard handler instead and there is no
+   * double answering.
+   */
+  private registerControlChannelHandlers(): void {
+    this.unregisterControlChannelHandlers();
+    this.controlChannelHandlerCleanups = [
+      installClipboardControlChannelHandler({
+        enabled: () => this.clipboardPasteEnabled,
+        maxBytes: this.clipboardMaxBytes,
+        readClipboardText: async () => {
+          if (!this.options.readClipboardText) {
+            return "";
+          }
+          try {
+            return await this.options.readClipboardText();
+          } catch (error) {
+            this.log(
+              `Clipboard read failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return "";
+          }
+        },
+        sendReply: (payloadBase64) => {
+          if (this.controlChannel?.readyState === "open") {
+            this.controlChannel.send(decodeBase64Utf8(payloadBase64));
+          }
+        },
+        onAnswered: (text) => {
+          this.lastAdvertisedClipboardAvailable = Boolean(text);
+        },
+      }),
+      installTimerNotificationHandler({
+        onTimeWarning: this.options.onTimeWarning,
+        log: (line) => this.log(line),
+      }),
+    ];
+  }
 
-    if (!parsed || typeof parsed !== "object" || !("timerNotification" in parsed)) {
-      return;
+  private unregisterControlChannelHandlers(): void {
+    for (const cleanup of this.controlChannelHandlerCleanups) {
+      cleanup();
     }
-
-    const timerNotification = (parsed as { timerNotification?: unknown }).timerNotification;
-    if (!timerNotification || typeof timerNotification !== "object") {
-      return;
-    }
-
-    const rawCode = Number((timerNotification as { code?: unknown }).code);
-    const mappedCode = this.mapTimerNotificationCode(rawCode);
-    if (mappedCode === null) {
-      this.log(`Control timer notification ignored: code=${rawCode}`);
-      return;
-    }
-
-    const rawSecondsLeft = Number((timerNotification as { secondsLeft?: unknown }).secondsLeft);
-    const secondsLeft =
-      Number.isFinite(rawSecondsLeft) && rawSecondsLeft >= 0
-        ? Math.floor(rawSecondsLeft)
-        : undefined;
-    this.log(
-      `Control timer warning: rawCode=${rawCode} mappedCode=${mappedCode} secondsLeft=${secondsLeft ?? "n/a"}`,
-    );
-    this.options.onTimeWarning?.({ code: mappedCode, secondsLeft });
+    this.controlChannelHandlerCleanups = [];
   }
 
   private async flushQueuedCandidates(): Promise<void> {
@@ -2440,6 +2449,7 @@ export class GfnWebRtcClient {
       this.controlChannel.onopen = () => {
         this.log("Control channel open");
         this.lastAdvertisedClipboardAvailable = null;
+        this.registerControlChannelHandlers();
         void this.refreshClipboardAvailability();
       };
       this.controlChannel.onmessage = (msgEvent) => {
@@ -2450,6 +2460,7 @@ export class GfnWebRtcClient {
         if (this.controlChannel === channel) {
           this.controlChannel = null;
           this.lastAdvertisedClipboardAvailable = null;
+          this.unregisterControlChannelHandlers();
         }
       };
       this.controlChannel.onerror = () => {
@@ -2824,6 +2835,7 @@ export class GfnWebRtcClient {
 
   dispose(): void {
     this.cleanupPeerConnection();
+    this.unregisterControlChannelHandlers();
     this.releaseNativeMouse();
     this.externalEscapeCleanup?.();
     this.externalEscapeCleanup = null;
