@@ -689,6 +689,32 @@ impl NativeStreamerBackend for GstreamerBackend {
         }
     }
 
+    fn send_data_channel_message(&mut self, command: CommandEnvelope) -> BackendReply {
+        let id = command.id;
+        let Some(label) = command.label.as_deref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "missing-field".to_owned(),
+                message: "data-channel-message requires a label.".to_owned(),
+            });
+        };
+        let Some(payload_base64) = command.payload_base64.as_deref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "missing-field".to_owned(),
+                message: "data-channel-message requires a payloadBase64.".to_owned(),
+            });
+        };
+        match crate::gstreamer_input::send_remote_data_channel_message(label, payload_base64) {
+            Ok(()) => BackendReply::response(Response::Ok { id }),
+            Err(message) => BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "data-channel-send-failed".to_owned(),
+                message,
+            }),
+        }
+    }
+
     fn stop(&mut self, command: CommandEnvelope) -> BackendReply {
         self.active_context = None;
         self.pending_remote_ice.clear();

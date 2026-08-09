@@ -12,10 +12,13 @@ use crate::input::{
 use crate::protocol::Event;
 #[cfg(target_os = "windows")]
 use crate::protocol::NativeStreamerShortcutAction;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_webrtc as gst_webrtc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 #[cfg(target_os = "windows")]
@@ -1517,12 +1520,59 @@ fn connect_input_channel_callbacks(
     }
 }
 
+/// Remote WebRTC data channels (created by the server, e.g. GFN's
+/// `control_channel`) keyed by label. The input/stats channels are created
+/// locally; anything else is registered here so the renderer can reply over
+/// the same channel (clipboard control messages, etc.).
+static REMOTE_DATA_CHANNELS: OnceLock<Mutex<HashMap<String, gst_webrtc::WebRTCDataChannel>>> =
+    OnceLock::new();
+
+/// Send a base64 payload on a remote data channel (e.g. GFN `control_channel`
+/// clipboard responses). Returns an error when the channel is unknown or not
+/// open so the caller can surface it instead of silently dropping the reply.
+pub(crate) fn send_remote_data_channel_message(
+    label: &str,
+    payload_base64: &str,
+) -> Result<(), String> {
+    let payload = BASE64_STANDARD
+        .decode(payload_base64)
+        .map_err(|error| format!("Invalid data-channel payload base64: {error}"))?;
+    let channels = REMOTE_DATA_CHANNELS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "Remote data channel registry poisoned.".to_owned())?;
+    let Some(channel) = channels.get(label) else {
+        return Err(format!(
+            "No remote data channel registered with label \"{label}\"."
+        ));
+    };
+    if channel.ready_state() != gst_webrtc::WebRTCDataChannelState::Open {
+        return Err(format!("Remote data channel \"{label}\" is not open."));
+    }
+    let bytes = glib::Bytes::from_owned(payload);
+    channel
+        .send_data_full(Some(&bytes))
+        .map_err(|error| format!("Failed to send on remote data channel \"{label}\": {error}"))
+}
+
 fn connect_remote_data_channel_callbacks(
     label: &str,
     channel: &gst_webrtc::WebRTCDataChannel,
     event_sender: Option<Sender<Event>>,
 ) {
     let label = label.to_owned();
+    // Register non-native channels so replies can be routed back to the server.
+    if label != STATS_CHANNEL_LABEL
+        && label != RELIABLE_INPUT_CHANNEL_LABEL
+        && label != PARTIALLY_RELIABLE_INPUT_CHANNEL_LABEL
+    {
+        if let Ok(mut channels) = REMOTE_DATA_CHANNELS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            channels.insert(label.clone(), channel.clone());
+        }
+    }
     let open_sender = event_sender.clone();
     let open_label = label.clone();
     channel.connect_on_open(move |_| {
@@ -1544,7 +1594,7 @@ fn connect_remote_data_channel_callbacks(
     });
 
     let stats_sender = event_sender.clone();
-    let error_sender = event_sender;
+    let error_sender = event_sender.clone();
     let error_label = label.clone();
     channel.connect_on_error(move |_, error| {
         send_log(
@@ -1553,6 +1603,42 @@ fn connect_remote_data_channel_callbacks(
             format!("Remote data channel error on {error_label}: {error}."),
         );
     });
+
+    // Non-native remote channels (GFN `control_channel` and friends): relay
+    // every message verbatim (base64) to the renderer so server-initiated
+    // protocols — clipboard paste requests, etc. — work in native mode exactly
+    // like the web client's data channel handler.
+    if label != STATS_CHANNEL_LABEL {
+        let relay_sender = event_sender.clone();
+        let relay_label = label.clone();
+        channel.connect_on_message_data(move |_channel, data| {
+            let Some(bytes) = data else {
+                return;
+            };
+            let payload_base64 = BASE64_STANDARD.encode(bytes.as_ref());
+            if let Some(sender) = relay_sender.as_ref() {
+                let _ = sender.send(Event::DataChannelMessage {
+                    label: relay_label.clone(),
+                    payload_base64,
+                });
+            }
+        });
+
+        let relay_sender = event_sender.clone();
+        let relay_label = label.clone();
+        channel.connect_on_message_string(move |_channel, message| {
+            let Some(message) = message else {
+                return;
+            };
+            let payload_base64 = BASE64_STANDARD.encode(message.as_bytes());
+            if let Some(sender) = relay_sender.as_ref() {
+                let _ = sender.send(Event::DataChannelMessage {
+                    label: relay_label.clone(),
+                    payload_base64,
+                });
+            }
+        });
+    }
 
     // GFN `stats_channel`: parse the server-reported game FPS + network
     // telemetry (RTT, packet loss) so the native HUD shows the same numbers as

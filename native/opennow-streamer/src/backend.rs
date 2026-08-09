@@ -28,6 +28,7 @@ pub trait NativeStreamerBackend {
     fn take_screenshot(&mut self, command: CommandEnvelope) -> BackendReply;
     fn start_recording(&mut self, command: CommandEnvelope) -> BackendReply;
     fn stop_recording(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn send_data_channel_message(&mut self, command: CommandEnvelope) -> BackendReply;
     fn stop(&mut self, command: CommandEnvelope) -> BackendReply;
 }
 
@@ -669,6 +670,14 @@ impl NativeStreamerBackend for StubBackend {
             id: Some(command.id),
             code: "recording-unavailable".to_owned(),
             message: "Recording requires the GStreamer media backend.".to_owned(),
+        })
+    }
+
+    fn send_data_channel_message(&mut self, command: CommandEnvelope) -> BackendReply {
+        BackendReply::response(Response::Error {
+            id: Some(command.id),
+            code: "data-channel-unavailable".to_owned(),
+            message: "Data channel messages require the GStreamer media backend.".to_owned(),
         })
     }
 

@@ -2,6 +2,9 @@ export const GFN_CLIPBOARD_MESSAGE_TYPE = "PASTE";
 export const GFN_CLIPBOARD_CLIENT_RECIPIENT = "UIPlugin";
 export const GFN_CLIPBOARD_SERVER_RECIPIENT = "GFN_CLIENT_UI";
 
+/** Maximum UTF-8 clipboard bytes to advertise/send (web + native share this). */
+export const DEFAULT_CLIPBOARD_MAX_BYTES = 1024 * 1024;
+
 export const CLIPBOARD_CLIENT_ADDED_DATA = "CLIENT_ADDED_DATA";
 export const CLIPBOARD_CLIENT_REMOVED_DATA = "CLIENT_REMOVED_DATA";
 export const CLIPBOARD_CLIENT_DATA_RESPONSE = "CLIENT_DATA_RESPONSE";

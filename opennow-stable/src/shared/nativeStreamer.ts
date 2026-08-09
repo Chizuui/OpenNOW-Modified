@@ -100,6 +100,12 @@ export type NativeStreamerCommand =
       id: string;
       type: "stop-recording";
       finalize: boolean;
+    }
+  | {
+      id: string;
+      type: "send-data-channel-message";
+      label: string;
+      payloadBase64: string;
     };
 
 export type NativeStreamerResponse =
@@ -149,6 +155,12 @@ export type NativeStreamerEvent =
     }
   | {
       type: "clipboard-paste";
+    }
+  | {
+      /** Server-initiated message on a remote data channel (e.g. GFN `control_channel`). */
+      type: "data-channel-message";
+      label: string;
+      payloadBase64: string;
     }
   | {
       type: "input-capture-changed";

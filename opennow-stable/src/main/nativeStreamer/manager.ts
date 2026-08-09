@@ -80,8 +80,8 @@ const SESSION_START_TIMEOUT_MS = process.platform === "win32" ? 90000 : 45000;
 const SURFACE_UPDATE_TIMEOUT_MS = 15000;
 const OFFER_TIMEOUT_MS = 20000;
 const STOP_TIMEOUT_MS = 1200;
-const SCREENSHOT_TIMEOUT_MS = 5000;
-const RECORDING_STOP_TIMEOUT_MS = 5000;
+const SCREENSHOT_TIMEOUT_MS = 5000;  const RECORDING_STOP_TIMEOUT_MS = 5000;
+  const DATA_CHANNEL_SEND_TIMEOUT_MS = 3000;
 const MAX_INPUT_STDIN_BUFFER_BYTES = 64 * 1024;
 const MIN_NATIVE_BITRATE_KBPS = 5_000;
 const MAX_NATIVE_BITRATE_KBPS = 150_000;
@@ -403,6 +403,21 @@ export class NativeStreamerManager {
       this.activeNativeRecordingId = null;
       throw error;
     }
+  }
+
+  /**
+   * Send a message on a remote WebRTC data channel (e.g. GFN's
+   * `control_channel` — clipboard responses). The channel must have been
+   * created by the server and registered by the native streamer.
+   */
+  async sendDataChannelMessage(label: string, payloadBase64: string): Promise<void> {
+    if (!this.child || !this.activeSessionId) {
+      throw new Error("Native streamer is not running.");
+    }
+    await this.request(
+      { type: "send-data-channel-message", label, payloadBase64 },
+      DATA_CHANNEL_SEND_TIMEOUT_MS,
+    );
   }
 
   /**
@@ -805,6 +820,15 @@ export class NativeStreamerManager {
 
     if (message.type === "clipboard-paste") {
       this.options.emit({ type: "native-clipboard-paste" });
+      return;
+    }
+
+    if (message.type === "data-channel-message") {
+      this.options.emit({
+        type: "native-data-channel-message",
+        label: message.label,
+        payloadBase64: message.payloadBase64,
+      });
       return;
     }
 
