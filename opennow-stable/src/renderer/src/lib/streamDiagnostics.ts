@@ -2,6 +2,14 @@ import type { NativeStreamStats } from "@shared/gfn";
 
 import type { StreamDiagnostics } from "../platforms/gfn/webrtcClient";
 
+// Native stats events arrive roughly once a second. When a stats merge has
+// no fresh RTT source (no local RTCP measurement yet and the server field
+// is 0/absent), the last ping is kept for only a few merges before it
+// decays to 0 (HUD "--") — a one-off spike value must never stick in the
+// HUD as a stale "current" ping.
+const NATIVE_RTT_STALE_SAMPLE_LIMIT = 5;
+let nativeRttStaleSamples = 0;
+
 export function defaultDiagnostics(): StreamDiagnostics {
   return {
     connectionState: "closed",
@@ -91,6 +99,23 @@ export function mergeNativeStreamStats(
     !stats.memoryMode && stats.zeroCopyD3D11 ? "D3D11 zero-copy" : "",
   ].filter(Boolean).join(" · ");
 
+  // Live native ping: prefer the local RTCP measurement, then the server
+  // stats_channel field. When neither reports anything for a few consecutive
+  // merges, the previous value decays to 0 ("--") instead of sticking.
+  const freshLocalRtcp = stats.localRtcpRttMs !== undefined && stats.localRtcpRttMs > 0;
+  const freshServerRtt = stats.networkRttMs !== undefined && stats.networkRttMs > 0;
+  let rttMs: number;
+  if (freshLocalRtcp || freshServerRtt) {
+    nativeRttStaleSamples = 0;
+    rttMs = freshLocalRtcp ? stats.localRtcpRttMs! : stats.networkRttMs!;
+  } else if (current.rttMs > 0 && nativeRttStaleSamples < NATIVE_RTT_STALE_SAMPLE_LIMIT) {
+    nativeRttStaleSamples += 1;
+    rttMs = current.rttMs;
+  } else {
+    nativeRttStaleSamples = 0;
+    rttMs = 0;
+  }
+
   return {
     ...current,
     connectionState: "connected",
@@ -115,15 +140,12 @@ export function mergeNativeStreamStats(
       : current.decodeTimeMs,
     // Native ping source, in preference order: (1) locally computed RTCP
     // LSR/DLSR round-trip from Receiver Reports the server sends about our
-    // outgoing RTP — the requested local measurement, active once the
-    // pipeline sends RTP; (2) the server-reported stats_channel RTT (the
-    // server's own LSR/DLSR measurement of OUR receiver reports); (3) the
-    // previous value. 0/undefined = no source yet → HUD keeps "--".
-    rttMs: stats.localRtcpRttMs !== undefined && stats.localRtcpRttMs > 0
-      ? stats.localRtcpRttMs
-      : (stats.networkRttMs !== undefined && stats.networkRttMs > 0
-        ? stats.networkRttMs
-        : current.rttMs),
+    // outgoing RTP — the live local measurement (the native pipeline always
+    // negotiates the mic m-line sendonly so RTP flows and RTCP RRs come
+    // back); (2) the server-reported stats_channel RTT; (3) the previous
+    // value, only while it is fresh (see NATIVE_RTT_STALE_SAMPLE_LIMIT).
+    // 0 = no fresh source → HUD keeps "--".
+    rttMs,
     framesReceived: stats.framesDecoded,
     framesDecoded: stats.framesDecoded,
     framesDropped: sinkDropped,
@@ -159,7 +181,7 @@ export function mergeNativeStreamStats(
     // RTT/loss: ≥1% loss or ≥75ms RTT = network lag, else render-drop / stable.
     lagReason: (stats.networkPacketLossPercent !== undefined
         && stats.networkPacketLossPercent >= 1)
-      || (stats.networkRttMs !== undefined && stats.networkRttMs >= 75)
+      || rttMs >= 75
       ? "network"
       : (dropPercent > 1 ? "render" : "stable"),
     lagReasonDetail: stats.lastTransitionSummary

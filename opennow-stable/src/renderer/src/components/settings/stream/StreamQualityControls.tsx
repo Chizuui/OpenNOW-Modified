@@ -20,9 +20,12 @@ import {
   getCodecDecodeBadgeState,
   isCodecUsableForStream,
   resolveEffectiveCodec,
+  resolveNativeCodecAvailability,
   resolveSupportedStreamCodecs,
   type CodecTestResult,
+  type NativeCodecAvailability,
 } from "../../../lib/codecDiagnostics";
+import { useNativeStreamerStatus } from "../../../hooks/useNativeStreamerStatus";
 import { useTranslation } from "../../../i18n";
 import { MotionSpinner } from "../../MotionSpinner";
 import { SelectDropdown, type SelectDropdownOption } from "../../ui/SelectDropdown";
@@ -60,6 +63,19 @@ export function StreamQualityControls({
   onOpenCodecDiagnostics,
 }: StreamQualityControlsProps): JSX.Element {
   const { t } = useTranslation();
+  // In native mode the codec dropdown uses the native streamer's own decoder
+  // capabilities (videoBackends[].codecs[].available) instead of the browser
+  // mediaCapabilities probe — so H.265 is not wrongly marked "Unsupported" on
+  // machines without the Chromium HEVC extension while the native streamer
+  // decodes it fine (d3d12h265dec etc.). Falls back to the browser probe when
+  // the streamer status is missing/loading.
+  const nativeStreamerStatus = useNativeStreamerStatus(settings.streamClientMode === "native");
+  const nativeAvailability = useMemo<NativeCodecAvailability | null>(
+    () => (settings.streamClientMode === "native"
+      ? resolveNativeCodecAvailability(nativeStreamerStatus.status)
+      : null),
+    [nativeStreamerStatus.status, settings.streamClientMode],
+  );
   const effectiveEntitledResolutions = useMemo(() => {
     const baseResolutions = entitledResolutions.length > 0
       ? entitledResolutions
@@ -142,14 +158,17 @@ export function StreamQualityControls({
     }
   }, [handleChange, settings.colorQuality]);
 
-  const autoPickedCodec = useMemo(() => resolveEffectiveCodec("auto"), []);
+  const autoPickedCodec = useMemo(
+    () => resolveEffectiveCodec("auto", nativeAvailability),
+    [nativeAvailability],
+  );
 
   // GPU/CPU decode badge next to each concrete codec option (mirrors the
   // diagnostics panel's powerEfficient result) so users can see at a glance
   // whether the device decodes a codec in hardware before picking it.
   const codecLabelWithDecodeBadge = useCallback(
     (codec: VideoCodec): ReactNode => {
-      const badge = getCodecDecodeBadgeState(codec, codecResults, false);
+      const badge = getCodecDecodeBadgeState(codec, codecResults, false, nativeAvailability);
       if (!badge) return codec;
       return (
         <span className="codec-option-label">
@@ -160,7 +179,7 @@ export function StreamQualityControls({
         </span>
       );
     },
-    [codecResults, t],
+    [codecResults, nativeAvailability, t],
   );
 
   // When the selected concrete codec only decodes on the CPU, the session
@@ -171,7 +190,7 @@ export function StreamQualityControls({
     if (settings.codec === "auto" || !codecResults || codecResults.length === 0) {
       return null;
     }
-    const badge = getCodecDecodeBadgeState(settings.codec, codecResults, false);
+    const badge = getCodecDecodeBadgeState(settings.codec, codecResults, false, nativeAvailability);
     if (badge !== "cpu") return null;
     // Mirror the createSession ladder resolution: the first ladder entry the
     // client can actually decode wins (AV1→H265→H264, H265→H264). Computing
@@ -180,11 +199,11 @@ export function StreamQualityControls({
     // undecodable (e.g. H265 without the HEVC extension → request lands on H264).
     const ladder: readonly VideoCodec[] =
       settings.codec === "AV1" ? ["H265", "H264"] : settings.codec === "H265" ? ["H264"] : [];
-    const supported = new Set(resolveSupportedStreamCodecs(codecResults));
+    const supported = new Set(resolveSupportedStreamCodecs(codecResults, nativeAvailability));
     const fallback = ladder.find((candidate) => supported.has(candidate)) ?? null;
     if (!fallback) return null;
     return t("settings.video.codecCpuDecodeHint", { codec: settings.codec, fallback });
-  }, [codecResults, settings.codec, t]);
+  }, [codecResults, nativeAvailability, settings.codec, t]);
 
   // GFN-web-style codec dropdown: Auto first (with the resolved codec in
   // parentheses), then the concrete codecs. Codecs the device cannot decode are
@@ -207,7 +226,7 @@ export function StreamQualityControls({
         });
         continue;
       }
-      const usable = isCodecUsableForStream(preference, codecResults);
+      const usable = isCodecUsableForStream(preference, codecResults, nativeAvailability);
       if (usable) {
         supported.push({ value: preference, label: codecLabelWithDecodeBadge(preference) });
       } else {
@@ -231,7 +250,7 @@ export function StreamQualityControls({
     }
 
     return [...supported, ...unsupported];
-  }, [autoPickedCodec, codecResults, t]);
+  }, [autoPickedCodec, codecResults, nativeAvailability, t]);
 
   const handleCodecPreferenceChange = useCallback((value: string): void => {
     if (value === "__see_why__") {
@@ -253,7 +272,7 @@ export function StreamQualityControls({
         supported.push({ value: "auto", label: t("app.labels.auto") });
         continue;
       }
-      const usable = isCodecUsableForStream(preference, codecResults);
+      const usable = isCodecUsableForStream(preference, codecResults, nativeAvailability);
       if (usable) {
         supported.push({ value: preference, label: codecLabelWithDecodeBadge(preference) });
       } else {
@@ -266,7 +285,7 @@ export function StreamQualityControls({
       }
     }
     return [...supported, ...unsupported];
-  }, [codecResults, t]);
+  }, [codecResults, nativeAvailability, t]);
 
   return (
     <>

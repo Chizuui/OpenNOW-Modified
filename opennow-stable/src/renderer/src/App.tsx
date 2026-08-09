@@ -44,10 +44,12 @@ import {
   useStreamSession,
 } from "./hooks/useStreamSession";
 import { useQueueAdRuntime } from "./hooks/useQueueAdRuntime";
+import { useNativeStreamerStatus } from "./hooks/useNativeStreamerStatus";
 import { usePlaytime } from "./utils/usePlaytime";
 import { createStreamDiagnosticsStore, useStreamDiagnosticsSelector } from "./utils/streamDiagnosticsStore";
+import { formatServerLocation } from "./utils/streamDiagnosticsFormat";
 import type { StreamStatus } from "./lib/appTypes";
-import { getCodecToMigrateToAuto, loadStoredCodecResults, resolveStreamProfileCodec, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
+import { getCodecToMigrateToAuto, loadStoredCodecResults, resolveNativeCodecAvailability, resolveStreamProfileCodec, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
 import {
   detectDisplayRefreshRate,
   hasResolvedAutoFps,
@@ -124,6 +126,19 @@ function isNvidiaProvider(provider: LoginProvider | null | undefined): boolean {
   return (provider?.code ?? "").trim().toUpperCase() === "NVIDIA";
 }
 
+/** Extract the bare hostname (no scheme/port/trailing slash) from a URL. */
+function hostnameOf(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    return new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`).hostname.replace(/^\.+|\.+$/g, "");
+  } catch {
+    return trimmed.replace(/^https?:\/\//i, "").split("/")[0].split(":")[0].replace(/^\.+|\.+$/g, "");
+  }
+}
+
 const PLAYTIME_RESYNC_INTERVAL_MS = 5 * 60 * 1000;
 const FREE_TIER_30_MIN_WARNING_SECONDS = 30 * 60;
 const FREE_TIER_15_MIN_WARNING_SECONDS = 15 * 60;
@@ -172,6 +187,18 @@ export function App(): JSX.Element {
   );
   const [codecResults, setCodecResults] = useState<CodecTestResult[] | null>(() => loadStoredCodecResults());
   const [codecTesting, setCodecTesting] = useState(false);
+  // Native mode: codec usability (dropdown + saved-codec migration below) is
+  // judged by the native streamer's own decoder capabilities (videoBackends
+  // codecs available) instead of the browser mediaCapabilities probe — the
+  // Chromium HEVC extension is often missing even though the native streamer
+  // decodes H.265 in hardware (d3d12h265dec etc.).
+  const nativeStreamerStatus = useNativeStreamerStatus(settings.streamClientMode === "native");
+  const nativeAvailability = useMemo(
+    () => (settings.streamClientMode === "native"
+      ? resolveNativeCodecAvailability(nativeStreamerStatus.status)
+      : null),
+    [nativeStreamerStatus.status, settings.streamClientMode],
+  );
   const diagnosticsStoreRef = useRef<ReturnType<typeof createStreamDiagnosticsStore> | null>(null);
   const diagnosticsStore =
     diagnosticsStoreRef.current ?? (diagnosticsStoreRef.current = createStreamDiagnosticsStore(defaultDiagnostics()));
@@ -842,12 +869,32 @@ export function App(): JSX.Element {
     if (settings.region) {
       return regions.find(r => r.url === settings.region)?.name ?? settings.region;
     }
+    // Auto (Best): resolve the region the active session actually connected
+    // to. The session's streamingBaseUrl is the resolved local-region base
+    // (e.g. https://my-yes.yes.geforcenow.nvidiagrid.net) while the region
+    // list may carry a trailing slash or a slightly different URL, so also
+    // match by hostname before giving up and showing "Auto (Best)".
     const activeUrl = session?.streamingBaseUrl?.replace(/\/$/, "");
-    const activeRegion = activeUrl && regions.find(
-      (region) => region.url.replace(/\/$/, "") === activeUrl,
+    const activeHost = activeUrl ? hostnameOf(activeUrl) : "";
+    const activeRegion =
+      (activeUrl && regions.find((region) => region.url.replace(/\/$/, "") === activeUrl))
+      || (activeHost && regions.find((region) => hostnameOf(region.url) === activeHost))
+      || (activeHost && regions.find((region) => {
+        const regionHost = hostnameOf(region.url);
+        return regionHost.startsWith(activeHost) || activeHost.startsWith(regionHost);
+      }));
+    if (activeRegion) {
+      return activeRegion.name;
+    }
+    // Last resort: derive a location label from the signaling server
+    // hostname (city codes like "kul" → "Malaysia (KUL)") instead of
+    // showing the raw "Auto (Best)" selection.
+    const derived = formatServerLocation(
+      session?.zone || "",
+      session?.signalingServer || session?.serverIp || "",
     );
-    return activeRegion ? activeRegion.name : t("settings.region.autoBest");
-  }, [regions, session?.streamingBaseUrl, settings.region, t]);
+    return derived !== "--" ? derived : t("settings.region.autoBest");
+  }, [regions, session?.streamingBaseUrl, session?.signalingServer, session?.serverIp, session?.zone, settings.region, t]);
 
   const {
     activeQueueAd,
@@ -1530,7 +1577,7 @@ export function App(): JSX.Element {
     if (!settingsLoaded) {
       return;
     }
-    const unusable = getCodecToMigrateToAuto(settings.codec, codecResults);
+    const unusable = getCodecToMigrateToAuto(settings.codec, codecResults, nativeAvailability);
     if (!unusable) {
       return;
     }
@@ -1539,7 +1586,7 @@ export function App(): JSX.Element {
     );
     void updateSetting("codec", "auto");
     setCodecMigratedNotice({ fromCodec: unusable });
-  }, [codecResults, settings.codec, settingsLoaded, updateSetting]);
+  }, [codecResults, nativeAvailability, settings.codec, settingsLoaded, updateSetting]);
 
   // Auto-detect the display refresh rate and fill the DEFAULT stream FPS
   // (mirrors GFN web: a >=117Hz display gets a 120 FPS session, >=233Hz gets
@@ -3020,7 +3067,7 @@ export function App(): JSX.Element {
                 recording: shortcuts.recording.canonical,
               }}
               hideStreamButtons={settings.hideStreamButtons}
-              serverRegion={session?.serverIp}
+              serverRegion={session?.signalingServer || session?.serverIp}
               userSelectedRegionName={userSelectedRegionName}
               antiAfkEnabled={antiAfkEnabled}
               antiAfkAckNonce={antiAfkAckNonce}

@@ -4,6 +4,8 @@ import {
   type CodecPreference,
   type ColorQuality,
   type GpuBackendInfo,
+  type NativeStreamerStatus,
+  type NativeVideoBackendCapability,
   type VideoCodec,
 } from "@shared/gfn";
 
@@ -17,6 +19,88 @@ export interface CodecTestResult {
   decodeVia: string;
   encodeVia: string;
   profiles: string[];
+}
+
+/**
+ * Codecs the native streamer can decode, from its own capability probe
+ * (`videoBackends[].codecs[].available`). Independent of the browser's
+ * `mediaCapabilities` probe — on a machine without the Chromium HEVC extension
+ * the browser reports H.265 "Unsupported" while the native streamer decodes it
+ * fine via d3d12h265dec etc.
+ */
+export interface NativeCodecAvailability {
+  /** Decodable codecs (H264/H265/AV1). */
+  codecs: Set<VideoCodec>;
+  /** True when the native path decodes on a hardware backend (D3D12/D3D11/Vulkan/NVDEC/VAAPI/V4L2/VideoToolbox). */
+  hardware: boolean;
+}
+
+const NATIVE_HARDWARE_BACKENDS = new Set<string>([
+  "d3d12",
+  "d3d11",
+  "nvdec",
+  "vaapi",
+  "v4l2",
+  "vulkan",
+  "videotoolbox",
+]);
+
+function nativeHostPlatform(): "windows" | "macos" | "linux" | "other" {
+  if (isWindowsClient()) return "windows";
+  if (isMacOsClient()) return "macos";
+  if (isLinuxClient()) return "linux";
+  return "other";
+}
+
+/**
+ * Resolve the codecs the native streamer can actually decode. Returns null
+ * when the native streamer is not usable (not detected, GStreamer backend not
+ * ready) or reports no codecs — callers then fall back to the browser probe.
+ * Backends for other platforms are excluded (they are advertised as
+ * unavailable anyway); the active backend is always included first.
+ */
+export function resolveNativeCodecAvailability(
+  nativeStatus: NativeStreamerStatus | null,
+): NativeCodecAvailability | null {
+  if (!nativeStatus?.gstreamerAvailable || !nativeStatus.videoBackends?.length) {
+    return null;
+  }
+  const host = nativeHostPlatform();
+  const availableBackends = nativeStatus.videoBackends.filter(
+    (backend) => backend.available
+      && (backend.platform === host || backend.platform === "cross-platform"),
+  );
+  const ordered: NativeVideoBackendCapability[] = [];
+  if (nativeStatus.activeVideoBackend?.available) {
+    ordered.push(nativeStatus.activeVideoBackend);
+  }
+  for (const backend of availableBackends) {
+    if (!ordered.some((entry) => entry.backend === backend.backend)) {
+      ordered.push(backend);
+    }
+  }
+  if (ordered.length === 0) {
+    return null;
+  }
+
+  const codecs = new Set<VideoCodec>();
+  let hardware = false;
+  for (const backend of ordered) {
+    if (NATIVE_HARDWARE_BACKENDS.has(backend.backend)) {
+      hardware = true;
+    }
+    for (const codec of backend.codecs ?? []) {
+      if (!codec.available) continue;
+      const upper = codec.codec.toUpperCase();
+      if (upper === "H264" || upper === "H265" || upper === "AV1") {
+        codecs.add(upper as VideoCodec);
+      }
+    }
+  }
+  if (codecs.size === 0) {
+    return null;
+  }
+  return { codecs, hardware };
 }
 
 const CODEC_TEST_CONFIGS: {
@@ -321,7 +405,14 @@ export function getCodecDecodeBadgeState(
   codec: VideoCodec,
   codecResults: CodecTestResult[] | null,
   codecTesting: boolean,
+  nativeAvailability?: NativeCodecAvailability | null,
 ): CodecDecodeBadgeState {
+  // Native path is authoritative for the badge: the browser probe can say
+  // "unsupported" (no HEVC extension) while the native streamer decodes in
+  // hardware via its own GStreamer decoders.
+  if (nativeAvailability?.codecs.has(codec)) {
+    return nativeAvailability.hardware ? "gpu" : "cpu";
+  }
   const result = codecResults?.find((entry) => entry.codec === codec);
   if (!result) {
     return codecTesting ? "testing" : null;
@@ -354,7 +445,15 @@ export function isWebRtcCodecAvailable(codec: VideoCodec): boolean {
 export function isCodecUsableForStream(
   codec: VideoCodec,
   codecResults: CodecTestResult[] | null,
+  nativeAvailability?: NativeCodecAvailability | null,
 ): boolean {
+  // In native mode the streamer's own GStreamer decoders handle the codec
+  // (d3d12h265dec etc.), independent of Chromium's HEVC support — so the
+  // native capability list wins over the browser probe. Native availability
+  // only ADDS codecs; it never removes one the browser probe supports.
+  if (nativeAvailability?.codecs.has(codec)) {
+    return true;
+  }
   const result = codecResults?.find((entry) => entry.codec === codec);
   if (result) {
     // A codec is usable for STREAMING only when it is BOTH decodable on this
@@ -378,11 +477,12 @@ export function isCodecUsableForStream(
 export function getCodecToMigrateToAuto(
   codecPreference: CodecPreference,
   codecResults: CodecTestResult[] | null,
+  nativeAvailability?: NativeCodecAvailability | null,
 ): VideoCodec | null {
   if (codecPreference === "auto" || !codecResults || codecResults.length === 0) {
     return null;
   }
-  return isCodecUsableForStream(codecPreference, codecResults) ? null : codecPreference;
+  return isCodecUsableForStream(codecPreference, codecResults, nativeAvailability) ? null : codecPreference;
 }
 
 /**
@@ -391,9 +491,17 @@ export function getCodecToMigrateToAuto(
  * H265, mirroring GFN web's "Auto (AV1)"), falling back to H264. An explicit
  * user choice is always honored, even if the device reports it unsupported.
  */
-export function resolveEffectiveCodec(preference: CodecPreference): VideoCodec {
+export function resolveEffectiveCodec(
+  preference: CodecPreference,
+  nativeAvailability?: NativeCodecAvailability | null,
+): VideoCodec {
   if (preference !== "auto") {
     return preference;
+  }
+  if (nativeAvailability) {
+    // Native mode: auto-pick from the codecs the streamer can decode (same
+    // AV1 → H264 → H265 priority as web mode).
+    return AUTO_CODEC_PREFERENCE_ORDER.find((codec) => nativeAvailability.codecs.has(codec)) ?? "H264";
   }
   return AUTO_CODEC_PREFERENCE_ORDER.find((codec) => isWebRtcCodecAvailable(codec)) ?? "H264";
 }
@@ -429,10 +537,19 @@ export function resolveStreamProfileCodec(
  * available, and an empty list would disable ladder resolution in the
  * session request).
  */
-export function resolveSupportedStreamCodecs(results: CodecTestResult[] | null): VideoCodec[] {
+export function resolveSupportedStreamCodecs(
+  results: CodecTestResult[] | null,
+  nativeAvailability?: NativeCodecAvailability | null,
+): VideoCodec[] {
   const candidates: readonly VideoCodec[] = ["H264", "H265", "AV1"];
   const supported: VideoCodec[] = [];
   for (const codec of candidates) {
+    // Native decode is authoritative and not hardware-gated: the software
+    // backend (avdec_*/dav1d) is a valid native path too.
+    if (nativeAvailability?.codecs.has(codec)) {
+      supported.push(codec);
+      continue;
+    }
     const result = results?.find((entry) => entry.codec === codec);
     let usable: boolean;
     if (result) {

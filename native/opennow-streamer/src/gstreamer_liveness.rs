@@ -1205,11 +1205,12 @@ fn request_upstream_key_unit(state: &VideoLivenessState, event_sender: &Option<S
 /// `rb-round-trip` (16.16 fixed-point seconds) in the session's
 /// `source-stats`.
 ///
-/// A receiver-only pipeline gets `None`: the server only sends RRs for RTP
-/// streams it receives, and the native pipeline currently sends no RTP (mic
-/// audio rides the renderer peer connection in web mode). When outgoing RTP
-/// exists, this becomes the preferred local ping — independent of the
-/// server-reported stats_channel field.
+/// The server only sends RRs for RTP streams it receives, so this needs
+/// outgoing RTP. The native pipeline carries it on the mic m-line: real
+/// capture when the user's mic is on, and a muted generated-silence
+/// keepalive when it is off (see build_mic_pipeline). With
+/// OPENNOW_NATIVE_MIC=0 there is no outgoing RTP and this returns None, and
+/// the HUD falls back to the server-reported stats_channel field.
 fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
     let webrtc = pipeline.by_name("opennow-webrtcbin")?;
     let webrtc_bin = webrtc.downcast::<gst::Bin>().ok()?;
@@ -2072,6 +2073,13 @@ fn read_sink_stats(sink: &gst::Element) -> VideoSinkStats {
     }
 }
 
+/// Number of frames the sink has presented so far (None when the sink has no
+/// `stats` property). Used by the deferred video-tap attach to wait for the
+/// D3D sink to finish warming up before hot-plugging the tap tee.
+pub(crate) fn sink_rendered_frame_count(sink: &gst::Element) -> Option<u64> {
+    read_sink_stats(sink).rendered
+}
+
 pub(crate) fn caps_framerate_summary(caps: &str) -> Option<String> {
     let marker = "framerate=(fraction)";
     let start = caps.find(marker)? + marker.len();
@@ -2107,4 +2115,1398 @@ pub(crate) fn is_zero_copy_memory_mode(memory_mode: &str) -> bool {
         memory_mode,
         "D3D12Memory" | "D3D11Memory" | "VulkanImage" | "VAMemory" | "GLMemory"
     )
+}
+
+/// Decisive diagnostic for the "black screen after SDK downgrade" report: the
+/// app's stacked renderer restyles/repositions the sink window while the
+/// present queue is live (enforce_stacked_renderer_window_style +
+/// apply_stacked_renderer_surface). If GStreamer 1.28.x d3d12videosink stops
+/// presenting after any of those Win32 operations, this test fails with the
+/// exact phase that killed it.
+#[cfg(all(test, target_os = "windows"))]
+mod stacked_window_dance_diagnostics {
+    use super::*;
+    use std::str::FromStr;
+    use std::time::{Duration, Instant};
+
+    fn rendered(sink: &gst::Element) -> u64 {
+        read_sink_stats(sink).rendered.unwrap_or(0)
+    }
+
+    /// Bisect the app's decode chain on 1.28.3. Each variant builds a fresh
+    /// pipeline and reports how many frames the sink actually presented:
+    /// 0: dec→download→sink, 1: +videoconvert+capsfilter, 2: +dwritetextoverlay,
+    /// 3: +queue+tee+screenshot branch (full app chain), 4: dec→sink (D3D12
+    /// zero-copy, no download), 5: +queue only (no tee), 6: +tee with an
+    /// NV12-accepting branch (no videoconvert/pngenc) to isolate the RGB caps
+    /// difference.
+    #[test]
+    fn full_hardware_decode_chain_renders_d3d12_present() {
+        gst::init().expect("gstreamer init");
+        for variant in [0u8, 5, 6] {
+            let rendered_count = run_decode_chain_variant(variant);
+            eprintln!("DIAG chain variant {variant}: rendered={rendered_count}");
+        }
+        // FIX VERIFICATION: the app chain WITHOUT the tee, let the sink start
+        // presenting, then hot-plug the tee + screenshot branch (deferred
+        // insertion). If rendered keeps growing, deferring the tee insertion
+        // until after the first frame is a working fix.
+        let after_hotplug = run_deferred_tee_fix();
+        eprintln!("DIAG deferred tee fix: rendered={after_hotplug}");
+        assert!(
+            after_hotplug > 0,
+            "deferred tee insertion also stalls the sink — need a different fix"
+        );
+    }
+
+    fn run_deferred_tee_fix() -> u64 {
+        let Some(sink) = gst::ElementFactory::make("d3d12videosink").build().ok() else {
+            return 0;
+        };
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        sink.set_property("qos", false);
+        sink.set_property("max-lateness", -1i64);
+        sink.set_property("show-preroll-frame", false);
+        sink.set_property("redraw-on-update", true);
+        sink.set_property("force-aspect-ratio", true);
+        sink.set_property("direct-swapchain", false);
+        sink.set_property("enable-navigation-events", false);
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let enc = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        enc.set_property("bitrate", 8000u32);
+        enc.set_property_from_str("speed-preset", "ultrafast");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("bframes", 0u32);
+        enc.set_property("key-int-max", 60u32);
+        let parse = gst::ElementFactory::make("h264parse")
+            .build()
+            .expect("h264parse");
+        let pre_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("pre queue");
+        let dec = gst::ElementFactory::make("d3d12h264dec")
+            .build()
+            .expect("d3d12h264dec");
+        let download = gst::ElementFactory::make("d3d12download")
+            .build()
+            .expect("d3d12download");
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let nv12 = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("nv12 capsfilter");
+        nv12.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)NV12").expect("nv12 caps"),
+        );
+        let overlay = gst::ElementFactory::make("dwritetextoverlay")
+            .build()
+            .expect("overlay");
+        overlay.set_property("visible", false);
+        overlay.set_property("text", "");
+        overlay.set_property("auto-resize", true);
+        overlay.set_property("font-family", "Cascadia Mono");
+        let queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("post queue");
+        queue.set_property("max-size-buffers", 1u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        queue.set_property_from_str("leaky", "downstream");
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let branch_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("branch queue");
+        branch_queue.set_property_from_str("leaky", "downstream");
+        branch_queue.set_property("max-size-buffers", 2u32);
+        branch_queue.set_property("max-size-bytes", 0u32);
+        branch_queue.set_property("max-size-time", 0u64);
+        let branch_convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("branch convert");
+        let pngenc = gst::ElementFactory::make("pngenc").build().expect("pngenc");
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+
+        let pipeline = gst::Pipeline::new();
+        let chain: Vec<&gst::Element> = vec![
+            &src, &src_caps, &enc, &parse, &pre_queue, &dec, &download, &convert, &nv12, &overlay,
+            &queue, &sink,
+        ];
+        for element in &chain {
+            pipeline.add(*element).expect("add element");
+        }
+        for pair in chain.windows(2) {
+            pair[0].link(pair[1]).expect("link chain pair");
+        }
+        pipeline.set_state(gst::State::Playing).expect("playing");
+
+        // Mirror the app's warm-up guard (GstreamerVideoTap::ensure_tee): wait
+        // until the sink has presented at least 8 frames before hot-plugging
+        // the tee — the d3d12 present-chain stall is a warm-up race.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            if rendered(&sink) >= 8 {
+                break;
+            }
+        }
+        let before = rendered(&sink);
+        assert!(
+            before >= 8,
+            "sink never warmed up (rendered={before}) before the deferred tee attach"
+        );
+
+        // Hot-plug the tee + screenshot branch after the sink is presenting.
+        queue.unlink(&sink);
+        for element in [
+            &tee,
+            &valve,
+            &branch_queue,
+            &branch_convert,
+            &pngenc,
+            &appsink,
+        ] {
+            pipeline.add(element).expect("add hotplug element");
+        }
+        queue.link(&tee).expect("queue->tee");
+        tee.link(&sink).expect("tee->sink");
+        valve.link(&branch_queue).expect("valve->branch_queue");
+        branch_queue
+            .link(&branch_convert)
+            .expect("branch_queue->branch_convert");
+        branch_convert
+            .link(&pngenc)
+            .expect("branch_convert->pngenc");
+        pngenc.link(&appsink).expect("pngenc->appsink");
+        for element in [
+            &tee,
+            &valve,
+            &branch_queue,
+            &branch_convert,
+            &pngenc,
+            &appsink,
+        ] {
+            element
+                .sync_state_with_parent()
+                .expect("sync hotplug state");
+        }
+
+        std::thread::sleep(Duration::from_millis(2000));
+        let after = rendered(&sink);
+        eprintln!("DIAG deferred tee: before={before} after={after}");
+        let _ = pipeline.set_state(gst::State::Null);
+        after
+    }
+
+    fn run_decode_chain_variant(variant: u8) -> u64 {
+        let Some(sink) = gst::ElementFactory::make("d3d12videosink").build().ok() else {
+            return 0;
+        };
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        sink.set_property("qos", false);
+        sink.set_property("max-lateness", -1i64);
+        sink.set_property("processing-deadline", 0u64);
+        sink.set_property("render-delay", 0u64);
+        sink.set_property("throttle-time", 0u64);
+        sink.set_property("enable-last-sample", false);
+        sink.set_property("show-preroll-frame", false);
+        sink.set_property("redraw-on-update", true);
+        sink.set_property("force-aspect-ratio", true);
+        sink.set_property("direct-swapchain", false);
+        sink.set_property("error-on-closed", false);
+        sink.set_property("enable-navigation-events", false);
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let enc = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        enc.set_property("bitrate", 8000u32);
+        enc.set_property_from_str("speed-preset", "ultrafast");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("bframes", 0u32);
+        enc.set_property("key-int-max", 60u32);
+        let parse = gst::ElementFactory::make("h264parse")
+            .build()
+            .expect("h264parse");
+        let pre_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("pre queue");
+        let dec = gst::ElementFactory::make("d3d12h264dec")
+            .build()
+            .expect("d3d12h264dec");
+        let download = gst::ElementFactory::make("d3d12download")
+            .build()
+            .expect("d3d12download");
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let nv12 = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("nv12 capsfilter");
+        nv12.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)NV12").expect("nv12 caps"),
+        );
+        let overlay = gst::ElementFactory::make("dwritetextoverlay")
+            .build()
+            .expect("overlay");
+        overlay.set_property("visible", false);
+        overlay.set_property("text", "");
+        overlay.set_property("auto-resize", true);
+        overlay.set_property("font-family", "Cascadia Mono");
+        let queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("post queue");
+        queue.set_property("max-size-buffers", 1u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        queue.set_property_from_str("leaky", "downstream");
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let branch_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("branch queue");
+        branch_queue.set_property_from_str("leaky", "downstream");
+        branch_queue.set_property("max-size-buffers", 2u32);
+        branch_queue.set_property("max-size-bytes", 0u32);
+        branch_queue.set_property("max-size-time", 0u64);
+        let branch_convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("branch convert");
+        let pngenc = gst::ElementFactory::make("pngenc").build().expect("pngenc");
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+
+        let pipeline = gst::Pipeline::new();
+        let mut chain: Vec<&gst::Element> = vec![&src, &src_caps, &enc, &parse, &pre_queue, &dec];
+        match variant {
+            0 => chain.extend([&download, &sink]),
+            1 => chain.extend([&download, &convert, &nv12, &sink]),
+            2 => chain.extend([&download, &convert, &nv12, &overlay, &sink]),
+            3 => {
+                chain.extend([&download, &convert, &nv12, &overlay, &queue, &tee]);
+                // tee → sink (main) and tee → valve → branch (screenshot).
+                for element in [&valve, &branch_queue, &branch_convert, &pngenc, &appsink] {
+                    pipeline.add(element).expect("add branch element");
+                }
+                valve.link(&branch_queue).expect("valve->branch_queue");
+                branch_queue
+                    .link(&branch_convert)
+                    .expect("branch_queue->branch_convert");
+                branch_convert
+                    .link(&pngenc)
+                    .expect("branch_convert->pngenc");
+                pngenc.link(&appsink).expect("pngenc->appsink");
+                tee.link(&sink).expect("tee->sink");
+            }
+            4 => chain.extend([&sink]), // dec → sink, zero-copy D3D12Memory
+            5 => chain.extend([&download, &convert, &nv12, &overlay, &queue, &sink]),
+            6 => {
+                // tee with an NV12-accepting branch (valve → queue → appsink),
+                // no videoconvert/pngenc — isolates whether the RGB caps
+                // difference of the pngenc branch is what breaks negotiation.
+                chain.extend([&download, &convert, &nv12, &overlay, &queue, &tee]);
+                for element in [&valve, &branch_queue, &appsink] {
+                    pipeline.add(element).expect("add branch element");
+                }
+                valve.link(&branch_queue).expect("valve->branch_queue");
+                branch_queue.link(&appsink).expect("branch_queue->appsink");
+                tee.link(&sink).expect("tee->sink");
+            }
+            7 => {
+                // bare tee, no branch at all: queue → tee → sink.
+                chain.extend([&download, &convert, &nv12, &overlay, &queue, &tee, &sink]);
+            }
+            _ => {
+                // 8: tee BEFORE the post-decode queue: overlay → tee → queue →
+                // sink (+ pngenc branch) — the sink negotiates its pool with the
+                // queue, not across the tee.
+                chain.extend([&download, &convert, &nv12, &overlay, &tee, &queue, &sink]);
+                for element in [&valve, &branch_queue, &branch_convert, &pngenc, &appsink] {
+                    pipeline.add(element).expect("add branch element");
+                }
+                valve.link(&branch_queue).expect("valve->branch_queue");
+                branch_queue
+                    .link(&branch_convert)
+                    .expect("branch_queue->branch_convert");
+                branch_convert
+                    .link(&pngenc)
+                    .expect("branch_convert->pngenc");
+                pngenc.link(&appsink).expect("pngenc->appsink");
+            }
+        }
+        for element in &chain {
+            pipeline.add(*element).expect("add element");
+        }
+        for pair in chain.windows(2) {
+            pair[0].link(pair[1]).expect("link chain pair");
+        }
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut rendered_count = 0u64;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            rendered_count = rendered(&sink);
+            if rendered_count > 0 {
+                break;
+            }
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        rendered_count
+    }
+
+    /// Reproduce the app's Windows "Vulkan" external-renderer chain
+    /// (windows_vulkan_external_present_chain_definition): DXVA decode →
+    /// dwritetextoverlay → d3d12download → videoconvert → RGBA capsfilter →
+    /// vulkanupload → queue → vulkansink. If the chain only presents a single
+    /// frame (or none) on the bundled runtime, the 1.28.3 vulkan plugin
+    /// present path itself is broken and an SDK upgrade is the fix; if it
+    /// keeps presenting hundreds of frames, the stall is app-side.
+    #[test]
+    fn vulkan_external_present_chain_renders() {
+        gst::init().expect("gstreamer init");
+        let (first, final_count) = run_vulkan_chain();
+        eprintln!("DIAG vulkan external chain: first={first} final={final_count}");
+        assert!(
+            final_count > 1,
+            "vulkansink present stalled after {first} frame(s) on this runtime — SDK vulkan plugin issue"
+        );
+    }
+
+    fn run_vulkan_chain() -> (u64, u64) {
+        let Some(sink) = gst::ElementFactory::make("vulkansink").build().ok() else {
+            eprintln!("DIAG vulkan: vulkansink unavailable");
+            return (0, 0);
+        };
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        sink.set_property("qos", false);
+        sink.set_property("max-lateness", -1i64);
+        sink.set_property("show-preroll-frame", false);
+        sink.set_property("force-aspect-ratio", true);
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let enc = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        enc.set_property("bitrate", 8000u32);
+        enc.set_property_from_str("speed-preset", "ultrafast");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("bframes", 0u32);
+        enc.set_property("key-int-max", 60u32);
+        let parse = gst::ElementFactory::make("h264parse")
+            .build()
+            .expect("h264parse");
+        let pre_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("pre queue");
+        let dec = gst::ElementFactory::make("d3d12h264dec")
+            .build()
+            .expect("d3d12h264dec");
+        let overlay = gst::ElementFactory::make("dwritetextoverlay")
+            .build()
+            .expect("overlay");
+        overlay.set_property("visible", false);
+        overlay.set_property("text", "");
+        overlay.set_property("auto-resize", true);
+        let download = gst::ElementFactory::make("d3d12download")
+            .build()
+            .expect("d3d12download");
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let rgba = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("rgba capsfilter");
+        rgba.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)RGBA").expect("rgba caps"),
+        );
+        let upload = gst::ElementFactory::make("vulkanupload")
+            .build()
+            .expect("vulkanupload");
+        let queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("post queue");
+        queue.set_property("max-size-buffers", 1u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        queue.set_property_from_str("leaky", "downstream");
+
+        let chain: Vec<&gst::Element> = vec![
+            &src, &src_caps, &enc, &parse, &pre_queue, &dec, &overlay, &download, &convert, &rgba,
+            &upload, &queue, &sink,
+        ];
+        let pipeline = gst::Pipeline::new();
+        for element in &chain {
+            pipeline.add(*element).expect("add element");
+        }
+        for pair in chain.windows(2) {
+            pair[0].link(pair[1]).expect("link chain pair");
+        }
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut first = 0u64;
+        let mut final_count = 0u64;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = rendered(&sink);
+            if first == 0 && now > 0 {
+                first = now;
+            }
+            final_count = now;
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        (first, final_count)
+    }
+
+    /// The app's d3d11 H265 receive chain, end to end: RTP H265 → capsfilter
+    /// (the app's ReceiveCapsFilter, `application/x-rtp, encoding-name=H265`)
+    /// → rtph265depay → h265parse → queue → d3d11h265dec → d3d11download →
+    /// videoconvert → NV12 → queue → d3d11videosink. The 03:51 field log's
+    /// explicit-H265 session received real video RTP (23 Mbps) but never
+    /// decoded a single frame (no decoded caps, no sink reveal → black
+    /// screen); this test decides whether the decode chain itself is broken
+    /// on this runtime or the failure lives upstream (SDP/negotiation).
+    #[test]
+    fn h265_d3d11_rtp_chain_renders() {
+        gst::init().expect("gstreamer init");
+        let (first, final_count) = run_h265_d3d11_rtp_chain();
+        eprintln!("DIAG h265 d3d11 RTP chain: first={first} final={final_count}");
+        assert!(
+            final_count > 1,
+            "d3d11h265dec chain stalled after {first} frame(s) on this runtime — H265 decode itself is broken"
+        );
+    }
+
+    fn run_h265_d3d11_rtp_chain() -> (u64, u64) {
+        let Some(sink) = gst::ElementFactory::make("d3d11videosink").build().ok() else {
+            eprintln!("DIAG h265: d3d11videosink unavailable");
+            return (0, 0);
+        };
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        sink.set_property("qos", false);
+        sink.set_property("max-lateness", -1i64);
+        sink.set_property("show-preroll-frame", false);
+        sink.set_property("force-aspect-ratio", true);
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        // x265enc accepts I420/Y444 (no NV12), so feed it I420 directly.
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)I420,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let enc = gst::ElementFactory::make("x265enc")
+            .build()
+            .expect("x265enc");
+        enc.set_property("bitrate", 8000u32);
+        enc.set_property_from_str("speed-preset", "ultrafast");
+        enc.set_property_from_str("tune", "zerolatency");
+        // x265enc's key-int-max is a signed gint (unlike x264enc's guint).
+        enc.set_property("key-int-max", 60i32);
+        let enc_parse = gst::ElementFactory::make("h265parse")
+            .build()
+            .expect("encoder h265parse");
+        let pay = gst::ElementFactory::make("rtph265pay")
+            .build()
+            .expect("rtph265pay");
+        let receive_filter = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("receive capsfilter");
+        receive_filter.set_property(
+            "caps",
+            gst::Caps::from_str("application/x-rtp, encoding-name=H265").expect("rtp caps"),
+        );
+        let depay = gst::ElementFactory::make("rtph265depay")
+            .build()
+            .expect("rtph265depay");
+        let parse = gst::ElementFactory::make("h265parse")
+            .build()
+            .expect("h265parse");
+        let pre_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("pre queue");
+        pre_queue.set_property("max-size-buffers", 2u32);
+        pre_queue.set_property("max-size-bytes", 0u32);
+        pre_queue.set_property("max-size-time", 0u64);
+        pre_queue.set_property_from_str("leaky", "downstream");
+        let dec = gst::ElementFactory::make("d3d11h265dec")
+            .build()
+            .expect("d3d11h265dec");
+        let download = gst::ElementFactory::make("d3d11download")
+            .build()
+            .expect("d3d11download");
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let nv12 = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("nv12 capsfilter");
+        nv12.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)NV12").expect("nv12 caps"),
+        );
+        let queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("post queue");
+        queue.set_property("max-size-buffers", 1u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        queue.set_property_from_str("leaky", "downstream");
+
+        let chain: Vec<&gst::Element> = vec![
+            &src,
+            &src_caps,
+            &enc,
+            &enc_parse,
+            &pay,
+            &receive_filter,
+            &depay,
+            &parse,
+            &pre_queue,
+            &dec,
+            &download,
+            &convert,
+            &nv12,
+            &queue,
+            &sink,
+        ];
+        let pipeline = gst::Pipeline::new();
+        for element in &chain {
+            pipeline.add(*element).expect("add element");
+        }
+        for pair in chain.windows(2) {
+            pair[0].link(pair[1]).expect("link chain pair");
+        }
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut first = 0u64;
+        let mut final_count = 0u64;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = rendered(&sink);
+            if first == 0 && now > 0 {
+                first = now;
+            }
+            final_count = now;
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        (first, final_count)
+    }
+
+    /// Replicate the app's native recording branch (tee → valve → queue →
+    /// videoconvert → capsfilter(I420) → x264enc → mp4mux → appsink, plus the
+    /// first-frame JPEG thumbnail branch off an I420 tee) and the stop flow
+    /// (close valve → EOS on the valve sink pad → wait for EOS at the appsink).
+    /// Reports (chunks_captured_while_recording, eos_seen_within_timeout).
+    fn run_recording_eos_variant(include_thumb: bool, eos_target: &str) -> (usize, bool) {
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let queue = gst::ElementFactory::make("queue").build().expect("queue");
+        queue.set_property_from_str("leaky", "downstream");
+        queue.set_property("max-size-buffers", 30u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("capsfilter");
+        caps.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)I420").expect("I420 caps"),
+        );
+        let encoder = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        encoder.set_property_from_str("speed-preset", "ultrafast");
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property("bitrate", 8000u32);
+        encoder.set_property("bframes", 0u32);
+        encoder.set_property("key-int-max", 120u32);
+        let muxer = gst::ElementFactory::make("mp4mux").build().expect("mp4mux");
+        muxer.set_property("streamable", true);
+        muxer.set_property("fragment-duration", 500u32);
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+
+        let thumb_tee = gst::ElementFactory::make("tee").build().expect("thumb tee");
+        let thumb_valve = gst::ElementFactory::make("valve")
+            .build()
+            .expect("thumb valve");
+        thumb_valve.set_property("drop", true);
+        let thumb_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("thumb queue");
+        thumb_queue.set_property_from_str("leaky", "downstream");
+        thumb_queue.set_property("max-size-buffers", 1u32);
+        thumb_queue.set_property("max-size-bytes", 0u32);
+        thumb_queue.set_property("max-size-time", 0u64);
+        let thumb_encoder = gst::ElementFactory::make("jpegenc")
+            .build()
+            .expect("jpegenc");
+        thumb_encoder.set_property("quality", 70i32);
+        thumb_encoder.set_property("snapshot", true);
+        let thumb_appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("thumb appsink");
+        thumb_appsink.set_property("sync", false);
+        thumb_appsink.set_property("max-buffers", 1u32);
+        thumb_appsink.set_property("drop", true);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [
+            &src,
+            &src_caps,
+            &tee,
+            &valve,
+            &queue,
+            &convert,
+            &caps,
+            &thumb_tee,
+            &encoder,
+            &muxer,
+            &appsink,
+            &thumb_valve,
+            &thumb_queue,
+            &thumb_encoder,
+            &thumb_appsink,
+        ] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("src->src_caps");
+        src_caps.link(&tee).expect("src_caps->tee");
+        tee.link(&valve).expect("tee->valve");
+        valve.link(&queue).expect("valve->queue");
+        queue.link(&convert).expect("queue->convert");
+        convert.link(&caps).expect("convert->caps");
+        caps.link(&thumb_tee).expect("caps->thumb_tee");
+        thumb_tee.link(&encoder).expect("thumb_tee->encoder");
+        encoder.link(&muxer).expect("encoder->muxer");
+        muxer.link(&appsink).expect("muxer->appsink");
+        if include_thumb {
+            thumb_tee
+                .link(&thumb_valve)
+                .expect("thumb_tee->thumb_valve");
+            thumb_valve
+                .link(&thumb_queue)
+                .expect("thumb_valve->thumb_queue");
+            thumb_queue
+                .link(&thumb_encoder)
+                .expect("thumb_queue->thumb_encoder");
+            thumb_encoder
+                .link(&thumb_appsink)
+                .expect("thumb_encoder->thumb_appsink");
+        }
+
+        let chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let eos_seen = Arc::new(AtomicBool::new(false));
+        let appsink_sink_pad = appsink.static_pad("sink").expect("appsink sink pad");
+        let chunk_counter = chunks.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            chunk_counter.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        let eos_flag = eos_seen.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    eos_flag.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        let thumb_gate = thumb_valve.clone();
+        let thumb_grabber = Arc::new(Mutex::new(false));
+        let thumb_grab = thumb_grabber.clone();
+        let thumb_sink_pad = thumb_appsink.static_pad("sink").expect("thumb sink pad");
+        thumb_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            let mut slot = thumb_grab.lock().expect("thumb lock");
+            if !*slot {
+                *slot = true;
+                let _ = thumb_gate.set_property("drop", true);
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        valve.set_property("drop", false);
+        if include_thumb {
+            thumb_valve.set_property("drop", false);
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let chunks_during = chunks.load(Ordering::SeqCst);
+
+        // Stop flow (mirrors GstreamerRecordingState::stop(finalize=true)).
+        valve.set_property("drop", true);
+        let eos_target_pad = match eos_target {
+            "encoder" => encoder.static_pad("sink").expect("encoder sink pad"),
+            // The closed valve drops EOS in this GStreamer build; enter below
+            // it (the queue's sink pad) so the buffered tail drains and the
+            // muxer finalizes — mirrors the app fix.
+            "below-valve" => valve
+                .static_pad("src")
+                .expect("valve src pad")
+                .peer()
+                .expect("valve src peer (queue sink pad)"),
+            _ => valve.static_pad("sink").expect("valve sink pad"),
+        };
+        eos_target_pad.send_event(gst::event::Eos::new());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let eos_ok = eos_seen.load(Ordering::SeqCst);
+        let _ = pipeline.set_state(gst::State::Null);
+        (chunks_during, eos_ok)
+    }
+
+    /// Replicate the app's recording stop with the REAL two-branch tap tee:
+    /// the shared tee also feeds a live main video sink (fakesink, sync=false)
+    /// while the recording branch is attached, exactly like the app's
+    /// hot-plugged video tap. Returns (chunks, eos_ok).
+    fn run_recording_two_branch_tee(
+        main_branch: &str,
+        preset: &str,
+        eos_target: &str,
+    ) -> (usize, bool) {
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        // Pace at the caps framerate like the app's live WebRTC video instead
+        // of flooding as fast as possible.
+        src.set_property("is-live", true);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let queue = gst::ElementFactory::make("queue").build().expect("queue");
+        queue.set_property_from_str("leaky", "downstream");
+        queue.set_property("max-size-buffers", 30u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("capsfilter");
+        caps.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)I420").expect("I420 caps"),
+        );
+        let encoder = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        // `preset` varies the encoder speed so we can isolate the two-branch
+        // tee effect from the real-world iGPU x264 bottleneck.
+        encoder.set_property_from_str("speed-preset", preset);
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property("bitrate", 8000u32);
+        encoder.set_property("bframes", 0u32);
+        encoder.set_property("key-int-max", 120u32);
+        let muxer = gst::ElementFactory::make("mp4mux").build().expect("mp4mux");
+        muxer.set_property("streamable", true);
+        muxer.set_property("fragment-duration", 500u32);
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+
+        // Thumbnail branch (exact app wiring).
+        let thumb_tee = gst::ElementFactory::make("tee").build().expect("thumb tee");
+        let thumb_valve = gst::ElementFactory::make("valve")
+            .build()
+            .expect("thumb valve");
+        thumb_valve.set_property("drop", true);
+        let thumb_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("thumb queue");
+        thumb_queue.set_property_from_str("leaky", "downstream");
+        thumb_queue.set_property("max-size-buffers", 1u32);
+        thumb_queue.set_property("max-size-bytes", 0u32);
+        thumb_queue.set_property("max-size-time", 0u64);
+        let thumb_encoder = gst::ElementFactory::make("jpegenc")
+            .build()
+            .expect("jpegenc");
+        thumb_encoder.set_property("quality", 70i32);
+        thumb_encoder.set_property("snapshot", true);
+        let thumb_appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("thumb appsink");
+        thumb_appsink.set_property("sync", false);
+        thumb_appsink.set_property("max-buffers", 1u32);
+        thumb_appsink.set_property("drop", true);
+
+        // Main branch styles:
+        //  "fakesink"        — plain fakesink (sync=false, async=false)
+        //  "queue-fakesink"  — queue → fakesink (closer to the app's post-decode
+        //                      queue → sink present chain)
+        //  "hotplug"         — recording branch attached to the tee AFTER the
+        //                      pipeline is already flowing (app's ensure_tee)
+        let main_sink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("main fakesink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+        let main_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("main queue");
+        main_queue.set_property("max-size-buffers", 1u32);
+        main_queue.set_property_from_str("leaky", "downstream");
+
+        let pipeline = gst::Pipeline::new();
+        let mut all: Vec<gst::Element> = vec![
+            src.clone(),
+            src_caps.clone(),
+            tee.clone(),
+            valve.clone(),
+            queue.clone(),
+            convert.clone(),
+            caps.clone(),
+            thumb_tee.clone(),
+            encoder.clone(),
+            muxer.clone(),
+            appsink.clone(),
+            thumb_valve.clone(),
+            thumb_queue.clone(),
+            thumb_encoder.clone(),
+            thumb_appsink.clone(),
+        ];
+        let hotplug_recording = main_branch == "hotplug";
+        if main_branch != "fakesink-none" {
+            all.push(main_sink.clone());
+        }
+        if main_branch == "queue-fakesink" {
+            all.push(main_queue.clone());
+        }
+        for element in &all {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("src->src_caps");
+        src_caps.link(&tee).expect("src_caps->tee");
+        match main_branch {
+            "fakesink" | "hotplug" => {
+                tee.link(&main_sink).expect("tee->main_sink");
+            }
+            "queue-fakesink" => {
+                tee.link(&main_queue).expect("tee->main_queue");
+                main_queue.link(&main_sink).expect("main_queue->main_sink");
+            }
+            _ => {}
+        }
+        if !hotplug_recording {
+            tee.link(&valve).expect("tee->valve");
+        }
+        valve.link(&queue).expect("valve->queue");
+        queue.link(&convert).expect("queue->convert");
+        convert.link(&caps).expect("convert->caps");
+        caps.link(&thumb_tee).expect("caps->thumb_tee");
+        thumb_tee.link(&encoder).expect("thumb_tee->encoder");
+        encoder.link(&muxer).expect("encoder->muxer");
+        muxer.link(&appsink).expect("muxer->appsink");
+        thumb_tee
+            .link(&thumb_valve)
+            .expect("thumb_tee->thumb_valve");
+        thumb_valve
+            .link(&thumb_queue)
+            .expect("thumb_valve->thumb_queue");
+        thumb_queue
+            .link(&thumb_encoder)
+            .expect("thumb_queue->thumb_encoder");
+        thumb_encoder
+            .link(&thumb_appsink)
+            .expect("thumb_encoder->thumb_appsink");
+
+        let chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let eos_seen = Arc::new(AtomicBool::new(false));
+        let frames_in_branch = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frames_at_encoder = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let branch_count = frames_in_branch.clone();
+        valve.static_pad("sink").expect("valve sink pad").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad, _info| {
+                branch_count.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            },
+        );
+        let enc_count = frames_at_encoder.clone();
+        encoder
+            .static_pad("sink")
+            .expect("encoder sink pad")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                enc_count.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        let appsink_sink_pad = appsink.static_pad("sink").expect("appsink sink pad");
+        let chunk_counter = chunks.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            chunk_counter.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        let eos_flag = eos_seen.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    eos_flag.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        let thumb_gate = thumb_valve.clone();
+        let thumb_grabber = Arc::new(Mutex::new(false));
+        let thumb_grab = thumb_grabber.clone();
+        let thumb_sink_pad = thumb_appsink.static_pad("sink").expect("thumb sink pad");
+        thumb_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            let mut slot = thumb_grab.lock().expect("thumb lock");
+            if !*slot {
+                *slot = true;
+                let _ = thumb_gate.set_property("drop", true);
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        let bus = pipeline.bus().expect("bus");
+        let bus_dumper = std::thread::spawn(move || {
+            for _ in 0..40 {
+                let msg = bus.timed_pop(gst::ClockTime::from_mseconds(100));
+                if let Some(msg) = msg {
+                    use gst::prelude::*;
+                    match msg.view() {
+                        gst::MessageView::Error(err) => {
+                            eprintln!("DIAG   bus ERROR: {}", err.error())
+                        }
+                        gst::MessageView::Warning(warn) => {
+                            eprintln!("DIAG   bus WARNING: {}", warn.error())
+                        }
+                        gst::MessageView::StateChanged(sc) => {
+                            if let Some(src) = sc.src() {
+                                if src.name().contains("pipeline") {
+                                    eprintln!(
+                                        "DIAG   pipeline state: {:?} -> {:?}",
+                                        sc.old(),
+                                        sc.current()
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        if hotplug_recording {
+            // App's ensure_tee pattern: attach the recording branch to the tee
+            // only after the main branch has been flowing.
+            std::thread::sleep(Duration::from_millis(500));
+            tee.link(&valve).expect("hotplug tee->valve");
+            valve.sync_state_with_parent().expect("valve state");
+            queue.sync_state_with_parent().expect("queue state");
+            convert.sync_state_with_parent().expect("convert state");
+            caps.sync_state_with_parent().expect("caps state");
+            thumb_tee.sync_state_with_parent().expect("thumb tee state");
+            encoder.sync_state_with_parent().expect("encoder state");
+            muxer.sync_state_with_parent().expect("muxer state");
+            appsink.sync_state_with_parent().expect("appsink state");
+            thumb_valve
+                .sync_state_with_parent()
+                .expect("thumb valve state");
+            thumb_queue
+                .sync_state_with_parent()
+                .expect("thumb queue state");
+            thumb_encoder
+                .sync_state_with_parent()
+                .expect("thumb encoder state");
+            thumb_appsink
+                .sync_state_with_parent()
+                .expect("thumb appsink state");
+        }
+        valve.set_property("drop", false);
+        thumb_valve.set_property("drop", false);
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = bus_dumper.join();
+        let chunks_during = chunks.load(Ordering::SeqCst);
+
+        // Stop flow (mirrors GstreamerRecordingState::stop(finalize=true)).
+        valve.set_property("drop", true);
+        thumb_valve.set_property("drop", true);
+        let eos_target_pad = match eos_target {
+            "below-valve" => valve
+                .static_pad("src")
+                .expect("valve src pad")
+                .peer()
+                .expect("valve src peer (queue sink pad)"),
+            _ => valve.static_pad("sink").expect("valve sink pad"),
+        };
+        eos_target_pad.send_event(gst::event::Eos::new());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let eos_ok = eos_seen.load(Ordering::SeqCst);
+        eprintln!(
+            "DIAG   frames: branch={} encoder={} chunks={}",
+            frames_in_branch.load(Ordering::SeqCst),
+            frames_at_encoder.load(Ordering::SeqCst),
+            chunks_during
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+        (chunks_during, eos_ok)
+    }
+
+    /// Force the recording branch queue FULL at stop time (flooding source +
+    /// queue-fakesink main branch) and compare EOS-below-valve sent
+    /// immediately (current app behavior) vs. after the queue drains.
+    /// Returns (queue_level_at_stop, eos_ok).
+    fn run_recording_eos_queue_full(eos_mode: &str) -> (u32, bool) {
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        // Flood as fast as possible: the recording queue stays full (30 max)
+        // because the encoder cannot keep up — like the iGPU at 1080p60.
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                "video/x-raw,format=(string)NV12,width=(int)1920,height=(int)1080,framerate=(fraction)60/1",
+            )
+            .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let queue = gst::ElementFactory::make("queue").build().expect("queue");
+        queue.set_property_from_str("leaky", "downstream");
+        queue.set_property("max-size-buffers", 30u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("capsfilter");
+        caps.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)I420").expect("I420 caps"),
+        );
+        let encoder = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        encoder.set_property_from_str("speed-preset", "ultrafast");
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property("bitrate", 8000u32);
+        encoder.set_property("bframes", 0u32);
+        encoder.set_property("key-int-max", 120u32);
+        let muxer = gst::ElementFactory::make("mp4mux").build().expect("mp4mux");
+        muxer.set_property("streamable", true);
+        muxer.set_property("fragment-duration", 500u32);
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+        let thumb_valve = gst::ElementFactory::make("valve")
+            .build()
+            .expect("thumb valve");
+        thumb_valve.set_property("drop", true);
+        let main_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("main queue");
+        main_queue.set_property("max-size-buffers", 1u32);
+        main_queue.set_property_from_str("leaky", "downstream");
+        let main_sink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("main fakesink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [
+            &src,
+            &src_caps,
+            &tee,
+            &valve,
+            &queue,
+            &convert,
+            &caps,
+            &encoder,
+            &muxer,
+            &appsink,
+            &thumb_valve,
+            &main_queue,
+            &main_sink,
+        ] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("src->src_caps");
+        src_caps.link(&tee).expect("src_caps->tee");
+        tee.link(&main_queue).expect("tee->main_queue");
+        main_queue.link(&main_sink).expect("main_queue->main_sink");
+        tee.link(&valve).expect("tee->valve");
+        valve.link(&queue).expect("valve->queue");
+        queue.link(&convert).expect("queue->convert");
+        convert.link(&caps).expect("convert->caps");
+        caps.link(&encoder).expect("caps->encoder");
+        encoder.link(&muxer).expect("encoder->muxer");
+        muxer.link(&appsink).expect("muxer->appsink");
+
+        let eos_seen = Arc::new(AtomicBool::new(false));
+        let appsink_sink_pad = appsink.static_pad("sink").expect("appsink sink pad");
+        let eos_flag = eos_seen.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    eos_flag.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        valve.set_property("drop", false);
+        std::thread::sleep(Duration::from_secs(3));
+        valve.set_property("drop", true);
+        let queue_level: u32 = queue.property::<u32>("current-level-buffers");
+        let below = valve
+            .static_pad("src")
+            .expect("valve src pad")
+            .peer()
+            .expect("valve src peer");
+        if eos_mode == "drain" {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                let level: u32 = queue.property::<u32>("current-level-buffers");
+                if level == 0 || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        below.send_event(gst::event::Eos::new());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let eos_ok = eos_seen.load(Ordering::SeqCst);
+        let _ = pipeline.set_state(gst::State::Null);
+        (queue_level, eos_ok)
+    }
+
+    #[test]
+    fn recording_branch_eos_finalizes() {
+        gst::init().expect("gstreamer init");
+        // 1. Exact app wiring (with thumbnail branch), EOS on the closed valve
+        //    sink pad — the reproduced bug (valve drops EOS while closed).
+        let (chunks, eos_bug) = run_recording_eos_variant(true, "valve");
+        eprintln!("DIAG recording app-wiring (EOS on closed valve): chunks={chunks} eos={eos_bug}");
+        assert!(
+            chunks > 0,
+            "recording branch never produced muxer output while recording"
+        );
+        assert!(
+            !eos_bug,
+            "expected the closed-valve EOS to hang (bug reproduction); it unexpectedly finalized"
+        );
+        // 2. FIX VERIFICATION: same app wiring, but EOS enters BELOW the closed
+        //    valve (the queue's sink pad) — the app's fix in stop().
+        let (chunks_fix, eos_fix) = run_recording_eos_variant(true, "below-valve");
+        eprintln!("DIAG recording fix (EOS below closed valve): chunks={chunks_fix} eos={eos_fix}");
+        assert!(
+            eos_fix,
+            "EOS below the closed valve still does not finalize — recording-stop crash remains"
+        );
+        // 3a. queue→fakesink main branch, ultrafast encoder (the passing
+        //     control from the last run).
+        let (a_main, a_eos) =
+            run_recording_two_branch_tee("queue-fakesink", "ultrafast", "below-valve");
+        eprintln!("DIAG two-branch live [queue-fakesink/ultrafast]: chunks={a_main} eos={a_eos}");
+        // 3b. Hot-plugged recording branch (the app's ensure_tee pattern), fast
+        //     encoder.
+        let (b_main, b_eos) = run_recording_two_branch_tee("hotplug", "ultrafast", "below-valve");
+        eprintln!("DIAG two-branch live [hotplug/ultrafast]: chunks={b_main} eos={b_eos}");
+        // 3c. Hot-plugged recording branch with the realistic slow encoder
+        //     (iGPU x264 at 1080p60 keeps the queue full) — the closest field
+        //     reproduction.
+        let (c_main, c_eos) = run_recording_two_branch_tee("hotplug", "veryfast", "below-valve");
+        eprintln!("DIAG two-branch live [hotplug/veryfast]: chunks={c_main} eos={c_eos}");
+        assert!(
+            a_main > 0 || b_main > 0 || c_main > 0,
+            "two-branch recording never produced muxer output while recording"
+        );
+        assert!(
+            a_eos && b_eos && c_eos,
+            "two-branch tee + EOS below valve still does not finalize — matches the field timeout; fix needed"
+        );
+        // 4. QUEUE-FULL reproduction: EOS below the valve while the branch queue
+        //    is full (flooding source), immediate vs. after drain.
+        let (q_level, q_imm) = run_recording_eos_queue_full("immediate");
+        eprintln!("DIAG queue-full [immediate]: queue={q_level} eos={q_imm}");
+        let (_q2, q_drain) = run_recording_eos_queue_full("drain");
+        eprintln!("DIAG queue-full [drain-then-EOS]: eos={q_drain}");
+        assert!(
+            q_imm,
+            "queue-full + immediate EOS lost — matches the field timeout; EOS must be serialized after the buffered tail"
+        );
+    }
+
+    /// Regression: webrtcbin emits pad-added for SEND-path pads (SINK
+    /// direction, e.g. the mic transceiver's send pad when the local
+    /// description is sendonly). wire_incoming_media_sink must exclude them;
+    /// the old code let the RTP-capped mic send pad through, created a
+    /// spurious decodebin in the running pipeline and failed the link with
+    /// WrongDirection, stalling the video present chain on every session
+    /// with a sendonly mic m-line (07:45 field log: 6/6 sessions rendered=0;
+    /// 06:32 working log: 0 send-pad events, rendered climbs to 10k+).
+    #[test]
+    fn mic_send_pad_is_not_incoming_media() {
+        gst::init().expect("gstreamer init");
+        use crate::gstreamer_pipeline::is_incoming_media_pad;
+
+        // The mic send pad is a SINK-direction pad on webrtcbin (the app
+        // pushes RTP into it). It must be excluded from incoming-media
+        // handling even though its caps are application/x-rtp (OPUS).
+        let sink_pad = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("mic-send-pad")
+            .build();
+        assert_eq!(
+            sink_pad.direction(),
+            gst::PadDirection::Sink,
+            "precondition: mic send pad is a sink pad"
+        );
+        assert!(
+            !is_incoming_media_pad(&sink_pad),
+            "SINK-direction send pad (mic) must not be treated as incoming media"
+        );
+
+        // Incoming peer streams are SRC-direction pads — they must still be
+        // processed.
+        let src_pad = gst::Pad::builder(gst::PadDirection::Src)
+            .name("peer-video-pad")
+            .build();
+        assert_eq!(src_pad.direction(), gst::PadDirection::Src);
+        assert!(
+            is_incoming_media_pad(&src_pad),
+            "SRC-direction pad (peer video/audio) must be treated as incoming media"
+        );
+        eprintln!(
+            "DIAG mic send pad excluded from incoming-media handler: sink={} src={}",
+            !is_incoming_media_pad(&sink_pad),
+            is_incoming_media_pad(&src_pad)
+        );
+    }
 }
