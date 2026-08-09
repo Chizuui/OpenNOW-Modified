@@ -1273,22 +1273,28 @@ fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
 /// game's render rate and can briefly overshoot the negotiated stream rate
 /// (menu/loading screens that render uncapped, catch-up bursts after stalls,
 /// sub-second averaging-window artifacts) — e.g. 174-200 for a game capped at
-/// 120 fps. GFN streams at the game's target rate, so any value above the
-/// negotiated ceiling (requested fps, else the caps framerate numerator) is
-/// implausible; clamp it so the HUD/overlay never shows a number the stream
-/// cannot deliver. 0 = no stats yet.
+/// 120 fps. But the game's render rate legitimately EXCEEDS the stream rate: a
+/// 60 fps stream can carry a game capped at 120 fps, so clamping to the
+/// negotiated stream fps (requested fps) made the HUD stick at 60 regardless
+/// of the game. Keep a plausibility ceiling of 2x the stream rate (120 for a
+/// 60 fps stream, 240 for 120 fps, absolute sanity cap 360) so uncapped
+/// menu/loading spikes stay out while real in-game rates are shown. 0 = no
+/// stats yet.
 fn clamped_server_game_fps(state: &VideoLivenessState) -> u32 {
     let game_fps = stats_channel_game_fps();
     if game_fps == 0 {
         return 0;
     }
-    let ceiling = state.requested_fps().or_else(|| {
+    let stream_fps = state.requested_fps().or_else(|| {
         state
             .caps_framerate()
             .and_then(|caps| caps.split('/').next()?.trim().parse::<u32>().ok())
     });
-    match ceiling {
-        Some(ceiling) if ceiling > 0 => game_fps.min(ceiling),
+    match stream_fps {
+        Some(stream_fps) if stream_fps > 0 => {
+            let ceiling = stream_fps.saturating_mul(2).clamp(60, 360);
+            game_fps.min(ceiling)
+        }
         _ => game_fps,
     }
 }
