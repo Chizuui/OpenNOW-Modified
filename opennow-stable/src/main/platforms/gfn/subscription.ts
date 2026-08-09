@@ -10,10 +10,13 @@ import type {
   StreamRegion,
 } from "@shared/gfn";
 
+import { fetchWithTimeout } from "../../services/requestTimeout";
 import { buildGfnLcarsHeaders } from "./clientHeaders";
 
 /** MES API endpoint URL */
 const MES_URL = "https://mes.geforcenow.com/v4/subscriptions";
+const SUBSCRIPTION_REQUEST_TIMEOUT_MS = 8_000;
+const SERVER_INFO_REQUEST_TIMEOUT_MS = 5_000;
 
 interface SubscriptionResponse {
   firstEntitlementStartDateTime?: string;
@@ -90,6 +93,25 @@ function parseIsoDate(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function noActiveEntitlementSubscription(vpcId: string): SubscriptionInfo {
+  return {
+    membershipTier: "FREE",
+    allottedHours: 0,
+    purchasedHours: 0,
+    rolledOverHours: 0,
+    usedHours: 0,
+    remainingHours: 0,
+    totalHours: 0,
+    serverRegionId: vpcId,
+    isUnlimited: false,
+    entitledResolutions: [],
+  };
+}
+
+function isNoActiveEntitlementResponse(status: number, body: string): boolean {
+  return status === 404 && /user doesn't have active entitlement/i.test(body);
+}
+
 /**
  * Fetch subscription info from MES API
  * @param token - The authentication token
@@ -108,16 +130,24 @@ export async function fetchSubscription(
   url.searchParams.append("vpcId", vpcId);
   url.searchParams.append("userId", userId);
 
-  const response = await fetch(url.toString(), {
-    headers: buildGfnLcarsHeaders({
-      token,
-      clientType: "NATIVE",
-      clientStreamer: "NVIDIA-CLASSIC",
-    }),
-  });
+  const response = await fetchWithTimeout(
+    url.toString(),
+    {
+      headers: buildGfnLcarsHeaders({
+        token,
+        clientType: "NATIVE",
+        clientStreamer: "NVIDIA-CLASSIC",
+      }),
+    },
+    SUBSCRIPTION_REQUEST_TIMEOUT_MS,
+    "Subscription API request",
+  );
 
   if (!response.ok) {
     const body = await response.text();
+    if (isNoActiveEntitlementResponse(response.status, body)) {
+      return noActiveEntitlementSubscription(vpcId);
+    }
     throw new Error(`Subscription API failed with status ${response.status}: ${body}`);
   }
 
@@ -254,7 +284,12 @@ export async function fetchDynamicRegions(
 
   let response: Response;
   try {
-    response = await fetch(url, { headers });
+    response = await fetchWithTimeout(
+      url,
+      { headers },
+      SERVER_INFO_REQUEST_TIMEOUT_MS,
+      "GFN server info request",
+    );
   } catch {
     return { regions: [], vpcId: null };
   }

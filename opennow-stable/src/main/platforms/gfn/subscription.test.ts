@@ -68,3 +68,24 @@ test("fetchSubscription exposes only entitled resolution and fps profiles", asyn
     { width: 1280, height: 800, fps: 90 },
   ]);
 });
+
+test("fetchSubscription treats missing active entitlement as a free tier", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  globalThis.fetch = (async () =>
+    jsonResponse(
+      {
+        detail: "User Doesn't Have Active Entitlement",
+      },
+      { status: 404 },
+    )) as typeof fetch;
+
+  const subscription = await fetchSubscription("token", "user-without-entitlement", "NP-AMS-08");
+
+  assert.equal(subscription.membershipTier, "FREE");
+  assert.equal(subscription.totalHours, 0);
+  assert.deepEqual(subscription.entitledResolutions, []);
+});
