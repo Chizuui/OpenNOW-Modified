@@ -56,17 +56,24 @@ const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 6;
 /// after opening its valve before giving up (the stream may be paused).
 const SCREENSHOT_CAPTURE_TIMEOUT_MS: u64 = 2_000;
 /// How long to wait for the recording encoder/muxer to flush after EOS before
-/// giving up on finalizing the recording. Generous on purpose: on weak CPUs /
-/// iGPUs the branch queue (up to 30 frames) drains through x264enc at a few
-/// tens of fps, and the muxer must also flush its final fragment — the
-/// original 3 s timed out in the field on every recording stop.
-const RECORDING_FINALIZE_TIMEOUT_MS: u64 = 10_000;
+/// falling back to the muxer-direct EOS failsafe (and then giving up).
+/// Generous on purpose: on weak CPUs / iGPUs the branch queue (up to 30
+/// frames) drains through x264enc at a few tens of fps, and the muxer must
+/// also flush its final fragment. Bounded so stop(finalize=true) always
+/// completes well inside the Electron request timeout even when the audio
+/// branch never flowed (the audio EOS is rejected below the dead audio
+/// valve, the muxer would otherwise wait forever, and the failsafe below
+/// finalizes it directly).
+const RECORDING_FINALIZE_TIMEOUT_MS: u64 = 4_000;
 /// How long to wait for the recording branch queue to drain after the capture
 /// valve closes, before injecting EOS. Once the queue is empty the EOS is
 /// serialized after the last buffered frame instead of racing ahead of it
 /// (an EOS that overtakes a full queue can be lost inside the encoder/muxer
 /// on slow machines, leaving the recording un-finalized).
-const RECORDING_DRAIN_TIMEOUT_MS: u64 = 8_000;
+const RECORDING_DRAIN_TIMEOUT_MS: u64 = 4_000;
+/// How long to wait after the muxer-direct EOS failsafe before giving up on
+/// finalizing the recording.
+const RECORDING_FAILSAFE_TIMEOUT_MS: u64 = 2_000;
 /// Default recording bitrate (kbps) for the native H.264 encoder.
 // Must stay unsigned: x264enc's `bitrate` is a guint, and gstreamer-rs
 // `set_property` panics (process exit 101) when the Rust integer width/
@@ -560,21 +567,35 @@ impl GstreamerVideoTap {
 pub(crate) struct GstreamerRecordingState {
     /// Video branch valve (between the video tap tee and the encoder chain).
     valve: gst::Element,
-    /// Mixer-output valve (None for video-only recordings without any audio
-    /// source). Gates the whole audio encode path.
-    audio_valve: Option<gst::Element>,
+    /// Per-track audio valves (one per audio source: game audio, mic). Each
+    /// track is an independent chain tap → audioresample → audioconvert →
+    /// capsfilter(2ch/48k) → valve → voaacenc → mp4mux, so no audio mixer
+    /// (aggregator) is involved — a mixer hot-plugged into a PLAYING pipeline
+    /// drops the joined pads ("outside output segment") and fills them with
+    /// digital silence, then its tiny per-pad queues block the game chain
+    /// upstream (field: recordings carry no game audio). Empty for video-only
+    /// recordings without any audio source.
+    audio_valves: Vec<gst::Element>,
     /// Thumbnail valve (between the I420 tee and the JPEG grabber): open only
     /// while capturing the first frame, then closed again (idle ~0 cost).
     thumb_valve: gst::Element,
     /// Base64 JPEG of the first encoded recording frame; `None` until a frame
     /// has been captured (or the recording had no frames).
     thumbnail: Arc<Mutex<Option<String>>>,
-    appsink: gst::Element,
+    pub(crate) appsink: gst::Element,
+    /// The mp4mux element. `stop(finalize=true)` falls back to sending EOS
+    /// directly on its sink pads when the normal below-valve EOS path cannot
+    /// complete (a recording audio branch that never flowed rejects the audio
+    /// EOS, so the muxer would otherwise wait forever and stop() would time
+    /// out); sending EOS on the muxer's sink pads finalizes it regardless.
+    pub(crate) muxer: gst::Element,
     elements: Vec<gst::Element>,
     tee: gst::Element,
-    /// Tap queues (game audio / mic) currently linked into the recording
-    /// mixer; unlinked on teardown so a rebuilt branch can relink them.
-    audio_taps: Vec<gst::Element>,
+    /// (tap tee, requested fresh pad) for each audio track currently linked
+    /// into the recording branch. On teardown the fresh pad is unlinked and
+    /// released back to its tee so the next recording can request a new one
+    /// (fresh pads never have the parked-src-task problem of dangling queues).
+    audio_taps: Vec<(gst::Element, gst::Pad)>,
     /// The video-branch queue (valve → queue → convert → …). `stop()` drains
     /// it before injecting EOS so the EOS is serialized after the buffered
     /// tail instead of racing ahead of it.
@@ -595,7 +616,7 @@ impl GstreamerRecordingState {
         // the first muxer output (ftyp + moov).
         self.active.store(true, Ordering::SeqCst);
         self.valve.set_property("drop", false);
-        if let Some(audio_valve) = &self.audio_valve {
+        for audio_valve in &self.audio_valves {
             audio_valve.set_property("drop", false);
         }
         // Reset + open the thumbnail grabber; its probe closes the valve right
@@ -604,10 +625,12 @@ impl GstreamerRecordingState {
             *slot = None;
         }
         self.thumb_valve.set_property("drop", false);
-        let audio_note = if self.audio_valve.is_some() {
+        let audio_note = if self.audio_valves.is_empty() {
+            " (video only — no audio source available)"
+        } else if self.audio_valves.len() == 1 {
             " with audio"
         } else {
-            " (video only — no audio source available)"
+            " with game + mic audio tracks"
         };
         send_log(
             &self.event_sender,
@@ -621,7 +644,7 @@ impl GstreamerRecordingState {
         // Stop new frames entering the branch first; buffers already inside
         // (queue → encoder → muxer) keep flowing.
         self.valve.set_property("drop", true);
-        if let Some(audio_valve) = &self.audio_valve {
+        for audio_valve in &self.audio_valves {
             audio_valve.set_property("drop", true);
         }
         self.thumb_valve.set_property("drop", true);
@@ -678,7 +701,7 @@ impl GstreamerRecordingState {
             );
         }
 
-        for element in std::iter::once(&self.valve).chain(self.audio_valve.iter()) {
+        for element in std::iter::once(&self.valve).chain(self.audio_valves.iter()) {
             let src_pad = element
                 .static_pad("src")
                 .ok_or_else(|| "Recording valve has no src pad.".to_owned())?;
@@ -704,14 +727,14 @@ impl GstreamerRecordingState {
             // frame; a second EOS after the drain is harmless and often
             // completes the flush.
             let retry_deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+                std::time::Instant::now() + std::time::Duration::from_millis(1_000);
             let mut retried = false;
             while !self.eos_seen.load(Ordering::SeqCst)
                 && std::time::Instant::now() < retry_deadline
             {
                 if !retried {
                     retried = true;
-                    for element in std::iter::once(&self.valve).chain(self.audio_valve.iter()) {
+                    for element in std::iter::once(&self.valve).chain(self.audio_valves.iter()) {
                         if let Some(src_pad) = element.static_pad("src") {
                             if let Some(below) = src_pad.peer() {
                                 let _ = below.send_event(gst::event::Eos::new());
@@ -719,6 +742,34 @@ impl GstreamerRecordingState {
                         }
                     }
                 }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        // FAILSAFE: mp4mux only emits EOS once EVERY sink pad has seen it.
+        // If an audio track never flowed (e.g. the tap tee had no data, or a
+        // fresh pad link failed and the track was skipped) it rejects the
+        // audio EOS below its valve — the muxer then waits forever for that
+        // audio pad's EOS and stop(finalize=true) times out (field: "Native
+        // recording stop: sent EOS below valve (accepted=false)", muxer EOS
+        // never seen, Electron 5s timeout). Sending EOS directly on the
+        // muxer's sink pads bypasses the dead audio upstream: the muxer
+        // finalizes (probe sees EOS at the appsink)
+        // even when no audio buffer ever flowed.
+        if !self.eos_seen.load(Ordering::SeqCst) {
+            send_log(
+                &self.event_sender,
+                "warn",
+                "Native recording stop: normal EOS path did not finalize the muxer; sending EOS directly on the muxer sink pads (dead audio branch).".to_owned(),
+            );
+            for pad in self.muxer.sink_pads() {
+                let _ = pad.send_event(gst::event::Eos::new());
+            }
+            let failsafe_deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(RECORDING_FAILSAFE_TIMEOUT_MS);
+            while !self.eos_seen.load(Ordering::SeqCst)
+                && std::time::Instant::now() < failsafe_deadline
+            {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -848,8 +899,12 @@ impl GstreamerScreenshotGrab {
 }
 
 /// Native microphone send path: platform capture (WASAPI/osxaudiosrc/pulse) → Opus → RTP into the
-/// negotiated mic transceiver. Mute toggles the volume element so the
-/// sendonly m-line stays negotiated (re-negotiation would be disruptive).
+/// negotiated mic transceiver. Disabling the mic pauses the whole chain so
+/// NO outgoing RTP is emitted while it is off — volume-0 alone would still
+/// encode and send silence packets, and that continuous RTP stream was the
+/// only structural delta behind the periodic video stalls (see the
+/// negotiate_answer regression note). The sendonly m-line stays negotiated
+/// (re-negotiation would be disruptive).
 #[derive(Debug)]
 pub(crate) struct GstreamerMicPipeline {
     volume: gst::Element,
@@ -858,6 +913,21 @@ pub(crate) struct GstreamerMicPipeline {
 
 impl GstreamerMicPipeline {
     fn set_enabled(&self, enabled: bool) {
+        // Disable = run the WHOLE chain back to NULL (reversible, keeps the
+        // negotiated m-line and the payloader→webrtcbin pad link): PAUSED is
+        // not a hard stop — chain elements pass data through in PAUSED and
+        // audiotestsrc-class sources keep pushing — so only NULL guarantees
+        // that no buffers (→ no Opus → no RTP packets) leave the chain while
+        // the mic is off. Re-enabling returns every element to PLAYING; the
+        // capture device is re-opened and the RTP stream resumes.
+        let target = if enabled {
+            gst::State::Playing
+        } else {
+            gst::State::Null
+        };
+        for element in &self.elements {
+            let _ = element.set_state(target);
+        }
         self.volume
             .set_property("volume", if enabled { 1.0f64 } else { 0.0f64 });
     }
@@ -919,12 +989,23 @@ pub(crate) struct GstreamerPipeline {
     screenshot_grab: Arc<Mutex<Option<GstreamerScreenshotGrab>>>,
     video_tap: Arc<Mutex<Option<GstreamerVideoTap>>>,
     recording: Arc<Mutex<Option<GstreamerRecordingState>>>,
-    /// Recording tap on the decoded game-audio chain (queue element): built
-    /// when the audio chain appears, linked into the recording mixer on demand.
+    /// Recording tap tee on the decoded game-audio chain: built when the audio
+    /// chain appears. The recording branch requests a fresh src pad per
+    /// recording (fresh pads never carry the parked-src-task problem of the
+    /// old dangling queues).
     game_audio_tap: Arc<Mutex<Option<gst::Element>>>,
-    /// Recording tap on the mic chain after the mute volume (queue
-    /// element), so muting the mic also silences it in recordings.
+    /// Recording tap tee on the mic chain after the mute volume, so muting the
+    /// mic also silences it in recordings. Same fresh-pad-per-recording
+    /// contract as the game-audio tap.
     mic_audio_tap: Arc<Mutex<Option<gst::Element>>>,
+    /// The mic transceiver + negotiated Opus payload type from the last
+    /// answer, kept so `set_microphone_enabled(true)` can attach the mic send
+    /// path ON DEMAND when the mic was OFF at session start (the quick-menu /
+    /// shortcut toggle mid-session, when no mic pipeline was ever built). The
+    /// mic m-line is always negotiated sendonly in the answer; only the
+    /// actual capture/encode pipeline is deferred until the user enables it.
+    mic_transceiver: Option<gst_webrtc::WebRTCRTPTransceiver>,
+    mic_payload_type: Option<u32>,
     event_sender: Option<Sender<Event>>,
     pub(crate) original_remote_ice_credentials: Option<IceCredentials>,
 }
@@ -1007,8 +1088,18 @@ impl GstreamerPipeline {
             screenshot_grab,
             video_tap,
             recording: Arc::new(Mutex::new(None)),
-            game_audio_tap: Arc::new(Mutex::new(None)),
+            // The SAME Arc that `wire_incoming_media_sink` populated: the game
+            // audio chain stores its tap tee in this slot, and start_recording
+            // reads it back. A fresh empty Arc here (the old bug) made every
+            // recording report "no audio source (game audio or mic tap)" even
+            // though the game-audio tap tee was attached and flowing. The mic
+            // tap slot is the struct field itself (the deferred mic attach
+            // thread writes into it via `self.mic_audio_tap`), so it stays a
+            // fresh Arc here.
+            game_audio_tap,
             mic_audio_tap: Arc::new(Mutex::new(None)),
+            mic_transceiver: None,
+            mic_payload_type: None,
             event_sender,
             original_remote_ice_credentials: None,
         })
@@ -1411,13 +1502,17 @@ impl GstreamerPipeline {
         // that data channels — also sendonly but non-RTP — already passed
         // through untouched). The mic send path is therefore ON by default
         // again; the attach itself stays deferred (spawn_deferred_mic_attach)
-        // and carries outgoing RTP: real capture when the user's mic is on,
-        // and a muted generated-silence keepalive when it is off (see
-        // build_mic_pipeline) — that outgoing stream is what keeps the server
-        // sending us Receiver Reports, i.e. the local RTCP round-trip ping the
-        // HUD prefers over the (often 0) server-reported stats_channel field.
-        // OPENNOW_NATIVE_MIC=0 remains as a kill-switch for any machine where
-        // the mic send path still stalls the video present chain.
+        // and carries outgoing RTP ONLY when the user's mic is actually on
+        // (real platform capture). There is deliberately no
+        // generated-silence keepalive: a muted keepalive kept continuous
+        // outgoing RTP alive, and that continuous stream was the only
+        // structural delta between the stable 60fps era and the periodic
+        // video stalls. When the mic is off (or capture is unavailable) no
+        // RTP is sent at all, the server sends no Receiver Reports, and the
+        // HUD ping falls back to the (often 0) server-reported
+        // stats_channel field. OPENNOW_NATIVE_MIC=0 remains as a kill-switch
+        // for any machine where the mic send path still stalls the video
+        // present chain.
         let mic_attach_allowed = Self::native_mic_attach_allowed();
         if !mic_attach_allowed {
             send_log(
@@ -1450,6 +1545,11 @@ impl GstreamerPipeline {
 
         if let Some(transceiver) = mic_transceiver {
             if let Some(payload_type) = mic_payload {
+                // Keep the transceiver + payload so a mid-session mic toggle
+                // (set_microphone_enabled with no pipeline built yet) can
+                // attach the send path on demand.
+                self.mic_transceiver = Some(transceiver.clone());
+                self.mic_payload_type = Some(payload_type);
                 // Attach asynchronously, only after the video sink has started
                 // presenting (regression note above: attaching during video
                 // warm-up stalls every backend's present chain). The mic
@@ -1696,11 +1796,46 @@ impl GstreamerPipeline {
     }
 
     pub(crate) fn set_microphone_enabled(&self, enabled: bool) {
+        // Toggle an existing mic pipeline (mute/unmute the send path).
+        let mut already_attached = false;
         if let Ok(slot) = self.mic.lock() {
             if let Some(mic) = slot.as_ref() {
                 mic.set_enabled(enabled);
+                already_attached = true;
             }
         }
+        if already_attached || !enabled {
+            return;
+        }
+        // No mic pipeline yet (the mic was OFF at session start): attach the
+        // send path on demand using the negotiated transceiver/payload. The
+        // attach is deferred until the video sink is presenting (same warm-up
+        // guard as the session-start attach).
+        let Some(transceiver) = self.mic_transceiver.clone() else {
+            send_log(
+                &self.event_sender,
+                "warn",
+                "Cannot enable the mic mid-session: no mic transceiver was negotiated (mic send path may be force-disabled via OPENNOW_NATIVE_MIC=0)."
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(payload_type) = self.mic_payload_type else {
+            send_log(
+                &self.event_sender,
+                "warn",
+                "Cannot enable the mic mid-session: no Opus payload type was negotiated for the mic m-line."
+                    .to_owned(),
+            );
+            return;
+        };
+        send_log(
+            &self.event_sender,
+            "info",
+            "Mic toggled ON mid-session: attaching the mic send path (deferred until the video sink is presenting)."
+                .to_owned(),
+        );
+        self.spawn_deferred_mic_attach(transceiver, payload_type, true);
     }
 
     pub(crate) fn mic_attached(&self) -> bool {
@@ -1910,6 +2045,22 @@ impl GstreamerPipeline {
         let mic = self.mic.clone();
         let mic_audio_tap = self.mic_audio_tap.clone();
         std::thread::spawn(move || {
+            // Mic off → attach NOTHING. There is deliberately no muted
+            // generated-silence keepalive: continuous outgoing RTP (even
+            // silence) was the only structural delta behind the periodic
+            // video stalls, so the mic send path must be completely dead when
+            // the mic is off. With no outgoing RTP the server sends no
+            // Receiver Reports and the HUD ping falls back to the
+            // server-reported stats_channel field.
+            if !enabled {
+                send_log(
+                    &event_sender,
+                    "info",
+                    "Mic is off — no mic RTP path is attached (no silence keepalive); the HUD ping falls back to the server-reported stats field."
+                        .to_owned(),
+                );
+                return;
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut no_stats_head_start: Option<std::time::Instant> = None;
             let warm = loop {
@@ -2054,8 +2205,12 @@ impl GstreamerPipeline {
     /// Build the platform capture → Opus → RTP send path and link it into the
     /// mic transceiver's sink pad. The payload type comes from the negotiated
     /// answer so the RTP we send matches the SDP the server accepted.
-    /// `enabled` sets the initial mute state. When capture is unavailable the
-    /// source is generated silence and the volume element mutes it to zero.
+    /// `enabled` must be true (callers gate on it): when the mic is off there
+    /// is deliberately NO generated-silence keepalive — continuous outgoing
+    /// RTP (even muted silence) was the only structural delta behind the
+    /// periodic video stalls — so no mic pipeline exists at all and the HUD
+    /// ping falls back to the server stats field. Capture unavailability is
+    /// likewise NOT masked with silence: it aborts the attach (Err).
     /// Returns the mic pipeline plus the mic-tap queue (recording audio tap).
     fn build_mic_pipeline(
         pipeline: &gst::Pipeline,
@@ -2074,44 +2229,29 @@ impl GstreamerPipeline {
 
         let result = (|| -> Result<Vec<gst::Element>, String> {
             let mut elements = Vec::with_capacity(6);
-            // Mic ON → real capture; any capture failure falls back to
-            // generated silence. Mic OFF → no capture at all: a muted
-            // generated-silence keepalive keeps the sendonly m-line carrying
-            // outgoing RTP — that outgoing stream is what keeps the server
-            // sending us Receiver Reports, i.e. the local RTCP round-trip
-            // ping source. The volume element mutes it to zero either way.
-            let (source, source_factory, is_capture) = if !enabled {
-                let silence = gst::ElementFactory::make("audiotestsrc")
-                    .name("mic-silence-src")
-                    .build()
-                    .map_err(|error| {
-                        format!("Failed to create mic silence keepalive source: {error}")
-                    })?;
-                silence.set_property_from_str("wave", "silence");
-                (silence, "audiotestsrc (silence keepalive)", false)
-            } else {
-                match GstreamerPipeline::create_mic_source_element() {
-                    Ok((source, factory)) => {
-                        set_property_if_supported(&source, "low-latency", true);
-                        (source, factory, true)
-                    }
-                    Err(error) => {
-                        send_log(
-                            event_sender,
-                            "warn",
-                            format!(
-                                "Microphone capture unavailable ({error}); sending generated silence so the mic channel keeps the RTCP round-trip alive."
-                            ),
-                        );
-                        let silence = gst::ElementFactory::make("audiotestsrc")
-                            .name("mic-silence-src")
-                            .build()
-                            .map_err(|error| {
-                                format!("Failed to create mic silence source: {error}")
-                            })?;
-                        silence.set_property_from_str("wave", "silence");
-                        (silence, "audiotestsrc (silence)", false)
-                    }
+            // Mic ON → real capture ONLY. There is deliberately no
+            // generated-silence keepalive fallback: a continuous outgoing RTP
+            // stream (even muted silence) was the only structural delta
+            // between the stable 60fps era and the periodic video stalls, so
+            // the mic send path must be completely dead whenever there is no
+            // real capture — whether the mic is off at session start or the
+            // capture device is unavailable. With no outgoing RTP the server
+            // sends no Receiver Reports and the HUD ping falls back to the
+            // server-reported stats_channel field.
+            if !enabled {
+                return Err(
+                    "mic disabled — no mic RTP path is built (no silence keepalive).".to_owned(),
+                );
+            }
+            let (source, source_factory) = match GstreamerPipeline::create_mic_source_element() {
+                Ok((source, factory)) => {
+                    set_property_if_supported(&source, "low-latency", true);
+                    (source, factory)
+                }
+                Err(error) => {
+                    return Err(format!(
+                            "Microphone capture unavailable ({error}); no mic RTP is sent (no generated-silence keepalive) — the HUD ping falls back to the server stats field."
+                        ));
                 }
             };
 
@@ -2119,7 +2259,7 @@ impl GstreamerPipeline {
                 .name("mic-volume")
                 .build()
                 .map_err(|error| format!("Failed to create mic volume: {error}"))?;
-            volume.set_property("volume", if enabled { 1.0f64 } else { 0.0f64 });
+            volume.set_property("volume", 1.0f64);
 
             let convert = gst::ElementFactory::make("audioconvert")
                 .name("mic-audioconvert")
@@ -2145,40 +2285,28 @@ impl GstreamerPipeline {
                 })?;
                 elements.push(element.clone());
             }
-            let source_kind = if is_capture {
-                "platform capture"
-            } else if enabled {
-                "generated silence (capture unavailable)"
-            } else {
-                "generated silence keepalive (mic off)"
-            };
             send_log(
                 event_sender,
                 "info",
-                format!("Native microphone source: {source_factory} ({source_kind})."),
+                format!("Native microphone source: {source_factory} (platform capture)."),
             );
 
-            // Recording tap after the mute volume: tee → queue. Always flowing,
-            // gated downstream by the recording branch's mixer-output valve, so
-            // muting the mic (volume 0) also silences it in recordings.
+            // Recording tap after the mute volume: the tee itself is stored
+            // (no dangling queue — a queue built while the mic chain was idle
+            // parked its src task on FLOW_UNLINKED and never restarted when
+            // relinked at recording time). The recording branch requests a
+            // fresh src pad per recording and releases it on teardown, exactly
+            // like the game-audio and video taps. Muting the mic (volume 0)
+            // also silences it in recordings because the tap sits after the
+            // mute volume.
             let tap_tee = gst::ElementFactory::make("tee")
                 .name("mic-tap-tee")
                 .build()
                 .map_err(|error| format!("Failed to create mic tap tee: {error}"))?;
-            let tap_queue = gst::ElementFactory::make("queue")
-                .name("mic-tap-queue")
-                .build()
-                .map_err(|error| format!("Failed to create mic tap queue: {error}"))?;
-            tap_queue.set_property_from_str("leaky", "downstream");
-            tap_queue.set_property("max-size-buffers", 8u32);
-            tap_queue.set_property("max-size-bytes", 0u32);
-            tap_queue.set_property("max-size-time", 0u64);
-            for element in [&tap_tee, &tap_queue] {
-                pipeline.add(element).map_err(|error| {
-                    format!("Failed to add {} to the pipeline: {error}", element.name())
-                })?;
-                elements.push(element.clone());
-            }
+            pipeline.add(&tap_tee).map_err(|error| {
+                format!("Failed to add {} to the pipeline: {error}", tap_tee.name())
+            })?;
+            elements.push(tap_tee.clone());
 
             for pair in [
                 (&source, &volume),
@@ -2196,10 +2324,6 @@ impl GstreamerPipeline {
                     )
                 })?;
             }
-            tap_tee
-                .link(&tap_queue)
-                .map_err(|error| format!("Failed to link mic tap tee -> queue: {error:?}"))?;
-
             let payloader_src = payloader
                 .static_pad("src")
                 .ok_or_else(|| "mic rtpopuspay has no src pad.".to_owned())?;
@@ -2216,22 +2340,11 @@ impl GstreamerPipeline {
                 })?;
             }
 
-            let mode = if is_capture {
-                if enabled {
-                    "capture"
-                } else {
-                    "capture (muted)"
-                }
-            } else if enabled {
-                "silence probe (capture unavailable)"
-            } else {
-                "silence keepalive (mic off, muted)"
-            };
             send_log(
                 event_sender,
                 "info",
                 format!(
-                    "Native mic RTP path attached: {source_factory} ({mode}) → Opus → RTP payload {payload_type} on mid {:?}.",
+                    "Native mic RTP path attached: {source_factory} (capture) → Opus → RTP payload {payload_type} on mid {:?}.",
                     transceiver.mid()
                 ),
             );
@@ -2242,7 +2355,7 @@ impl GstreamerPipeline {
             Ok(elements) => {
                 let mic_tap = elements
                     .iter()
-                    .find(|element| element.name() == "mic-tap-queue")
+                    .find(|element| element.name() == "mic-tap-tee")
                     .cloned();
                 let mic_pipeline = GstreamerMicPipeline {
                     volume: elements
@@ -4396,9 +4509,12 @@ fn link_media_chain(
     }
 
     // Recording tap on the game-audio chain: tee between the last pre-sink
-    // element and the audio sink. The tap queue always flows (cheap, dropped
-    // at the recording branch's mixer-output valve when idle) and is linked
-    // into the recording mixer on demand.
+    // element and the audio sink. The TEE itself is stored (no dangling
+    // queue): a fresh src pad is requested from it per recording and released
+    // on teardown, exactly like the video tap. A dangling queue built at
+    // stream start received data immediately, parked its src task on
+    // FLOW_UNLINKED, and never restarted when relinked at recording time —
+    // the recording audio branch never flowed and stop-recording timed out.
     if media_label == "audio" {
         if let Some(tap_slot) = game_audio_tap {
             let tap_empty = tap_slot.lock().ok().is_none_or(|slot| slot.is_none());
@@ -4406,16 +4522,9 @@ fn link_media_chain(
                 let before_sink = elements[elements.len() - 2].clone();
                 let sink = elements[elements.len() - 1].clone();
                 let tap_tee = make_element("tee")?;
-                let tap_queue = make_element("queue")?;
-                tap_queue.set_property_from_str("leaky", "downstream");
-                tap_queue.set_property("max-size-buffers", 8u32);
-                tap_queue.set_property("max-size-bytes", 0u32);
-                tap_queue.set_property("max-size-time", 0u64);
-                for element in [&tap_tee, &tap_queue] {
-                    pipeline.add(element).map_err(|error| {
-                        format!("Failed to add game-audio tap element: {error}")
-                    })?;
-                }
+                pipeline
+                    .add(&tap_tee)
+                    .map_err(|error| format!("Failed to add game-audio tap tee: {error}"))?;
                 before_sink.unlink(&sink);
                 before_sink.link(&tap_tee).map_err(|error| {
                     format!("Failed to link audio chain into tap tee: {error:?}")
@@ -4424,20 +4533,15 @@ fn link_media_chain(
                     .link(&sink)
                     .map_err(|error| format!("Failed to link tap tee to audio sink: {error:?}"))?;
                 tap_tee
-                    .link(&tap_queue)
-                    .map_err(|error| format!("Failed to link audio tap tee -> queue: {error:?}"))?;
-                for element in [&tap_tee, &tap_queue] {
-                    element.sync_state_with_parent().map_err(|error| {
-                        format!("Failed to sync game-audio tap element state: {error}")
-                    })?;
-                }
+                    .sync_state_with_parent()
+                    .map_err(|error| format!("Failed to sync game-audio tap tee state: {error}"))?;
                 if let Ok(mut slot) = tap_slot.lock() {
-                    *slot = Some(tap_queue.clone());
+                    *slot = Some(tap_tee.clone());
                 }
                 send_log(
                     event_sender,
                     "info",
-                    "Attached native recording game-audio tap (tee → queue).".to_owned(),
+                    "Attached native recording game-audio tap tee.".to_owned(),
                 );
             }
         }
@@ -4635,7 +4739,7 @@ fn insert_screenshot_grab_branch(
 /// pad (each becomes one `recording-chunk` event); an EVENT probe records EOS
 /// so `stop(finalize=true)` knows when the branch flushed. The valve starts
 /// closed, so the branch costs nothing until a recording starts.
-fn insert_recording_branch(
+pub(crate) fn insert_recording_branch(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     video_api: RtpVideoApi,
@@ -4728,69 +4832,75 @@ fn insert_recording_branch(
     }
     video_elements.extend([convert, caps, thumb_tee.clone(), encoder.clone()]);
 
-    // --- Audio sub-branch (only when at least one audio tap exists) ---
-    // Each tap is normalized to identical caps (S16LE / 48 kHz / 2ch) before
-    // the mixer: audiomixer requires the same caps on every input pad, and the
-    // game-audio chain may carry e.g. 44.1 kHz mono while the WASAPI mic is
-    // 48 kHz stereo.
+    // --- Audio sub-branch: TWO independent AAC tracks (game + mic), NO mixer.
+    // Each available audio tap tee gets its own track: fresh tee pad →
+    // audioresample → audioconvert → capsfilter(S16LE/2ch/48k) → valve(closed)
+    // → voaacenc → mp4mux. The per-track valve gates the track exactly like
+    // the video branch's valve (data drops at the closed valve without
+    // back-pressure while the muxer finishes its state transition), and the
+    // fresh pads are only requested after every branch element reached PLAYING
+    // (sink pads FLUSH mid-transition, which stalled the game chain). This
+    // deliberately avoids audiomixer: an aggregator hot-plugged into a PLAYING
+    // pipeline drops the joined pads ("outside output segment") and fills them
+    // with digital silence, then its tiny per-pad queues block the game chain
+    // upstream after a few buffers (field: recordings carried no game audio).
+    // mp4mux supports multiple audio tracks, so game and mic each keep their
+    // own AAC track. The tap slots hold the tap TEES (fresh pads are requested
+    // per recording); the old eager dangling tap queues are gone — a queue
+    // that received data at stream start parked its src task on FLOW_UNLINKED
+    // and never restarted when relinked (stop-recording timed out).
     let mut audio_taps: Vec<gst::Element> = Vec::new();
     for slot in [game_audio_tap, mic_audio_tap] {
         if let Ok(guard) = slot.lock() {
-            if let Some(tap) = guard.clone() {
-                audio_taps.push(tap);
+            if let Some(tap_tee) = guard.clone() {
+                audio_taps.push(tap_tee);
             }
         }
     }
     let mut audio_elements: Vec<gst::Element> = Vec::new();
-    // Shared chain after the per-tap normalization chains (mixer → valve → AAC).
-    let mut audio_shared: Vec<gst::Element> = Vec::new();
-    let audio_valve = if audio_taps.is_empty() {
+    // Per-track chains: (tap tee, [resample, convert, capsfilter], valve, encoder).
+    let mut audio_track_chains: Vec<(gst::Element, Vec<gst::Element>, gst::Element, gst::Element)> =
+        Vec::new();
+    let audio_valves: Vec<gst::Element> = if audio_taps.is_empty() {
         send_log(
             &event_sender,
             "warn",
             "Native recording has no audio source (game audio or mic tap); recording video only."
                 .to_owned(),
         );
-        None
+        Vec::new()
     } else {
-        let mixer = make_element("audiomixer")?;
-        let audio_valve = make_element("valve")?;
-        let aac = make_element("voaacenc")?;
-        audio_valve.set_property("drop", true);
         let tap_caps: gst::Caps = "audio/x-raw,format=S16LE,channels=2,rate=48000"
             .parse()
             .map_err(|error| format!("Invalid recording audio caps: {error}"))?;
-        // Per-tap normalization chains (audioresample → audioconvert → capsfilter).
-        for tap in &audio_taps {
+        for tap_tee in &audio_taps {
             let tap_resample = make_element("audioresample")?;
             let tap_convert = make_element("audioconvert")?;
             let tap_caps_element = make_element("capsfilter")?;
             tap_caps_element.set_property("caps", &tap_caps);
-            for element in [&tap_resample, &tap_convert, &tap_caps_element] {
+            let tap_valve = make_element("valve")?;
+            tap_valve.set_property("drop", true);
+            let tap_aac = make_element("voaacenc")?;
+            for element in [
+                &tap_resample,
+                &tap_convert,
+                &tap_caps_element,
+                &tap_valve,
+                &tap_aac,
+            ] {
                 audio_elements.push(element.clone());
             }
-            // The tap may still be linked to a previous (removed) mixer.
-            if let Some(src) = tap.static_pad("src") {
-                if let Some(peer) = src.peer() {
-                    let _ = src.unlink(&peer);
-                }
-            }
-            tap.link(&tap_resample).map_err(|error| {
-                format!("Failed to link audio tap into recording resample: {error:?}")
-            })?;
-            tap_resample.link(&tap_convert).map_err(|error| {
-                format!("Failed to link recording audio resample -> convert: {error:?}")
-            })?;
-            tap_convert.link(&tap_caps_element).map_err(|error| {
-                format!("Failed to link recording audio convert -> caps: {error:?}")
-            })?;
-            tap_caps_element.link(&mixer).map_err(|error| {
-                format!("Failed to link recording audio caps -> mixer: {error:?}")
-            })?;
+            audio_track_chains.push((
+                tap_tee.clone(),
+                vec![tap_resample, tap_convert, tap_caps_element],
+                tap_valve,
+                tap_aac,
+            ));
         }
-        audio_elements.extend([mixer.clone(), audio_valve.clone(), aac.clone()]);
-        audio_shared.extend([mixer, audio_valve.clone(), aac]);
-        Some(audio_valve)
+        audio_track_chains
+            .iter()
+            .map(|(_, _, valve, _)| valve.clone())
+            .collect()
     };
 
     let mut elements: Vec<gst::Element> =
@@ -4822,6 +4932,16 @@ fn insert_recording_branch(
         .ok_or_else(|| "Recording video branch is empty.".to_owned())?
         .link(&muxer)
         .map_err(|error| format!("Failed to link x264enc -> mp4mux: {error:?}"))?;
+    // The muxer's output MUST be linked into the appsink: the chunk BUFFER
+    // probe and the EOS EVENT probe live on the appsink's sink pad, and the
+    // mp4mux src task only starts when its src pad has a peer. Without this
+    // link the muxer never aggregates (no chunks) and never pushes EOS, so
+    // stop(finalize=true) times out with "EOS still not seen at the muxer
+    // output" even after the direct-muxer failsafe (field: every native
+    // recording since the feature landed failed exactly this way).
+    muxer
+        .link(&appsink)
+        .map_err(|error| format!("Failed to link mp4mux -> appsink: {error:?}"))?;
 
     // Thumbnail grabber off the I420 tee: valve → queue → jpegenc → appsink.
     thumb_tee
@@ -4837,23 +4957,110 @@ fn insert_recording_branch(
         format!("Failed to link recording thumbnail jpegenc -> appsink: {error:?}")
     })?;
 
-    // Shared audio chain: mixer → valve → voaacenc → mp4mux. The per-tap
-    // normalization chains were already linked into the mixer above, so only
-    // the shared tail needs linking here.
-    for pair in audio_shared.windows(2) {
-        pair[0]
-            .link(&pair[1])
-            .map_err(|error| format!("Failed to link recording audio branch: {error:?}"))?;
-    }
-    if let Some(aac) = audio_shared.last() {
+    // Per-track internal chains — linked now that every element is inside the
+    // pipeline (common-bin-ancestor requirement). Each track links its own
+    // encoder straight into the muxer (mp4mux requests a new sink pad per
+    // track), all before any element goes PLAYING.
+    for (_, chain, valve, aac) in &audio_track_chains {
+        chain[0].link(&chain[1]).map_err(|error| {
+            format!("Failed to link recording audio resample -> convert: {error:?}")
+        })?;
+        chain[1].link(&chain[2]).map_err(|error| {
+            format!("Failed to link recording audio convert -> caps: {error:?}")
+        })?;
+        chain[2]
+            .link(valve)
+            .map_err(|error| format!("Failed to link recording audio caps -> valve: {error:?}"))?;
+        valve.link(aac).map_err(|error| {
+            format!("Failed to link recording audio valve -> voaacenc: {error:?}")
+        })?;
         aac.link(&muxer)
-            .map_err(|error| format!("Failed to link voaacenc -> mp4mux: {error:?}"))?;
+            .map_err(|error| format!("Failed to link recording voaacenc -> mp4mux: {error:?}"))?;
     }
 
     for element in &elements {
         element
             .sync_state_with_parent()
             .map_err(|error| format!("Failed to sync recording branch element state: {error}"))?;
+    }
+
+    // sync_state_with_parent is ASYNC: sink pads FLUSH during the NULL→PLAYING
+    // transition. Requesting fresh tap-tee pads mid-transition makes the
+    // already-PLAYING tap tees push into flushing pads → FLUSHING upstream →
+    // the game chain stalls after a few buffers (field: game-audio tap
+    // contributed nothing to recordings). Wait for the normalize chains + the
+    // muxer to actually reach PLAYING before linking the fresh pads: the
+    // chains reach PLAYING immediately, and the muxer can reach PLAYING via
+    // caps negotiation from the fixed capsfilters even with the track valves
+    // closed (data drops there). The appsink stays PAUSED until the first
+    // buffer, which is expected. Video-only recordings skip the wait entirely
+    // (no fresh audio pads to race).
+    if !audio_track_chains.is_empty() {
+        let mut pre_link_elements: Vec<gst::Element> = audio_track_chains
+            .iter()
+            .flat_map(|(_, chain, valve, _)| chain.iter().chain(std::iter::once(valve)))
+            .cloned()
+            .collect();
+        pre_link_elements.push(muxer.clone());
+        let transition_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let all_playing = pre_link_elements
+                .iter()
+                .all(|element| element.current_state() >= gst::State::Playing);
+            if all_playing || std::time::Instant::now() >= transition_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let not_playing: Vec<String> = pre_link_elements
+            .iter()
+            .filter(|element| element.current_state() < gst::State::Playing)
+            .map(|element| format!("{}={:?}", element.name(), element.current_state()))
+            .collect();
+        if !not_playing.is_empty() {
+            send_log(
+                &event_sender,
+                "warn",
+                format!(
+                    "Recording branch elements did not reach PLAYING before audio tap link: {not_playing:?}."
+                ),
+            );
+        }
+    }
+
+    // Request a fresh pad from each audio tap tee and link it into the track's
+    // resample sink. A tap tee that fails to provide/link a pad is skipped
+    // with a warning so one bad audio source can never abort the whole
+    // recording (video still records).
+    let mut audio_taps_linked: Vec<(gst::Element, gst::Pad)> = Vec::new();
+    for (tap_tee, chain, _, _) in &audio_track_chains {
+        let Some(request_pad) = tap_tee.request_pad_simple("src_%u") else {
+            send_log(
+                &event_sender,
+                "warn",
+                format!(
+                    "Skipping recording audio tap {}: failed to request a fresh pad.",
+                    tap_tee.name()
+                ),
+            );
+            continue;
+        };
+        let resample_sink = chain[0]
+            .static_pad("sink")
+            .ok_or_else(|| "Recording audio resample has no sink pad.".to_owned())?;
+        if let Err(error) = request_pad.link(&resample_sink) {
+            send_log(
+                &event_sender,
+                "warn",
+                format!(
+                    "Skipping recording audio tap {}: fresh pad link failed: {error:?}",
+                    tap_tee.name()
+                ),
+            );
+            let _ = tap_tee.release_request_pad(&request_pad);
+            continue;
+        }
+        audio_taps_linked.push((tap_tee.clone(), request_pad));
     }
 
     let eos_seen = Arc::new(AtomicBool::new(false));
@@ -4926,8 +5133,11 @@ fn insert_recording_branch(
         }
         None => "tee → valve → queue → videoconvert → x264enc → mp4mux → appsink".to_owned(),
     };
-    if audio_valve.is_some() {
-        chain_desc.push_str(" | audiomixer → voaacenc → mp4mux");
+    if !audio_valves.is_empty() {
+        chain_desc.push_str(&format!(
+            " | {} audio track(s): tap → resample → convert → caps → valve → voaacenc → mp4mux",
+            audio_valves.len()
+        ));
     }
     chain_desc.push_str(" | thumbnail: tee → valve → jpegenc → appsink");
     send_log(
@@ -4938,13 +5148,14 @@ fn insert_recording_branch(
 
     Ok(GstreamerRecordingState {
         valve,
-        audio_valve,
+        audio_valves,
         thumb_valve,
         thumbnail,
         appsink,
+        muxer,
         elements,
         tee: tee.clone(),
-        audio_taps,
+        audio_taps: audio_taps_linked,
         queue,
         eos_seen,
         active,
@@ -4953,17 +5164,19 @@ fn insert_recording_branch(
     })
 }
 
-/// Tear down a spent recording branch: unlink the audio taps from the mixer,
-/// unlink the video branch from the video tap tee, release the tee request
-/// pad, and remove the branch elements. Only called after a finalized (EOS)
-/// recording, when the branch is quiescent.
+/// Tear down a spent recording branch: release each audio track's fresh tee
+/// pad back to its tap tee, unlink the video branch from the video tap tee,
+/// release the tee request pad, and remove the branch elements. Only called
+/// after a finalized (EOS) recording, when the branch is quiescent.
 fn teardown_recording_branch(pipeline: &gst::Pipeline, recording: &GstreamerRecordingState) {
-    for tap in &recording.audio_taps {
-        if let Some(src) = tap.static_pad("src") {
-            if let Some(peer) = src.peer() {
-                let _ = src.unlink(&peer);
-            }
+    // Unlink and release each audio track's fresh pad back to its tap tee so
+    // the next recording can request a new one (reusing a spent pad that has
+    // seen EOS/teardown events is what left dangling queues dead).
+    for (tap_tee, fresh_pad) in &recording.audio_taps {
+        if let Some(peer) = fresh_pad.peer() {
+            let _ = fresh_pad.unlink(&peer);
         }
+        tap_tee.release_request_pad(fresh_pad);
     }
     if let Some(valve_sink_pad) = recording.valve.static_pad("sink") {
         if let Some(tee_src_pad) = valve_sink_pad.peer() {
@@ -4980,4 +5193,102 @@ fn teardown_recording_branch(pipeline: &gst::Pipeline, recording: &GstreamerReco
         "info",
         "Tore down finalized native recording branch (ready for a fresh branch).".to_owned(),
     );
+}
+
+#[cfg(test)]
+mod mic_pipeline_tests {
+    use super::*;
+
+    /// The mic send path must be COMPLETELY dead while the mic is off: no
+    /// buffers may flow (→ no Opus → no RTP), not even volume-0 silence. The
+    /// old volume-only mute kept continuous outgoing RTP alive, and that
+    /// continuous stream was the only structural delta behind the periodic
+    /// video stalls. Disabling pauses the source; enabling resumes it.
+    #[test]
+    fn mic_pipeline_pauses_source_when_disabled() {
+        gst::init().expect("gstreamer init");
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("audiotestsrc")
+            .name("mic-test-src")
+            .build()
+            .expect("audiotestsrc");
+        let volume = gst::ElementFactory::make("volume")
+            .name("mic-volume")
+            .build()
+            .expect("volume");
+        let sink = gst::ElementFactory::make("fakesink")
+            .name("mic-test-sink")
+            .build()
+            .expect("fakesink");
+        sink.set_property("sync", false);
+        pipeline.add(&source).expect("add source");
+        pipeline.add(&volume).expect("add volume");
+        pipeline.add(&sink).expect("add sink");
+        source.link(&volume).expect("src -> volume");
+        volume.link(&sink).expect("volume -> sink");
+
+        let buffers = Arc::new(AtomicU32::new(0));
+        let counter = buffers.clone();
+        sink.static_pad("sink").expect("sink pad").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            },
+        );
+
+        let mic = GstreamerMicPipeline {
+            volume: volume.clone(),
+            elements: vec![source.clone(), volume.clone()],
+        };
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("play pipeline");
+        // A pipeline's state change is asynchronous; wait until PLAYING is
+        // reached before toggling (the in-flight transition would otherwise
+        // override the source pause).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pipeline.current_state() != gst::State::Playing
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(pipeline.current_state(), gst::State::Playing);
+        // Drain anything that flowed before the pause so the disabled-window
+        // counter starts at zero.
+        buffers.store(0, Ordering::SeqCst);
+
+        // Disabled → chain run back to NULL → the flow must STOP (a tiny
+        // in-flight burst during the async NULL transition is tolerated; what
+        // matters is that the counter stops growing).
+        mic.set_enabled(false);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after_settle = buffers.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after_wait = buffers.load(Ordering::SeqCst);
+        assert_eq!(
+            after_wait, after_settle,
+            "no buffers (→ no RTP) may flow while the mic is off (after settle={after_settle}, after wait={after_wait})"
+        );
+
+        // Enabled → chain resumes → buffers flow again. The full suite runs
+        // many live pipelines in parallel, so the state transition + first
+        // buffers can take far longer than a fixed sleep; poll with a
+        // deadline instead of asserting against a fixed window.
+        mic.set_enabled(true);
+        let flow_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let flowing = buffers.load(Ordering::SeqCst);
+            if flowing > after_wait || std::time::Instant::now() >= flow_deadline {
+                let while_enabled = flowing;
+                assert!(
+                    while_enabled > after_wait,
+                    "buffers must flow once the mic is enabled (before={after_wait}, after={while_enabled})"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+    }
 }

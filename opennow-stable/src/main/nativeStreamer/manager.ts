@@ -80,8 +80,13 @@ const SESSION_START_TIMEOUT_MS = process.platform === "win32" ? 90000 : 45000;
 const SURFACE_UPDATE_TIMEOUT_MS = 15000;
 const OFFER_TIMEOUT_MS = 20000;
 const STOP_TIMEOUT_MS = 1200;
-const SCREENSHOT_TIMEOUT_MS = 5000;  const RECORDING_STOP_TIMEOUT_MS = 5000;
-  const DATA_CHANNEL_SEND_TIMEOUT_MS = 3000;
+const SCREENSHOT_TIMEOUT_MS = 5000;
+// Native stop(finalize=true) budget: queue drain (4s) + EOS flush (4s) +
+// muxer-direct EOS failsafe (2s) = 10s worst case, so the Electron side must
+// not give up first. A dead recording audio branch used to leave the muxer
+// waiting forever and this 5s timeout fired ("stop-recording timed out").
+const RECORDING_STOP_TIMEOUT_MS = 20000;
+const DATA_CHANNEL_SEND_TIMEOUT_MS = 3000;
 const MAX_INPUT_STDIN_BUFFER_BYTES = 64 * 1024;
 const MIN_NATIVE_BITRATE_KBPS = 5_000;
 const MAX_NATIVE_BITRATE_KBPS = 150_000;

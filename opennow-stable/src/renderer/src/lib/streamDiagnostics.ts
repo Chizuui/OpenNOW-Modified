@@ -7,7 +7,15 @@ import type { StreamDiagnostics } from "../platforms/gfn/webrtcClient";
 // is 0/absent), the last ping is kept for only a few merges before it
 // decays to 0 (HUD "--") — a one-off spike value must never stick in the
 // HUD as a stale "current" ping.
-const NATIVE_RTT_STALE_SAMPLE_LIMIT = 5;
+// How many consecutive native stats samples (~1/s) without a fresh RTT source
+// before the held ping decays to 0 ("--"). The native pipeline is receiver-only
+// when the mic is off — no outgoing RTP means the server sends no Receiver
+// Reports, so the only live local RTT (RTCP LSR/DLSR) is unavailable and the
+// server stats_channel RTT is often reported as 0. A short limit made the HUD
+// ping flicker to "--" every few seconds; holding the last known-good value for
+// minutes keeps it stable and only updates when a real measurement arrives
+// (the mic-on path still gives a live value every sample).
+const NATIVE_RTT_STALE_SAMPLE_LIMIT = 300;
 let nativeRttStaleSamples = 0;
 
 export function defaultDiagnostics(): StreamDiagnostics {

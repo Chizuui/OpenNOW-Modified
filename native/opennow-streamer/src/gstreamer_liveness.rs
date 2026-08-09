@@ -1206,11 +1206,13 @@ fn request_upstream_key_unit(state: &VideoLivenessState, event_sender: &Option<S
 /// `source-stats`.
 ///
 /// The server only sends RRs for RTP streams it receives, so this needs
-/// outgoing RTP. The native pipeline carries it on the mic m-line: real
-/// capture when the user's mic is on, and a muted generated-silence
-/// keepalive when it is off (see build_mic_pipeline). With
-/// OPENNOW_NATIVE_MIC=0 there is no outgoing RTP and this returns None, and
-/// the HUD falls back to the server-reported stats_channel field.
+/// outgoing RTP. The native pipeline carries it on the mic m-line, and only
+/// while the user's mic is actually on (real platform capture): there is no
+/// generated-silence keepalive (a muted keepalive kept continuous outgoing
+/// RTP alive and was the only structural delta behind the periodic video
+/// stalls — see build_mic_pipeline). With the mic off (or
+/// OPENNOW_NATIVE_MIC=0) there is no outgoing RTP and this returns None,
+/// and the HUD falls back to the server-reported stats_channel field.
 fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
     let webrtc = pipeline.by_name("opennow-webrtcbin")?;
     let webrtc_bin = webrtc.downcast::<gst::Bin>().ok()?;
@@ -1251,6 +1253,30 @@ fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
     None
 }
 
+/// The stats_channel `avgGameFps` is a short-window server-side average of the
+/// game's render rate and can briefly overshoot the negotiated stream rate
+/// (menu/loading screens that render uncapped, catch-up bursts after stalls,
+/// sub-second averaging-window artifacts) — e.g. 174-200 for a game capped at
+/// 120 fps. GFN streams at the game's target rate, so any value above the
+/// negotiated ceiling (requested fps, else the caps framerate numerator) is
+/// implausible; clamp it so the HUD/overlay never shows a number the stream
+/// cannot deliver. 0 = no stats yet.
+fn clamped_server_game_fps(state: &VideoLivenessState) -> u32 {
+    let game_fps = stats_channel_game_fps();
+    if game_fps == 0 {
+        return 0;
+    }
+    let ceiling = state.requested_fps().or_else(|| {
+        state
+            .caps_framerate()
+            .and_then(|caps| caps.split('/').next()?.trim().parse::<u32>().ok())
+    });
+    match ceiling {
+        Some(ceiling) if ceiling > 0 => game_fps.min(ceiling),
+        _ => game_fps,
+    }
+}
+
 fn emit_native_stats_event(
     event_sender: &Option<Sender<Event>>,
     sink: &gst::Element,
@@ -1288,7 +1314,7 @@ fn emit_native_stats_event(
         .unwrap_or_default();
     let sink_stats = read_sink_stats(sink);
     let telemetry = state.transition_telemetry_snapshot();
-    let game_fps = stats_channel_game_fps();
+    let game_fps = clamped_server_game_fps(state);
     let rtt_ms = crate::gstreamer_input::stats_channel_rtt_ms();
     let input_path = crate::gstreamer_input::native_input_path().to_owned();
     let mouse_delta_latency_us =
@@ -1413,9 +1439,11 @@ fn update_native_stats_overlay(
         bitrate_performance_percent,
         ping_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "-".to_owned()),
         server_bitrate,
-        // Server-reported game render FPS (stats_channel) — the real game rate,
-        // which can exceed the negotiated stream FPS; 0 until the first frame.
-        f64::from(stats_channel_game_fps()),
+        // Server-reported game render FPS (stats_channel), clamped to the
+        // negotiated stream rate (short-window server averages can overshoot
+        // the game's cap — e.g. 200 for a 120-cap game); 0 until the first
+        // frame.
+        f64::from(clamped_server_game_fps(state)),
         rates.sink_fps,
         rates.decoded_fps,
         drop_percent,
@@ -3507,6 +3535,943 @@ mod stacked_window_dance_diagnostics {
             "DIAG mic send pad excluded from incoming-media handler: sink={} src={}",
             !is_incoming_media_pad(&sink_pad),
             is_incoming_media_pad(&src_pad)
+        );
+    }
+
+    /// Reproduce the field failure `recording-start-failed: Failed to link
+    /// elements 'mic-tap-queue' and 'audioresample1'`. Builds the mic chain
+    /// the way `build_mic_pipeline` wires it when the mic is ON (capture
+    /// source → volume → tap tee → tap queue dangling), lets it negotiate,
+    /// then attempts the recording-branch link the way
+    /// `insert_recording_branch` does (resample element NOT yet added to the
+    /// pipeline).
+    #[test]
+    fn mic_tap_links_into_recording_resample() {
+        gst::init().expect("gstreamer init");
+        let pipeline = gst::Pipeline::new();
+
+        let silence = gst::ElementFactory::make("audiotestsrc")
+            .name("mic-silence-src")
+            .build()
+            .expect("audiotestsrc");
+        silence.set_property_from_str("wave", "silence");
+        let volume = gst::ElementFactory::make("volume")
+            .name("mic-volume")
+            .build()
+            .expect("volume");
+        volume.set_property("volume", 0.0f64);
+        let tap_tee = gst::ElementFactory::make("tee")
+            .name("mic-tap-tee")
+            .build()
+            .expect("tee");
+        let tap_queue = gst::ElementFactory::make("queue")
+            .name("mic-tap-queue")
+            .build()
+            .expect("queue");
+        tap_queue.set_property_from_str("leaky", "downstream");
+        tap_queue.set_property("max-size-buffers", 8u32);
+        tap_queue.set_property("max-size-bytes", 0u32);
+        tap_queue.set_property("max-size-time", 0u64);
+        let convert = gst::ElementFactory::make("audioconvert")
+            .name("mic-audioconvert")
+            .build()
+            .expect("audioconvert");
+        let resample = gst::ElementFactory::make("audioresample")
+            .name("mic-audioresample")
+            .build()
+            .expect("audioresample");
+        let encoder = gst::ElementFactory::make("opusenc")
+            .name("mic-opusenc")
+            .build()
+            .expect("opusenc");
+        let payloader = gst::ElementFactory::make("rtpopuspay")
+            .name("mic-rtpopuspay")
+            .build()
+            .expect("rtpopuspay");
+        let fakesink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("fakesink");
+
+        for element in [
+            &silence, &volume, &tap_tee, &tap_queue, &convert, &resample, &encoder, &payloader,
+            &fakesink,
+        ] {
+            pipeline.add(element).expect("add mic element");
+        }
+        silence.link(&volume).expect("src -> volume");
+        volume.link(&tap_tee).expect("volume -> tee");
+        tap_tee.link(&convert).expect("tee -> convert");
+        convert.link(&resample).expect("convert -> resample");
+        resample.link(&encoder).expect("resample -> encoder");
+        encoder.link(&payloader).expect("encoder -> payloader");
+        payloader.link(&fakesink).expect("payloader -> fakesink");
+        tap_tee.link(&tap_queue).expect("tee -> tap queue");
+
+        pipeline.set_state(gst::State::Playing).expect("play");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let src_pad = tap_queue.static_pad("src").expect("tap queue src");
+        eprintln!(
+            "DIAG mic-tap-queue src current caps: {:?}",
+            src_pad.current_caps()
+        );
+        eprintln!(
+            "DIAG mic-tap-queue parent: {:?}",
+            tap_queue.parent().map(|parent| parent.name())
+        );
+
+        // Regression guard: linking a tap that is already inside the pipeline
+        // to a resample that has NOT been added yet must fail (gst_element_link
+        // requires a common bin ancestor). This is exactly the field failure
+        // "Failed to link elements 'mic-tap-queue' and 'audioresample1'" that
+        // happened because insert_recording_branch linked the taps before
+        // pipeline.add. The app now adds every branch element first.
+        let tap_resample = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("audioresample");
+        assert!(
+            tap_resample.parent().is_none(),
+            "precondition: resample not yet added to the pipeline"
+        );
+        assert!(
+            tap_queue.link(&tap_resample).is_err(),
+            "linking an in-pipeline tap to a not-yet-added resample must fail (common bin ancestor)"
+        );
+
+        // The fix: add the resample (and the rest of the branch) to the
+        // pipeline first, then link. This must succeed.
+        let tap_resample2 = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("audioresample");
+        pipeline.add(&tap_resample2).expect("add resample");
+        tap_queue
+            .link(&tap_resample2)
+            .expect("mic tap must link into recording resample once both are in the pipeline");
+        eprintln!(
+            "DIAG mic tap -> recording resample (post-add): OK; src caps {:?}",
+            tap_queue
+                .static_pad("src")
+                .and_then(|pad| pad.current_caps())
+        );
+
+        // Game-audio tap scenario: same requirement applies to any tap, and the
+        // post-add link must work for it too.
+        let game_tap_tee = gst::ElementFactory::make("tee")
+            .name("game-tap-tee")
+            .build()
+            .expect("tee");
+        let game_tap_queue = gst::ElementFactory::make("queue")
+            .name("game-tap-queue")
+            .build()
+            .expect("queue");
+        pipeline.add(&game_tap_tee).expect("add game tee");
+        pipeline.add(&game_tap_queue).expect("add game queue");
+        game_tap_tee
+            .link(&game_tap_queue)
+            .expect("game tee -> queue");
+        game_tap_queue
+            .sync_state_with_parent()
+            .expect("sync game queue");
+        let game_resample = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("audioresample");
+        pipeline.add(&game_resample).expect("add game resample");
+        game_tap_queue
+            .link(&game_resample)
+            .expect("game tap must link into recording resample once both are in the pipeline");
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Faithful reproduction of the field's dead audio recording branch
+    /// (09:40:43: with audio taps present the mixer/voaacenc never stream, the
+    /// audio EOS is rejected and stop-recording times out). Builds a live
+    /// game-audio chain + mic chain with dangling tap queues exactly like the
+    /// app, then inserts the recording audio branch exactly like
+    /// `insert_recording_branch` (per-tap audioresample → audioconvert →
+    /// capsfilter → audiomixer → audio-valve → voaacenc → mp4mux → appsink)
+    /// and verifies the muxer actually produces audio output.
+    #[test]
+    fn recording_two_audio_tracks_contains_game_audio() {
+        gst::init().expect("gstreamer init");
+        let pipeline = gst::Pipeline::new();
+
+        // --- Live game-audio chain (2ch/48k ticks) feeding a recording tap tee.
+        let game_src = gst::ElementFactory::make("audiotestsrc")
+            .name("game-src")
+            .build()
+            .expect("audiotestsrc");
+        // Real-time pacing like production decoded audio: audiotestsrc defaults
+        // to is-live=false and produces as fast as possible (≈80× realtime),
+        // which would make the muxer fragment timestamps race ahead.
+        game_src.set_property("is-live", true);
+        let game_convert = gst::ElementFactory::make("audioconvert")
+            .name("game-convert")
+            .build()
+            .expect("audioconvert");
+        let game_resample = gst::ElementFactory::make("audioresample")
+            .name("game-resample")
+            .build()
+            .expect("audioresample");
+        let game_caps = gst::ElementFactory::make("capsfilter")
+            .name("game-caps")
+            .build()
+            .expect("capsfilter");
+        let game_caps_caps: gst::Caps = "audio/x-raw,format=S16LE,channels=2,rate=48000"
+            .parse()
+            .expect("caps");
+        game_caps.set_property("caps", &game_caps_caps);
+        let game_tee = gst::ElementFactory::make("tee")
+            .name("game-tap-tee")
+            .build()
+            .expect("tee");
+        let game_sink = gst::ElementFactory::make("fakesink")
+            .name("game-sink")
+            .build()
+            .expect("fakesink");
+        game_sink.set_property("sync", false);
+
+        // --- Live mic chain (1ch/48k silence) feeding a recording tap tee.
+        let mic_src = gst::ElementFactory::make("audiotestsrc")
+            .name("mic-silence-src")
+            .build()
+            .expect("audiotestsrc");
+        mic_src.set_property("is-live", true);
+        mic_src.set_property_from_str("wave", "silence");
+        let mic_volume = gst::ElementFactory::make("volume")
+            .name("mic-volume")
+            .build()
+            .expect("volume");
+        mic_volume.set_property("volume", 0.0f64);
+        let mic_tap_tee = gst::ElementFactory::make("tee")
+            .name("mic-tap-tee")
+            .build()
+            .expect("tee");
+        let mic_convert = gst::ElementFactory::make("audioconvert")
+            .name("mic-audioconvert")
+            .build()
+            .expect("audioconvert");
+        let mic_resample = gst::ElementFactory::make("audioresample")
+            .name("mic-audioresample")
+            .build()
+            .expect("audioresample");
+        let mic_opus = gst::ElementFactory::make("opusenc")
+            .name("mic-opusenc")
+            .build()
+            .expect("opusenc");
+        let mic_pay = gst::ElementFactory::make("rtpopuspay")
+            .name("mic-rtpopuspay")
+            .build()
+            .expect("rtpopuspay");
+        let mic_sink = gst::ElementFactory::make("fakesink")
+            .name("mic-sink")
+            .build()
+            .expect("fakesink");
+        mic_sink.set_property("sync", false);
+
+        for element in [
+            &game_src,
+            &game_convert,
+            &game_resample,
+            &game_caps,
+            &game_tee,
+            &game_sink,
+            &mic_src,
+            &mic_volume,
+            &mic_tap_tee,
+            &mic_convert,
+            &mic_resample,
+            &mic_opus,
+            &mic_pay,
+            &mic_sink,
+        ] {
+            pipeline.add(element).expect("add live element");
+        }
+        game_src.link(&game_convert).expect("game src -> convert");
+        game_convert
+            .link(&game_resample)
+            .expect("game convert -> resample");
+        game_resample
+            .link(&game_caps)
+            .expect("game resample -> caps");
+        game_caps.link(&game_tee).expect("game caps -> tee");
+        game_tee.link(&game_sink).expect("game tee -> sink");
+        mic_src.link(&mic_volume).expect("mic src -> volume");
+        mic_volume.link(&mic_tap_tee).expect("mic volume -> tee");
+        mic_tap_tee.link(&mic_convert).expect("mic tee -> convert");
+        mic_convert
+            .link(&mic_resample)
+            .expect("mic convert -> resample");
+        mic_resample.link(&mic_opus).expect("mic resample -> opus");
+        mic_opus.link(&mic_pay).expect("mic opus -> pay");
+        mic_pay.link(&mic_sink).expect("mic pay -> sink");
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("play live chains");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // --- Recording branch: TWO independent AAC tracks (game + mic), NO
+        // mixer. Each tap gets a fresh tee pad at recording time →
+        // audioresample → audioconvert → capsfilter(2ch/48k) → voaacenc →
+        // mp4mux. This mixer-free chain is the same pattern that provably
+        // carries real audio (fresh-pad hot-plug → chain elements → encoder),
+        // and mp4mux supports multiple audio tracks. The audiomixer
+        // (aggregator) is deliberately gone: it drops hot-joined pads
+        // ("outside output segment") and fills them with digital silence, and
+        // its tiny per-pad queues then block the game chain upstream after a
+        // few buffers (field: recordings carry no game audio).
+        let tap_caps: gst::Caps = "audio/x-raw,format=S16LE,channels=2,rate=48000"
+            .parse()
+            .expect("caps");
+        let mut audio_elements: Vec<gst::Element> = Vec::new();
+        // (tap tee, normalize chain, valve, encoder)
+        let mut audio_tap_branches: Vec<(
+            gst::Element,
+            Vec<gst::Element>,
+            gst::Element,
+            gst::Element,
+        )> = Vec::new();
+        for (i, tap_tee) in [&game_tee, &mic_tap_tee].iter().enumerate() {
+            let tap_resample = gst::ElementFactory::make("audioresample")
+                .name(format!("rec-resample-{i}"))
+                .build()
+                .expect("audioresample");
+            let tap_convert = gst::ElementFactory::make("audioconvert")
+                .name(format!("rec-convert-{i}"))
+                .build()
+                .expect("audioconvert");
+            let tap_caps_element = gst::ElementFactory::make("capsfilter")
+                .name(format!("rec-caps-{i}"))
+                .build()
+                .expect("capsfilter");
+            tap_caps_element.set_property("caps", &tap_caps);
+            // Valve gates each track exactly like the video branch's valve:
+            // the fresh pads can be linked at build time (data drops at the
+            // closed valve without back-pressure) while the muxer finishes its
+            // NULL→PLAYING transition, and recording start just opens it. This
+            // avoids pushing the first buffers into a still-transitioning
+            // (flushing) muxer, which returned FLUSHING upstream and killed
+            // the game chain after a few buffers.
+            let tap_valve = gst::ElementFactory::make("valve")
+                .name(format!("rec-valve-{i}"))
+                .build()
+                .expect("valve");
+            tap_valve.set_property("drop", true);
+            let tap_aac = gst::ElementFactory::make("voaacenc")
+                .name(format!("rec-voaacenc-{i}"))
+                .build()
+                .expect("voaacenc");
+            for element in [
+                &tap_resample,
+                &tap_convert,
+                &tap_caps_element,
+                &tap_valve,
+                &tap_aac,
+            ] {
+                audio_elements.push(element.clone());
+            }
+            audio_tap_branches.push((
+                (*tap_tee).clone(),
+                vec![tap_resample, tap_convert, tap_caps_element],
+                tap_valve,
+                tap_aac,
+            ));
+        }
+        let muxer = gst::ElementFactory::make("mp4mux").build().expect("mp4mux");
+        muxer.set_property("streamable", true);
+        muxer.set_property("fragment-duration", 500u32);
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        audio_elements.extend([muxer.clone(), appsink.clone()]);
+        for element in &audio_elements {
+            pipeline.add(element).expect("add branch element");
+        }
+        for (_, chain, valve, aac) in &audio_tap_branches {
+            chain[0].link(&chain[1]).expect("resample -> convert");
+            chain[1].link(&chain[2]).expect("convert -> caps");
+            chain[2].link(valve).expect("caps -> valve");
+            valve.link(aac).expect("valve -> voaacenc");
+            aac.link(&muxer).expect("voaacenc -> muxer");
+        }
+        muxer.link(&appsink).expect("muxer -> appsink");
+        for element in &audio_elements {
+            element
+                .sync_state_with_parent()
+                .expect("sync branch element");
+        }
+        // sync_state_with_parent is ASYNC: pads FLUSH during the NULL→PLAYING
+        // transition. Linking the fresh tee pads mid-transition makes the
+        // already-PLAYING tee push into a flushing pad → FLUSHING upstream →
+        // the game chain stalls (field bug). Wait for the normalize chains and
+        // the muxer to actually reach PLAYING before linking the fresh pads:
+        // the normalize chains reach PLAYING immediately, and the muxer can
+        // reach PLAYING via caps negotiation from the fixed capsfilters even
+        // with the track valves closed. The appsink stays PAUSED until the
+        // first buffer (expected).
+        let mut pre_link_elements: Vec<&gst::Element> = audio_tap_branches
+            .iter()
+            .flat_map(|(_, chain, valve, _)| chain.iter().chain(std::iter::once(valve)))
+            .collect();
+        pre_link_elements.push(&muxer);
+        let transition_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let all_playing = pre_link_elements
+                .iter()
+                .all(|element| element.current_state() >= gst::State::Playing);
+            if all_playing || Instant::now() >= transition_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let not_playing: Vec<String> = pre_link_elements
+            .iter()
+            .filter(|element| element.current_state() < gst::State::Playing)
+            .map(|element| format!("{}={:?}", element.name(), element.current_state()))
+            .collect();
+        eprintln!(
+            "DIAG recording pre-link states before pad link: not-playing={:?}",
+            not_playing
+        );
+        assert!(
+            not_playing.is_empty(),
+            "recording normalize chains + muxer must reach PLAYING before the fresh tee pads are linked (still: {not_playing:?})"
+        );
+        // Request a fresh pad from each tap tee and link it straight into the
+        // resample sink pad (data drops at the closed valve — no back-pressure).
+        let mut fresh_tap_pads: Vec<gst::Pad> = Vec::new();
+        for (tap_tee, chain, _, _) in &audio_tap_branches {
+            let request_pad = tap_tee
+                .request_pad_simple("src_%u")
+                .expect("tee request pad");
+            let resample_sink = chain[0].static_pad("sink").expect("resample sink pad");
+            request_pad
+                .link(&resample_sink)
+                .expect("tee request pad -> resample");
+            fresh_tap_pads.push(request_pad);
+        }
+        let game_tap_pad = fresh_tap_pads[0].clone();
+        // Recording start: open both track valves (mirrors state.start()).
+        for (_, _, valve, _) in &audio_tap_branches {
+            valve.set_property("drop", false);
+        }
+
+        // Count muxer output on the appsink sink pad, plus per-track counters
+        // and the game track's largest absolute sample (ground truth that REAL
+        // game audio, not silence, reaches the encoder).
+        let chunks = Arc::new(AtomicU32::new(0));
+        let sink_pad = appsink.static_pad("sink").expect("appsink sink pad");
+        let counter = chunks.clone();
+        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        let (game_enc_in, mic_enc_in) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let game_max = Arc::new(AtomicU32::new(0));
+        let (g1, g2) = (game_enc_in.clone(), game_max.clone());
+        audio_tap_branches[0]
+            .3
+            .static_pad("sink")
+            .expect("game encoder sink")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                g1.fetch_add(1, Ordering::SeqCst);
+                if let Some(buffer) = info.buffer() {
+                    if let Ok(mapped) = buffer.map_readable() {
+                        let bytes = mapped.as_slice();
+                        for pair in bytes.chunks_exact(2) {
+                            let sample = i16::from_le_bytes([pair[0], pair[1]]);
+                            let magnitude = u32::from(sample.unsigned_abs());
+                            let mut current = g2.load(Ordering::SeqCst);
+                            while magnitude > current
+                                && g2
+                                    .compare_exchange_weak(
+                                        current,
+                                        magnitude,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_err()
+                            {
+                                current = g2.load(Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let m1 = mic_enc_in.clone();
+        audio_tap_branches[1]
+            .3
+            .static_pad("sink")
+            .expect("mic encoder sink")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                m1.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        std::thread::sleep(Duration::from_millis(3000));
+        let produced = chunks.load(Ordering::SeqCst);
+        eprintln!(
+            "DIAG two-track recording: muxer={produced} game-enc-in={} game-max={} mic-enc-in={} game-tap-caps={:?}",
+            game_enc_in.load(Ordering::SeqCst),
+            game_max.load(Ordering::SeqCst),
+            mic_enc_in.load(Ordering::SeqCst),
+            game_tap_pad.current_caps()
+        );
+        assert!(
+            produced > 0,
+            "recording audio tracks must flow into the muxer; produced={produced}"
+        );
+        assert!(
+            game_enc_in.load(Ordering::SeqCst) > 100,
+            "game audio track must flow into its encoder (game-enc-in={})",
+            game_enc_in.load(Ordering::SeqCst)
+        );
+        assert!(
+            game_max.load(Ordering::SeqCst) > 500,
+            "game audio track must carry REAL game audio, not silence (game-max={})",
+            game_max.load(Ordering::SeqCst)
+        );
+        assert!(
+            produced < 1_000,
+            "muxer output must be realtime-paced fragments, not a runaway loop (produced={produced})"
+        );
+
+        // Failsafe validation (the app's stop() fix): sending EOS DIRECTLY to
+        // the muxer's sink pads finalizes it even when a track never flowed.
+        let eos_seen = Arc::new(AtomicBool::new(false));
+        let eos_flag = eos_seen.clone();
+        let appsink_sink_pad = appsink.static_pad("sink").expect("appsink sink pad");
+        appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    eos_flag.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        for pad in muxer.sink_pads() {
+            let _ = pad.send_event(gst::event::Eos::new());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let finalized = eos_seen.load(Ordering::SeqCst);
+        eprintln!("DIAG failsafe direct-muxer EOS: finalized={finalized}");
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(
+            finalized,
+            "stop() failsafe: EOS directly on the muxer sink pads must finalize the muxer even when a track never flowed"
+        );
+    }
+
+    /// Regression guard for the 12:30 field failure: `insert_recording_branch`
+    /// NEVER linked the muxer to the appsink (the mp4mux src pad had no peer,
+    /// so its src task never started: no chunks flowed and EOS never
+    /// finalized — "EOS still not seen at the muxer output; recording not
+    /// finalized" after every stop, deterministically). The liveness tests
+    /// rebuilt the wiring manually and never caught it; this test calls the
+    /// REAL production function and asserts the muxer→appsink link exists.
+    #[test]
+    fn recording_branch_links_muxer_to_appsink() {
+        gst::init().expect("gstreamer init");
+        use std::sync::{Arc, Mutex};
+        let pipeline = gst::Pipeline::new();
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        pipeline.add(&tee).expect("add tee");
+        let no_tap: Arc<Mutex<Option<gst::Element>>> = Arc::new(Mutex::new(None));
+        let state = crate::gstreamer_pipeline::insert_recording_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            &no_tap,
+            &no_tap,
+            None,
+        )
+        .expect("insert recording branch");
+        let muxer_src = state.muxer.static_pad("src").expect("muxer src pad");
+        let appsink_sink = state.appsink.static_pad("sink").expect("appsink sink pad");
+        let linked = muxer_src.peer().is_some_and(|peer| peer == appsink_sink);
+        eprintln!("DIAG muxer->appsink linked: {linked}");
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(
+            linked,
+            "mp4mux src pad must be linked to the appsink sink pad; without it the muxer never aggregates (no chunks) and EOS never finalizes"
+        );
+    }
+
+    /// Faithful production-sequence reproduction of the field failure
+    /// (12:30 session: recording attached to a PLAYING pipeline, frames
+    /// negotiated but "EOS still not seen at the muxer output; recording not
+    /// finalized" even after the direct-muxer failsafe). Mirrors
+    /// `insert_recording_branch` + `GstreamerRecordingState::stop(finalize)`
+    /// exactly: hot-plugged tap tee, branch elements created and added to the
+    /// PLAYING pipeline at recording time, closed valve at creation, then
+    /// drain → EOS below valve → retry → failsafe. Probes at every stage tell
+    /// us where frames stop and whether EOS ever reaches the muxer.
+    #[test]
+    fn recording_hotplugged_into_playing_pipeline_finalizes() {
+        gst::init().expect("gstreamer init");
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // --- Main chain: the app's post-decode queue → tap tee → sink queue.
+        // The tee is HOT-PLUGGED after the pipeline is PLAYING (the app's
+        // `ensure_tee` pattern: unlink queue→sink, insert tee, sync).
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property_from_str("pattern", "smpte");
+        // NOT live: a live source paces frames on the pipeline clock, which
+        // can be starved to zero frames under full-suite CPU contention (the
+        // failing run showed chunks=2 but valve_in=0 — the muxer wrote a
+        // header-only fragment on EOS while the source never produced a
+        // frame). This test proves the hot-plug wiring + EOS finalize, not
+        // live pacing, so a deterministic push source is correct.
+        src.set_property("is-live", false);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            gst::Caps::from_str(
+                // Small frames keep the x264+muxer chain deterministic under
+                // full-suite CPU contention; this test proves the hot-plug
+                // wiring and EOS finalize, not encoding throughput.
+                "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1",
+            )
+            .expect("valid caps"),
+        );
+        let pre_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("pre queue");
+        pre_queue.set_property("max-size-buffers", 1u32);
+        pre_queue.set_property_from_str("leaky", "downstream");
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let sink_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("sink queue");
+        sink_queue.set_property("max-size-buffers", 1u32);
+        sink_queue.set_property_from_str("leaky", "downstream");
+        let sink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("fakesink");
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [&src, &src_caps, &pre_queue, &tee, &sink_queue, &sink] {
+            pipeline.add(element).expect("add main chain");
+        }
+        src.link(&src_caps).expect("src -> src_caps");
+        src_caps.link(&pre_queue).expect("src_caps -> pre_queue");
+        pre_queue.link(&tee).expect("pre_queue -> tee");
+        tee.link(&sink_queue).expect("tee -> sink_queue");
+        sink_queue.link(&sink).expect("sink_queue -> sink");
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        // --- Recording branch, created at recording time exactly like
+        // `insert_recording_branch` (elements fresh, valve closed) ---
+        let valve = gst::ElementFactory::make("valve").build().expect("valve");
+        valve.set_property("drop", true);
+        let queue = gst::ElementFactory::make("queue").build().expect("queue");
+        queue.set_property_from_str("leaky", "downstream");
+        queue.set_property("max-size-buffers", 30u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("videoconvert");
+        let caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("capsfilter");
+        caps.set_property(
+            "caps",
+            gst::Caps::from_str("video/x-raw,format=(string)I420").expect("I420 caps"),
+        );
+        let encoder = gst::ElementFactory::make("x264enc")
+            .build()
+            .expect("x264enc");
+        encoder.set_property_from_str("speed-preset", "ultrafast");
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property("bitrate", 8000u32);
+        encoder.set_property("bframes", 0u32);
+        encoder.set_property("key-int-max", 120u32);
+        let muxer = gst::ElementFactory::make("mp4mux").build().expect("mp4mux");
+        muxer.set_property("streamable", true);
+        muxer.set_property("fragment-duration", 500u32);
+        let appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("appsink");
+        appsink.set_property("sync", false);
+        // async=false (like production configure_sink_for_low_latency): a
+        // default async sink waits for preroll before PLAYING, and the closed
+        // recording valve blocks preroll forever → appsink stuck at Ready →
+        // muxer blocked → tee blocks all outputs → zero frames. With async
+        // disabled the sink reaches PLAYING immediately and the branch drains
+        // when the valve opens.
+        appsink.set_property("async", false);
+        appsink.set_property("max-buffers", 1u32);
+        appsink.set_property("drop", true);
+        appsink.set_property("wait-on-eos", false);
+        // Thumbnail branch (production wiring).
+        let thumb_tee = gst::ElementFactory::make("tee").build().expect("thumb tee");
+        let thumb_valve = gst::ElementFactory::make("valve")
+            .build()
+            .expect("thumb valve");
+        thumb_valve.set_property("drop", true);
+        let thumb_queue = gst::ElementFactory::make("queue")
+            .build()
+            .expect("thumb queue");
+        thumb_queue.set_property_from_str("leaky", "downstream");
+        thumb_queue.set_property("max-size-buffers", 1u32);
+        thumb_queue.set_property("max-size-bytes", 0u32);
+        thumb_queue.set_property("max-size-time", 0u64);
+        let thumb_encoder = gst::ElementFactory::make("jpegenc")
+            .build()
+            .expect("jpegenc");
+        thumb_encoder.set_property("quality", 70i32);
+        thumb_encoder.set_property("snapshot", true);
+        let thumb_appsink = gst::ElementFactory::make("appsink")
+            .build()
+            .expect("thumb appsink");
+        thumb_appsink.set_property("sync", false);
+        thumb_appsink.set_property("max-buffers", 1u32);
+        thumb_appsink.set_property("drop", true);
+
+        for element in [
+            &valve,
+            &queue,
+            &convert,
+            &caps,
+            &encoder,
+            &muxer,
+            &appsink,
+            &thumb_tee,
+            &thumb_valve,
+            &thumb_queue,
+            &thumb_encoder,
+            &thumb_appsink,
+        ] {
+            pipeline.add(element).expect("add recording branch");
+        }
+        valve.link(&queue).expect("valve -> queue");
+        queue.link(&convert).expect("queue -> convert");
+        convert.link(&caps).expect("convert -> caps");
+        caps.link(&thumb_tee).expect("caps -> thumb_tee");
+        thumb_tee.link(&encoder).expect("thumb_tee -> encoder");
+        encoder.link(&muxer).expect("encoder -> muxer");
+        muxer.link(&appsink).expect("muxer -> appsink");
+        thumb_tee
+            .link(&thumb_valve)
+            .expect("thumb_tee -> thumb_valve");
+        thumb_valve
+            .link(&thumb_queue)
+            .expect("thumb_valve -> thumb_queue");
+        thumb_queue
+            .link(&thumb_encoder)
+            .expect("thumb_queue -> thumb_encoder");
+        thumb_encoder
+            .link(&thumb_appsink)
+            .expect("thumb_encoder -> thumb_appsink");
+        for element in [
+            &valve,
+            &queue,
+            &convert,
+            &caps,
+            &encoder,
+            &muxer,
+            &appsink,
+            &thumb_tee,
+            &thumb_valve,
+            &thumb_queue,
+            &thumb_encoder,
+            &thumb_appsink,
+        ] {
+            element.sync_state_with_parent().expect("sync state");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // sync_state_with_parent is ASYNC: the new elements can still be
+        // mid-transition (appsink stuck at Ready blocks the whole branch → tee
+        // blocks all outputs → zero frames). Production waits for PLAYING;
+        // wait here too before probing/recording.
+        let play_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < play_deadline {
+            let playing = [&valve, &queue, &convert, &encoder, &muxer, &appsink]
+                .iter()
+                .all(|element| element.current_state() == gst::State::Playing);
+            if playing {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "DIAG states after sync: muxer={:?} appsink={:?} encoder={:?} valve={:?}",
+            muxer.current_state(),
+            appsink.current_state(),
+            encoder.current_state(),
+            valve.current_state()
+        );
+
+        // Request a fresh tee src pad explicitly and link it AFTER the branch
+        // reached PLAYING (the proven hot-plug pattern from the audio-tap
+        // test: `tee.link(&valve)` element-link on an already-PLAYING tee can
+        // leave the fresh pad without an active/linked state and the tee
+        // silently never pushes into it).
+        let tap_pad = tee.request_pad_simple("src_%u").expect("tee request pad");
+        let valve_sink = valve.static_pad("sink").expect("valve sink pad");
+        tap_pad.link(&valve_sink).expect("tee pad -> valve");
+
+        // --- Probes at every stage ---
+        let valve_in = Arc::new(AtomicUsize::new(0));
+        let enc_in = Arc::new(AtomicUsize::new(0));
+        let mux_pad_in = Arc::new(AtomicUsize::new(0));
+        let chunks = Arc::new(AtomicUsize::new(0));
+        let eos_seen = Arc::new(AtomicBool::new(false));
+        let v = valve_in.clone();
+        valve.static_pad("sink").expect("valve sink").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad, _info| {
+                v.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            },
+        );
+        let e = enc_in.clone();
+        encoder.static_pad("sink").expect("encoder sink").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad, _info| {
+                e.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            },
+        );
+        // Probe the muxer's video sink pad (the one x264enc feeds).
+        let m = mux_pad_in.clone();
+        muxer
+            .sink_pads()
+            .first()
+            .expect("muxer sink pad")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                m.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        let c = chunks.clone();
+        let appsink_sink_pad = appsink.static_pad("sink").expect("appsink sink");
+        appsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            c.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        let f = eos_seen.clone();
+        appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    f.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        // Thumbnail gate (production probe closes the thumb valve after frame 1).
+        let thumb_gate = thumb_valve.clone();
+        let grabbed = Arc::new(std::sync::Mutex::new(false));
+        let grab = grabbed.clone();
+        thumb_appsink
+            .static_pad("sink")
+            .expect("thumb appsink sink")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                let mut slot = grab.lock().expect("thumb lock");
+                if !*slot {
+                    *slot = true;
+                    let _ = thumb_gate.set_property("drop", true);
+                }
+                gst::PadProbeReturn::Ok
+            });
+
+        // --- Record (production start()). The live 60fps source + x264 under
+        // full-suite CPU contention can take a while to emit the first muxer
+        // fragment, so record until the first chunk appears (deadline) instead
+        // of a fixed 3s sleep — the assertion below still requires chunks.
+        valve.set_property("drop", false);
+        thumb_valve.set_property("drop", false);
+        let chunk_deadline = Instant::now() + Duration::from_secs(12);
+        while chunks.load(Ordering::SeqCst) == 0 && Instant::now() < chunk_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // --- Production stop(finalize=true) ---
+        valve.set_property("drop", true);
+        thumb_valve.set_property("drop", true);
+        // Drain.
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        let mut queue_level = 0u32;
+        loop {
+            queue_level = queue.property::<u32>("current-level-buffers");
+            if queue_level == 0 || Instant::now() >= drain_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // EOS below the valve.
+        let below = valve
+            .static_pad("src")
+            .expect("valve src")
+            .peer()
+            .expect("valve src peer");
+        let eos_accepted = below.send_event(gst::event::Eos::new());
+        let finalize_deadline = Instant::now() + Duration::from_secs(5);
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < finalize_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Retry once.
+        let retry_deadline = Instant::now() + Duration::from_secs(1);
+        let mut retried = false;
+        while !eos_seen.load(Ordering::SeqCst) && Instant::now() < retry_deadline {
+            if !retried {
+                retried = true;
+                let _ = below.send_event(gst::event::Eos::new());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Failsafe: EOS directly on the muxer sink pads.
+        if !eos_seen.load(Ordering::SeqCst) {
+            for pad in muxer.sink_pads() {
+                let _ = pad.send_event(gst::event::Eos::new());
+            }
+            let failsafe_deadline = Instant::now() + Duration::from_secs(2);
+            while !eos_seen.load(Ordering::SeqCst) && Instant::now() < failsafe_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let finalized = eos_seen.load(Ordering::SeqCst);
+        eprintln!(
+            "DIAG hotplug repro: valve_in={} enc_in={} mux_pad_in={} chunks={} queue_level={queue_level} eos_accepted={eos_accepted} finalized={finalized}",
+            valve_in.load(Ordering::SeqCst),
+            enc_in.load(Ordering::SeqCst),
+            mux_pad_in.load(Ordering::SeqCst),
+            chunks.load(Ordering::SeqCst)
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+        // The live 60fps source + x264 chain is heavily throttled when the
+        // full suite runs in parallel (many live pipelines contending for
+        // CPU/GPU), so any positive count proves real flow; the decisive
+        // assertions are that the muxer produced output and EOS finalized it
+        // (the field bug: EOS timeout despite negotiated frames).
+        assert!(
+            valve_in.load(Ordering::SeqCst) > 0,
+            "frames must flow through the hot-plugged recording valve (valve_in={})",
+            valve_in.load(Ordering::SeqCst)
+        );
+        assert!(
+            chunks.load(Ordering::SeqCst) > 0,
+            "muxer must produce output while recording (chunks={})",
+            chunks.load(Ordering::SeqCst)
+        );
+        assert!(
+            finalized,
+            "EOS must finalize the hot-plugged recording branch (matches the 12:30 field timeout)"
         );
     }
 }

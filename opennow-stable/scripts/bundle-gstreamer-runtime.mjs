@@ -199,9 +199,41 @@ function copyWindowsLoaderDlls({ sdkRoot, destination, binary }) {
   console.log(`Copied Windows VC runtime DLLs: ${copiedVc.length ? copiedVc.join(", ") : "none found"}.`);
 }
 
+function killStaleWindowsPluginScanners() {
+  if (process.platform !== "win32") {
+    return;
+  }
+  // Stale gst-plugin-scanner.exe helpers from a killed dev session hold the
+  // bundled GStreamer DLLs (e.g. gio-2.0-0.dll) open, which makes the
+  // recursive delete below fail with EPERM ("Device or resource busy"). They
+  // are short-lived scan helpers with no state worth keeping, so terminating
+  // them is safe and unblocks the rebuild.
+  const result = spawnSync("taskkill", ["/F", "/IM", "gst-plugin-scanner.exe"], {
+    encoding: "utf8",
+  });
+  if (result.status === 0) {
+    console.log("Terminated stale gst-plugin-scanner.exe processes holding the bundled GStreamer runtime.");
+  }
+}
+
 function bundleWindowsRuntime({ sdkRoot, destination, binary }) {
   const resolvedSdkRoot = resolveWindowsSdkRoot(sdkRoot);
-  rmSync(destination, { recursive: true, force: true });
+  killStaleWindowsPluginScanners();
+  // Windows can transiently lock a DLL right after the verify step loads it
+  // (AV scan or a just-exited scanner); retry the recursive delete briefly
+  // before giving up with the EPERM.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rmSync(destination, { recursive: true, force: true });
+      break;
+    } catch (error) {
+      if (attempt >= 2) {
+        throw error;
+      }
+      console.warn(`Retrying removal of ${destination} (attempt ${attempt + 1}): ${error.code ?? error.message}`);
+      spawnSync("ping", ["-n", "2", "127.0.0.1"], { stdio: "ignore" });
+    }
+  }
   mkdirSync(destination, { recursive: true });
   const copied = [
     copyPathIfPresent(join(resolvedSdkRoot, "bin"), join(destination, "bin")),
