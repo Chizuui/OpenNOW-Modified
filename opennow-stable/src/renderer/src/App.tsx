@@ -471,24 +471,43 @@ export function App(): JSX.Element {
     if (removeAccountConfirmOpen) setRemoveAccountConfirmSurfacePresent(true);
   }, [removeAccountConfirmOpen]);
 
-  // GStreamer plugin scan status listener (registry warm-up / driver re-scan)
+  // GStreamer plugin scan status listener (registry warm-up / driver re-scan).
+  // The mount-time query below seeds the toast from the main process's live
+  // scan state, so a scan that started (or finished) before this renderer
+  // attached its listener can never leave a stuck "scanning" toast behind.
   useEffect(() => {
     const hideTimerRef = { current: 0 as number | undefined };
+    const showScanning = (reason: string): void => {
+      if (hideTimerRef.current !== undefined) {
+        window.clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = undefined;
+      }
+      setGstScanState({ status: "scanning", reason });
+    };
+    const hideScanning = (failed: boolean): void => {
+      // Keep state briefly so the user sees the result, then clear.
+      // "failed" stays a bit longer so the message is readable.
+      hideTimerRef.current = window.setTimeout(
+        () => setGstScanState(null),
+        failed ? 4000 : 2000,
+      );
+    };
+
+    window.openNow
+      .getGStreamerScanStatus()
+      .then((status) => {
+        if (status.scanInProgress || status.lastStatus === "scanning") {
+          showScanning(status.lastReason ?? "first-scan");
+        }
+      })
+      .catch(() => undefined);
+
     const unsubscribe = window.openNow.onGStreamerScanStatus(({ status, reason }) => {
       console.log(`[App] GStreamer scan status: ${status} (reason: ${reason})`);
       if (status === "scanning") {
-        if (hideTimerRef.current !== undefined) {
-          window.clearTimeout(hideTimerRef.current);
-          hideTimerRef.current = undefined;
-        }
-        setGstScanState({ status, reason });
+        showScanning(reason);
       } else {
-        // Keep state briefly so the user sees the result, then clear.
-        // "failed" stays a bit longer so the message is readable.
-        hideTimerRef.current = window.setTimeout(
-          () => setGstScanState(null),
-          status === "failed" ? 4000 : 2000,
-        );
+        hideScanning(status === "failed");
       }
     });
     return () => {
@@ -698,6 +717,8 @@ export function App(): JSX.Element {
       maxBitrateMbps: settings.maxBitrateMbps,
       codec: resolvedCodecProfile.codec,
       colorQuality: resolvedCodecProfile.colorQuality,
+      // "auto" means the full official ladder; only pin a concrete fallback.
+      fallbackCodec: settings.fallbackCodec === "auto" ? undefined : settings.fallbackCodec,
       keyboardLayout: settings.keyboardLayout,
       gameLanguage: settings.gameLanguage,
       enableL4S: settings.enableL4S,
@@ -707,6 +728,8 @@ export function App(): JSX.Element {
       transportMode: "webrtc",
       nativeCloudGsyncMode: settings.nativeCloudGsyncMode,
       nativeTransitionDiagnostics: settings.nativeTransitionDiagnostics,
+      nativeSinkInputCapture: settings.nativeSinkInputCapture,
+      microphoneEnabled: settings.microphoneMode !== "disabled",
       appLaunchMode:
         settings.controllerMode || settings.launchInConsoleMode || directLaunchConsoleMode
           ? "gamepadFriendly"
@@ -1238,6 +1261,31 @@ export function App(): JSX.Element {
     return () => window.removeEventListener("focus", onFocus);
   }, [isStreaming, sessionFullscreen, setSessionFullscreen, settings.nativeStackedRenderer]);
 
+  // When a session ends (game exited server-side, disconnect, native streamer
+  // stopped, ...) the entry paths above forced fullscreen/maximized but nothing
+  // restored the window — leaving it stuck filling the screen after a game.
+  // On the streaming → idle edge, exit DOM + native fullscreen and clear any
+  // stale maximized state so the app returns to its normal window. Respects an
+  // explicit in-session "Windowed" toggle (sessionFullscreen already false).
+  const wasStreamingForSessionEndRef = useRef(false);
+  useEffect(() => {
+    const wasStreaming = wasStreamingForSessionEndRef.current;
+    wasStreamingForSessionEndRef.current = isStreaming;
+    if (isStreaming || !wasStreaming) {
+      return;
+    }
+    const restoreWindow = async (): Promise<void> => {
+      // Exit the DOM + native fullscreen first and let it settle, otherwise the
+      // restore below races the fullscreen exit and the pre-fullscreen maximized
+      // state re-applies after we unmaximize (stuck-fullscreen report).
+      if (sessionFullscreen || document.fullscreenElement) {
+        await setSessionFullscreen(false);
+      }
+      void window.openNow.restoreWindowAfterSession?.();
+    };
+    void restoreWindow();
+  }, [isStreaming, sessionFullscreen, setSessionFullscreen]);
+
   // Anti-AFK interval
   useEffect(() => {
     if (!isStreaming) {
@@ -1557,6 +1605,28 @@ export function App(): JSX.Element {
   const handleMouseSensitivityChange = useCallback((value: number) => {
     void updateSetting("mouseSensitivity", value);
   }, [updateSetting]);
+
+  // In native mode the renderer has no RTCPeerConnection, so the WebRTC mic
+  // path captures audio and silently discards it. Route the toggle to the
+  // native streamer (WASAPI → Opus over the negotiated mic m-line) instead,
+  // and mirror the state in diagnostics so the mic badge stays accurate.
+  const handleToggleMicrophone = useCallback((): void => {
+    if (streamStatus !== "streaming") {
+      return;
+    }
+    const snapshot = diagnosticsStore.getSnapshot();
+    if (snapshot.nativeRendererActive) {
+      const next = !(snapshot.micEnabled ?? false);
+      diagnosticsStore.set({
+        ...diagnosticsStore.getSnapshot(),
+        micState: next ? "started" : "stopped",
+        micEnabled: next,
+      });
+      window.openNow?.setNativeMicrophoneEnabled?.(next);
+      return;
+    }
+    clientRef.current?.toggleMicrophone();
+  }, [clientRef, diagnosticsStore, streamStatus]);
 
   const handleToggleFavoriteGame = useCallback((gameId: string): void => {
     const favorites = settings.favoriteGameIds;
@@ -2460,18 +2530,23 @@ export function App(): JSX.Element {
         }
         return;
       case "toggleMicrophone":
-        if (streamStatus === "streaming") {
-          clientRef.current?.toggleMicrophone();
-        }
+        handleToggleMicrophone();
         return;
       case "screenshot":
+        // In native mode the keyboard is owned by the native streamer (RawInput)
+        // and the shortcut arrives as a native-shortcut event; captureScreenshot
+        // is native-aware, so dispatch unconditionally.
+        dispatchStreamShortcutAction(action);
+        return;
       case "toggleRecording":
-        if (streamStatus === "streaming" && !nativeStreamingRef.current) {
+        // Recording now works in native mode too (native pipeline encodes and
+        // streams chunks), so dispatch unconditionally like screenshot.
+        if (streamStatus === "streaming") {
           dispatchStreamShortcutAction(action);
         }
         return;
     }
-  }, [handlePromptedStopStream, requestPointerLockCapture, streamStatus, toggleSessionFullscreen]);
+  }, [handlePromptedStopStream, handleToggleMicrophone, requestPointerLockCapture, streamStatus, toggleSessionFullscreen]);
 
   useEffect(() => {
     handleStreamShortcutActionRef.current = handleStreamShortcutAction;
@@ -2980,9 +3055,7 @@ export function App(): JSX.Element {
               onEndSession={() => {
                 void handlePromptedStopStream();
               }}
-              onToggleMicrophone={() => {
-                clientRef.current?.toggleMicrophone();
-              }}
+              onToggleMicrophone={handleToggleMicrophone}
               mouseSensitivity={settings.mouseSensitivity}
               onMouseSensitivityChange={handleMouseSensitivityChange}
               mouseAcceleration={settings.mouseAcceleration}

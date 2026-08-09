@@ -214,10 +214,7 @@ mod tests {
     #[test]
     fn default_present_policy_is_uncapped_without_vrr() {
         assert_eq!(resolve_present_max_fps(false), 0);
-        assert_eq!(
-            resolve_present_max_fps(true),
-            PRESENT_LIMITER_VRR_SENTINEL
-        );
+        assert_eq!(resolve_present_max_fps(true), PRESENT_LIMITER_VRR_SENTINEL);
     }
 
     #[test]

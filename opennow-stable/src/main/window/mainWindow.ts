@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain, app } from "electron";
+import { BrowserWindow, ipcMain, app, Menu } from "electron";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -274,6 +274,38 @@ export async function createMainWindow(
     }
   });
 
+  // Frameless window (frame: false): Alt+Space normally opens the OS system
+  // menu, which is how keyboard users minimize/maximize/close a window. Restore
+  // it manually with a native popup menu. Never intercept while a stream session
+  // is active — the key belongs to the game there (and the native streamer's
+  // raw input owns the session keyboard while captured).
+  const openFramelessWindowSystemMenu = (): void => {
+    const activeWindow = deps.getMainWindow();
+    if (!activeWindow || activeWindow.isDestroyed()) return;
+    const isMaximized = activeWindow.isMaximized();
+    const isMinimized = activeWindow.isMinimized();
+    const systemMenu = Menu.buildFromTemplate([
+      {
+        label: "Restore",
+        enabled: isMaximized || isMinimized,
+        click: () => {
+          if (activeWindow.isMaximized()) activeWindow.unmaximize();
+          if (activeWindow.isMinimized()) activeWindow.restore();
+        },
+      },
+      { type: "separator" },
+      { label: "Minimize", click: () => activeWindow.minimize() },
+      {
+        label: "Maximize",
+        enabled: !isMaximized && !isMinimized,
+        click: () => activeWindow.maximize(),
+      },
+      { type: "separator" },
+      { label: "Close", click: () => activeWindow.close() },
+    ]);
+    systemMenu.popup({ window: activeWindow });
+  };
+
   // Intercept Escape early to avoid Chromium exiting fullscreen before the
   // renderer can forward the key to the remote session. Keep a short fullscreen
   // grace window after pointer lock drops so rapid repeated Escape presses cannot
@@ -281,6 +313,21 @@ export async function createMainWindow(
   window.webContents.on("before-input-event", (event, input) => {
     try {
       const mainWindow = deps.getMainWindow();
+      if (
+        process.platform !== "darwin" &&
+        input.type === "keyDown" &&
+        input.alt &&
+        !input.control &&
+        !input.meta &&
+        !deps.getStreamInputActive() &&
+        !deps.getPointerLockActive() &&
+        !(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()) &&
+        input.key === " "
+      ) {
+        event.preventDefault();
+        openFramelessWindowSystemMenu();
+        return;
+      }
       const resolved = resolveEscapeHoldCaptureAction(
         input,
         {

@@ -128,7 +128,9 @@ impl NativeShortcutMatcher {
             .find(|binding| {
                 binding.keycode == keycode
                     && binding.modifiers == modifiers
-                    && binding.scancode.map_or(true, |expected| expected == scancode)
+                    && binding
+                        .scancode
+                        .map_or(true, |expected| expected == scancode)
             })
             .map(|binding| binding.action)
     }
@@ -148,7 +150,11 @@ fn parse_binding(action: NativeStreamerShortcutAction, raw: &str) -> Option<Shor
     let mut modifiers = 0u16;
     let mut key = None;
 
-    for token in raw.split('+').map(str::trim).filter(|token| !token.is_empty()) {
+    for token in raw
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
         match token.to_ascii_uppercase().as_str() {
             "CTRL" | "CONTROL" => modifiers |= MODIFIER_CTRL,
             "ALT" | "OPTION" => modifiers |= MODIFIER_ALT,
@@ -310,7 +316,10 @@ mod tests {
             matcher.match_keydown(u16::from(b'Q'), 0, MODIFIER_CTRL | MODIFIER_SHIFT),
             Some(NativeStreamerShortcutAction::StopStream)
         );
-        assert_eq!(matcher.match_keydown(u16::from(b'Q'), 0, MODIFIER_CTRL), None);
+        assert_eq!(
+            matcher.match_keydown(u16::from(b'Q'), 0, MODIFIER_CTRL),
+            None
+        );
         assert_eq!(
             matcher.match_keydown(
                 u16::from(b'Q'),

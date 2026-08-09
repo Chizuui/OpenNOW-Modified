@@ -82,6 +82,24 @@ export type NativeStreamerCommand =
       id: string;
       type: "update-shortcuts";
       shortcuts: import("./gfn").NativeStreamerShortcutBindings;
+    }
+  | {
+      id: string;
+      type: "microphone";
+      microphoneEnabled: boolean;
+    }
+  | {
+      id: string;
+      type: "take-screenshot";
+    }
+  | {
+      id: string;
+      type: "start-recording";
+    }
+  | {
+      id: string;
+      type: "stop-recording";
+      finalize: boolean;
     };
 
 export type NativeStreamerResponse =
@@ -170,6 +188,23 @@ export type NativeStreamerEvent =
   | {
       type: "stats";
       stats: NativeStreamStats;
+    }
+  | {
+      type: "screenshot";
+      screenshot: {
+        pngBase64: string;
+        width: number;
+        height: number;
+      };
+    }
+  | {
+      type: "recording-chunk";
+      chunkBase64: string;
+    }
+  | {
+      type: "recording-finished";
+      /** Base64 JPEG of the first encoded recording frame (gallery thumbnail). */
+      thumbnailBase64?: string;
     }
   | {
       type: "error";

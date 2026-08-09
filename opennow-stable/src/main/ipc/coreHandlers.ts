@@ -31,7 +31,11 @@ import {
 } from "../discordRpc";
 import { unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  getGStreamerRegistryPaths,
+  getGStreamerScanSnapshot,
+  warmUpGStreamerRegistry,
+} from "../nativeStreamer/registryWarmup";
 import { registerMediaIpcHandlers } from "./mediaHandlers";
 import { getAppBuildInfo } from "../appBuildInfo";
 import { getReleaseHighlightsPayload, normalizeReleaseVersion } from "../releaseHighlights";
@@ -157,6 +161,44 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
 
   ipcMain.handle(IPC_CHANNELS.WINDOW_GET_MAXIMIZE_STATE, async (): Promise<boolean> => {
     return deps.getMainWindow()?.isMaximized() ?? false;
+  });
+
+  // A stream session forces fullscreen/maximized on entry (stacked mode, auto
+  // fullscreen); when the session ends server-side nothing restored the window,
+  // leaving it stuck filling the screen. Exit both fullscreen and a stale
+  // maximized state so the app returns to its normal window after a game.
+  //
+  // Exiting fullscreen is asynchronous on Windows and restores the window's
+  // pre-fullscreen state (often maximized). Unmaximizing synchronously right
+  // after setFullScreen(false) races that transition: isMaximized() is still
+  // false while the window is mid-transition, so the restore is skipped and the
+  // fullscreen exit re-applies the maximized state — the "stuck fullscreen,
+  // clicking restore fixes it" report. Settle on the leave-full-screen event
+  // (with a timeout fallback in case the event is missed) before unmaximizing.
+  ipcMain.handle(IPC_CHANNELS.WINDOW_RESTORE_AFTER_SESSION, async (): Promise<void> => {
+    const mainWindow = deps.getMainWindow();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const wasFullScreen = mainWindow.isFullScreen();
+
+    let settled = false;
+    const settle = (): void => {
+      if (settled || mainWindow.isDestroyed()) return;
+      settled = true;
+      if (mainWindow.isFullScreen()) return;
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+      }
+    };
+
+    if (wasFullScreen) {
+      mainWindow.setFullScreen(false);
+      mainWindow.once("leave-full-screen", settle);
+      // Safety net: some paths (HTML fullscreen) can exit without the event.
+      setTimeout(settle, 500);
+    } else {
+      settle();
+    }
+    deps.setRendererControlledFullscreen(false);
   });
 
   ipcMain.on(IPC_CHANNELS.WINDOW_CLOSE, () => {
@@ -474,44 +516,47 @@ export function registerCoreIpcHandlers(deps: CoreIpcHandlerDeps): void {
 
   ipcMain.handle(
     IPC_CHANNELS.GSTREAMER_CLEAR_CACHE,
-    async (): Promise<{ cleared: boolean; path: string }> => {
+    async (): Promise<{ cleared: boolean; path: string; rebuilding: boolean }> => {
       if (process.platform !== "win32") {
-        return { cleared: false, path: "" };
+        return { cleared: false, path: "", rebuilding: false };
       }
       try {
-        const platformKey = `${process.platform}-${process.arch}`;
-        const registryPath = join(
-          app.getPath("userData"),
-          "native-streamer",
-          "gstreamer",
-          `${platformKey}-registry.bin`,
-        );
+        const { registryPath } = getGStreamerRegistryPaths();
         if (existsSync(registryPath)) {
           await unlink(registryPath);
           console.log("[Main] GStreamer plugin registry cache cleared successfully.");
-          return { cleared: true, path: registryPath };
         }
-        return { cleared: false, path: registryPath };
+        // Rebuild the registry in the background right away (instead of waiting
+        // for the next launch). The scan-status toast keeps the renderer informed
+        // and resolves when the rebuild finishes.
+        const { started } = await warmUpGStreamerRegistry({
+          getMainWindow: () => deps.getMainWindow(),
+        });
+        return { cleared: true, path: registryPath, rebuilding: started };
       } catch (err) {
         console.error("[Main] Failed to clear GStreamer cache:", err);
-        return { cleared: false, path: "" };
+        return { cleared: false, path: "", rebuilding: false };
       }
     },
   );
 
   ipcMain.handle(
     IPC_CHANNELS.GSTREAMER_GET_SCAN_STATUS,
-    async (): Promise<{ registryExists: boolean; registryPath: string }> => {
-      const platformKey = `${process.platform}-${process.arch}`;
-      const registryPath = join(
-        app.getPath("userData"),
-        "native-streamer",
-        "gstreamer",
-        `${platformKey}-registry.bin`,
-      );
+    async (): Promise<{
+      registryExists: boolean;
+      registryPath: string;
+      scanInProgress: boolean;
+      lastStatus: string | null;
+      lastReason: string | null;
+    }> => {
+      const { registryPath } = getGStreamerRegistryPaths();
+      const snapshot = getGStreamerScanSnapshot();
       return {
         registryExists: existsSync(registryPath),
         registryPath,
+        scanInProgress: snapshot.scanInProgress,
+        lastStatus: snapshot.lastStatus,
+        lastReason: snapshot.lastReason,
       };
     },
   );

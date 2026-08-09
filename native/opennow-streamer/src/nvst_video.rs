@@ -415,16 +415,14 @@ fn nvst_udp_recv_loop(
                     );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 continue;
             }
             Err(e) => {
                 if !stop.load(Ordering::SeqCst) {
-                    send_log(
-                        &event_sender,
-                        "warn",
-                        format!("NVST UDP recv error: {e}"),
-                    );
+                    send_log(&event_sender, "warn", format!("NVST UDP recv error: {e}"));
                 }
                 break;
             }

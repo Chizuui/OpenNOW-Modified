@@ -127,6 +127,20 @@ pub(crate) fn arm_internal_child_input(hwnd: usize) -> bool {
     unsafe { win32_renderer_window::arm_internal_child_input(hwnd) }
 }
 
+/// Arm mouse + keyboard RawInput capture on the stacked sink window so raw HID
+/// events bypass the Electron bridge (renderer -> main -> stdin) entirely —
+/// low-latency, in-process. No-op outside stacked render mode or when the
+/// sink / shell / bridge are not ready (the stacked guard retries).
+#[cfg(target_os = "windows")]
+pub(crate) fn arm_stacked_sink_input_capture() -> bool {
+    unsafe { win32_renderer_window::arm_stacked_sink_input_capture() }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn arm_stacked_sink_input_capture() -> bool {
+    false
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn update_external_renderer_surface(surface: &NativeRenderSurface) {
     let target = surface
@@ -294,7 +308,8 @@ pub(crate) fn start_stacked_renderer_window_guard(
 pub(crate) fn apply_stacked_renderer_surface(
     _surface: &NativeRenderSurface,
     _sink_window_handle: usize,
-) {}
+) {
+}
 
 #[cfg(target_os = "windows")]
 pub(crate) mod win32_renderer_window {
@@ -583,7 +598,6 @@ pub(crate) mod win32_renderer_window {
     static PRESSED_KEYS: OnceLock<Mutex<HashMap<u16, PressedKey>>> = OnceLock::new();
     static LAST_LOCK_KEYS_STATE: OnceLock<Mutex<u8>> = OnceLock::new();
     static LEGACY_SUPPRESSED_KEYS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    static STARTED_AT: OnceLock<Instant> = OnceLock::new();
     static ESCAPE_HOLD_HWND: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
     static ESCAPE_HOLD_TOKEN: OnceLock<AtomicU64> = OnceLock::new();
     static ESCAPE_KEY_PRESS: OnceLock<Mutex<Option<EscapeKeyPress>>> = OnceLock::new();
@@ -610,6 +624,13 @@ pub(crate) mod win32_renderer_window {
     // is not Send). Matches the HWND-as-isize pattern used by the other slots.
     static STACKED_EVENT_HOOK: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
     static STACKED_EVENT_HOOK_THREAD: OnceLock<Mutex<Option<Dword>>> = OnceLock::new();
+    /// True while the Electron shell (browser_hwnd) is the Windows foreground
+    /// window. The stacked sink's RawInput mouse registration uses
+    /// RIDEV_INPUTSINK (deltas arrive even though the sink is never
+    /// foreground), so this flag gates forwarding: when the user alt-tabs to
+    /// another app, the game must never receive that app's mouse movement.
+    /// Updated by the foreground WinEvent hook and the stacked guard tick.
+    static STACKED_SHELL_FOREGROUND: OnceLock<AtomicBool> = OnceLock::new();
     /// Optional event sender used to surface stacked sink window transitions
     /// (style changes, SetWindowPos calls) in the Electron log, so flicker or
     /// border regressions can be matched against what the guard actually did.
@@ -943,6 +964,14 @@ pub(crate) mod win32_renderer_window {
             .and_then(|target| target.lock().ok().and_then(|target| *target))
             .map(|target| target.browser_hwnd as Hwnd);
         let browser_foreground = browser_hwnd.is_some_and(|hwnd| hwnd == GetForegroundWindow());
+        // Keep the stacked sink's RawInput mouse capture in sync with the shell
+        // being foreground: arm it while streaming, release it when the user
+        // alt-tabs away (so the other app's mouse never reaches the game). The
+        // foreground WinEvent hook handles the common case; this tick is the
+        // safety net.
+        if browser_hwnd.is_some() {
+            update_stacked_shell_foreground(browser_foreground);
+        }
         let already_below = browser_hwnd
             .is_some_and(|browser| GetWindow(sink_hwnd, GW_HWNDPREV) as Hwnd == browser);
         if !already_below && (browser_foreground || IsWindowVisible(sink_hwnd) == 0) {
@@ -1478,11 +1507,19 @@ pub(crate) mod win32_renderer_window {
         if hwnd as isize == target.browser_hwnd {
             if event == EVENT_SYSTEM_FOREGROUND {
                 // Shell regained the foreground (e.g. alt-tab back): re-assert
-                // the sink's z-order even though the rect may be unchanged.
+                // the sink's z-order even though the rect may be unchanged, and
+                // (re)arm the stacked sink's RawInput mouse capture.
                 reassert_stacked_renderer_window_zorder();
+                update_stacked_shell_foreground(true);
             } else {
                 sync_stacked_renderer_window_position();
             }
+        } else if event == EVENT_SYSTEM_FOREGROUND {
+            // Some other window (another app) took the foreground: release the
+            // stacked sink's mouse capture so the game never receives that
+            // app's input. The sink itself is WS_EX_NOACTIVATE and can never
+            // become foreground, so this branch is purely about alt-tab.
+            update_stacked_shell_foreground(false);
         }
     }
 
@@ -1521,16 +1558,11 @@ pub(crate) mod win32_renderer_window {
         found.map(|found| found.hwnd)
     }
 
-    unsafe extern "system" fn collect_own_window_candidate(
-        hwnd: Hwnd,
-        lparam: Lparam,
-    ) -> Bool {
+    unsafe extern "system" fn collect_own_window_candidate(hwnd: Hwnd, lparam: Lparam) -> Bool {
         let found = &mut *(lparam as *mut Option<Found>);
         let mut window_process_id: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut window_process_id);
-        if window_process_id == GetCurrentProcessId()
-            && GetWindow(hwnd, GW_OWNER).is_null()
-        {
+        if window_process_id == GetCurrentProcessId() && GetWindow(hwnd, GW_OWNER).is_null() {
             *found = Some(Found { hwnd });
             return 0;
         }
@@ -1606,6 +1638,92 @@ pub(crate) mod win32_renderer_window {
         let wndproc_installed = install_input_wndproc(hwnd);
         let keyboard_registered = register_internal_raw_keyboard(hwnd);
         wndproc_installed || keyboard_registered
+    }
+
+    /// Arm mouse + keyboard RawInput capture on the stacked sink window (the
+    /// streamer's own top-level video window, positioned directly below the
+    /// Electron shell). This is the low-latency input path for stacked mode:
+    /// raw HID events travel sink window -> data channel entirely inside this
+    /// process, bypassing the renderer -> main -> stdin bridge and its
+    /// batching/delay. Escape and UI shortcuts stay with Electron (the raw
+    /// path skips them), and keyboard uses INPUTSINK without NOLEGACY so
+    /// Electron keeps receiving legacy keys for IME / browser UI.
+    ///
+    /// Guards: only in stacked render mode, only while the input bridge is
+    /// running (data channels created) and the Electron shell is the foreground
+    /// window (alt-tab must never leak input), and idempotent (re-arming an
+    /// already-captured sink is a no-op).
+    pub unsafe fn arm_stacked_sink_input_capture() -> bool {
+        if !use_stacked_renderer() {
+            return false;
+        }
+        // Opt-in toggle (settings > native streamer): the sink-native RawInput
+        // bypass is experimental; by default stacked mode rides the Electron
+        // bridge (addon mouse + DOM keyboard) like the web path.
+        if !crate::gstreamer_input::native_sink_input_capture_enabled() {
+            return false;
+        }
+        // Never re-arm while input is paused (an overlay / quick menu is open):
+        // the guard tick and foreground hook call this repeatedly, and re-arming
+        // would re-hide the cursor over the overlay and re-own input the game
+        // should not receive (the visible arm/release cursor flicker).
+        if crate::gstreamer_input::input_paused() {
+            return false;
+        }
+        let bridge_running = INPUT_EVENT_SENDER
+            .get()
+            .and_then(|sender| sender.lock().ok().map(|sender| sender.is_some()))
+            .unwrap_or(false);
+        if !bridge_running {
+            return false;
+        }
+        if !STACKED_SHELL_FOREGROUND
+            .get_or_init(|| AtomicBool::new(false))
+            .load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let Some(sink_hwnd) = resolve_stacked_sink_window() else {
+            return false;
+        };
+        if is_input_captured(sink_hwnd) {
+            return true;
+        }
+        install_input_wndproc(sink_hwnd);
+        begin_input_capture(sink_hwnd);
+        true
+    }
+
+    /// Resolve the stacked sink's top-level window: the cached STACKED_TARGET
+    /// handle when still valid, otherwise rediscover the streamer's own window
+    /// (the sink is the only top-level window this process owns in stacked
+    /// mode).
+    unsafe fn resolve_stacked_sink_window() -> Option<Hwnd> {
+        let cached = STACKED_TARGET
+            .get()
+            .and_then(|target| target.lock().ok().and_then(|target| *target))
+            .map(|target| target.sink_hwnd as Hwnd)
+            .filter(|hwnd| IsWindow(*hwnd) != 0);
+        if let Some(hwnd) = cached {
+            return Some(hwnd);
+        }
+        find_first_own_window()
+    }
+
+    /// Track whether the Electron shell is the foreground window and keep the
+    /// stacked sink's mouse capture in sync: arm it while the shell is
+    /// foreground, release it the moment another window takes the foreground
+    /// (alt-tab), so the game never receives another app's input. Called from
+    /// the foreground WinEvent hook and the stacked guard tick.
+    pub unsafe fn update_stacked_shell_foreground(foreground: bool) {
+        STACKED_SHELL_FOREGROUND
+            .get_or_init(|| AtomicBool::new(false))
+            .store(foreground, Ordering::SeqCst);
+        if foreground {
+            arm_stacked_sink_input_capture();
+        } else if captured_hwnd().is_some() {
+            release_current_input_capture();
+        }
     }
 
     pub unsafe fn protect_process_renderer_window() -> bool {
@@ -1863,26 +1981,101 @@ pub(crate) mod win32_renderer_window {
     }
 
     unsafe fn begin_input_capture(hwnd: Hwnd) {
+        let stacked = crate::gstreamer_config::use_stacked_renderer();
         // External floating window: take OS focus so RawInput + ClipCursor work
-        // without INPUTSINK. Internal child: leave Electron as foreground so its
-        // shortcut keydown handlers keep working; keyboard arrives via INPUTSINK.
-        if !crate::gstreamer_config::use_internal_renderer() {
+        // without INPUTSINK. Internal child / stacked sink: leave Electron as
+        // foreground so its shortcut keydown handlers keep working; keyboard
+        // arrives via INPUTSINK, and the stacked sink must never steal focus
+        // (it sits below the shell, which stays the interactive layer).
+        if !crate::gstreamer_config::use_internal_renderer() && !stacked {
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
         }
-        SetCapture(hwnd);
-        register_raw_input_devices(hwnd);
-        if let Some(rect) = target_renderer_rect().or_else(|| monitor_rect_for_window(hwnd)) {
+        if !stacked {
+            // Child/external capture: redirect all mouse messages to the
+            // capture window while active (the renderer pauses capture when an
+            // overlay opens, so the shell UI still works).
+            SetCapture(hwnd);
+        }
+        if stacked {
+            // Stacked: mouse + keyboard RawInput against the sink window. No
+            // SetCapture — with RIDEV_INPUTSINK the sink receives raw input
+            // for the whole desktop while the Electron shell keeps receiving
+            // (and acting on) its own legacy messages, so the shell UI stays
+            // interactive above the video. Keyboard registers INPUTSINK
+            // WITHOUT NOLEGACY so Electron's IME / layout handling keeps
+            // working; the raw path skips Escape and UI shortcuts (Electron
+            // owns those).
+            register_stacked_raw_mouse(hwnd);
+            register_stacked_raw_keyboard(hwnd);
+        } else {
+            register_raw_input_devices(hwnd);
+        }
+        if stacked {
+            // Stacked: confine the cursor to the sink window's own rect (the
+            // stream area). target_renderer_rect is not populated in stacked
+            // mode — that surface path belongs to the embedded/external
+            // renderers.
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(hwnd, &mut rect) != 0 {
+                ClipCursor(&rect);
+            }
+        } else if let Some(rect) = target_renderer_rect().or_else(|| monitor_rect_for_window(hwnd))
+        {
             ClipCursor(&rect);
         }
         hide_cursor();
         emit_input_capture_changed(true);
+        crate::gstreamer_input::set_native_input_path(if stacked {
+            "sink-native"
+        } else if crate::gstreamer_config::use_internal_renderer() {
+            "internal"
+        } else {
+            "external"
+        });
 
         let slot = CAPTURED_HWND.get_or_init(|| Mutex::new(None));
         if let Ok(mut captured) = slot.lock() {
             *captured = Some(hwnd as isize);
         }
         sync_lock_keys_state(true);
+    }
+
+    /// Register mouse-only RawInput for the stacked sink window. INPUTSINK
+    /// delivers WM_INPUT even though Electron remains the top-level foreground
+    /// window; NOLEGACY keeps GStreamer's window from additionally processing
+    /// legacy mouse messages.
+    unsafe fn register_stacked_raw_mouse(hwnd: Hwnd) -> bool {
+        let device = RawInputDevice {
+            us_usage_page: 0x01,
+            us_usage: 0x02,
+            dw_flags: RIDEV_NOLEGACY | RIDEV_INPUTSINK,
+            hwnd_target: hwnd,
+        };
+
+        RegisterRawInputDevices(&device, 1, std::mem::size_of::<RawInputDevice>() as u32) != 0
+    }
+
+    /// Register keyboard RawInput for the stacked sink window. INPUTSINK only
+    /// (deliberately NOT NOLEGACY): Electron stays the foreground window and
+    /// must keep receiving legacy WM_KEYDOWN/WM_CHAR for IME composition,
+    /// layout APIs and the browser UI, while the sink receives the raw keys in
+    /// parallel. Escape and UI shortcuts are skipped on the raw path so
+    /// Electron's own keydown owns them.
+    unsafe fn register_stacked_raw_keyboard(hwnd: Hwnd) -> bool {
+        let device = RawInputDevice {
+            us_usage_page: 0x01,
+            us_usage: 0x06,
+            dw_flags: RIDEV_INPUTSINK,
+            hwnd_target: hwnd,
+        };
+
+        RegisterRawInputDevices(&device, 1, std::mem::size_of::<RawInputDevice>() as u32) != 0
     }
 
     unsafe fn release_input_capture(hwnd: Hwnd) {
@@ -1906,6 +2099,9 @@ pub(crate) mod win32_renderer_window {
         ClipCursor(null());
         show_cursor();
         emit_input_capture_changed(false);
+        // Capture released: input now travels over the renderer bridge
+        // (addon / pointer-lock → IPC → stdin) until the next re-arm.
+        crate::gstreamer_input::set_native_input_path("bridge");
         if crate::gstreamer_config::use_internal_renderer() {
             // F10/F8 release relative mouse capture, but the internal stream
             // must keep receiving keyboard input (especially Escape) while the
@@ -2048,11 +2244,7 @@ pub(crate) mod win32_renderer_window {
             hwnd_target: hwnd,
         };
 
-        RegisterRawInputDevices(
-            &device,
-            1,
-            std::mem::size_of::<RawInputDevice>() as u32,
-        ) != 0
+        RegisterRawInputDevices(&device, 1, std::mem::size_of::<RawInputDevice>() as u32) != 0
     }
 
     unsafe fn unregister_raw_mouse_device() -> bool {
@@ -2063,11 +2255,7 @@ pub(crate) mod win32_renderer_window {
             hwnd_target: null_mut(),
         };
 
-        RegisterRawInputDevices(
-            &device,
-            1,
-            std::mem::size_of::<RawInputDevice>() as u32,
-        ) != 0
+        RegisterRawInputDevices(&device, 1, std::mem::size_of::<RawInputDevice>() as u32) != 0
     }
 
     unsafe fn unregister_raw_input_devices() -> bool {
@@ -2130,10 +2318,37 @@ pub(crate) mod win32_renderer_window {
         {
             return;
         }
+        // Stacked mode registers the sink with RIDEV_INPUTSINK, so raw deltas
+        // arrive for the whole desktop — including while the user is alt-tabbed
+        // to another app. Never forward those: only while the Electron shell is
+        // the foreground window (the foreground WinEvent hook keeps this flag
+        // current, and the stacked guard tick is the safety net).
+        if crate::gstreamer_config::use_stacked_renderer()
+            && !STACKED_SHELL_FOREGROUND
+                .get_or_init(|| AtomicBool::new(false))
+                .load(Ordering::SeqCst)
+        {
+            return;
+        }
 
         let timestamp_us = timestamp_us();
-        let dx = clamp_i32_to_i16(raw.l_last_x);
-        let dy = clamp_i32_to_i16(raw.l_last_y);
+        // Apply the configured mouse sensitivity / acceleration in-process (same
+        // formula the renderer uses for the addon and DOM pointer-lock paths) so
+        // the sink-native capture feels exactly like the mouse settings instead
+        // of raw unscaled HID counts.
+        let sensitivity = crate::gstreamer_input::native_mouse_sensitivity();
+        let acceleration_percent = crate::gstreamer_input::native_mouse_acceleration_percent();
+        let mut dx_f = f64::from(raw.l_last_x) * sensitivity;
+        let mut dy_f = f64::from(raw.l_last_y) * sensitivity;
+        if acceleration_percent > 1.0 {
+            let speed = (dx_f * dx_f + dy_f * dy_f).sqrt();
+            let strength = (acceleration_percent - 1.0) / 149.0;
+            let accel_factor = 1.0 + (0.6 * strength).min((speed / 50.0) * strength);
+            dx_f *= accel_factor;
+            dy_f *= accel_factor;
+        }
+        let dx = clamp_i32_to_i16(dx_f.round() as i32);
+        let dy = clamp_i32_to_i16(dy_f.round() as i32);
         if dx != 0 || dy != 0 {
             emit_input_event(NativeWindowInputEvent::MouseMove {
                 dx,
@@ -2180,6 +2395,17 @@ pub(crate) mod win32_renderer_window {
 
     unsafe fn handle_raw_keyboard(raw: &RawKeyboard) {
         if raw.vkey == 0xff {
+            return;
+        }
+        // Same foreground gate as the stacked mouse: INPUTSINK delivers keys
+        // for the whole desktop, so never forward them while the user is
+        // alt-tabbed to another app (capture is also released on foreground
+        // loss, this check covers queued WM_INPUTs in the gap).
+        if crate::gstreamer_config::use_stacked_renderer()
+            && !STACKED_SHELL_FOREGROUND
+                .get_or_init(|| AtomicBool::new(false))
+                .load(Ordering::SeqCst)
+        {
             return;
         }
 
@@ -2287,11 +2513,14 @@ pub(crate) mod win32_renderer_window {
         }
         if keycode == VK_ESCAPE {
             drop(keys);
-            // In the internal renderer Electron must intercept the legacy Escape
-            // before Chromium exits fullscreen, then forward exactly one tap over
-            // IPC. RawInput still owns every other key in this mode. The external
-            // native window has no Electron interception and keeps this path.
-            if crate::gstreamer_config::use_internal_renderer() {
+            // In the internal renderer AND the stacked sink, Electron must
+            // intercept the legacy Escape before Chromium exits fullscreen,
+            // then forward exactly one tap over IPC. RawInput still owns every
+            // other key in these modes. The external native window has no
+            // Electron interception and keeps this path.
+            if crate::gstreamer_config::use_internal_renderer()
+                || crate::gstreamer_config::use_stacked_renderer()
+            {
                 return;
             }
             handle_escape_keyboard_state(scancode, pressed);
@@ -2665,9 +2894,12 @@ pub(crate) mod win32_renderer_window {
                         begin_input_capture(hwnd);
                     }
                 }
-                // Internal: Electron's own keydown owns the UI shortcut; only
-                // toggle RawInput capture here and keep the key out of GFN.
-                if crate::gstreamer_config::use_internal_renderer() {
+                // Internal/stacked: Electron's own keydown owns the UI
+                // shortcut; only toggle RawInput capture here and keep the key
+                // out of GFN.
+                if crate::gstreamer_config::use_internal_renderer()
+                    || crate::gstreamer_config::use_stacked_renderer()
+                {
                     return;
                 }
             }
@@ -2675,10 +2907,12 @@ pub(crate) mod win32_renderer_window {
                 if shortcut_action_releases_input_capture(action) {
                     release_current_input_capture();
                 }
-                // Internal: Electron already owns UI shortcuts via keydown.
-                // Suppress the key from GFN (caller marks suppressed) without
-                // emitting Shortcut, or Electron would double-fire.
-                if crate::gstreamer_config::use_internal_renderer() {
+                // Internal/stacked: Electron already owns UI shortcuts via
+                // keydown. Suppress the key from GFN (caller marks suppressed)
+                // without emitting Shortcut, or Electron would double-fire.
+                if crate::gstreamer_config::use_internal_renderer()
+                    || crate::gstreamer_config::use_stacked_renderer()
+                {
                     return;
                 }
                 emit_input_event(NativeWindowInputEvent::Shortcut { action });
@@ -2762,11 +2996,9 @@ pub(crate) mod win32_renderer_window {
     }
 
     fn timestamp_us() -> u64 {
-        STARTED_AT
-            .get_or_init(Instant::now)
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64
+        // Shared with the input thread so measured capture→send delta latency
+        // is exact (a module-local baseline here would offset the subtraction).
+        crate::gstreamer_input::native_input_clock_us()
     }
 
     unsafe fn hide_cursor() {

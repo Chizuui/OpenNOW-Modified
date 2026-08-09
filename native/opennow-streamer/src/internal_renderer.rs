@@ -193,12 +193,15 @@ impl InternalRenderer {
         let (Some(child), Some(sink)) = (state.surface.as_ref(), state.video_sink.as_ref()) else {
             return Ok(());
         };
-        let bounds = state.last_bounds.clone().unwrap_or_else(|| NativeRenderRect {
-            x: 0,
-            y: 0,
-            width: renderer.child_width.load(Ordering::SeqCst).max(2),
-            height: renderer.child_height.load(Ordering::SeqCst).max(2),
-        });
+        let bounds = state
+            .last_bounds
+            .clone()
+            .unwrap_or_else(|| NativeRenderRect {
+                x: 0,
+                y: 0,
+                width: renderer.child_width.load(Ordering::SeqCst).max(2),
+                height: renderer.child_height.load(Ordering::SeqCst).max(2),
+            });
         bind_overlay_to_child(sink, child.handle(), Some(&bounds))
     }
 }
@@ -522,7 +525,12 @@ mod windows_child {
         ) -> Bool;
         fn ShowWindow(h_wnd: Hwnd, n_cmd_show: i32) -> Bool;
         fn ValidateRect(h_wnd: Hwnd, lp_rect: *const c_void) -> Bool;
-        fn GetMessageW(lp_msg: *mut Msg, h_wnd: Hwnd, w_msg_filter_min: u32, w_msg_filter_max: u32) -> Bool;
+        fn GetMessageW(
+            lp_msg: *mut Msg,
+            h_wnd: Hwnd,
+            w_msg_filter_min: u32,
+            w_msg_filter_max: u32,
+        ) -> Bool;
         fn TranslateMessage(lp_msg: *const Msg) -> Bool;
         fn DispatchMessageW(lp_msg: *const Msg) -> Lresult;
         fn PostMessageW(h_wnd: Hwnd, msg: u32, w_param: Wparam, l_param: Lparam) -> Bool;
@@ -557,9 +565,27 @@ mod windows_child {
 
     static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
     const CLASS_NAME: &[u16] = &[
-        b'O' as u16, b'p' as u16, b'e' as u16, b'n' as u16, b'N' as u16, b'O' as u16, b'W' as u16,
-        b'I' as u16, b'n' as u16, b't' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'a' as u16,
-        b'l' as u16, b'V' as u16, b'i' as u16, b'd' as u16, b'e' as u16, b'o' as u16, 0,
+        b'O' as u16,
+        b'p' as u16,
+        b'e' as u16,
+        b'n' as u16,
+        b'N' as u16,
+        b'O' as u16,
+        b'W' as u16,
+        b'I' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        b'n' as u16,
+        b'a' as u16,
+        b'l' as u16,
+        b'V' as u16,
+        b'i' as u16,
+        b'd' as u16,
+        b'e' as u16,
+        b'o' as u16,
+        0,
     ];
 
     unsafe extern "system" fn wnd_proc(
@@ -778,8 +804,8 @@ mod windows_child {
         unsafe {
             suppress_top_level_gst_vulkan_windows();
 
-            let Some(vulkan) = find_gst_vulkan_under_parent(parent)
-                .or_else(|| find_process_gst_vulkan_window())
+            let Some(vulkan) =
+                find_gst_vulkan_under_parent(parent).or_else(|| find_process_gst_vulkan_window())
             else {
                 return false;
             };
@@ -908,8 +934,7 @@ mod windows_child {
             let join = std::thread::Builder::new()
                 .name("opennow-internal-video".to_owned())
                 .spawn(move || {
-                    let created =
-                        unsafe { create_child_on_thread(parent_handle as Hwnd, &bounds) };
+                    let created = unsafe { create_child_on_thread(parent_handle as Hwnd, &bounds) };
                     match created {
                         Ok(hwnd) => {
                             let thread_id = unsafe { GetCurrentThreadId() };
@@ -923,10 +948,9 @@ mod windows_child {
                 })
                 .map_err(|error| format!("Failed to spawn internal renderer UI thread: {error}"))?;
 
-            let (hwnd, thread_id) = rx
-                .recv()
-                .map_err(|_| "Internal renderer UI thread exited before creating HWND.".to_owned())?
-                ?;
+            let (hwnd, thread_id) = rx.recv().map_err(|_| {
+                "Internal renderer UI thread exited before creating HWND.".to_owned()
+            })??;
 
             Ok(Self {
                 hwnd,
@@ -951,13 +975,7 @@ mod windows_child {
             let h = bounds.height.max(2).min(u16::MAX as i32) as u16 as usize;
             let w_param = (h << 16) | w;
             unsafe {
-                if PostMessageW(
-                    self.hwnd as Hwnd,
-                    WM_USER_SET_BOUNDS,
-                    w_param,
-                    l_param,
-                ) == 0
-                {
+                if PostMessageW(self.hwnd as Hwnd, WM_USER_SET_BOUNDS, w_param, l_param) == 0 {
                     return Err("PostMessageW(SET_BOUNDS) failed for internal renderer.".to_owned());
                 }
             }
@@ -976,7 +994,9 @@ mod windows_child {
                     0,
                 ) == 0
                 {
-                    return Err("PostMessageW(SET_VISIBLE) failed for internal renderer.".to_owned());
+                    return Err(
+                        "PostMessageW(SET_VISIBLE) failed for internal renderer.".to_owned()
+                    );
                 }
             }
             Ok(())
@@ -1003,7 +1023,10 @@ mod windows_child {
         }
     }
 
-    unsafe fn create_child_on_thread(parent_hwnd: Hwnd, bounds: &NativeRenderRect) -> Result<Hwnd, String> {
+    unsafe fn create_child_on_thread(
+        parent_hwnd: Hwnd,
+        bounds: &NativeRenderRect,
+    ) -> Result<Hwnd, String> {
         let instance = GetModuleHandleW(null());
         let chromium = find_chromium_content_hwnd(parent_hwnd);
         enable_clip_styles(parent_hwnd, chromium);
@@ -1183,7 +1206,10 @@ mod macos_child {
         }
     }
 
-    pub(super) fn create_child(parent: usize, bounds: &NativeRenderRect) -> Result<NsViewPtr, String> {
+    pub(super) fn create_child(
+        parent: usize,
+        bounds: &NativeRenderRect,
+    ) -> Result<NsViewPtr, String> {
         let parent_view = parent as NsViewPtr;
         if parent_view.is_null() {
             return Err("Internal renderer parent NSView is null.".to_owned());
@@ -1373,7 +1399,10 @@ mod linux_child {
         }
     }
 
-    pub(super) fn create_child(parent: usize, bounds: &NativeRenderRect) -> Result<XWindow, String> {
+    pub(super) fn create_child(
+        parent: usize,
+        bounds: &NativeRenderRect,
+    ) -> Result<XWindow, String> {
         unsafe {
             let display = XOpenDisplay(null_mut());
             if display.is_null() {

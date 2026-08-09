@@ -1,17 +1,17 @@
 use crate::backend::{
     normalize_bitrate_kbps, prepare_native_offer, prepared_offer_events,
-    update_context_bitrate_limit, BackendReply, NativeStreamerBackend,
-    web_rtc_media_connection_info,
+    update_context_bitrate_limit, web_rtc_media_connection_info, BackendReply,
+    NativeStreamerBackend,
 };
 use crate::gstreamer_config::{
     resolve_d3d_fullscreen_sink, resolve_present_max_fps, use_internal_renderer,
     NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV, PRESENT_LIMITER_AUTO_SENTINEL,
     PRESENT_LIMITER_VRR_SENTINEL,
 };
-use crate::gstreamer_platform::{clear_native_shortcut_bindings, set_native_shortcut_bindings};
 use crate::gstreamer_pipeline::{
     current_platform_label, init_gstreamer, native_video_backend_capabilities, GstreamerPipeline,
 };
+use crate::gstreamer_platform::{clear_native_shortcut_bindings, set_native_shortcut_bindings};
 use crate::protocol::{
     missing_field, CommandEnvelope, Event, IceCandidatePayload, NativeRenderSurface,
     NativeStreamerCapabilities, NativeStreamerSessionContext, NativeVideoBackendCapability,
@@ -136,26 +136,25 @@ impl NativeStreamerBackend for GstreamerBackend {
         };
 
         let session_id = context.session.session_id.clone();
-        let pipeline = match GstreamerPipeline::build(
-            self.event_sender.clone(),
-            &context.session.ice_servers,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(message) => {
-                return BackendReply {
-                    events: vec![Event::Error {
-                        code: "gstreamer-start-failed".to_owned(),
-                        message: message.clone(),
-                    }],
-                    response: Some(Response::Error {
-                        id: Some(id),
-                        code: "gstreamer-start-failed".to_owned(),
-                        message,
-                    }),
-                    should_continue: true,
-                };
-            }
-        };
+        let pipeline =
+            match GstreamerPipeline::build(self.event_sender.clone(), &context.session.ice_servers)
+            {
+                Ok(pipeline) => pipeline,
+                Err(message) => {
+                    return BackendReply {
+                        events: vec![Event::Error {
+                            code: "gstreamer-start-failed".to_owned(),
+                            message: message.clone(),
+                        }],
+                        response: Some(Response::Error {
+                            id: Some(id),
+                            code: "gstreamer-start-failed".to_owned(),
+                            message,
+                        }),
+                        should_continue: true,
+                    };
+                }
+            };
 
         if let Some(old_pipeline) = self.pipeline.take() {
             if let Err(message) = old_pipeline.stop() {
@@ -163,6 +162,17 @@ impl NativeStreamerBackend for GstreamerBackend {
             }
         }
 
+        // The sink-native RawInput mouse path scales deltas with the same
+        // sensitivity / acceleration the renderer applies to the addon and DOM
+        // pointer-lock paths, so stacked capture feels identical to the
+        // configured mouse settings instead of raw HID counts.
+        crate::gstreamer_input::set_native_mouse_settings(
+            context.settings.mouse_sensitivity,
+            context.settings.mouse_acceleration_percent,
+        );
+        crate::gstreamer_input::set_native_sink_input_capture_enabled(
+            context.settings.native_sink_input_capture,
+        );
         set_native_shortcut_bindings(&context.shortcuts);
         self.active_context = Some(context);
         self.pending_remote_ice.clear();
@@ -188,10 +198,7 @@ impl NativeStreamerBackend for GstreamerBackend {
                 .as_ref()
                 .map(|ctx| ctx.settings.codec.as_str().to_owned())
                 .unwrap_or_else(|| "H265".to_owned());
-            let requested_fps = self
-                .active_context
-                .as_ref()
-                .map(|ctx| ctx.settings.fps);
+            let requested_fps = self.active_context.as_ref().map(|ctx| ctx.settings.fps);
             let d3d_fullscreen = resolve_d3d_fullscreen_sink(
                 self.active_context
                     .as_ref()
@@ -357,6 +364,7 @@ impl NativeStreamerBackend for GstreamerBackend {
             (prepared.gstreamer_ice_pwd_replacements > 0)
                 .then_some(&prepared.nvst_params.credentials),
             prepared.nvst_params.partial_reliable_threshold_ms,
+            context.settings.microphone_enabled,
         ) {
             Ok(answer_sdp) => {
                 let munged = munge_answer_sdp(&answer_sdp, prepared.nvst_params.max_bitrate_kbps);
@@ -576,6 +584,109 @@ impl NativeStreamerBackend for GstreamerBackend {
             context.shortcuts = shortcuts;
         }
         BackendReply::response(Response::Ok { id: command.id })
+    }
+
+    fn set_microphone_enabled(&mut self, command: CommandEnvelope) -> BackendReply {
+        let Some(enabled) = command.microphone_enabled else {
+            return BackendReply::response(missing_field(&command.id, "microphoneEnabled"));
+        };
+
+        if let Some(context) = self.active_context.as_mut() {
+            context.settings.microphone_enabled = enabled;
+        }
+        if let Some(pipeline) = self.pipeline.as_ref() {
+            pipeline.set_microphone_enabled(enabled);
+        }
+        let attached = self
+            .pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.mic_attached());
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Native microphone {}{}",
+                if enabled { "unmuted" } else { "muted" },
+                if attached {
+                    ""
+                } else {
+                    " (no mic pipeline attached — session started without microphone)"
+                }
+            ),
+        );
+        BackendReply::response(Response::Ok { id: command.id })
+    }
+
+    fn take_screenshot(&mut self, command: CommandEnvelope) -> BackendReply {
+        let id = command.id;
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "gstreamer-not-started".to_owned(),
+                message: "GStreamer pipeline is not started.".to_owned(),
+            });
+        };
+
+        match pipeline.capture_screenshot() {
+            Ok(screenshot) => BackendReply {
+                events: vec![Event::Screenshot { screenshot }],
+                response: Some(Response::Ok { id }),
+                should_continue: true,
+            },
+            Err(message) => BackendReply {
+                events: vec![Event::Log {
+                    level: "warn",
+                    message: format!("Native screenshot failed: {message}"),
+                }],
+                response: Some(Response::Error {
+                    id: Some(id),
+                    code: "screenshot-failed".to_owned(),
+                    message,
+                }),
+                should_continue: true,
+            },
+        }
+    }
+
+    fn start_recording(&mut self, command: CommandEnvelope) -> BackendReply {
+        let id = command.id;
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "gstreamer-not-started".to_owned(),
+                message: "GStreamer pipeline is not started.".to_owned(),
+            });
+        };
+
+        match pipeline.start_recording() {
+            Ok(()) => BackendReply::response(Response::Ok { id }),
+            Err(message) => BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "recording-start-failed".to_owned(),
+                message,
+            }),
+        }
+    }
+
+    fn stop_recording(&mut self, command: CommandEnvelope) -> BackendReply {
+        let id = command.id;
+        let finalize = command.finalize.unwrap_or(true);
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "gstreamer-not-started".to_owned(),
+                message: "GStreamer pipeline is not started.".to_owned(),
+            });
+        };
+
+        match pipeline.stop_recording(finalize) {
+            Ok(()) => BackendReply::response(Response::Ok { id }),
+            Err(message) => BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "recording-stop-failed".to_owned(),
+                message,
+            }),
+        }
     }
 
     fn stop(&mut self, command: CommandEnvelope) -> BackendReply {
@@ -894,11 +1005,8 @@ mod tests {
 
         // The chain routes AV1/H265 through download + videoconvert to system
         // NV12 instead of presenting the D3D texture zero-copy.
-        let chain =
-            rtp_video_chain_definition("AV1", RtpVideoApi::D3D12).expect("AV1 D3D12 chain");
-        assert!(chain
-            .iter()
-            .any(|spec| spec.factory == "d3d12download"));
+        let chain = rtp_video_chain_definition("AV1", RtpVideoApi::D3D12).expect("AV1 D3D12 chain");
+        assert!(chain.iter().any(|spec| spec.factory == "d3d12download"));
         assert!(chain.iter().any(|spec| spec.factory == "videoconvert"));
         assert!(chain.iter().any(|spec| {
             spec.role == RtpVideoChainRole::PostDecodeCapsFilter
@@ -982,6 +1090,10 @@ mod tests {
 
     #[test]
     fn maps_cross_platform_video_paths_to_expected_decoders() {
+        // Chains carry a pre-decode queue at varying positions, so assert on the
+        // Decoder role instead of a hard-coded index (which drifted when the
+        // pre-decode queue was added and left this test silently broken until it
+        // ran with the gstreamer feature enabled).
         let vt =
             rtp_video_chain_definition("H264", RtpVideoApi::VideoToolbox).expect("VideoToolbox");
         assert_eq!(vt[3].factory, "vtdec_hw");
@@ -1000,17 +1112,33 @@ mod tests {
         assert_eq!(nvdec.last().map(|spec| spec.factory), Some("glimagesink"));
 
         let v4l2 = rtp_video_chain_definition("H265", RtpVideoApi::V4L2).expect("V4L2 H265");
-        assert_eq!(v4l2[3].factory, "v4l2slh265dec");
+        assert_eq!(
+            v4l2.iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory.as_ref()),
+            Some("v4l2slh265dec")
+        );
         assert!(!v4l2.iter().any(|spec| spec.factory == "videoconvert"));
 
-        let v4l2_av1 =
-            rtp_video_chain_definition("AV1", RtpVideoApi::V4L2).expect("V4L2 AV1");
-        assert_eq!(v4l2_av1[3].factory, "v4l2slav1dec");
+        let v4l2_av1 = rtp_video_chain_definition("AV1", RtpVideoApi::V4L2).expect("V4L2 AV1");
+        assert_eq!(
+            v4l2_av1
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory.as_ref()),
+            Some("v4l2slav1dec")
+        );
 
         let vulkan = rtp_video_chain_definition("H265", RtpVideoApi::Vulkan).expect("Vulkan H265");
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(vulkan[3].factory, "d3d12h265dec");
+            assert_eq!(
+                vulkan
+                    .iter()
+                    .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                    .map(|spec| spec.factory.as_ref()),
+                Some("d3d12h265dec")
+            );
             assert!(!vulkan.iter().any(|spec| spec.factory == "vulkanh265dec"));
             // Default Internal renderer: Electron cannot composite vulkansink.
             assert_eq!(
@@ -1024,7 +1152,13 @@ mod tests {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert_eq!(vulkan[3].factory, "vulkanh265dec");
+            assert_eq!(
+                vulkan
+                    .iter()
+                    .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                    .map(|spec| spec.factory.as_ref()),
+                Some("vulkanh265dec")
+            );
             assert!(vulkan
                 .iter()
                 .any(|spec| spec.factory == "vulkancolorconvert"));
@@ -1033,13 +1167,31 @@ mod tests {
         let vulkan_av1 =
             rtp_video_chain_definition("AV1", RtpVideoApi::Vulkan).expect("Vulkan AV1");
         #[cfg(target_os = "windows")]
-        assert_eq!(vulkan_av1[3].factory, "d3d12av1dec");
+        assert_eq!(
+            vulkan_av1
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory.as_ref()),
+            Some("d3d12av1dec")
+        );
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(vulkan_av1[3].factory, "vulkanav1dec");
+        assert_eq!(
+            vulkan_av1
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory.as_ref()),
+            Some("vulkanav1dec")
+        );
 
         let software =
             rtp_video_chain_definition("H264", RtpVideoApi::Software).expect("software H264");
-        assert_eq!(software[3].factory, "avdec_h264");
+        assert_eq!(
+            software
+                .iter()
+                .find(|spec| spec.role == RtpVideoChainRole::Decoder)
+                .map(|spec| spec.factory.as_ref()),
+            Some("avdec_h264")
+        );
         assert!(software.iter().any(|spec| spec.factory == "videoconvert"));
         assert_eq!(
             software.last().map(|spec| spec.factory),
@@ -1287,7 +1439,12 @@ mod tests {
             codec: VideoCodec::H265,
             color_quality: crate::protocol::ColorQuality::TenBit420,
             enable_cloud_gsync: false,
+            fallback_codec: None,
             native_transition_diagnostics: None,
+            mouse_sensitivity: 1.0,
+            mouse_acceleration_percent: 1.0,
+            native_sink_input_capture: false,
+            microphone_enabled: false,
         });
         assert_eq!(adaptive, NativeQueueMode::Adaptive);
 
@@ -1298,7 +1455,12 @@ mod tests {
             codec: VideoCodec::H265,
             color_quality: crate::protocol::ColorQuality::TenBit420,
             enable_cloud_gsync: true,
+            fallback_codec: None,
             native_transition_diagnostics: None,
+            mouse_sensitivity: 1.0,
+            mouse_acceleration_percent: 1.0,
+            native_sink_input_capture: false,
+            microphone_enabled: false,
         });
         assert_eq!(vrr, NativeQueueMode::Vrr);
     }

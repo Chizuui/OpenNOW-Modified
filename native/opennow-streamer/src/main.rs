@@ -20,13 +20,13 @@ mod gstreamer_pipeline;
 mod gstreamer_platform;
 #[cfg(feature = "gstreamer")]
 mod gstreamer_transitions;
+mod input;
 #[cfg(feature = "gstreamer")]
 mod internal_renderer;
-mod input;
 mod nvst_video;
 mod protocol;
-mod shortcuts;
 mod sdp;
+mod shortcuts;
 #[cfg(target_os = "windows")]
 mod windows_dpi;
 
@@ -116,6 +116,18 @@ fn handle_command(
         }
         "update-shortcuts" => {
             return write_reply(backend.update_shortcuts(command));
+        }
+        "microphone" => {
+            return write_reply(backend.set_microphone_enabled(command));
+        }
+        "take-screenshot" => {
+            return write_reply(backend.take_screenshot(command));
+        }
+        "start-recording" => {
+            return write_reply(backend.start_recording(command));
+        }
+        "stop-recording" => {
+            return write_reply(backend.stop_recording(command));
         }
         "stop" => {
             return write_reply(backend.stop(command));

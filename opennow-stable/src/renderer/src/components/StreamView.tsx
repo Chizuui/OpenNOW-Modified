@@ -363,12 +363,18 @@ export function StreamView({
   const screenshotGallery = useScreenshotGallery({
     videoRef: localVideoRef,
     gameTitle,
+    // Native mode renders video in the native sink window; the renderer's
+    // <video> element has no frames, so capture from the native video chain.
+    nativeCaptureScreenshot: nativeRendererActive
+      ? () => window.openNow.captureNativeScreenshot({ gameTitle })
+      : undefined,
   });
   const streamRecorder = useStreamRecorder({
     videoRef: localVideoRef,
     audioRef: localAudioRef,
     gameTitle,
     micTrack: micTrack ?? null,
+    nativeRecordingEnabled: nativeRendererActive,
     recordingBitrateMbps,
     recordingResolution,
     recordingFps,
@@ -499,10 +505,14 @@ export function StreamView({
       // document (minimized window) suppresses it, handled by the branch above.
       const stacked = diagnosticsStore.getSnapshot().nativeStackedRenderer;
       const visible = width >= 2 && height >= 2 && (stacked || (!showSideBar && !exitOpen));
+      // The built-in GStreamer stats overlay (dwritetextoverlay) is a native
+      // rendering, so only the dedicated "Show Native Streamer Stats" setting
+      // controls it — the DOM HUD (statsMode) is drawn by React above the
+      // video and must not force the native overlay on/off.
       updateSurface({
         deviceScaleFactor: dpr,
         visible,
-        showStats: statsMode !== "off" || showNativeStats,
+        showStats: showNativeStats,
         rect: visible
           ? {
               x: Math.round(rect.left * dpr),
@@ -735,7 +745,14 @@ export function StreamView({
     (nativeRendererActive || gstreamerEnabled) && !nativeExternalRenderer;
 
   return (
-    <div className={["sv", streamVideoReady ? "sv--video-ready" : "sv--video-pending", nativeInternalHole ? "sv--native-hole" : "", className].filter(Boolean).join(" ")}>
+    <div
+      className={["sv", streamVideoReady ? "sv--video-ready" : "sv--video-pending", nativeInternalHole ? "sv--native-hole" : "", className].filter(Boolean).join(" ")}
+      // While the native streamer owns RawInput mouse capture, the OS cursor is
+      // hidden/confined by capture; hide it over the shell too (falls back to
+      // the addon's ShowCursor when that path is unavailable). Overlays release
+      // capture (input-capture-changed: false) so their cursor returns.
+      style={nativeInputCaptureActive ? { cursor: "none" } : undefined}
+    >
       {nativeInternalHole ? (
         <video
           ref={setVideoRef}

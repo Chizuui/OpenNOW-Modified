@@ -80,6 +80,10 @@ export function buildNativeStreamerSessionContext(
       ...settings,
       enableCloudGsync:
         session.negotiatedStreamProfile?.enableCloudGsync ?? settings.enableCloudGsync,
+      // The renderer resolves microphoneMode → microphoneEnabled ("always-on"
+      // and "push-to-talk" both capture); the native streamer owns mute via
+      // its volume element.
+      microphoneEnabled: settings.microphoneEnabled ?? false,
     },
     shortcuts,
     ...(nvstVideo ? { nvstVideo } : {}),
@@ -162,6 +166,31 @@ export interface NativeStreamStats {
   bitratePerformancePercent: number;
   decodedFps: number;
   renderFps: number;
+  /** Server-reported game render FPS from the stats_channel (may exceed the stream FPS). */
+  gameFps?: number;
+  /** Server-reported network round-trip time (ms) from the stats_channel. */
+  networkRttMs?: number;
+  /**
+   * Locally computed RTCP round-trip time (ms) from Receiver Reports the
+   * server sends about our outgoing RTP (rtpsession LSR/DLSR). Absent for a
+   * receiver-only pipeline — the native streamer sends no RTP today, so this
+   * stays undefined until outgoing RTP exists.
+   */
+  localRtcpRttMs?: number;
+  /** Server-reported packet loss (percent) from the stats_channel. */
+  networkPacketLossPercent?: number;
+  /**
+   * Server-reported session bitrate (kbps) derived from the stats_channel
+   * counter deltas — confidence-gated in the native streamer, so it only
+   * appears once the counter is verified to be cumulative bytes.
+   */
+  networkBitrateKbps?: number;
+  /** Average decode→present pipeline latency in ms. */
+  decodeTimeMs?: number;
+  /** Active input capture path in the native streamer: sink-native / internal / external / bridge / none. */
+  inputPath?: string;
+  /** Measured in-process mouse delta latency (capture → data channel send) in µs. */
+  mouseDeltaLatencyUs?: number;
   framesDecoded: number;
   framesRendered: number;
   framesPendingToPresent?: number;

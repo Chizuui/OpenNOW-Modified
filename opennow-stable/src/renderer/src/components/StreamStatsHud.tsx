@@ -4,7 +4,11 @@ import { AlertTriangle } from "lucide-react";
 import type { JSX } from "react";
 import type { StatsOverlayPosition } from "@shared/gfn";
 import type { StreamLagReason } from "../platforms/gfn/webrtcClient";
-import { isRttSpike, PACKET_LOSS_BANNER_PERCENT } from "../platforms/gfn/webrtc/streamLag";
+import {
+  isRttSpike,
+  NATIVE_PACKET_LOSS_BANNER_PERCENT,
+  PACKET_LOSS_BANNER_PERCENT,
+} from "../platforms/gfn/webrtc/streamLag";
 import type { StreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import { useStreamDiagnosticsStore } from "../utils/streamDiagnosticsStore";
 import {
@@ -211,10 +215,27 @@ export function StreamStatsHud({
   const shaderActive = stats.shaderActive === true;
 
   const hasLagIssue = stats.lagReason !== "stable" && stats.lagReason !== "unknown";
-  const hasPacketLoss = stats.packetLossPercent > 0;
-  // Banner threshold is coarser than the alert dot: sub-0.15% loss is normal
-  // noise, so it should not flash the transient banner on every poll.
-  const bannerPacketLoss = stats.packetLossPercent >= PACKET_LOSS_BANNER_PERCENT;
+  // Packet-loss source differs by mode: web uses the receiver-computed
+  // getStats loss; native uses the server-reported stats_channel field (a
+  // cleaner send-side signal, so its banner threshold is lower — see
+  // NATIVE_PACKET_LOSS_BANNER_PERCENT). The alert dot uses the same native
+  // threshold so healthy ~0.02-0.05% server loss does not leave the warn
+  // state permanently on.
+  const nativePacketLoss = stats.nativeRendererActive
+    && stats.nativePacketLossPercent !== undefined
+    ? stats.nativePacketLossPercent
+    : 0;
+  const effectivePacketLossPercent = stats.nativeRendererActive
+    ? nativePacketLoss
+    : stats.packetLossPercent;
+  const hasPacketLoss = stats.nativeRendererActive
+    ? nativePacketLoss >= NATIVE_PACKET_LOSS_BANNER_PERCENT
+    : stats.packetLossPercent > 0;
+  // Banner threshold is coarser than the alert dot: sub-threshold loss is
+  // normal noise, so it should not flash the transient banner on every poll.
+  const bannerPacketLoss = stats.nativeRendererActive
+    ? nativePacketLoss >= NATIVE_PACKET_LOSS_BANNER_PERCENT
+    : stats.packetLossPercent >= PACKET_LOSS_BANNER_PERCENT;
   const hasIssues = hasLagIssue || hasPacketLoss;
 
   const advancedLines = useMemo(() => {
@@ -228,6 +249,31 @@ export function StreamStatsHud({
     lines.push(
       `Mouse flush ${stats.mouseFlushIntervalMs.toFixed(0)}ms · ${stats.mousePacketsPerSecond}/s · PR ${stats.partiallyReliableInputOpen ? `${stats.mouseMoveTransport} · ${(stats.partiallyReliableInputQueueBufferedBytes / 1024).toFixed(1)}KB` : "off"}`,
     );
+    // Input path diagnostic: which mouse route is active this session and how
+    // much latency it adds. sink-native / internal / external capture RawInput
+    // in-process (1:1, no bridge); addon / pointer-lock ride the renderer
+    // bridge — hop is the renderer-side event→send cost measured there.
+    if (stats.nativeRendererActive) {
+      const nativePath = stats.nativeInputPath || stats.mousePath;
+      const nativeLatency = stats.nativeMouseDeltaLatencyUs !== undefined
+        && stats.nativeMouseDeltaLatencyUs > 0
+        ? ` · Δ ${(stats.nativeMouseDeltaLatencyUs / 1000).toFixed(2)}ms`
+        : "";
+      if (nativePath && nativePath !== "none") {
+        lines.push(`Input path ${nativePath}${nativeLatency}`);
+      }
+      // Server-reported session bitrate (stats_channel counter deltas, decoded
+      // + confidence-gated in the native streamer). Only shown once the counter
+      // is verified to be cumulative bytes — until then it stays hidden.
+      if (stats.nativeServerBitrateKbps !== undefined && stats.nativeServerBitrateKbps > 0) {
+        lines.push(`Server bitrate ${formatBitrate(stats.nativeServerBitrateKbps)}`);
+      }
+    } else if (stats.mousePath && stats.mousePath !== "none") {
+      const hop = stats.mouseHopLatencyMs !== undefined && stats.mouseHopLatencyMs > 0
+        ? ` · hop ${stats.mouseHopLatencyMs.toFixed(2)}ms`
+        : "";
+      lines.push(`Mouse path ${stats.mousePath}${hop}`);
+    }
     lines.push(
       gstreamerEnabled
         ? `GStreamer enabled · ${stats.nativeRendererActive ? "in use" : "not active"}`
@@ -328,7 +374,7 @@ export function StreamStatsHud({
             <span>
               {rttSpikeActive && `RTT spike ${rttSpikeValueMs}ms`}
               {rttSpikeActive && bannerPacketLoss && " · "}
-              {bannerPacketLoss && `${stats.packetLossPercent.toFixed(2)}% loss`}
+              {bannerPacketLoss && `${effectivePacketLossPercent.toFixed(2)}% loss`}
             </span>
           </m.div>
         )}

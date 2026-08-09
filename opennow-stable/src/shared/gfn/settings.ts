@@ -93,6 +93,8 @@ export interface Settings {
   steamControllerCompatibilityMode: boolean;
   /** Use the WebRTC cursor_channel overlay instead of leaving cursor rendering to the stream. */
   nativeCursorOverlay: boolean;
+  /** Opt-in stacked sink-native RawInput capture (mouse + keyboard bypass the Electron bridge). */
+  nativeSinkInputCapture: boolean;
   mouseSensitivity: number;
   mouseAcceleration: number;
   shortcutToggleStats: string;
@@ -273,6 +275,7 @@ export function createDefaultSettings(platform: string): Settings {
     enableGyroscopeControls: false,
     steamControllerCompatibilityMode: false,
     nativeCursorOverlay: true,
+    nativeSinkInputCapture: false,
     mouseSensitivity: 1,
     mouseAcceleration: 1,
     ...shortcuts.bindings,
