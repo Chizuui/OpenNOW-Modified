@@ -71,7 +71,7 @@ export class AuthService {
     this.sessionValidity = new SessionValidityCoordinator({
       state: this.state,
       enrichmentCaches: this.enrichmentCaches,
-      logout: () => this.accountManager.logout(),
+      logout: () => this.logoutWithChizuiRevoke(),
       fetchChizuiSession: (url, token, userId) => this.fetchChizuiSession(url, token, userId),
     });
     this.accountManager = new AccountManager(
@@ -238,17 +238,41 @@ export class AuthService {
     await shell.openExternal(oauthUrl);
     const code = await codePromise;
 
-    const jwtToken = code.startsWith("CHIZUI_") ? code.substring("CHIZUI_".length) : code;
-    const session = await this.fetchChizuiSession(serverUrl, jwtToken);
+    const rawCode = code.startsWith("CHIZUI_") ? code.substring("CHIZUI_".length) : code;
+    const token = rawCode.startsWith("ctc_")
+      ? await this.exchangeChizuiCode(serverUrl, rawCode, port)
+      : rawCode; // legacy JWT (server lama)
+    const session = await this.fetchChizuiSession(serverUrl, token);
 
     const sessionWithChizui: AuthSession = {
       ...session,
       provider: normalizeProvider(session.provider),
       chizuiServerUrl: serverUrl,
-      chizuiJwtToken: jwtToken,
+      chizuiJwtToken: token,
     };
 
     return this.saveLoginSession(sessionWithChizui);
+  }
+
+  private async exchangeChizuiCode(serverUrl: string, code: string, callbackPort: number): Promise<string> {
+    const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/auth/exchange`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, callbackPort }),
+    });
+    if (response.status === 404 || response.status === 405) return code; // server lama tanpa endpoint exchange
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      let errMsg = `HTTP error ${response.status}`;
+      try {
+        const parsed = JSON.parse(body) as { error?: string };
+        if (parsed.error) errMsg = parsed.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+    const payload = (await response.json()) as { token?: string; error?: string };
+    if (!payload.token) throw new Error(payload.error || "Exchange failed");
+    return payload.token;
   }
 
   public async fetchChizuiSession(serverUrl: string, jwtToken: string, gfnUserId?: string): Promise<AuthSession> {
@@ -281,6 +305,26 @@ export class AuthService {
     }
 
     return payload.data;
+  }
+
+  /** Logout dengan best-effort revoke sesi ChizuiLogin di server (gagal → abaikan). */
+  private async logoutWithChizuiRevoke(): Promise<void> {
+    await this.revokeChizuiSession(this.accountManager.getSession());
+    await this.accountManager.logout();
+  }
+
+  private async revokeChizuiSession(session: AuthSession | null): Promise<void> {
+    const serverUrl = session?.chizuiServerUrl;
+    const token = session?.chizuiJwtToken;
+    if (!serverUrl || !token) return;
+    try {
+      await fetch(`${serverUrl.replace(/\/$/, "")}/api/auth/revoke`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // best-effort: gagal → abaikan, logout lokal tetap jalan
+    }
   }
 
   async startDeviceLogin(input: AuthDeviceLoginStartRequest): Promise<AuthDeviceLoginChallenge> {

@@ -173,7 +173,7 @@ export function registerAccountCatalogIpcHandlers(
   );
 
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGOUT, async () => {
-    await authService.logout();
+    await authService.logoutWithChizuiRevoke();
   });
 
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGOUT_ALL, async () => {
