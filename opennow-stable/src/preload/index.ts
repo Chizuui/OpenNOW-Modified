@@ -163,6 +163,17 @@ const api: OpenNowApi = {
   updateNativeBitrateLimit: (maxBitrateKbps) => {
     ipcRenderer.send(IPC_CHANNELS.NATIVE_UPDATE_BITRATE, maxBitrateKbps);
   },
+  setNativeMicrophoneEnabled: (enabled: boolean) => {
+    ipcRenderer.send(IPC_CHANNELS.NATIVE_MICROPHONE, enabled);
+  },
+  captureNativeScreenshot: (input: { gameTitle: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.NATIVE_SCREENSHOT, input),
+  startNativeRecording: (recordingId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.NATIVE_RECORDING_START, recordingId),
+  stopNativeRecording: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.NATIVE_RECORDING_STOP),
+  abortNativeRecording: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.NATIVE_RECORDING_ABORT),
   requestKeyframe: (input: KeyframeRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.REQUEST_KEYFRAME, input),
   onSignalingEvent: (listener: (event: MainToRendererSignalingEvent) => void) => {
@@ -212,6 +223,8 @@ const api: OpenNowApi = {
     ipcRenderer.invoke(IPC_CHANNELS.WINDOW_TOGGLE_MAXIMIZE),
   getMaximizeWindowState: (): Promise<boolean> =>
     ipcRenderer.invoke(IPC_CHANNELS.WINDOW_GET_MAXIMIZE_STATE),
+  restoreWindowAfterSession: (): Promise<void> =>
+    ipcRenderer.invoke(IPC_CHANNELS.WINDOW_RESTORE_AFTER_SESSION),
   closeWindow: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_CLOSE),
   onMaximizeWindowStateChanged: (listener: (maximized: boolean) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, maximized: boolean) => {
@@ -305,10 +318,15 @@ const api: OpenNowApi = {
   getReleaseHighlights: (version?: string): Promise<import("@shared/gfn").ReleaseHighlightsPayload> =>
     ipcRenderer.invoke(IPC_CHANNELS.RELEASE_HIGHLIGHTS_GET, version),
   ackReleaseHighlights: (): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.RELEASE_HIGHLIGHTS_ACK),
-  clearGStreamerCache: (): Promise<{ cleared: boolean; path: string }> =>
+  clearGStreamerCache: (): Promise<{ cleared: boolean; path: string; rebuilding: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.GSTREAMER_CLEAR_CACHE),
-  getGStreamerScanStatus: (): Promise<{ registryExists: boolean; registryPath: string }> =>
-    ipcRenderer.invoke(IPC_CHANNELS.GSTREAMER_GET_SCAN_STATUS),
+  getGStreamerScanStatus: (): Promise<{
+    registryExists: boolean;
+    registryPath: string;
+    scanInProgress: boolean;
+    lastStatus: string | null;
+    lastReason: string | null;
+  }> => ipcRenderer.invoke(IPC_CHANNELS.GSTREAMER_GET_SCAN_STATUS),
   onGStreamerScanStatus: (listener: (payload: { status: string; reason: string }) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, payload: { status: string; reason: string }) => {
       listener(payload);

@@ -11,8 +11,7 @@ import {
 } from "electron";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 
 // Keyboard shortcuts reference (matching Rust implementation):
 // Screenshot keybind - configurable, handled in renderer
@@ -26,8 +25,7 @@ import { initLogCapture } from "@shared/logger";
 import { cacheManager } from "./services/cacheManager";
 import { refreshScheduler } from "./services/refreshScheduler";
 import { cacheEventBus } from "./services/cacheEventBus";
-import { resolveNativeStreamerExecutableCandidates } from "./nativeStreamer/executableDiscovery";
-import { createNativeStreamerRuntimeEnvironment } from "./nativeStreamer/runtime";
+import { warmUpGStreamerRegistry, replayGStreamerScanStatus } from "./nativeStreamer/registryWarmup";
 import {
   fetchMainGamesUncached,
   fetchLibraryGamesUncached,
@@ -627,134 +625,16 @@ app.whenReady().then(async () => {
 
   // Fire-and-forget: check for GPU driver updates, warm up the GStreamer plugin
   // registry in the background (so the first stream start is ~1s instead of
-  // 60-90s), and notify the renderer so it can show a status toast.
-  void (async () => {
-    if (process.platform !== "win32") return;
-    try {
-      const candidates = resolveNativeStreamerExecutableCandidates({
-        platform: process.platform,
-        arch: process.arch,
-        resourcesPath: process.resourcesPath,
-        appPath: app.getAppPath(),
-        mainDir: __dirname,
-        isPackaged: app.isPackaged,
-        envExecutablePath: process.env.OPENNOW_NATIVE_STREAMER,
-        getConfiguredPath: () => "",
-        cacheContext: {
-          appVersion: app.getVersion(),
-          isPackaged: app.isPackaged,
-          platform: process.platform,
-          resourcesPath: process.resourcesPath,
-          tempDirectory: app.getPath("temp"),
-          userDataPath: app.getPath("userData"),
-        },
-      });
-
-      if (candidates.length === 0) return;
-      const exePath = candidates[0];
-      const runtimeRoot = join(dirname(exePath), "gstreamer");
-      const gstInspect = join(runtimeRoot, "bin", "gst-inspect-1.0.exe");
-
-      if (!existsSync(gstInspect)) return;
-
-      const registryDir = join(app.getPath("userData"), "native-streamer", "gstreamer");
-      const driverVersionPath = join(registryDir, "gpu-driver-version.txt");
-      const platformKey = `${process.platform}-${process.arch}`;
-      const registryPath = join(registryDir, `${platformKey}-registry.bin`);
-
-      let scanReason = "idle"; // "idle" | "first-scan" | "driver-update"
-      let currentDriver = "";
-
-      try {
-        const gpuInfo = await app.getGPUInfo("basic") as {
-          gpuDevice?: Array<{ driverVersion?: string }>;
-        };
-        currentDriver = gpuInfo.gpuDevice?.[0]?.driverVersion || "";
-      } catch (err) {
-        console.warn("[Main] Failed to query GPU driver version:", err);
-      }
-
-      const registryExists = existsSync(registryPath);
-      mkdirSync(registryDir, { recursive: true });
-
-      if (!registryExists) {
-        scanReason = "first-scan";
-        if (currentDriver) writeFileSync(driverVersionPath, currentDriver, "utf8");
-      } else if (currentDriver && existsSync(driverVersionPath)) {
-        const lastDriver = readFileSync(driverVersionPath, "utf8").trim();
-        if (lastDriver !== currentDriver.trim()) {
-          console.log(`[Main] GPU Driver updated: ${lastDriver} -> ${currentDriver}. Resetting registry...`);
-          scanReason = "driver-update";
-          try { unlinkSync(registryPath); } catch {}
-          writeFileSync(driverVersionPath, currentDriver, "utf8");
-        }
-      } else if (currentDriver) {
-        // Missing version file, create it
-        writeFileSync(driverVersionPath, currentDriver, "utf8");
-      }
-
-      const { env } = createNativeStreamerRuntimeEnvironment({
-        executablePath: exePath,
-        baseEnv: process.env,
-        platform: process.platform,
-        arch: process.arch,
-        userDataPath: app.getPath("userData"),
-        protocolVersion: 1,
-        backendPreference: "gstreamer",
-        videoBackendPreference: "auto",
-        externalRendererEnabled: false,
-        cloudGsyncMode: "auto",
-        d3dFullscreenMode: "auto",
-      });
-
-      // Registry cache already exists and the GPU driver is unchanged — nothing
-      // to rebuild. Skip the spawn entirely so subsequent launches stay ~1s.
-      if (scanReason === "idle") {
-        console.log("[Main] GStreamer registry cache is fresh; skipping background scan.");
-        return;
-      }
-
-      console.log(`[Main] GStreamer scan started (Reason: ${scanReason}).`);
-
-      // Notify renderer of GStreamer scanning state
-      const notifyRenderer = (status: string) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send("gstreamer-scan-status", { status, reason: scanReason });
-        }
-      };
-
-      // Notify immediately if main window is already created, or wait until load
-      notifyRenderer("scanning");
-      if (mainWindow) {
-        mainWindow.webContents.once("did-finish-load", () => {
-          notifyRenderer("scanning");
-        });
-      }
-
-      const child = spawn(gstInspect, [], {
-        env: { ...env, GST_REGISTRY_FORK: "no" },
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"], // capture stdout and stderr
-      });
-
-      let stderrOutput = "";
-      child.stderr.on("data", (data) => {
-        stderrOutput += data.toString();
-      });
-
-      child.on("exit", (code) => {
-        if (code !== 0) {
-          console.error(`[Main] GStreamer background scan failed with code ${code}. Stderr: ${stderrOutput}`);
-          notifyRenderer("failed");
-        } else {
-          console.log(`[Main] GStreamer background scan finished with code ${code}`);
-          notifyRenderer("finished");
-        }
-      });
-    } catch (err) {
-      console.warn("[Main] Failed GStreamer background scan:", err);
-    }
-  })();
+  // 60-90s), and notify the renderer so it can show a status toast. The scan
+  // module tracks its latest status, and the did-finish-load replay below makes
+  // sure a window that mounts after the scan finished still converges instead of
+  // showing a stuck "scanning" toast forever.
+  void warmUpGStreamerRegistry({ getMainWindow: () => mainWindow });
+  if (mainWindow) {
+    mainWindow.webContents.once("did-finish-load", () => {
+      replayGStreamerScanStatus(() => mainWindow);
+    });
+  }
 
   // Fire-and-forget: check if we should show release highlights after the window loads
   void (async () => {

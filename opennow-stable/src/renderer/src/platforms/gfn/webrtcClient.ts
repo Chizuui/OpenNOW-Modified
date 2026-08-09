@@ -325,13 +325,28 @@ export class GfnWebRtcClient {
   private externalEscapeCleanup: (() => void) | null = null;
   private nativeMouseEventCleanup: (() => void) | null = null;
   private nativeMouseGrabbed = false;
+  /** When the native streamer reports it owns OS RawInput capture (mouse +
+   *  keyboard on the stacked sink window), the renderer's own input sources
+   *  (addon mouse, pointer lock, DOM keys) stand down so the game never
+   *  receives the same input twice. Escape is exempt — Electron keeps
+   *  intercepting and forwarding it. */
+  private nativeStreamerInputOwned = false;
+  /** Last logged effective mouse path (avoids spamming the same path per poll). */
+  private lastLoggedMousePath: string | null = null;
+  private readonly handlePointerLockChange = (): void => {
+    this.updateMousePathDiagnostics();
+  };
   private queuedCandidates: RTCIceCandidateInit[] = [];
 
   private static readonly NATIVE_INPUT_PROTOCOL_FALLBACK = 3;
   private static readonly MOUSE_FLUSH_NORMAL_MS = 8;
   private static readonly MOUSE_FLUSH_MIN_MS = 2;
   private static readonly MOUSE_FLUSH_MAX_MS = 20;
-  private static readonly DEFAULT_PARTIAL_RELIABLE_THRESHOLD_MS = 300;
+  // Official GFN value (a=ri.partialReliableThresholdMs). Only used as a
+  // fallback when the offer omits the attribute — the negotiated value (16 ms)
+  // always wins. maxPacketLifeTime is the retransmission window, not a send
+  // delay: packets go out immediately; the lifetime only caps retransmission.
+  private static readonly DEFAULT_PARTIAL_RELIABLE_THRESHOLD_MS = 16;
   private static readonly RELIABLE_MOUSE_BACKPRESSURE_BYTES = 64 * 1024;
   private static readonly BACKPRESSURE_LOG_INTERVAL_MS = 2000;
 
@@ -443,6 +458,10 @@ export class GfnWebRtcClient {
     mousePacketsPerSecond: 0,
     mouseResidualMagnitude: 0,
     mouseAdaptiveFlushActive: false,
+    mousePath: "none",
+    mouseHopLatencyMs: undefined,
+    nativeInputPath: undefined,
+    nativeMouseDeltaLatencyUs: undefined,
     lagReason: "unknown",
     lagReasonDetail: "Waiting for stream stats",
     gpuType: "",
@@ -519,6 +538,7 @@ export class GfnWebRtcClient {
         isInputBlocked: () => this.isStreamInputBlocked(),
         isNativeInputActive: () => this.nativeInputActive,
         isNativeElectronInputBridge: () => this.nativeElectronInputBridge,
+        isNativeStreamerInputOwned: () => this.nativeStreamerInputOwned,
         shouldAutoFullscreen: () => this.shouldAutoFullscreen(),
         getCurrentResolution: () => this.currentResolution,
         getKeyboardLayout: () => this.keyboardLayout,
@@ -596,7 +616,7 @@ export class GfnWebRtcClient {
     // Active only while we've grabbed the native mouse (nativeMouseGrabbed).
     try {
       this.nativeMouseEventCleanup = window.openNow.onNativeMouseEvent((ev) => {
-        if (!this.inputReady || !this.nativeMouseGrabbed) return;
+        if (!this.inputReady || !this.nativeMouseGrabbed || this.nativeStreamerInputOwned) return;
         this.domInputController.injectNativeMouseEvent(ev);
       });
     } catch {
@@ -609,6 +629,7 @@ export class GfnWebRtcClient {
     // Detect GPU once on construction
     this.gpuType = detectGpuType();
     this.diagnostics.gpuType = this.gpuType;
+    document.addEventListener("pointerlockchange", this.handlePointerLockChange);
     this.diagnostics.hardwareAcceleration = "Chromium GPU decode";
 
     // Initialize microphone manager if mode is enabled
@@ -804,6 +825,47 @@ export class GfnWebRtcClient {
     return this.nativeMouseGrabbed;
   }
 
+  /** Set when the native streamer reports it owns OS RawInput capture (mouse
+   *  + keyboard on the stacked sink window). While owned, the renderer's
+   *  addon/pointer-lock/DOM-key sources stand down — the native streamer feeds
+   *  the data channel directly, so forwarding the same input again would
+   *  double-input the game. Escape stays on the Electron path. */
+  public setNativeStreamerInputOwned(owned: boolean): void {
+    if (this.nativeStreamerInputOwned === owned) return;
+    this.nativeStreamerInputOwned = owned;
+    this.log(owned
+      ? "Native streamer owns RawInput capture (sink window); renderer mouse sources stand down"
+      : "Native streamer released RawInput capture; renderer mouse sources re-engaged");
+    this.updateMousePathDiagnostics();
+  }
+
+  /** Resolve the effective mouse input path for this session. */
+  private resolveEffectiveMousePath(): StreamDiagnostics["mousePath"] {
+    if (this.nativeStreamerInputOwned) return "sink-native";
+    if (this.nativeMouseGrabbed) return "addon";
+    if (document.pointerLockElement !== null) return "pointer-lock";
+    return "none";
+  }
+
+  /** Persist and log the effective mouse path when it changes, so the active
+   *  capture route (sink-native vs addon vs pointer-lock) is confirmable per
+   *  session from the log and the HUD. */
+  private updateMousePathDiagnostics(): void {
+    const path = this.resolveEffectiveMousePath();
+    this.diagnostics.mousePath = path;
+    if (path === this.lastLoggedMousePath) return;
+    this.lastLoggedMousePath = path;
+    const detail: Record<string, string> = {
+      "sink-native": "RawInput captured in-process on the sink window (1:1, no bridge)",
+      addon: "native raw-mouse addon over IPC → stdin bridge",
+      "pointer-lock": "DOM pointer lock fallback (renderer → stdin bridge)",
+      internal: "internal child-window RawInput (1:1, no bridge)",
+      external: "external sink window RawInput (1:1, no bridge)",
+      none: "no mouse capture active",
+    };
+    this.log(`Mouse path: ${path} — ${detail[path] ?? ""}`);
+  }
+
   /**
    * Rewrite the NVST video bitrate attributes in a local SDP string.
    * GFN negotiates bitrate via `a=video.initialBitrateKbps`,
@@ -979,6 +1041,10 @@ export class GfnWebRtcClient {
       mousePacketsPerSecond: mouseDiagnostics.packetsPerSecond,
       mouseResidualMagnitude: 0,
       mouseAdaptiveFlushActive: mouseDiagnostics.adaptiveFlushActive,
+      mousePath: "none",
+      mouseHopLatencyMs: mouseDiagnostics.hopLatencyMs,
+      nativeInputPath: undefined,
+      nativeMouseDeltaLatencyUs: undefined,
       lagReason: "unknown",
       lagReasonDetail: "Waiting for stream stats",
       gpuType: this.gpuType,
@@ -1007,6 +1073,7 @@ export class GfnWebRtcClient {
     this.inputReady = false;
     this.nativeInputActive = false;
     this.nativeElectronInputBridge = false;
+    this.nativeStreamerInputOwned = false;
     this.inputProtocolVersion = 2;
     this.inputEncoder.setProtocolVersion(2);
     this.diagnostics.inputReady = false;
@@ -1381,6 +1448,7 @@ export class GfnWebRtcClient {
     this.diagnostics.mouseFlushIntervalMs = mouseDiagnostics.flushIntervalMs;
     this.diagnostics.mousePacketsPerSecond = mouseDiagnostics.packetsPerSecond;
     this.diagnostics.mouseResidualMagnitude = mouseDiagnostics.residualMagnitude;
+    this.diagnostics.mouseHopLatencyMs = mouseDiagnostics.hopLatencyMs;
 
     // Intentional adaptive coalesce: only when mouse moves ride the reliable
     // channel (PR mouse keeps the fixed 4/8/16 ms official interval). Skip while
@@ -1746,14 +1814,30 @@ export class GfnWebRtcClient {
     }
   }
 
-  /** Enter stream input capture. Uses the official GFN approach: DOM pointer
-   *  lock + FORCED fullscreen so navigator.keyboard.lock(["Escape",...]) engages.
-   *  That is what makes an Escape tap reach the game without releasing the mouse,
-   *  and lets a long Escape hold exit fullscreen (handled in the main process). */
+  /** Enter stream input capture.
+   *
+   *  Preferred path (GFN desktop-app parity): the native raw-mouse addon grabs
+   *  Windows RawInput, so deltas are exact HID counts — 1:1 with the physical
+   *  mouse, no OS acceleration and no DPI/CSS-pixel scaling — while the addon
+   *  confines and hides the OS cursor. Falls back to the official GFN-web
+   *  approach (DOM pointer lock with unadjustedMovement + FORCED fullscreen so
+   *  keyboard.lock engages for Escape) when the addon is unavailable.
+   */
   private async enableNativeMouseOrFallback(): Promise<void> {
-    // NOTE: the native raw-mouse addon path is intentionally disabled — it does
-    // not reliably hold the cursor and conflicts with DOM pointer lock. The
-    // GFN-parity DOM+fullscreen path below is the single source of truth.
+    // Only the Electron input bridge path (stacked / internal / Linux) needs
+    // renderer-side raw capture; in external-window mode the native streamer
+    // owns input through its own RawInput on the sink window.
+    if (this.nativeElectronInputBridge && (await this.tryGrabNativeMouse())) {
+      return;
+    }
+    if (this.nativeStreamerInputOwned) {
+      // The native streamer captured input on its sink window (stacked mode);
+      // DOM pointer lock would double-send the same movement. Cursor
+      // hiding/confining stays with the addon grab above, or the shell's
+      // cursor:none while native capture is active.
+      this.log("Native streamer owns input capture; skipping DOM pointer lock");
+      return;
+    }
     this.domInputController.setNativeMouseActive(false);
     // Automatically trigger pointer lock right away upon input handshake ready,
     // achieving 100% GFN parity (no click needed to capture mouse).
@@ -1762,12 +1846,39 @@ export class GfnWebRtcClient {
     });
   }
 
+  /** Try to capture the mouse through the native RawInput addon. Returns true
+   *  when capture is active (the DOM mouse handlers stand down automatically
+   *  because native mode has no pointer lock). */
+  private async tryGrabNativeMouse(): Promise<boolean> {
+    if (this.nativeMouseGrabbed) {
+      return true;
+    }
+    try {
+      const grabbed = await window.openNow.grabNativeMouse();
+      if (!grabbed) {
+        this.log("Native raw-mouse addon unavailable; falling back to DOM pointer lock");
+        this.updateMousePathDiagnostics();
+        return false;
+      }
+      this.nativeMouseGrabbed = true;
+      this.domInputController.setNativeMouseActive(true);
+      this.log("Native RawInput mouse capture active (1:1 raw deltas)");
+      this.updateMousePathDiagnostics();
+      return true;
+    } catch (err) {
+      this.log(`Native raw-mouse grab failed (${String(err)}); falling back to DOM pointer lock`);
+      this.updateMousePathDiagnostics();
+      return false;
+    }
+  }
+
   /** Release native raw-mouse capture (used when an overlay/exit prompt opens
    *  and when the session tears down). Safe to call when not grabbed. */
   private releaseNativeMouse(): void {
     if (!this.nativeMouseGrabbed) return;
     this.nativeMouseGrabbed = false;
     this.domInputController.setNativeMouseActive(false);
+    this.updateMousePathDiagnostics();
     try {
       void window.openNow.releaseNativeMouse();
     } catch {
@@ -2718,6 +2829,7 @@ export class GfnWebRtcClient {
     this.externalEscapeCleanup = null;
     this.nativeMouseEventCleanup?.();
     this.nativeMouseEventCleanup = null;
+    document.removeEventListener("pointerlockchange", this.handlePointerLockChange);
 
     // Cleanup microphone
     if (this.micManager) {

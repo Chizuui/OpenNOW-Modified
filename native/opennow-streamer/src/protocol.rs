@@ -31,6 +31,13 @@ pub struct CommandEnvelope {
     pub reason: Option<String>,
     #[serde(default)]
     pub shortcuts: Option<NativeStreamerShortcutBindings>,
+    #[serde(default)]
+    pub microphone_enabled: Option<bool>,
+    /// For `stop-recording`: true finalizes the recording (flush encoder/muxer
+    /// with EOS and emit a `recording-finished` event), false aborts it (close
+    /// the capture valve without finalizing).
+    #[serde(default)]
+    pub finalize: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,9 +125,45 @@ pub struct StreamSettings {
     #[serde(default)]
     #[allow(dead_code)]
     pub enable_cloud_gsync: bool,
+    /// User-configured fallback codec (settings > stream). Honored when the
+    /// requested codec is missing from the server offer or cannot be decoded,
+    /// before the final H264 safety net.
+    #[serde(default)]
+    pub fallback_codec: Option<VideoCodec>,
     #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
     #[serde(default)]
     pub native_transition_diagnostics: Option<NativeTransitionDiagnosticsSettings>,
+    /// Mouse sensitivity multiplier (1.0 = default). Mirrors the renderer's
+    /// `mouseSensitivity` setting so the sink-native RawInput capture feels
+    /// identical to the addon / DOM pointer-lock path (which scales in the
+    /// renderer) instead of sending unscaled HID counts.
+    #[serde(default = "default_mouse_sensitivity")]
+    pub mouse_sensitivity: f64,
+    /// Software mouse acceleration strength (1-150, 1 = off). Same formula as
+    /// the renderer's `mouseAcceleration` setting.
+    #[serde(default = "default_mouse_acceleration_percent")]
+    pub mouse_acceleration_percent: f64,
+    /// Opt-in stacked sink-native RawInput capture (settings > native
+    /// streamer). Default OFF: input rides the Electron bridge (addon mouse +
+    /// DOM keyboard) like the web path; the experimental sink bypass must be
+    /// explicitly enabled.
+    #[serde(default)]
+    pub native_sink_input_capture: bool,
+    /// Native microphone capture: when true, the GStreamer pipeline captures
+    /// the default WASAPI input device, encodes it (Opus), and negotiates the
+    /// offer's mic m-line (mid 3) as sendonly so mic audio reaches the server.
+    /// The renderer's WebRTC client has no peer connection in native mode, so
+    /// without this the mic is captured and silently discarded.
+    #[serde(default)]
+    pub microphone_enabled: bool,
+}
+
+fn default_mouse_sensitivity() -> f64 {
+    1.0
+}
+
+fn default_mouse_acceleration_percent() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -502,6 +545,16 @@ pub struct VideoTransitionEvent {
     pub summary: String,
 }
 
+/// PNG frame captured from the native video chain (pre-sink), serialized as
+/// base64 so it can ride the same stdout JSON protocol as every other event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeScreenshotEvent {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeStatsEvent {
@@ -517,6 +570,33 @@ pub struct NativeStatsEvent {
     pub bitrate_performance_percent: f64,
     pub decoded_fps: f64,
     pub render_fps: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_fps: Option<u32>,
+    /// Server-reported network round-trip time (ms) from the stats_channel
+    /// (the server's own LSR/DLSR measurement of OUR receiver reports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_rtt_ms: Option<u32>,
+    /// Locally computed RTCP round-trip time (ms) from Receiver Reports the
+    /// server sends about our outgoing RTP (rtpsession's LSR/DLSR
+    /// `rb-round-trip`). None for a receiver-only pipeline — the server only
+    /// sends RRs for streams it receives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_rtcp_rtt_ms: Option<u32>,
+    /// Server-reported packet loss (percent) from the stats_channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_packet_loss_percent: Option<f64>,
+    /// Server-reported session bitrate (kbps) derived from the stats_channel
+    /// counter deltas; None until enough consistent samples confirm the
+    /// counter is cumulative bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_bitrate_kbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_time_ms: Option<u32>,
+    /// Active input capture path: sink-native / internal / external / bridge / none.
+    pub input_path: String,
+    /// Measured in-process mouse delta latency (capture → data channel send) in µs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_delta_latency_us: Option<u64>,
     pub frames_decoded: u64,
     pub frames_rendered: u64,
     pub frames_pending_to_present: u64,
@@ -572,15 +652,33 @@ pub enum Event {
     #[serde(rename = "clipboard-paste")]
     ClipboardPaste,
     #[serde(rename = "input-capture-changed")]
-    InputCaptureChanged {
-        captured: bool,
-    },
+    InputCaptureChanged { captured: bool },
     #[serde(rename = "video-stall")]
     VideoStall(VideoStallEvent),
     #[serde(rename = "video-transition")]
     VideoTransition { transition: VideoTransitionEvent },
     #[serde(rename = "stats")]
     Stats { stats: NativeStatsEvent },
+    #[serde(rename = "screenshot")]
+    Screenshot { screenshot: NativeScreenshotEvent },
+    /// One chunk of the active native recording (base64 bytes). Chunks are
+    /// emitted in file order and must be appended to the recording file in
+    /// arrival order.
+    #[serde(rename = "recording-chunk")]
+    RecordingChunk {
+        #[serde(rename = "chunkBase64")]
+        chunk_base64: String,
+    },
+    /// Emitted (via the event channel, so strictly after every chunk of the
+    /// finalized recording) once the recording branch has flushed with EOS.
+    /// The Electron main process waits for this before finalizing the file.
+    /// `thumbnail_base64` is a JPEG of the first encoded recording frame
+    /// (base64, no data URL prefix); `None` when no frame was captured.
+    #[serde(rename = "recording-finished")]
+    RecordingFinished {
+        #[serde(rename = "thumbnailBase64", skip_serializing_if = "Option::is_none")]
+        thumbnail_base64: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { code: String, message: String },
 }
@@ -703,6 +801,52 @@ mod tests {
     }
 
     #[test]
+    fn recording_and_screenshot_events_serialize_with_camel_case_fields() {
+        let screenshot = Event::Screenshot {
+            screenshot: NativeScreenshotEvent {
+                png_base64: "aGVsbG8=".to_owned(),
+                width: 1920,
+                height: 1080,
+            },
+        };
+        let value = serde_json::to_value(screenshot).expect("serializes");
+        assert_eq!(value["type"], "screenshot");
+        assert_eq!(value["screenshot"]["pngBase64"], "aGVsbG8=");
+        assert_eq!(value["screenshot"]["width"], 1920);
+
+        let chunk = Event::RecordingChunk {
+            chunk_base64: "Y2h1bms=".to_owned(),
+        };
+        let value = serde_json::to_value(chunk).expect("serializes");
+        assert_eq!(value["type"], "recording-chunk");
+        assert_eq!(value["chunkBase64"], "Y2h1bms=");
+
+        let finished = serde_json::to_value(Event::RecordingFinished {
+            thumbnail_base64: Some("L3RodW1ibmFpbA==".to_owned()),
+        })
+        .expect("serializes");
+        assert_eq!(finished["type"], "recording-finished");
+        assert_eq!(finished["thumbnailBase64"], "L3RodW1ibmFpbA==");
+
+        let finished_none = serde_json::to_value(Event::RecordingFinished {
+            thumbnail_base64: None,
+        })
+        .expect("serializes");
+        assert!(finished_none.get("thumbnailBase64").is_none());
+    }
+
+    #[test]
+    fn stop_recording_command_parses_finalize_field() {
+        let value = serde_json::json!({
+            "id": "rec-1",
+            "type": "stop-recording",
+            "finalize": true
+        });
+        let command: CommandEnvelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(command.finalize, Some(true));
+    }
+
+    #[test]
     fn nvst_video_session_deserializes_camel_case() {
         let value = serde_json::json!({
             "session": {
@@ -728,8 +872,7 @@ mod tests {
                 "codec": "H265"
             }
         });
-        let ctx: NativeStreamerSessionContext =
-            serde_json::from_value(value).expect("deserialize");
+        let ctx: NativeStreamerSessionContext = serde_json::from_value(value).expect("deserialize");
         let nvst = ctx.nvst_video.expect("nvstVideo present");
         assert_eq!(nvst.client_udp_port, 49005);
         assert_eq!(nvst.video_peer_port, 5004);

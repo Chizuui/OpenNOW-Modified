@@ -65,6 +65,32 @@ export interface StreamDiagnostics {
   mousePacketsPerSecond: number;
   mouseResidualMagnitude: number;
   mouseAdaptiveFlushActive: boolean;
+  /**
+   * Effective mouse input path this session: sink-native (native streamer
+   * captures RawInput on the stacked sink window, in-process), addon (native
+   * raw-mouse addon → IPC → stdin), pointer-lock (DOM fallback), or none.
+   */
+  mousePath: "sink-native" | "addon" | "pointer-lock" | "internal" | "external" | "none";
+  /** Renderer-side event→send hop latency (EMA) for the addon / pointer-lock paths. */
+  mouseHopLatencyMs?: number;
+  /** Active capture path reported by the native streamer (stats event). */
+  nativeInputPath?: string;
+  /** Native-measured in-process mouse delta latency (EMA, µs) for sink-native capture. */
+  nativeMouseDeltaLatencyUs?: number;
+  /**
+   * Server-reported session bitrate (kbps) from the stats_channel counter
+   * (confidence-gated in the native streamer — only present once the counter
+   * is verified to be cumulative bytes).
+   */
+  nativeServerBitrateKbps?: number;
+  /**
+   * Server-reported packet loss (percent, 0..100) from the stats_channel,
+   * kept separate from the receiver-computed `packetLossPercent` so the
+   * native HUD banner can key off the server's own (cleaner) measurement —
+   * same value the native merge also mirrors into `packetLossPercent` for the
+   * loss row display.
+   */
+  nativePacketLossPercent?: number;
 
   lagReason: StreamLagReason;
   lagReasonDetail: string;

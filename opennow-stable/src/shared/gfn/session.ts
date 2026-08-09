@@ -2,6 +2,7 @@ import type { CloudGsyncResolution } from "../cloudGsync";
 import type {
   AppLaunchMode,
   ColorQuality,
+  FallbackCodecPreference,
   NativeTransitionDiagnostics,
   StreamClientMode,
   StreamingFeatures,
@@ -41,10 +42,20 @@ export interface StreamSettings {
   nativeCloudGsyncMode?: NativeStreamerFeatureMode;
   /** User's raw Cloud G-Sync preference before main-process capability resolution. */
   requestedCloudGsync?: boolean;
+  /** User-configured fallback codec (settings > stream); "auto" is omitted. */
+  fallbackCodec?: FallbackCodecPreference;
   /** Diagnostics from the main-process Cloud G-Sync resolver. */
   cloudGsyncResolution?: CloudGsyncResolution;
   /** Hidden diagnostics for native transition recovery and 240 FPS server-side stream changes. */
   nativeTransitionDiagnostics?: NativeTransitionDiagnostics;
+  /** Opt-in stacked sink-native RawInput capture (mouse + keyboard bypass the Electron bridge). */
+  nativeSinkInputCapture?: boolean;
+  /**
+   * Native microphone capture (WASAPI → Opus over the negotiated mic m-line).
+   * The renderer WebRTC client has no peer connection in native mode, so the
+   * native streamer must capture and send the mic itself.
+   */
+  microphoneEnabled?: boolean;
   /** Requested session app launch mode; "gamepadFriendly" asks NVIDIA to launch games big-picture style. */
   appLaunchMode?: AppLaunchMode;
 }

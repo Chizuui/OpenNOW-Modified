@@ -171,6 +171,8 @@ export interface OpenNowApi {
 
   /** Update the native streamer receive bitrate limit mid-session (Kbps) */
   updateNativeBitrateLimit(maxBitrateKbps: number): void;
+  /** Mute/unmute the native streamer microphone (WASAPI send path) mid-session. */
+  setNativeMicrophoneEnabled(enabled: boolean): void;
   requestKeyframe(input: KeyframeRequest): Promise<void>;
   onSignalingEvent(listener: (event: MainToRendererSignalingEvent) => void): () => void;
   /** Listen for F11 fullscreen toggle from main process */
@@ -191,6 +193,8 @@ export interface OpenNowApi {
   toggleMaximizeWindow(): Promise<boolean>;
   /** Get the current maximized state of the main window */
   getMaximizeWindowState(): Promise<boolean>;
+  /** After a stream session ends, exit fullscreen and any stale maximized state */
+  restoreWindowAfterSession(): Promise<void>;
   /** Close the main window */
   closeWindow(): void;
   /** Subscribe to maximize/restore changes from the main process */
@@ -215,6 +219,29 @@ export interface OpenNowApi {
 
   /** Persist a PNG screenshot from a renderer-generated data URL */
   saveScreenshot(input: ScreenshotSaveRequest): Promise<ScreenshotEntry>;
+
+  /**
+   * Capture a screenshot from the native streamer's video chain (last
+   * presented frame, PNG) and persist it to the gallery. Only valid while a
+   * native streamer session is active.
+   */
+  captureNativeScreenshot(input: { gameTitle: string }): Promise<ScreenshotEntry>;
+
+  /**
+   * Start a native streamer recording (H.264 fragmented MP4). Chunks are
+   * streamed to the main process, which appends them to the recording file
+   * created by `beginRecording`.
+   */
+  startNativeRecording(recordingId: string): Promise<void>;
+
+  /**
+   * Finalize the native recording; resolves after every chunk was written.
+   * Returns the base64 JPEG thumbnail of the first encoded frame, if any.
+   */
+  stopNativeRecording(): Promise<string | undefined>;
+
+  /** Abort the native recording without finalizing the file. */
+  abortNativeRecording(): Promise<void>;
 
   /** List recent screenshots from the persistent screenshot directory */
   listScreenshots(): Promise<ScreenshotEntry[]>;
@@ -305,11 +332,17 @@ export interface OpenNowApi {
   /** Subscribe to automatic release-highlights show events from main process */
   onReleaseHighlightsShow(listener: (payload: ReleaseHighlightsPayload) => void): () => void;
 
-  /** Clear the GStreamer plugin registry cache (forces re-scan on next stream) */
-  clearGStreamerCache(): Promise<{ cleared: boolean; path: string }>;
+  /** Clear the GStreamer plugin registry cache (rebuilds in the background) */
+  clearGStreamerCache(): Promise<{ cleared: boolean; path: string; rebuilding: boolean }>;
 
-  /** Get current GStreamer registry scan status */
-  getGStreamerScanStatus(): Promise<{ registryExists: boolean; registryPath: string }>;
+  /** Get current GStreamer registry scan status (cache presence + live scan state) */
+  getGStreamerScanStatus(): Promise<{
+    registryExists: boolean;
+    registryPath: string;
+    scanInProgress: boolean;
+    lastStatus: string | null;
+    lastReason: string | null;
+  }>;
 
   /** Subscribe to GStreamer plugin scan status events from the main process */
   onGStreamerScanStatus(listener: (payload: { status: string; reason: string }) => void): () => void;

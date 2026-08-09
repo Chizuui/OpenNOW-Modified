@@ -33,6 +33,18 @@ export const RTT_SPIKE_MULTIPLIER = 2;
 export const PACKET_LOSS_BANNER_PERCENT = 0.15;
 
 /**
+ * Packet loss (%) above which the NATIVE HUD banner appears, driven by the
+ * server-reported stats_channel field. The server's own measurement is a
+ * cleaner send-side signal than the receiver-computed WebRTC getStats loss
+ * (no duplicate/RTX/NACK-counting noise), so the native threshold is lower
+ * than the web one. Healthy native sessions sit at ~0.02-0.05%; 0.1% is
+ * 2-5× that floor and still far below anything concerning, so it fires only
+ * on real degradation instead of never firing like the 0.15% web threshold
+ * would for the server's cleaner numbers.
+ */
+export const NATIVE_PACKET_LOSS_BANNER_PERCENT = 0.1;
+
+/**
  * True when the current RTT jumped sharply versus the previous sample — a
  * sudden "ping tinggi banget tiba-tiba" event, as opposed to a gradual rise.
  * Mirrors the log-based spike detector in GfnWebRtcClient.collectStats so the

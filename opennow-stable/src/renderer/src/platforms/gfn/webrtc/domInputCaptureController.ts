@@ -26,6 +26,8 @@ interface DomInputCaptureDependencies {
   isInputBlocked: () => boolean;
   isNativeInputActive: () => boolean;
   isNativeElectronInputBridge: () => boolean;
+  /** True while the native streamer owns OS RawInput capture (stacked sink). */
+  isNativeStreamerInputOwned: () => boolean;
   shouldAutoFullscreen: () => boolean;
   getCurrentResolution: () => string;
   getKeyboardLayout: () => KeyboardLayout | undefined;
@@ -47,6 +49,8 @@ export interface MouseInputDiagnostics {
   packetsPerSecond: number;
   residualMagnitude: number;
   adaptiveFlushActive: boolean;
+  /** EMA of the renderer-side event→send hop (ms) for addon / pointer-lock paths. */
+  hopLatencyMs: number;
 }
 
 const MOUSE_FLUSH_FAST_MS = 0;
@@ -105,6 +109,13 @@ export class DomInputCaptureController {
   private nativeMouseActive = false;
   private queueNativeMouseMovement: (dx: number, dy: number) => void = () => {};
   private scheduleNativeMouseFlush: () => void = () => {};
+  // Renderer-side hop latency diagnostic: time from a mouse event arriving in
+  // this controller (addon delta or DOM pointer move) to the packet leaving on
+  // the data channel. On the sink-native path this stays 0 — the mouse never
+  // passes through the renderer.
+  private mouseHopLatencyMs = 0;
+  private mouseHopSamples = 0;
+  private lastMouseEventArrivalMs: number | null = null;
 
   constructor(
     private readonly dependencies: DomInputCaptureDependencies,
@@ -204,10 +215,19 @@ export class DomInputCaptureController {
       packetsPerSecond: this.mousePacketsPerSecond,
       residualMagnitude: Math.hypot(this.pendingMouseDxFloat, this.pendingMouseDyFloat),
       adaptiveFlushActive: this.mouseAdaptiveFlushActive,
+      hopLatencyMs: Math.round(this.mouseHopLatencyMs * 100) / 100,
     };
   }
 
   setAdaptiveFlushInterval(intervalMs: number, active: boolean): void {
+    // Native RawInput mouse is a high-rate, low-jitter source — batching it
+    // (adaptive back-off can raise the interval to 8-20ms under reliable
+    // channel pressure) adds nothing but latency. Pin it to immediate flush.
+    if (this.nativeMouseActive) {
+      this.mouseFlushIntervalMs = 0;
+      this.mouseAdaptiveFlushActive = false;
+      return;
+    }
     this.mouseFlushIntervalMs = intervalMs;
     this.mouseAdaptiveFlushActive = active;
   }
@@ -326,6 +346,10 @@ export class DomInputCaptureController {
 
   async attemptAutoPointerLock(ensureFullscreen = true): Promise<void> {
     if (this.autoPointerLockInProgress) return;
+    // Native RawInput capture is active: the addon owns the cursor (confines +
+    // hides it) and feeding raw deltas directly. Requesting DOM pointer lock on
+    // top would fight the addon's ClipCursor — never auto-lock in native mode.
+    if (this.isNativeMouseActive()) return;
     this.autoPointerLockInProgress = true;
     try {
       const target = this.pointerLockTarget ?? this.dependencies.videoElement;
@@ -444,7 +468,12 @@ export class DomInputCaptureController {
    *  movement/buttons/wheel arrive via injectNativeMouseEvent(). */
   setNativeMouseActive(active: boolean): void {
     this.nativeMouseActive = active;
-    if (!active) {
+    if (active) {
+      // Raw deltas must reach the encoder on the next task turn, never wait on
+      // a coalesce window — 1:1 latency like the official GFN app.
+      this.mouseFlushIntervalMs = 0;
+      this.mouseAdaptiveFlushActive = false;
+    } else {
       this.flushPendingMovement();
     }
   }
@@ -455,9 +484,10 @@ export class DomInputCaptureController {
 
   /** Feed one raw mouse event from the native addon into the encode pipeline. */
   injectNativeMouseEvent(ev: { kind: number; dx: number; dy: number; button: number; state: number; wheel: number }): void {
-    if (!this.nativeMouseActive || !this.dependencies.isInputReady()) {
+    if (!this.nativeMouseActive || !this.dependencies.isInputReady() || this.dependencies.isInputBlocked()) {
       return;
     }
+    this.lastMouseEventArrivalMs = performance.now();
     if (ev.kind === 0) {
       // Relative move.
       if (ev.dx !== 0 || ev.dy !== 0) {
@@ -748,6 +778,16 @@ export class DomInputCaptureController {
       this.mouseCoalescedBatchEntries = 0;
       this.mouseFlushLastSendMs = tickNow;
       updateMousePacketRate();
+      // Hop latency diagnostic: event arrival → packet on the wire. EMA over
+      // samples so a single scheduling hiccup doesn't skew the shown value.
+      if (this.lastMouseEventArrivalMs !== null) {
+        const hopMs = Math.max(0, tickNow - this.lastMouseEventArrivalMs);
+        this.lastMouseEventArrivalMs = null;
+        this.mouseHopLatencyMs = this.mouseHopSamples === 0
+          ? hopMs
+          : this.mouseHopLatencyMs * 0.9 + hopMs * 0.1;
+        this.mouseHopSamples += 1;
+      }
       return true;
     };
 
@@ -858,7 +898,7 @@ export class DomInputCaptureController {
         return;
       }
 
-      if (autoLockPending || isPointerLockActive() || !mouseInStreamView || !this.dependencies.isInputReady()) {
+      if (autoLockPending || isPointerLockActive() || this.isNativeMouseActive() || !mouseInStreamView || !this.dependencies.isInputReady()) {
         return;
       }
       autoLockPending = true;
@@ -946,6 +986,7 @@ export class DomInputCaptureController {
       if (!this.dependencies.isInputReady() || !isPointerLockActive()) {
         return;
       }
+      this.lastMouseEventArrivalMs = performance.now();
 
       if (!this.mouseDeltaFilter.update(dx, dy, eventTimestampMs)) {
         return;
@@ -1082,13 +1123,22 @@ export class DomInputCaptureController {
         return;
       }
 
-      this.syncLockKeysState(event);
-
       const isEscapeEvent =
         event.key === "Escape"
         || event.key === "Esc"
         || event.code === "Escape"
         || event.keyCode === 27;
+
+      // The native streamer owns OS RawInput keyboard capture on the stacked
+      // sink: keys flow from the streamer, so forwarding them again here would
+      // double-input the game. Escape is the exception — the streamer skips it
+      // and Electron keeps intercepting + forwarding exactly one tap.
+      if (this.dependencies.isNativeStreamerInputOwned() && !isEscapeEvent) {
+        return;
+      }
+
+      this.syncLockKeysState(event);
+
       const mapped = mapKeyboardEvent(event, this.dependencies.getKeyboardLayout()) ?? (isEscapeEvent ? codeMap.Escape : null);
 
       // Keep browser from handling held keys (for example Tab focus traversal)
@@ -1133,13 +1183,19 @@ export class DomInputCaptureController {
         return;
       }
 
-      this.syncLockKeysState(event);
-
       const isEscapeEvent =
         event.key === "Escape"
         || event.key === "Esc"
         || event.code === "Escape"
         || event.keyCode === 27;
+
+      // Same gate as onKeyDown: native streamer owns keys except Escape.
+      if (this.dependencies.isNativeStreamerInputOwned() && !isEscapeEvent) {
+        return;
+      }
+
+      this.syncLockKeysState(event);
+
       const isCapsLockToggle = event.code === "CapsLock";
       const mapped = mapKeyboardEvent(event, this.dependencies.getKeyboardLayout()) ?? (isEscapeEvent ? codeMap.Escape : null);
       if (!mapped && !isCapsLockToggle) {
@@ -1420,7 +1476,11 @@ export class DomInputCaptureController {
       // Pause forwarding while window is not focused (host overlay pause is separate).
       // In native mode the renderer sink can be a separate no-activate window,
       // so a focus transition is not enough reason to stop controller polling.
-      if (!this.dependencies.isNativeInputActive()) {
+      // Native RawInput capture (this.isNativeMouseActive()) is an exception:
+      // RIDEV_INPUTSINK keeps delivering events even while unfocused, so without
+      // pausing here the game would receive mouse movement while the user
+      // alt-tabs away.
+      if (!this.dependencies.isNativeInputActive() || this.isNativeMouseActive()) {
         this.dependencies.setWindowInputPaused(true);
       }
     };

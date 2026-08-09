@@ -26,6 +26,12 @@ interface UseStreamRecorderOptions {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  /**
+   * Native streamer mode: the renderer's <video> element has no frames, so
+   * recording happens in the native pipeline (H.264 fragmented MP4) and its
+   * chunks are streamed to the main process instead of MediaRecorder.
+   */
+  nativeRecordingEnabled: boolean;
 }
 
 export function useStreamRecorder({
@@ -36,6 +42,7 @@ export function useStreamRecorder({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  nativeRecordingEnabled,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [recordings, setRecordings] = useState<RecordingEntry[]>([]);
@@ -68,7 +75,10 @@ export function useStreamRecorder({
     typeof window.openNow?.finishRecording === "function" &&
     typeof window.openNow?.abortRecording === "function" &&
     typeof window.openNow?.listRecordings === "function" &&
-    typeof window.openNow?.deleteRecording === "function";
+    typeof window.openNow?.deleteRecording === "function" &&
+    typeof window.openNow?.startNativeRecording === "function" &&
+    typeof window.openNow?.stopNativeRecording === "function" &&
+    typeof window.openNow?.abortNativeRecording === "function";
 
   const refreshRecordings = useCallback(async () => {
     setRecordingError(null);
@@ -104,12 +114,74 @@ export function useStreamRecorder({
     setRecordingError(null);
 
     if (isRecording) {
+      if (nativeRecordingEnabled) {
+        // Native: finalize the encoder (flush remaining chunks), then save via
+        // the same recording API. isRecording flips first so a second click
+        // during finalization cannot re-enter.
+        setIsRecording(false);
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = undefined;
+        const id = recordingIdRef.current;
+        recordingIdRef.current = null;
+        let thumbnailBase64: string | undefined;
+        try {
+          thumbnailBase64 = await window.openNow.stopNativeRecording();
+        } catch (error) {
+          console.error("[StreamView] Failed to finalize native recording:", error);
+          setRecordingError("Recording could not be saved.");
+          if (id) {
+            window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
+          }
+          return;
+        }
+        if (!id) return;
+        const durationMs = Date.now() - recordingStartTimeRef.current;
+        try {
+          const entry = await window.openNow.finishRecording({
+            recordingId: id,
+            durationMs,
+            gameTitle,
+            // Thumbnail from the native streamer's first encoded frame (JPEG).
+            thumbnailDataUrl: thumbnailBase64
+              ? `data:image/jpeg;base64,${thumbnailBase64}`
+              : undefined,
+          });
+          setRecordings((prev) => [entry, ...prev].slice(0, 20));
+        } catch (error) {
+          console.error("[StreamView] Failed to finish native recording:", error);
+          setRecordingError("Recording could not be saved.");
+        }
+        return;
+      }
       mediaRecorderRef.current?.stop();
       return;
     }
 
     if (!recordingApiAvailable) {
       setRecordingError("Recording API unavailable. Restart OpenNOW to enable recording.");
+      return;
+    }
+
+    if (nativeRecordingEnabled) {
+      // No <video> frames in native mode — the native streamer encodes the
+      // grabbed frames itself and streams the chunks back.
+      let recordingId: string;
+      try {
+        const result = await window.openNow.beginRecording({ mimeType: "video/mp4" });
+        recordingId = result.recordingId;
+        await window.openNow.startNativeRecording(recordingId);
+      } catch (error) {
+        console.error("[StreamView] Failed to start native recording:", error);
+        setRecordingError("Could not start recording.");
+        return;
+      }
+      recordingIdRef.current = recordingId;
+      recordingStartTimeRef.current = Date.now();
+      setRecordingDurationMs(0);
+      setIsRecording(true);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
+      }, 500);
       return;
     }
 
@@ -330,6 +402,7 @@ export function useStreamRecorder({
     gameTitle,
     isRecording,
     micTrack,
+    nativeRecordingEnabled,
     recordingApiAvailable,
     recordingBitrateMbps,
     recordingFps,
@@ -352,13 +425,16 @@ export function useStreamRecorder({
         recorder.stop();
       }
       if (id) {
+        if (nativeRecordingEnabled) {
+          window.openNow.abortNativeRecording().catch(() => undefined);
+        }
         window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
         recordingIdRef.current = null;
       }
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
     };
-  }, []);
+  }, [nativeRecordingEnabled]);
 
   return {
     isRecording,

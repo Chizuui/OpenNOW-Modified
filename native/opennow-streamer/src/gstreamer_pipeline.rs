@@ -1,8 +1,8 @@
 use crate::gstreamer_backend::send_log;
 use crate::gstreamer_config::{
-    automatic_present_max_fps, requested_video_backend, use_external_renderer_window,
-    av1_decoder_preference, h265_decoder_preference, use_internal_renderer, use_stacked_renderer,
-    vrr_present_max_fps, zero_copy_requested, CodecDecoderPreference,
+    automatic_present_max_fps, av1_decoder_preference, h265_decoder_preference,
+    requested_video_backend, use_external_renderer_window, use_internal_renderer,
+    use_stacked_renderer, vrr_present_max_fps, zero_copy_requested, CodecDecoderPreference,
     EXTERNAL_RENDERER_ENV, NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV,
     NATIVE_VIDEO_API_ENV, NATIVE_VIDEO_BACKEND_ENV, PRESENT_LIMITER_AUTO_SENTINEL,
     PRESENT_LIMITER_VRR_SENTINEL,
@@ -18,23 +18,24 @@ use crate::gstreamer_liveness::{
     watch_rtp_video_bitrate, watch_video_caps_transitions, watch_video_decoded_rate,
     watch_video_sink_caps_transitions, watch_video_sink_rate, VideoLivenessMonitor,
 };
-use crate::gstreamer_platform::{
-    apply_stacked_renderer_surface, primary_display_refresh_hz, release_native_input_capture,
-    start_external_renderer_window_guard, start_stacked_renderer_window_guard,
-    stop_stacked_renderer_window_guard, update_external_renderer_surface,
-};
 #[cfg(target_os = "windows")]
 use crate::gstreamer_platform::arm_internal_child_input;
+use crate::gstreamer_platform::{
+    apply_stacked_renderer_surface, arm_stacked_sink_input_capture, primary_display_refresh_hz,
+    release_native_input_capture, start_external_renderer_window_guard,
+    start_stacked_renderer_window_guard, stop_stacked_renderer_window_guard,
+    update_external_renderer_surface,
+};
 use crate::gstreamer_transitions::DEFAULT_VIDEO_QUEUE_DEPTH;
 use crate::internal_renderer::InternalRenderer;
-use crate::nvst_video::{
-    annexb_appsrc_caps, spawn_nvst_udp_receive, NvstVideoReceiveHandle,
-};
+use crate::nvst_video::{annexb_appsrc_caps, spawn_nvst_udp_receive, NvstVideoReceiveHandle};
 use crate::protocol::{
-    Event, IceCandidatePayload, IceServer, NativeRenderSurface, NativeStreamerSessionContext,
-    NativeVideoBackendCapability, NativeVideoCodecCapability, NvstVideoSession,
+    Event, IceCandidatePayload, IceServer, NativeRenderSurface, NativeScreenshotEvent,
+    NativeStreamerSessionContext, NativeVideoBackendCapability, NativeVideoCodecCapability,
+    NvstVideoSession,
 };
 use crate::sdp::IceCredentials;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
@@ -50,6 +51,14 @@ use std::thread;
 const WEBRTC_LATENCY_MS: u32 = 2;
 const DEFAULT_GFN_STUN_SERVER: &str = "stun://stun2.l.google.com:19302";
 const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 6;
+/// How long to wait for a fresh frame to arrive at the screenshot grab branch
+/// after opening its valve before giving up (the stream may be paused).
+const SCREENSHOT_CAPTURE_TIMEOUT_MS: u64 = 2_000;
+/// How long to wait for the recording encoder/muxer to flush after EOS before
+/// giving up on finalizing the recording.
+const RECORDING_FINALIZE_TIMEOUT_MS: u64 = 3_000;
+/// Default recording bitrate (kbps) for the native H.264 encoder.
+const RECORDING_BITRATE_KBPS: i32 = 8_000;
 pub(crate) const VIDEO_QUEUE_MAX_BUFFERS: u32 = DEFAULT_VIDEO_QUEUE_DEPTH;
 const AUDIO_QUEUE_MAX_BUFFERS: u32 = 2;
 
@@ -241,12 +250,8 @@ impl RtpVideoApi {
             (Self::Vulkan, "H265" | "HEVC") if cfg!(target_os = "windows") => {
                 &["d3d11h265dec", "nvh265dec"]
             }
-            (Self::Vulkan, "H264") if cfg!(target_os = "windows") => {
-                &["d3d11h264dec", "nvh264dec"]
-            }
-            (Self::Vulkan, "AV1") if cfg!(target_os = "windows") => {
-                &["d3d11av1dec", "nvav1dec"]
-            }
+            (Self::Vulkan, "H264") if cfg!(target_os = "windows") => &["d3d11h264dec", "nvh264dec"],
+            (Self::Vulkan, "AV1") if cfg!(target_os = "windows") => &["d3d11av1dec", "nvav1dec"],
             (Self::Software, "AV1") => &["dav1ddec", "av1dec"],
             _ => &[],
         }
@@ -257,9 +262,13 @@ impl RtpVideoApi {
             Self::VideoToolbox => &["osxvideosink", "autovideosink"],
             // Prefer X11-capable sinks first: Internal Linux embeds via GstVideoOverlay
             // into an X11 child. waylandsink cannot paint into that handle.
-            Self::Nvdec | Self::Vaapi | Self::V4L2 => {
-                &["ximagesink", "xvimagesink", "glimagesink", "waylandsink", "autovideosink"]
-            }
+            Self::Nvdec | Self::Vaapi | Self::V4L2 => &[
+                "ximagesink",
+                "xvimagesink",
+                "glimagesink",
+                "waylandsink",
+                "autovideosink",
+            ],
             Self::Software => &["ximagesink", "xvimagesink", "glimagesink", "waylandsink"],
             _ => &[],
         }
@@ -458,9 +467,280 @@ impl GstreamerRenderState {
 
     fn destroy_internal_renderer(&self) {
         self.internal_renderer.destroy();
-        self.internal_renderer_logged
-            .store(false, Ordering::SeqCst);
+        self.internal_renderer_logged.store(false, Ordering::SeqCst);
     }
+}
+
+/// The video-chain tap shared by screenshots and recording: the tee inserted
+/// between the last pre-sink element and the sink. Screenshots and recording
+/// open extra tee src pads on demand.
+#[derive(Debug, Clone)]
+pub(crate) struct GstreamerVideoTap {
+    pub(crate) tee: gst::Element,
+    pub(crate) video_api: RtpVideoApi,
+}
+
+/// Native recording branch: tee → valve → queue → (download) → videoconvert →
+/// capsfilter(I420) → x264enc → mp4mux (fragmented, streamable) → appsink.
+/// Muxer output buffers are captured by a pad probe and streamed to the
+/// Electron main process as `recording-chunk` events (base64), which are
+/// appended to the recording file in order. `stop(finalize=true)` sends EOS
+/// down the branch, waits for the flush, and the pipeline emits a
+/// `recording-finished` event strictly after the last chunk so the main
+/// process can close the file safely.
+#[derive(Debug, Clone)]
+pub(crate) struct GstreamerRecordingState {
+    /// Video branch valve (between the video tap tee and the encoder chain).
+    valve: gst::Element,
+    /// Mixer-output valve (None for video-only recordings without any audio
+    /// source). Gates the whole audio encode path.
+    audio_valve: Option<gst::Element>,
+    /// Thumbnail valve (between the I420 tee and the JPEG grabber): open only
+    /// while capturing the first frame, then closed again (idle ~0 cost).
+    thumb_valve: gst::Element,
+    /// Base64 JPEG of the first encoded recording frame; `None` until a frame
+    /// has been captured (or the recording had no frames).
+    thumbnail: Arc<Mutex<Option<String>>>,
+    appsink: gst::Element,
+    elements: Vec<gst::Element>,
+    tee: gst::Element,
+    /// Tap queues (game audio / mic) currently linked into the recording
+    /// mixer; unlinked on teardown so a rebuilt branch can relink them.
+    audio_taps: Vec<gst::Element>,
+    eos_seen: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    /// True after a finalized (EOS) recording: the branch must be rebuilt
+    /// before the next recording because the muxer does not accept new data
+    /// after EOS.
+    spent: Arc<AtomicBool>,
+    event_sender: Option<Sender<Event>>,
+}
+
+impl GstreamerRecordingState {
+    fn start(&self) -> Result<(), String> {
+        self.eos_seen.store(false, Ordering::SeqCst);
+        // Set active before opening the valve so the chunk probe never drops
+        // the first muxer output (ftyp + moov).
+        self.active.store(true, Ordering::SeqCst);
+        self.valve.set_property("drop", false);
+        if let Some(audio_valve) = &self.audio_valve {
+            audio_valve.set_property("drop", false);
+        }
+        // Reset + open the thumbnail grabber; its probe closes the valve right
+        // after the first frame is captured.
+        if let Ok(mut slot) = self.thumbnail.lock() {
+            *slot = None;
+        }
+        self.thumb_valve.set_property("drop", false);
+        let audio_note = if self.audio_valve.is_some() {
+            " with audio"
+        } else {
+            " (video only — no audio source available)"
+        };
+        send_log(
+            &self.event_sender,
+            "info",
+            format!("Native recording started (H.264 fragmented MP4{audio_note})."),
+        );
+        Ok(())
+    }
+
+    fn stop(&self, finalize: bool) -> Result<(), String> {
+        // Stop new frames entering the branch first; buffers already inside
+        // (queue → encoder → muxer) keep flowing.
+        self.valve.set_property("drop", true);
+        if let Some(audio_valve) = &self.audio_valve {
+            audio_valve.set_property("drop", true);
+        }
+        self.thumb_valve.set_property("drop", true);
+        if !finalize {
+            self.active.store(false, Ordering::SeqCst);
+            send_log(
+                &self.event_sender,
+                "info",
+                "Native recording aborted; capture valves closed.".to_owned(),
+            );
+            return Ok(());
+        }
+
+        // EOS both branches (video + audio); mp4mux only emits EOS once every
+        // linked pad has seen EOS, so both events must be sent.
+        for element in std::iter::once(&self.valve).chain(self.audio_valve.iter()) {
+            let sink_pad = element
+                .static_pad("sink")
+                .ok_or_else(|| "Recording valve has no sink pad.".to_owned())?;
+            sink_pad.send_event(gst::event::Eos::new());
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(RECORDING_FINALIZE_TIMEOUT_MS);
+        while !self.eos_seen.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !self.eos_seen.load(Ordering::SeqCst) {
+            // Keep the branch usable: without EOS the muxer was not spent.
+            self.active.store(false, Ordering::SeqCst);
+            return Err("Timed out waiting for the recording encoder to flush.".to_owned());
+        }
+        self.active.store(false, Ordering::SeqCst);
+        self.spent.store(true, Ordering::SeqCst);
+        let thumb_note = if self
+            .thumbnail
+            .lock()
+            .ok()
+            .is_some_and(|slot| slot.is_some())
+        {
+            " with thumbnail"
+        } else {
+            " without thumbnail"
+        };
+        send_log(
+            &self.event_sender,
+            "info",
+            format!("Native recording finalized; H.264/MP4 chunks flushed{thumb_note}."),
+        );
+        Ok(())
+    }
+
+    /// Base64 JPEG of the first captured recording frame (gallery thumbnail).
+    fn thumbnail(&self) -> Option<String> {
+        self.thumbnail.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+/// Screenshot frame-grab branch tapped off the video chain right before the
+/// sink: tee → valve → queue → (download) → videoconvert → pngenc → appsink.
+/// The valve is closed (drop=true) whenever no capture is in flight, so the
+/// branch costs ~zero when idle; on `capture()` the valve opens for one frame
+/// interval and a pad probe on the appsink sink pad stores the newest encoded
+/// PNG buffer, then the valve closes again before it is read out.
+#[derive(Debug, Clone)]
+pub(crate) struct GstreamerScreenshotGrab {
+    valve: gst::Element,
+    appsink: gst::Element,
+    last_buffer: Arc<Mutex<Option<gst::Buffer>>>,
+    event_sender: Option<Sender<Event>>,
+}
+
+impl GstreamerScreenshotGrab {
+    fn capture(&self) -> Result<NativeScreenshotEvent, String> {
+        // Drop any stale sample from a previous capture before opening the
+        // valve so the probe only reports a freshly presented frame.
+        if let Ok(mut slot) = self.last_buffer.lock() {
+            *slot = None;
+        }
+        self.valve.set_property("drop", false);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(SCREENSHOT_CAPTURE_TIMEOUT_MS);
+        let buffer = loop {
+            let captured = self.last_buffer.lock().ok().and_then(|slot| slot.clone());
+            if captured.is_some() {
+                break captured;
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // Close the valve immediately once a frame is in hand (or the wait
+        // expired) so the grab branch goes back to idle.
+        self.valve.set_property("drop", true);
+        let buffer = buffer.ok_or_else(|| {
+            "Timed out waiting for a video frame to screenshot; the stream may be paused."
+                .to_owned()
+        })?;
+
+        // The probe stores only the buffer; caps come from the appsink pad at
+        // read-out time (they do not change between frames within a session).
+        let caps = self
+            .appsink
+            .static_pad("sink")
+            .and_then(|pad| pad.current_caps());
+        let (width, height) = caps
+            .as_ref()
+            .and_then(|caps| caps.structure(0))
+            .map(|structure| {
+                (
+                    structure.get::<i32>("width").unwrap_or(0).max(0) as u32,
+                    structure.get::<i32>("height").unwrap_or(0).max(0) as u32,
+                )
+            })
+            .unwrap_or((0, 0));
+
+        let mapped = buffer
+            .map_readable()
+            .map_err(|error| format!("Failed to map captured frame: {error}"))?;
+        let png_bytes = mapped.as_slice();
+        if png_bytes.is_empty() {
+            return Err("Captured frame is empty.".to_owned());
+        }
+        let png_base64 = BASE64_STANDARD.encode(png_bytes);
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Captured native screenshot: {width}x{height}, {} PNG bytes.",
+                png_bytes.len()
+            ),
+        );
+        Ok(NativeScreenshotEvent {
+            png_base64,
+            width,
+            height,
+        })
+    }
+}
+
+/// Native microphone send path: platform capture (WASAPI/osxaudiosrc/pulse) → Opus → RTP into the
+/// negotiated mic transceiver. Mute toggles the volume element so the
+/// sendonly m-line stays negotiated (re-negotiation would be disruptive).
+#[derive(Debug)]
+pub(crate) struct GstreamerMicPipeline {
+    volume: gst::Element,
+    elements: Vec<gst::Element>,
+}
+
+impl GstreamerMicPipeline {
+    fn set_enabled(&self, enabled: bool) {
+        self.volume
+            .set_property("volume", if enabled { 1.0f64 } else { 0.0f64 });
+    }
+}
+
+/// Find the Opus payload type negotiated for the mic m-line in the local
+/// answer. The mic m-line is the media section with `a=mid:3` (or a `m=mic`
+/// media type); the game-audio m-line also carries Opus, so scoping to the
+/// mic section matters.
+fn negotiated_mic_opus_payload(answer_sdp: &str) -> Option<u32> {
+    let mut section_media: Option<&str> = None;
+    let mut section_mid: Option<&str> = None;
+    for raw_line in answer_sdp.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            section_media = rest.split_whitespace().next();
+            section_mid = None;
+            continue;
+        }
+        if let Some(mid) = line.strip_prefix("a=mid:") {
+            section_mid = Some(mid.trim());
+            continue;
+        }
+        let is_mic_section = section_media == Some("mic")
+            || section_mid == Some("3")
+            || (section_media == Some("audio") && section_mid.is_some_and(|mid| mid != "0"));
+        if !is_mic_section {
+            continue;
+        }
+        if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+            if rtpmap.to_ascii_uppercase().contains("OPUS") {
+                if let Some((pt, _)) = rtpmap.split_once(' ') {
+                    if let Ok(pt) = pt.parse::<u32>() {
+                        return Some(pt);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -469,6 +749,7 @@ pub(crate) struct GstreamerPipeline {
     pub(crate) webrtc: gst::Element,
     input_state: GstreamerInputState,
     input_channels: Option<GstreamerInputChannels>,
+    mic: Option<GstreamerMicPipeline>,
     #[cfg(target_os = "windows")]
     native_window_input_bridge: Option<NativeWindowInputBridge>,
     render_state: GstreamerRenderState,
@@ -478,6 +759,15 @@ pub(crate) struct GstreamerPipeline {
     skip_webrtc_video: Arc<AtomicBool>,
     nvst_receive: Option<NvstVideoReceiveHandle>,
     video_liveness: VideoLivenessMonitor,
+    screenshot_grab: Arc<Mutex<Option<GstreamerScreenshotGrab>>>,
+    video_tap: Arc<Mutex<Option<GstreamerVideoTap>>>,
+    recording: Arc<Mutex<Option<GstreamerRecordingState>>>,
+    /// Recording tap on the decoded game-audio chain (queue element): built
+    /// when the audio chain appears, linked into the recording mixer on demand.
+    game_audio_tap: Arc<Mutex<Option<gst::Element>>>,
+    /// Recording tap on the mic chain after the mute volume (queue
+    /// element), so muting the mic also silences it in recordings.
+    mic_audio_tap: Arc<Mutex<Option<gst::Element>>>,
     event_sender: Option<Sender<Event>>,
     pub(crate) original_remote_ice_credentials: Option<IceCredentials>,
 }
@@ -519,6 +809,9 @@ impl GstreamerPipeline {
         let present_max_fps = Arc::new(AtomicU32::new(0));
         let d3d_fullscreen_sink = Arc::new(AtomicBool::new(false));
         let skip_webrtc_video = Arc::new(AtomicBool::new(false));
+        let screenshot_grab = Arc::new(Mutex::new(None));
+        let video_tap = Arc::new(Mutex::new(None));
+        let game_audio_tap = Arc::new(Mutex::new(None));
         wire_incoming_media_sink(
             &pipeline,
             &webrtc,
@@ -528,6 +821,9 @@ impl GstreamerPipeline {
             d3d_fullscreen_sink.clone(),
             skip_webrtc_video.clone(),
             video_liveness.clone(),
+            screenshot_grab.clone(),
+            video_tap.clone(),
+            game_audio_tap.clone(),
         );
 
         pipeline
@@ -542,6 +838,7 @@ impl GstreamerPipeline {
             webrtc,
             input_state,
             input_channels: None,
+            mic: None,
             #[cfg(target_os = "windows")]
             native_window_input_bridge: None,
             render_state,
@@ -550,6 +847,11 @@ impl GstreamerPipeline {
             skip_webrtc_video,
             nvst_receive: None,
             video_liveness,
+            screenshot_grab,
+            video_tap,
+            recording: Arc::new(Mutex::new(None)),
+            game_audio_tap: Arc::new(Mutex::new(None)),
+            mic_audio_tap: Arc::new(Mutex::new(None)),
             event_sender,
             original_remote_ice_credentials: None,
         })
@@ -701,6 +1003,31 @@ impl GstreamerPipeline {
                 })?;
             }
 
+            // Same valve-gated screenshot grab as the WebRTC RTP path.
+            if elements.len() >= 2 {
+                let before_sink = elements[elements.len() - 2].clone();
+                let sink_element = elements[elements.len() - 1].clone();
+                match insert_screenshot_grab(
+                    &self.pipeline,
+                    &before_sink,
+                    &sink_element,
+                    video_api,
+                    &self.event_sender,
+                    &self.video_tap,
+                ) {
+                    Ok(grab) => {
+                        if let Ok(mut slot) = self.screenshot_grab.lock() {
+                            *slot = Some(grab);
+                        }
+                    }
+                    Err(message) => send_log(
+                        &self.event_sender,
+                        "warn",
+                        format!("Screenshot grab branch disabled for NVST {encoding}: {message}"),
+                    ),
+                }
+            }
+
             let sink = elements
                 .last()
                 .ok_or_else(|| format!("NVST {encoding} video chain has no sink."))?;
@@ -731,9 +1058,14 @@ impl GstreamerPipeline {
                 self.video_liveness
                     .set_pre_decode_queue(pre_decode_queue.clone());
             }
-            if let Some(parser) = specs.iter().zip(elements.iter().skip(1)).find_map(
-                |(spec, element)| (spec.role == RtpVideoChainRole::Parser).then_some(element),
-            ) {
+            if let Some(parser) =
+                specs
+                    .iter()
+                    .zip(elements.iter().skip(1))
+                    .find_map(|(spec, element)| {
+                        (spec.role == RtpVideoChainRole::Parser).then_some(element)
+                    })
+            {
                 watch_video_caps_transitions(
                     parser,
                     "parser",
@@ -741,9 +1073,14 @@ impl GstreamerPipeline {
                     self.video_liveness.clone(),
                 );
             }
-            if let Some(decoder) = specs.iter().zip(elements.iter().skip(1)).find_map(
-                |(spec, element)| (spec.role == RtpVideoChainRole::Decoder).then_some(element),
-            ) {
+            if let Some(decoder) =
+                specs
+                    .iter()
+                    .zip(elements.iter().skip(1))
+                    .find_map(|(spec, element)| {
+                        (spec.role == RtpVideoChainRole::Decoder).then_some(element)
+                    })
+            {
                 self.video_liveness.set_decoder(decoder.clone());
                 watch_video_caps_transitions(
                     decoder,
@@ -767,11 +1104,7 @@ impl GstreamerPipeline {
                 Some(self.video_liveness.clone()),
             );
             watch_first_sink_buffer(sink, "video", &self.event_sender, &streaming_reported);
-            watch_video_sink_rate(
-                sink,
-                &self.event_sender,
-                Some(self.video_liveness.clone()),
-            );
+            watch_video_sink_rate(sink, &self.event_sender, Some(self.video_liveness.clone()));
 
             for element in &elements {
                 element.sync_state_with_parent().map_err(|error| {
@@ -789,11 +1122,7 @@ impl GstreamerPipeline {
                 self.event_sender.clone(),
             );
 
-            let handle = spawn_nvst_udp_receive(
-                session,
-                appsrc,
-                self.event_sender.clone(),
-            )?;
+            let handle = spawn_nvst_udp_receive(session, appsrc, self.event_sender.clone())?;
             self.nvst_receive = Some(handle);
 
             // Ensure pipeline can run the appsrc branch even before WebRTC offer.
@@ -882,6 +1211,7 @@ impl GstreamerPipeline {
         offer_sdp: gst_sdp::SDPMessage,
         original_remote_credentials: Option<&IceCredentials>,
         partial_reliable_threshold_ms: u32,
+        microphone_enabled: bool,
     ) -> Result<String, String> {
         let offer =
             gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, offer_sdp);
@@ -896,13 +1226,52 @@ impl GstreamerPipeline {
             self.try_restore_original_remote_ice_credentials("after remote description")?;
         }
         self.ensure_input_data_channels(partial_reliable_threshold_ms)?;
+
+        // Microphone: before creating the answer, force the offer's mic
+        // m-line transceiver to sendonly with Opus codec preferences.
+        // webrtcbin answers unassigned media m-lines recvonly, so without
+        // this the mic m-line is never negotiated as sendonly and the server
+        // never receives mic audio.
+        let mic_transceiver = if microphone_enabled {
+            self.prepare_mic_transceiver()
+        } else {
+            None
+        };
+
         let answer = self.create_answer()?;
         let answer_sdp = answer
             .sdp()
             .as_text()
             .map_err(|error| format!("Failed to serialize GStreamer answer SDP: {error}"))?;
+
+        // Only attach once a concrete Opus payload type was negotiated for
+        // the mic m-line (mirrors the web client, which sends Opus mic).
+        let mic_payload = mic_transceiver
+            .as_ref()
+            .and_then(|_| negotiated_mic_opus_payload(&answer_sdp));
+
         self.set_description("set-local-description", &answer)?;
         self.try_restore_original_remote_ice_credentials("after local description")?;
+
+        if let Some(payload_type) = mic_payload {
+            if let Some(transceiver) = mic_transceiver.as_ref() {
+                if let Err(message) = self.attach_mic_pipeline(transceiver, payload_type) {
+                    send_log(
+                        &self.event_sender,
+                        "warn",
+                        format!("Microphone attach failed: {message}"),
+                    );
+                }
+            }
+        } else if mic_transceiver.is_some() {
+            send_log(
+                &self.event_sender,
+                "warn",
+                "Microphone enabled but the answer negotiated no Opus payload for the mic m-line; mic audio will not be sent."
+                    .to_owned(),
+            );
+        }
+
         Ok(answer_sdp)
     }
 
@@ -1132,6 +1501,374 @@ impl GstreamerPipeline {
         Ok(())
     }
 
+    pub(crate) fn set_microphone_enabled(&self, enabled: bool) {
+        if let Some(mic) = &self.mic {
+            mic.set_enabled(enabled);
+        }
+    }
+
+    pub(crate) fn mic_attached(&self) -> bool {
+        self.mic.is_some()
+    }
+
+    /// Capture the last presented video frame as a PNG (base64) by briefly
+    /// opening the valve-gated grab branch and pulling the newest encoded
+    /// sample from the appsink.
+    pub(crate) fn capture_screenshot(&self) -> Result<NativeScreenshotEvent, String> {
+        let grab = self
+            .screenshot_grab
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        match grab {
+            Some(grab) => grab.capture(),
+            None => Err(
+                "Screenshot capture is not ready: the native video chain has no frame grab branch (waiting for game video)."
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// Start a native recording: open (or build, if missing/spent) the
+    /// H.264/MP4 recording branch on the shared video tap.
+    pub(crate) fn start_recording(&self) -> Result<(), String> {
+        let tap = self
+            .video_tap
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| {
+                "Recording is not ready: the native video chain has no video tap (waiting for game video)."
+                    .to_owned()
+            })?;
+        let pipeline = self.pipeline.clone();
+
+        let mut slot = self
+            .recording
+            .lock()
+            .map_err(|_| "Recording state lock poisoned.".to_owned())?;
+        if let Some(state) = slot.as_ref() {
+            if state.active.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if state.spent.load(Ordering::SeqCst) {
+                // The muxer is spent after an EOS-finalized recording; rebuild
+                // a fresh branch so a second recording works in the session.
+                teardown_recording_branch(&pipeline, state);
+                *slot = None;
+            }
+        }
+        if slot.is_none() {
+            let state = insert_recording_branch(
+                &pipeline,
+                &tap.tee,
+                tap.video_api,
+                &self.game_audio_tap,
+                &self.mic_audio_tap,
+                self.event_sender.clone(),
+            )?;
+            *slot = Some(state);
+        }
+        let state = slot
+            .as_ref()
+            .ok_or_else(|| "Recording branch missing after start.".to_owned())?;
+        state.start()
+    }
+
+    /// Stop the active recording. `finalize=true` flushes the encoder/muxer
+    /// with EOS and emits `recording-finished` (via the event channel, strictly
+    /// after every chunk); `finalize=false` aborts (valve closed, branch kept).
+    pub(crate) fn stop_recording(&self, finalize: bool) -> Result<(), String> {
+        let state = self.recording.lock().ok().and_then(|slot| slot.clone());
+        let Some(state) = state else {
+            return Ok(());
+        };
+        if !state.active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        state.stop(finalize)?;
+        if finalize {
+            if let Some(event_sender) = &self.event_sender {
+                let _ = event_sender.send(Event::RecordingFinished {
+                    thumbnail_base64: state.thumbnail(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Locate the offer's mic m-line transceiver and force it sendonly with
+    /// Opus codec preferences. Without this, webrtcbin answers unassigned
+    /// audio m-lines with recvonly (or rejects them) because no track is
+    /// attached, and the server never receives mic audio.
+    fn prepare_mic_transceiver(&self) -> Option<gst_webrtc::WebRTCRTPTransceiver> {
+        let Some(transceiver) = self.find_mic_transceiver() else {
+            send_log(
+                &self.event_sender,
+                "warn",
+                "Microphone is enabled but the server offer has no mic m-line; mic audio will not be sent."
+                    .to_owned(),
+            );
+            return None;
+        };
+
+        let opus_caps: gst::Caps = "application/x-rtp, media=(string)audio, encoding-name=(string)OPUS, payload=(int)[0,127]"
+            .parse()
+            .expect("valid Opus RTP caps");
+        transceiver.set_codec_preferences(Some(&opus_caps));
+        transceiver.set_direction(gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly);
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Prepared mic transceiver (mid={:?}, mline={}) for sendonly Opus.",
+                transceiver.mid(),
+                transceiver.mlineindex()
+            ),
+        );
+        Some(transceiver)
+    }
+
+    /// The offer's mic m-line is the audio transceiver on mid "3" (GFN layout:
+    /// audio=0, video=1, application=2, mic=3). Falls back to the last audio
+    /// transceiver that is not the recvonly game-audio line.
+    fn find_mic_transceiver(&self) -> Option<gst_webrtc::WebRTCRTPTransceiver> {
+        let mut audio = Vec::new();
+        for index in 0..8i32 {
+            let transceiver = self
+                .webrtc
+                .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                    "get-transceiver",
+                    &[&index],
+                );
+            let Some(transceiver) = transceiver else {
+                break;
+            };
+            if transceiver.kind() == gst_webrtc::WebRTCKind::Audio {
+                audio.push(transceiver);
+            }
+        }
+        if audio.is_empty() {
+            return None;
+        }
+        if let Some(found) = audio
+            .iter()
+            .find(|transceiver| transceiver.mid().as_deref() == Some("3"))
+        {
+            return Some(found.clone());
+        }
+        if let Some(found) = audio.iter().rev().find(|transceiver| {
+            transceiver.direction() != gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly
+        }) {
+            return Some(found.clone());
+        }
+        audio.first().cloned()
+    }
+
+    /// Find the webrtcbin sink pad (`sink_%u`) that belongs to the mic
+    /// transceiver. It is created when the local description (sendonly mic
+    /// m-line) is applied, so this must run after `set-local-description`.
+    fn find_transceiver_sink_pad(
+        &self,
+        transceiver: &gst_webrtc::WebRTCRTPTransceiver,
+    ) -> Option<gst::Pad> {
+        for pad in self.webrtc.pads() {
+            if pad.direction() != gst::PadDirection::Sink {
+                continue;
+            }
+            let pad_transceiver: Option<gst_webrtc::WebRTCRTPTransceiver> =
+                pad.property("transceiver");
+            if pad_transceiver
+                .as_ref()
+                .is_some_and(|other| other.as_ptr() == transceiver.as_ptr())
+            {
+                return Some(pad);
+            }
+        }
+        None
+    }
+
+    /// Create the platform's default microphone capture source. GStreamer's
+    /// audio source elements are platform-specific: `wasapi2src` (Windows),
+    /// `osxaudiosrc` (macOS), and `pulsesrc`/`pipewiresrc` (Linux, tried in
+    /// order since PipeWire ships a PulseAudio shim). `autoaudiosrc` is the
+    /// final cross-platform fallback (ALSA on Linux, CoreAudio on macOS).
+    fn create_mic_source_element() -> Result<(gst::Element, &'static str), String> {
+        #[cfg(target_os = "windows")]
+        let candidates: &[&str] = &["wasapi2src", "autoaudiosrc"];
+        #[cfg(target_os = "macos")]
+        let candidates: &[&str] = &["osxaudiosrc", "autoaudiosrc"];
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let candidates: &[&str] = &["pulsesrc", "pipewiresrc", "autoaudiosrc"];
+
+        let mut last_error: Option<String> = None;
+        for factory in candidates {
+            let element = gst::ElementFactory::make(factory)
+                .name("mic-audiosrc")
+                .build();
+            match element {
+                Ok(element) => return Ok((element, factory)),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(format!(
+            "No microphone capture source available (tried {candidates:?}): {}",
+            last_error.unwrap_or_else(|| "unknown".to_owned())
+        ))
+    }
+
+    /// Build the platform capture → Opus → RTP send path and link it into the
+    /// mic transceiver's sink pad. The payload type comes from the negotiated
+    /// answer so the RTP we send matches the SDP the server accepted.
+    fn attach_mic_pipeline(
+        &mut self,
+        transceiver: &gst_webrtc::WebRTCRTPTransceiver,
+        payload_type: u32,
+    ) -> Result<(), String> {
+        if self.mic.is_some() {
+            return Ok(());
+        }
+
+        let Some(sink_pad) = self.find_transceiver_sink_pad(transceiver) else {
+            return Err(
+                "webrtcbin created no send pad for the mic transceiver after set-local-description."
+                    .to_owned(),
+            );
+        };
+
+        let result = (|| -> Result<Vec<gst::Element>, String> {
+            let mut elements = Vec::with_capacity(6);
+            let (source, source_factory) = Self::create_mic_source_element()?;
+            set_property_if_supported(&source, "low-latency", true);
+
+            let volume = gst::ElementFactory::make("volume")
+                .name("mic-volume")
+                .build()
+                .map_err(|error| format!("Failed to create mic volume: {error}"))?;
+            volume.set_property("volume", 1.0f64);
+
+            let convert = gst::ElementFactory::make("audioconvert")
+                .name("mic-audioconvert")
+                .build()
+                .map_err(|error| format!("Failed to create mic audioconvert: {error}"))?;
+            let resample = gst::ElementFactory::make("audioresample")
+                .name("mic-audioresample")
+                .build()
+                .map_err(|error| format!("Failed to create mic audioresample: {error}"))?;
+            let encoder = gst::ElementFactory::make("opusenc")
+                .name("mic-opusenc")
+                .build()
+                .map_err(|error| format!("Failed to create mic opusenc: {error}"))?;
+            let payloader = gst::ElementFactory::make("rtpopuspay")
+                .name("mic-rtpopuspay")
+                .build()
+                .map_err(|error| format!("Failed to create mic rtpopuspay: {error}"))?;
+            payloader.set_property("pt", payload_type);
+
+            for element in [&source, &volume, &convert, &resample, &encoder, &payloader] {
+                self.pipeline.add(element).map_err(|error| {
+                    format!("Failed to add {} to the pipeline: {error}", element.name())
+                })?;
+                elements.push(element.clone());
+            }
+            send_log(
+                &self.event_sender,
+                "info",
+                format!("Native microphone source: {source_factory} (platform capture)."),
+            );
+
+            // Recording tap after the mute volume: tee → queue. Always flowing,
+            // gated downstream by the recording branch's mixer-output valve, so
+            // muting the mic (volume 0) also silences it in recordings.
+            let tap_tee = gst::ElementFactory::make("tee")
+                .name("mic-tap-tee")
+                .build()
+                .map_err(|error| format!("Failed to create mic tap tee: {error}"))?;
+            let tap_queue = gst::ElementFactory::make("queue")
+                .name("mic-tap-queue")
+                .build()
+                .map_err(|error| format!("Failed to create mic tap queue: {error}"))?;
+            tap_queue.set_property_from_str("leaky", "downstream");
+            tap_queue.set_property("max-size-buffers", 8u32);
+            tap_queue.set_property("max-size-bytes", 0u32);
+            tap_queue.set_property("max-size-time", 0u64);
+            for element in [&tap_tee, &tap_queue] {
+                self.pipeline.add(element).map_err(|error| {
+                    format!("Failed to add {} to the pipeline: {error}", element.name())
+                })?;
+                elements.push(element.clone());
+            }
+
+            for pair in [
+                (&source, &volume),
+                (&volume, &tap_tee),
+                (&tap_tee, &convert),
+                (&convert, &resample),
+                (&resample, &encoder),
+                (&encoder, &payloader),
+            ] {
+                pair.0.link(pair.1).map_err(|error| {
+                    format!(
+                        "Failed to link {} -> {}: {error:?}",
+                        pair.0.name(),
+                        pair.1.name()
+                    )
+                })?;
+            }
+            tap_tee
+                .link(&tap_queue)
+                .map_err(|error| format!("Failed to link mic tap tee -> queue: {error:?}"))?;
+
+            let payloader_src = payloader
+                .static_pad("src")
+                .ok_or_else(|| "mic rtpopuspay has no src pad.".to_owned())?;
+            payloader_src.link(&sink_pad).map_err(|error| {
+                format!("Failed to link mic rtpopuspay -> webrtcbin sink pad: {error:?}")
+            })?;
+
+            for element in &elements {
+                element.sync_state_with_parent().map_err(|error| {
+                    format!(
+                        "Failed to sync mic element {} state: {error}",
+                        element.name()
+                    )
+                })?;
+            }
+
+            send_log(
+                &self.event_sender,
+                "info",
+                format!(
+                    "Native microphone attached: {source_factory} default input → Opus → RTP payload {payload_type} on mid {:?}.",
+                    transceiver.mid()
+                ),
+            );
+            Ok(elements)
+        })();
+
+        match result {
+            Ok(elements) => {
+                let mic_tap = elements
+                    .iter()
+                    .find(|element| element.name() == "mic-tap-queue")
+                    .cloned();
+                self.mic = Some(GstreamerMicPipeline {
+                    volume: elements
+                        .iter()
+                        .find(|element| element.name() == "mic-volume")
+                        .cloned()
+                        .ok_or_else(|| "mic-volume element missing after attach.".to_owned())?,
+                    elements,
+                });
+                if let Ok(mut slot) = self.mic_audio_tap.lock() {
+                    *slot = mic_tap;
+                }
+                Ok(())
+            }
+            Err(message) => Err(message),
+        }
+    }
+
     pub(crate) fn send_input_packet(&self, payload: &[u8], partially_reliable: bool) -> bool {
         if !self.input_state.ready.load(Ordering::SeqCst)
             || self.input_state.paused.load(Ordering::SeqCst)
@@ -1148,8 +1885,16 @@ impl GstreamerPipeline {
 
     pub(crate) fn set_input_paused(&self, paused: bool) {
         self.input_state.paused.store(paused, Ordering::SeqCst);
+        // Shared with the platform so the stacked guard tick cannot re-arm the
+        // sink RawInput capture (re-hiding the cursor) while an overlay is open.
+        crate::gstreamer_input::set_input_paused_flag(paused);
         if paused {
             release_native_input_capture();
+        } else {
+            // Stacked mode: (re)arm the sink-window RawInput mouse + keyboard
+            // capture so input bypasses the Electron bridge entirely (low
+            // latency). No-op in other render modes / when not ready.
+            arm_stacked_sink_input_capture();
         }
     }
 
@@ -1162,6 +1907,12 @@ impl GstreamerPipeline {
     pub(crate) fn stop(mut self) -> Result<(), String> {
         if let Some(handle) = self.nvst_receive.take() {
             handle.stop();
+        }
+        if let Some(mic) = self.mic.take() {
+            for element in mic.elements {
+                let _ = element.set_state(gst::State::Null);
+                let _ = self.pipeline.remove(&element);
+            }
         }
         self.skip_webrtc_video.store(false, Ordering::SeqCst);
         self.video_liveness.set_stats_overlay_visible(false);
@@ -1623,6 +2374,9 @@ fn wire_incoming_media_sink(
     d3d_fullscreen_sink: Arc<AtomicBool>,
     skip_webrtc_video: Arc<AtomicBool>,
     video_liveness: VideoLivenessMonitor,
+    screenshot_grab: Arc<Mutex<Option<GstreamerScreenshotGrab>>>,
+    video_tap: Arc<Mutex<Option<GstreamerVideoTap>>>,
+    game_audio_tap: Arc<Mutex<Option<gst::Element>>>,
 ) {
     let pipeline = pipeline.downgrade();
     let streaming_reported = Arc::new(AtomicBool::new(false));
@@ -1670,6 +2424,8 @@ fn wire_incoming_media_sink(
                 present_max_fps.clone(),
                 d3d_fullscreen_sink.load(Ordering::SeqCst),
                 video_liveness.clone(),
+                &screenshot_grab,
+                &video_tap,
             ) {
                 Ok(()) => return,
                 Err(error) => send_log(
@@ -1693,6 +2449,7 @@ fn wire_incoming_media_sink(
         let decode_render_state = render_state.clone();
         let decode_streaming_reported = streaming_reported.clone();
         let decode_video_liveness = video_liveness.clone();
+        let decode_game_audio_tap = game_audio_tap.clone();
         decodebin.connect_pad_added(move |_decodebin, decoded_pad| {
             let Some(pipeline) = decode_pipeline.upgrade() else {
                 return;
@@ -1705,6 +2462,7 @@ fn wire_incoming_media_sink(
                 &decode_sender,
                 &decode_streaming_reported,
                 &decode_video_liveness,
+                &decode_game_audio_tap,
             ) {
                 send_log(&decode_sender, "warn", error);
                 if let Err(fallback_error) =
@@ -2312,8 +3070,7 @@ fn align_windows_vulkan_internal_present(specs: &mut Vec<RtpVideoChainSpec>, dec
         && gst::ElementFactory::find("d3d12videosink").is_some()
     {
         ("d3d12videosink", RtpVideoApi::D3D12.memory_caps())
-    } else if decoder.starts_with("d3d11")
-        && gst::ElementFactory::find("d3d11videosink").is_some()
+    } else if decoder.starts_with("d3d11") && gst::ElementFactory::find("d3d11videosink").is_some()
     {
         ("d3d11videosink", RtpVideoApi::D3D11.memory_caps())
     } else {
@@ -2765,6 +3522,8 @@ fn link_rtp_video_pad(
     present_max_fps: Arc<AtomicU32>,
     d3d_fullscreen_sink: bool,
     video_liveness: VideoLivenessMonitor,
+    screenshot_grab: &Arc<Mutex<Option<GstreamerScreenshotGrab>>>,
+    video_tap: &Arc<Mutex<Option<GstreamerVideoTap>>>,
 ) -> Result<(), String> {
     if src_pad.is_linked() {
         return Ok(());
@@ -2856,6 +3615,33 @@ fn link_rtp_video_pad(
                     element_factory_name(&pair[1])
                 )
             })?;
+        }
+
+        // Tap the chain right before the sink so screenshots capture exactly
+        // what was presented (including the stats overlay when visible). The
+        // branch is valve-gated, so it costs nothing while idle.
+        if elements.len() >= 2 {
+            let before_sink = elements[elements.len() - 2].clone();
+            let sink_element = elements[elements.len() - 1].clone();
+            match insert_screenshot_grab(
+                pipeline,
+                &before_sink,
+                &sink_element,
+                video_api,
+                event_sender,
+                video_tap,
+            ) {
+                Ok(grab) => {
+                    if let Ok(mut slot) = screenshot_grab.lock() {
+                        *slot = Some(grab);
+                    }
+                }
+                Err(message) => send_log(
+                    event_sender,
+                    "warn",
+                    format!("Screenshot grab branch disabled for RTP {encoding}: {message}"),
+                ),
+            }
         }
 
         let first = elements
@@ -3056,6 +3842,7 @@ fn link_decoded_media_pad(
     event_sender: &Option<Sender<Event>>,
     streaming_reported: &Arc<AtomicBool>,
     video_liveness: &VideoLivenessMonitor,
+    game_audio_tap: &Arc<Mutex<Option<gst::Element>>>,
 ) -> Result<(), String> {
     if src_pad.is_linked() {
         return Ok(());
@@ -3071,6 +3858,7 @@ fn link_decoded_media_pad(
             event_sender,
             streaming_reported,
             Some(video_liveness),
+            None,
         ),
         DecodedMediaKind::Audio => link_media_chain(
             pipeline,
@@ -3086,6 +3874,7 @@ fn link_decoded_media_pad(
             event_sender,
             streaming_reported,
             None,
+            Some(game_audio_tap),
         ),
         DecodedMediaKind::Unknown => Err(format!(
             "Unsupported decoded media caps {:?}; routing to fallback sink.",
@@ -3127,6 +3916,7 @@ fn link_media_chain(
     event_sender: &Option<Sender<Event>>,
     streaming_reported: &Arc<AtomicBool>,
     video_liveness: Option<&VideoLivenessMonitor>,
+    game_audio_tap: Option<&Arc<Mutex<Option<gst::Element>>>>,
 ) -> Result<(), String> {
     if media_label == "video" {
         if let Some(video_liveness) = video_liveness {
@@ -3177,6 +3967,54 @@ fn link_media_chain(
                     .unwrap_or_default()
             )
         })?;
+    }
+
+    // Recording tap on the game-audio chain: tee between the last pre-sink
+    // element and the audio sink. The tap queue always flows (cheap, dropped
+    // at the recording branch's mixer-output valve when idle) and is linked
+    // into the recording mixer on demand.
+    if media_label == "audio" {
+        if let Some(tap_slot) = game_audio_tap {
+            let tap_empty = tap_slot.lock().ok().is_none_or(|slot| slot.is_none());
+            if tap_empty && elements.len() >= 2 {
+                let before_sink = elements[elements.len() - 2].clone();
+                let sink = elements[elements.len() - 1].clone();
+                let tap_tee = make_element("tee")?;
+                let tap_queue = make_element("queue")?;
+                tap_queue.set_property_from_str("leaky", "downstream");
+                tap_queue.set_property("max-size-buffers", 8u32);
+                tap_queue.set_property("max-size-bytes", 0u32);
+                tap_queue.set_property("max-size-time", 0u64);
+                for element in [&tap_tee, &tap_queue] {
+                    pipeline.add(element).map_err(|error| {
+                        format!("Failed to add game-audio tap element: {error}")
+                    })?;
+                }
+                before_sink.unlink(&sink);
+                before_sink.link(&tap_tee).map_err(|error| {
+                    format!("Failed to link audio chain into tap tee: {error:?}")
+                })?;
+                tap_tee
+                    .link(&sink)
+                    .map_err(|error| format!("Failed to link tap tee to audio sink: {error:?}"))?;
+                tap_tee
+                    .link(&tap_queue)
+                    .map_err(|error| format!("Failed to link audio tap tee -> queue: {error:?}"))?;
+                for element in [&tap_tee, &tap_queue] {
+                    element.sync_state_with_parent().map_err(|error| {
+                        format!("Failed to sync game-audio tap element state: {error}")
+                    })?;
+                }
+                if let Ok(mut slot) = tap_slot.lock() {
+                    *slot = Some(tap_queue.clone());
+                }
+                send_log(
+                    event_sender,
+                    "info",
+                    "Attached native recording game-audio tap (tee → queue).".to_owned(),
+                );
+            }
+        }
     }
 
     let first = elements
@@ -3254,4 +4092,475 @@ fn make_element(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
         .map_err(|error| format!("Failed to create GStreamer element {factory}: {error}"))
+}
+
+/// Insert a valve-gated screenshot grab branch between `before_sink` and
+/// `sink`: tee → valve → queue → [download] → videoconvert → pngenc → appsink.
+///
+/// The valve starts closed (drop=true), so the branch is idle (zero frame
+/// cost) until `capture()` briefly opens it. The download element is only
+/// added when zero-copy is requested (frames are D3D textures then); system
+/// memory flows straight into videoconvert.
+fn insert_screenshot_grab(
+    pipeline: &gst::Pipeline,
+    before_sink: &gst::Element,
+    sink: &gst::Element,
+    video_api: RtpVideoApi,
+    event_sender: &Option<Sender<Event>>,
+    video_tap: &Arc<Mutex<Option<GstreamerVideoTap>>>,
+) -> Result<GstreamerScreenshotGrab, String> {
+    let tee = make_element("tee")?;
+    if let Ok(mut slot) = video_tap.lock() {
+        *slot = Some(GstreamerVideoTap {
+            tee: tee.clone(),
+            video_api,
+        });
+    }
+    let valve = make_element("valve")?;
+    let queue = make_element("queue")?;
+    let convert = make_element("videoconvert")?;
+    let pngenc = make_element("pngenc")?;
+    let appsink = make_element("appsink")?;
+
+    valve.set_property("drop", true);
+    // Never let the grab branch back-pressure the video path: drop new buffers
+    // when the queue fills instead of blocking the tee.
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-buffers", 2u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+    // sync=false lets the branch run as fast as frames arrive; the pad probe
+    // below keeps only the newest encoded PNG buffer.
+    appsink.set_property("sync", false);
+    appsink.set_property("max-buffers", 1u32);
+    appsink.set_property("drop", true);
+    appsink.set_property("wait-on-eos", false);
+
+    let last_buffer: Arc<Mutex<Option<gst::Buffer>>> = Arc::new(Mutex::new(None));
+    let appsink_sink_pad = appsink
+        .static_pad("sink")
+        .ok_or_else(|| "Screenshot appsink has no sink pad.".to_owned())?;
+    let probe_last_buffer = last_buffer.clone();
+    appsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if let Some(buffer) = info.buffer() {
+            if let Ok(mut slot) = probe_last_buffer.lock() {
+                *slot = Some(buffer.clone());
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    // D3D paths with zero-copy produce texture-backed frames; download them to
+    // system memory first (videoconvert/pngenc cannot import D3D memory).
+    let download_factory = match (video_api, zero_copy_requested()) {
+        (RtpVideoApi::D3D11, true) => Some("d3d11download"),
+        (RtpVideoApi::D3D12, true) => Some("d3d12download"),
+        _ => None,
+    };
+    let download = match download_factory {
+        Some(factory) => Some(make_element(factory)?),
+        None => None,
+    };
+
+    before_sink.unlink(sink);
+    let mut new_elements: Vec<&gst::Element> = vec![&tee, &valve, &queue];
+    if let Some(download) = download.as_ref() {
+        new_elements.push(download);
+    }
+    new_elements.extend([&convert, &pngenc, &appsink]);
+    for element in &new_elements {
+        pipeline
+            .add(*element)
+            .map_err(|error| format!("Failed to add screenshot grab element: {error}"))?;
+    }
+
+    before_sink
+        .link(&tee)
+        .map_err(|error| format!("Failed to link video chain into screenshot tee: {error:?}"))?;
+    tee.link(sink)
+        .map_err(|error| format!("Failed to link screenshot tee to sink: {error:?}"))?;
+    for pair in new_elements.windows(2) {
+        pair[0]
+            .link(pair[1])
+            .map_err(|error| format!("Failed to link screenshot grab branch: {error:?}"))?;
+    }
+
+    for element in new_elements {
+        element
+            .sync_state_with_parent()
+            .map_err(|error| format!("Failed to sync screenshot grab element state: {error}"))?;
+    }
+
+    let chain_desc = match download_factory {
+        Some(factory) => {
+            format!("tee → valve → queue → {factory} → videoconvert → pngenc → appsink")
+        }
+        None => "tee → valve → queue → videoconvert → pngenc → appsink".to_owned(),
+    };
+    send_log(
+        event_sender,
+        "info",
+        format!("Attached native screenshot grab branch ({chain_desc})."),
+    );
+
+    Ok(GstreamerScreenshotGrab {
+        valve,
+        appsink,
+        last_buffer,
+        event_sender: event_sender.clone(),
+    })
+}
+
+/// Build the native recording branch off the shared video tap:
+/// tee → valve → queue → (download) → videoconvert → capsfilter(I420) →
+/// x264enc → mp4mux (fragmented, streamable) → appsink.
+///
+/// Muxer output buffers are captured by a BUFFER probe on the appsink sink
+/// pad (each becomes one `recording-chunk` event); an EVENT probe records EOS
+/// so `stop(finalize=true)` knows when the branch flushed. The valve starts
+/// closed, so the branch costs nothing until a recording starts.
+fn insert_recording_branch(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    video_api: RtpVideoApi,
+    game_audio_tap: &Arc<Mutex<Option<gst::Element>>>,
+    mic_audio_tap: &Arc<Mutex<Option<gst::Element>>>,
+    event_sender: Option<Sender<Event>>,
+) -> Result<GstreamerRecordingState, String> {
+    let valve = make_element("valve")?;
+    let queue = make_element("queue")?;
+    let convert = make_element("videoconvert")?;
+    let caps = make_element("capsfilter")?;
+    let encoder = make_element("x264enc")?;
+    let muxer = make_element("mp4mux")?;
+    let appsink = make_element("appsink")?;
+
+    valve.set_property("drop", true);
+    // Frames past the valve are recording frames, but the branch must never
+    // back-pressure the live video path: if the encoder lags, drop the oldest
+    // queued frames instead of stalling the tee.
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-buffers", 30u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+
+    let i420_caps: gst::Caps = "video/x-raw,format=I420"
+        .parse()
+        .map_err(|error| format!("Invalid recording caps: {error}"))?;
+    caps.set_property("caps", &i420_caps);
+
+    encoder.set_property_from_str("speed-preset", "ultrafast");
+    encoder.set_property_from_str("tune", "zerolatency");
+    encoder.set_property("bitrate", RECORDING_BITRATE_KBPS);
+    encoder.set_property("bframes", 0u32);
+    encoder.set_property("key-int-max", 120u32);
+
+    // Fragmented MP4 in streamable mode: the first muxer buffer carries
+    // ftyp + moov, then one buffer per ~500ms fragment. Appending these in
+    // order produces a playable file (same contract as MediaRecorder chunks).
+    muxer.set_property("streamable", true);
+    muxer.set_property("fragment-duration", 500u32);
+
+    // sync=false: the branch runs as fast as frames arrive; the probes below
+    // capture every muxer output before appsink's internal (max 1) buffer.
+    appsink.set_property("sync", false);
+    appsink.set_property("max-buffers", 1u32);
+    appsink.set_property("drop", true);
+    appsink.set_property("wait-on-eos", false);
+
+    // D3D paths with zero-copy produce texture-backed frames; download them to
+    // system memory first (videoconvert/x264enc cannot import D3D memory).
+    let download_factory = match (video_api, zero_copy_requested()) {
+        (RtpVideoApi::D3D11, true) => Some("d3d11download"),
+        (RtpVideoApi::D3D12, true) => Some("d3d12download"),
+        _ => None,
+    };
+    let download = match download_factory {
+        Some(factory) => Some(make_element(factory)?),
+        None => None,
+    };
+
+    // --- Video sub-branch ---
+    // The I420 frames are split after the capsfilter: one branch feeds the
+    // H.264 encoder (the recording), the other feeds a first-frame JPEG
+    // grabber used as the recording thumbnail in the gallery.
+    let thumb_tee = make_element("tee")?;
+    let thumb_valve = make_element("valve")?;
+    let thumb_queue = make_element("queue")?;
+    let thumb_encoder = make_element("jpegenc")?;
+    let thumb_appsink = make_element("appsink")?;
+    thumb_valve.set_property("drop", true);
+    // Gallery thumbnail: compressed at quality 70 so the recording-finished
+    // event stays light, and snapshot mode sends EOS right after the first
+    // frame so exactly one JPEG is ever encoded (the probe below closes the
+    // valve as a belt-and-suspenders guard).
+    thumb_encoder.set_property("quality", 70i32);
+    thumb_encoder.set_property("snapshot", true);
+    // Only the very first frame is needed; never back-pressure the recording
+    // branch if jpegenc lags (leaky, max 1 buffer).
+    thumb_queue.set_property_from_str("leaky", "downstream");
+    thumb_queue.set_property("max-size-buffers", 1u32);
+    thumb_queue.set_property("max-size-bytes", 0u32);
+    thumb_queue.set_property("max-size-time", 0u64);
+    thumb_appsink.set_property("sync", false);
+    thumb_appsink.set_property("max-buffers", 1u32);
+    thumb_appsink.set_property("drop", true);
+
+    let mut video_elements: Vec<gst::Element> = vec![valve.clone(), queue.clone()];
+    if let Some(download) = download {
+        video_elements.push(download);
+    }
+    video_elements.extend([convert, caps, thumb_tee.clone(), encoder.clone()]);
+
+    // --- Audio sub-branch (only when at least one audio tap exists) ---
+    // Each tap is normalized to identical caps (S16LE / 48 kHz / 2ch) before
+    // the mixer: audiomixer requires the same caps on every input pad, and the
+    // game-audio chain may carry e.g. 44.1 kHz mono while the WASAPI mic is
+    // 48 kHz stereo.
+    let mut audio_taps: Vec<gst::Element> = Vec::new();
+    for slot in [game_audio_tap, mic_audio_tap] {
+        if let Ok(guard) = slot.lock() {
+            if let Some(tap) = guard.clone() {
+                audio_taps.push(tap);
+            }
+        }
+    }
+    let mut audio_elements: Vec<gst::Element> = Vec::new();
+    // Shared chain after the per-tap normalization chains (mixer → valve → AAC).
+    let mut audio_shared: Vec<gst::Element> = Vec::new();
+    let audio_valve = if audio_taps.is_empty() {
+        send_log(
+            &event_sender,
+            "warn",
+            "Native recording has no audio source (game audio or mic tap); recording video only."
+                .to_owned(),
+        );
+        None
+    } else {
+        let mixer = make_element("audiomixer")?;
+        let audio_valve = make_element("valve")?;
+        let aac = make_element("voaacenc")?;
+        audio_valve.set_property("drop", true);
+        let tap_caps: gst::Caps = "audio/x-raw,format=S16LE,channels=2,rate=48000"
+            .parse()
+            .map_err(|error| format!("Invalid recording audio caps: {error}"))?;
+        // Per-tap normalization chains (audioresample → audioconvert → capsfilter).
+        for tap in &audio_taps {
+            let tap_resample = make_element("audioresample")?;
+            let tap_convert = make_element("audioconvert")?;
+            let tap_caps_element = make_element("capsfilter")?;
+            tap_caps_element.set_property("caps", &tap_caps);
+            for element in [&tap_resample, &tap_convert, &tap_caps_element] {
+                audio_elements.push(element.clone());
+            }
+            // The tap may still be linked to a previous (removed) mixer.
+            if let Some(src) = tap.static_pad("src") {
+                if let Some(peer) = src.peer() {
+                    let _ = src.unlink(&peer);
+                }
+            }
+            tap.link(&tap_resample).map_err(|error| {
+                format!("Failed to link audio tap into recording resample: {error:?}")
+            })?;
+            tap_resample.link(&tap_convert).map_err(|error| {
+                format!("Failed to link recording audio resample -> convert: {error:?}")
+            })?;
+            tap_convert.link(&tap_caps_element).map_err(|error| {
+                format!("Failed to link recording audio convert -> caps: {error:?}")
+            })?;
+            tap_caps_element.link(&mixer).map_err(|error| {
+                format!("Failed to link recording audio caps -> mixer: {error:?}")
+            })?;
+        }
+        audio_elements.extend([mixer.clone(), audio_valve.clone(), aac.clone()]);
+        audio_shared.extend([mixer, audio_valve.clone(), aac]);
+        Some(audio_valve)
+    };
+
+    let mut elements: Vec<gst::Element> =
+        Vec::with_capacity(video_elements.len() + audio_elements.len() + 4 + 2);
+    elements.extend(video_elements.iter().cloned());
+    elements.extend(audio_elements.iter().cloned());
+    elements.extend([
+        thumb_valve.clone(),
+        thumb_queue.clone(),
+        thumb_encoder.clone(),
+        thumb_appsink.clone(),
+    ]);
+    elements.extend([muxer.clone(), appsink.clone()]);
+
+    for element in &elements {
+        pipeline
+            .add(element)
+            .map_err(|error| format!("Failed to add recording branch element: {error}"))?;
+    }
+    tee.link(&valve)
+        .map_err(|error| format!("Failed to link video tap into recording branch: {error:?}"))?;
+    for pair in video_elements.windows(2) {
+        pair[0]
+            .link(&pair[1])
+            .map_err(|error| format!("Failed to link recording video branch: {error:?}"))?;
+    }
+    video_elements
+        .last()
+        .ok_or_else(|| "Recording video branch is empty.".to_owned())?
+        .link(&muxer)
+        .map_err(|error| format!("Failed to link x264enc -> mp4mux: {error:?}"))?;
+
+    // Thumbnail grabber off the I420 tee: valve → queue → jpegenc → appsink.
+    thumb_tee
+        .link(&thumb_valve)
+        .map_err(|error| format!("Failed to link recording thumbnail tee -> valve: {error:?}"))?;
+    thumb_valve
+        .link(&thumb_queue)
+        .map_err(|error| format!("Failed to link recording thumbnail valve -> queue: {error:?}"))?;
+    thumb_queue.link(&thumb_encoder).map_err(|error| {
+        format!("Failed to link recording thumbnail queue -> jpegenc: {error:?}")
+    })?;
+    thumb_encoder.link(&thumb_appsink).map_err(|error| {
+        format!("Failed to link recording thumbnail jpegenc -> appsink: {error:?}")
+    })?;
+
+    // Shared audio chain: mixer → valve → voaacenc → mp4mux. The per-tap
+    // normalization chains were already linked into the mixer above, so only
+    // the shared tail needs linking here.
+    for pair in audio_shared.windows(2) {
+        pair[0]
+            .link(&pair[1])
+            .map_err(|error| format!("Failed to link recording audio branch: {error:?}"))?;
+    }
+    if let Some(aac) = audio_shared.last() {
+        aac.link(&muxer)
+            .map_err(|error| format!("Failed to link voaacenc -> mp4mux: {error:?}"))?;
+    }
+
+    for element in &elements {
+        element
+            .sync_state_with_parent()
+            .map_err(|error| format!("Failed to sync recording branch element state: {error}"))?;
+    }
+
+    let eos_seen = Arc::new(AtomicBool::new(false));
+    // Inactive until the first `start()`; the chunk probe is gated on this so
+    // no muxer output is ever captured while the branch is idle.
+    let active = Arc::new(AtomicBool::new(false));
+    let appsink_sink_pad = appsink
+        .static_pad("sink")
+        .ok_or_else(|| "Recording appsink has no sink pad.".to_owned())?;
+
+    let chunk_sender = event_sender.clone();
+    let chunk_active = active.clone();
+    appsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if chunk_active.load(Ordering::SeqCst) {
+            if let Some(buffer) = info.buffer() {
+                if let Ok(mapped) = buffer.map_readable() {
+                    let chunk_base64 = BASE64_STANDARD.encode(mapped.as_slice());
+                    if let Some(sender) = &chunk_sender {
+                        let _ = sender.send(Event::RecordingChunk { chunk_base64 });
+                    }
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    let eos_flag = eos_seen.clone();
+    appsink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        if let Some(event) = info.event() {
+            if event.type_() == gst::EventType::Eos {
+                eos_flag.store(true, Ordering::SeqCst);
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    // Thumbnail capture: the very first JPEG frame is stored (base64) and the
+    // thumb valve closes immediately after, so jpegenc runs for exactly one
+    // frame per recording (zero cost while idle — valve starts closed).
+    let thumbnail = Arc::new(Mutex::new(None));
+    let thumb_slot = thumbnail.clone();
+    let thumb_gate = thumb_valve.clone();
+    let thumb_active = active.clone();
+    let thumb_sink_pad = thumb_appsink
+        .static_pad("sink")
+        .ok_or_else(|| "Thumbnail appsink has no sink pad.".to_owned())?;
+    thumb_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if !thumb_active.load(Ordering::SeqCst) {
+            return gst::PadProbeReturn::Ok;
+        }
+        let mut slot = match thumb_slot.lock() {
+            Ok(slot) => slot,
+            Err(_) => return gst::PadProbeReturn::Ok,
+        };
+        if slot.is_none() {
+            if let Some(buffer) = info.buffer() {
+                if let Ok(mapped) = buffer.map_readable() {
+                    *slot = Some(BASE64_STANDARD.encode(mapped.as_slice()));
+                    // One frame is enough; close the grabber so jpegenc idles.
+                    thumb_gate.set_property("drop", true);
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    let mut chain_desc = match download_factory {
+        Some(factory) => {
+            format!("tee → valve → queue → {factory} → videoconvert → x264enc → mp4mux → appsink")
+        }
+        None => "tee → valve → queue → videoconvert → x264enc → mp4mux → appsink".to_owned(),
+    };
+    if audio_valve.is_some() {
+        chain_desc.push_str(" | audiomixer → voaacenc → mp4mux");
+    }
+    chain_desc.push_str(" | thumbnail: tee → valve → jpegenc → appsink");
+    send_log(
+        &event_sender,
+        "info",
+        format!("Attached native recording branch ({chain_desc})."),
+    );
+
+    Ok(GstreamerRecordingState {
+        valve,
+        audio_valve,
+        thumb_valve,
+        thumbnail,
+        appsink,
+        elements,
+        tee: tee.clone(),
+        audio_taps,
+        eos_seen,
+        active,
+        spent: Arc::new(AtomicBool::new(false)),
+        event_sender,
+    })
+}
+
+/// Tear down a spent recording branch: unlink the audio taps from the mixer,
+/// unlink the video branch from the video tap tee, release the tee request
+/// pad, and remove the branch elements. Only called after a finalized (EOS)
+/// recording, when the branch is quiescent.
+fn teardown_recording_branch(pipeline: &gst::Pipeline, recording: &GstreamerRecordingState) {
+    for tap in &recording.audio_taps {
+        if let Some(src) = tap.static_pad("src") {
+            if let Some(peer) = src.peer() {
+                let _ = src.unlink(&peer);
+            }
+        }
+    }
+    if let Some(valve_sink_pad) = recording.valve.static_pad("sink") {
+        if let Some(tee_src_pad) = valve_sink_pad.peer() {
+            let _ = tee_src_pad.unlink(&valve_sink_pad);
+            recording.tee.release_request_pad(&tee_src_pad);
+        }
+    }
+    for element in recording.elements.iter().rev() {
+        let _ = element.set_state(gst::State::Null);
+        let _ = pipeline.remove(element);
+    }
+    send_log(
+        &recording.event_sender,
+        "info",
+        "Tore down finalized native recording branch (ready for a fresh branch).".to_owned(),
+    );
 }

@@ -14,6 +14,15 @@ const ENABLE_OUT_OF_FOCUS_FPS_ADJUSTMENT: bool = true;
 const ENABLE_240_FPS_SPLIT_ENCODE: bool = true;
 const ENABLE_DYNAMIC_SPLIT_ENCODE_UPDATES: bool = true;
 
+/// Official GFN value for the partially-reliable input channel's
+/// `maxPacketLifeTime` (a.k.a. `a=ri.partialReliableThresholdMs`). This is the
+/// retransmission window, NOT a send delay: packets are pushed to the wire
+/// immediately, and the lifetime only caps how long the sender will retransmit
+/// a lost packet before dropping it. 16 ms matches the official client, so
+/// mouse deltas are fire-and-forget under loss while keys/buttons (reliable
+/// channel) are unaffected.
+pub(crate) const OFFICIAL_PARTIAL_RELIABLE_THRESHOLD_MS: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IceCredentials {
     pub ufrag: String,
@@ -97,17 +106,16 @@ pub fn fix_server_ip(sdp: &str, server_ip: &str) -> String {
         .into_owned()
 }
 
-pub fn rewrite_ice_candidate_endpoint(
-    candidate: &str,
-    ip: &str,
-    port: u16,
-) -> (String, bool) {
+pub fn rewrite_ice_candidate_endpoint(candidate: &str, ip: &str, port: u16) -> (String, bool) {
     let ip = ip.trim();
     if ip.is_empty() || port == 0 {
         return (candidate.to_owned(), false);
     }
 
-    let mut parts: Vec<String> = candidate.split_whitespace().map(ToOwned::to_owned).collect();
+    let mut parts: Vec<String> = candidate
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect();
     if parts.len() < 6
         || !(parts[0].starts_with("candidate:") || parts[0].starts_with("a=candidate:"))
     {
@@ -124,11 +132,7 @@ pub fn rewrite_ice_candidate_endpoint(
     (rewritten, true)
 }
 
-pub fn rewrite_sdp_ice_candidate_endpoints(
-    sdp: &str,
-    ip: &str,
-    port: u16,
-) -> (String, usize) {
+pub fn rewrite_sdp_ice_candidate_endpoints(sdp: &str, ip: &str, port: u16) -> (String, usize) {
     let ending = line_ending(sdp);
     let mut replacements = 0usize;
     let lines = split_lines_lossless(sdp)
@@ -871,9 +875,8 @@ pub fn build_nvst_sdp(params: &NvstParams) -> String {
     let enable_partially_reliable_transfer_hid = params
         .enable_partially_reliable_transfer_hid
         .unwrap_or(hid_device_mask);
-    let min_target_frame_time_us = (1_000_000u32.saturating_mul(95)
-        / params.fps.max(1).saturating_mul(100))
-    .max(1000);
+    let min_target_frame_time_us =
+        (1_000_000u32.saturating_mul(95) / params.fps.max(1).saturating_mul(100)).max(1000);
 
     let mut lines = vec![
         "v=0".to_owned(),
@@ -1157,8 +1160,7 @@ mod tests {
             rewrite_sdp_ice_candidate_endpoints(&offer, "198.51.100.55", 18784);
 
         assert_eq!(replacements, 2);
-        assert!(rewritten
-            .contains("a=candidate:1 1 udp 2122260223 198.51.100.55 18784 typ host"));
+        assert!(rewritten.contains("a=candidate:1 1 udp 2122260223 198.51.100.55 18784 typ host"));
         assert!(rewritten.contains(
             "a=candidate:2 1 tcp 1518214911 198.51.100.55 18784 typ host tcptype active"
         ));

@@ -107,7 +107,38 @@ export function useSignalingEvents({
           // Keep client-side pipeline state (shaderActive) owned by StreamView
           // alive across the client's wholesale diagnostics snapshots.
           const snapshot = diagnosticsStore.getSnapshot();
-          diagnosticsStore.set({ ...stats, shaderActive: snapshot.shaderActive });
+          // In native mode the renderer client has no RTCPeerConnection, so
+          // its snapshot carries no video/network data and would clobber the
+          // native-streamer-reported fields (game FPS, server RTT/loss,
+          // capture path, bitrate) whenever it re-emits (e.g. mouse-path
+          // changes). Preserve those fields so the native HUD values and the
+          // packet-loss banner stay stable.
+          const preserved = snapshot.nativeRendererActive
+            ? {
+                gameFps: snapshot.gameFps,
+                rttMs: snapshot.rttMs,
+                packetLossPercent: snapshot.packetLossPercent,
+                nativePacketLossPercent: snapshot.nativePacketLossPercent,
+                bitrateKbps: snapshot.bitrateKbps,
+                targetBitrateKbps: snapshot.targetBitrateKbps,
+                decodeTimeMs: snapshot.decodeTimeMs,
+                lagReason: snapshot.lagReason,
+                lagReasonDetail: snapshot.lagReasonDetail,
+                nativeInputPath: snapshot.nativeInputPath,
+                nativeMouseDeltaLatencyUs: snapshot.nativeMouseDeltaLatencyUs,
+                nativeServerBitrateKbps: snapshot.nativeServerBitrateKbps,
+                nativeRequestedFps: snapshot.nativeRequestedFps,
+                nativeCapsFramerate: snapshot.nativeCapsFramerate,
+                nativeQueueMode: snapshot.nativeQueueMode,
+                nativeFramesPendingToPresent: snapshot.nativeFramesPendingToPresent,
+                nativePartialFlushCount: snapshot.nativePartialFlushCount,
+                nativeCompleteFlushCount: snapshot.nativeCompleteFlushCount,
+                nativeTransitionSummary: snapshot.nativeTransitionSummary,
+                nativeRequestedStreamingFeaturesSummary: snapshot.nativeRequestedStreamingFeaturesSummary,
+                nativeFinalizedStreamingFeaturesSummary: snapshot.nativeFinalizedStreamingFeaturesSummary,
+              }
+            : {};
+          diagnosticsStore.set({ ...stats, ...preserved, shaderActive: snapshot.shaderActive });
         },
         onTimeWarning: (warning) => {
           setRemoteStreamWarning({
@@ -211,6 +242,20 @@ export function useSignalingEvents({
           electronInputBridge,
         },
       );
+      // Native mode owns the microphone: the native streamer captures WASAPI
+      // and sends Opus over the negotiated mic m-line. The renderer WebRTC
+      // client has no peer connection here, so its getUserMedia capture is
+      // dead weight — stop it and mirror the native mic state in diagnostics
+      // (the native streamer starts unmuted when the mode is enabled).
+      if (settings.microphoneMode !== "disabled") {
+        client.stopMicrophone();
+        const snapshot = diagnosticsStore.getSnapshot();
+        diagnosticsStore.set({
+          ...snapshot,
+          micState: "started",
+          micEnabled: true,
+        });
+      }
       // The external native window exclusively owns Escape through RawInput.
       // Internal AND stacked mode leave Escape with Electron so it can prevent
       // Chromium's fullscreen exit and forward one synthetic tap to the native
@@ -322,6 +367,10 @@ export function useSignalingEvents({
           }
         } else if (event.type === "native-input-capture-changed") {
           setNativeInputCaptureActive(event.captured);
+          // When the native streamer captures input itself (stacked sink
+          // window: mouse + keyboard), the renderer's addon/pointer-lock/DOM
+          // sources stand down so the game never receives the same input twice.
+          clientRef.current?.setNativeStreamerInputOwned(event.captured);
           // Treat OS RawInput capture like pointer lock so main-process Escape
           // interception keeps Chromium from exiting fullscreen on tap.
           try {

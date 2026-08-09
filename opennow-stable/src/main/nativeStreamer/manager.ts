@@ -36,6 +36,7 @@ import {
   createNativeStreamerStatus,
   formatError,
 } from "./capabilities";
+import { appendRecordingChunk } from "../media/recordings";
 import { resolveNativeStreamerExecutableCandidates } from "./executableDiscovery";
 import {
   isNativeStreamerEvent,
@@ -79,6 +80,8 @@ const SESSION_START_TIMEOUT_MS = process.platform === "win32" ? 90000 : 45000;
 const SURFACE_UPDATE_TIMEOUT_MS = 15000;
 const OFFER_TIMEOUT_MS = 20000;
 const STOP_TIMEOUT_MS = 1200;
+const SCREENSHOT_TIMEOUT_MS = 5000;
+const RECORDING_STOP_TIMEOUT_MS = 5000;
 const MAX_INPUT_STDIN_BUFFER_BYTES = 64 * 1024;
 const MIN_NATIVE_BITRATE_KBPS = 5_000;
 const MAX_NATIVE_BITRATE_KBPS = 150_000;
@@ -105,6 +108,12 @@ export class NativeStreamerManager {
   private activeSessionId: string | null = null;
   private inputBackpressureWarned = false;
   private answerInFlight = false;
+  /** Captured by `handleEvent` for the in-flight `take-screenshot` request. */
+  private pendingScreenshot: { pngBase64: string; width: number; height: number } | null = null;
+  /** recordingId of the active native recording; chunks are appended to it. */
+  private activeNativeRecordingId: string | null = null;
+  /** Resolver for the in-flight `stop-recording` finalization wait. */
+  private pendingRecordingFinishedResolve: ((thumbnailBase64?: string) => void) | null = null;
   private queuedLocalIce: IceCandidatePayload[] = [];
   private queuedRemoteIceSessionId: string | null = null;
   private queuedRemoteIce: IceCandidatePayload[] = [];
@@ -357,6 +366,110 @@ export class NativeStreamerManager {
     }, CONTROL_TIMEOUT_MS).catch((error) => {
       console.warn("[NativeStreamer] Failed to update native shortcut bindings:", error);
     });
+  }
+
+  setMicrophoneEnabled(enabled: boolean): void {
+    if (!this.child || !this.activeSessionId) {
+      return;
+    }
+
+    void this.request({
+      type: "microphone",
+      microphoneEnabled: enabled,
+    }, CONTROL_TIMEOUT_MS).catch((error) => {
+      console.warn("[NativeStreamer] Failed to update native microphone state:", error);
+    });
+  }
+
+  /**
+   * Ask the native streamer to grab the last presented video frame as a PNG.
+   * The native process writes a `screenshot` event just before the `ok`
+   * response, so by the time `request()` resolves, `pendingScreenshot` holds
+   * the captured frame. Single-flight is guaranteed by the UI's in-flight
+   * guard, so a plain latest-wins slot is sufficient.
+   */
+  /**
+   * Start a native recording. Chunks flow back as `recording-chunk` events
+   * and are appended to the recording file (in order) by `handleEvent`.
+   */
+  async startNativeRecording(recordingId: string): Promise<void> {
+    if (!this.child || !this.activeSessionId) {
+      throw new Error("Native streamer is not running.");
+    }
+    this.activeNativeRecordingId = recordingId;
+    try {
+      await this.request({ type: "start-recording" }, CONTROL_TIMEOUT_MS);
+    } catch (error) {
+      this.activeNativeRecordingId = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Finalize the native recording: flush the encoder/muxer with EOS, wait for
+   * the `recording-finished` event (which arrives strictly after every chunk
+   * has been emitted and appended), then resolve.
+   */
+  async stopNativeRecording(): Promise<string | undefined> {
+    if (!this.child || !this.activeSessionId) {
+      this.activeNativeRecordingId = null;
+      throw new Error("Native streamer is not running.");
+    }
+
+    const finished = new Promise<string | undefined>((resolve) => {
+      this.pendingRecordingFinishedResolve = resolve;
+    });
+    let thumbnailBase64: string | undefined;
+    try {
+      await this.request({ type: "stop-recording", finalize: true }, RECORDING_STOP_TIMEOUT_MS);
+    } catch (error) {
+      this.pendingRecordingFinishedResolve = null;
+      this.activeNativeRecordingId = null;
+      throw error;
+    }
+    try {
+      thumbnailBase64 = await Promise.race([
+        finished,
+        new Promise<never>((_, reject) => {
+          const timeout = setTimeout(() => {
+            this.pendingRecordingFinishedResolve = null;
+            reject(new Error("Native recording did not finalize in time."));
+          }, 3000);
+          timeout.unref?.();
+        }),
+      ]);
+    } finally {
+      this.activeNativeRecordingId = null;
+    }
+    return thumbnailBase64;
+  }
+
+  /** Abort the native recording without finalizing (keeps the branch usable). */
+  async abortNativeRecording(): Promise<void> {
+    this.activeNativeRecordingId = null;
+    if (!this.child || !this.activeSessionId) {
+      return;
+    }
+    try {
+      await this.request({ type: "stop-recording", finalize: false }, CONTROL_TIMEOUT_MS);
+    } catch (error) {
+      console.warn("[NativeStreamer] Failed to abort native recording:", error);
+    }
+  }
+
+  async captureScreenshot(): Promise<{ pngBase64: string; width: number; height: number }> {
+    if (!this.child || !this.activeSessionId) {
+      throw new Error("Native streamer is not running.");
+    }
+
+    this.pendingScreenshot = null;
+    await this.request({ type: "take-screenshot" }, SCREENSHOT_TIMEOUT_MS);
+    const screenshot = this.pendingScreenshot;
+    this.pendingScreenshot = null;
+    if (!screenshot) {
+      throw new Error("Native streamer did not produce a screenshot frame.");
+    }
+    return screenshot;
   }
 
   async stop(reason = "stopped"): Promise<void> {
@@ -757,6 +870,36 @@ export class NativeStreamerManager {
         type: "native-stream-stats",
         stats: message.stats,
       });
+      return;
+    }
+
+    if (message.type === "screenshot") {
+      this.pendingScreenshot = message.screenshot;
+      return;
+    }
+
+    if (message.type === "recording-chunk") {
+      const recordingId = this.activeNativeRecordingId;
+      if (recordingId) {
+        const buffer = Buffer.from(message.chunkBase64, "base64");
+        void appendRecordingChunk({
+          recordingId,
+          // Buffer's underlying ArrayBuffer spans exactly the decoded bytes.
+          chunk: buffer.buffer.slice(
+            buffer.byteOffset,
+            buffer.byteOffset + buffer.byteLength,
+          ) as ArrayBuffer,
+        }).catch((error) => {
+          console.warn("[NativeStreamer] Failed to append native recording chunk:", error);
+        });
+      }
+      return;
+    }
+
+    if (message.type === "recording-finished") {
+      const resolve = this.pendingRecordingFinishedResolve;
+      this.pendingRecordingFinishedResolve = null;
+      resolve?.(message.thumbnailBase64);
       return;
     }
 

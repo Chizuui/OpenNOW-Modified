@@ -9,11 +9,13 @@ import type {
   NativeStreamerSessionContext,
   NativeStreamerShortcutBindings,
   NativeStreamerStatus,
+  ScreenshotEntry,
   SendAnswerRequest,
   Settings,
   SignalingConnectRequest,
 } from "@shared/gfn";
 import { GfnSignalingClient } from "../platforms/gfn/signaling";
+import { saveScreenshot } from "../media/screenshots";
 import { NativeStreamerManager } from "../nativeStreamer/manager";
 import { normalizeNativeInputPacket } from "../nativeStreamer/input";
 import { normalizeNativeRenderSurface } from "../nativeStreamer/surface";
@@ -149,6 +151,60 @@ export class SignalingCoordinator {
           return;
         }
         this.getNativeStreamerManager().updateBitrateLimit(maxBitrateKbps);
+      },
+    );
+
+    ipcMain.on(
+      IPC_CHANNELS.NATIVE_MICROPHONE,
+      (_event, enabled: boolean) => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          return;
+        }
+        this.getNativeStreamerManager().setMicrophoneEnabled(enabled === true);
+      },
+    );
+
+    ipcMain.handle(
+      IPC_CHANNELS.NATIVE_SCREENSHOT,
+      async (_event, payload: { gameTitle?: string }): Promise<ScreenshotEntry> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          throw new Error("Native streamer is not active for this session.");
+        }
+        const screenshot = await this.getNativeStreamerManager().captureScreenshot();
+        return saveScreenshot({
+          dataUrl: `data:image/png;base64,${screenshot.pngBase64}`,
+          gameTitle: payload?.gameTitle ?? "",
+        });
+      },
+    );
+
+    ipcMain.handle(
+      IPC_CHANNELS.NATIVE_RECORDING_START,
+      async (_event, recordingId: string): Promise<void> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          throw new Error("Native streamer is not active for this session.");
+        }
+        await this.getNativeStreamerManager().startNativeRecording(recordingId);
+      },
+    );
+
+    ipcMain.handle(
+      IPC_CHANNELS.NATIVE_RECORDING_STOP,
+      async (): Promise<void> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          throw new Error("Native streamer is not active for this session.");
+        }
+        await this.getNativeStreamerManager().stopNativeRecording();
+      },
+    );
+
+    ipcMain.handle(
+      IPC_CHANNELS.NATIVE_RECORDING_ABORT,
+      async (): Promise<void> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          return;
+        }
+        await this.getNativeStreamerManager().abortNativeRecording();
       },
     );
 

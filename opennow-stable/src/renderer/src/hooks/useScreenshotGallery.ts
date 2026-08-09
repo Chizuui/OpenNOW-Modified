@@ -5,11 +5,18 @@ import type { ScreenshotEntry } from "@shared/gfn";
 interface UseScreenshotGalleryOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   gameTitle: string;
+  /**
+   * When provided (native streamer mode), screenshots are captured from the
+   * native video chain instead of the renderer's <video> element, which has no
+   * frames in native mode.
+   */
+  nativeCaptureScreenshot?: () => Promise<ScreenshotEntry>;
 }
 
 export function useScreenshotGallery({
   videoRef,
   gameTitle,
+  nativeCaptureScreenshot,
 }: UseScreenshotGalleryOptions) {
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [isSavingScreenshot, setIsSavingScreenshot] = useState(false);
@@ -17,6 +24,7 @@ export function useScreenshotGallery({
   const [selectedScreenshotId, setSelectedScreenshotId] = useState<string | null>(null);
   const galleryStripRef = useRef<HTMLDivElement | null>(null);
   const screenshotApiAvailable =
+    typeof window.openNow?.captureNativeScreenshot === "function" &&
     typeof window.openNow?.saveScreenshot === "function" &&
     typeof window.openNow?.listScreenshots === "function" &&
     typeof window.openNow?.deleteScreenshot === "function" &&
@@ -52,14 +60,22 @@ export function useScreenshotGallery({
       return;
     }
 
-    const video = videoRef.current;
-    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
-      setGalleryError("Stream is not ready for screenshots yet.");
-      return;
-    }
-
     setIsSavingScreenshot(true);
     try {
+      // Native mode: the frame is captured in the native streamer (tee → PNG)
+      // and saved by the main process straight into the gallery.
+      if (nativeCaptureScreenshot) {
+        const saved = await nativeCaptureScreenshot();
+        setScreenshots((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)].slice(0, 60));
+        return;
+      }
+
+      const video = videoRef.current;
+      if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+        setGalleryError("Stream is not ready for screenshots yet.");
+        return;
+      }
+
       const canvas = document.createElement("canvas");
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -78,7 +94,7 @@ export function useScreenshotGallery({
     } finally {
       setIsSavingScreenshot(false);
     }
-  }, [gameTitle, isSavingScreenshot, screenshotApiAvailable, videoRef]);
+  }, [gameTitle, isSavingScreenshot, nativeCaptureScreenshot, screenshotApiAvailable, videoRef]);
 
   const scrollGallery = useCallback((direction: "left" | "right") => {
     const strip = galleryStripRef.current;

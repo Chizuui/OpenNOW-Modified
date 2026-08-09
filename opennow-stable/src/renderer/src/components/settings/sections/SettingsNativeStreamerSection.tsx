@@ -58,7 +58,13 @@ export function SettingsNativeStreamerSection({
   const [nativeStreamerStatusLoading, setNativeStreamerStatusLoading] = useState(false);
   const [probeElapsedSeconds, setProbeElapsedSeconds] = useState(0);
   const probeStartedAtRef = useRef<number | null>(null);
-  const [registryStatus, setRegistryStatus] = useState<{ registryExists: boolean; registryPath: string } | null>(null);
+  const [registryStatus, setRegistryStatus] = useState<{
+    registryExists: boolean;
+    registryPath: string;
+    scanInProgress: boolean;
+    lastStatus: string | null;
+    lastReason: string | null;
+  } | null>(null);
   const [clearingCache, setClearingCache] = useState(false);
   const [cacheCleared, setCacheCleared] = useState(false);
   const [nativeStreamerEnablePromptOpen, setNativeStreamerEnablePromptOpen] = useState(false);
@@ -128,7 +134,12 @@ export function SettingsNativeStreamerSection({
     setCacheCleared(false);
     try {
       const result = await window.openNow.clearGStreamerCache();
-      setRegistryStatus((prev) => (prev ? { ...prev, registryExists: false } : prev));
+      // Re-query live status: the main process starts rebuilding the registry in
+      // the background right away, so reflect that (and the in-progress scan).
+      window.openNow
+        .getGStreamerScanStatus()
+        .then(setRegistryStatus)
+        .catch(() => setRegistryStatus((prev) => (prev ? { ...prev, registryExists: false, scanInProgress: false } : prev)));
       setCacheCleared(true);
       console.log("[Settings] GStreamer cache cleared:", result);
     } catch (error) {
@@ -297,6 +308,26 @@ export function SettingsNativeStreamerSection({
 
               <div className="settings-row settings-row--column">
                 <div className="settings-row-top settings-row-top--compact">
+                  <label className="settings-label settings-label--wrap" htmlFor="settings-native-sink-input-capture">
+                    <span className="settings-label-title">{t("settings.nativeStreamer.sinkInputCapture")}</span>
+                  </label>
+                  <label className="settings-toggle">
+                    <input
+                      id="settings-native-sink-input-capture"
+                      type="checkbox"
+                      checked={settings.nativeSinkInputCapture}
+                      onChange={(e) => handleChange("nativeSinkInputCapture", e.target.checked)}
+                    />
+                    <span className="settings-toggle-track" />
+                  </label>
+                </div>
+                <span className="settings-subtle-hint">
+                  {t("settings.nativeStreamer.sinkInputCaptureHint")}
+                </span>
+              </div>
+
+              <div className="settings-row settings-row--column">
+                <div className="settings-row-top settings-row-top--compact">
                   <label className="settings-label settings-label--wrap" htmlFor="settings-native-external-renderer">
                     <span className="settings-label-title">{t("settings.nativeStreamer.externalRenderer")}</span>
                   </label>
@@ -405,12 +436,16 @@ export function SettingsNativeStreamerSection({
                   </div>
                   <span className="settings-subtle-hint">
                     {cacheCleared
-                      ? "Cache cleared — GStreamer will rebuild it in the background on the next launch."
-                      : "Clears the plugin registry cache. GStreamer re-scans automatically on startup and after GPU driver updates. Helpful after driver changes or if plugins stop loading."}
+                      ? "Cache cleared — GStreamer is rebuilding the engine in the background."
+                      : "Clears the plugin registry cache. GStreamer re-scans automatically on startup, after GPU driver updates, and right after clearing. Helpful after driver changes or if plugins stop loading."}
                   </span>
                   {registryStatus ? (
                     <span className="settings-subtle-hint">
-                      {registryStatus.registryExists ? "Cache present — fast startup enabled." : "No cache yet — will be built on next launch."}
+                      {registryStatus.scanInProgress
+                        ? "GStreamer engine is rebuilding in the background..."
+                        : registryStatus.registryExists
+                          ? "Cache present — fast startup enabled."
+                          : "No cache yet — GStreamer builds it in the background when needed."}
                     </span>
                   ) : null}
                 </div>

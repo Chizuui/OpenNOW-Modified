@@ -9,7 +9,7 @@ use crate::sdp::{
     extract_h265_fmtp_params, extract_ice_credentials, fix_server_ip, parse_resolution,
     prefer_codec, rewrite_sdp_ice_candidate_endpoints, sanitize_h265_fmtp_for_gstreamer,
     sanitize_ice_pwd_for_gstreamer, sdp_contains_codec, summarize_media_transport_attributes,
-    NvstParams, PreferCodecOptions,
+    NvstParams, PreferCodecOptions, OFFICIAL_PARTIAL_RELIABLE_THRESHOLD_MS,
 };
 use std::env;
 use std::sync::mpsc::Sender;
@@ -24,6 +24,10 @@ pub trait NativeStreamerBackend {
     fn update_render_surface(&mut self, command: CommandEnvelope) -> BackendReply;
     fn update_bitrate_limit(&mut self, command: CommandEnvelope) -> BackendReply;
     fn update_shortcuts(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn set_microphone_enabled(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn take_screenshot(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn start_recording(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn stop_recording(&mut self, command: CommandEnvelope) -> BackendReply;
     fn stop(&mut self, command: CommandEnvelope) -> BackendReply;
 }
 
@@ -176,14 +180,25 @@ pub fn prepare_native_offer(
         };
     let fixed_offer_sdp = duplicate_session_webrtc_attributes_to_media(&fixed_offer_sdp);
     let requested_codec = resolve_native_codec(context.settings.codec);
+    let user_fallback = context
+        .settings
+        .fallback_codec
+        .filter(|codec| *codec != requested_codec);
     // When the requested codec is missing from the server offer, do not leave
     // the video m-line unfiltered: GStreamer's webrtcbin would answer with
     // H265, and GFN servers that never advertised it send a stream that does
     // not match the negotiated answer (`not-negotiated` on the receive path,
-    // killing the session). Fall back to H264, which these servers always
+    // killing the session). Prefer the user's configured fallback codec when
+    // the server offers it, then fall back to H264, which these servers always
     // offer and reliably send.
     let codec = if sdp_contains_codec(&fixed_offer_sdp, requested_codec) {
         requested_codec
+    } else if let Some(fallback) = user_fallback {
+        if sdp_contains_codec(&fixed_offer_sdp, fallback) {
+            fallback
+        } else {
+            VideoCodec::H264
+        }
     } else {
         VideoCodec::H264
     };
@@ -191,7 +206,11 @@ pub fn prepare_native_offer(
     let fixed_offer_sdp = prefer_codec(
         &fixed_offer_sdp,
         codec,
-        codec_preference_options_for(context.settings.color_quality, codec_available),
+        codec_preference_options_for(
+            context.settings.color_quality,
+            codec_available,
+            user_fallback.is_some(),
+        ),
     );
     let (gstreamer_framerate_offer_sdp, gstreamer_framerate_adjusted) =
         align_video_sdp_framerate_for_gstreamer(&fixed_offer_sdp, context.settings.fps);
@@ -211,7 +230,7 @@ pub fn prepare_native_offer(
         height,
         fps: context.settings.fps,
         max_bitrate_kbps: context.settings.max_bitrate_mbps.saturating_mul(1000),
-        partial_reliable_threshold_ms: 16,
+        partial_reliable_threshold_ms: OFFICIAL_PARTIAL_RELIABLE_THRESHOLD_MS,
         codec,
         color_quality: context.settings.color_quality,
         credentials,
@@ -318,10 +337,15 @@ fn align_video_sdp_framerate_for_gstreamer(sdp: &str, fps: u32) -> (String, bool
 fn codec_preference_options_for(
     color_quality: ColorQuality,
     codec_available: bool,
+    user_fallback_specified: bool,
 ) -> PreferCodecOptions {
     PreferCodecOptions {
         prefer_hevc_profile_id: Some(preferred_hevc_profile_id(color_quality)),
-        keep_fallbacks: !codec_available,
+        // A user-configured fallback codec keeps the other payloads in the
+        // m-line (requested codec reordered first) so webrtcbin can negotiate
+        // the fallback when the server cannot deliver the requested codec,
+        // mirroring the web-mode `keepFallbacks` behavior.
+        keep_fallbacks: !codec_available || user_fallback_specified,
     }
 }
 
@@ -614,6 +638,40 @@ impl NativeStreamerBackend for StubBackend {
         BackendReply::response(Response::Ok { id: command.id })
     }
 
+    fn set_microphone_enabled(&mut self, command: CommandEnvelope) -> BackendReply {
+        if command.microphone_enabled.is_none() {
+            return BackendReply::response(missing_field(&command.id, "microphoneEnabled"));
+        }
+        if let Some(context) = self.active_context.as_mut() {
+            context.settings.microphone_enabled = command.microphone_enabled.unwrap_or(false);
+        }
+        BackendReply::response(Response::Ok { id: command.id })
+    }
+
+    fn take_screenshot(&mut self, command: CommandEnvelope) -> BackendReply {
+        BackendReply::response(Response::Error {
+            id: Some(command.id),
+            code: "screenshot-unavailable".to_owned(),
+            message: "Screenshot capture requires the GStreamer media backend.".to_owned(),
+        })
+    }
+
+    fn start_recording(&mut self, command: CommandEnvelope) -> BackendReply {
+        BackendReply::response(Response::Error {
+            id: Some(command.id),
+            code: "recording-unavailable".to_owned(),
+            message: "Recording requires the GStreamer media backend.".to_owned(),
+        })
+    }
+
+    fn stop_recording(&mut self, command: CommandEnvelope) -> BackendReply {
+        BackendReply::response(Response::Error {
+            id: Some(command.id),
+            code: "recording-unavailable".to_owned(),
+            message: "Recording requires the GStreamer media backend.".to_owned(),
+        })
+    }
+
     fn stop(&mut self, command: CommandEnvelope) -> BackendReply {
         self.active_context = None;
         let message = command
@@ -646,7 +704,9 @@ fn preferred_hevc_profile_id(color_quality: ColorQuality) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ColorQuality, NativeStreamerShortcutBindings, SessionInfo, StreamSettings};
+    use crate::protocol::{
+        ColorQuality, NativeStreamerShortcutBindings, SessionInfo, StreamSettings,
+    };
 
     fn context(resolution: &str) -> NativeStreamerSessionContext {
         NativeStreamerSessionContext {
@@ -670,7 +730,12 @@ mod tests {
                 codec: VideoCodec::H265,
                 color_quality: ColorQuality::TenBit420,
                 enable_cloud_gsync: false,
+                fallback_codec: None,
                 native_transition_diagnostics: None,
+                mouse_sensitivity: 1.0,
+                mouse_acceleration_percent: 1.0,
+                native_sink_input_capture: false,
+                microphone_enabled: false,
             },
             shortcuts: NativeStreamerShortcutBindings::default(),
             nvst_video: None,
@@ -849,13 +914,63 @@ mod tests {
     #[test]
     fn keeps_fallback_codecs_only_when_requested_codec_is_unavailable() {
         let quality = ColorQuality::EightBit420;
-        // Available codec -> historical strict filter (no fallbacks).
-        let strict = codec_preference_options_for(quality, true);
+        // Available codec, no user fallback -> historical strict filter.
+        let strict = codec_preference_options_for(quality, true, false);
         assert!(!strict.keep_fallbacks);
+        // Available codec but a user fallback was configured -> keep the other
+        // payloads so the fallback can negotiate if the server cannot deliver.
+        let user_fallback = codec_preference_options_for(quality, true, true);
+        assert!(user_fallback.keep_fallbacks);
         // Unavailable codec -> soft filter so webrtcbin can negotiate a
         // decodable codec instead of rejecting the whole video m-line.
-        let soft = codec_preference_options_for(quality, false);
+        let soft = codec_preference_options_for(quality, false, false);
         assert!(soft.keep_fallbacks);
+    }
+
+    #[test]
+    fn prefers_user_fallback_codec_when_requested_codec_missing_from_offer() {
+        let offer = [
+            "v=0",
+            "a=group:BUNDLE 0 1",
+            "a=ice-ufrag:user",
+            "a=ice-pwd:pass",
+            "a=fingerprint:sha-256 AA:BB",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=rtpmap:111 OPUS/48000/2",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99",
+            "a=rtpmap:96 H264/90000",
+            "a=rtpmap:97 rtx/90000",
+            "a=fmtp:97 apt=96",
+            "a=rtpmap:98 H265/90000",
+            "a=rtpmap:99 rtx/90000",
+            "a=fmtp:99 apt=98",
+        ]
+        .join("\n");
+
+        let mut ctx = context("1920x1080");
+        ctx.settings.codec = VideoCodec::AV1;
+        ctx.settings.fallback_codec = Some(VideoCodec::H265);
+        let prepared = prepare_native_offer(&ctx, &offer).expect("valid offer");
+
+        // AV1 was requested but never advertised: land on the user's configured
+        // H265 fallback (offered by the server) instead of the H264 safety net.
+        assert_eq!(prepared.requested_codec, VideoCodec::AV1);
+        assert_eq!(prepared.nvst_params.codec, VideoCodec::H265);
+        assert!(prepared
+            .gstreamer_offer_sdp
+            .contains("a=rtpmap:98 H265/90000"));
+
+        // A fallback the server does not offer still lands on H264.
+        let mut ctx = context("1920x1080");
+        ctx.settings.codec = VideoCodec::AV1;
+        ctx.settings.fallback_codec = Some(VideoCodec::H265);
+        let offer_h264_only = offer
+            .replace(" 98 99", "")
+            .replace("a=rtpmap:98 H265/90000\n", "")
+            .replace("a=rtpmap:99 rtx/90000\n", "")
+            .replace("a=fmtp:99 apt=98\n", "");
+        let prepared = prepare_native_offer(&ctx, &offer_h264_only).expect("valid offer");
+        assert_eq!(prepared.nvst_params.codec, VideoCodec::H264);
     }
 
     #[test]

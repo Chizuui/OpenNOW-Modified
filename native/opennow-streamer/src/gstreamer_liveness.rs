@@ -1,5 +1,9 @@
 use crate::gstreamer_backend::send_log;
 use crate::gstreamer_config::{use_external_renderer_window, use_stacked_renderer};
+use crate::gstreamer_input::{
+    stats_channel_bitrate_kbps, stats_channel_game_fps, stats_channel_packet_loss_fraction,
+    stats_channel_rtt_ms,
+};
 use crate::gstreamer_pipeline::{configure_queue, set_property_if_supported};
 use crate::gstreamer_transitions::{
     format_transition_summary, resolve_queue_mode, TransitionSnapshot, TransitionTelemetry,
@@ -8,6 +12,7 @@ use crate::gstreamer_transitions::{
 use crate::protocol::{Event, NativeQueueMode, NativeStreamerSessionContext, VideoStallEvent};
 use gst::prelude::*;
 use gstreamer as gst;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -26,6 +31,11 @@ const VIDEO_STARTUP_KEYFRAME_MS: u64 = 2_500;
 const VIDEO_STARTUP_RESYNC_MS: u64 = 5_000;
 const VIDEO_STARTUP_FATAL_MS: u64 = 8_000;
 const VIDEO_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Upper bound on the decode-timestamp queue used to measure decode→present
+/// latency. 60fps ≈ 120 entries/second; 512 covers ~4s before old samples
+/// start dropping, which only happens if the sink stalls (latency then reads
+/// stale and is ignored anyway).
+const DECODE_TIMESTAMP_QUEUE_MAX: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct VideoRateSnapshot {
@@ -141,6 +151,11 @@ pub(crate) struct VideoLivenessState {
     first_startup_audio_ms: AtomicU64,
     decoded_total: AtomicU64,
     sink_total: AtomicU64,
+    /// Decode finish timestamps, popped one per sink present to measure the
+    /// decode→present pipeline latency (filled into the HUD "Decode time").
+    decode_timestamps: Mutex<VecDeque<u64>>,
+    /// EMA of decode→present latency in ms.
+    avg_decode_present_ms: AtomicU32,
     zero_copy_d3d11: AtomicBool,
     zero_copy_d3d12: AtomicBool,
     rtp_video_src_pad: Mutex<Option<gst::Pad>>,
@@ -179,6 +194,8 @@ impl VideoLivenessState {
             first_startup_audio_ms: AtomicU64::new(0),
             decoded_total: AtomicU64::new(0),
             sink_total: AtomicU64::new(0),
+            decode_timestamps: Mutex::new(VecDeque::new()),
+            avg_decode_present_ms: AtomicU32::new(0),
             zero_copy_d3d11: AtomicBool::new(false),
             zero_copy_d3d12: AtomicBool::new(false),
             rtp_video_src_pad: Mutex::new(None),
@@ -326,13 +343,40 @@ impl VideoLivenessState {
     }
 
     pub(crate) fn record_decoded_buffer(&self) {
-        self.last_decoded_ms.store(self.now_ms(), Ordering::Relaxed);
+        let now_ms = self.now_ms();
+        self.last_decoded_ms.store(now_ms, Ordering::Relaxed);
         self.decoded_total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut timestamps) = self.decode_timestamps.lock() {
+            timestamps.push_back(now_ms);
+            if timestamps.len() > DECODE_TIMESTAMP_QUEUE_MAX {
+                timestamps.pop_front();
+            }
+        }
     }
 
     pub(crate) fn record_sink_buffer(&self) {
-        self.last_sink_ms.store(self.now_ms(), Ordering::Relaxed);
+        let now_ms = self.now_ms();
+        self.last_sink_ms.store(now_ms, Ordering::Relaxed);
         self.sink_total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut timestamps) = self.decode_timestamps.lock() {
+            if let Some(decoded_at_ms) = timestamps.pop_front() {
+                let delta = now_ms.saturating_sub(decoded_at_ms) as u32;
+                let current = self.avg_decode_present_ms.load(Ordering::Relaxed);
+                let next = if current == 0 {
+                    delta
+                } else {
+                    // EMA (75% history, 25% latest) — smooths frame-to-frame jitter.
+                    (current * 3 + delta) / 4
+                };
+                self.avg_decode_present_ms.store(next, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Average decode→present latency in ms (None until the first present).
+    fn avg_decode_present_ms(&self) -> Option<u32> {
+        let value = self.avg_decode_present_ms.load(Ordering::Relaxed);
+        (value > 0).then_some(value)
     }
 
     pub(crate) fn update_caps(&self, caps: &str) {
@@ -739,6 +783,7 @@ fn run_video_liveness_watchdog(
 ) {
     let mut tracker = VideoStallTracker::default();
     let mut last_rate_at = Instant::now();
+    let mut last_health_at = Instant::now();
     let mut last_encoded_bytes_total = state.encoded_bytes_total.load(Ordering::Relaxed);
     let mut last_decoded_total = state.decoded_total.load(Ordering::Relaxed);
     let mut last_sink_total = state.sink_total.load(Ordering::Relaxed);
@@ -767,6 +812,7 @@ fn run_video_liveness_watchdog(
                 decoded_fps: decoded_total.saturating_sub(last_decoded_total) as f64 / elapsed_secs,
                 sink_fps: sink_total.saturating_sub(last_sink_total) as f64 / elapsed_secs,
             };
+            let local_rtcp_rtt_ms = query_rtcp_rtt_ms(&pipeline);
             update_native_stats_overlay(
                 &sink,
                 &state,
@@ -774,6 +820,7 @@ fn run_video_liveness_watchdog(
                 rates,
                 decoded_total,
                 sink_total,
+                local_rtcp_rtt_ms,
             );
             emit_native_stats_event(
                 &event_sender,
@@ -783,7 +830,44 @@ fn run_video_liveness_watchdog(
                 rates,
                 decoded_total,
                 sink_total,
+                local_rtcp_rtt_ms,
             );
+            // Fine-grained network health: the server RTT field vs the local
+            // RTCP LSR/DLSR measurement + local signals, logged every 5s so a
+            // single throttled session shows whether the server RTT actually
+            // tracks degradation (or stays static — the trigger for switching
+            // the HUD ping to the local RTCP source).
+            if last_health_at.elapsed() >= Duration::from_secs(5) {
+                last_health_at = Instant::now();
+                let server_rtt = stats_channel_rtt_ms();
+                let loss_percent = stats_channel_packet_loss_fraction()
+                    .map(|loss| loss * 100.0)
+                    .unwrap_or(-1.0);
+                let sink_stats = read_sink_stats(&sink);
+                let sink_dropped = sink_stats.dropped.unwrap_or(0);
+                let sink_rendered = sink_stats.rendered.unwrap_or(sink_total);
+                let sink_total_now = sink_rendered.saturating_add(sink_dropped);
+                let drop_percent = if sink_total_now > 0 {
+                    (sink_dropped as f64 / sink_total_now as f64) * 100.0
+                } else {
+                    0.0
+                };
+                send_log(
+                    &event_sender,
+                    "info",
+                    format!(
+                        "[NetworkHealth] server rtt={}ms loss={:.4}% rtcp={} sinkDrop={:.2}% sink={:.1}fps bitrate={:.1}Mbps",
+                        server_rtt,
+                        loss_percent,
+                        local_rtcp_rtt_ms
+                            .map(|rtt| format!("{rtt}ms"))
+                            .unwrap_or_else(|| "n/a (receiver-only)".to_owned()),
+                        drop_percent,
+                        rates.sink_fps,
+                        rates.encoded_kbps / 1000.0,
+                    ),
+                );
+            }
             last_encoded_bytes_total = encoded_bytes_total;
             last_decoded_total = decoded_total;
             last_sink_total = sink_total;
@@ -1114,6 +1198,58 @@ fn request_upstream_key_unit(state: &VideoLivenessState, event_sender: &Option<S
     }
 }
 
+/// Query the LOCAL RTCP round-trip time from the webrtcbin's internal rtpbin
+/// session stats. `rtpsession` computes this from Receiver Reports the server
+/// sends about OUR outgoing RTP streams (the LSR/DLSR algorithm — the exact
+/// "round-trip from Receiver Report" measurement) and exposes it as
+/// `rb-round-trip` (16.16 fixed-point seconds) in the session's
+/// `source-stats`.
+///
+/// A receiver-only pipeline gets `None`: the server only sends RRs for RTP
+/// streams it receives, and the native pipeline currently sends no RTP (mic
+/// audio rides the renderer peer connection in web mode). When outgoing RTP
+/// exists, this becomes the preferred local ping — independent of the
+/// server-reported stats_channel field.
+fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
+    let webrtc = pipeline.by_name("opennow-webrtcbin")?;
+    let webrtc_bin = webrtc.downcast::<gst::Bin>().ok()?;
+    let rtpbin = webrtc_bin.children().into_iter().find(|child| {
+        child
+            .factory()
+            .is_some_and(|factory| factory.name() == "rtpbin")
+    })?;
+    let rtpbin_bin = rtpbin.downcast::<gst::Bin>().ok()?;
+    for session in rtpbin_bin.children() {
+        // Only rtpsession elements expose a "stats" property; guard before
+        // querying because `property()` panics on a missing property.
+        if session.find_property("stats").is_none() {
+            continue;
+        }
+        let stats = session.property::<gst::Structure>("stats");
+        let Ok(source_stats) = stats.value("source-stats") else {
+            continue;
+        };
+        let Ok(sources) = source_stats.get::<gst::glib::ValueArray>() else {
+            continue;
+        };
+        for source in sources.iter() {
+            let Ok(source) = source.get::<gst::Structure>() else {
+                continue;
+            };
+            if source.get::<bool>("have-rb").unwrap_or(false) {
+                if let Ok(rtt_fixed) = source.get::<u32>("rb-round-trip") {
+                    // 16.16 fixed point: value / 65536 seconds → ms.
+                    let rtt_ms = (f64::from(rtt_fixed) / 65536.0 * 1000.0).round();
+                    if rtt_ms > 0.0 && rtt_ms <= 2000.0 {
+                        return Some(rtt_ms as u32);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn emit_native_stats_event(
     event_sender: &Option<Sender<Event>>,
     sink: &gst::Element,
@@ -1122,6 +1258,7 @@ fn emit_native_stats_event(
     rates: VideoRateSnapshot,
     frames_decoded: u64,
     frames_rendered: u64,
+    local_rtcp_rtt_ms: Option<u32>,
 ) {
     let Some(event_sender) = event_sender else {
         return;
@@ -1150,6 +1287,11 @@ fn emit_native_stats_event(
         .unwrap_or_default();
     let sink_stats = read_sink_stats(sink);
     let telemetry = state.transition_telemetry_snapshot();
+    let game_fps = stats_channel_game_fps();
+    let rtt_ms = crate::gstreamer_input::stats_channel_rtt_ms();
+    let input_path = crate::gstreamer_input::native_input_path().to_owned();
+    let mouse_delta_latency_us =
+        crate::gstreamer_input::mouse_delta_latency_us().map(|(ema_us, _, _)| ema_us);
     let _ = event_sender.send(Event::Stats {
         stats: crate::protocol::NativeStatsEvent {
             codec,
@@ -1162,6 +1304,15 @@ fn emit_native_stats_event(
             bitrate_performance_percent,
             decoded_fps: rates.decoded_fps,
             render_fps: rates.sink_fps,
+            game_fps: (game_fps > 0).then_some(game_fps),
+            network_rtt_ms: (rtt_ms > 0).then_some(rtt_ms),
+            local_rtcp_rtt_ms,
+            network_packet_loss_percent: stats_channel_packet_loss_fraction()
+                .map(|loss| loss * 100.0),
+            network_bitrate_kbps: stats_channel_bitrate_kbps(),
+            decode_time_ms: state.avg_decode_present_ms(),
+            input_path,
+            mouse_delta_latency_us,
             frames_decoded,
             frames_rendered,
             frames_pending_to_present: frames_decoded.saturating_sub(frames_rendered),
@@ -1201,6 +1352,7 @@ fn update_native_stats_overlay(
     rates: VideoRateSnapshot,
     _frames_decoded: u64,
     frames_rendered: u64,
+    local_rtcp_rtt_ms: Option<u32>,
 ) {
     let target_bitrate_kbps = state.target_bitrate_kbps.load(Ordering::Relaxed);
     let bitrate_performance_percent = if target_bitrate_kbps > 0 {
@@ -1240,15 +1392,31 @@ fn update_native_stats_overlay(
     } else {
         memory_mode
     };
+    let rtt_ms = crate::gstreamer_input::stats_channel_rtt_ms();
+    // Prefer the LOCAL RTCP round-trip (LSR/DLSR from RRs the server sends
+    // about our outgoing RTP) over the server-reported stats_channel field
+    // whenever it is available; "-" until any source reports.
+    let ping_ms = local_rtcp_rtt_ms.or((rtt_ms > 0).then_some(rtt_ms));
+    // Server-reported session bitrate (stats_channel counter, confidence-gated
+    // in the native streamer); "-" until enough consistent samples confirm the
+    // counter is cumulative bytes.
+    let server_bitrate = stats_channel_bitrate_kbps()
+        .map(|kbps| format!("{:.1}", f64::from(kbps) / 1000.0))
+        .unwrap_or_else(|| "-".to_owned());
     let text = format!(
-        "{} {}  {:.1}/{:.1} Mbps  Bit {:.0}%\nDecode {:.0}fps  Render {:.0}fps  Drop {:.2}%  {}",
+        "{} {}  {:.1}/{:.1} Mbps  Bit {:.0}%  Ping {}ms  Srv {} Mbps\nGame {:.0}fps  Stream {:.0}fps  Decode {:.0}fps  Drop {:.2}%  {}",
         codec,
         resolution,
         bitrate_mbps,
         target_mbps,
         bitrate_performance_percent,
-        rates.decoded_fps,
+        ping_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "-".to_owned()),
+        server_bitrate,
+        // Server-reported game render FPS (stats_channel) — the real game rate,
+        // which can exceed the negotiated stream FPS; 0 until the first frame.
+        f64::from(stats_channel_game_fps()),
         rates.sink_fps,
+        rates.decoded_fps,
         drop_percent,
         if hardware_acceleration.is_empty() {
             memory_path
