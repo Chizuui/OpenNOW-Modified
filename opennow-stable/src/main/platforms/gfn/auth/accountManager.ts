@@ -23,6 +23,10 @@ export class AccountManager {
     void this.state.persist();
   }
 
+  getSession(): AuthSession | null {
+    return this.state.accounts.getSession();
+  }
+
   getSavedAccounts(): SavedAccount[] {
     return this.state.accounts.getSavedAccounts();
   }

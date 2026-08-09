@@ -308,7 +308,7 @@ export class AuthService {
   }
 
   /** Logout dengan best-effort revoke sesi ChizuiLogin di server (gagal → abaikan). */
-  private async logoutWithChizuiRevoke(): Promise<void> {
+  async logoutWithChizuiRevoke(): Promise<void> {
     await this.revokeChizuiSession(this.accountManager.getSession());
     await this.accountManager.logout();
   }

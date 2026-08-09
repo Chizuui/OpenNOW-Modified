@@ -32,6 +32,15 @@ function session(userId: string): AuthSession {
   };
 }
 
+test("AccountManager exposes the active session for logout/revoke flows", () => {
+  const state = new PersistedAccountState("unused-auth-state.json");
+  const active = session("active");
+  state.accounts.setSession(active);
+  const manager = new AccountManager(state, () => {});
+
+  assert.equal(manager.getSession()?.user.userId, "active");
+});
+
 test("AccountManager removes an incomplete switched account and restores the prior account", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "opennow-auth-account-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
