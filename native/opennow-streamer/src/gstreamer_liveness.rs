@@ -4087,6 +4087,7 @@ mod stacked_window_dance_diagnostics {
             &pipeline,
             &tee,
             crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
             &no_tap,
             &no_tap,
             None,
@@ -4101,6 +4102,68 @@ mod stacked_window_dance_diagnostics {
             linked,
             "mp4mux src pad must be linked to the appsink sink pad; without it the muxer never aggregates (no chunks) and EOS never finalizes"
         );
+    }
+
+    /// Regression guard for the field start-recording timeout: a live audio
+    /// tap must be attachable without waiting for mp4mux to become PLAYING.
+    /// With no requested audio pad and closed valves, mp4mux is legitimately
+    /// PAUSED until the first buffers arrive; the production code must still
+    /// return start-recording promptly and must not back-pressure the live tap.
+    #[test]
+    fn recording_audio_start_does_not_wait_for_paused_muxer() {
+        gst::init().expect("gstreamer init");
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let pipeline = gst::Pipeline::new();
+        let audio_src = gst::ElementFactory::make("audiotestsrc")
+            .property("is-live", true)
+            .build()
+            .expect("audio source");
+        let audio_tee = gst::ElementFactory::make("tee")
+            .name("recording-start-audio-tee")
+            .build()
+            .expect("audio tee");
+        let audio_sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .expect("audio sink");
+        pipeline
+            .add_many([&audio_src, &audio_tee, &audio_sink])
+            .expect("add audio source");
+        audio_src.link(&audio_tee).expect("audio source -> tee");
+        audio_tee.link(&audio_sink).expect("audio tee -> sink");
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("play audio source");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let game_audio_tap = Arc::new(Mutex::new(Some(audio_tee.clone())));
+        let no_mic: Arc<Mutex<Option<gst::Element>>> = Arc::new(Mutex::new(None));
+        let video_tee = gst::ElementFactory::make("tee")
+            .name("recording-start-video-tee")
+            .build()
+            .expect("video tee");
+        pipeline.add(&video_tee).expect("add video tee");
+        let state = crate::gstreamer_pipeline::insert_recording_branch(
+            &pipeline,
+            &video_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            &game_audio_tap,
+            &no_mic,
+            None,
+        )
+        .expect("insert recording branch");
+        let started_at = Instant::now();
+        state.start().expect("start recording");
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "start-recording must not wait for mp4mux preroll"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        state.stop(false).expect("abort recording");
+        let _ = pipeline.set_state(gst::State::Null);
     }
 
     /// Faithful production-sequence reproduction of the field failure
