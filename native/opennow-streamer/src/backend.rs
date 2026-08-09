@@ -208,6 +208,7 @@ pub fn prepare_native_offer(
         &fixed_offer_sdp,
         codec,
         codec_preference_options_for(
+            codec,
             context.settings.color_quality,
             codec_available,
             user_fallback.is_some(),
@@ -336,17 +337,24 @@ fn align_video_sdp_framerate_for_gstreamer(sdp: &str, fps: u32) -> (String, bool
 /// negotiated RTP pad caps) and the NVST SDP rebuild already follow whatever
 /// codec is negotiated.
 fn codec_preference_options_for(
+    codec: VideoCodec,
     color_quality: ColorQuality,
     codec_available: bool,
     user_fallback_specified: bool,
 ) -> PreferCodecOptions {
     PreferCodecOptions {
         prefer_hevc_profile_id: Some(preferred_hevc_profile_id(color_quality)),
-        // A user-configured fallback codec keeps the other payloads in the
-        // m-line (requested codec reordered first) so webrtcbin can negotiate
-        // the fallback when the server cannot deliver the requested codec,
-        // mirroring the web-mode `keepFallbacks` behavior.
-        keep_fallbacks: !codec_available || user_fallback_specified,
+        // Soft filter when the requested codec is H265: the 03:51 field log's
+        // explicit-H265 session used a strict H265-only offer (H264 dropped)
+        // and received real video RTP (23 Mbps) but never decoded a single
+        // frame (no decoded caps, no sink reveal → black screen), while every
+        // session whose offer kept the H264 fallback decoded fine. Keeping the
+        // fallbacks mirrors the empirically-working offer shape; RFC 3264
+        // answerer-picks-first still lets the requested codec win.
+        // A user-configured fallback codec also keeps the other payloads in
+        // the m-line so webrtcbin can negotiate the fallback when the server
+        // cannot deliver the requested codec (web-mode `keepFallbacks`).
+        keep_fallbacks: !codec_available || user_fallback_specified || codec == VideoCodec::H265,
     }
 }
 
@@ -850,17 +858,15 @@ mod tests {
 
         let prepared = prepare_native_offer(&context("1920x1080"), &offer).expect("valid offer");
 
-        // H265 is the requested codec. In the default (non-GStreamer) build the
-        // availability probe is conservative (`native_codec_available` returns
-        // true), so the offer is hard-filtered to H265. In a GStreamer build the
-        // outcome depends on the machine's decode capabilities: when H265 is
-        // decodable the m-line is strict, otherwise soft mode keeps the
-        // fallbacks with H265 still reordered to the front. Both shapes keep
-        // H265 + its RTX/FEC at the head of the video m-line, so only the
-        // absence of the other codecs is gated to the non-GStreamer build.
+        // H265 is the requested codec. H265 offers are ALWAYS soft-filtered
+        // (field-log regression 2026-08-09: the strict H265-only offer
+        // received real video RTP but never decoded a single frame, while
+        // every offer that kept the other codecs decoded fine), so H265 + its
+        // RTX/FEC stay at the head of the video m-line and the other codecs
+        // are kept as fallbacks in every build.
         assert!(prepared
             .gstreamer_offer_sdp
-            .contains("m=video 9 UDP/TLS/RTP/SAVPF 98 99 100"));
+            .contains("m=video 9 UDP/TLS/RTP/SAVPF 98 96 97 99 100"));
         assert!(prepared
             .gstreamer_offer_sdp
             .contains("a=rtpmap:98 H265/90000"));
@@ -870,15 +876,14 @@ mod tests {
         assert!(prepared
             .gstreamer_offer_sdp
             .contains("a=rtpmap:100 flexfec-03/90000"));
-        #[cfg(not(feature = "gstreamer"))]
-        {
-            assert!(!prepared
-                .gstreamer_offer_sdp
-                .contains("a=rtpmap:96 AV1/90000"));
-            assert!(!prepared
-                .gstreamer_offer_sdp
-                .contains("a=rtpmap:97 rtx/90000"));
-        }
+        // Soft mode keeps the other codecs so webrtcbin can negotiate a
+        // decodable fallback instead of hanging on a strict single codec.
+        assert!(prepared
+            .gstreamer_offer_sdp
+            .contains("a=rtpmap:96 AV1/90000"));
+        assert!(prepared
+            .gstreamer_offer_sdp
+            .contains("a=rtpmap:97 rtx/90000"));
     }
 
     #[test]
@@ -923,16 +928,20 @@ mod tests {
     #[test]
     fn keeps_fallback_codecs_only_when_requested_codec_is_unavailable() {
         let quality = ColorQuality::EightBit420;
-        // Available codec, no user fallback -> historical strict filter.
-        let strict = codec_preference_options_for(quality, true, false);
+        // Available H264, no user fallback -> historical strict filter.
+        let strict = codec_preference_options_for(VideoCodec::H264, quality, true, false);
         assert!(!strict.keep_fallbacks);
+        // H265 is always soft-filtered (field-log regression: the strict
+        // H265-only offer received RTP but never decoded a frame).
+        let h265 = codec_preference_options_for(VideoCodec::H265, quality, true, false);
+        assert!(h265.keep_fallbacks);
         // Available codec but a user fallback was configured -> keep the other
         // payloads so the fallback can negotiate if the server cannot deliver.
-        let user_fallback = codec_preference_options_for(quality, true, true);
+        let user_fallback = codec_preference_options_for(VideoCodec::H264, quality, true, true);
         assert!(user_fallback.keep_fallbacks);
         // Unavailable codec -> soft filter so webrtcbin can negotiate a
         // decodable codec instead of rejecting the whole video m-line.
-        let soft = codec_preference_options_for(quality, false, false);
+        let soft = codec_preference_options_for(VideoCodec::H264, quality, false, false);
         assert!(soft.keep_fallbacks);
     }
 

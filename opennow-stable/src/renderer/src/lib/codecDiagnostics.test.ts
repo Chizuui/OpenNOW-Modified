@@ -8,13 +8,14 @@ import {
   getGpuDriverSubtitle,
   isCodecUsableForStream,
   resolveEffectiveCodec,
+  resolveNativeCodecAvailability,
   resolveStreamProfileCodec,
   resolveSupportedStreamCodecs,
   shouldShowLinuxHardwareCodecHint,
   shouldShowQuickSyncDriverHint,
   type CodecTestResult,
 } from "./codecDiagnostics";
-import type { GpuBackendInfo } from "@shared/gfn";
+import type { GpuBackendInfo, NativeStreamerStatus } from "@shared/gfn";
 
 function withNavigator(platform: string, userAgent: string, run: () => void): void {
   const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
@@ -322,4 +323,165 @@ test("gpu driver subtitle returns null when no identity is known", () => {
     hardwareEncodeCodecs: [],
   };
   assert.equal(getGpuDriverSubtitle(empty), null);
+});
+
+function nativeStatus(overrides: Partial<NativeStreamerStatus> = {}): NativeStreamerStatus {
+  const d3d12 = {
+    backend: "d3d12",
+    platform: "windows",
+    codecs: [
+      { codec: "h264", available: true, decoder: "d3d12h264dec" },
+      { codec: "h265", available: true, decoder: "d3d12h265dec" },
+      { codec: "av1", available: true, decoder: "d3d12av1dec" },
+    ],
+    zeroCopyModes: ["D3D12Memory"],
+    sink: "d3d12videosink",
+    available: true,
+  };
+  return {
+    detected: true,
+    gstreamerAvailable: true,
+    supportsOfferAnswer: true,
+    backend: "gstreamer",
+    videoBackends: [
+      d3d12,
+      {
+        backend: "software",
+        platform: "cross-platform",
+        codecs: [
+          { codec: "h264", available: true, decoder: "avdec_h264" },
+          { codec: "h265", available: true, decoder: "avdec_h265" },
+          { codec: "av1", available: true, decoder: "dav1ddec" },
+        ],
+        zeroCopyModes: [],
+        sink: "autovideosink",
+        available: true,
+      },
+      {
+        backend: "videotoolbox",
+        platform: "macos",
+        codecs: [
+          { codec: "h264", available: false, decoder: "vtdec_h264", reason: "does not run on windows" },
+        ],
+        zeroCopyModes: [],
+        available: false,
+      },
+    ],
+    activeVideoBackend: d3d12,
+    gstreamerRuntime: { source: "bundled", bundled: true, message: "ok" },
+    message: "ok",
+    ...overrides,
+  };
+}
+
+test("native codec availability resolves decodable codecs from the active backend", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    const availability = resolveNativeCodecAvailability(nativeStatus());
+    assert.ok(availability);
+    // The active D3D12 backend decodes all three codecs in hardware.
+    assert.deepEqual([...availability!.codecs].sort(), ["AV1", "H264", "H265"]);
+    assert.equal(availability!.hardware, true);
+  });
+});
+
+test("native codec availability returns null when the streamer is not usable", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    assert.equal(resolveNativeCodecAvailability(null), null);
+    assert.equal(resolveNativeCodecAvailability(nativeStatus({ gstreamerAvailable: false })), null);
+    assert.equal(resolveNativeCodecAvailability(nativeStatus({ videoBackends: [] })), null);
+  });
+});
+
+test("native codec availability excludes backends for other platforms", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    // Only the macos backend is available: a Windows host must not inherit it.
+    const macOnly = nativeStatus({
+      videoBackends: [{
+        backend: "videotoolbox",
+        platform: "macos",
+        codecs: [
+          { codec: "h264", available: true, decoder: "vtdec_h264" },
+          { codec: "h265", available: true, decoder: "vtdec_h265" },
+        ],
+        zeroCopyModes: [],
+        available: true,
+      }],
+      activeVideoBackend: undefined,
+    });
+    assert.equal(resolveNativeCodecAvailability(macOnly), null);
+  });
+});
+
+test("native codec availability marks software-only paths as CPU", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    const softwareOnly = nativeStatus({
+      videoBackends: [{
+        backend: "software",
+        platform: "cross-platform",
+        codecs: [{ codec: "h264", available: true, decoder: "avdec_h264" }],
+        zeroCopyModes: [],
+        sink: "autovideosink",
+        available: true,
+      }],
+      activeVideoBackend: undefined,
+    });
+    const availability = resolveNativeCodecAvailability(softwareOnly);
+    assert.ok(availability);
+    assert.deepEqual([...availability!.codecs], ["H264"]);
+    assert.equal(availability!.hardware, false);
+  });
+});
+
+test("native capabilities make H265 usable even when the browser probe says unsupported", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Browser probe: H265 in receiver caps but not decodable (no HEVC extension).
+  assert.equal(isCodecUsableForStream("H265", [
+    codecResult({ codec: "H265", webrtcSupported: true, decodeSupported: false }),
+  ]), false);
+  // Native mode: the streamer decodes H265 via d3d12h265dec → usable.
+  assert.equal(isCodecUsableForStream("H265", [
+    codecResult({ codec: "H265", webrtcSupported: true, decodeSupported: false }),
+  ], availability), true);
+});
+
+test("native availability wins over the browser probe but never removes codecs", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Browser-only supported codec (not in the native set) stays usable.
+  assert.equal(isCodecUsableForStream("AV1", [
+    codecResult({ codec: "AV1", webrtcSupported: true, decodeSupported: true }),
+  ], availability), true);
+  // Missing native status → browser probe rules again.
+  assert.equal(isCodecUsableForStream("H265", [
+    codecResult({ codec: "H265", webrtcSupported: true, decodeSupported: false }),
+  ], null), false);
+});
+
+test("auto codec resolution prefers the native codec order", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Native set contains AV1 → auto picks AV1 (same priority as web mode).
+  assert.equal(resolveEffectiveCodec("auto", availability), "AV1");
+  // Without native status the Node test env falls back to H264.
+  assert.equal(resolveEffectiveCodec("auto", null), "H264");
+});
+
+test("native capabilities add codecs to the supported list for the ladder/hint", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Browser probe says H265 is not decodable, but native adds it back.
+  assert.deepEqual(resolveSupportedStreamCodecs([
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: false, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: false, webrtcSupported: true }),
+  ], availability), ["H264", "H265", "AV1"]);
+});
+
+test("native capabilities prevent saved H265 from being migrated to auto", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Browser-only view: H265 not decodable → would migrate.
+  assert.equal(getCodecToMigrateToAuto("H265", [
+    codecResult({ codec: "H265", webrtcSupported: true, decodeSupported: false }),
+  ]), "H265");
+  // Native mode: the streamer decodes it → keep the saved preference.
+  assert.equal(getCodecToMigrateToAuto("H265", [
+    codecResult({ codec: "H265", webrtcSupported: true, decodeSupported: false }),
+  ], availability), null);
 });

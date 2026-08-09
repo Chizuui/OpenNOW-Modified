@@ -584,8 +584,9 @@ pub struct NativeStatsEvent {
     pub network_rtt_ms: Option<u32>,
     /// Locally computed RTCP round-trip time (ms) from Receiver Reports the
     /// server sends about our outgoing RTP (rtpsession's LSR/DLSR
-    /// `rb-round-trip`). None for a receiver-only pipeline — the server only
-    /// sends RRs for streams it receives.
+    /// `rb-round-trip`). None when there is no outgoing RTP (e.g.
+    /// OPENNOW_NATIVE_MIC=0) — the server only sends RRs for streams it
+    /// receives.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_rtcp_rtt_ms: Option<u32>,
     /// Server-reported packet loss (percent) from the stats_channel.
