@@ -236,7 +236,17 @@ export class AuthService {
 
     const codePromise = waitForAuthorizationCode(port, 120000);
     await shell.openExternal(oauthUrl);
-    const code = await codePromise;
+
+    let code: string;
+    try {
+      code = await codePromise;
+    } catch (error) {
+      console.warn("[chizui-login] callback TIMEOUT/GAGAL — app tidak menerima redirect", {
+        port,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
 
     const rawCode = code.startsWith("CHIZUI_") ? code.substring("CHIZUI_".length) : code;
     const token = rawCode.startsWith("ctc_")

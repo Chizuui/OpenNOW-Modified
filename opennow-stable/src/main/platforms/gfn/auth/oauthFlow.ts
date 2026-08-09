@@ -81,10 +81,26 @@ export async function findAvailablePort(): Promise<number> {
 
 export async function waitForAuthorizationCode(port: number, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined;
+
+    const finish = (fn: () => void): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      server.close(() => {});
+      fn();
+    };
+
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", `http://localhost:${port}`);
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
+      console.log(`[chizui-login] callback request di port ${port}`, {
+        fullUrl: url.toString(),
+        hasCode: Boolean(code),
+        error: error ?? null,
+      });
 
       const html = `<!doctype html><html><head><meta charset="utf-8"><title>OpenNOW Login</title></head><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#dbe7ff;display:flex;justify-content:center;align-items:center;height:100vh"><div style="background:#111a2c;padding:24px 28px;border:1px solid #30425f;border-radius:12px;max-width:460px"><h2 style="margin-top:0">OpenNOW Login</h2><p>${
         code
@@ -96,21 +112,20 @@ export async function waitForAuthorizationCode(port: number, timeoutMs: number):
       response.setHeader("Content-Type", "text/html; charset=utf-8");
       response.end(html);
 
-      server.close(() => {
-        if (code) {
-          resolve(code);
-          return;
-        }
-        reject(new Error(error ?? "Authorization failed"));
-      });
+      // Resolve/reject segera tanpa menunggu server.close(). server.close()
+      // menunggu koneksi keep-alive yang masih terbuka (mis. request favicon)
+      // dan bisa menggantung lama — itu penyebab login kedua terasa "stuck".
+      if (code) {
+        finish(() => resolve(code));
+      } else if (error) {
+        finish(() => reject(new Error(error)));
+      }
     });
 
     server.listen(port, "127.0.0.1", () => {
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         server.close(() => reject(new Error("Timed out waiting for OAuth callback")));
       }, timeoutMs);
-
-      server.once("close", () => clearTimeout(timer));
     });
   });
 }
