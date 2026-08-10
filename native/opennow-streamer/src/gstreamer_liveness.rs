@@ -4,7 +4,9 @@ use crate::gstreamer_input::{
     stats_channel_bitrate_kbps, stats_channel_game_fps, stats_channel_packet_loss_fraction,
     stats_channel_rtt_ms,
 };
-use crate::gstreamer_pipeline::{configure_queue, set_property_if_supported};
+use crate::gstreamer_pipeline::{
+    configure_queue, set_property_if_supported, VideoChainRebuildContext,
+};
 use crate::gstreamer_transitions::{
     format_transition_summary, resolve_queue_mode, TransitionSnapshot, TransitionTelemetry,
     DEFAULT_VIDEO_QUEUE_DEPTH,
@@ -167,6 +169,17 @@ pub(crate) struct VideoLivenessState {
     startup_keyframe_requested: AtomicBool,
     startup_resync_requested: AtomicBool,
     startup_fatal_reported: AtomicBool,
+    /// The current video sink element. The decoder-fallback rebuild replaces
+    /// the whole decode chain (including the sink), so the watchdog must read
+    /// the live sink from here instead of holding the element it captured at
+    /// `start()` — otherwise it would keep driving stats/health probes against
+    /// a removed element after a rebuild.
+    current_sink: Mutex<Option<gst::Element>>,
+    /// Whether the RTP video bitrate probe is already installed on the src
+    /// pad. The probe survives a decoder-fallback rebuild (the src pad is not
+    /// torn down, only the chain elements), so re-adding it would double-count
+    /// encoded bytes. Guarded per monitor instance.
+    rtp_bitrate_probe_installed: AtomicBool,
 }
 
 impl VideoLivenessState {
@@ -208,6 +221,8 @@ impl VideoLivenessState {
             startup_keyframe_requested: AtomicBool::new(false),
             startup_resync_requested: AtomicBool::new(false),
             startup_fatal_reported: AtomicBool::new(false),
+            current_sink: Mutex::new(None),
+            rtp_bitrate_probe_installed: AtomicBool::new(false),
         }
     }
 
@@ -404,6 +419,53 @@ impl VideoLivenessState {
         if let Ok(mut caps_framerate) = self.caps_framerate.lock() {
             *caps_framerate = caps_framerate_summary(caps);
         }
+    }
+
+    pub(crate) fn set_current_sink(&self, sink: gst::Element) {
+        if let Ok(mut current) = self.current_sink.lock() {
+            *current = Some(sink);
+        }
+    }
+
+    pub(crate) fn current_sink(&self) -> Option<gst::Element> {
+        self.current_sink
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
+
+    /// Drop liveness element references to a decode chain that is being torn
+    /// down (decoder-fallback rebuild). The new chain re-registers fresh
+    /// elements through the normal `set_*` methods.
+    pub(crate) fn clear_chain_elements(&self) {
+        if let Ok(mut current) = self.stats_overlay.lock() {
+            *current = None;
+        }
+        if let Ok(mut current) = self.pre_decode_queue.lock() {
+            *current = None;
+        }
+        if let Ok(mut current) = self.decoder.lock() {
+            *current = None;
+        }
+        if let Ok(mut current) = self.post_decode_queue.lock() {
+            *current = None;
+        }
+    }
+
+    /// Give a freshly-rebuilt decode chain a full startup-recovery window.
+    /// Called right after a decoder-fallback rebuild succeeds, so the new
+    /// chain gets its own keyframe/resync/fatal timeline instead of inheriting
+    /// the dead chain's exhausted budget.
+    pub(crate) fn reset_startup_window(&self) {
+        self.first_startup_encoded_ms.store(0, Ordering::Relaxed);
+        self.decoded_total.store(0, Ordering::Relaxed);
+        self.sink_total.store(0, Ordering::Relaxed);
+        self.last_decoded_ms.store(0, Ordering::Relaxed);
+        self.last_sink_ms.store(0, Ordering::Relaxed);
+        self.startup_keyframe_requested
+            .store(false, Ordering::Relaxed);
+        self.startup_resync_requested.store(false, Ordering::Relaxed);
+        self.startup_fatal_reported.store(false, Ordering::Relaxed);
     }
 
     fn zero_copy_d3d11(&self) -> bool {
@@ -642,6 +704,13 @@ pub(crate) struct VideoLivenessMonitor {
     stop: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Decoder-chain fallback context registered by the RTP video chain
+    /// builder. The watchdog consults it when startup/stall recovery is
+    /// exhausted: it tears down the current decode chain and rebuilds it with
+    /// the next candidate decoder API (e.g. D3D12 → D3D11 → software) instead
+    /// of declaring the stream dead. Cleared on stop so it never outlives the
+    /// session.
+    chain_rebuild: Arc<Mutex<Option<VideoChainRebuildContext>>>,
 }
 
 impl Default for VideoLivenessMonitor {
@@ -651,6 +720,7 @@ impl Default for VideoLivenessMonitor {
             stop: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
+            chain_rebuild: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -700,6 +770,10 @@ impl VideoLivenessMonitor {
         self.state.set_rtp_video_src_pad(pad);
     }
 
+    pub(crate) fn clear_chain_elements(&self) {
+        self.state.clear_chain_elements();
+    }
+
     pub(crate) fn set_post_decode_queue(&self, queue: gst::Element) {
         self.state.set_post_decode_queue(queue);
     }
@@ -730,6 +804,20 @@ impl VideoLivenessMonitor {
 
     pub(crate) fn stop_flag(&self) -> Arc<AtomicBool> {
         self.stop.clone()
+    }
+
+    pub(crate) fn state(&self) -> Arc<VideoLivenessState> {
+        self.state.clone()
+    }
+
+    pub(crate) fn set_chain_rebuild(&self, rebuild: Option<VideoChainRebuildContext>) {
+        if let Ok(mut slot) = self.chain_rebuild.lock() {
+            *slot = rebuild;
+        }
+    }
+
+    pub(crate) fn chain_rebuild(&self) -> Arc<Mutex<Option<VideoChainRebuildContext>>> {
+        self.chain_rebuild.clone()
     }
 
     pub(crate) fn record_transition(
@@ -768,10 +856,19 @@ impl VideoLivenessMonitor {
         }
 
         self.stop.store(false, Ordering::SeqCst);
+        self.state.set_current_sink(sink.clone());
         let state = self.state.clone();
         let stop = self.stop.clone();
+        let chain_rebuild = self.chain_rebuild.clone();
         let thread = thread::spawn(move || {
-            run_video_liveness_watchdog(state, stop, pipeline, sink, event_sender);
+            run_video_liveness_watchdog(
+                state,
+                chain_rebuild,
+                stop,
+                pipeline,
+                sink,
+                event_sender,
+            );
         });
         if let Ok(mut slot) = self.thread.lock() {
             *slot = Some(thread);
@@ -781,6 +878,12 @@ impl VideoLivenessMonitor {
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
+        // Drop the rebuild context before joining: it holds the pipeline / pad
+        // / chain elements and must not outlive the session or keep them alive
+        // after the watchdog (which holds a clone) finishes.
+        if let Ok(mut slot) = self.chain_rebuild.lock() {
+            *slot = None;
+        }
         let handle = self.thread.lock().ok().and_then(|mut slot| slot.take());
         if let Some(handle) = handle {
             let _ = handle.join();
@@ -790,6 +893,7 @@ impl VideoLivenessMonitor {
 
 fn run_video_liveness_watchdog(
     state: Arc<VideoLivenessState>,
+    chain_rebuild: Arc<Mutex<Option<VideoChainRebuildContext>>>,
     stop: Arc<AtomicBool>,
     pipeline: gst::Pipeline,
     sink: gst::Element,
@@ -809,6 +913,11 @@ fn run_video_liveness_watchdog(
 
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(VIDEO_LIVENESS_POLL_INTERVAL);
+
+        // The decoder-fallback rebuild replaces the whole decode chain
+        // (including the sink), so always drive stats/health against the live
+        // sink instead of the element captured when the watchdog started.
+        let sink = state.current_sink().unwrap_or_else(|| sink.clone());
 
         let elapsed = last_rate_at.elapsed();
         if elapsed >= VIDEO_SINK_RATE_LOG_INTERVAL {
@@ -890,7 +999,12 @@ fn run_video_liveness_watchdog(
 
         let last_sink_ms = state.last_sink_ms.load(Ordering::Relaxed);
         if last_sink_ms == 0 {
-            maybe_recover_video_startup(&state, &pipeline, &event_sender);
+            maybe_recover_video_startup(
+                &state,
+                &chain_rebuild,
+                &pipeline,
+                &event_sender,
+            );
             continue;
         }
 
@@ -982,6 +1096,15 @@ fn run_video_liveness_watchdog(
                     stall_ms,
                     false,
                 );
+                // A mid-stream decode-chain stall (decoder stops producing
+                // while RTP keeps flowing) can also be recovered by rebuilding
+                // with the next decoder candidate before declaring the stream
+                // dead. Reset the stall tracker so the new chain gets its own
+                // escalation ladder.
+                if try_decoder_chain_fallback(&chain_rebuild, &state, &event_sender) {
+                    tracker = VideoStallTracker::default();
+                    continue;
+                }
                 send_log(
                     &event_sender,
                     "error",
@@ -1020,6 +1143,7 @@ fn run_video_liveness_watchdog(
 
 fn maybe_recover_video_startup(
     state: &VideoLivenessState,
+    chain_rebuild: &Arc<Mutex<Option<VideoChainRebuildContext>>>,
     pipeline: &gst::Pipeline,
     event_sender: &Option<Sender<Event>>,
 ) {
@@ -1083,6 +1207,14 @@ fn maybe_recover_video_startup(
     if encoded_active_ms >= VIDEO_STARTUP_FATAL_MS
         && !state.startup_fatal_reported.swap(true, Ordering::Relaxed)
     {
+        // Before declaring the stream dead, try the decoder-chain fallback: a
+        // hardware decoder that never outputs a frame (d3d12h265dec on some
+        // Intel iGPUs) is only recoverable by rebuilding the chain with the
+        // next candidate (D3D11, then software avdec). Keyframe requests don't
+        // help a decoder that produces nothing at all.
+        if try_decoder_chain_fallback(chain_rebuild, state, event_sender) {
+            return;
+        }
         send_log(
             event_sender,
             "error",
@@ -1099,6 +1231,35 @@ fn maybe_recover_video_startup(
             });
         }
     }
+}
+
+/// Try to rebuild the RTP video decode chain with the next decoder candidate
+/// (e.g. D3D12 → D3D11 → software). Returns true when a fallback chain is now
+/// live; false when no candidates remain or the rebuild failed (the caller
+/// should then escalate to the normal fatal error). Resets the startup window
+/// so the new chain gets a fresh keyframe/resync/fatal timeline.
+fn try_decoder_chain_fallback(
+    chain_rebuild: &Arc<Mutex<Option<VideoChainRebuildContext>>>,
+    state: &VideoLivenessState,
+    event_sender: &Option<Sender<Event>>,
+) -> bool {
+    let Ok(mut slot) = chain_rebuild.lock() else {
+        return false;
+    };
+    let Some(context) = slot.as_mut() else {
+        return false;
+    };
+    if !context.try_rebuild(event_sender) {
+        return false;
+    }
+    state.reset_startup_window();
+    request_upstream_key_unit(state, event_sender);
+    send_log(
+        event_sender,
+        "warn",
+        "Native video decode chain rebuilt with the next decoder candidate; giving it a fresh startup window.".to_owned(),
+    );
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1693,6 +1854,16 @@ pub(crate) fn watch_rtp_video_bitrate(
     video_liveness: VideoLivenessMonitor,
     event_sender: &Option<Sender<Event>>,
 ) {
+    // The RTP src pad outlives decoder-chain rebuilds, so the probe must only
+    // be installed once per session; re-adding would double-count encoded
+    // bytes in the stats/bitrate reporting.
+    if video_liveness
+        .state()
+        .rtp_bitrate_probe_installed
+        .swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
     let sender = event_sender.clone();
     pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, info| {
         if let Some(buffer) = info.buffer() {

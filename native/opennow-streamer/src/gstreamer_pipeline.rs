@@ -3559,26 +3559,68 @@ fn rtp_video_chain_specs(
     preferred_rtp_video_apis(requested_fps)
         .into_iter()
         .find_map(|video_api| {
-            let codec = encoding.to_ascii_uppercase();
-            let decoder = select_decoder_factory(video_api, codec.as_str())?;
-            let sink = select_sink_factory(video_api)?;
-            let mut specs = rtp_video_chain_definition(encoding, video_api)?;
-            for spec in &mut specs {
-                if spec.role == RtpVideoChainRole::Decoder {
-                    spec.factory = decoder;
-                } else if spec.role == RtpVideoChainRole::Sink {
-                    spec.factory = sink;
-                }
-            }
-            align_windows_vulkan_download_factory(&mut specs, decoder);
-            align_windows_vulkan_internal_present(&mut specs, decoder);
-            insert_requested_fps_capssetter(&mut specs, requested_fps);
-            specs.retain(|spec| {
-                spec.role != RtpVideoChainRole::StatsOverlay
-                    || gst::ElementFactory::find(spec.factory).is_some()
-            });
-            required_video_chain_elements_available(&specs).then_some((video_api, specs))
+            rtp_video_chain_specs_for_api(encoding, video_api, requested_fps)
+                .map(|specs| (video_api, specs))
         })
+}
+
+/// Chain specs for one specific API, or None when that API cannot build a
+/// complete chain for this codec (missing decoder/sink/plugin elements).
+/// Shared by initial selection and the decoder-fallback ladder, which must be
+/// able to rebuild with a *specific* next candidate rather than re-running
+/// the preference search.
+fn rtp_video_chain_specs_for_api(
+    encoding: &str,
+    video_api: RtpVideoApi,
+    requested_fps: Option<u32>,
+) -> Option<Vec<RtpVideoChainSpec>> {
+    let codec = encoding.to_ascii_uppercase();
+    let decoder = select_decoder_factory(video_api, codec.as_str())?;
+    let sink = select_sink_factory(video_api)?;
+    let mut specs = rtp_video_chain_definition(encoding, video_api)?;
+    for spec in &mut specs {
+        if spec.role == RtpVideoChainRole::Decoder {
+            spec.factory = decoder;
+        } else if spec.role == RtpVideoChainRole::Sink {
+            spec.factory = sink;
+        }
+    }
+    align_windows_vulkan_download_factory(&mut specs, decoder);
+    align_windows_vulkan_internal_present(&mut specs, decoder);
+    insert_requested_fps_capssetter(&mut specs, requested_fps);
+    specs.retain(|spec| {
+        spec.role != RtpVideoChainRole::StatsOverlay
+            || gst::ElementFactory::find(spec.factory).is_some()
+    });
+    required_video_chain_elements_available(&specs).then_some(specs)
+}
+
+/// Decoder-fallback ladder: every API that could decode this stream, ordered
+/// most-preferred first, with the platform's natural priority merged in so a
+/// forced backend (e.g. `OPENNOW_NATIVE_VIDEO_BACKEND=d3d12`) still falls
+/// back to D3D11 / software instead of failing hard. The currently-selected
+/// API is excluded by the caller.
+pub(crate) fn rtp_video_chain_fallback_ladder(
+    encoding: &str,
+    current: RtpVideoApi,
+    requested_fps: Option<u32>,
+) -> Vec<RtpVideoApi> {
+    let mut ladder: Vec<RtpVideoApi> = Vec::new();
+    for api in preferred_rtp_video_apis(requested_fps)
+        .into_iter()
+        .chain(default_rtp_video_api_priority(requested_fps).into_iter())
+    {
+        if api != current && !ladder.contains(&api) {
+            ladder.push(api);
+        }
+    }
+    // Software decode is the guaranteed-last fallback everywhere; keep it at
+    // the tail even when a platform priority list omitted it.
+    if RtpVideoApi::Software != current && !ladder.contains(&RtpVideoApi::Software) {
+        ladder.push(RtpVideoApi::Software);
+    }
+    ladder.retain(|api| rtp_video_chain_specs_for_api(encoding, *api, requested_fps).is_some());
+    ladder
 }
 
 pub(crate) fn align_windows_vulkan_download_factory(
@@ -4105,6 +4147,68 @@ fn link_rtp_video_pad(
             "Explicit low-latency decode chain is unavailable for RTP {encoding}; install the platform GStreamer plugin packages or set {NATIVE_VIDEO_BACKEND_ENV}=software to force software decode."
         )
     })?;
+    let elements = build_rtp_video_chain(
+        pipeline,
+        src_pad,
+        encoding,
+        video_api,
+        &specs,
+        render_state,
+        event_sender,
+        streaming_reported,
+        present_max_fps.clone(),
+        d3d_fullscreen_sink,
+        &video_liveness,
+        video_tap,
+    )?;
+    // Arm the decoder-chain fallback: if this chain never renders (or dies
+    // mid-stream), the liveness watchdog rebuilds it with the next candidate
+    // decoder API (D3D12 → D3D11 → software) instead of giving up. Only armed
+    // on the initial WebRTC RTP build; NVST classic UDP has its own path.
+    register_video_chain_fallback(
+        pipeline,
+        src_pad,
+        encoding,
+        video_api,
+        requested_fps,
+        render_state,
+        event_sender,
+        streaming_reported,
+        present_max_fps,
+        d3d_fullscreen_sink,
+        &video_liveness,
+        video_tap,
+        elements,
+    );
+    send_log(
+        event_sender,
+        "info",
+        format!(
+            "Linked RTP {encoding} video through explicit low-latency {} decode chain.",
+            video_api.label()
+        ),
+    );
+    Ok(())
+}
+
+/// Build, wire and start one complete RTP video decode chain for `video_api`.
+/// Shared by the initial build (`link_rtp_video_pad`) and the decoder-fallback
+/// rebuild, which needs the exact same element creation / probe wiring / state
+/// sync / src-pad link sequence for the next candidate API.
+fn build_rtp_video_chain(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    encoding: &str,
+    video_api: RtpVideoApi,
+    specs: &[RtpVideoChainSpec],
+    render_state: &GstreamerRenderState,
+    event_sender: &Option<Sender<Event>>,
+    streaming_reported: &Arc<AtomicBool>,
+    present_max_fps: Arc<AtomicU32>,
+    d3d_fullscreen_sink: bool,
+    video_liveness: &VideoLivenessMonitor,
+    video_tap: &Arc<Mutex<Option<GstreamerVideoTap>>>,
+) -> Result<Vec<gst::Element>, String> {
     let zero_copy = specs.iter().any(|spec| {
         spec.caps
             .as_deref()
@@ -4118,19 +4222,19 @@ fn link_rtp_video_pad(
         send_log(
             event_sender,
             "info",
-            format_video_chain_selection(encoding, video_api, &specs),
+            format_video_chain_selection(encoding, video_api, specs),
         );
         if video_api == RtpVideoApi::D3D12 {
             send_log(
                 event_sender,
                 "info",
-                format_d3d12_selection_summary(requested_fps),
+                format_d3d12_selection_summary(video_liveness.requested_fps()),
             );
         }
         let configured_present_max_fps = present_max_fps.load(Ordering::SeqCst);
         let effective_present_max_fps = effective_present_max_fps(
             configured_present_max_fps,
-            requested_fps,
+            video_liveness.requested_fps(),
             video_api,
             primary_display_refresh_hz(),
         );
@@ -4162,7 +4266,7 @@ fn link_rtp_video_pad(
                 ),
             );
         }
-        for spec in &specs {
+        for spec in specs {
             let element = make_element(spec.factory)?;
             configure_rtp_video_chain_element(
                 &element,
@@ -4273,6 +4377,7 @@ fn link_rtp_video_pad(
             watch_video_caps_transitions(decoder, "decoder", event_sender, video_liveness.clone());
         }
         render_state.set_video_sink(sink.clone(), event_sender);
+        video_liveness.state().set_current_sink(sink.clone());
         install_present_limiter(
             sink,
             present_max_fps,
@@ -4306,15 +4411,226 @@ fn link_rtp_video_pad(
     }
 
     result?;
+    Ok(elements)
+}
+
+/// Decoder-chain fallback state, armed after the initial RTP video chain
+/// build. The liveness watchdog calls `try_rebuild` when startup/stall
+/// recovery is exhausted; it tears down the current chain and rebuilds it with
+/// the next candidate API, so a hardware decoder that silently produces no
+/// frames (e.g. d3d12h265dec on some Intel iGPUs) gets replaced instead of
+/// killing the session.
+pub(crate) struct VideoChainRebuildContext {
+    pipeline: gst::Pipeline,
+    src_pad: gst::Pad,
+    encoding: String,
+    render_state: GstreamerRenderState,
+    event_sender: Option<Sender<Event>>,
+    streaming_reported: Arc<AtomicBool>,
+    present_max_fps: Arc<AtomicU32>,
+    d3d_fullscreen_sink: bool,
+    video_liveness: VideoLivenessMonitor,
+    video_tap: Arc<Mutex<Option<GstreamerVideoTap>>>,
+    /// Current chain elements (torn down before the rebuild).
+    elements: Vec<gst::Element>,
+    /// The API currently in use, for diagnostics.
+    current_api: RtpVideoApi,
+    /// Remaining candidate APIs, most preferred first.
+    candidates: Vec<RtpVideoApi>,
+}
+
+// Manual `Debug` instead of `#[derive(Debug)]`: the context holds a
+// `VideoLivenessMonitor`, which itself holds this context (via
+// `chain_rebuild`), so a derived impl would require `Debug` on both sides
+// cyclically. Only the lightweight diagnostic fields are printed.
+impl std::fmt::Debug for VideoChainRebuildContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoChainRebuildContext")
+            .field("encoding", &self.encoding)
+            .field("current_api", &self.current_api)
+            .field("candidates", &self.candidates)
+            .field("element_count", &self.elements.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VideoChainRebuildContext {
+    /// Try the next decoder candidate. Returns true when a fallback chain is
+    /// now live, false when no candidates remain. On success the old chain is
+    /// removed from the pipeline and the new one is fully wired (probes,
+    /// sink, src-pad link, liveness restart).
+    pub(crate) fn try_rebuild(&mut self, event_sender: &Option<Sender<Event>>) -> bool {
+        // Refuse to rebuild while a screenshot/recording branch is hot-plugged
+        // into the video tap: the tee is linked between the old chain's
+        // before_sink/sink, and tearing them out mid-capture would orphan the
+        // branch. The tap tee only exists after first capture use, which
+        // requires the sink to have rendered frames — so a never-started
+        // chain never has one.
+        if let Ok(slot) = self.video_tap.lock() {
+            if slot.as_ref().is_some_and(|tap| tap.tee.is_some()) {
+                send_log(
+                    event_sender,
+                    "warn",
+                    "Skipping video decoder fallback: a recording/screenshot branch is attached to the video tap."
+                        .to_owned(),
+                );
+                return false;
+            }
+        }
+
+        // `candidates` is ordered most-preferred-first (Software always at the
+        // tail), so take from the front to try the next-best API before
+        // falling back to software decode. Keep trying until one rebuild
+        // succeeds or every candidate is exhausted.
+        while let Some(next_api) = self.candidates.first().copied() {
+            self.candidates.remove(0);
+
+            send_log(
+                event_sender,
+                "warn",
+                format!(
+                    "Native video decoder fallback: rebuilding RTP {} chain with {} (was {}).",
+                    self.encoding,
+                    next_api.label(),
+                    self.current_api.label()
+                ),
+            );
+
+            // Tear down the current chain: unlink the RTP src pad, Null +
+            // remove every element. A failed rebuild leaves the old chain
+            // already removed, so the next candidate starts from a clean slate.
+            if let Some(first) = self.elements.first() {
+                if let Some(first_sink_pad) = first.static_pad("sink") {
+                    let _ = self.src_pad.unlink(&first_sink_pad);
+                }
+            }
+            for element in self.elements.drain(..) {
+                let _ = element.set_state(gst::State::Null);
+                let _ = self.pipeline.remove(&element);
+            }
+            self.video_liveness.clear_chain_elements();
+            if let Ok(mut slot) = self.video_tap.lock() {
+                *slot = None;
+            }
+
+            let requested_fps = self.video_liveness.requested_fps();
+            let Some(specs) =
+                rtp_video_chain_specs_for_api(&self.encoding, next_api, requested_fps)
+            else {
+                send_log(
+                    event_sender,
+                    "warn",
+                    format!(
+                        "Video decoder fallback: {} chain is unavailable for RTP {}; skipping.",
+                        next_api.label(),
+                        self.encoding
+                    ),
+                );
+                continue;
+            };
+
+            match build_rtp_video_chain(
+                &self.pipeline,
+                &self.src_pad,
+                &self.encoding,
+                next_api,
+                &specs,
+                &self.render_state,
+                &self.event_sender,
+                &self.streaming_reported,
+                self.present_max_fps.clone(),
+                self.d3d_fullscreen_sink,
+                &self.video_liveness,
+                &self.video_tap,
+            ) {
+                Ok(elements) => {
+                    self.elements = elements;
+                    self.current_api = next_api;
+                    send_log(
+                        event_sender,
+                        "warn",
+                        format!(
+                            "Native video decoder fallback succeeded: RTP {} now on {} decode chain.",
+                            self.encoding,
+                            next_api.label()
+                        ),
+                    );
+                    return true;
+                }
+                Err(error) => {
+                    send_log(
+                        event_sender,
+                        "warn",
+                        format!(
+                            "Video decoder fallback to {} failed: {error}",
+                            next_api.label()
+                        ),
+                    );
+                    // Fall through to the next candidate.
+                }
+            }
+        }
+
+        send_log(
+            event_sender,
+            "warn",
+            format!(
+                "Native video decoder fallback exhausted: no more candidates after {} for RTP {}.",
+                self.current_api.label(),
+                self.encoding
+            ),
+        );
+        false
+    }
+}
+
+fn register_video_chain_fallback(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    encoding: &str,
+    current_api: RtpVideoApi,
+    requested_fps: Option<u32>,
+    render_state: &GstreamerRenderState,
+    event_sender: &Option<Sender<Event>>,
+    streaming_reported: &Arc<AtomicBool>,
+    present_max_fps: Arc<AtomicU32>,
+    d3d_fullscreen_sink: bool,
+    video_liveness: &VideoLivenessMonitor,
+    video_tap: &Arc<Mutex<Option<GstreamerVideoTap>>>,
+    elements: Vec<gst::Element>,
+) {
+    let candidates = rtp_video_chain_fallback_ladder(encoding, current_api, requested_fps);
+    if candidates.is_empty() {
+        return;
+    }
     send_log(
         event_sender,
         "info",
         format!(
-            "Linked RTP {encoding} video through explicit low-latency {} decode chain.",
-            video_api.label()
+            "Native video decoder fallback armed for RTP {encoding}: candidates after {} = [{}].",
+            current_api.label(),
+            candidates
+                .iter()
+                .map(|api| api.label())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     );
-    Ok(())
+    video_liveness.set_chain_rebuild(Some(VideoChainRebuildContext {
+        pipeline: pipeline.clone(),
+        src_pad: src_pad.clone(),
+        encoding: encoding.to_owned(),
+        render_state: render_state.clone(),
+        event_sender: event_sender.clone(),
+        streaming_reported: streaming_reported.clone(),
+        present_max_fps,
+        d3d_fullscreen_sink,
+        video_liveness: video_liveness.clone(),
+        video_tap: video_tap.clone(),
+        elements,
+        current_api,
+        candidates,
+    }));
 }
 
 pub(crate) fn format_video_chain_selection(
