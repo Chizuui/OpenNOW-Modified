@@ -426,6 +426,7 @@ export class GfnWebRtcClient {
   private serverZone = "";
   private serverLocationLabel = ""; // <--- NEW FIELD
   private gpuType = "";
+  private serverGpuType = "";
 
   private diagnostics: StreamDiagnostics = {
     connectionState: "closed",
@@ -476,6 +477,7 @@ export class GfnWebRtcClient {
     lagReason: "unknown",
     lagReasonDetail: "Waiting for stream stats",
     gpuType: "",
+    serverGpuType: "",
     serverRegion: "",
     serverZone: "",
     decoderPressureActive: false,
@@ -1049,6 +1051,7 @@ export class GfnWebRtcClient {
       lagReason: "unknown",
       lagReasonDetail: "Waiting for stream stats",
       gpuType: this.gpuType,
+      serverGpuType: this.serverGpuType,
       serverRegion: this.serverRegion,
       serverZone: this.serverZone,
       decoderPressureActive: false,
@@ -2356,6 +2359,11 @@ export class GfnWebRtcClient {
     this.serverLocationLabel = label;
     this.log(`[webrtc] serverLocationLabel computed as: "${this.serverLocationLabel}"`);
 
+    // GPU type reported by the GFN server (e.g. "RTX 5080"); empty when the
+    // server doesn't provide one, in which case the HUD falls back to the
+    // locally detected GPU.
+    this.serverGpuType = session.gpuType || "";
+
     this.serverRegion = rawRegionSource;
     if (this.serverRegion) {
       // If it looks like a URL or has protocol, strip it down to host/IP
@@ -2384,6 +2392,7 @@ export class GfnWebRtcClient {
     this.diagnostics.serverZone = this.serverZone;
     this.diagnostics.serverLocationLabel = this.serverLocationLabel; // <--- ADD THIS
     this.diagnostics.gpuType = this.gpuType;
+    this.diagnostics.serverGpuType = this.serverGpuType;
     this.emitStats();
     this.createDataChannels(pc);
     this.domInputController.install(this.options.videoElement);

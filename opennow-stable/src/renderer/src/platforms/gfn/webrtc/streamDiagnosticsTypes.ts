@@ -96,6 +96,9 @@ export interface StreamDiagnostics {
   lagReasonDetail: string;
 
   // System info
+  /** GPU type reported by the GFN server (CloudMatch session.gpuType, e.g. "RTX 5080"). */
+  serverGpuType: string;
+  /** GPU type detected locally via WebGL (fallback when the server doesn't report one). */
   gpuType: string;
   serverRegion: string;
   /** Raw CloudMatch zone code (e.g. "NP-TYO-01"), used for a friendly location label. */

@@ -419,6 +419,7 @@
       "totalUsed": "Total used",
       "streamSection": "Stream",
       "resolution": "Resolution",
+      "gpu": "GPU",
       "codec": "Codec",
       "codecFallback": "{{requested}} couldn't be negotiated → {{negotiated}}",
       "serverLocation": "Server location",

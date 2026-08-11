@@ -10111,6 +10111,13 @@ button.game-card-store-chip.owned.active:hover {
   color: var(--ink);
 }
 
+.sovl-val--ellipsis {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sovl-badge {
   padding: 1px 5px;
   background: var(--accent-surface);

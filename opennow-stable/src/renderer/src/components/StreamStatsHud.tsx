@@ -142,7 +142,11 @@ export function StreamStatsHud({
   const rttColor = getRttColor(stats.rttMs);
   const pingText = stats.rttMs > 0 ? String(Math.round(stats.rttMs)) : "--";
 
-  const gpuTitle = stats.gpuType && stats.gpuType !== "" ? stats.gpuType : t("stream.stats.title");
+  // Server-reported GPU (e.g. "RTX 5080" from CloudMatch) wins; fall back to
+  // the locally detected GPU, then the generic title.
+  const gpuTitle = stats.serverGpuType && stats.serverGpuType !== ""
+    ? stats.serverGpuType
+    : (stats.gpuType && stats.gpuType !== "" ? stats.gpuType : t("stream.stats.title"));
   const parsedRegionLabel = stats.serverLocationLabel && stats.serverLocationLabel !== "--"
     ? stats.serverLocationLabel
     : formatServerLocation(

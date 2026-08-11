@@ -1,4 +1,4 @@
-import { Monitor, Wifi, Activity, Gamepad2, AlertTriangle } from "lucide-react";
+import { Monitor, Wifi, Activity, Gamepad2, AlertTriangle, Cpu } from "lucide-react";
 import type { StreamDiagnostics } from "../platforms/gfn/webrtcClient";
 import type { JSX } from "react";
 import { useTranslation } from "../i18n";
@@ -35,6 +35,8 @@ export function StatsOverlay({
       : (stats.renderFps > 0 ? String(stats.renderFps) : "--"));
   // STREAM = frames rendered on this device (local display rate).
   const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
+  // GPU = server-reported GPU (e.g. "RTX 5080") with the local GPU as fallback.
+  const gpuTitle = stats.serverGpuType || stats.gpuType || "";
 
   if (!hasData) {
     return (
@@ -79,6 +81,14 @@ export function StatsOverlay({
           <div className="sovl-pill">
             <span className="sovl-badge">{stats.codec}</span>
             {stats.isHdr && <span className="sovl-badge sovl-badge--hdr">HDR</span>}
+          </div>
+        )}
+
+        {/* GPU (server-reported, local fallback) */}
+        {gpuTitle && (
+          <div className="sovl-pill" title={gpuTitle}>
+            <Cpu size={13} className="sovl-icon" />
+            <span className="sovl-val sovl-val--ellipsis">{gpuTitle}</span>
           </div>
         )}
 
