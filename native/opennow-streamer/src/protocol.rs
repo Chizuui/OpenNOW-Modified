@@ -484,6 +484,20 @@ pub struct SendAnswerRequest {
     pub nvst_sdp: Option<String>,
 }
 
+/// A request for an upstream video keyframe, forwarded by the Electron main
+/// process to the RTCP/PLI signaling path (data channel) so the request NEVER
+/// travels as a GStreamer CustomUpstream event inside the media pipeline (a
+/// `GstForceKeyUnit` sent on the webrtcbin src pad propagates upstream into
+/// the UDP receiver and errors it out — the record-start stream death).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoKeyframeRequest {
+    pub reason: String,
+    /// Recovery attempt number, where applicable (0 for first-time/startup
+    /// requests without an escalation ladder).
+    pub attempt: u8,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoStallEvent {
@@ -672,6 +686,8 @@ pub enum Event {
     InputCaptureChanged { captured: bool },
     #[serde(rename = "video-stall")]
     VideoStall(VideoStallEvent),
+    #[serde(rename = "video-keyframe-request")]
+    VideoKeyframeRequest(VideoKeyframeRequest),
     #[serde(rename = "video-transition")]
     VideoTransition { transition: VideoTransitionEvent },
     #[serde(rename = "stats")]

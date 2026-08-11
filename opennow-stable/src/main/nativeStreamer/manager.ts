@@ -119,6 +119,8 @@ export class NativeStreamerManager {
   private activeNativeRecordingId: string | null = null;
   /** Resolver for the in-flight `stop-recording` finalization wait. */
   private pendingRecordingFinishedResolve: ((thumbnailBase64?: string) => void) | null = null;
+  /** Serialize native chunk writes; stdout events can arrive faster than disk writes. */
+  private recordingChunkQueue: Promise<void> = Promise.resolve();
   private queuedLocalIce: IceCandidatePayload[] = [];
   private queuedRemoteIceSessionId: string | null = null;
   private queuedRemoteIce: IceCandidatePayload[] = [];
@@ -402,6 +404,7 @@ export class NativeStreamerManager {
       throw new Error("Native streamer is not running.");
     }
     this.activeNativeRecordingId = recordingId;
+    this.recordingChunkQueue = Promise.resolve();
     try {
       await this.request({ type: "start-recording" }, CONTROL_TIMEOUT_MS);
     } catch (error) {
@@ -454,7 +457,7 @@ export class NativeStreamerManager {
           const timeout = setTimeout(() => {
             this.pendingRecordingFinishedResolve = null;
             reject(new Error("Native recording did not finalize in time."));
-          }, 3000);
+          }, RECORDING_STOP_TIMEOUT_MS);
           timeout.unref?.();
         }),
       ]);
@@ -879,6 +882,23 @@ export class NativeStreamerManager {
       return;
     }
 
+    if (message.type === "video-keyframe-request") {
+      // Keyframe recovery over RTCP via signaling (data channel) only — the
+      // native streamer must NEVER push a GstForceKeyUnit CustomUpstream event
+      // into the WebRTC media pipeline (it propagates upstream into the UDP
+      // receiver and kills the transport: the record-start stream death).
+      void this.options
+        .requestKeyframe({
+          reason: message.reason,
+          backlogFrames: 0,
+          attempt: message.attempt ?? 0,
+        })
+        .catch((error) => {
+          console.warn("[NativeStreamer] Failed to request video keyframe via signaling:", error);
+        });
+      return;
+    }
+
     if (message.type === "video-transition") {
       const transition = message.transition;
       const summary = transition.summary ?? `${transition.transitionType} @ ${transition.atMs}ms`;
@@ -911,16 +931,22 @@ export class NativeStreamerManager {
       const recordingId = this.activeNativeRecordingId;
       if (recordingId) {
         const buffer = Buffer.from(message.chunkBase64, "base64");
-        void appendRecordingChunk({
-          recordingId,
-          // Buffer's underlying ArrayBuffer spans exactly the decoded bytes.
-          chunk: buffer.buffer.slice(
-            buffer.byteOffset,
-            buffer.byteOffset + buffer.byteLength,
-          ) as ArrayBuffer,
-        }).catch((error) => {
-          console.warn("[NativeStreamer] Failed to append native recording chunk:", error);
-        });
+        // Keep chunks strictly ordered and do not let recording-finished race
+        // a still-pending disk write. This matters for non-fragmented qtmux:
+        // the final MP4 can be one very large stdout event.
+        this.recordingChunkQueue = this.recordingChunkQueue
+          .catch(() => undefined)
+          .then(() => appendRecordingChunk({
+            recordingId,
+            // Buffer's underlying ArrayBuffer spans exactly the decoded bytes.
+            chunk: buffer.buffer.slice(
+              buffer.byteOffset,
+              buffer.byteOffset + buffer.byteLength,
+            ) as ArrayBuffer,
+          }))
+          .catch((error) => {
+            console.warn("[NativeStreamer] Failed to append native recording chunk:", error);
+          });
       }
       return;
     }
@@ -928,7 +954,9 @@ export class NativeStreamerManager {
     if (message.type === "recording-finished") {
       const resolve = this.pendingRecordingFinishedResolve;
       this.pendingRecordingFinishedResolve = null;
-      resolve?.(message.thumbnailBase64);
+      void this.recordingChunkQueue.finally(() => {
+        resolve?.(message.thumbnailBase64);
+      });
       return;
     }
 

@@ -194,6 +194,12 @@ export type NativeStreamerEvent =
       recoveryAttempt: number;
     }
   | {
+      /** Keyframe request to forward to the RTCP/PLI signaling path. Never a GStreamer CustomUpstream event (that kills the transport). */
+      type: "video-keyframe-request";
+      reason: string;
+      attempt?: number;
+    }
+  | {
       type: "video-transition";
       transition: NativeVideoTransition;
     }
