@@ -348,6 +348,27 @@ export function extractNegotiatedStreamProfile(payload: CloudMatchResponse): Neg
   return Object.keys(profile).length > 0 ? profile : undefined;
 }
 
+/**
+ * Pick the zone LB hostname that carries the datacenter code (e.g.
+ * "npa-yes-kul-01.yes.geforcenow.nvidiagrid.net", "np-lax-01.cloudmatchbeta...")
+ * so the HUD can show a region label like the official client's
+ * "Malaysia (NP-KUL-01)". The first hostname segment contains letters for zone
+ * hostnames but is purely numeric for real server IPs ("183-78-14-236..."),
+ * which carry no city info and must not shadow the zone LB.
+ */
+export function firstZoneHostname(...candidates: Array<string | string[] | undefined>): string | undefined {
+  for (const candidate of candidates) {
+    const host = Array.isArray(candidate) ? candidate[0] : candidate;
+    if (!host || host.trim().length === 0) {
+      continue;
+    }
+    if (/[a-zA-Z]/.test(host.split(".")[0])) {
+      return host;
+    }
+  }
+  return undefined;
+}
+
 export interface ToSessionInfoOptions {
   zone: string;
   streamingBaseUrl: string;
@@ -378,6 +399,16 @@ export async function toSessionInfo(options: ToSessionInfoOptions): Promise<Sess
   const finalizedStreamingFeatures = normalizeStreamingFeatures(
     payload.session.finalizedStreamingFeatures,
   );
+  // CloudMatch rarely fills payload.session.serverLocation. Fall back to the
+  // zone LB hostname (sessionControlInfo.ip / usage=14 connection host) which
+  // carries the datacenter code; the renderer preserves the first good value
+  // across polls so it survives the seat assignment replacing it with an IP.
+  const serverLocation =
+    payload.session.serverLocation?.trim() ||
+    firstZoneHostname(
+      payload.session.sessionControlInfo?.ip,
+      payload.session.connectionInfo?.find((conn) => conn.usage === 14)?.ip,
+    );
   const enablePersistingInGameSettings =
     typeof payload.session.sessionRequestData?.enablePersistingInGameSettings === "boolean"
       ? payload.session.sessionRequestData.enablePersistingInGameSettings
@@ -395,6 +426,7 @@ export async function toSessionInfo(options: ToSessionInfoOptions): Promise<Sess
     `[CloudMatch] toSessionInfo: status=${payload.session.status}, ` +
     `seatSetupStep=${seatSetupStep ?? "n/a"}, ` +
     `queuePosition=${queuePosition ?? "n/a"}, ` +
+    `gpuType=${payload.session.gpuType ?? "<empty>"}, ` +
     `connectionInfo=${connections.length} entries, ` +
     `serverIp=${signaling.serverIp}, ` +
     `signalingServer=${signaling.signalingServer}, ` +
@@ -427,7 +459,7 @@ export async function toSessionInfo(options: ToSessionInfoOptions): Promise<Sess
     negotiatedStreamProfile,
     requestedStreamingFeatures,
     finalizedStreamingFeatures,
-    serverLocation: payload.session.serverLocation,
+    serverLocation,
     clientId,
     deviceId,
   };

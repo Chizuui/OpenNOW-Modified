@@ -2,7 +2,7 @@ import { Monitor, Wifi, Activity, Gamepad2, AlertTriangle, Cpu } from "lucide-re
 import type { StreamDiagnostics } from "../platforms/gfn/webrtcClient";
 import type { JSX } from "react";
 import { useTranslation } from "../i18n";
-import { formatBitrate, getRttColor } from "../utils/streamDiagnosticsFormat";
+import { formatBitrate, formatServerLocation, getRttColor } from "../utils/streamDiagnosticsFormat";
 
 interface StatsOverlayProps {
   stats: StreamDiagnostics;
@@ -37,6 +37,12 @@ export function StatsOverlay({
   const streamFps = stats.renderFps > 0 ? String(stats.renderFps) : "--";
   // GPU = server-reported GPU (e.g. "RTX 5080") with the local GPU as fallback.
   const gpuTitle = stats.serverGpuType || stats.gpuType || "";
+  // Region = official-style label ("Japan (NP-TYO-01)") resolved at session
+  // start, falling back to deriving it from the raw server host/IP. Raw
+  // hostnames are never shown directly.
+  const regionLabel = stats.serverLocationLabel && stats.serverLocationLabel !== "--"
+    ? stats.serverLocationLabel
+    : formatServerLocation(stats.serverZone, stats.serverRegion || serverRegion || "");
 
   if (!hasData) {
     return (
@@ -115,9 +121,9 @@ export function StatsOverlay({
           </div>
         )}
 
-        {/* Server Region */}
-        {serverRegion && (
-          <div className="sovl-region">{serverRegion}</div>
+        {/* Server Region (official-style label) */}
+        {regionLabel && regionLabel !== "--" && (
+          <div className="sovl-region">{regionLabel}</div>
         )}
       </div>
     </div>

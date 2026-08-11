@@ -168,3 +168,56 @@ export function computeIntervalFrameRates(params: IntervalFrameRateParams): Inte
 
   return { receiveFps, decodeFps, decodeTimeMs };
 }
+
+/**
+ * The official GFN client translates the server's raw gpuType code (e.g.
+ * "2080d / T10") into a friendly rig name via a server-provided gpuNameMap
+ * (cloud variable `enableGpuNameMappingV2`). OpenNOW has no access to that
+ * cloud variable, so mirror the observed map locally so the HUD shows the
+ * same "GeForce RTX 3080"-style label the official client does instead of the
+ * raw code. Keys are exact gpuType values captured from CloudMatch payloads;
+ * unknown values pass through unchanged.
+ */
+const SERVER_GPU_NAME_MAP: Record<string, string> = {
+  // Basic Rig (Performance tier, older / entry-class hardware)
+  "1060b / T10-8": "Basic Rig",
+  "1060bi / T10-8": "Basic Rig",
+  "1060c / T10-8": "Basic Rig",
+  "1080d / P40": "Basic Rig",
+  "2080c / T10": "Basic Rig",
+  "3050b / L40-6": "Basic Rig",
+  "3050b / L40G-6": "Basic Rig",
+  "3050b / L40S-6": "Basic Rig",
+  "3050b / A10G-6": "Basic Rig",
+  // GeForce RTX 20-series
+  "2060c / L40G-8": "GeForce RTX 2060",
+  "2080d / T10": "GeForce RTX",
+  "2080h / T10": "GeForce RTX",
+  // GeForce RTX 30-series
+  "3060d / L40-24": "GeForce RTX",
+  "3060d / L40-12": "GeForce RTX",
+  "3060d / L40G-12": "GeForce RTX",
+  "3060d / L40S-12": "GeForce RTX",
+  "3060d / L40S-24": "GeForce RTX",
+  "3060d / A10G-12": "GeForce RTX",
+  "3080h / A10G": "GeForce RTX 3080",
+  "3080p / A10Gx2": "GeForce RTX 3080",
+  // GeForce RTX 40-series
+  "4080h / L40": "GeForce RTX 4080",
+  "4080h / L40G": "GeForce RTX 4080",
+  "4080h / L40S": "GeForce RTX 4080",
+  "4080p / L40x2": "GeForce RTX 4080",
+  "4080p / L40Gx2": "GeForce RTX 4080",
+  "4080p / L40Sx2": "GeForce RTX 4080",
+  // GeForce RTX 50-series
+  "5080h / B40": "GeForce RTX 5080",
+};
+
+/** Map a raw CloudMatch gpuType code to the official rig name (unknown → unchanged). */
+export function mapServerGpuType(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return SERVER_GPU_NAME_MAP[trimmed] ?? trimmed;
+}

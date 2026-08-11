@@ -70,6 +70,7 @@ import {
   codecLabelFromMimeType,
   computeIntervalFrameRates,
   detectGpuType,
+  mapServerGpuType,
 } from "./webrtc/streamStatsHelpers";
 import {
   DecoderPressureController,
@@ -155,6 +156,8 @@ function describeColorQuality(colorQuality: ColorQuality): string {
       return colorQuality;
   }
 }
+
+export { mapServerGpuType };
 
 function describeNativeHardwareAcceleration(): string {
   const platform = navigator.platform.toLowerCase();
@@ -2361,8 +2364,11 @@ export class GfnWebRtcClient {
 
     // GPU type reported by the GFN server (e.g. "RTX 5080"); empty when the
     // server doesn't provide one, in which case the HUD falls back to the
-    // locally detected GPU.
-    this.serverGpuType = session.gpuType || "";
+    // locally detected GPU. Some zones report a short code (e.g. "RTX") that
+    // the official web client maps to a friendly name via its server-provided
+    // gpuNameMap; apply the same idea locally when the value is a known code.
+    this.serverGpuType = mapServerGpuType(session.gpuType || "");
+    this.log(`[webrtc] serverGpuType resolved: raw=${JSON.stringify(session.gpuType ?? "")} -> "${this.serverGpuType}"`);
 
     this.serverRegion = rawRegionSource;
     if (this.serverRegion) {

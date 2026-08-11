@@ -82,11 +82,50 @@ const SERVER_CITY_LABELS: Record<string, string> = {
   sao: "Brazil",
 };
 
+// Tokens that appear inside zone hostnames/domains but are not part of the
+// datacenter code (brand/domain noise), e.g. the "yes" in
+// "npa-yes-kul-01.yes.geforcenow.nvidiagrid.net".
+const SERVER_ZONE_SKIP_TOKENS = new Set([
+  "yes",
+  "geforcenow",
+  "nvidiagrid",
+  "net",
+  "com",
+  "cloudmatch",
+  "cloudmatchbeta",
+]);
+
+// Raw hostname prefix → official zone-id prefix. The official client shows
+// zone ids like "NP-TYO-01" (NVIDIA Partner Tokyo 01); the zone LB hostname
+// carries the same prefix as "npa-yes-kul-01" / "np-lax-01", so map it back.
+const SERVER_ZONE_PREFIX_LABELS: Record<string, string> = {
+  npa: "NP",
+  np: "NP",
+};
+
+/**
+ * Reconstruct the datacenter code prefix from the tokens before the city code,
+ * e.g. "npa-yes-kul-01" → "NP", "np-tyo-01" → "NP". Returns undefined when
+ * there is no usable prefix so the caller can fall back to the city-only form.
+ */
+function serverZoneCodePrefix(tokens: string[], cityIndex: number): string | undefined {
+  const prefixTokens = tokens
+    .slice(0, cityIndex)
+    .filter((tok) => !SERVER_ZONE_SKIP_TOKENS.has(tok));
+  if (prefixTokens.length === 0) {
+    return undefined;
+  }
+  const last = prefixTokens[prefixTokens.length - 1];
+  return SERVER_ZONE_PREFIX_LABELS[last] ?? last.toUpperCase();
+}
+
 /**
  * Turn a raw zone id (e.g. "NP-TYO-01") and/or server hostname
  * (e.g. "npa-yes-kul-01.yes.geforcenow.nvidiagrid.net" or
  * "183-78-14-232.yes.geforcenow.nvidiagrid.net") into a friendly location label
- * like "Malaysia (KUL)". Falls back to the zone code, then the hostname.
+ * matching the official client format "Japan (NP-TYO-01)" — country name from
+ * the city code, then the reconstructed datacenter code in parentheses.
+ * Falls back to the zone code, then the hostname.
  */
 export function formatServerLocation(zone: string, hostname: string): string {
   const zoneCode = (zone || "").trim().toLowerCase();
@@ -99,37 +138,31 @@ export function formatServerLocation(zone: string, hostname: string): string {
     host = host.replace(/^https?:\/\//i, "").split("/")[0];
   }
 
-  // 1. Coba parse dari zoneCode dulu, e.g. "NP-SJC-01"
-  if (zoneCode && zoneCode !== "prod") {
-    const tokens = zoneCode.split("-");
-    for (const tok of tokens) {
-      if (tok in SERVER_CITY_LABELS) {
-        const city = tok;
-        const country = SERVER_CITY_LABELS[city];
-        return `${country} (${city.toUpperCase()})`;
-      }
-    }
-  }
+  // Prefer the zone id when it carries a location (e.g. "NP-SJC-01"; "prod" is
+  // just the environment name, not a location).
+  const zoneTokens = zoneCode && zoneCode !== "prod" ? zoneCode.split("-") : [];
+  // Parse the hostname by scanning every hyphen/dot token across all segments,
+  // e.g. "np-tyo-01.cloudmatchbeta.nvidiagrid.net" → [np,tyo,01,cloudmatchbeta,...]
+  //      "npa-yes-kul-01.yes.geforcenow.nvidiagrid.net" → [...,kul,...]
+  const hostTokens = host.toLowerCase().split(/[.-]/);
 
-  // 2. Parse dari hostname: scan semua token hyphen di semua dot-segments
-  // e.g. "np-tyo-01.cloudmatchbeta.nvidiagrid.net" → tokens: [np,tyo,01,cloudmatchbeta,...]
-  // e.g. "npa-yes-kul-01.yes.geforcenow.nvidiagrid.net" → tokens: [...,kul,...]
-  const tokens = host.toLowerCase().split(/[.\-]/);
-  let city: string | undefined;
-  for (const tok of tokens) {
-    if (tok in SERVER_CITY_LABELS) {
-      city = tok;
-      break;
+  for (const tokens of [zoneTokens, hostTokens]) {
+    if (tokens.length === 0) {
+      continue;
     }
-  }
-  const country = city ? SERVER_CITY_LABELS[city] : undefined;
-
-  if (country && city) {
+    const cityIndex = tokens.findIndex((tok) => tok in SERVER_CITY_LABELS);
+    if (cityIndex < 0) {
+      continue;
+    }
+    const city = tokens[cityIndex];
+    const country = SERVER_CITY_LABELS[city];
     // Append the numeric server index when present, e.g. "np-tyo-01" → "TYO-01".
-    const idx = tokens.indexOf(city);
-    const next = tokens[idx + 1];
-    const suffix = next && /^\d+$/.test(next) ? `-${next}` : "";
-    return `${country} (${city.toUpperCase()}${suffix})`;
+    const next = tokens[cityIndex + 1];
+    const indexSuffix = next && /^\d+$/.test(next) ? `-${next}` : "";
+    const prefix = serverZoneCodePrefix(tokens, cityIndex);
+    return prefix
+      ? `${country} (${prefix}-${city.toUpperCase()}${indexSuffix})`
+      : `${country} (${city.toUpperCase()}${indexSuffix})`;
   }
 
   // 3. Fallback

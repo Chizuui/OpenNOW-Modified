@@ -128,14 +128,23 @@ export function mergePolledSessionState(previous: SessionInfo, next: SessionInfo
   // Poll responses may omit the echoed appLaunchMode; keep the session-stable value.
   const appLaunchMode = next.appLaunchMode ?? previous.appLaunchMode;
   const appId = next.appId ?? previous.appId;
+  // Same for gpuType: the seat-assigned GPU is session-stable, but only some
+  // poll responses echo it, so keep the first value we saw.
+  const gpuType = next.gpuType ?? previous.gpuType;
+  // The zone LB hostname (datacenter code, e.g. "npa-yes-kul-01...") is only
+  // present in early polls; once the seat assigns a real server IP, later polls
+  // no longer carry it, so keep the first value we saw for the region label.
+  const serverLocation = next.serverLocation || previous.serverLocation;
   if (isSessionReadyForConnect(next.status)) {
-    return { ...next, appId, appLaunchMode };
+    return { ...next, appId, appLaunchMode, gpuType, serverLocation };
   }
 
   return {
     ...next,
     appId,
     appLaunchMode,
+    gpuType,
+    serverLocation,
     adState: mergeAdState(previous.adState, next.adState),
     mediaConnectionInfo: next.mediaConnectionInfo ?? previous.mediaConnectionInfo,
   };

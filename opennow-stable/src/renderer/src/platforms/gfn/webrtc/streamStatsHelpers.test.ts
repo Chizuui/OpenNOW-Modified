@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   computeIntervalFrameRates,
+  mapServerGpuType,
   type IntervalFrameRateParams,
 } from "./streamStatsHelpers";
 
@@ -96,4 +97,19 @@ test("negative frame counters (Chromium resets on codec switch) keep the last ra
   assert.equal(rates.receiveFps, 60);
   assert.equal(rates.decodeFps, 60);
   assert.equal(rates.decodeTimeMs, 8.3);
+});
+
+test("mapServerGpuType translates raw CloudMatch codes to official rig names", () => {
+  assert.equal(mapServerGpuType("2080d / T10"), "GeForce RTX");
+  assert.equal(mapServerGpuType("3080p / A10Gx2"), "GeForce RTX 3080");
+  assert.equal(mapServerGpuType("4080h / L40S"), "GeForce RTX 4080");
+  assert.equal(mapServerGpuType("5080h / B40"), "GeForce RTX 5080");
+  assert.equal(mapServerGpuType("1060b / T10-8"), "Basic Rig");
+});
+
+test("mapServerGpuType passes unknown codes through unchanged and trims input", () => {
+  assert.equal(mapServerGpuType("9999z / X99"), "9999z / X99");
+  assert.equal(mapServerGpuType(" 2080d / T10 "), "GeForce RTX");
+  assert.equal(mapServerGpuType("   "), "");
+  assert.equal(mapServerGpuType(""), "");
 });

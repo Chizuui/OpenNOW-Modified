@@ -405,6 +405,34 @@ export class SignalingCoordinator {
   private emitToRenderer(event: MainToRendererSignalingEvent): void {
     const mainWindow = this.deps.getMainWindow();
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // Native mode never runs the renderer handleOffer() that resolves the
+      // server GPU for WebRTC sessions, so stamp the raw CloudMatch gpuType
+      // (e.g. "2080d / T10") onto each stats sample here — the renderer maps
+      // it to the official rig name for the HUD. Only stamp when the session
+      // actually reported one so a stale value never overwrites a newer one.
+      if (event.type === "native-stream-stats") {
+        if (event.stats.serverGpuType === undefined) {
+          const gpuType = this.nativeStreamerContext?.session.gpuType?.trim() ?? "";
+          if (gpuType) {
+            event = {
+              ...event,
+              stats: { ...event.stats, serverGpuType: gpuType },
+            };
+          }
+        }
+        // Same for the zone LB hostname (datacenter code): native mode never
+        // runs the renderer handleOffer() that resolves the region label, so
+        // stamp the preserved serverLocation onto each stats sample here.
+        if (event.stats.serverLocation === undefined) {
+          const serverLocation = this.nativeStreamerContext?.session.serverLocation?.trim() ?? "";
+          if (serverLocation) {
+            event = {
+              ...event,
+              stats: { ...event.stats, serverLocation },
+            };
+          }
+        }
+      }
       mainWindow.webContents.send(IPC_CHANNELS.SIGNALING_EVENT, event);
     }
   }

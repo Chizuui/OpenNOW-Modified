@@ -1,6 +1,8 @@
 import type { NativeStreamStats } from "@shared/gfn";
 
+import { mapServerGpuType } from "../platforms/gfn/webrtc/streamStatsHelpers";
 import type { StreamDiagnostics } from "../platforms/gfn/webrtcClient";
+import { formatServerLocation } from "../utils/streamDiagnosticsFormat";
 
 // Native stats events arrive roughly once a second. When a stats merge has
 // no fresh RTT source (no local RTCP measurement yet and the server field
@@ -206,5 +208,19 @@ export function mergeNativeStreamStats(
     nativeTransitionSummary: stats.lastTransitionSummary,
     nativeRequestedStreamingFeaturesSummary: stats.requestedStreamingFeaturesSummary,
     nativeFinalizedStreamingFeaturesSummary: stats.finalizedStreamingFeaturesSummary,
+    // Server GPU (raw CloudMatch code like "2080d / T10", stamped by the main
+    // process onto native stats) mapped to the official rig name so the HUD
+    // shows "GeForce RTX" instead of falling back to the local GPU. Keep the
+    // previous value when a stats sample carries none.
+    serverGpuType: stats.serverGpuType
+      ? mapServerGpuType(stats.serverGpuType)
+      : current.serverGpuType,
+    // Zone LB hostname (datacenter code) stamped by the main process; resolve
+    // the official-style region label once and keep it across samples so the
+    // HUD shows "Malaysia (NP-KUL-01)" in native sessions too.
+    serverLocationLabel: stats.serverLocation
+      ? formatServerLocation("", stats.serverLocation)
+      : current.serverLocationLabel,
+    serverRegion: stats.serverLocation || current.serverRegion,
   };
 }

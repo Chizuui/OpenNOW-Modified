@@ -222,12 +222,21 @@ export function useGameLaunch({
       );
       const launchStreamingBaseUrl = i2pStorageRegionBaseUrl ?? options?.streamingBaseUrl ?? effectiveStreamingBaseUrl;
       let existingSessionStrategy: ExistingSessionStrategy | undefined;
+      // GPU reported by an existing session for this app (getActiveSessions
+      // carries gpuType even when the create/poll payload omits it). Used as a
+      // backfill when the freshly created session does not report one.
+      let activeSessionGpuType: string | undefined;
 
       // Check for active sessions first
       if (token) {
         try {
           const activeSessions = await window.openNow.getActiveSessions(token, launchStreamingBaseUrl);
           if (activeSessions.length > 0) {
+            const matchingGpu = activeSessions.find(
+              (entry) => entry.appId === numericAppId && entry.gpuType,
+            );
+            const anyGpu = activeSessions.find((entry) => entry.gpuType);
+            activeSessionGpuType = matchingGpu?.gpuType ?? anyGpu?.gpuType;
             // Only claim sessions that are already paused/ready (status 2 or 3).
             // Status=1 sessions are still in queue/setup; sending a RESUME claim
             // skips the queue/ad phase entirely. Let them fall through to
@@ -272,7 +281,7 @@ export function useGameLaunch({
       const supportedCodecs = resolveSupportedStreamCodecs(await getOrRunCodecSupport());
 
       // Create new session
-      const newSession = await window.openNow.createSession({
+      let newSession = await window.openNow.createSession({
         token: token || undefined,
         streamingBaseUrl: launchStreamingBaseUrl,
         appId,
@@ -287,6 +296,13 @@ export function useGameLaunch({
         settings: streamSettings,
         supportedCodecs,
       });
+
+      // Backfill the server GPU from an existing session for this app when the
+      // create response omitted it (common on some zones/rigs). The poll loop
+      // below may also surface it later via mergePolledSessionState.
+      if (!newSession.gpuType && activeSessionGpuType) {
+        newSession = { ...newSession, gpuType: activeSessionGpuType };
+      }
 
       setSession(newSession);
       setQueuePosition(newSession.queuePosition);

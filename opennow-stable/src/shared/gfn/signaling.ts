@@ -190,6 +190,22 @@ export interface NativeStreamStats {
    * appears once the counter is verified to be cumulative bytes.
    */
   networkBitrateKbps?: number;
+  /**
+   * Raw CloudMatch gpuType code (e.g. "2080d / T10") stamped by the main
+   * process onto native-stream-stats so the renderer HUD can show the
+   * server rig. The renderer maps it to the official rig name via
+   * mapServerGpuType(). Absent in WebRTC (non-native) sessions, where the
+   * client reads session.gpuType directly.
+   */
+  serverGpuType?: string;
+  /**
+   * Zone LB hostname / datacenter code (e.g. "npa-yes-kul-01.yes.geforcenow...")
+   * stamped by the main process onto native-stream-stats so the renderer HUD
+   * can show the region label. The renderer maps it to "Country (NP-CODE)"
+   * via formatServerLocation(). Absent in WebRTC (non-native) sessions, where
+   * the client resolves the label from session.serverLocation directly.
+   */
+  serverLocation?: string;
   /** Average decode→present pipeline latency in ms. */
   decodeTimeMs?: number;
   /** Active input capture path in the native streamer: sink-native / internal / external / bridge / none. */

@@ -11,6 +11,7 @@ import {
   classifyStreamLagReason,
   evaluateControllerOverlayShortcutGate,
   isRttSpike,
+  mapServerGpuType,
   parseStatsChannelGameFps,
   quantizeMouseDeltaWithResidual,
   subsampleCoalescedPointerEvents,
@@ -377,4 +378,17 @@ test("classifyStreamLagReason reports render lag for large relative render drop"
     renderFps: 90,
   });
   assert.equal(result.reason, "render");
+});
+
+test("mapServerGpuType translates raw CloudMatch GPU codes to friendly rig names", () => {
+  // Codes captured from real CloudMatch payloads (official client gpuNameMap)
+  assert.equal(mapServerGpuType("2080d / T10"), "GeForce RTX");
+  assert.equal(mapServerGpuType("3080p / A10Gx2"), "GeForce RTX 3080");
+  assert.equal(mapServerGpuType("4080h / L40S"), "GeForce RTX 4080");
+  assert.equal(mapServerGpuType("5080h / B40"), "GeForce RTX 5080");
+  assert.equal(mapServerGpuType("1060b / T10-8"), "Basic Rig");
+  // Unknown codes and empty values pass through unchanged
+  assert.equal(mapServerGpuType("9999z / X99"), "9999z / X99");
+  assert.equal(mapServerGpuType("  "), "");
+  assert.equal(mapServerGpuType(""), "");
 });
