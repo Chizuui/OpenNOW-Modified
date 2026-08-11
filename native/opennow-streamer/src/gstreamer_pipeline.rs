@@ -56,12 +56,23 @@ use std::thread;
 const WEBRTC_LATENCY_MS: u32 = 100;
 const DEFAULT_GFN_STUN_SERVER: &str = "stun://stun2.l.google.com:19302";
 /// Compressed-frame jitter buffer between the parser and the decoder (leaky=no,
-/// so it blocks the RTP thread instead of dropping). ~250 ms at 60 fps absorbs
-/// the 100-300 ms WAN jitter bursts the field logs show (sink fps collapsing to
-/// single digits with only 0.03-0.09% packet loss); 6 frames (100 ms) was too
-/// small — any gap beyond it starved the decoder and froze the picture on the
-/// last frame until the next burst.
-const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
+/// so it blocks the RTP thread instead of dropping). This constant is the DEEP
+/// ceiling (~250 ms at 60 fps) that absorbs the 100-300 ms WAN jitter bursts
+/// the field logs show (sink fps collapsing to single digits with only
+/// 0.03-0.09% packet loss). A fixed deep buffer also added ~150 ms of constant
+/// latency, which made in-game drags feel "patah-patah" on stable links — the
+/// liveness monitor now resizes this queue ADAPTIVELY (base 6 frames ≈ 100 ms
+/// when the network RTT is low, up to this ceiling when RTT rises), so
+/// steady-state latency stays tight and the anti-flicker protection engages
+/// only while the network actually needs it.
+pub(crate) const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
+/// Shallow floor of the adaptive compressed-frame jitter buffer (~100 ms at
+/// 60 fps). On stable links (RTT ≤ ~60 ms) the buffer rests here, keeping
+/// drag/input feel tight.
+pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 6;
+/// Mid depth (~167 ms at 60 fps) used while the network RTT is moderately
+/// elevated (60-100 ms).
+pub(crate) const VIDEO_COMPRESSED_QUEUE_MID_BUFFERS: u32 = 10;
 /// How long to wait for a fresh frame to arrive at the screenshot grab branch
 /// after opening its valve before giving up (the stream may be paused).
 const SCREENSHOT_CAPTURE_TIMEOUT_MS: u64 = 2_000;
@@ -555,14 +566,14 @@ impl GstreamerVideoTap {
 
 /// Native recording branch — TRANSCODE to H.264. The branch taps the DECODED
 /// video right before the sink (the permanent video tap tee in the live
-/// chain, the same tee screenshots use), converts it to standard BT.709
-/// 8-bit 4:2:0, re-encodes with H.264 (hardware d3d12h264enc when the GPU
-/// supports it, else openh264enc/x264enc), and muxes with AAC game audio into
-/// a standard seekable MP4 (faststart):
+/// chain, the same tee screenshots use), converts it to 8-bit 4:2:0,
+/// re-encodes with H.264 (x264enc ultrafast by default with insert-vui=false
+/// so the file carries no colorimetry/range tag — exactly like the official
+/// GeForce Now recordings; openh264enc fallback), and muxes with AAC game
+/// audio into a standard seekable MP4 (faststart):
 ///
 ///   tap tee → valve → queue → [d3d12download] → videoconvert → capsfilter
-///   (FULL bt709) → videoconvert (FULL→LIMITED) → capsfilter
-///   (LIMITED bt709) → H.264 encoder → h264parse → qtmux → swallow
+///   (FULL bt709) → H.264 encoder → h264parse → qtmux → swallow
 ///
 /// Re-encoding (instead of the old source-bitstream RTP remux) is what makes
 /// the recording UNIVERSAL — the field complaint: recordings of GFN's H.265
@@ -572,12 +583,13 @@ impl GstreamerVideoTap {
 /// it at once:
 ///
 /// - Universal: H.264 main profile, 8-bit, plays on any device/player.
-/// - Colors: the GFN stream is FULL-RANGE PC video (decoder output 0-255,
-///   range untagged), so the branch declares full-range BT.709 and then
-///   scales it down to LIMITED 16-235 before the encoder — the encoder's
-///   limited VUI tag then matches the data and every player renders the
-///   exact live colors (the old file tagged 0-255 data as limited and came
-///   out washed-out / "weird colors").
+/// - Colors: the GFN stream is FULL-RANGE PC video (decoder output 0-255),
+///   but H.264 playback expects LIMITED range and every field player expands
+///   H.264 content as limited, so the branch converts 0-255 → 16-235 (RGB
+///   round-trip, exact at both ends) and tags nothing (x264 with
+///   insert-vui=false) — the recording is then limited + untagged, exactly
+///   like the official GeForce Now PC recordings, and renders with the same
+///   colors as the live stream and the in-app screenshot.
 /// - Glitch-free start: the encoder begins a fresh GOP (IDR) at the first
 ///   frame it sees, so the file NEVER starts mid-GOP with orphan P-frames
 ///   referencing pre-recording frames (the decode glitches at the head of
@@ -601,8 +613,10 @@ pub(crate) struct GstreamerRecordingState {
     /// Leaky decoupling queue (valve → queue → …). It never back-pressures
     /// the live decode path.
     pub(crate) queue: gst::Element,
-    /// The H.264 encoder actually in use (d3d12h264enc / openh264enc /
-    /// x264enc). Only fed while the valve is open.
+    /// The H.264 encoder actually in use (x264enc by default — configured
+    /// with insert-vui=false so the file carries no range/colorimetry tag,
+    /// exactly like the official GeForce Now recordings; openh264enc
+    /// fallback). Only fed while the valve is open.
     pub(crate) encoder: gst::Element,
     /// Factory name of `encoder`, for logs and tests.
     pub(crate) encoder_factory: String,
@@ -616,17 +630,29 @@ pub(crate) struct GstreamerRecordingState {
     /// valve starts the next recording in the exact fresh state it had at
     /// build time.
     pub(crate) video_convert: gst::Element,
-    /// Declares the decoder's output as FULL-RANGE BT.709 (the GFN H.265
-    /// stream carries full-range PC video, but the decoder leaves the range
-    /// untagged, so the encoder would otherwise tag the file limited while
-    /// the pixel data stays 0-255 — the exact "weird colors" field bug).
+    /// Declares the branch input as FULL-RANGE BT.709 (0-255) — what the
+    /// decoder actually outputs (the same data the screenshot branch writes
+    /// straight into a PNG). The branch then scales it 0-255 → 16-235 with a
+    /// LUT-based Y-plane probe (`range_lut_probe`), matching the official
+    /// GeForce Now recordings (limited + untagged), which render correctly on
+    /// the field. H.264 playback expects LIMITED range and every player on
+    /// the field expands H.264 content as limited, so full-range (or
+    /// clip-only "limited") data comes out with crushed blacks
+    /// ("hitam pekat").
     pub(crate) video_declare_caps: gst::Element,
-    /// Second videoconvert: scales the declared full-range data down to
-    /// LIMITED range (16-235), matching what the H.264 encoders tag, so every
-    /// player renders the recorded colors exactly like the live stream.
-    pub(crate) video_range_convert: gst::Element,
     /// Demands LIMITED-range BT.709 (16-235) at the encoder input.
     pub(crate) video_encode_caps: gst::Element,
+    /// The FULL→LIMITED (0-255 → 16-235) Y-plane scaler probe attached to
+    /// the range bridge's (`range_convert`) sink pad. Behind a mutex because
+    /// recycle() must remove/re-attach it (&self) when range_convert is reset
+    /// to NULL there (which deactivates its pads and drops the probe).
+    /// PadProbeId is not Clone, hence the interior mutability instead of a
+    /// plain field.
+    pub(crate) range_lut_probe: Arc<Mutex<Option<gst::PadProbeId>>>,
+    /// The videoconvert that bridges the FULL→LIMITED colourimetry change
+    /// between the declare caps and the encoder caps (the caps must intersect
+    /// for the elements to link; the LUT probe rescales the data).
+    pub(crate) range_convert: gst::Element,
     /// Optional D3D11/D3D12 texture→system-memory downloader (only when
     /// zero-copy is active). Reset on recycle like the rest of the branch.
     pub(crate) video_download: Option<gst::Element>,
@@ -1063,7 +1089,7 @@ impl GstreamerRecordingState {
         }
         branch_elements.push(self.video_convert.clone());
         branch_elements.push(self.video_declare_caps.clone());
-        branch_elements.push(self.video_range_convert.clone());
+        branch_elements.push(self.range_convert.clone());
         branch_elements.push(self.video_encode_caps.clone());
         if let Some(audio_queue) = &self.audio_queue {
             branch_elements.push(audio_queue.clone());
@@ -1073,6 +1099,17 @@ impl GstreamerRecordingState {
         }
         if let Some(audio_depayloader) = &self.audio_depayloader {
             branch_elements.push(audio_depayloader.clone());
+        }
+        // The LUT probe lives on the range bridge's sink pad; resetting the
+        // element to NULL deactivates its pads and drops the probe, so remove
+        // it before the reset and re-attach after re-arming. (range_convert
+        // itself is a stateless videoconvert — the probe is what carries the
+        // scaler.)
+        let lut_probe = self.range_lut_probe.lock().expect("lut probe lock").take();
+        if let Some(probe) = lut_probe {
+            if let Some(sink_pad) = self.range_convert.static_pad("sink") {
+                let _ = sink_pad.remove_probe(probe);
+            }
         }
         for element in &branch_elements {
             element.set_state(gst::State::Null).map_err(|error| {
@@ -1089,6 +1126,15 @@ impl GstreamerRecordingState {
                     element.name()
                 )
             })?;
+        }
+        if let Some(sink_pad) = self.range_convert.static_pad("sink") {
+            *self.range_lut_probe.lock().expect("lut probe lock") =
+                sink_pad.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
+                    if let Some(buffer) = info.buffer_mut() {
+                        scale_y_plane_full_to_limited(buffer, pad.current_caps().as_ref());
+                    }
+                    gst::PadProbeReturn::Ok
+                });
         }
         // Resetting qtmux clears its sticky stream events. Replay them while
         // both valves remain closed; opening first races the live video and
@@ -5837,10 +5883,11 @@ fn insert_screenshot_grab_branch(
 /// Build the native TRANSCODE recording branch off the video tap tee (the
 /// tee embedded between the post-decode queue and the sink in
 /// `build_rtp_video_chain` — the same tee screenshots use). The branch takes
-/// the DECODED frames, converts them to standard BT.709 8-bit 4:2:0, and
+/// the DECODED frames, converts them to standard BT.709 8-bit 4:2:0, scales
+/// the luma FULL→LIMITED with a LUT pad probe (videoconvert only clips), and
 /// re-encodes with H.264:
-/// tee → valve → queue → [download] → videoconvert → capsfilter → encoder →
-/// h264parse → qtmux → swallow.
+/// tee → valve → queue → [download] → videoconvert → capsfilter (FULL) →
+/// capsfilter (LIMITED, LUT probe) → encoder → h264parse → qtmux → swallow.
 ///
 /// The branch is built at session start (pipeline NULL/READY) and the tee pad
 /// stays linked for the whole session, so record start/stop is ONLY a valve
@@ -5854,6 +5901,102 @@ fn insert_screenshot_grab_branch(
 /// `stop(finalize=true)` knows when the branch flushed. The game-audio RTP
 /// stream is Opus and is transcoded to AAC into the same qtmux when available;
 /// the local mic is not part of the server RTP stream.
+/// Neutralizes the MP4 `colr` colour-information box(es) in the finished
+/// recording so the file carries NO colour metadata at all — primaries,
+/// transfer, matrix and range all "unknown" — byte-identical in spirit to
+/// the official GeForce Now PC recordings. qtmux always writes a `colr` box
+/// from the colourimetry that h264parse derives by resolution (BT.709 for
+/// 1080p) even when the bitstream has no VUI (insert-vui=false), and no
+/// capsfilter can remove the field from the caps, so the box is neutralized
+/// after muxing by renaming its type `colr` → `free`. A `free` box is a
+/// standard, universally-ignored MP4 box: the file's structure, sizes and
+/// absolute sample offsets (stco/co64) stay untouched, so no box-tree surgery
+/// or offset patching is needed and the file remains fully playable. This is
+/// what makes the field players render the recording like the GFN file:
+/// content with zero colour tags is expanded as limited by default, while a
+/// present-but-misinterpreted colr box makes some players skip the range
+/// expansion and show crushed blacks ("hitam pekat"). Returns the number of
+/// boxes neutralized.
+pub(crate) fn strip_mp4_colr_boxes(data: &mut Vec<u8>) -> usize {
+    let mut count = 0usize;
+    let mut idx = 0usize;
+    while idx + 8 <= data.len() {
+        if &data[idx..idx + 4] == b"colr" {
+            data[idx..idx + 4].copy_from_slice(b"free");
+            count += 1;
+            idx += 4;
+        } else {
+            idx += 1;
+        }
+    }
+    count
+}
+
+/// Scale a video buffer's Y plane from FULL range (0-255) to LIMITED range
+/// (16-235) with a precomputed 256-entry LUT: `y' = 16 + y*219/255`.
+/// GStreamer's videoconvert does NOT rescale YUV range — it only clips
+/// extremes to [16,235] while leaving mid-tones at their full-range values
+/// (verified experimentally), and RGB round-trips through it clip the same
+/// way. A file full of clipped-full data is exactly what the field players
+/// expand to "hitam pekat" (crushed blacks + blown highlights), which is
+/// also why every earlier fix attempt (data full, data limited, tag or no
+/// tag) looked equally dark: the data was never genuinely rescaled. Only the
+/// Y plane is touched — chroma is left as-is (BT.709 1080p), and 4:2:0
+/// formats (I420/NV12) both have the Y plane first, so no format lookup is
+/// needed beyond the plane geometry from the caps. The probe passes the
+/// element's current caps (stable for the whole session) rather than the
+/// buffer's, keeping this free of BufferRef trait gymnastics.
+pub(crate) fn scale_y_plane_full_to_limited(buffer: &mut gst::Buffer, caps: Option<&gst::Caps>) {
+    use gstreamer_video::{VideoFormat, VideoInfo};
+    let Some(caps) = caps else { return };
+    let Ok(info) = VideoInfo::from_caps(caps) else {
+        return;
+    };
+    if info.format() != VideoFormat::I420 && info.format() != VideoFormat::Nv12 {
+        return;
+    }
+    // make_mut() guarantees a unique writable view (copies the data if the
+    // buffer is shared elsewhere); the decode path hands us an exclusive
+    // buffer here, so this is a no-op in practice.
+    let Ok(mut map) = buffer.make_mut().map_writable() else {
+        return;
+    };
+    let data = map.as_mut_slice();
+    let base = info.offset()[0];
+    let stride = usize::try_from(info.stride()[0]).unwrap_or(0);
+    let width = info.width() as usize;
+    let height = info.height() as usize;
+    // Bounds-check the LAST row's last pixel only (the Y plane is the first
+    // `height*stride` bytes; the guard must not require `height*stride` to
+    // fit when the buffer's total size includes just the chroma planes — e.g.
+    // I420 2x2 is 6 bytes but height*stride is 8).
+    if width > stride
+        || base + (height.saturating_sub(1)).saturating_mul(stride) + width > data.len()
+    {
+        return;
+    }
+    let lut = full_to_limited_lut();
+    for row in 0..height {
+        let start = base + row * stride;
+        let end = start + width;
+        for pixel in &mut data[start..end] {
+            *pixel = lut[*pixel as usize];
+        }
+    }
+}
+
+/// Precomputed 256-entry FULL→LIMITED luma LUT: `y' = 16 + y*219/255`
+/// (0 → 16, 128 → 126, 255 → 235). Pure — used both by the pad probe and by
+/// the unit test, which validates the exact values without needing to
+/// construct pipeline buffers.
+pub(crate) fn full_to_limited_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (x, slot) in lut.iter_mut().enumerate() {
+        *slot = (16u32 + (x as u32 * 219u32 + 127u32) / 255u32) as u8;
+    }
+    lut
+}
+
 pub(crate) fn build_transcode_record_branch(
     pipeline: &gst::Pipeline,
     tap_tee: &gst::Element,
@@ -5866,22 +6009,39 @@ pub(crate) fn build_transcode_record_branch(
     // Format conversion: the decoder's native NV12 → the encoder's input
     // format (NV12 for d3d12h264enc, I420 for the software encoders).
     let convert = make_element("videoconvert")?;
-    // Declares the input as FULL-RANGE BT.709. The GFN H.265 stream is
-    // full-range PC video and the decoder leaves the range untagged; without
-    // this declaration the range conversion below would be a no-op and the
-    // encoder would tag the 0-255 data as limited (washed-out colors).
+    // The GFN H.265 stream is FULL-RANGE PC video (decoder output 0-255 — the
+    // screenshot branch on the same tee writes it straight into a PNG, which
+    // has no range ambiguity and shows the true colors), but H.264 playback
+    // expects LIMITED range: the official GeForce Now PC recordings are
+    // limited (16-235, verified by histogram — the 0-255 readings in earlier
+    // analysis were codec overshoot, <0.1% of pixels), and every player on
+    // the field expands H.264 content as limited, so full-range data comes
+    // out with crushed blacks ("hitam pekat"). The branch therefore declares
+    // the input FULL-RANGE and converts it to LIMITED 16-235 with a LUT-based
+    // Y-plane scaler (a Rust pad probe — videoconvert only CLIPS extremes to
+    // [16,235] without rescaling mid-tones, which is exactly the "hitam
+    // pekat" + blown-highlight look, and RGB round-trips do the same clip),
+    // then feeds an encoder configured with insert-vui=false so the file
+    // carries NO range/colorimetry tag — byte-identical in spirit to the GFN
+    // recordings.
+    // NOTE: no videorate in this chain — videorate re-bases its output onto
+    // the replayed live segment (start=0, session start) and INSERTS
+    // duplicate frames for the whole gap between session start and the valve
+    // opening, so a 31 s recording came out as 79.8 s of video with the
+    // audio track stranded at the tail (the field "stuck / audio missing"
+    // bug). The muxer normalizes the first sample of each track to 0 on its
+    // own, so the live stream's own pacing is preserved and both tracks stay
+    // in sync.
     let declare_caps = make_element("capsfilter")?;
-    // Scales the full-range data to LIMITED range (16-235) so the pixel data
-    // matches the limited-range tag every H.264 encoder writes (both the
-    // hardware encoder and x264 hardcode limited in their VUI). NOTE: no
-    // videorate in this chain — videorate re-bases its output onto the
-    // replayed live segment (start=0, session start) and INSERTS duplicate
-    // frames for the whole gap between session start and the valve opening,
-    // so a 31 s recording came out as 79.8 s of video with the audio track
-    // stranded at the tail (the field "stuck / audio missing" bug). The
-    // muxer normalizes the first sample of each track to 0 on its own, so
-    // the live stream's own pacing is preserved and both tracks stay in sync.
+    // Bridges the FULL→LIMITED colourimetry change between the two caps
+    // filters (the caps must intersect for the elements to link; the range
+    // is actually rescaled by the LUT probe below — videoconvert only clips
+    // extremes, which is exactly the bug being fixed). Keeps the data in the
+    // encoder's format and limited range, and the LUT probe hangs on its
+    // sink pad.
     let range_convert = make_element("videoconvert")?;
+    // Declares the LIMITED range at the encoder input (what the LUT scaler
+    // below produces).
     let encode_caps = make_element("capsfilter")?;
     let (encoder_factory, encoder) = pick_h264_encoder()?;
     // Converts the encoder's byte-stream H.264 to avcC for qtmux: the
@@ -5932,16 +6092,12 @@ pub(crate) fn build_transcode_record_branch(
         None => None,
     };
 
-    // Universal color, made deterministic: BT.709 4:2:0 8-bit with an
-    // explicit FULL→LIMITED range conversion. The GFN H.265 stream is
-    // full-range PC video (decoder output is 0-255, range untagged), so the
-    // branch (1) declares the input full-range, (2) scales it to limited
-    // 16-235, and (3) feeds the encoder — whose limited VUI tag then matches
-    // the data, so every player renders the recording with the exact live
-    // colors. Without the declared conversion the encoder tags the 0-255
-    // data as limited and the file comes out washed-out (the field bug).
-    // d3d12h264enc takes NV12 (the decode chain's native output); the
-    // software encoders take I420.
+    // x264enc/openh264enc take I420 (the default encoders — d3d12h264enc,
+    // which takes NV12, is only used when forced via OPENNOW_RECORD_ENCODER
+    // and cannot write untagged files). The FULL-range colorimetry is
+    // declared at the branch input (what the decoder actually outputs), and
+    // the LIMITED colorimetry at the encoder input (what the RGB round-trip
+    // produces and what H.264 players expect).
     let encoder_format = if encoder_factory == "d3d12h264enc" {
         "NV12"
     } else {
@@ -5955,6 +6111,10 @@ pub(crate) fn build_transcode_record_branch(
         .parse::<gst::Caps>()
         .map_err(|error| format!("Invalid recording transcode caps: {error}"))?,
     );
+    // LIMITED range, encoder format (NV12 for d3d12h264enc, I420 for the
+    // software encoders) — the LUT probe on this element's sink pad has
+    // already rescaled the Y plane 0-255 → 16-235 by the time the caps here
+    // are negotiated, so the caps match the data.
     encode_caps.set_property(
         "caps",
         format!(
@@ -5978,12 +6138,13 @@ pub(crate) fn build_transcode_record_branch(
     muxer.set_property("fragment-duration", 0u32);
     muxer.set_property("streamable", false);
 
-    // Chain order: valve → queue → [download] → videoconvert → capsfilter
-    // (declare FULL bt709) → videoconvert (FULL→LIMITED) → capsfilter
-    // (LIMITED bt709) → encoder → h264parse → qtmux → swallow. The valve is
-    // deliberately FIRST so the encoder only runs while a recording is
-    // active (zero CPU when idle) and every element below it is stateless
-    // enough to reset in place.
+    // Chain order: valve → queue → [download] → videoconvert (to the
+    // encoder's format) → capsfilter (declare FULL bt709) → videoconvert
+    // (range bridge, with the LUT full→limited Y-plane scaler probe on its
+    // sink pad) → capsfilter (LIMITED bt709) → encoder → h264parse → qtmux
+    // → swallow. The valve is deliberately FIRST so the encoder only runs
+    // while a recording is active (zero CPU when idle) and every element
+    // below it is stateless enough to reset in place.
     let mut elements: Vec<&gst::Element> = vec![&valve, &queue];
     if let Some(download) = download.as_ref() {
         elements.push(download);
@@ -6037,6 +6198,27 @@ pub(crate) fn build_transcode_record_branch(
         ));
     }
 
+    // The LUT scaler: full-range (0-255) → limited (16-235) on the Y plane.
+    // GStreamer's videoconvert does NOT rescale YUV range (it only clips
+    // extremes to [16,235], leaving mid-tones at full-range values — the
+    // crushed-blacks/"hitam pekat" field bug), so the scale is done here in
+    // Rust with a precomputed 256-entry LUT. Only the luma plane is touched
+    // (chroma stays as-is; 1080p H.264 is always BT.709), and only while the
+    // valve is open, so it costs nothing when idle. Attached to the range
+    // bridge's sink pad; range_convert is reset on recycle, so the probe is
+    // removed and re-attached there.
+    let lut_probe_id = Arc::new(Mutex::new({
+        let range_sink = range_convert
+            .static_pad("sink")
+            .ok_or_else(|| "Recording range bridge has no sink pad.".to_owned())?;
+        range_sink.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
+            if let Some(buffer) = info.buffer_mut() {
+                scale_y_plane_full_to_limited(buffer, pad.current_caps().as_ref());
+            }
+            gst::PadProbeReturn::Ok
+        })
+    }));
+
     let eos_seen = Arc::new(AtomicBool::new(false));
     // Inactive until the first `start()`; the chunk probe is gated on this so
     // no muxer output is ever captured while the branch is idle.
@@ -6047,6 +6229,7 @@ pub(crate) fn build_transcode_record_branch(
     // EOS, so a single final chunk carries the complete seekable MP4).
     let chunk_sender = event_sender.clone();
     let chunk_active = active.clone();
+    let probe_sender = event_sender.clone();
     let swallow_sink_pad = swallow
         .static_pad("sink")
         .ok_or_else(|| "Recording swallow queue has no sink pad.".to_owned())?;
@@ -6056,7 +6239,22 @@ pub(crate) fn build_transcode_record_branch(
         if chunk_active.load(Ordering::SeqCst) {
             if let Some(buffer) = info.buffer() {
                 if let Ok(mapped) = buffer.map_readable() {
-                    let chunk_base64 = BASE64_STANDARD.encode(mapped.as_slice());
+                    // Strip the container's colour-metadata box so the file
+                    // carries NO colour tags at all (see strip_mp4_colr_boxes
+                    // for why the player needs it byte-identical to the
+                    // official GeForce Now recordings).
+                    let mut bytes = mapped.as_slice().to_vec();
+                    let stripped = strip_mp4_colr_boxes(&mut bytes);
+                    if stripped > 0 {
+                        send_log(
+                            &probe_sender,
+                            "info",
+                            format!(
+                                "Recording finalized with {stripped} colour-metadata box(es) neutralized (colr→free); file carries no colour tags, matching the official GeForce Now recordings."
+                            ),
+                        );
+                    }
+                    let chunk_base64 = BASE64_STANDARD.encode(&bytes);
                     if let Some(sender) = &chunk_sender {
                         let _ = sender.send(Event::RecordingChunk { chunk_base64 });
                     }
@@ -6080,7 +6278,7 @@ pub(crate) fn build_transcode_record_branch(
         &event_sender,
         "info",
         format!(
-            "Attached native TRANSCODE recording branch (decoded → videoconvert → {encoder_factory} → qtmux → swallow; universal H.264/BT.709 MP4, never touches the decode/present chain)."
+            "Attached native TRANSCODE recording branch (decoded → {encoder_factory} (insert-vui=false) → qtmux → swallow; FULL→LIMITED Y-plane LUT scaler → limited-range untagged H.264 MP4 matching the official GeForce Now recordings, never touches the decode/present chain)."
         ),
     );
 
@@ -6092,8 +6290,9 @@ pub(crate) fn build_transcode_record_branch(
         h264_parse: parse,
         video_convert: convert,
         video_declare_caps: declare_caps,
-        video_range_convert: range_convert,
         video_encode_caps: encode_caps,
+        range_lut_probe: lut_probe_id,
+        range_convert,
         video_download: download,
         muxer,
         swallow,
@@ -6111,10 +6310,18 @@ pub(crate) fn build_transcode_record_branch(
     })
 }
 
-/// Pick the H.264 encoder for the recording branch: hardware first (zero CPU
-/// — recordings must never steal frames from the live decode on weak
-/// machines), then light software encoders. `OPENNOW_RECORD_ENCODER` forces a
-/// specific factory (e.g. `x264enc`) for debugging/problem machines.
+/// Pick the H.264 encoder for the recording branch. The recording carries
+/// LIMITED (16-235) data — the RGB round-trip converts the decoder's
+/// full-range output to the limited range H.264 playback expects — and the
+/// encoder must NOT write a range tag in its VUI: the official GeForce Now
+/// recordings are untagged, and any tag (especially `tv`, which the hardware
+/// encoders hardcode) is what the field players mis-render (crushed blacks).
+/// That rules out the hardware encoders (d3d12h264enc and mfh264enc hardcode
+/// a `tv` VUI regardless of the input caps — verified against the bundled
+/// runtime), so the default is x264enc (ultrafast + insert-vui=false → no
+/// colorimetry/range VUI at all), with openh264enc (which writes no range
+/// tag either) as fallback. `OPENNOW_RECORD_ENCODER` forces a specific
+/// factory for debugging/problem machines.
 fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
     let forced = std::env::var("OPENNOW_RECORD_ENCODER")
         .ok()
@@ -6124,7 +6331,7 @@ fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
     if let Some(forced) = &forced {
         candidates.push(forced);
     }
-    candidates.extend(["d3d12h264enc", "openh264enc", "x264enc"]);
+    candidates.extend(["x264enc", "openh264enc"]);
     for factory in candidates {
         if let Ok(element) = gst::ElementFactory::make(factory).build() {
             configure_h264_encoder(&element, factory);
@@ -6136,7 +6343,7 @@ fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
         if forced.is_some() {
             "forced factory + defaults"
         } else {
-            "d3d12h264enc, openh264enc, x264enc"
+            "x264enc, openh264enc"
         }
     ))
 }
@@ -6165,6 +6372,12 @@ fn configure_h264_encoder(element: &gst::Element, factory: &str) {
             element.set_property("key-int-max", 60u32);
             element.set_property("bframes", 0u32);
             set_property_from_str_if_supported(element, "profile", "main");
+            // insert-vui=false: emit NO VUI NAL, so the bitstream carries no
+            // colorimetry and no video_full_range_flag — the recording stays
+            // untagged exactly like the official GeForce Now files (limited
+            // 16-235 data, no tag), which is what the field players render
+            // correctly. Verified: ffprobe shows color_range=unknown.
+            set_property_from_str_if_supported(element, "insert-vui", "false");
         }
         _ => {}
     }
@@ -6191,6 +6404,100 @@ fn pick_aac_encoder() -> Result<(String, gst::Element), String> {
 #[cfg(test)]
 mod mic_pipeline_tests {
     use super::*;
+
+    /// The finished MP4 must carry NO colour metadata: qtmux writes a `colr`
+    /// box (BT.709 for 1080p, derived by h264parse even when the bitstream
+    /// has no VUI) which some field players misinterpret as full-range and
+    /// then render the limited 16-235 data without expansion ("hitam pekat")
+    /// — the official GeForce Now recordings carry no colour tags at all and
+    /// render correctly. The box type is renamed `colr` → `free` (a standard,
+    /// universally-ignored MP4 box) so sizes/offsets stay untouched.
+    #[test]
+    fn strip_mp4_colr_boxes_neutralizes_colour_metadata_without_shifting_structure() {
+        // Synthetic faststart MP4 skeleton: moov (with a video trak whose
+        // stsd holds an avc1 sample entry containing the colr box + avcC, and
+        // an stco with sample offsets into a later mdat) followed by mdat.
+        fn box_of(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&((payload.len() as u32 + 8u32).to_be_bytes()));
+            b.extend_from_slice(box_type);
+            b.extend_from_slice(payload);
+            b
+        }
+        let avc1_payload_start = vec![0u8; 78]; // VisualSampleEntry fixed fields
+        let colr = box_of(b"colr", &[b'n', b'c', b'l', b'c', 0, 1, 0, 1, 0, 1]);
+        let avcc = box_of(b"avcC", &[1u8; 8]);
+        let mut avc1_payload = avc1_payload_start;
+        avc1_payload.extend_from_slice(&colr);
+        avc1_payload.extend_from_slice(&avcc);
+        let avc1 = box_of(b"avc1", &avc1_payload);
+        let mut entry_payload = Vec::new();
+        entry_payload.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        entry_payload.extend_from_slice(&avc1);
+        let stsd = box_of(b"stsd", &entry_payload);
+        let mut stco_payload = vec![0u8; 4]; // version+flags
+        stco_payload.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        stco_payload.extend_from_slice(&1000u32.to_be_bytes());
+        stco_payload.extend_from_slice(&2000u32.to_be_bytes());
+        let stco = box_of(b"stco", &stco_payload);
+        let mut stbl_payload = Vec::new();
+        stbl_payload.extend_from_slice(&stsd);
+        stbl_payload.extend_from_slice(&stco);
+        let stbl = box_of(b"stbl", &stbl_payload);
+        let mut minf_payload = Vec::new();
+        minf_payload.extend_from_slice(&stbl);
+        let minf = box_of(b"minf", &minf_payload);
+        let mut mdia_payload = Vec::new();
+        mdia_payload.extend_from_slice(&minf);
+        let mdia = box_of(b"mdia", &mdia_payload);
+        let mut trak_payload = Vec::new();
+        trak_payload.extend_from_slice(&mdia);
+        let trak = box_of(b"trak", &trak_payload);
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&trak);
+        let moov = box_of(b"moov", &moov_payload);
+        let mdat = box_of(b"mdat", &[0u8; 64]);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&moov);
+        data.extend_from_slice(&mdat);
+        assert!(
+            data.windows(4).any(|w| w == b"colr"),
+            "fixture must contain colr"
+        );
+        let stco_offset = data.windows(4).position(|w| w == b"stco").unwrap();
+        let stco_entry_a = stco_offset + 12; // version/flags + count
+        let stco_entry_b = stco_entry_a + 4;
+
+        let count = strip_mp4_colr_boxes(&mut data);
+        assert_eq!(count, 1, "exactly one colr box must be neutralized");
+        assert!(
+            !data.windows(4).any(|w| w == b"colr"),
+            "colr must be gone after stripping"
+        );
+        assert!(
+            data.windows(4).any(|w| w == b"free"),
+            "the neutralized box must remain as a free box"
+        );
+        // Structure untouched: stco entry offsets and box layout unchanged.
+        let new_stco_offset = data.windows(4).position(|w| w == b"stco").unwrap();
+        assert_eq!(new_stco_offset, stco_offset, "stco box must not move");
+        assert_eq!(
+            &data[stco_entry_a..stco_entry_a + 4],
+            &1000u32.to_be_bytes(),
+            "stco sample offsets must be untouched"
+        );
+        assert_eq!(
+            &data[stco_entry_b..stco_entry_b + 4],
+            &2000u32.to_be_bytes(),
+            "stco sample offsets must be untouched"
+        );
+        assert_eq!(
+            data.len(),
+            moov.len() + mdat.len(),
+            "file length must not change"
+        );
+    }
 
     /// Regression guard for the 19:56 field failure pattern (the remux
     /// recording branch killed the whole video flow when its elements were
@@ -6391,5 +6698,34 @@ mod mic_pipeline_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// The FULL→LIMITED Y-plane scaler must genuinely RESCALE mid-tones
+    /// (128 → 126), not merely clip extremes to [16,235] like GStreamer's
+    /// videoconvert / the old RGB round-trip did — clipped-full data is what
+    /// the field players expand to "hitam pekat" (crushed blacks + blown
+    /// highlights) no matter what colour tags the file carries. The probe
+    /// tests in gstreamer_liveness verify the scaler is actually wired into
+    /// the branch with real pipeline buffers; this test pins the exact
+    /// LUT values.
+    #[test]
+    fn full_to_limited_lut_rescales_midtones() {
+        let lut = full_to_limited_lut();
+        assert_eq!(lut[0], 16, "black 0 must map to limited 16");
+        assert_eq!(
+            lut[128], 126,
+            "mid-tone 128 must RESCALE to 126 (clip-only converters leave it at 128 — the field bug)"
+        );
+        assert_eq!(lut[255], 235, "white 255 must map to limited 235");
+        // Spot-check the full curve is a genuine linear rescale, not a clip:
+        // 64 → 16 + (64*219+127)/255 = 71; 192 → 16 + (192*219+127)/255 = 180.
+        assert_eq!(lut[64], 71, "64 must rescale to 71");
+        assert_eq!(lut[192], 181, "192 must rescale to 181");
+        // Monotonic: never decreases (floor rounding makes some steps flat,
+        // but a true rescale never steps backwards — a clip would flatten
+        // 235..255 at 235).
+        for pair in lut.windows(2) {
+            assert!(pair[1] >= pair[0], "LUT must be monotonic non-decreasing");
+        }
     }
 }

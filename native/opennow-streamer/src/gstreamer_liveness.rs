@@ -28,6 +28,24 @@ const VIDEO_STALL_RESYNC_MS: u64 = 8_000;
 const VIDEO_STALL_PARTIAL_FLUSH_MS: u64 = 12_000;
 const VIDEO_STALL_COMPLETE_FLUSH_MS: u64 = 16_000;
 const VIDEO_STALL_FATAL_MS: u64 = 20_000;
+
+/// Map the network RTT EMA to a pre-decode jitter-buffer depth in compressed
+/// frames: 6 (≈100 ms) on stable links, 10 (≈167 ms) when moderately elevated,
+/// 15 (≈250 ms) under heavy jitter. Thresholds come from the field logs — the
+/// decoder starved with a 100 ms buffer once RTT rose past ~100 ms.
+fn pre_decode_depth_for_rtt_ema(rtt_ema_ms: u32) -> u32 {
+    use crate::gstreamer_pipeline::{
+        VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
+        VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
+    };
+    if rtt_ema_ms >= 100 {
+        VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+    } else if rtt_ema_ms >= 60 {
+        VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
+    } else {
+        VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+    }
+}
 const VIDEO_STALL_MIN_KEYFRAME_REQUEST_MS: u64 = 2_000;
 const VIDEO_STARTUP_KEYFRAME_MS: u64 = 2_500;
 const VIDEO_STARTUP_RESYNC_MS: u64 = 5_000;
@@ -179,6 +197,13 @@ pub(crate) struct VideoLivenessState {
     /// torn down, only the chain elements), so re-adding it would double-count
     /// encoded bytes. Guarded per monitor instance.
     rtp_bitrate_probe_installed: AtomicBool,
+    /// EMA (ms) of the effective network RTT (stats-channel server RTT, or the
+    /// local RTCP measurement when available), used to resize the pre-decode
+    /// jitter buffer adaptively.
+    network_rtt_ema_ms: AtomicU32,
+    /// Current pre-decode queue depth in compressed frames, so the adaptive
+    /// resize only touches the element when the target actually changes.
+    pre_decode_depth: AtomicU32,
 }
 
 impl VideoLivenessState {
@@ -221,6 +246,10 @@ impl VideoLivenessState {
             startup_fatal_reported: AtomicBool::new(false),
             current_sink: Mutex::new(None),
             rtp_bitrate_probe_installed: AtomicBool::new(false),
+            network_rtt_ema_ms: AtomicU32::new(0),
+            pre_decode_depth: AtomicU32::new(
+                crate::gstreamer_pipeline::VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
+            ),
         }
     }
 
@@ -519,6 +548,41 @@ impl VideoLivenessState {
         if let Ok(mut current) = self.pre_decode_queue.lock() {
             *current = Some(queue);
         }
+    }
+
+    /// Adaptive pre-decode jitter buffer depth: DEEP (15 frames ≈ 250 ms)
+    /// while the network RTT is elevated so WAN jitter bursts never starve the
+    /// decoder (the anti-flicker fix), SHALLOW (6 frames ≈ 100 ms) on stable
+    /// links so in-game drags and aiming stay tight — a fixed 15-frame depth
+    /// added ~150 ms of constant latency and made drags feel "patah-patah".
+    /// Returns the new depth in frames when it changed, else None.
+    pub(crate) fn adjust_pre_decode_queue_for_network(&self, rtt_ms: u32) -> Option<u32> {
+        // EMA (75% history, 25% latest) — the stats-channel RTT is a raw
+        // per-sample value that can bounce between polls; the EMA also gives
+        // the band-switch hysteresis that stops oscillation.
+        let ema = {
+            let current = self.network_rtt_ema_ms.load(Ordering::Relaxed);
+            let next = if current == 0 {
+                rtt_ms
+            } else {
+                (current * 3 + rtt_ms) / 4
+            };
+            self.network_rtt_ema_ms.store(next, Ordering::Relaxed);
+            next
+        };
+        let target = pre_decode_depth_for_rtt_ema(ema);
+        if target == self.pre_decode_depth.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(queue) = self.pre_decode_queue() else {
+            return None;
+        };
+        // Runtime resize: the queue drains to the new max on its own, and with
+        // the present limiter the backlog is consumed at real-time, so
+        // shrinking never fast-forwards the picture.
+        set_property_if_supported(&queue, "max-size-buffers", target);
+        self.pre_decode_depth.store(target, Ordering::Relaxed);
+        Some(target)
     }
 
     pub(crate) fn set_decoder(&self, decoder: gst::Element) {
@@ -911,6 +975,24 @@ fn run_video_liveness_watchdog(
                 sink_fps: sink_total.saturating_sub(last_sink_total) as f64 / elapsed_secs,
             };
             let local_rtcp_rtt_ms = query_rtcp_rtt_ms(&pipeline);
+            // Adaptive pre-decode jitter buffer: keep it shallow while the link
+            // is stable (tight drag/input feel) and deepen it when the RTT
+            // rises so WAN jitter bursts don't starve the decoder.
+            let server_rtt_now = stats_channel_rtt_ms();
+            let effective_rtt =
+                local_rtcp_rtt_ms.or((server_rtt_now > 0).then_some(server_rtt_now));
+            if let Some(rtt) = effective_rtt {
+                if let Some(depth) = state.adjust_pre_decode_queue_for_network(rtt) {
+                    send_log(
+                        &event_sender,
+                        "info",
+                        format!(
+                            "Native pre-decode jitter buffer resized to {depth} compressed frames (~{} ms) for network rtt={rtt} ms.",
+                            depth * 1000 / 60
+                        ),
+                    );
+                }
+            }
             update_native_stats_overlay(
                 &sink,
                 &state,
@@ -2050,6 +2132,12 @@ pub(crate) fn watch_video_sink_caps_transitions(
     });
 }
 
+/// Frames arriving up to this much before their present slot pass instead of
+/// being dropped. Steady-state arrival jitter is usually ±2 ms; dropping those
+/// marginal frames against the fixed grid reads as "patah-patah" motion during
+/// a smooth drag. Real catch-up bursts (many ms early) are still thinned.
+const PRESENT_LIMITER_EARLY_TOLERANCE: Duration = Duration::from_millis(2);
+
 pub(crate) fn install_present_limiter(
     sink: &gst::Element,
     present_max_fps: Arc<AtomicU32>,
@@ -2093,14 +2181,26 @@ pub(crate) fn install_present_limiter(
         }
 
         let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
-        if now < state.next_present_at {
+        // Drop only frames arriving well before their slot (the jitter
+        // catch-up bursts the limiter exists to thin). A 2 ms tolerance keeps
+        // steady-state arrival jitter from dropping frames against the fixed
+        // grid; marginal early frames pass and re-anchor the grid instead of
+        // vanishing (dropped frames during a smooth drag read as "patah-patah"
+        // motion).
+        if now + PRESENT_LIMITER_EARLY_TOLERANCE < state.next_present_at {
             state.dropped = state.dropped.saturating_add(1);
             return gst::PadProbeReturn::Drop;
         }
 
         state.passed = state.passed.saturating_add(1);
-        while state.next_present_at <= now {
-            state.next_present_at += frame_interval;
+        if now < state.next_present_at {
+            // Within tolerance: present at the actual arrival and anchor the
+            // next slot to it, so the grid keeps a stable cadence.
+            state.next_present_at = now + frame_interval;
+        } else {
+            while state.next_present_at <= now {
+                state.next_present_at += frame_interval;
+            }
         }
         let elapsed = state.last_log_at.elapsed();
         if elapsed >= VIDEO_SINK_RATE_LOG_INTERVAL {
@@ -4813,6 +4913,47 @@ mod stacked_window_dance_diagnostics {
 mod tests {
     use super::*;
 
+    /// The adaptive pre-decode jitter buffer must rest at the shallow depth on
+    /// stable links (low drag latency) and deepen only when the RTT rises.
+    #[test]
+    fn pre_decode_depth_bands_follow_network_rtt() {
+        use crate::gstreamer_pipeline::{
+            VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
+            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
+        };
+        // Stable: shallow (≈100 ms).
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(0),
+            VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+        );
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(38),
+            VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+        );
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(59),
+            VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+        );
+        // Moderately elevated: mid depth.
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(60),
+            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
+        );
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(99),
+            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
+        );
+        // Heavy jitter: deep ceiling (the anti-flicker protection).
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(100),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        assert_eq!(
+            pre_decode_depth_for_rtt_ema(250),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+    }
+
     /// The recorder must produce a STANDARD seekable MP4, not a fragmented
     /// streamable MP4: players like VLC cannot seek (slide the timeline) in a
     /// fragmented file and show glitches — the official GeForce Now recorder
@@ -5815,6 +5956,334 @@ mod tests {
             "encoder duplicated frames: encoded={encoded_frames} for recorded={recorded_frames} — the videorate inflation regression"
         );
         assert!(file_bytes.len() > 50_000);
+        // The finished recording must carry NO colour metadata (colr box
+        // neutralized to free) — the official GeForce Now recordings are
+        // untagged and the field players render them correctly, while a
+        // colr box makes them skip the limited-range expansion ("hitam
+        // pekat").
+        assert!(
+            !file_bytes.windows(4).any(|w| w == b"colr"),
+            "recording must not carry a colr colour-metadata box"
+        );
+        assert!(
+            file_bytes.windows(4).any(|w| w == b"free"),
+            "recording must keep the neutralized box as a free box"
+        );
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Production-faithful COLOR probe: the live decode chain hands the tap
+    /// tee NV12 tagged FULL-RANGE BT.709 (`colorimetry=1:3:5:1` — exactly what
+    /// d3d12h265dec reports on the field, 0-255 pixel data; the screenshot
+    /// branch on the same tee writes it straight into a PNG, which shows the
+    /// true colors). The official GeForce Now PC recordings are LIMITED
+    /// (16-235 — the 0-255 readings in early analysis were codec overshoot,
+    /// <0.1% of pixels), and every field player expands H.264 content as
+    /// limited, so full-range data comes out with crushed blacks ("hitam
+    /// pekat"). This feeds the branch the SAME caps shape and probes the
+    /// actual pixel data at the encoder input: the FULL→LIMITED conversion
+    /// must scale the data down (encoder input < branch input). Existing
+    /// tests omit colorimetry from the source caps, which is why the earlier
+    /// range handling was never caught on the field.
+    #[test]
+    fn probe_record_branch_converts_full_to_limited_with_tagged_input() {
+        gst::init().expect("gstreamer init");
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // videotestsrc ignores the 0-255 colorimetry (always emits limited
+        // white, Y=235) but it is continuous, which is what matters here: the
+        // branch must still run its FULL→LIMITED conversion on the declared
+        // full-range input, so the encoder input must come out LOWER than the
+        // branch input (a passthrough branch would leave them equal — the
+        // "0-255 data in an H.264 file = crushed blacks" field bug).
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        src.set_property_from_str("pattern", "white");
+        let full_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("full caps");
+        full_caps.set_property(
+            "caps",
+            // The field decoder's exact output caps: NV12, BT.709, FULL range.
+            "video/x-raw,format=(string)NV12,width=(int)64,height=(int)64,framerate=(fraction)30/1,colorimetry=(string)bt709/bt709/bt709/0-255,chroma-site=(string)mpeg2"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [&src, &full_caps, &tee, &main_sink] {
+            pipeline.add(element).expect("add");
+        }
+        src.link(&full_caps).expect("l1");
+        full_caps.link(&tee).expect("l2");
+        tee.link(&main_sink).expect("l3");
+
+        let (tx, _rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx),
+        )
+        .expect("build recording branch");
+
+        // Y-plane min/max + MEAN at two points: the branch input (raw source
+        // frame) and the encoder input (after the FULL→LIMITED conversion).
+        // The mean is what catches the clip-only "conversion": clipping
+        // extremes to [16,235] leaves the mean at the full-range value, while
+        // the real LUT rescale shifts it by the full→limited curve (e.g. a
+        // full-range mean of ~50 becomes ~59).
+        #[derive(Default)]
+        struct Stats {
+            min: u8,
+            max: u8,
+            sum: u64,
+            count: u64,
+        }
+        let branch_in = Arc::new(Mutex::new(Stats::default()));
+        let encoder_in = Arc::new(Mutex::new(Stats::default()));
+        let install_probe = |element: &gst::Element, pad_name: &str, sink: Arc<Mutex<Stats>>| {
+            let pad = element.static_pad(pad_name).expect("pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                use gst::prelude::*;
+                let Some(buffer) = info.buffer() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(caps) = _pad.current_caps() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(video_info) = gstreamer_video::VideoInfo::from_caps(&caps) else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(map) = buffer.map_readable() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let data = map.as_slice();
+                let base = video_info.offset()[0];
+                let stride = usize::try_from(video_info.stride()[0]).unwrap_or(0);
+                let mut slot = sink.lock().expect("probe lock");
+                if slot.count == 0 {
+                    slot.min = 255;
+                    slot.max = 0;
+                }
+                for row in 0..video_info.height() {
+                    let start = base + row as usize * stride;
+                    let end = start + video_info.width() as usize;
+                    if end > data.len() {
+                        break;
+                    }
+                    for &value in &data[start..end] {
+                        slot.min = slot.min.min(value);
+                        slot.max = slot.max.max(value);
+                        slot.sum += value as u64;
+                        slot.count += 1;
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        };
+        install_probe(&state.queue, "sink", branch_in.clone());
+        install_probe(&state.encoder, "sink", encoder_in.clone());
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(1_500));
+        state.stop(true).expect("finalize recording");
+
+        let bi = branch_in.lock().expect("branch probe");
+        let ei = encoder_in.lock().expect("encoder probe");
+        let bi_mean = bi.sum as f64 / bi.count.max(1) as f64;
+        let ei_mean = ei.sum as f64 / ei.count.max(1) as f64;
+        eprintln!(
+            "DIAG color probe: branch input Y min={} max={} mean={bi_mean:.1}",
+            bi.min, bi.max
+        );
+        eprintln!(
+            "DIAG color probe: encoder input Y min={} max={} mean={ei_mean:.1}",
+            ei.min, ei.max
+        );
+
+        assert!(bi.max > 0, "source delivered no frames to the branch");
+        // The FULL→LIMITED conversion must actually scale the data (the LUT
+        // scaler maps 255 → 235, 0 → 16, 128 → 126; the old videoconvert/RGB
+        // round-trip only CLIPPED extremes to [16,235] without rescaling
+        // mid-tones — the "hitam pekat" field bug). If the conversion is ever
+        // reverted to a plain pass-through, encoder input == branch input and
+        // this regression test fails.
+        assert!(
+            ei.max < bi.max,
+            "encoder input must be scaled below the branch input (FULL→LIMITED); branch={} encoder={} — the range conversion is a no-op",
+            bi.max, ei.max
+        );
+        assert!(
+            ei.max <= 240,
+            "encoder must receive LIMITED white (Y≈235), not full-range data; got max={}",
+            ei.max
+        );
+        // The MEAN must follow the full→limited curve (16 + m*219/255), not
+        // stay at the full-range value — a clip-only converter leaves the
+        // mean (mid-tones) untouched, which is exactly the field bug. Allow
+        // ±4 for the encoding/format conversions around it.
+        let expected_mean = 16.0 + bi_mean * 219.0 / 255.0;
+        assert!(
+            (ei_mean - expected_mean).abs() <= 4.0,
+            "encoder mean {ei_mean:.1} must follow the full→limited curve ≈ {expected_mean:.1} (clip-only converters leave the mean at {bi_mean:.1}) — mid-tones were not rescaled"
+        );
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// PRODUCTION-FAITHFUL D3D12 variant of the color probe: the field chain
+    /// runs the recording branch over the D3D12 video API (zero-copy OFF —
+    /// the Software-variant probe uses RtpVideoApi::Software; both exercise
+    /// the same production builder, which now picks x264enc). Same contract:
+    /// the FULL→LIMITED conversion must hand the encoder data scaled BELOW
+    /// the branch input, because every H.264 player expands content as
+    /// limited and full-range data comes out crushed ("hitam pekat"); the
+    /// encoder (x264enc with insert-vui=false) then writes the file with no
+    /// range tag at all, exactly like the official GeForce Now recordings.
+    #[test]
+    fn probe_record_branch_d3d12_full_range_converts() {
+        gst::init().expect("gstreamer init");
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        src.set_property_from_str("pattern", "white");
+        // Route through RGB so the NV12 caps can carry the declared FULL
+        // colorimetry (videotestsrc alone always emits limited white, Y=235 —
+        // but whatever level it emits, the branch must pass it through
+        // untouched, so the comparison is branch input vs encoder input).
+        let to_full = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("rgb to nv12 convert");
+        let full_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("full caps");
+        full_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)64,height=(int)64,framerate=(fraction)30/1,colorimetry=(string)bt709/bt709/bt709/0-255,chroma-site=(string)mpeg2"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [&src, &to_full, &full_caps, &tee, &main_sink] {
+            pipeline.add(element).expect("add");
+        }
+        src.link(&to_full).expect("l1");
+        to_full.link(&full_caps).expect("l2");
+        full_caps.link(&tee).expect("l3");
+        tee.link(&main_sink).expect("l4");
+
+        let (tx, _rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::D3D12,
+            false,
+            Some(tx),
+        )
+        .expect("build recording branch");
+
+        let branch_in = Arc::new(Mutex::new((255u8, 0u8)));
+        let encoder_in = Arc::new(Mutex::new((255u8, 0u8)));
+        let install_probe = |element: &gst::Element, pad_name: &str, sink: Arc<Mutex<(u8, u8)>>| {
+            let pad = element.static_pad(pad_name).expect("pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                use gst::prelude::*;
+                let Some(buffer) = info.buffer() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(caps) = _pad.current_caps() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(video_info) = gstreamer_video::VideoInfo::from_caps(&caps) else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(map) = buffer.map_readable() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let data = map.as_slice();
+                let base = video_info.offset()[0];
+                let stride = usize::try_from(video_info.stride()[0]).unwrap_or(0);
+                let mut min = 255u8;
+                let mut max = 0u8;
+                for row in 0..video_info.height() {
+                    let start = base + row as usize * stride;
+                    let end = start + video_info.width() as usize;
+                    if end > data.len() {
+                        break;
+                    }
+                    for &value in &data[start..end] {
+                        if value < min {
+                            min = value;
+                        }
+                        if value > max {
+                            max = value;
+                        }
+                    }
+                }
+                let mut slot = sink.lock().expect("probe lock");
+                if min < slot.0 {
+                    slot.0 = min;
+                }
+                if max > slot.1 {
+                    slot.1 = max;
+                }
+                gst::PadProbeReturn::Ok
+            });
+        };
+        install_probe(&state.queue, "sink", branch_in.clone());
+        install_probe(&state.encoder, "sink", encoder_in.clone());
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(1_500));
+        state.stop(true).expect("finalize recording");
+
+        let (bi_min, bi_max) = *branch_in.lock().expect("branch probe");
+        let (ei_min, ei_max) = *encoder_in.lock().expect("encoder probe");
+        eprintln!("DIAG d3d12 color probe: branch input Y min={bi_min} max={bi_max}");
+        eprintln!("DIAG d3d12 color probe: encoder input Y min={ei_min} max={ei_max}");
+
+        assert!(
+            bi_max > 0,
+            "source delivered no frames to the branch; max={bi_max}"
+        );
+        assert!(ei_max > 0, "encoder received no frames; max={ei_max}");
+        // Same contract as the Software-variant probe: the branch must hand
+        // the encoder data scaled BELOW its own input (the LUT scaler is
+        // active) — H.264 players expand content as limited, so full-range
+        // 0-255 data would come out crushed (the field dark-recording bug).
+        assert!(
+            ei_max < bi_max,
+            "D3D12 chain must scale the encoder input below the branch input (FULL→LIMITED); branch={bi_max} encoder={ei_max} — the range conversion is a no-op"
+        );
+        assert!(
+            ei_max <= 240,
+            "D3D12 chain must hand the encoder LIMITED white (Y≈235); got max={ei_max} — the production FULL→LIMITED conversion is a no-op (the field 0-255-tagged-limited bug)"
+        );
 
         let _ = pipeline.set_state(gst::State::Null);
     }
