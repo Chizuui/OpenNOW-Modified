@@ -29,21 +29,51 @@ const VIDEO_STALL_PARTIAL_FLUSH_MS: u64 = 12_000;
 const VIDEO_STALL_COMPLETE_FLUSH_MS: u64 = 16_000;
 const VIDEO_STALL_FATAL_MS: u64 = 20_000;
 
-/// Map the network RTT EMA to a pre-decode jitter-buffer depth in compressed
-/// frames: 6 (≈100 ms) on stable links, 10 (≈167 ms) when moderately elevated,
-/// 15 (≈250 ms) under heavy jitter. Thresholds come from the field logs — the
-/// decoder starved with a 100 ms buffer once RTT rose past ~100 ms.
-fn pre_decode_depth_for_rtt_ema(rtt_ema_ms: u32) -> u32 {
+/// How long a detected RTT spike holds the pre-decode jitter buffer at MAX
+/// depth before it is allowed to decay back. Spikes arrive in clusters (each
+/// burst is seconds of elevated jitter), and the EMA lags them by ~2-4
+/// samples, so the deep buffer must be HELD past the first spike or the very
+/// next burst starves the decoder again and the picture blinks the previous
+/// frame.
+const JITTER_BURST_HOLD_MS: u64 = 4_000;
+
+/// Map the network signals to a pre-decode jitter-buffer depth in compressed
+/// frames. A CONTINUOUS ramp grows the buffer in proportion to the measured
+/// RTT (BASE ≈100 ms at ≤ 30 ms up to MAX ≈250 ms at ≥ 150 ms) instead of
+/// jumping between discrete bands, so even a modest RTT rise buys buffer
+/// depth immediately — the field logs showed the decoder starving with a
+/// 100 ms buffer once RTT passed ~100 ms. Two overrides react to signals
+/// that LEAD the RTT EMA (which lags a burst by seconds):
+///   - `burst_hold`: a detected RTT spike (or one within the last few
+///     seconds — the caller holds it) forces MAX so the burst already in
+///     flight is absorbed instead of the decoder starving and the sink
+///     blinking the previous frame;
+///   - packet loss floors the depth (≥0.1% → mid, ≥0.5% → max): loss is the
+///     early indicator of jitter — it spikes before RTT climbs.
+fn target_pre_decode_depth(rtt_ema_ms: u32, loss_fraction: Option<f64>, burst_hold: bool) -> u32 {
     use crate::gstreamer_pipeline::{
         VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
         VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
     };
-    if rtt_ema_ms >= 100 {
-        VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
-    } else if rtt_ema_ms >= 60 {
-        VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
-    } else {
+    if burst_hold || loss_fraction.is_some_and(|loss| loss >= 0.005) {
+        return VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS;
+    }
+    if loss_fraction.is_some_and(|loss| loss >= 0.001) {
+        return VIDEO_COMPRESSED_QUEUE_MID_BUFFERS;
+    }
+    // Continuous ramp: 30 ms → BASE, 150 ms → MAX.
+    const RAMP_LO_MS: u32 = 30;
+    const RAMP_HI_MS: u32 = 150;
+    if rtt_ema_ms <= RAMP_LO_MS {
         VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+    } else if rtt_ema_ms >= RAMP_HI_MS {
+        VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+    } else {
+        let span = RAMP_HI_MS - RAMP_LO_MS;
+        let frac = rtt_ema_ms - RAMP_LO_MS;
+        VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+            + (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS - VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS) * frac
+                / span
     }
 }
 const VIDEO_STALL_MIN_KEYFRAME_REQUEST_MS: u64 = 2_000;
@@ -204,6 +234,12 @@ pub(crate) struct VideoLivenessState {
     /// Current pre-decode queue depth in compressed frames, so the adaptive
     /// resize only touches the element when the target actually changes.
     pre_decode_depth: AtomicU32,
+    /// Monotonic watchdog clock (ms) until which the jitter buffer must stay
+    /// at MAX depth after a detected RTT spike: the spike starves the decoder
+    /// in the seconds the EMA needs to catch up, so the deep buffer is HELD
+    /// past the spike instead of being released the moment RTT dips once
+    /// (that dip is followed by another burst).
+    burst_hold_until_ms: AtomicU64,
 }
 
 impl VideoLivenessState {
@@ -250,6 +286,7 @@ impl VideoLivenessState {
             pre_decode_depth: AtomicU32::new(
                 crate::gstreamer_pipeline::VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
             ),
+            burst_hold_until_ms: AtomicU64::new(0),
         }
     }
 
@@ -551,12 +588,16 @@ impl VideoLivenessState {
     }
 
     /// Adaptive pre-decode jitter buffer depth: DEEP (15 frames ≈ 250 ms)
-    /// while the network RTT is elevated so WAN jitter bursts never starve the
+    /// while the network is degraded so WAN jitter bursts never starve the
     /// decoder (the anti-flicker fix), SHALLOW (6 frames ≈ 100 ms) on stable
     /// links so in-game drags and aiming stay tight — a fixed 15-frame depth
     /// added ~150 ms of constant latency and made drags feel "patah-patah".
     /// Returns the new depth in frames when it changed, else None.
-    pub(crate) fn adjust_pre_decode_queue_for_network(&self, rtt_ms: u32) -> Option<u32> {
+    pub(crate) fn adjust_pre_decode_queue_for_network(
+        &self,
+        rtt_ms: u32,
+        loss_fraction: Option<f64>,
+    ) -> Option<u32> {
         // EMA (75% history, 25% latest) — the stats-channel RTT is a raw
         // per-sample value that can bounce between polls; the EMA also gives
         // the band-switch hysteresis that stops oscillation.
@@ -570,7 +611,22 @@ impl VideoLivenessState {
             self.network_rtt_ema_ms.store(next, Ordering::Relaxed);
             next
         };
-        let target = pre_decode_depth_for_rtt_ema(ema);
+        // Spike detection: the RAW sample far above the EMA means a jitter
+        // burst is in flight RIGHT NOW. The EMA would need ~2-4 samples to
+        // climb, during which the decoder starves and the sink repeats the
+        // last frame — the "kedip-kedip frame sebelumnya" flicker the user
+        // saw for seconds after the ping rose. Force MAX depth and HOLD it
+        // for JITTER_BURST_HOLD_MS so the burst in flight is absorbed and
+        // the following bursts (spikes come in clusters) never leak through.
+        let spike = rtt_ms > ema.saturating_mul(3) / 2 && rtt_ms.saturating_sub(ema) >= 30;
+        if spike {
+            self.burst_hold_until_ms.store(
+                self.now_ms().saturating_add(JITTER_BURST_HOLD_MS),
+                Ordering::Relaxed,
+            );
+        }
+        let burst_hold = self.now_ms() < self.burst_hold_until_ms.load(Ordering::Relaxed);
+        let target = target_pre_decode_depth(ema, loss_fraction, burst_hold);
         if target == self.pre_decode_depth.load(Ordering::Relaxed) {
             return None;
         }
@@ -958,6 +1014,31 @@ fn run_video_liveness_watchdog(
         // sink instead of the element captured when the watchdog started.
         let sink = state.current_sink().unwrap_or_else(|| sink.clone());
 
+        // Adaptive pre-decode jitter buffer — polled every watchdog tick
+        // (250 ms), NOT the 1 s rate-log interval below: the RTT EMA
+        // converges ~4x faster, so the buffer deepens within a quarter second
+        // of the RTT rising instead of after 2-4 seconds of a starved decoder
+        // (the "kedip-kedip frame sebelumnya" flicker). Kept shallow on
+        // stable links for tight input feel. Packet loss rides along as the
+        // leading indicator that floors the depth before RTT even climbs.
+        let local_rtcp_rtt_ms = query_rtcp_rtt_ms(&pipeline);
+        let server_rtt_now = stats_channel_rtt_ms();
+        let effective_rtt = local_rtcp_rtt_ms.or((server_rtt_now > 0).then_some(server_rtt_now));
+        if let Some(rtt) = effective_rtt {
+            if let Some(depth) =
+                state.adjust_pre_decode_queue_for_network(rtt, stats_channel_packet_loss_fraction())
+            {
+                send_log(
+                    &event_sender,
+                    "info",
+                    format!(
+                        "Native pre-decode jitter buffer resized to {depth} compressed frames (~{} ms) for network rtt={rtt} ms.",
+                        depth * 1000 / 60
+                    ),
+                );
+            }
+        }
+
         let elapsed = last_rate_at.elapsed();
         if elapsed >= VIDEO_SINK_RATE_LOG_INTERVAL {
             let encoded_bytes_total = state.encoded_bytes_total.load(Ordering::Relaxed);
@@ -974,25 +1055,6 @@ fn run_video_liveness_watchdog(
                 decoded_fps: decoded_total.saturating_sub(last_decoded_total) as f64 / elapsed_secs,
                 sink_fps: sink_total.saturating_sub(last_sink_total) as f64 / elapsed_secs,
             };
-            let local_rtcp_rtt_ms = query_rtcp_rtt_ms(&pipeline);
-            // Adaptive pre-decode jitter buffer: keep it shallow while the link
-            // is stable (tight drag/input feel) and deepen it when the RTT
-            // rises so WAN jitter bursts don't starve the decoder.
-            let server_rtt_now = stats_channel_rtt_ms();
-            let effective_rtt =
-                local_rtcp_rtt_ms.or((server_rtt_now > 0).then_some(server_rtt_now));
-            if let Some(rtt) = effective_rtt {
-                if let Some(depth) = state.adjust_pre_decode_queue_for_network(rtt) {
-                    send_log(
-                        &event_sender,
-                        "info",
-                        format!(
-                            "Native pre-decode jitter buffer resized to {depth} compressed frames (~{} ms) for network rtt={rtt} ms.",
-                            depth * 1000 / 60
-                        ),
-                    );
-                }
-            }
             update_native_stats_overlay(
                 &sink,
                 &state,
@@ -4914,44 +4976,75 @@ mod tests {
     use super::*;
 
     /// The adaptive pre-decode jitter buffer must rest at the shallow depth on
-    /// stable links (low drag latency) and deepen only when the RTT rises.
+    /// stable links (low drag latency), deepen CONTINUOUSLY as the RTT rises,
+    /// floor up on packet loss (the leading indicator), and force MAX on a
+    /// detected burst hold — the three signals that stop the decoder from
+    /// starving and the sink from blinking the previous frame when the ping
+    /// climbs.
     #[test]
-    fn pre_decode_depth_bands_follow_network_rtt() {
+    fn pre_decode_depth_adapts_to_rtt_loss_and_bursts() {
         use crate::gstreamer_pipeline::{
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
             VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
         };
-        // Stable: shallow (≈100 ms).
+        // Stable links: shallow (≈100 ms), no loss, no burst.
         assert_eq!(
-            pre_decode_depth_for_rtt_ema(0),
+            target_pre_decode_depth(0, None, false),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
         );
         assert_eq!(
-            pre_decode_depth_for_rtt_ema(38),
+            target_pre_decode_depth(38, None, false),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
         );
+        // Continuous ramp: even a modest RTT rise buys buffer depth — a
+        // slightly-elevated ping (60 ms) must NOT stay at the shallow floor
+        // (that was the 3-band step's blind spot: it held 6 frames until RTT
+        // hit 60 ms, so the burst between 38 and 60 ms starved the decoder).
+        // 45 ms → 6 + 9*15/120 = 7; 60 ms → 6 + 9*30/120 = 8; 100 ms → 6 +
+        // 9*70/120 = 11; ≥ 150 ms → 15.
+        assert_eq!(target_pre_decode_depth(45, None, false), 7);
+        assert_eq!(target_pre_decode_depth(60, None, false), 8);
+        assert_eq!(target_pre_decode_depth(100, None, false), 11);
         assert_eq!(
-            pre_decode_depth_for_rtt_ema(59),
-            VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
-        );
-        // Moderately elevated: mid depth.
-        assert_eq!(
-            pre_decode_depth_for_rtt_ema(60),
-            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
-        );
-        assert_eq!(
-            pre_decode_depth_for_rtt_ema(99),
-            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
-        );
-        // Heavy jitter: deep ceiling (the anti-flicker protection).
-        assert_eq!(
-            pre_decode_depth_for_rtt_ema(100),
+            target_pre_decode_depth(150, None, false),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
         assert_eq!(
-            pre_decode_depth_for_rtt_ema(250),
+            target_pre_decode_depth(250, None, false),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
+        // Packet loss is the leading indicator of jitter: it must floor the
+        // depth even while the RTT is still stable. ≥0.1% → mid, ≥0.5% → max.
+        assert_eq!(
+            target_pre_decode_depth(38, Some(0.001), false),
+            VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
+        );
+        assert_eq!(
+            target_pre_decode_depth(38, Some(0.005), false),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        // A detected RTT spike (burst hold) forces MAX immediately — the
+        // EMA would take seconds to climb, during which the decoder starves
+        // and the sink blinks the previous frame.
+        assert_eq!(
+            target_pre_decode_depth(38, None, true),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        assert_eq!(
+            target_pre_decode_depth(250, Some(0.005), true),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        // Monotonic in RTT (no flat/clipped regions): each +1 ms of RTT may
+        // never reduce the depth.
+        let mut last = target_pre_decode_depth(0, None, false);
+        for rtt in 1..=200 {
+            let depth = target_pre_decode_depth(rtt, None, false);
+            assert!(
+                depth >= last,
+                "depth must not decrease as RTT grows: rtt={rtt} depth={depth} < last={last}"
+            );
+            last = depth;
+        }
     }
 
     /// The recorder must produce a STANDARD seekable MP4, not a fragmented
@@ -5146,8 +5239,9 @@ mod tests {
     /// into a PLAYING pipeline, is recorded, then finalized with `stop(true)`.
     /// The chunk(s) the muxer emits at EOS must assemble into a STANDARD
     /// seekable MP4 (ftyp → moov → mdat, zero moof) — the exact property that
-    /// lets VLC slide the timeline — and the branch must recycle IN PLACE for
-    /// a second recording.
+    /// lets VLC slide the timeline — and the spent branch must be torn down
+    /// and REBUILT FRESH for a second recording (the old in-place recycle is
+    /// unreliable in this GStreamer build).
     #[test]
     fn transcode_recording_finalizes_into_seekable_mp4() {
         gst::init().expect("gstreamer init");
@@ -5192,12 +5286,12 @@ mod tests {
 
         // The real production call, exactly as link_rtp_video_pad does it: the
         // branch is built AFTER the pipeline is already PLAYING.
-        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+        let mut state = crate::gstreamer_pipeline::build_transcode_record_branch(
             &pipeline,
             &tap_tee,
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
-            Some(tx),
+            Some(tx.clone()),
         )
         .expect("build recording branch into PLAYING pipeline");
 
@@ -5214,7 +5308,11 @@ mod tests {
         let q_in = add_counter(&state.queue, "sink");
         let enc_out = add_counter(&state.encoder, "src");
 
-        let finalize_round = |record_ms: u64| -> Vec<u8> {
+        let finalize_round = |state: &mut crate::gstreamer_pipeline::GstreamerRecordingState,
+                              q_in: &Arc<AtomicU64>,
+                              enc_out: &Arc<AtomicU64>,
+                              record_ms: u64|
+         -> Vec<u8> {
             let q0 = q_in.load(Ordering::SeqCst);
             let e0 = enc_out.load(Ordering::SeqCst);
             state.start().expect("start recording");
@@ -5284,13 +5382,27 @@ mod tests {
         // Round 1: record, finalize, and assert the seekable MP4 structure
         // (the regression: a fragmented streamable file fails here — VLC
         // cannot seek it and shows glitches, unlike the GeForce Now file).
-        let round1 = finalize_round(2_500);
+        let round1 = finalize_round(&mut state, &q_in, &enc_out, 2_500);
         assert_seekable_structure("round1", &round1);
 
-        // Round 2: the branch must recycle IN PLACE (flush + encoder/muxer
-        // reset) and produce a second valid seekable file with a fresh moov.
-        state.recycle().expect("recycle branch");
-        let round2 = finalize_round(2_000);
+        // Round 2: the spent branch must be torn down and REBUILT FRESH — the
+        // old in-place recycle() is unreliable in this GStreamer build (a
+        // direct NULL→PLAYING on a queue kills its src task, and the qtmux
+        // keeps round-1 EOS/interleave state — the field "record again froze
+        // the whole stream" bug), and the fresh branch starts from the exact
+        // state round 1 always succeeds from.
+        state.teardown(&pipeline).expect("teardown branch");
+        state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tap_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx.clone()),
+        )
+        .expect("rebuild recording branch into PLAYING pipeline");
+        let q_in = add_counter(&state.queue, "sink");
+        let enc_out = add_counter(&state.encoder, "src");
+        let round2 = finalize_round(&mut state, &q_in, &enc_out, 2_000);
         assert_seekable_structure("round2", &round2);
 
         let _ = pipeline.set_state(gst::State::Null);
@@ -6139,6 +6251,250 @@ mod tests {
         assert!(
             (ei_mean - expected_mean).abs() <= 4.0,
             "encoder mean {ei_mean:.1} must follow the full→limited curve ≈ {expected_mean:.1} (clip-only converters leave the mean at {bi_mean:.1}) — mid-tones were not rescaled"
+        );
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Field reproduction of the record-#2 freeze: record → stop → recycle →
+    /// record again on a LIVE decoded-video tap tee (with the game-audio RTP
+    /// branch sharing the same qtmux, exactly like production). The field log
+    /// (2026-08-11 14:32) showed recording #1 working, then recording #2
+    /// (after the in-place recycle) freezing the ENTIRE RTP path within ~20 ms
+    /// of start — encoded/decoded/sink all stopped at 0, the stats channel
+    /// went silent, and stop() could not finalize (EOS below the valve not
+    /// accepted; only the 5 s failsafe finished the file). The main chain must
+    /// keep flowing through BOTH rounds, and stop() must finalize quickly
+    /// both times (EOS accepted, no failsafe timeout).
+    #[test]
+    fn record_restart_after_teardown_rebuild_keeps_main_chain_flowing() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // Video: LIVE decoded video (like the tap tee on the field: NV12 at
+        // the decoder output) → tap tee → main sink. The live flag matters:
+        // the field source is a live WebRTC stream, and live vs non-live
+        // changes how a blocked branch back-pressures the source.
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", true);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src caps");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)60/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        // Audio: Opus → RTP (game audio), into a second tee, like production.
+        let asrc = gst::ElementFactory::make("audiotestsrc")
+            .build()
+            .expect("asrc");
+        asrc.set_property("is-live", false);
+        let aconv = gst::ElementFactory::make("audioconvert")
+            .build()
+            .expect("aconv");
+        let ares = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("ares");
+        let acaps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("acaps");
+        acaps.set_property(
+            "caps",
+            "audio/x-raw,format=(string)S16LE,rate=(int)48000,channels=(int)2,layout=(string)interleaved"
+                .parse::<gst::Caps>()
+                .expect("valid audio caps"),
+        );
+        let opusenc = gst::ElementFactory::make("opusenc")
+            .build()
+            .expect("opusenc");
+        let apay = gst::ElementFactory::make("rtpopuspay")
+            .build()
+            .expect("apay");
+        apay.set_property("pt", 111u32);
+        let atee = gst::ElementFactory::make("tee").build().expect("atee");
+        let asink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("asink");
+        asink.set_property("sync", false);
+        asink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [
+            &src, &src_caps, &tee, &main_sink, &asrc, &aconv, &ares, &acaps, &opusenc, &apay,
+            &atee, &asink,
+        ] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("link v");
+        src_caps.link(&tee).expect("link v");
+        tee.link(&main_sink).expect("link v");
+        asrc.link(&aconv).expect("link a");
+        aconv.link(&ares).expect("link a");
+        ares.link(&acaps).expect("link a");
+        acaps.link(&opusenc).expect("link a");
+        opusenc.link(&apay).expect("link a");
+        apay.link(&atee).expect("link a");
+        atee.link(&asink).expect("link a");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+        let mut state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx.clone()),
+        )
+        .expect("build video branch");
+
+        // DIAG isolation: run round 2 WITHOUT the audio branch to see whether
+        // the shared-muxer audio side causes the round-2 stall.
+        let with_audio = std::env::var("DIAG_NO_AUDIO").is_err();
+        if with_audio {
+            state.audio_rtp_tee = Some(atee.clone());
+            state
+                .build_audio_branch(&pipeline)
+                .expect("build audio branch");
+        }
+
+        // Live-path frame counter on the MAIN sink: the field freeze stopped
+        // decoded/sink at 0 fps, so this counter is the decisive signal.
+        let main_counter = Arc::new(AtomicU64::new(0));
+        {
+            let counter = main_counter.clone();
+            let pad = main_sink.static_pad("sink").expect("sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        // Branch-side counters: tee sink (frames the tee accepted) and branch
+        // queue sink (frames the branch consumed) — tells us whether the stall
+        // is upstream of the branch or inside it.
+        let tee_counter = Arc::new(AtomicU64::new(0));
+        {
+            let counter = tee_counter.clone();
+            let pad = tee.static_pad("sink").expect("tee sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let branch_queue_counter = Arc::new(AtomicU64::new(0));
+        {
+            let counter = branch_queue_counter.clone();
+            let pad = state
+                .queue
+                .static_pad("sink")
+                .expect("branch queue sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        // DIAG bisect: does the round-2 buffer even reach the valve? A probe
+        // on the valve's SINK pad tells us whether the block is at the tee→
+        // valve push or inside the valve→queue path.
+        let valve_sink_counter = Arc::new(AtomicU64::new(0));
+        {
+            let counter = valve_sink_counter.clone();
+            let pad = state.valve.static_pad("sink").expect("valve sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+
+        // The tees stream into the closed valves for a while, like the field.
+        std::thread::sleep(Duration::from_millis(1_000));
+
+        let finalize_round = |state: &mut crate::gstreamer_pipeline::GstreamerRecordingState,
+                              round: &str,
+                              record_ms: u64|
+         -> Vec<u8> {
+            let before = main_counter.load(Ordering::SeqCst);
+            let tee0 = tee_counter.load(Ordering::SeqCst);
+            let bq0 = branch_queue_counter.load(Ordering::SeqCst);
+            let vs0 = valve_sink_counter.load(Ordering::SeqCst);
+            state.start().expect("start recording");
+            std::thread::sleep(Duration::from_millis(record_ms));
+            let during = main_counter.load(Ordering::SeqCst);
+            let tee1 = tee_counter.load(Ordering::SeqCst);
+            let bq1 = branch_queue_counter.load(Ordering::SeqCst);
+            let vs1 = valve_sink_counter.load(Ordering::SeqCst);
+            eprintln!(
+                "DIAG restart {round}: main sink {before}->{during} tee {tee0}->{tee1} valve_sink {vs0}->{vs1} branch_queue {bq0}->{bq1}"
+            );
+            assert!(
+                during > before + 30,
+                "{round}: the MAIN chain stalled while recording (main sink {before} -> {during} in {record_ms} ms) — the field record-#2 freeze",
+            );
+
+            let stop_started = Instant::now();
+            state.stop(true).expect("finalize recording");
+            let stop_ms = stop_started.elapsed().as_millis();
+            eprintln!("DIAG restart {round}: stop finalized in {stop_ms} ms");
+            assert!(
+                stop_ms < 4_000,
+                "{round}: stop() took {stop_ms} ms — the EOS-below-valve path failed and the 5 s failsafe had to run (field symptom)"
+            );
+
+            let mut file_bytes: Vec<u8> = Vec::new();
+            let mut chunks = 0usize;
+            while let Ok(event) = rx.try_recv() {
+                if let Event::RecordingChunk { chunk_base64 } = event {
+                    chunks += 1;
+                    file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
+                }
+            }
+            assert!(chunks >= 1, "{round}: no muxer chunk after stop");
+            file_bytes
+        };
+
+        let round1 = finalize_round(&mut state, "round1", 1_500);
+        assert!(
+            round1.windows(4).any(|w| w == b"avc1"),
+            "round1: missing H.264 video track"
+        );
+
+        // The critical part: the second recording must NOT freeze the stream.
+        // The field freeze happened ~20 ms after this second start. The old
+        // in-place recycle() is unreliable (queue src task dies on
+        // NULL→PLAYING, qtmux keeps round-1 EOS/interleave state), so the
+        // spent branch is torn down and REBUILT FRESH — the exact state round
+        // 1 always succeeds from — and the audio branch is rebuilt into the
+        // new branch's muxer.
+        state.teardown(&pipeline).expect("teardown branch");
+        state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx.clone()),
+        )
+        .expect("rebuild video branch");
+        if with_audio {
+            state.audio_rtp_tee = Some(atee.clone());
+            state
+                .build_audio_branch(&pipeline)
+                .expect("rebuild audio branch");
+        }
+        let round2 = finalize_round(&mut state, "round2", 1_500);
+        assert!(
+            round2.windows(4).any(|w| w == b"avc1"),
+            "round2: missing H.264 video track"
         );
 
         let _ = pipeline.set_state(gst::State::Null);
