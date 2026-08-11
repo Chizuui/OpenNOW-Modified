@@ -547,51 +547,71 @@ impl GstreamerVideoTap {
     }
 }
 
-/// Native recording branch — REMUX (no re-encode). The branch taps the raw
-/// RTP stream right after webrtcbin (the RTP record tap tee embedded in
-/// `build_rtp_video_chain`), BEFORE decode, and remuxes the source bitstream
-/// into a standard seekable MP4 (faststart): capsfilter → queue → rtpdepay →
-/// parse → valve → qtmux → swallow.
-/// There is no decode, no encode, and no sink anywhere in the branch, so
-/// record start/stop never touches the decode/present chain and costs ~zero
-/// CPU. The file is therefore source quality (the codec and bitrate GFN
-/// sends) and the recorder bitrate/resolution settings do not apply.
+/// Native recording branch — TRANSCODE to H.264. The branch taps the DECODED
+/// video right before the sink (the permanent video tap tee in the live
+/// chain, the same tee screenshots use), converts it to standard BT.709
+/// 8-bit 4:2:0, re-encodes with H.264 (hardware d3d12h264enc when the GPU
+/// supports it, else openh264enc/x264enc), and muxes with AAC game audio into
+/// a standard seekable MP4 (faststart):
 ///
-/// The capture valve sits BETWEEN THE PARSER AND THE MUXER, not at the tap:
-/// the depayloader + parser run continuously from session start (they are
-/// fed straight off the RTP record tap tee), so rtph265depay captures the
-/// in-band VPS/SPS/PPS the moment the stream begins. This is load-bearing:
-/// the WebRTC H265 caps carry no sprop-* fields and GFN never repeats the
-/// parameter sets in-band, so a valve-gated depayloader that misses the
-/// session-start parameter sets drops every subsequent packet (it requests
-/// force-key-unit upstream, which webrtcbin ignores) and the MP4 comes out
-/// with an empty video track — the exact field symptom (12 KB header-only
-/// file, no video). With the depayloader always armed, the file records
-/// video the instant the valve opens, and the parser's output caps (which
-/// carry codec_data / hvc1) are already established.
+///   tap tee → valve → queue → [d3d12download] → videoconvert → capsfilter →
+///   H.264 encoder → h264parse → qtmux → swallow
 ///
-/// The valve itself is closed (drop=true) whenever no recording is in
-/// flight; opening it is the entire "start recording" operation. qtmux is
-/// the only downstream element, so the closed valve gates the file write
-/// while the (cheap, non-decoding) depayloader/parser keep the codec state
-/// warm.
+/// Re-encoding (instead of the old source-bitstream RTP remux) is what makes
+/// the recording UNIVERSAL — the field complaint: recordings of GFN's H.265
+/// stream play back glitchy on weak devices (HEVC 1080p60 is heavy to
+/// decode, and the remux file had a mid-GOP orphan-frame start plus
+/// untagged color range that players mis-render). Transcoding fixes all of
+/// it at once:
+///
+/// - Universal: H.264 main profile, 8-bit, plays on any device/player.
+/// - Colors: videoconvert + an explicit `colorimetry=bt709` capsfilter makes
+///   the color range deterministic (the source H.265 VUI is ambiguous; the
+///   old file came out untagged and players guessed wrong).
+/// - Glitch-free start: the encoder begins a fresh GOP (IDR) at the first
+///   frame it sees, so the file NEVER starts mid-GOP with orphan P-frames
+///   referencing pre-recording frames (the decode glitches at the head of
+///   the old files). Recording also starts with zero delay: no waiting for
+///   the next server keyframe.
+/// - Steady timing: the live decode chain delivers frames at a steady rate,
+///   so the MP4 timestamps are regular (the old RTP remux produced a
+///   jittery ~53.5 fps file with 24 Mbps spikes that stuttered players).
+///
+/// The branch is built at session start off the video tap tee (after the
+/// decode chain is up), and the tee pad stays linked for the session, so
+/// record start/stop is ONLY a valve open/close — the decode/present chain
+/// is never touched and the pipeline cannot re-preroll (the exact failure of
+/// the old post-decode x264 branch with a sink; this branch has NO sink —
+/// the swallow queue tail with DROP probes is the same hot-plug-safe shape
+/// as the old remux branch). The encoder runs only while the valve is open,
+/// so recording costs no CPU when idle.
 #[derive(Debug, Clone)]
 pub(crate) struct GstreamerRecordingState {
-    /// Video branch valve (between the parser and qtmux — NOT at the RTP
-    /// tap; see the struct docs for why the depayloader must stay fed).
+    /// Video branch valve, FIRST element after the video tap tee. Closed
+    /// (drop=true) whenever no recording is in flight; opening it is the
+    /// entire "start recording" operation.
     pub(crate) valve: gst::Element,
-    /// Leaky decoupling queue on the RTP side (capsfilter → queue →
-    /// depayloader). It never back-pressures the live path.
+    /// Leaky decoupling queue (valve → queue → …). It never back-pressures
+    /// the live decode path.
     pub(crate) queue: gst::Element,
-    /// The RTP depayloader (rtph264depay / rtph265depay / rtpav1depay). Runs
-    /// continuously from session start so it retains the in-band parameter
-    /// sets (WebRTC caps carry no sprops).
-    pub(crate) depayloader: gst::Element,
-    /// The parser (h264parse / h265parse / av1parse); converts the stream to
-    /// the container format (avcC / hvc1 / av1C) for qtmux. Runs
-    /// continuously so its output caps (with codec_data) are ready when the
-    /// valve opens.
-    pub(crate) parse: gst::Element,
+    /// The H.264 encoder actually in use (d3d12h264enc / openh264enc /
+    /// x264enc). Only fed while the valve is open.
+    pub(crate) encoder: gst::Element,
+    /// Factory name of `encoder`, for logs and tests.
+    pub(crate) encoder_factory: String,
+    /// Converts the encoder's byte-stream H.264 into avcC for qtmux. Must be
+    /// reset together with the encoder on recycle: after EOS it stays EOS'd
+    /// and silently swallows the next recording's buffers.
+    pub(crate) h264_parse: gst::Element,
+    /// videoconvert + capsfilter between the queue and the encoder. Stateless,
+    /// but reset on recycle so every element below the valve starts the next
+    /// recording in the exact fresh state it had at build time.
+    pub(crate) video_convert: gst::Element,
+    /// The BT.709 colorimetry capsfilter feeding the encoder.
+    pub(crate) video_capsfilter: gst::Element,
+    /// Optional D3D11/D3D12 texture→system-memory downloader (only when
+    /// zero-copy is active). Reset on recycle like the rest of the branch.
+    pub(crate) video_download: Option<gst::Element>,
     /// The qtmux element (standard seekable MP4, faststart). Recycled between
     /// recordings: NULL→PLAYING un-spends it (fresh moov for the next file).
     pub(crate) muxer: gst::Element,
@@ -606,9 +626,9 @@ pub(crate) struct GstreamerRecordingState {
     active: Arc<AtomicBool>,
     /// RTP-level tap tee on the game-audio stream (between the webrtcbin
     /// audio src pad and the decode chain). Created when the audio RTP pad
-    /// arrives in `wire_incoming_media_sink`; the audio remux branch hangs
-    /// off it so the recording gets the game audio without touching the live
-    /// audio decode/playback path.
+    /// arrives in `wire_incoming_media_sink`; the audio transcode branch
+    /// hangs off it so the recording gets the game audio without touching the
+    /// live audio decode/playback path.
     pub(crate) audio_rtp_tee: Option<gst::Element>,
     /// Audio branch valve. Like the video valve, record start/stop is just
     /// drop=true/false; EOS for finalize is injected BELOW this valve.
@@ -623,10 +643,11 @@ pub(crate) struct GstreamerRecordingState {
     /// Audio RTP depayloader, reset with the queue during recycle so its
     /// segment state cannot leak across MP4 recordings.
     audio_depayloader: Option<gst::Element>,
-    /// The video RTP tap tee that feeds this recording branch. Keeping the
-    /// tee lets start/recycle replay its retained sticky stream events into
-    /// qtmux after a late branch attach or muxer reset.
-    pub(crate) video_rtp_tee: gst::Element,
+    /// The video tap tee (post-decode, before the sink) that feeds this
+    /// recording branch. Keeping the tee lets start/recycle replay its
+    /// retained sticky stream events (stream-start/caps/segment) into qtmux
+    /// after a muxer reset.
+    pub(crate) video_tap_tee: gst::Element,
     /// True once the audio branch is linked into the muxer. The audio RTP pad
     /// may arrive before or after the video pad; the branch is built from
     /// whichever side is armed first, exactly once.
@@ -640,10 +661,12 @@ pub(crate) struct GstreamerRecordingState {
 }
 
 impl GstreamerRecordingState {
-    /// Build the game-audio remux branch into the SAME qtmux as the video
-    /// branch: audio_rtp_tee → valve → queue → rtpopusdepay → muxer. No
-    /// decode, no encode, no sink — the same hot-plug-safe pattern as the
-    /// video branch. Every element is synced to the pipeline state BEFORE the
+    /// Build the game-audio transcode branch into the SAME qtmux as the video
+    /// branch: audio_rtp_tee → valve → capsfilter → queue → rtpopusdepay →
+    /// opusdec → audioconvert → AAC encoder → muxer. Game audio is decoded
+    /// and re-encoded as AAC so the MP4 plays on ANY device (Opus-in-MP4 is
+    /// not universal). No sink — the same hot-plug-safe pattern as the video
+    /// branch. Every element is synced to the pipeline state BEFORE the
     /// branch pad is linked into the audio tap tee (the tee is already
     /// PLAYING by the time this runs, so an unsynced NULL element would fail
     /// the first push and could kill the audio RTP flow upstream).
@@ -675,11 +698,21 @@ impl GstreamerRecordingState {
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
 
+        let opusdec = make_element("opusdec")?;
+        let audioconvert = make_element("audioconvert")?;
+        let (aac_factory, aac_encoder) = pick_aac_encoder()?;
+        // The opusdec/aacenc chain must not back-pressure the RTP tap either:
+        // the audio queue is already leaky (drops oldest when full), so the
+        // chain cannot stall the tap tee.
+
         let elements = [
             valve.clone(),
             capsfilter.clone(),
             queue.clone(),
             depayloader.clone(),
+            opusdec.clone(),
+            audioconvert.clone(),
+            aac_encoder.clone(),
         ];
         for element in &elements {
             pipeline.add(element).map_err(|error| {
@@ -691,19 +724,19 @@ impl GstreamerRecordingState {
                 .link(&pair[1])
                 .map_err(|error| format!("Failed to link recording audio branch: {error:?}"))?;
         }
-        // Link the depayloader into the EXISTING qtmux (already PLAYING).
+        // Link the AAC encoder into the EXISTING qtmux (already PLAYING).
         // qtmux names its sink-pad templates by media type (video_%u,
         // audio_%u) — request the audio one for this stream. qtmux negotiates
         // the pad on the first caps; this is a plain pad link, no state
         // change.
-        let depayloader_src = depayloader
+        let aac_src = aac_encoder
             .static_pad("src")
-            .ok_or_else(|| "Recording audio depayloader has no src pad.".to_owned())?;
+            .ok_or_else(|| "Recording audio encoder has no src pad.".to_owned())?;
         let muxer_sink = self
             .muxer
             .request_pad_simple("audio_%u")
             .ok_or_else(|| "Recording muxer refused an audio sink pad.".to_owned())?;
-        if let Err(error) = depayloader_src.link(&muxer_sink) {
+        if let Err(error) = aac_src.link(&muxer_sink) {
             let _ = self.muxer.release_request_pad(&muxer_sink);
             return Err(format!(
                 "Failed to link recording audio branch into muxer: {error:?}"
@@ -744,7 +777,7 @@ impl GstreamerRecordingState {
         send_log(
             &self.event_sender,
             "info",
-            "Attached native REMUX game-audio branch (rtp → rtpopusdepay → qtmux; no re-encode, never touches the audio playback chain).".to_owned(),
+            format!("Attached native game-audio transcode branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → qtmux; never touches the audio playback chain)."),
         );
         Ok(())
     }
@@ -767,20 +800,20 @@ impl GstreamerRecordingState {
         // `request-keyframe=true` so the branch asks locally on its own side
         // of the tap tee.
         // Replay the mandatory sticky events into qtmux while the valve is
-        // still closed. Opening first lets the live parser deliver a buffer
+        // still closed. Opening first lets the live video deliver a buffer
         // concurrently, which produces the exact field warnings
         // `queue:sink Got data flow before stream-start/segment` and leaves
         // qtmux with an empty track. Once stream-start/caps/segment are
         // queued downstream, open the valves.
         //
-        // The video valve now gates only qtmux (the depayloader/parser run
-        // continuously off the tap tee), so the events qtmux needs are the
-        // PARSER's output events — pulled from the parse src pad, which has
-        // been emitting since session start and whose caps carry codec_data
-        // (hvc1). The audio branch still has its valve before rtpopusdepay,
-        // so its events are replayed from the audio tap tee as before.
-        if let Some(parse_src) = self.parse.static_pad("src") {
-            replay_recording_sticky_events_from_pad(&parse_src, &self.valve);
+        // The video valve gates the whole transcode chain, so the events
+        // qtmux needs come from the video TAP TEE's sink pad (the
+        // authoritative retained stream-start/caps/segment of the live
+        // decode chain). The audio branch still has its valve before
+        // rtpopusdepay, so its events are replayed from the audio tap tee as
+        // before.
+        if let Some(tee_sink) = self.video_tap_tee.static_pad("sink") {
+            replay_recording_sticky_events_from_pad(&tee_sink, &self.valve);
         } else {
             replay_recording_sticky_events(&self.valve);
         }
@@ -804,11 +837,10 @@ impl GstreamerRecordingState {
             &self.event_sender,
             "info",
             if with_audio {
-                "Native recording started (video + game audio remuxed to seekable MP4; no re-encode)."
+                "Native recording started (video + game audio transcoded to a universal H.264/AAC MP4)."
                     .to_owned()
             } else {
-                "Native recording started (video-only source bitstream remuxed to seekable MP4; no re-encode)."
-                    .to_owned()
+                "Native recording started (video transcoded to a universal H.264 MP4).".to_owned()
             },
         );
         Ok(())
@@ -884,14 +916,11 @@ impl GstreamerRecordingState {
         // drains first, then EOS, so qtmux finalizes normally and the live
         // path is untouched.
         let drain_ms = std::time::Instant::now();
-        // Video branch: the valve sits between the parser and qtmux, so the
-        // RTP-side queue above it needs no drain — EOS below the valve reaches
-        // qtmux directly (qtmux buffers the whole faststart file internally).
-        if let Some(valve_src) = self.valve.static_pad("src") {
-            if let Some(below) = valve_src.peer() {
-                let _ = below.send_event(gst::event::Eos::new());
-            }
-        }
+        // Video branch: the valve sits at the tap (before the queue), so the
+        // queue must drain before EOS — an EOS that overtakes a full queue can
+        // be dropped inside the muxer (buffers-after-EOS). Drain then inject
+        // EOS below the valve, exactly like the audio branch.
+        self.drain_and_eos(&self.valve, &self.queue)?;
         if let (Some(audio_valve), Some(audio_queue)) = (&self.audio_valve, &self.audio_queue) {
             self.drain_and_eos(audio_valve, audio_queue)?;
         }
@@ -978,37 +1007,36 @@ impl GstreamerRecordingState {
     /// Recycle a spent branch for the next recording, entirely IN PLACE — no
     /// element is removed, added, or synced, so the pipeline cannot
     /// re-preroll. The tee pad stays linked for the session; the valve gates
-    /// the data. A flush clears every sticky event (including the final EOS)
-    /// on the branch's pads and restarts the queue's parked task, then
-    /// NULL→PLAYING the qtmux un-spends it (fresh moov for the next file).
-    /// qtmux is a non-sink — the transition is synchronous, no re-preroll.
+    /// the data. Every element BELOW the valve (queue → … → swallow) is reset
+    /// NULL→PLAYING so the next recording starts in the exact fresh state the
+    /// branch had at build time: the encoder re-emits a fresh avcC/stream,
+    /// qtmux writes a fresh moov, and the post-EOS sticky events (EOS is
+    /// sticky!) are cleared from every pad. Crucially, NO flush events are
+    /// sent: a FLUSH travels UPSTREAM through the valve into the tap tee and
+    /// wipes the tee sink pad's sticky stream-start/caps/segment — the exact
+    /// source `replay_recording_sticky_events_from_pad` needs to re-arm the
+    /// branch — and disturbs the live decode chain. All elements below the
+    /// valve are non-sinks, so NULL→PLAYING is synchronous (no re-preroll),
+    /// and the valve stays closed while they re-arm, so the live path is
+    /// never interrupted. The audio branch is gated at its valve and only
+    /// sees data during a recording, so its queue/capsfilter/depayloader are
+    /// reset the same way to drop the previous recording's segment.
     pub(crate) fn recycle(&self) -> Result<(), String> {
-        let flush_below = |element: &gst::Element| {
-            if let Some(src_pad) = element.static_pad("src") {
-                if let Some(below) = src_pad.peer() {
-                    below.send_event(gst::event::FlushStart::new());
-                    below.send_event(gst::event::FlushStop::new(true));
-                }
-            }
-        };
-        flush_below(&self.valve);
-        if let Some(audio_valve) = &self.audio_valve {
-            flush_below(audio_valve);
+        // Reset the elements below the video valve (queue → swallow) and the
+        // entire AUDIO branch. The valves stay closed while everything is
+        // re-armed, so this never interrupts the live decode path.
+        let mut branch_elements = vec![
+            self.queue.clone(),
+            self.encoder.clone(),
+            self.h264_parse.clone(),
+            self.muxer.clone(),
+            self.swallow.clone(),
+        ];
+        if let Some(download) = &self.video_download {
+            branch_elements.push(download.clone());
         }
-
-        // Reset the elements below the video valve (muxer + swallow) and the
-        // entire AUDIO branch. Deliberately NOT the video queue/depayloader/
-        // parser: they are fed continuously off the live RTP tap tee, and a
-        // NULL→PLAYING reset would wipe the depayloader's captured in-band
-        // parameter sets and the parser's output caps (codec_data). The live
-        // stream never repeats those parameter sets, so a reset branch would
-        // again record an empty video track on the next recording. The audio
-        // branch, by contrast, is gated at its valve and only sees data during
-        // a recording, so its queue/capsfilter/depayloader MUST be reset to
-        // drop the previous recording's segment before the next one. The
-        // valves stay closed while everything is re-armed, so this never
-        // interrupts the live RTP/decode path.
-        let mut branch_elements = vec![self.muxer.clone(), self.swallow.clone()];
+        branch_elements.push(self.video_convert.clone());
+        branch_elements.push(self.video_capsfilter.clone());
         if let Some(audio_queue) = &self.audio_queue {
             branch_elements.push(audio_queue.clone());
         }
@@ -1035,12 +1063,12 @@ impl GstreamerRecordingState {
             })?;
         }
         // Resetting qtmux clears its sticky stream events. Replay them while
-        // both valves remain closed; opening first races the live parser and
+        // both valves remain closed; opening first races the live video and
         // lets buffers overtake the new segment (the queue/segment warnings
-        // seen on recording #2). Video events come from the parser's src pad
-        // (see start()).
-        if let Some(parse_src) = self.parse.static_pad("src") {
-            replay_recording_sticky_events_from_pad(&parse_src, &self.valve);
+        // seen on recording #2). Video events come from the video tap tee's
+        // sink pad (see start()).
+        if let Some(tee_sink) = self.video_tap_tee.static_pad("sink") {
+            replay_recording_sticky_events_from_pad(&tee_sink, &self.valve);
         } else {
             replay_recording_sticky_events(&self.valve);
         }
@@ -4593,22 +4621,41 @@ fn link_rtp_video_pad(
         elements,
     );
 
-    // Build the native REMUX recording branch off the RTP record tap tee. It
-    // is built HERE (session start, pipeline NULL/READY) and its tee pad stays
-    // linked for the session, so record start/stop never touches the live
-    // chain. A decoder-fallback rebuild keeps the tee and branch intact.
+    // Build the native TRANSCODE recording branch off the video tap tee (the
+    // post-decode tee that also serves screenshots). It is built HERE (session
+    // start, pipeline NULL/READY) and its tee pad stays linked for the
+    // session, so record start/stop never touches the live chain. A
+    // decoder-fallback rebuild reconnects the SAME tap tee, so the branch
+    // survives it intact.
     let rtp_tee = video_tap
         .lock()
         .ok()
         .and_then(|slot| slot.as_ref().and_then(|tap| tap.rtp_tee.clone()));
-    if let Some(rtp_tee) = rtp_tee {
+    let tap_tee = video_tap
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|tap| tap.tee.clone()));
+    let (video_api, zero_copy) = video_tap
+        .lock()
+        .ok()
+        .map(|slot| {
+            slot.as_ref()
+                .map(|tap| (tap.video_api, tap.zero_copy))
+                .unwrap_or((RtpVideoApi::Software, false))
+        })
+        .unwrap_or((RtpVideoApi::Software, false));
+    if let Some(tap_tee) = tap_tee {
         let mut slot = recording
             .lock()
             .map_err(|_| "Recording state lock poisoned.".to_owned())?;
         if slot.is_none() {
-            let mut state =
-                build_rtp_record_branch(pipeline, &rtp_tee, encoding, event_sender.clone())?;
-            *slot = Some(state);
+            *slot = Some(build_transcode_record_branch(
+                pipeline,
+                &tap_tee,
+                video_api,
+                zero_copy,
+                event_sender.clone(),
+            )?);
         }
         // The game-audio tap tee lives at the pipeline level (the audio RTP
         // pad arrives BEFORE the video pad). Transfer it into the recording
@@ -4631,12 +4678,14 @@ fn link_rtp_video_pad(
         // then receives buffers without a segment and writes an empty MP4.
         // Keeping the source unlinked until this point makes the initial source
         // link fan out the complete event sequence to both decode and remux.
-        link_rtp_video_source_to_tee(src_pad, &rtp_tee, encoding)?;
+        if let Some(rtp_tee) = rtp_tee {
+            link_rtp_video_source_to_tee(src_pad, &rtp_tee, encoding)?;
+        }
     } else {
         send_log(
             event_sender,
             "warn",
-            "Native recording not armed: no RTP record tap tee (recording will be unavailable until a WebRTC video session starts).".to_owned(),
+            "Native recording not armed: no video tap tee (recording will be unavailable until a WebRTC video session starts).".to_owned(),
         );
     }
     send_log(
@@ -5728,97 +5777,97 @@ fn insert_screenshot_grab_branch(
     })
 }
 
-/// Build the native REMUX recording branch off the RTP record tap tee (the
-/// tee embedded between the webrtcbin video src pad and the decode chain in
-/// `build_rtp_video_chain`). The branch remuxes the SOURCE bitstream — it
-/// never decodes or re-encodes:
-/// tee → valve → queue → rtpdepay → parse → qtmux → swallow.
+/// Build the native TRANSCODE recording branch off the video tap tee (the
+/// tee embedded between the post-decode queue and the sink in
+/// `build_rtp_video_chain` — the same tee screenshots use). The branch takes
+/// the DECODED frames, converts them to standard BT.709 8-bit 4:2:0, and
+/// re-encodes with H.264:
+/// tee → valve → queue → [download] → videoconvert → capsfilter → encoder →
+/// h264parse → qtmux → swallow.
 ///
 /// The branch is built at session start (pipeline NULL/READY) and the tee pad
 /// stays linked for the whole session, so record start/stop is ONLY a valve
 /// open/close — the decode/present chain is never touched and the pipeline
-/// cannot re-preroll (the exact failure of the old post-decode x264 branch).
-/// The source stream carries periodic random-access frames; all parsed
-/// samples are preserved so qtmux never produces an empty track when an H265
-/// parser marks the initial samples as delta. Players begin at the first
-/// decodable keyframe. Chunks are captured by DROP probes on the swallow sink
-/// pad (each becomes one `recording-chunk` event); an EVENT probe records EOS
-/// so `stop(finalize=true)` knows when the branch flushed. The game-audio RTP
-/// stream is Opus and is remuxed into the same qtmux when available; the local
-/// mic is not part of the server RTP stream. No decode/re-encode is done. The
-/// file is source quality (the codec/bitrate GFN sends); recorder settings do
-/// not apply.
-pub(crate) fn build_rtp_record_branch(
+/// cannot re-preroll (the exact failure of the old post-decode x264 branch
+/// with a sink; this branch has NO sink). The encoder starts a fresh GOP (IDR)
+/// at the first frame it sees, so recording begins instantly with a decodable
+/// file (no mid-GOP orphan frames, no waiting for the next server keyframe).
+/// Chunks are captured by DROP probes on the swallow sink pad (each becomes
+/// one `recording-chunk` event); an EVENT probe records EOS so
+/// `stop(finalize=true)` knows when the branch flushed. The game-audio RTP
+/// stream is Opus and is transcoded to AAC into the same qtmux when available;
+/// the local mic is not part of the server RTP stream.
+pub(crate) fn build_transcode_record_branch(
     pipeline: &gst::Pipeline,
-    rtp_tee: &gst::Element,
-    encoding: &str,
+    tap_tee: &gst::Element,
+    video_api: RtpVideoApi,
+    zero_copy: bool,
     event_sender: Option<Sender<Event>>,
 ) -> Result<GstreamerRecordingState, String> {
-    // The RTP record tap is before the decode chain's capsfilter, so the
-    // branch sees the raw WebRTC pad caps (SDP-only fields included). A
-    // capsfilter here is a defensive sanity gate only — it forwards the caps
-    // event unchanged and passes any buffer whose caps carry
-    // media=video/encoding-name=H265, exactly like the live decode chain's
-    // filter. The depayloader must negotiate with the REAL caps (payload type
-    // included), never a stripped override: see start() for the failure that
-    // a stripped caps event caused (first RTP buffer rejected with
-    // FLOW_NOT_NEGOTIATED → transport killed).
-    let rtp_capsfilter = if matches!(encoding, "H265" | "HEVC") {
-        let capsfilter = make_element("capsfilter")?;
-        capsfilter.set_property(
-            "caps",
-            "application/x-rtp,media=(string)video,encoding-name=(string)H265"
-                .parse::<gst::Caps>()
-                .map_err(|error| format!("Invalid recording video RTP caps: {error}"))?,
-        );
-        Some(capsfilter)
-    } else {
-        None
-    };
     let valve = make_element("valve")?;
     let queue = make_element("queue")?;
-    let depayloader_factory = rtp_video_depayloader_factory(encoding)
-        .ok_or_else(|| format!("No RTP depayloader for recording codec {encoding}."))?;
-    let parser_factory = rtp_video_parser_factory(encoding)
-        .ok_or_else(|| format!("No RTP parser for recording codec {encoding}."))?;
-    let depayloader = make_element(depayloader_factory)?;
-    // Loss recovery aid only. The depayloader is fed from session start (the
-    // valve gates the muxer, not the tap), so it captures the in-band
-    // VPS/SPS/PPS at the first keyframe and never needs a keyframe request to
-    // begin emitting — which matters because the WebRTC caps carry no sprops
-    // and the force-key-unit upstream request is not honored by webrtcbin.
-    set_property_if_supported(&depayloader, "request-keyframe", true);
-    set_property_if_supported(&depayloader, "wait-for-keyframe", false);
-    let parse = make_element(parser_factory)?;
-    set_property_if_supported(&parse, "config-interval", -1i32);
-    set_property_if_supported(&parse, "disable-passthrough", true);
-    let muxer = make_element("qtmux")?;
-    let swallow = make_element("queue")?;
+    let convert = make_element("videoconvert")?;
+    let capsfilter = make_element("capsfilter")?;
+    let (encoder_factory, encoder) = pick_h264_encoder()?;
+    // Converts the encoder's byte-stream H.264 to avcC for qtmux: the
+    // hardware encoder (d3d12h264enc) and openh264/x264 emit byte-stream,
+    // which qtmux cannot accept directly (link fails / unplayable).
+    let parse = make_element("h264parse")?;
 
-    // The capture valve sits AFTER the parser (see the struct docs): the
-    // depayloader + parser stay fed from session start so rtph265depay keeps
-    // the in-band parameter sets it captured at the first keyframe. Closed
-    // (drop=true) whenever no recording is in flight; opening it is "start
-    // recording".
     valve.set_property("drop", true);
-    // Forward stream-start/caps/segment while dropping buffers. We also replay
-    // these events explicitly in start(), because the bundled GStreamer build
-    // can still lose the segment when a valve is initially closed.
+    // Forward sticky events while buffers are gated, so qtmux never receives
+    // a first buffer before its stream-start/caps/segment. We also replay
+    // these events explicitly in start()/recycle(), because the bundled
+    // GStreamer build can still lose the segment when a valve is closed.
     set_property_from_str_if_supported(&valve, "drop-mode", "forward-sticky-events");
-    // The branch must never back-pressure the live path: if the muxer or disk
-    // write lags, drop the oldest queued data instead of stalling the RTP tap
-    // tee (which feeds the decode chain).
+    // The branch must never back-pressure the live decode path: if the
+    // encoder or disk write lags, drop the oldest queued data instead of
+    // stalling the tap tee (which feeds the sink). 60 buffers ≈ 1 s at 60 fps.
     queue.set_property_from_str("leaky", "downstream");
-    queue.set_property("max-size-buffers", 30u32);
+    queue.set_property("max-size-buffers", 60u32);
     queue.set_property("max-size-bytes", 0u32);
     queue.set_property("max-size-time", 0u64);
     // Swallow queue: the chunk/EOS probes live on its sink pad and return
     // DROP, so qtmux's push always returns FLOW_OK and its src task keeps
     // running with an otherwise-unlinked tail (no NOT_LINKED parking).
+    let swallow = make_element("queue")?;
     swallow.set_property_from_str("leaky", "downstream");
     swallow.set_property("max-size-buffers", 1u32);
     swallow.set_property("max-size-bytes", 0u32);
     swallow.set_property("max-size-time", 0u64);
+
+    // D3D paths with zero-copy produce texture-backed decoded frames;
+    // videoconvert/x264 cannot import D3D memory, so download to system
+    // memory first (same as the screenshot grab branch).
+    let download_factory = match (video_api, zero_copy) {
+        (RtpVideoApi::D3D11, true) => Some("d3d11download"),
+        (RtpVideoApi::D3D12, true) => Some("d3d12download"),
+        _ => None,
+    };
+    let download = match download_factory {
+        Some(factory) => Some(make_element(factory)?),
+        None => None,
+    };
+
+    // Force deterministic, universal color: BT.709 (limited range) 4:2:0 8-bit.
+    // The source H.265 stream's VUI range is ambiguous (field files came out
+    // untagged and players mis-rendered them); videoconvert converts whatever
+    // range the decoder actually produced, and the capsfilter tags the output
+    // so every player decodes it the same way. d3d12h264enc takes NV12 (the
+    // decode chain's native output); the software encoders take I420.
+    let encoder_format = if encoder_factory == "d3d12h264enc" {
+        "NV12"
+    } else {
+        "I420"
+    };
+    capsfilter.set_property(
+        "caps",
+        format!(
+            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709,chroma-site=(string)mpeg2"
+        )
+        .parse::<gst::Caps>()
+        .map_err(|error| format!("Invalid recording transcode caps: {error}"))?,
+    );
 
     // STANDARD seekable MP4 (faststart), NOT fragmented: a fragmented
     // streamable MP4 (ftyp + moov + moof/mdat every ~500ms) is what the
@@ -5828,71 +5877,57 @@ pub(crate) fn build_rtp_record_branch(
     // at the front and writes zero moof boxes, so the file is fully seekable
     // and glitch-free in any player. qtmux buffers the (short) recording in
     // memory and writes it out when EOS finalizes the muxer — recordings are
-    // short clips (tens of seconds), so this is bounded and cheap. qtmux (not
-    // mp4mux) also supports AV1 (av1C) and HEVC (hvc1), so the remux works
-    // for every codec GFN may send (bundled GStreamer ≥ 1.18).
+    // short clips (tens of seconds), so this is bounded and cheap.
+    let muxer = make_element("qtmux")?;
     muxer.set_property("faststart", true);
     muxer.set_property("fragment-duration", 0u32);
     muxer.set_property("streamable", false);
 
-    // Chain order: capsfilter → queue → depayloader → parse → VALVE → qtmux
-    // → swallow. The valve is deliberately downstream of the parser so the
-    // RTP-side elements run continuously and keep the codec state (in-band
-    // parameter sets, output caps with codec_data) warm between recordings.
-    let mut elements = Vec::with_capacity(7);
-    if let Some(capsfilter) = &rtp_capsfilter {
-        elements.push(capsfilter.clone());
+    // Chain order: valve → queue → [download] → videoconvert → capsfilter →
+    // encoder → h264parse → qtmux → swallow. The valve is deliberately FIRST
+    // so the encoder only runs while a recording is active (zero CPU when
+    // idle) and every element below it is stateless enough to reset in place.
+    let mut elements: Vec<&gst::Element> = vec![&valve, &queue];
+    if let Some(download) = download.as_ref() {
+        elements.push(download);
     }
-    elements.extend([
-        queue.clone(),
-        depayloader.clone(),
-        parse.clone(),
-        valve.clone(),
-        muxer.clone(),
-        swallow.clone(),
-    ]);
+    elements.extend([&convert, &capsfilter, &encoder, &parse, &muxer, &swallow]);
     for element in &elements {
-        pipeline
-            .add(element)
-            .map_err(|error| format!("Failed to add recording remux branch element: {error}"))?;
+        pipeline.add(*element).map_err(|error| {
+            format!("Failed to add recording transcode branch element: {error}")
+        })?;
     }
     for pair in elements.windows(2) {
         pair[0]
-            .link(&pair[1])
-            .map_err(|error| format!("Failed to link recording remux branch: {error:?}"))?;
+            .link(pair[1])
+            .map_err(|error| format!("Failed to link recording transcode branch: {error:?}"))?;
     }
-    // Sync the branch to the pipeline state BEFORE linking it into the RTP
-    // record tap tee. This function is called from link_rtp_video_pad when the
-    // video pad appears, which is AFTER the pipeline is PLAYING — an element
+    // Sync the branch to the pipeline state BEFORE linking it into the video
+    // tap tee. This function is called from link_rtp_video_pad when the video
+    // chain is built, which is AFTER the pipeline is PLAYING — an element
     // left in NULL has an inactive sink pad, and the tee's first push to it
     // would fail and propagate the error upstream, killing the whole video
-    // RTP flow (field symptom: exactly one tiny encoded buffer arrived, then
-    // sink=0.0fps forever). All branch elements are non-sinks, so the sync is
-    // synchronous: it can never trigger the deferred-async re-preroll that a
-    // sink would (the exact failure of the old post-decode appsink branch).
+    // flow. All branch elements are non-sinks, so the sync is synchronous: it
+    // can never trigger the deferred-async re-preroll that a sink would (the
+    // exact failure of the old post-decode appsink branch).
     for element in &elements {
         element.sync_state_with_parent().map_err(|error| {
-            format!("Failed to sync recording remux branch element state: {error}")
+            format!("Failed to sync recording transcode branch element state: {error}")
         })?;
     }
-    // Link the branch into the RTP record tap tee. The branch elements were
-    // synced to PLAYING above (non-sinks: synchronous, re-preroll-free), so
-    // this link is a plain pad link on active pads — data flows into the
-    // branch immediately. The valve (downstream of the parser) starts closed
+    // Link the branch into the video tap tee. The valve starts closed
     // (drop=true), so qtmux consumes nothing until a recording is active,
-    // while the depayloader/parser stay fed and keep their codec state warm.
-    let first_sink = elements
-        .first()
-        .ok_or_else(|| "Recording branch has no elements.".to_owned())?
+    // while the decode/present chain keeps flowing untouched.
+    let first_sink = valve
         .static_pad("sink")
-        .ok_or_else(|| "First recording branch element has no sink pad.".to_owned())?;
-    let branch_pad = rtp_tee.request_pad_simple("src_%u").ok_or_else(|| {
-        "Failed to request a recording pad from the RTP record tap tee.".to_owned()
-    })?;
+        .ok_or_else(|| "Recording branch valve has no sink pad.".to_owned())?;
+    let branch_pad = tap_tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| "Failed to request a recording pad from the video tap tee.".to_owned())?;
     if let Err(error) = branch_pad.link(&first_sink) {
-        let _ = rtp_tee.release_request_pad(&branch_pad);
+        let _ = tap_tee.release_request_pad(&branch_pad);
         return Err(format!(
-            "Failed to link RTP record tap into the recording branch: {error:?}"
+            "Failed to link video tap into the recording branch: {error:?}"
         ));
     }
 
@@ -5900,12 +5935,6 @@ pub(crate) fn build_rtp_record_branch(
     // Inactive until the first `start()`; the chunk probe is gated on this so
     // no muxer output is ever captured while the branch is idle.
     let active = Arc::new(AtomicBool::new(false));
-    // Do not gate parser buffers on DELTA_UNIT here. Some H265 RTP sessions
-    // mark every parser output as delta until a later in-band VPS/SPS/IDR
-    // refresh, which made qtmux receive zero samples and produced an empty
-    // moov. The source stream already carries periodic random-access frames;
-    // preserving every parsed sample gives qtmux a real track immediately and
-    // lets players begin at the first decodable keyframe.
 
     // Chunk capture: every qtmux output buffer becomes one
     // `recording-chunk` event (with faststart the whole file is emitted at
@@ -5945,20 +5974,24 @@ pub(crate) fn build_rtp_record_branch(
         &event_sender,
         "info",
         format!(
-            "Attached native REMUX recording branch (rtp → {depayloader_factory} → {parser_factory} → qtmux → swallow; source quality, no re-encode, seekable MP4, never touches the decode/present chain)."
+            "Attached native TRANSCODE recording branch (decoded → videoconvert → {encoder_factory} → qtmux → swallow; universal H.264/BT.709 MP4, never touches the decode/present chain)."
         ),
     );
 
     Ok(GstreamerRecordingState {
         valve,
         queue,
-        depayloader,
-        parse,
+        encoder,
+        encoder_factory,
+        h264_parse: parse,
+        video_convert: convert,
+        video_capsfilter: capsfilter,
+        video_download: download,
         muxer,
         swallow,
         eos_seen,
         active,
-        video_rtp_tee: rtp_tee.clone(),
+        video_tap_tee: tap_tee.clone(),
         audio_rtp_tee: None,
         audio_valve: None,
         audio_queue: None,
@@ -5968,6 +6001,83 @@ pub(crate) fn build_rtp_record_branch(
         spent: Arc::new(AtomicBool::new(false)),
         event_sender,
     })
+}
+
+/// Pick the H.264 encoder for the recording branch: hardware first (zero CPU
+/// — recordings must never steal frames from the live decode on weak
+/// machines), then light software encoders. `OPENNOW_RECORD_ENCODER` forces a
+/// specific factory (e.g. `x264enc`) for debugging/problem machines.
+fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
+    let forced = std::env::var("OPENNOW_RECORD_ENCODER")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(forced) = &forced {
+        candidates.push(forced);
+    }
+    candidates.extend(["d3d12h264enc", "openh264enc", "x264enc"]);
+    for factory in candidates {
+        if let Ok(element) = gst::ElementFactory::make(factory).build() {
+            configure_h264_encoder(&element, factory);
+            return Ok((factory.to_owned(), element));
+        }
+    }
+    Err(format!(
+        "No H.264 encoder is available in the GStreamer runtime (tried {}); recording disabled.",
+        if forced.is_some() {
+            "forced factory + defaults"
+        } else {
+            "d3d12h264enc, openh264enc, x264enc"
+        }
+    ))
+}
+
+fn configure_h264_encoder(element: &gst::Element, factory: &str) {
+    // 8 Mbps ≈ the source stream's bitrate; moderate spikes so even a weak
+    // software decoder keeps up. GOP 60 ≈ 1 s keyframe interval at 60 fps:
+    // instant seeking, and the first GOP starts immediately at record start.
+    match factory {
+        "d3d12h264enc" => {
+            element.set_property("bitrate", 8000u32);
+            element.set_property("max-bitrate", 10_000u32);
+            set_property_from_str_if_supported(element, "rate-control", "vbr");
+            element.set_property("gop-size", 60u32);
+            set_property_from_str_if_supported(element, "profile", "main");
+        }
+        "openh264enc" => {
+            element.set_property("bitrate", 8000u32);
+            element.set_property("gop-size", 60u32);
+        }
+        "x264enc" => {
+            element.set_property("bitrate", 8000u32);
+            set_property_from_str_if_supported(element, "speed-preset", "ultrafast");
+            // No B-frames: lighter to decode on weak players AND no reordering.
+            set_property_from_str_if_supported(element, "tune", "zerolatency");
+            element.set_property("key-int-max", 60u32);
+            element.set_property("bframes", 0u32);
+            set_property_from_str_if_supported(element, "profile", "main");
+        }
+        _ => {}
+    }
+}
+
+/// Pick the AAC encoder for the recording audio branch (avenc_aac first —
+/// better quality; voaacenc fallback). AAC makes the MP4 play on ANY device,
+/// unlike Opus-in-MP4.
+fn pick_aac_encoder() -> Result<(String, gst::Element), String> {
+    for factory in ["avenc_aac", "voaacenc"] {
+        if let Ok(element) = gst::ElementFactory::make(factory).build() {
+            // avenc_aac's bitrate property is a signed gint (unlike the uint
+            // h264 encoders), so set it as i32.
+            element.set_property("bitrate", 128_000i32);
+            return Ok((factory.to_owned(), element));
+        }
+    }
+    Err(
+        "No AAC encoder is available in the GStreamer runtime (tried avenc_aac, voaacenc); audio recording disabled."
+            .to_owned(),
+    )
 }
 
 #[cfg(test)]

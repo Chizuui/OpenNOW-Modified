@@ -4283,9 +4283,14 @@ mod stacked_window_dance_diagnostics {
         let pipeline = gst::Pipeline::new();
         let rtp_tee = gst::ElementFactory::make("tee").build().expect("tee");
         pipeline.add(&rtp_tee).expect("add tee");
-        let state =
-            crate::gstreamer_pipeline::build_rtp_record_branch(&pipeline, &rtp_tee, "H264", None)
-                .expect("build recording branch");
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &rtp_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            None,
+        )
+        .expect("build recording branch");
         let muxer_src = state.muxer.static_pad("src").expect("muxer src pad");
         let swallow_sink = state.swallow.static_pad("sink").expect("swallow sink pad");
         let linked = muxer_src.peer().is_some_and(|peer| peer == swallow_sink);
@@ -4311,9 +4316,14 @@ mod stacked_window_dance_diagnostics {
         let pipeline = gst::Pipeline::new();
         let rtp_tee = gst::ElementFactory::make("tee").build().expect("tee");
         pipeline.add(&rtp_tee).expect("add tee");
-        let state =
-            crate::gstreamer_pipeline::build_rtp_record_branch(&pipeline, &rtp_tee, "H264", None)
-                .expect("build recording branch");
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &rtp_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            None,
+        )
+        .expect("build recording branch");
         let started_at = Instant::now();
         state.start().expect("start recording");
         assert!(
@@ -4345,9 +4355,14 @@ mod stacked_window_dance_diagnostics {
         // Recording state with its video branch (the REAL production build).
         let rtp_tee = gst::ElementFactory::make("tee").build().expect("video tee");
         pipeline.add(&rtp_tee).expect("add video tee");
-        let mut state =
-            crate::gstreamer_pipeline::build_rtp_record_branch(&pipeline, &rtp_tee, "H264", None)
-                .expect("build recording branch");
+        let mut state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &rtp_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            None,
+        )
+        .expect("build recording branch");
         // The audio tap tee, stored the way the pad-added handler stores it:
         // in the pipeline-level slot, because the recording state did not
         // exist when the audio pad arrived.
@@ -4403,7 +4418,9 @@ mod stacked_window_dance_diagnostics {
             .expect("audio valve")
             .static_pad("src")
             .expect("audio valve src");
-        for _ in 0..3 {
+        // valve → capsfilter → queue → rtpopusdepay → opusdec → audioconvert
+        // → AAC encoder → muxer audio pad.
+        for _ in 0..7 {
             pad = pad.peer().expect("audio branch link");
         }
         eprintln!(
@@ -4416,139 +4433,6 @@ mod stacked_window_dance_diagnostics {
             "audio depayloader must be linked into qtmux's audio sink pad (got {:?})",
             pad.name()
         );
-        let _ = pipeline.set_state(gst::State::Null);
-    }
-
-    /// Regression guard for the 19:56 field failure: after the RTP remux
-    /// redesign the stream did not appear AT ALL (sink=0.0fps forever, exactly
-    /// one 48-byte encoded buffer arrived, then silence). Cause: the REMUX
-    /// branch is built from link_rtp_video_pad when the video pad appears,
-    /// which is AFTER the pipeline is PLAYING — but build_rtp_record_branch
-    /// added its elements without sync_state_with_parent, so they stayed NULL
-    /// with inactive pads. The RTP record tap tee's first push into the
-    /// branch then failed, and the error propagated upstream through the tee,
-    /// stopping the whole video RTP flow. This test builds the REAL production
-    /// branch into a PLAYING pipeline with a live main chain and asserts the
-    /// main chain still receives buffers (the tee must not error on the
-    /// branch pad), plus every branch element reached PLAYING.
-    #[test]
-    fn remux_branch_built_into_playing_pipeline_keeps_main_chain_flowing() {
-        gst::init().expect("gstreamer init");
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
-
-        // Main chain: an appsrc feeding application/x-rtp (exactly what the
-        // real RTP record tap tee carries) → rtp_tee → main sink. The branch's
-        // rtph264depay only links against RTP caps, so the tee must carry RTP
-        // (feeding raw video here would fail the pad link with "Noformat").
-        let src = gst::ElementFactory::make("appsrc").build().expect("appsrc");
-        src.set_property("is-live", false);
-        src.set_property("format", gst::Format::Time);
-        let src_caps = gst::Caps::from_str(
-            "application/x-rtp, media=(string)video, encoding-name=(string)H264, payload=(int)96, clock-rate=(int)90000",
-        )
-        .expect("valid RTP caps");
-        src.set_property("caps", &src_caps);
-        let rtp_tee = gst::ElementFactory::make("tee").build().expect("tee");
-        let main_queue = gst::ElementFactory::make("queue")
-            .build()
-            .expect("main queue");
-        // Deterministic pass-through: a leaky 1-buffer queue (as production
-        // uses) would drop most of the 60 test pushes before the probe counts
-        // them; this test asserts the flow survives, not queue backpressure.
-        main_queue.set_property("max-size-buffers", 100u32);
-        let main_sink = gst::ElementFactory::make("fakesink")
-            .build()
-            .expect("main sink");
-        main_sink.set_property("sync", false);
-        main_sink.set_property("async", false);
-
-        let pipeline = gst::Pipeline::new();
-        for element in [&src, &rtp_tee, &main_queue, &main_sink] {
-            pipeline.add(element).expect("add main chain");
-        }
-        src.link(&rtp_tee).expect("src -> rtp_tee");
-        rtp_tee.link(&main_queue).expect("rtp_tee -> main_queue");
-        main_queue
-            .link(&main_sink)
-            .expect("main_queue -> main_sink");
-
-        let main_count = Arc::new(AtomicUsize::new(0));
-        let count = main_count.clone();
-        let main_sink_pad = main_sink.static_pad("sink").expect("main sink pad");
-        main_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-            count.fetch_add(1, Ordering::SeqCst);
-            gst::PadProbeReturn::Ok
-        });
-
-        // The real production call, exactly as link_rtp_video_pad does it: the
-        // branch is built AFTER the pipeline is already PLAYING.
-        pipeline.set_state(gst::State::Playing).expect("playing");
-        std::thread::sleep(Duration::from_millis(300));
-        let state =
-            crate::gstreamer_pipeline::build_rtp_record_branch(&pipeline, &rtp_tee, "H264", None)
-                .expect("build recording branch into PLAYING pipeline");
-
-        // Every branch element must reach PLAYING — the field regression was
-        // elements left NULL (inactive branch pad → tee push error → video
-        // flow killed).
-        let branch_elements = [
-            state.valve.clone(),
-            state.queue.clone(),
-            state.depayloader.clone(),
-            state.parse.clone(),
-            state.muxer.clone(),
-            state.swallow.clone(),
-        ];
-        for element in &branch_elements {
-            let playing = element.current_state() == gst::State::Playing;
-            eprintln!(
-                "DIAG remux branch element {:?} state={:?} playing={playing}",
-                element.name(),
-                element.current_state()
-            );
-            assert!(
-                playing,
-                "remux branch element {:?} did not reach PLAYING after build into a PLAYING pipeline; the tee push to its inactive pad would kill the video flow",
-                element.name()
-            );
-        }
-
-        // The main chain must keep flowing: the tee must NOT error on the
-        // branch pad (closed valve drops, returns FLOW_OK). Push RTP packets
-        // through the appsrc and confirm they all reach the main sink — with
-        // the branch left in NULL (the field bug), the tee's first push to the
-        // inactive branch pad would fail and stall the whole flow.
-        let mut pushed = 0u32;
-        for i in 0..60u32 {
-            let mut buffer = gst::Buffer::with_size(1200).expect("buffer");
-            {
-                let buffer = buffer.get_mut().expect("mutable buffer");
-                buffer.set_pts(Some(gst::ClockTime::from_mseconds((i * 33) as u64)));
-                buffer.set_duration(Some(gst::ClockTime::from_mseconds(33)));
-            }
-            let src_pad = src.static_pad("src").expect("appsrc src pad");
-            if let Err(flow_error) = src_pad.push(buffer) {
-                panic!(
-                    "appsrc push {i} failed with {flow_error:?} — the tee errored on the branch pad, killing the main chain flow"
-                );
-            }
-            pushed += 1;
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && main_count.load(Ordering::SeqCst) < pushed as usize {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let received = main_count.load(Ordering::SeqCst);
-        eprintln!(
-            "DIAG remux branch build kept main chain flowing: pushed={pushed} received={received}"
-        );
-        assert!(
-            received >= pushed as usize,
-            "main chain stalled after building the remux branch into the PLAYING pipeline (received only {received}/{pushed} buffers) — the branch pad error killed the flow"
-        );
-
-        state.stop(false).expect("abort recording");
         let _ = pipeline.set_state(gst::State::Null);
     }
 
@@ -4926,9 +4810,8 @@ mod stacked_window_dance_diagnostics {
 }
 
 #[cfg(test)]
-mod faststart_probe_tests {
+mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// The recorder must produce a STANDARD seekable MP4, not a fragmented
     /// streamable MP4: players like VLC cannot seek (slide the timeline) in a
@@ -5017,164 +4900,6 @@ mod faststart_probe_tests {
             "non-fragmented output must have no moof boxes"
         );
         let _ = std::fs::remove_file(&out);
-    }
-
-    /// End-to-end through the PRODUCTION branch: a real H.264 encode is
-    /// payloaded to RTP, tapped by the production `build_rtp_record_branch`
-    /// into a PLAYING pipeline, recorded, then finalized with `stop(true)`.
-    /// The chunk(s) the muxer emits at EOS must assemble into a STANDARD
-    /// seekable MP4 (ftyp → moov → mdat, zero moof) — the exact property that
-    /// lets VLC slide the timeline — and the branch must recycle IN PLACE for
-    /// a second recording.
-    #[test]
-    fn remux_recording_finalizes_into_seekable_mp4() {
-        gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
-
-        // Main chain: real encode → RTP payload → tap tee → main sink (exactly
-        // what the RTP record tap tee carries in production). NOT live, so the
-        // source pushes as fast as the CPU allows and the test is deterministic
-        // under full-suite contention (the encode just needs SOME data).
-        let src = gst::ElementFactory::make("videotestsrc")
-            .build()
-            .expect("videotestsrc");
-        src.set_property("is-live", false);
-        let src_caps = gst::ElementFactory::make("capsfilter")
-            .build()
-            .expect("src capsfilter");
-        src_caps.set_property(
-            "caps",
-            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
-                .parse::<gst::Caps>()
-                .expect("valid caps"),
-        );
-        let enc = gst::ElementFactory::make("x264enc")
-            .build()
-            .expect("x264enc");
-        enc.set_property_from_str("speed-preset", "ultrafast");
-        enc.set_property_from_str("tune", "zerolatency");
-        enc.set_property("bitrate", 3000u32);
-        // Small keyframe interval so the branch's keyframe gate opens fast and
-        // a decodable GOP is captured even for a short test recording.
-        enc.set_property("key-int-max", 30u32);
-        let parse = gst::ElementFactory::make("h264parse")
-            .build()
-            .expect("h264parse");
-        let pay = gst::ElementFactory::make("rtph264pay")
-            .build()
-            .expect("rtph264pay");
-        pay.set_property("pt", 96u32);
-        let rtp_tee = gst::ElementFactory::make("tee").build().expect("tee");
-        let main_sink = gst::ElementFactory::make("fakesink")
-            .build()
-            .expect("main sink");
-        main_sink.set_property("sync", false);
-        main_sink.set_property("async", false);
-
-        let pipeline = gst::Pipeline::new();
-        for element in [&src, &src_caps, &enc, &parse, &pay, &rtp_tee, &main_sink] {
-            pipeline.add(element).expect("add main chain");
-        }
-        src.link(&src_caps).expect("src -> src_caps");
-        src_caps.link(&enc).expect("src_caps -> enc");
-        enc.link(&parse).expect("enc -> parse");
-        parse.link(&pay).expect("parse -> pay");
-        pay.link(&rtp_tee).expect("pay -> rtp_tee");
-        rtp_tee.link(&main_sink).expect("rtp_tee -> main_sink");
-
-        let (tx, rx) = mpsc::channel::<Event>();
-
-        pipeline.set_state(gst::State::Playing).expect("playing");
-        std::thread::sleep(Duration::from_millis(400));
-
-        // The real production call, exactly as link_rtp_video_pad does it: the
-        // branch is built AFTER the pipeline is already PLAYING.
-        let state = crate::gstreamer_pipeline::build_rtp_record_branch(
-            &pipeline,
-            &rtp_tee,
-            "H264",
-            Some(tx),
-        )
-        .expect("build recording branch into PLAYING pipeline");
-
-        let finalize_round = |record_ms: u64| -> Vec<u8> {
-            state.start().expect("start recording");
-            std::thread::sleep(Duration::from_millis(record_ms));
-            state.stop(true).expect("finalize recording");
-
-            let mut file_bytes: Vec<u8> = Vec::new();
-            let mut chunk_count = 0usize;
-            while let Ok(event) = rx.try_recv() {
-                if let Event::RecordingChunk { chunk_base64 } = event {
-                    chunk_count += 1;
-                    file_bytes.extend(
-                        BASE64_STANDARD
-                            .decode(chunk_base64)
-                            .expect("valid base64 chunk"),
-                    );
-                }
-            }
-            eprintln!(
-                "DIAG e2e remux finalize: chunks={chunk_count} file_bytes={}",
-                file_bytes.len()
-            );
-            assert!(
-                chunk_count >= 1,
-                "finalized recording produced no chunk at the muxer output"
-            );
-            assert!(
-                file_bytes.len() > 50_000,
-                "finalized file too small ({})",
-                file_bytes.len()
-            );
-            file_bytes
-        };
-
-        // The seekable-structure check must scan the WHOLE file: with
-        // faststart the moov (per-sample tables) can itself be hundreds of KB
-        // for a long recording, so "mdat" is far beyond the first 4 KB.
-        let find_tag = |bytes: &[u8], tag: &[u8; 4]| -> Option<usize> {
-            bytes.windows(4).position(|w| w == tag)
-        };
-        let assert_seekable_structure = |label: &str, bytes: &[u8]| {
-            let ftyp_at = find_tag(bytes, b"ftyp");
-            let moov_at = find_tag(bytes, b"moov");
-            let mdat_at = find_tag(bytes, b"mdat");
-            let moof_count = bytes.windows(4).filter(|w| w == b"moof").count();
-            eprintln!(
-                "DIAG e2e remux {label} boxes: ftyp={ftyp_at:?} moov={moov_at:?} mdat={mdat_at:?} moof={moof_count} size={}",
-                bytes.len()
-            );
-            assert!(
-                ftyp_at.is_some() && moov_at.is_some() && mdat_at.is_some(),
-                "{label}: ftyp+moov+mdat must exist in the finalized recording"
-            );
-            assert!(
-                moov_at.unwrap() < mdat_at.unwrap(),
-                "{label}: moov must be BEFORE mdat (faststart headers first); got moov={moov_at:?} mdat={mdat_at:?}"
-            );
-            assert_eq!(
-                moof_count, 0,
-                "{label}: non-fragmented output must have no moof boxes"
-            );
-        };
-
-        // Round 1: record, finalize, and assert the seekable MP4 structure
-        // (the regression: a fragmented streamable file fails here — VLC
-        // cannot seek it and shows glitches, unlike the GeForce Now file).
-        let round1 = finalize_round(2_500);
-        assert_seekable_structure("round1", &round1);
-
-        // Round 2: the branch must recycle IN PLACE (flush + qtmux
-        // NULL→PLAYING) and produce a second valid seekable file with a
-        // fresh moov.
-        state.recycle().expect("recycle branch");
-        let round2 = finalize_round(2_000);
-        assert_seekable_structure("round2", &round2);
-
-        let _ = pipeline.set_state(gst::State::Null);
     }
 
     /// Probe: does the screenshot branch's `videoconvert → pngenc` chain turn
@@ -5275,75 +5000,251 @@ mod faststart_probe_tests {
         }
     }
 
-    /// Field reproduction of the record-start transport kill. Production
-    /// records by OPENING a valve-gated REMUX branch tapped off a LIVE RTP
-    /// tee (video + game-audio Opus into one qtmux). The field log shows the
-    /// whole WebRTC receive transport dying ~17 ms after "Native recording
-    /// started": `nicesrc: streaming stopped, reason not-negotiated (-4)` —
-    /// a FLOW_NOT_NEGOTIATED raised inside the branch propagating back
-    /// through the shared tee into the transport, freezing encoded/decoded/
-    /// sink at 0 fps. This test mirrors the production wiring as closely as
-    /// the harness allows (real H.264 video RTP + Opus audio RTP tapped into
-    /// a PLAYING pipeline, branches built late, valves held closed while the
-    /// tees stream, then `start()` opens them) and asserts the bus stays
-    /// clean and both live paths keep flowing.
+    /// End-to-end through the PRODUCTION branch: a decoded-video tap (NV12,
+    /// like the live decode chain output) feeds `build_transcode_record_branch`
+    /// into a PLAYING pipeline, is recorded, then finalized with `stop(true)`.
+    /// The chunk(s) the muxer emits at EOS must assemble into a STANDARD
+    /// seekable MP4 (ftyp → moov → mdat, zero moof) — the exact property that
+    /// lets VLC slide the timeline — and the branch must recycle IN PLACE for
+    /// a second recording.
     #[test]
-    fn record_start_never_kills_running_rtp_transport() {
+    fn transcode_recording_finalizes_into_seekable_mp4() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Main chain: decoded raw video → tap tee → main sink (exactly what
+        // the video tap tee carries in production: post-decode frames).
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let tap_tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let main_sink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("main sink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [&src, &src_caps, &tap_tee, &main_sink] {
+            pipeline.add(element).expect("add main chain");
+        }
+        src.link(&src_caps).expect("src -> src_caps");
+        src_caps.link(&tap_tee).expect("src_caps -> tap_tee");
+        tap_tee.link(&main_sink).expect("tap_tee -> main_sink");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        // The real production call, exactly as link_rtp_video_pad does it: the
+        // branch is built AFTER the pipeline is already PLAYING.
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tap_tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx),
+        )
+        .expect("build recording branch into PLAYING pipeline");
+
+        let add_counter = |element: &gst::Element, pad_name: &str| -> Arc<AtomicU64> {
+            let counter = Arc::new(AtomicU64::new(0));
+            let c = counter.clone();
+            let pad = element.static_pad(pad_name).expect("pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                c.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+            counter
+        };
+        let q_in = add_counter(&state.queue, "sink");
+        let enc_out = add_counter(&state.encoder, "src");
+
+        let finalize_round = |record_ms: u64| -> Vec<u8> {
+            let q0 = q_in.load(Ordering::SeqCst);
+            let e0 = enc_out.load(Ordering::SeqCst);
+            state.start().expect("start recording");
+            std::thread::sleep(Duration::from_millis(record_ms));
+            let q1 = q_in.load(Ordering::SeqCst);
+            let e1 = enc_out.load(Ordering::SeqCst);
+            eprintln!("DIAG e2e transcode round: queue_in={q0}->{q1} enc_out={e0}->{e1}");
+            state.stop(true).expect("finalize recording");
+
+            let mut file_bytes: Vec<u8> = Vec::new();
+            let mut chunk_count = 0usize;
+            while let Ok(event) = rx.try_recv() {
+                if let Event::RecordingChunk { chunk_base64 } = event {
+                    chunk_count += 1;
+                    file_bytes.extend(
+                        BASE64_STANDARD
+                            .decode(chunk_base64)
+                            .expect("valid base64 chunk"),
+                    );
+                }
+            }
+            eprintln!(
+                "DIAG e2e transcode finalize: chunks={chunk_count} file_bytes={}",
+                file_bytes.len()
+            );
+            assert!(
+                chunk_count >= 1,
+                "finalized recording produced no chunk at the muxer output"
+            );
+            assert!(
+                file_bytes.len() > 50_000,
+                "finalized file too small ({})",
+                file_bytes.len()
+            );
+            file_bytes
+        };
+
+        // The seekable-structure check must scan the WHOLE file: with
+        // faststart the moov (per-sample tables) can itself be hundreds of KB
+        // for a long recording, so "mdat" is far beyond the first 4 KB.
+        let find_tag = |bytes: &[u8], tag: &[u8; 4]| -> Option<usize> {
+            bytes.windows(4).position(|w| w == tag)
+        };
+        let assert_seekable_structure = |label: &str, bytes: &[u8]| {
+            let ftyp_at = find_tag(bytes, b"ftyp");
+            let moov_at = find_tag(bytes, b"moov");
+            let mdat_at = find_tag(bytes, b"mdat");
+            let moof_count = bytes.windows(4).filter(|w| w == b"moof").count();
+            eprintln!(
+                "DIAG e2e transcode {label} boxes: ftyp={ftyp_at:?} moov={moov_at:?} mdat={mdat_at:?} moof={moof_count} size={}",
+                bytes.len()
+            );
+            assert!(
+                ftyp_at.is_some() && moov_at.is_some() && mdat_at.is_some(),
+                "{label}: ftyp+moov+mdat must exist in the finalized recording"
+            );
+            assert!(
+                moov_at.unwrap() < mdat_at.unwrap(),
+                "{label}: moov must be BEFORE mdat (faststart headers first); got moov={moov_at:?} mdat={mdat_at:?}"
+            );
+            assert_eq!(
+                moof_count, 0,
+                "{label}: non-fragmented output must have no moof boxes"
+            );
+        };
+
+        // Round 1: record, finalize, and assert the seekable MP4 structure
+        // (the regression: a fragmented streamable file fails here — VLC
+        // cannot seek it and shows glitches, unlike the GeForce Now file).
+        let round1 = finalize_round(2_500);
+        assert_seekable_structure("round1", &round1);
+
+        // Round 2: the branch must recycle IN PLACE (flush + encoder/muxer
+        // reset) and produce a second valid seekable file with a fresh moov.
+        state.recycle().expect("recycle branch");
+        let round2 = finalize_round(2_000);
+        assert_seekable_structure("round2", &round2);
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Field reproduction of the record-start transport kill, in the new
+    /// transcode topology. Production records by OPENING a valve-gated
+    /// TRANSCODE branch tapped off the decoded-video tap tee (video + game
+    /// audio into one qtmux). The old remux failure — a FLOW_NOT_NEGOTIATED
+    /// raised inside the branch propagating back through the shared tee into
+    /// the WebRTC transport (nicesrc dies, freezing encoded/decoded/sink at 0
+    /// fps) — must not regress: the encoder raises no upstream events, and the
+    /// live video + audio paths keep flowing through record start/stop.
+    #[test]
+    fn record_start_never_kills_running_stream() {
         gst::init().expect("gstreamer init");
         use std::sync::mpsc;
+        use std::time::{Duration, Instant};
 
         let pipeline = gst::Pipeline::new();
 
-        // Video source: appsrc feeding H.265 RTP packets exactly like the
-        // production WebRTC video pad (application/x-rtp, encoding-name=H265).
-        // The record tap tee sees the same stream as production; the record
-        // branch's own capsfilter normalizes it before the depayloader. The
-        // live stream must survive record start — the field failure is the
-        // record branch sending a force-key-unit CustomUpstream back through
-        // this tee into the WebRTC transport (nicesrc dies with
-        // not-negotiated) the moment its first packet reaches the remux
-        // depayloader after the valve opens.
-        let vsrc = gst::ElementFactory::make("appsrc").build().expect("vsrc");
+        // Video source: decoded raw video (NV12) → tap tee → main sink,
+        // exactly what the video tap tee carries in production.
+        let vsrc = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("vsrc");
         vsrc.set_property("is-live", false);
-        vsrc.set_property("format", gst::Format::Time);
-        // The FULL production pad caps as observed in the field log (WebRTC
-        // attaches SDP-only fields): rtph265depay must survive record start
-        // with these flowing through the record tap tee.
-        let v_src_caps = "application/x-rtp, media=(string)video, payload=(int)103, clock-rate=(int)90000, encoding-name=(string)H265, rtcp-fb-nack-pli=(boolean)true, rtcp-fb-ccm-fir=(boolean)true, rtcp-fb-transport-cc=(boolean)true, a-ice-ufrag=(string)Epgv, a-ice-pwd=(string)GaM1ZgP59wl4htiOL769k, a-fingerprint=(string)sha-256-47-23-4F-5A, a-setup=(string)actpass, a-rtcp=(string)47998, a-candidate=(string)1-1-udp-2122260223-183-78-14-236-11220-typ-host, a-mid=(string)1, a-msid=(string)stream_id-fbc-video-0, a-framerate=(string)60, extmap-3=(string)transport-wide-cc, ssrc-2-cname=(string)fbc-video-02, ssrc=(uint)2"
-            .parse::<gst::Caps>()
-            .expect("valid H265 RTP caps");
-        vsrc.set_property("caps", &v_src_caps);
+        let v_src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("v caps");
+        v_src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
         let vtee = gst::ElementFactory::make("tee").build().expect("vtee");
-        let vsink = gst::ElementFactory::make("fakesink").build().expect("vsink");
+        let vsink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("vsink");
         vsink.set_property("sync", false);
         vsink.set_property("async", false);
 
         // Audio source: Opus → RTP, the game-audio side.
-        let asrc = gst::ElementFactory::make("audiotestsrc").build().expect("asrc");
+        let asrc = gst::ElementFactory::make("audiotestsrc")
+            .build()
+            .expect("asrc");
         asrc.set_property("is-live", false);
-        let aconv = gst::ElementFactory::make("audioconvert").build().expect("aconv");
-        let ares = gst::ElementFactory::make("audioresample").build().expect("ares");
-        let acaps = gst::ElementFactory::make("capsfilter").build().expect("acaps");
+        let aconv = gst::ElementFactory::make("audioconvert")
+            .build()
+            .expect("aconv");
+        let ares = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("ares");
+        let acaps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("acaps");
         acaps.set_property(
             "caps",
             "audio/x-raw,format=(string)S16LE,rate=(int)48000,channels=(int)2,layout=(string)interleaved"
                 .parse::<gst::Caps>()
                 .expect("valid audio caps"),
         );
-        let opusenc = gst::ElementFactory::make("opusenc").build().expect("opusenc");
-        let apay = gst::ElementFactory::make("rtpopuspay").build().expect("apay");
+        let opusenc = gst::ElementFactory::make("opusenc")
+            .build()
+            .expect("opusenc");
+        let apay = gst::ElementFactory::make("rtpopuspay")
+            .build()
+            .expect("apay");
         apay.set_property("pt", 111u32);
         let atee = gst::ElementFactory::make("tee").build().expect("atee");
-        let asink = gst::ElementFactory::make("fakesink").build().expect("asink");
+        let asink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("asink");
         asink.set_property("sync", false);
         asink.set_property("async", false);
 
         for element in [
-            &vsrc, &vtee, &vsink, &asrc, &aconv, &ares, &acaps, &opusenc, &apay, &atee, &asink,
+            &vsrc,
+            &v_src_caps,
+            &vtee,
+            &vsink,
+            &asrc,
+            &aconv,
+            &ares,
+            &acaps,
+            &opusenc,
+            &apay,
+            &atee,
+            &asink,
         ] {
             pipeline.add(element).expect("add element");
         }
-        vsrc.link(&vtee).expect("link v");
+        vsrc.link(&v_src_caps).expect("link v");
+        v_src_caps.link(&vtee).expect("link v");
         vtee.link(&vsink).expect("link v");
         asrc.link(&aconv).expect("link a");
         aconv.link(&ares).expect("link a");
@@ -5361,10 +5262,11 @@ mod faststart_probe_tests {
         // Production wiring: the video branch is built AFTER the pipeline is
         // PLAYING, then the audio tap tee is transferred into the recording
         // state and the audio branch is built into the SAME qtmux.
-        let mut state = crate::gstreamer_pipeline::build_rtp_record_branch(
+        let mut state = crate::gstreamer_pipeline::build_transcode_record_branch(
             &pipeline,
             &vtee,
-            "H265",
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
             Some(tx),
         )
         .expect("build video branch");
@@ -5378,9 +5280,8 @@ mod faststart_probe_tests {
         std::thread::sleep(Duration::from_millis(1_500));
 
         // Catch any upstream event the record branch tries to send back into
-        // the transport (a force-key-unit CustomUpstream from the depayloader
-        // is the field's transport killer: it propagates through the tee into
-        // the WebRTC receiver and errors nicesrc with not-negotiated).
+        // the transport (the old remux depayloader sent force-key-unit
+        // CustomUpstream through the tee and killed the WebRTC receiver).
         let upstream_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         for tee in [&vtee, &atee] {
             let events = upstream_events.clone();
@@ -5436,75 +5337,6 @@ mod faststart_probe_tests {
         let video_buffers = add_counter(&vsink);
         let audio_buffers = add_counter(&asink);
 
-        // The RTP helper builds a minimal single-NAL H.265 packet with a real
-        // RTP header so the remux depayloader sees a plausible seqnum stream.
-        // NUT (NAL unit type) to use for each packet: parameter sets first
-        // (VPS=32, SPS=33, PPS=34) then an IDR slice (19), like the head of a
-        // real H.265 stream. This bisects whether the depayloader's
-        // NotNegotiated is caused by missing in-band parameter sets (dropped
-        // at the closed valve since session start).
-        let make_rtp = |seq: u16, ts: u32, nut: u8| -> gst::Buffer {
-            let mut buffer = gst::Buffer::with_size(12 + 2 + 2 + 24).expect("rtp buffer");
-            {
-                let buffer = buffer.get_mut().expect("mutable buffer");
-                let mut map = buffer.map_writable().expect("writable map");
-                let data = map.as_mut_slice();
-                data[0] = 0x80; // RTP version 2
-                data[1] = 103 & 0x7f; // payload type 103 = H265
-                data[2] = (seq >> 8) as u8;
-                data[3] = seq as u8;
-                data[4] = (ts >> 24) as u8;
-                data[5] = (ts >> 16) as u8;
-                data[6] = (ts >> 8) as u8;
-                data[7] = ts as u8;
-                data[8] = 0x12;
-                data[9] = 0x34;
-                data[10] = 0x56;
-                data[11] = 0x78; // ssrc
-                // 2-byte H265 RTP payload header (single-NAL): F=0, Type=nut,
-                // layer 0, TID 1.
-                data[12] = (nut & 0x3f) << 1;
-                data[13] = 0x01;
-                // 2-byte NAL unit header: F=0, NUT=nut, layer 0, TID 1.
-                data[14] = (nut & 0x3f) << 1;
-                data[15] = 0x01;
-                // A few payload bytes so the NAL looks non-empty.
-                for (i, byte) in data[16..].iter_mut().enumerate() {
-                    *byte = (i as u8).wrapping_mul(3).wrapping_add(7);
-                }
-            }
-            buffer
-        };
-        let push_rtp = |src: &gst::Element, packets: &[(u16, u32, u8)]| {
-            let pad = src.static_pad("src").expect("appsrc src pad");
-            for (seq, ts, nut) in packets {
-                let buffer = make_rtp(*seq, *ts, *nut);
-                if let Err(error) = pad.push(buffer) {
-                    panic!("appsrc RTP push seq={seq} failed with {error:?}");
-                }
-            }
-        };
-        // Push the mandatory sticky events on the video source (production's
-        // webrtcbin delivers stream-start/caps/segment; the branch's
-        // depayloader is fed directly from the tee from session start, so it
-        // needs the same events). The stream head carries the in-band
-        // VPS/SPS/PPS before the deltas — exactly like production — so the
-        // always-armed depayloader captures the parameter sets and never
-        // needs a force-key-unit upstream request.
-        let vsrc_src = vsrc.static_pad("src").expect("appsrc src pad");
-        vsrc_src.push_event(gst::event::StreamStart::new("opennow-record-test-video"));
-        vsrc_src.push_event(gst::event::Caps::new(&v_src_caps));
-        let mut segment = gst::Segment::new();
-        segment.set_format(gst::Format::Time);
-        vsrc_src.push_event(gst::event::Segment::new(&segment));
-        let mut pre_packets: Vec<(u16, u32, u8)> = vec![
-            (1000, 3000, 32),
-            (1001, 3000, 33),
-            (1002, 3000, 34),
-            (1003, 3000, 19),
-        ];
-        pre_packets.extend((0..16u16).map(|i| (1004 + i, 3033 + i as u32 * 33, 19)));
-        push_rtp(&vsrc, &pre_packets);
         std::thread::sleep(Duration::from_millis(300));
         let video_before = video_buffers.load(Ordering::SeqCst);
         let audio_before = audio_buffers.load(Ordering::SeqCst);
@@ -5517,27 +5349,7 @@ mod faststart_probe_tests {
         );
 
         state.start().expect("start recording");
-        let post_start_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // VPS/SPS/PPS first, then IDRs — the record valve opens here, and
-            // the depayloader (already armed from session start) keeps its
-            // captured parameter sets.
-            let mut packets: Vec<(u16, u32, u8)> = vec![
-                (1020, 4000, 32),
-                (1021, 4000, 33),
-                (1022, 4000, 34),
-                (1023, 4000, 19),
-            ];
-            packets.extend((0..56u16).map(|i| (1024 + i, 4033 + i as u32 * 33, 19)));
-            push_rtp(&vsrc, &packets);
-        }));
-        if let Err(payload) = post_start_result {
-            let message = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                .unwrap_or("unknown panic payload");
-            panic!("post-start RTP push failed: {message}");
-        }
+        std::thread::sleep(Duration::from_millis(2_500));
 
         let deadline = Instant::now() + Duration::from_millis(2_500);
         let mut errors: Vec<String> = Vec::new();
@@ -5557,7 +5369,11 @@ mod faststart_probe_tests {
 
         let video_after = video_buffers.load(Ordering::SeqCst);
         let audio_after = audio_buffers.load(Ordering::SeqCst);
-        let upstream = upstream_events.lock().ok().map(|slot| slot.len()).unwrap_or(0);
+        let upstream = upstream_events
+            .lock()
+            .ok()
+            .map(|slot| slot.len())
+            .unwrap_or(0);
         eprintln!(
             "DIAG record-start transport: errors={} upstream_force_key={upstream} video_buffers={video_before}->{video_after} audio_buffers={audio_before}->{audio_after}",
             errors.len()
@@ -5579,9 +5395,10 @@ mod faststart_probe_tests {
             "live audio path stalled after record start: {audio_before} -> {audio_after}"
         );
 
-        // Finalize cleanly: EOS below the valves must flush the muxer without
-        // disturbing the live paths (the field stop also showed queue/segment
-        // warnings, so the drain+EOS path is part of this regression).
+        // Finalize cleanly: drain + EOS below the valves must flush the muxer
+        // without disturbing the live paths (the field stop also showed
+        // queue/segment warnings, so the drain+EOS path is part of this
+        // regression).
         state.stop(true).expect("finalize recording");
         let mut chunks = 0usize;
         while let Ok(event) = rx.try_recv() {
@@ -5589,63 +5406,57 @@ mod faststart_probe_tests {
                 chunks += 1;
             }
         }
-        // The synthetic single-NAL packets carry no real codec data, so a
-        // valid seekable MP4 is NOT expected here (that is covered by
-        // remux_recording_finalizes_into_seekable_mp4); the transport-survival
-        // assertions above are the point of this test.
         eprintln!("DIAG record-start transport: finalized chunks={chunks}");
-        let _ = chunks;
+        assert!(
+            chunks >= 1,
+            "finalized transcode recording produced no muxer chunks"
+        );
 
         let _ = pipeline.set_state(gst::State::Null);
     }
 
-    /// Reproduce the field symptom: recording a REAL H265 RTP stream through
-    /// the production remux branch (valve → capsfilter → queue → rtph265depay
-    /// → h265parse → qtmux) must produce a VIDEO track in the muxer output.
-    /// The field file contains ONLY an Opus audio track (12 KB MP4 after a
-    /// 1-minute recording) — video never reached qtmux. Every branch pad is
-    /// instrumented so a failure shows exactly where the video dies.
+    /// Reproduce the field symptom (empty video track) with the NEW transcode
+    /// branch: recording a decoded-video stream through
+    /// `build_transcode_record_branch` (valve → queue → videoconvert →
+    /// capsfilter → H.264 encoder → qtmux) must produce a VIDEO track in the
+    /// muxer output — the old remux produced a 12 KB MP4 with only an Opus
+    /// track after a 1-minute recording because the depayloader never
+    /// captured the parameter sets. Every branch pad is instrumented so a
+    /// failure shows exactly where the video dies.
     #[test]
-    fn h265_remux_branch_real_stream_produces_video_track() {
+    fn transcode_branch_real_stream_produces_video_track() {
         gst::init().expect("gstreamer init");
         use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
-        // Real H265 source: encode → parse → RTP payload → tee → main sink.
-        let src = gst::ElementFactory::make("videotestsrc").build().expect("videotestsrc");
+        // Decoded video source (NV12, like the live chain output) → tap tee →
+        // main sink.
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
         src.set_property("is-live", false);
-        let src_caps = gst::ElementFactory::make("capsfilter").build().expect("src caps");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src caps");
         src_caps.set_property(
             "caps",
-            "video/x-raw,format=(string)I420,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
                 .parse::<gst::Caps>()
                 .expect("valid caps"),
         );
-        let enc = gst::ElementFactory::make("x265enc").build().expect("x265enc");
-        enc.set_property_from_str("speed-preset", "ultrafast");
-        // I420 input makes x265enc pick the main profile by default (no
-        // main-444 confound that rtph265pay rejects).
-        enc.set_property("key-int-max", 30i32);
-        enc.set_property("bitrate", 3000u32);
-        let parse = gst::ElementFactory::make("h265parse").build().expect("h265parse");
-        let pay = gst::ElementFactory::make("rtph265pay").build().expect("rtph265pay");
-        pay.set_property("pt", 103u32);
         let tee = gst::ElementFactory::make("tee").build().expect("tee");
         let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
         main_sink.set_property("sync", false);
         main_sink.set_property("async", false);
 
         let pipeline = gst::Pipeline::new();
-        for element in [&src, &src_caps, &enc, &parse, &pay, &tee, &main_sink] {
+        for element in [&src, &src_caps, &tee, &main_sink] {
             pipeline.add(element).expect("add");
         }
         src.link(&src_caps).expect("l1");
-        src_caps.link(&enc).expect("l2");
-        enc.link(&parse).expect("l3");
-        parse.link(&pay).expect("l4");
-        pay.link(&tee).expect("l5");
-        tee.link(&main_sink).expect("l6");
+        src_caps.link(&tee).expect("l2");
+        tee.link(&main_sink).expect("l3");
 
         let (tx, rx) = mpsc::channel::<Event>();
         pipeline.set_state(gst::State::Playing).expect("playing");
@@ -5653,10 +5464,11 @@ mod faststart_probe_tests {
 
         // Production wiring: branch built into the already-PLAYING pipeline
         // with the valve closed, exactly like link_rtp_video_pad does it.
-        let state = crate::gstreamer_pipeline::build_rtp_record_branch(
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
             &pipeline,
             &tee,
-            "H265",
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
             Some(tx),
         )
         .expect("build recording branch");
@@ -5672,8 +5484,7 @@ mod faststart_probe_tests {
             counter
         };
         let queue_in = add_counter(&state.queue, "sink");
-        let depay_out = add_counter(&state.depayloader, "src");
-        let parse_out = add_counter(&state.parse, "src");
+        let enc_out = add_counter(&state.encoder, "src");
         // Count on the muxer SRC pad, not the swallow sink pad: the swallow
         // sink carries the chunk probe that returns DROP (which prevents any
         // later probe on that pad from running), so a counter there would
@@ -5685,58 +5496,24 @@ mod faststart_probe_tests {
         std::thread::sleep(Duration::from_millis(1_500));
         let q0 = queue_in.load(Ordering::SeqCst);
         eprintln!(
-            "DIAG h265 branch: before start queue_in={q0} depay_out={} parse_out={} mux_out={}",
-            depay_out.load(Ordering::SeqCst),
-            parse_out.load(Ordering::SeqCst),
+            "DIAG transcode branch: before start queue_in={q0} enc_out={} mux_out={}",
+            enc_out.load(Ordering::SeqCst),
             mux_out.load(Ordering::SeqCst)
         );
 
         state.start().expect("start recording");
-
-        // After the replay + valve open, does the branch queue have its
-        // mandatory sticky events?
-        let mut has_stream_start = false;
-        let mut has_segment = false;
-        let mut has_caps = false;
-        state
-            .queue
-            .static_pad("sink")
-            .expect("queue sink")
-            .sticky_events_foreach(|event| {
-                match event.type_() {
-                    gst::EventType::StreamStart => has_stream_start = true,
-                    gst::EventType::Segment => has_segment = true,
-                    gst::EventType::Caps => has_caps = true,
-                    _ => {}
-                }
-                std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
-            });
-        eprintln!(
-            "DIAG h265 branch: after start queue sticky stream_start={has_stream_start} segment={has_segment} caps={has_caps}"
-        );
-
         std::thread::sleep(Duration::from_millis(2_500));
         let q1 = queue_in.load(Ordering::SeqCst);
-        let d1 = depay_out.load(Ordering::SeqCst);
-        let p1 = parse_out.load(Ordering::SeqCst);
+        let e1 = enc_out.load(Ordering::SeqCst);
         let m1 = mux_out.load(Ordering::SeqCst);
-        let depay_caps = state
-            .depayloader
+        let enc_caps = state
+            .encoder
             .static_pad("src")
             .and_then(|pad| pad.current_caps())
             .map(|caps| caps.to_string())
             .unwrap_or_else(|| "<none>".to_owned());
-        let parse_caps = state
-            .parse
-            .static_pad("src")
-            .and_then(|pad| pad.current_caps())
-            .map(|caps| caps.to_string())
-            .unwrap_or_else(|| "<none>".to_owned());
-        eprintln!(
-            "DIAG h265 branch: recording queue_in={q0}->{q1} depay_out={d1} parse_out={p1} mux_out={m1}"
-        );
-        eprintln!("DIAG h265 branch: depay src caps = {depay_caps}");
-        eprintln!("DIAG h265 branch: parse src caps = {parse_caps}");
+        eprintln!("DIAG transcode branch: recording queue_in={q0}->{q1} enc_out={e1} mux_out={m1}");
+        eprintln!("DIAG transcode branch: encoder src caps = {enc_caps}");
 
         state.stop(true).expect("finalize recording");
         let mut file_bytes: Vec<u8> = Vec::new();
@@ -5747,10 +5524,9 @@ mod faststart_probe_tests {
                 file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
             }
         }
-        let hvc1_at = file_bytes.windows(4).position(|w| w == b"hvc1");
-        let hev1_at = file_bytes.windows(4).position(|w| w == b"hev1");
+        let avc1_at = file_bytes.windows(4).position(|w| w == b"avc1");
         eprintln!(
-            "DIAG h265 branch: finalized chunks={chunks} file_bytes={} hvc1={hvc1_at:?} hev1={hev1_at:?}",
+            "DIAG transcode branch: finalized chunks={chunks} file_bytes={} avc1={avc1_at:?}",
             file_bytes.len()
         );
         assert!(
@@ -5758,87 +5534,93 @@ mod faststart_probe_tests {
             "branch queue received no video buffers after record start: {q0} -> {q1}"
         );
         assert!(
-            m1 > 0,
-            "qtmux produced no output buffers; video died in the remux chain (queue_in={q1} depay_out={d1} parse_out={p1})"
+            e1 > 0 && m1 > 0,
+            "encoder/muxer produced no output; video died in the transcode chain (queue_in={q1} enc_out={e1} mux_out={m1})"
         );
         assert!(
-            hvc1_at.is_some() || hev1_at.is_some(),
-            "finalized MP4 has no H265 video track (hvc1/hev1 missing); depay_out={d1} parse_out={p1} mux_out={m1}"
+            avc1_at.is_some(),
+            "finalized MP4 has no H.264 video track (avc1 missing); enc_out={e1} mux_out={m1}"
         );
 
         let _ = pipeline.set_state(gst::State::Null);
     }
 
-    /// Production-faithful variant: the WebRTC H265 RTP caps carry NO
-    /// sprop-vps/sps/pps (parameter sets arrive in-band only), plus the game
-    /// audio branch shares the SAME qtmux. Test 1's real H265 encoder chain
-    /// feeds the branch, but a downstream event probe rewrites the caps event
-    /// to the production shape (sprop-* removed) before it reaches the record
-    /// tee. The field symptom: a 12 KB MP4 with only an Opus track after a
-    /// 1-minute recording.
+    /// Production-faithful variant: the video side consumes DECODED frames
+    /// (no RTP caps involved), while the game-audio branch consumes the real
+    /// production Opus RTP stream and shares the SAME qtmux. The field
+    /// symptom — a 12 KB MP4 with only an audio track after a 1-minute
+    /// recording — must not regress: the finalized file must carry BOTH an
+    /// H.264 video track (avc1) and an AAC audio track (mp4a).
     #[test]
-    fn h265_remux_branch_production_caps_and_audio() {
+    fn transcode_branch_with_audio_produces_video_and_audio_tracks() {
         gst::init().expect("gstreamer init");
         use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
-        // Video: real H265 encode -> RTP payload -> tee -> main sink, identical
-        // to test 1 (this exact chain demonstrably works in the harness).
-        let src = gst::ElementFactory::make("videotestsrc").build().expect("videotestsrc");
+        // Video: decoded raw video → tap tee → main sink.
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
         src.set_property("is-live", false);
-        let src_caps = gst::ElementFactory::make("capsfilter").build().expect("src caps");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src caps");
         src_caps.set_property(
             "caps",
-            "video/x-raw,format=(string)I420,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
                 .parse::<gst::Caps>()
                 .expect("valid caps"),
         );
-        let enc = gst::ElementFactory::make("x265enc").build().expect("x265enc");
-        enc.set_property_from_str("speed-preset", "ultrafast");
-        enc.set_property("key-int-max", 30i32);
-        enc.set_property("bitrate", 3000u32);
-        let parse = gst::ElementFactory::make("h265parse").build().expect("h265parse");
-        let pay = gst::ElementFactory::make("rtph265pay").build().expect("rtph265pay");
-        pay.set_property("pt", 103u32);
         let tee = gst::ElementFactory::make("tee").build().expect("tee");
         let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
         main_sink.set_property("sync", false);
         main_sink.set_property("async", false);
 
-        // Audio: Opus -> RTP (game audio), into a second tee.
-        let asrc = gst::ElementFactory::make("audiotestsrc").build().expect("asrc");
+        // Audio: Opus → RTP (game audio), into a second tee.
+        let asrc = gst::ElementFactory::make("audiotestsrc")
+            .build()
+            .expect("asrc");
         asrc.set_property("is-live", false);
-        let aconv = gst::ElementFactory::make("audioconvert").build().expect("aconv");
-        let ares = gst::ElementFactory::make("audioresample").build().expect("ares");
-        let acaps = gst::ElementFactory::make("capsfilter").build().expect("acaps");
+        let aconv = gst::ElementFactory::make("audioconvert")
+            .build()
+            .expect("aconv");
+        let ares = gst::ElementFactory::make("audioresample")
+            .build()
+            .expect("ares");
+        let acaps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("acaps");
         acaps.set_property(
             "caps",
             "audio/x-raw,format=(string)S16LE,rate=(int)48000,channels=(int)2,layout=(string)interleaved"
                 .parse::<gst::Caps>()
                 .expect("valid audio caps"),
         );
-        let opusenc = gst::ElementFactory::make("opusenc").build().expect("opusenc");
-        let apay = gst::ElementFactory::make("rtpopuspay").build().expect("apay");
+        let opusenc = gst::ElementFactory::make("opusenc")
+            .build()
+            .expect("opusenc");
+        let apay = gst::ElementFactory::make("rtpopuspay")
+            .build()
+            .expect("apay");
         apay.set_property("pt", 111u32);
         let atee = gst::ElementFactory::make("tee").build().expect("atee");
-        let asink = gst::ElementFactory::make("fakesink").build().expect("asink");
+        let asink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("asink");
         asink.set_property("sync", false);
         asink.set_property("async", false);
 
         let pipeline = gst::Pipeline::new();
         for element in [
-            &src, &src_caps, &enc, &parse, &pay, &tee, &main_sink, &asrc, &aconv, &ares, &acaps,
-            &opusenc, &apay, &atee, &asink,
+            &src, &src_caps, &tee, &main_sink, &asrc, &aconv, &ares, &acaps, &opusenc, &apay,
+            &atee, &asink,
         ] {
             pipeline.add(element).expect("add element");
         }
         src.link(&src_caps).expect("l1");
-        src_caps.link(&enc).expect("l2");
-        enc.link(&parse).expect("l3");
-        parse.link(&pay).expect("l4");
-        pay.link(&tee).expect("l5");
-        tee.link(&main_sink).expect("l6");
+        src_caps.link(&tee).expect("l2");
+        tee.link(&main_sink).expect("l3");
         asrc.link(&aconv).expect("a1");
         aconv.link(&ares).expect("a2");
         ares.link(&acaps).expect("a3");
@@ -5847,52 +5629,15 @@ mod faststart_probe_tests {
         apay.link(&atee).expect("a6");
         atee.link(&asink).expect("a7");
 
-        // Rewrite the caps event on the way out of rtph265pay: drop the
-        // sprop-* fields so the branch sees EXACTLY the production WebRTC
-        // caps (parameter sets in-band only, SDP-only fields retained). Both
-        // the live path and the record tee receive the rewritten caps. The
-        // original event is swallowed (Drop) and a stripped replacement is
-        // pushed in its place, so the tee retains the production-shaped caps.
-        // A guard keeps the replacement caps event from re-entering this
-        // probe (which would recurse infinitely).
-        let pay_src = pay.static_pad("src").expect("pay src");
-        let rewritten = std::sync::atomic::AtomicBool::new(false);
-        pay_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
-            if let Some(event) = info.event() {
-                if event.type_() == gst::EventType::Caps
-                    && !rewritten.swap(true, Ordering::SeqCst)
-                {
-                    if let Some(structure) = event.structure() {
-                        let mut owned = structure.to_owned();
-                        for field in [
-                            "sprop-vps",
-                            "sprop-sps",
-                            "sprop-pps",
-                            "profile-id",
-                            "tier-flag",
-                            "level-id",
-                            "seqnum-offset",
-                            "timestamp-offset",
-                        ] {
-                            owned.remove_field(field);
-                        }
-                        let caps: gst::Caps = owned.into();
-                        pad.push_event(gst::event::Caps::new(&caps));
-                        return gst::PadProbeReturn::Drop;
-                    }
-                }
-            }
-            gst::PadProbeReturn::Ok
-        });
-
         let (tx, rx) = mpsc::channel::<Event>();
         pipeline.set_state(gst::State::Playing).expect("playing");
         std::thread::sleep(Duration::from_millis(400));
 
-        let mut state = crate::gstreamer_pipeline::build_rtp_record_branch(
+        let mut state = crate::gstreamer_pipeline::build_transcode_record_branch(
             &pipeline,
             &tee,
-            "H265",
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
             Some(tx),
         )
         .expect("build video branch");
@@ -5912,31 +5657,27 @@ mod faststart_probe_tests {
             counter
         };
         let v_queue_in = add_counter(&state.queue, "sink");
-        let v_depay_out = add_counter(&state.depayloader, "src");
-        let v_parse_out = add_counter(&state.parse, "src");
+        let v_enc_out = add_counter(&state.encoder, "src");
 
         // Valve closed while both tees stream, like production (branch
         // attached at session start, record pressed minutes later).
         std::thread::sleep(Duration::from_millis(1_500));
         let q_before = v_queue_in.load(Ordering::SeqCst);
-        eprintln!("DIAG h265 prod: before start queue_in={q_before}");
+        eprintln!("DIAG transcode prod: before start queue_in={q_before}");
 
         state.start().expect("start recording");
         std::thread::sleep(Duration::from_millis(3_000));
 
         let q1 = v_queue_in.load(Ordering::SeqCst);
-        let d1 = v_depay_out.load(Ordering::SeqCst);
-        let p1 = v_parse_out.load(Ordering::SeqCst);
-        let parse_caps = state
-            .parse
+        let e1 = v_enc_out.load(Ordering::SeqCst);
+        let enc_caps = state
+            .encoder
             .static_pad("src")
             .and_then(|pad| pad.current_caps())
             .map(|caps| caps.to_string())
             .unwrap_or_else(|| "<none>".to_owned());
-        eprintln!(
-            "DIAG h265 prod: recording queue_in={q_before}->{q1} depay_out={d1} parse_out={p1}"
-        );
-        eprintln!("DIAG h265 prod: parse src caps = {parse_caps}");
+        eprintln!("DIAG transcode prod: recording queue_in={q_before}->{q1} enc_out={e1}");
+        eprintln!("DIAG transcode prod: encoder src caps = {enc_caps}");
 
         state.stop(true).expect("finalize recording");
         let mut file_bytes: Vec<u8> = Vec::new();
@@ -5947,10 +5688,10 @@ mod faststart_probe_tests {
                 file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
             }
         }
-        let hvc1_at = file_bytes.windows(4).position(|w| w == b"hvc1");
-        let opus_at = file_bytes.windows(4).position(|w| w == b"Opus");
+        let avc1_at = file_bytes.windows(4).position(|w| w == b"avc1");
+        let mp4a_at = file_bytes.windows(4).position(|w| w == b"mp4a");
         eprintln!(
-            "DIAG h265 prod: finalized chunks={chunks} file_bytes={} hvc1={hvc1_at:?} opus={opus_at:?}",
+            "DIAG transcode prod: finalized chunks={chunks} file_bytes={} avc1={avc1_at:?} mp4a={mp4a_at:?}",
             file_bytes.len()
         );
         assert!(
@@ -5958,8 +5699,12 @@ mod faststart_probe_tests {
             "video branch queue received no buffers after record start: {q_before} -> {q1}"
         );
         assert!(
-            hvc1_at.is_some(),
-            "finalized MP4 has no H265 video track with production (no-sprop) caps; queue_in={q1} depay_out={d1} parse_out={p1}"
+            avc1_at.is_some(),
+            "finalized MP4 has no H.264 video track; queue_in={q1} enc_out={e1}"
+        );
+        assert!(
+            mp4a_at.is_some(),
+            "finalized MP4 has no AAC audio track (game audio died in the transcode chain)"
         );
 
         let _ = pipeline.set_state(gst::State::Null);
