@@ -5709,4 +5709,113 @@ mod tests {
 
         let _ = pipeline.set_state(gst::State::Null);
     }
+
+    /// Regression: a LIVE source (like the production tap tee) with the branch
+    /// idle for a while before record start must NOT inflate the recording.
+    /// The old videorate-based chain re-based its output onto the replayed
+    /// live segment (start=0, session start) and inserted duplicate frames
+    /// for the whole idle gap — a 31 s field recording came out as 79.8 s of
+    /// video ("stuck"/slow-motion playback) with the audio track stranded at
+    /// the tail. The encoder must output ~1 frame per input frame (no
+    /// duplication) and the file must be ~the recording window long.
+    #[test]
+    fn live_record_window_does_not_inflate_transcode_output() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", true);
+        src.set_property_from_str("pattern", "smpte");
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src caps");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)60/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let tee = gst::ElementFactory::make("tee").build().expect("tee");
+        let main_sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        main_sink.set_property("sync", false);
+        main_sink.set_property("async", false);
+
+        let pipeline = gst::Pipeline::new();
+        for element in [&src, &src_caps, &tee, &main_sink] {
+            pipeline.add(element).expect("add");
+        }
+        src.link(&src_caps).expect("l1");
+        src_caps.link(&tee).expect("l2");
+        tee.link(&main_sink).expect("l3");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let state = crate::gstreamer_pipeline::build_transcode_record_branch(
+            &pipeline,
+            &tee,
+            crate::gstreamer_pipeline::RtpVideoApi::Software,
+            false,
+            Some(tx),
+        )
+        .expect("build recording branch");
+
+        let add_counter = |element: &gst::Element, pad_name: &str| -> Arc<AtomicU64> {
+            let counter = Arc::new(AtomicU64::new(0));
+            let c = counter.clone();
+            let pad = element.static_pad(pad_name).expect("pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                c.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+            counter
+        };
+        let q_in = add_counter(&state.queue, "sink");
+        let enc_out = add_counter(&state.encoder, "src");
+
+        // Branch idle while the live tee streams (like session start -> record).
+        std::thread::sleep(Duration::from_millis(2_000));
+        let q0 = q_in.load(Ordering::SeqCst);
+        let e0 = enc_out.load(Ordering::SeqCst);
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(3_000));
+        let q1 = q_in.load(Ordering::SeqCst);
+        let e1 = enc_out.load(Ordering::SeqCst);
+        let recorded_frames = q1 - q0;
+        let encoded_frames = e1 - e0;
+        eprintln!(
+            "DIAG live: 3s window queue_in={q0}->{q1} enc_out={e0}->{e1} (recorded={recorded_frames} encoded={encoded_frames})"
+        );
+
+        state.stop(true).expect("finalize recording");
+        let mut file_bytes: Vec<u8> = Vec::new();
+        let mut chunks = 0usize;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks += 1;
+                file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
+            }
+        }
+        eprintln!(
+            "DIAG live: finalized chunks={chunks} file_bytes={} (expected ~{recorded_frames} encoded frames)",
+            file_bytes.len()
+        );
+        assert!(
+            recorded_frames >= 120,
+            "recording window captured too few frames: {recorded_frames}"
+        );
+        assert!(
+            encoded_frames <= recorded_frames + 30,
+            "encoder duplicated frames: encoded={encoded_frames} for recorded={recorded_frames} — the videorate inflation regression"
+        );
+        assert!(file_bytes.len() > 50_000);
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
 }

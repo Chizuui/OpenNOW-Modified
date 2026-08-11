@@ -5,7 +5,7 @@ use crate::gstreamer_config::{
     use_stacked_renderer, vrr_present_max_fps, zero_copy_requested, CodecDecoderPreference,
     EXTERNAL_RENDERER_ENV, NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV,
     NATIVE_VIDEO_API_ENV, NATIVE_VIDEO_BACKEND_ENV, PRESENT_LIMITER_AUTO_SENTINEL,
-    PRESENT_LIMITER_VRR_SENTINEL,
+    PRESENT_LIMITER_STREAM_SENTINEL, PRESENT_LIMITER_VRR_SENTINEL,
 };
 #[cfg(target_os = "windows")]
 use crate::gstreamer_input::NativeWindowInputBridge;
@@ -55,7 +55,13 @@ use std::thread;
 // usual WebRTC buffer while allowing normal Wi-Fi/Internet jitter to settle.
 const WEBRTC_LATENCY_MS: u32 = 100;
 const DEFAULT_GFN_STUN_SERVER: &str = "stun://stun2.l.google.com:19302";
-const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 6;
+/// Compressed-frame jitter buffer between the parser and the decoder (leaky=no,
+/// so it blocks the RTP thread instead of dropping). ~250 ms at 60 fps absorbs
+/// the 100-300 ms WAN jitter bursts the field logs show (sink fps collapsing to
+/// single digits with only 0.03-0.09% packet loss); 6 frames (100 ms) was too
+/// small — any gap beyond it starved the decoder and froze the picture on the
+/// last frame until the next burst.
+const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
 /// How long to wait for a fresh frame to arrive at the screenshot grab branch
 /// after opening its valve before giving up (the stream may be paused).
 const SCREENSHOT_CAPTURE_TIMEOUT_MS: u64 = 2_000;
@@ -554,8 +560,9 @@ impl GstreamerVideoTap {
 /// supports it, else openh264enc/x264enc), and muxes with AAC game audio into
 /// a standard seekable MP4 (faststart):
 ///
-///   tap tee → valve → queue → [d3d12download] → videoconvert → capsfilter →
-///   H.264 encoder → h264parse → qtmux → swallow
+///   tap tee → valve → queue → [d3d12download] → videoconvert → capsfilter
+///   (FULL bt709) → videoconvert (FULL→LIMITED) → capsfilter
+///   (LIMITED bt709) → H.264 encoder → h264parse → qtmux → swallow
 ///
 /// Re-encoding (instead of the old source-bitstream RTP remux) is what makes
 /// the recording UNIVERSAL — the field complaint: recordings of GFN's H.265
@@ -565,18 +572,18 @@ impl GstreamerVideoTap {
 /// it at once:
 ///
 /// - Universal: H.264 main profile, 8-bit, plays on any device/player.
-/// - Colors: videoconvert + an explicit `colorimetry=bt709` capsfilter makes
-///   the color range deterministic (the source H.265 VUI is ambiguous; the
-///   old file came out untagged and players guessed wrong).
+/// - Colors: the GFN stream is FULL-RANGE PC video (decoder output 0-255,
+///   range untagged), so the branch declares full-range BT.709 and then
+///   scales it down to LIMITED 16-235 before the encoder — the encoder's
+///   limited VUI tag then matches the data and every player renders the
+///   exact live colors (the old file tagged 0-255 data as limited and came
+///   out washed-out / "weird colors").
 /// - Glitch-free start: the encoder begins a fresh GOP (IDR) at the first
 ///   frame it sees, so the file NEVER starts mid-GOP with orphan P-frames
 ///   referencing pre-recording frames (the decode glitches at the head of
 ///   the old files). Recording also starts with zero delay: no waiting for
 ///   the next server keyframe.
-/// - Steady timing: the live decode chain delivers frames at a steady rate,
-///   so the MP4 timestamps are regular (the old RTP remux produced a
-///   jittery ~53.5 fps file with 24 Mbps spikes that stuttered players).
-///
+
 /// The branch is built at session start off the video tap tee (after the
 /// decode chain is up), and the tee pad stays linked for the session, so
 /// record start/stop is ONLY a valve open/close — the decode/present chain
@@ -603,12 +610,23 @@ pub(crate) struct GstreamerRecordingState {
     /// reset together with the encoder on recycle: after EOS it stays EOS'd
     /// and silently swallows the next recording's buffers.
     pub(crate) h264_parse: gst::Element,
-    /// videoconvert + capsfilter between the queue and the encoder. Stateless,
-    /// but reset on recycle so every element below the valve starts the next
-    /// recording in the exact fresh state it had at build time.
+    /// First videoconvert: converts the decoder's native output (NV12) to the
+    /// encoder's input format (NV12 for d3d12h264enc, I420 for the software
+    /// encoders). Stateless, but reset on recycle so every element below the
+    /// valve starts the next recording in the exact fresh state it had at
+    /// build time.
     pub(crate) video_convert: gst::Element,
-    /// The BT.709 colorimetry capsfilter feeding the encoder.
-    pub(crate) video_capsfilter: gst::Element,
+    /// Declares the decoder's output as FULL-RANGE BT.709 (the GFN H.265
+    /// stream carries full-range PC video, but the decoder leaves the range
+    /// untagged, so the encoder would otherwise tag the file limited while
+    /// the pixel data stays 0-255 — the exact "weird colors" field bug).
+    pub(crate) video_declare_caps: gst::Element,
+    /// Second videoconvert: scales the declared full-range data down to
+    /// LIMITED range (16-235), matching what the H.264 encoders tag, so every
+    /// player renders the recorded colors exactly like the live stream.
+    pub(crate) video_range_convert: gst::Element,
+    /// Demands LIMITED-range BT.709 (16-235) at the encoder input.
+    pub(crate) video_encode_caps: gst::Element,
     /// Optional D3D11/D3D12 texture→system-memory downloader (only when
     /// zero-copy is active). Reset on recycle like the rest of the branch.
     pub(crate) video_download: Option<gst::Element>,
@@ -693,7 +711,9 @@ impl GstreamerRecordingState {
         // newly attached audio branch can receive buffers before its segment.
         set_property_from_str_if_supported(&valve, "drop-mode", "forward-sticky-events");
         // Same contract as the video queue: never back-pressure the live path.
-        queue.set_property_from_str("leaky", "downstream");
+        // leaky=upstream drops incoming RTP packets when full, so the audio
+        // tap tee's push never blocks on this branch.
+        queue.set_property_from_str("leaky", "upstream");
         queue.set_property("max-size-buffers", 30u32);
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
@@ -812,8 +832,14 @@ impl GstreamerRecordingState {
         // decode chain). The audio branch still has its valve before
         // rtpopusdepay, so its events are replayed from the audio tap tee as
         // before.
+        // The VIDEO branch replays stream-start + segment WITHOUT the tee's
+        // caps: the tee's raw decoded caps would override the branch's
+        // declared full-range BT.709 caps and disable the FULL→LIMITED range
+        // conversion (the field "too contrasty colors" bug). The audio
+        // branch keeps its RTP caps replay — rtpopusdepay needs the payload
+        // type from the audio tee's caps.
         if let Some(tee_sink) = self.video_tap_tee.static_pad("sink") {
-            replay_recording_sticky_events_from_pad(&tee_sink, &self.valve);
+            replay_recording_sticky_events_no_caps(&tee_sink, &self.valve);
         } else {
             replay_recording_sticky_events(&self.valve);
         }
@@ -1036,7 +1062,9 @@ impl GstreamerRecordingState {
             branch_elements.push(download.clone());
         }
         branch_elements.push(self.video_convert.clone());
-        branch_elements.push(self.video_capsfilter.clone());
+        branch_elements.push(self.video_declare_caps.clone());
+        branch_elements.push(self.video_range_convert.clone());
+        branch_elements.push(self.video_encode_caps.clone());
         if let Some(audio_queue) = &self.audio_queue {
             branch_elements.push(audio_queue.clone());
         }
@@ -1067,8 +1095,9 @@ impl GstreamerRecordingState {
         // lets buffers overtake the new segment (the queue/segment warnings
         // seen on recording #2). Video events come from the video tap tee's
         // sink pad (see start()).
+        // Video: stream-start + segment only (no caps — see start()).
         if let Some(tee_sink) = self.video_tap_tee.static_pad("sink") {
-            replay_recording_sticky_events_from_pad(&tee_sink, &self.valve);
+            replay_recording_sticky_events_no_caps(&tee_sink, &self.valve);
         } else {
             replay_recording_sticky_events(&self.valve);
         }
@@ -3898,6 +3927,14 @@ pub(crate) fn effective_present_max_fps(
     video_api: RtpVideoApi,
     display_hz: Option<u32>,
 ) -> u32 {
+    if configured_present_max_fps == PRESENT_LIMITER_STREAM_SENTINEL {
+        // Default policy without Cloud G-Sync: pace presentation to the stream
+        // fps. Zero added latency in steady state; jitter catch-up bursts are
+        // thinned back to real-time so the picture never "blinks" through
+        // backlogged frames.
+        return requested_fps.filter(|fps| *fps > 0).unwrap_or(0);
+    }
+
     if configured_present_max_fps == PRESENT_LIMITER_VRR_SENTINEL {
         if !matches!(video_api, RtpVideoApi::D3D11 | RtpVideoApi::D3D12) {
             return 0;
@@ -4748,7 +4785,10 @@ fn build_rtp_video_chain(
         );
         present_max_fps.store(effective_present_max_fps, Ordering::SeqCst);
         if effective_present_max_fps > 0 {
-            let reason = if configured_present_max_fps == PRESENT_LIMITER_AUTO_SENTINEL {
+            let reason = if configured_present_max_fps == PRESENT_LIMITER_STREAM_SENTINEL {
+                "default: paced to the stream frame rate so network jitter bursts render at real-time instead of blinking"
+                    .to_owned()
+            } else if configured_present_max_fps == PRESENT_LIMITER_AUTO_SENTINEL {
                 "auto-enabled for the D3D present path to prevent display-rate present backpressure"
                     .to_owned()
             } else if configured_present_max_fps == PRESENT_LIMITER_VRR_SENTINEL {
@@ -5556,13 +5596,26 @@ fn link_rtp_video_source_to_tee(
 }
 
 fn replay_recording_sticky_events_from_pad(upstream_src: &gst::Pad, valve: &gst::Element) {
-    replay_recording_sticky_events_with_caps(upstream_src, valve, None);
+    replay_recording_sticky_events_with_caps(upstream_src, valve, None, false);
+}
+
+/// Replay stream-start + segment only, WITHOUT the upstream caps event. Used
+/// by the VIDEO transcode branch: the tee's raw decoded caps (e.g. NV12 with
+/// the decoder's `1:3:5:1` full-range tag, or no colorimetry at all) would
+/// override the branch's declared FULL-RANGE BT.709 caps on the videoconverts
+/// and silently disable the FULL→LIMITED range conversion — the recorded
+/// file then carries 0-255 pixel data tagged limited, which players render
+/// with crushed/"too contrasty" colors. The branch's own capsfilters re-assert
+/// the correct caps with the first buffer, so qtmux still gets its caps.
+fn replay_recording_sticky_events_no_caps(upstream_src: &gst::Pad, valve: &gst::Element) {
+    replay_recording_sticky_events_with_caps(upstream_src, valve, None, true);
 }
 
 fn replay_recording_sticky_events_with_caps(
     upstream_src: &gst::Pad,
     valve: &gst::Element,
     caps_override: Option<&'static str>,
+    skip_caps: bool,
 ) {
     let Some(valve_src) = valve.static_pad("src") else {
         return;
@@ -5620,9 +5673,13 @@ fn replay_recording_sticky_events_with_caps(
     // makes the depayloader reject the first buffered RTP packet with
     // FLOW_NOT_NEGOTIATED, killing the whole stream through the shared tee.
     let stream_ok = valve_src.push_event(stream_start);
-    let caps_ok = caps_event
-        .map(|event| valve_src.push_event(event))
-        .unwrap_or(true);
+    let caps_ok = if skip_caps {
+        true
+    } else {
+        caps_event
+            .map(|event| valve_src.push_event(event))
+            .unwrap_or(true)
+    };
     let segment_ok = valve_src.push_event(segment);
     if !(stream_ok && caps_ok && segment_ok) {
         // This is diagnostic only; a closed valve may legitimately reject a
@@ -5806,8 +5863,26 @@ pub(crate) fn build_transcode_record_branch(
 ) -> Result<GstreamerRecordingState, String> {
     let valve = make_element("valve")?;
     let queue = make_element("queue")?;
+    // Format conversion: the decoder's native NV12 → the encoder's input
+    // format (NV12 for d3d12h264enc, I420 for the software encoders).
     let convert = make_element("videoconvert")?;
-    let capsfilter = make_element("capsfilter")?;
+    // Declares the input as FULL-RANGE BT.709. The GFN H.265 stream is
+    // full-range PC video and the decoder leaves the range untagged; without
+    // this declaration the range conversion below would be a no-op and the
+    // encoder would tag the 0-255 data as limited (washed-out colors).
+    let declare_caps = make_element("capsfilter")?;
+    // Scales the full-range data to LIMITED range (16-235) so the pixel data
+    // matches the limited-range tag every H.264 encoder writes (both the
+    // hardware encoder and x264 hardcode limited in their VUI). NOTE: no
+    // videorate in this chain — videorate re-bases its output onto the
+    // replayed live segment (start=0, session start) and INSERTS duplicate
+    // frames for the whole gap between session start and the valve opening,
+    // so a 31 s recording came out as 79.8 s of video with the audio track
+    // stranded at the tail (the field "stuck / audio missing" bug). The
+    // muxer normalizes the first sample of each track to 0 on its own, so
+    // the live stream's own pacing is preserved and both tracks stay in sync.
+    let range_convert = make_element("videoconvert")?;
+    let encode_caps = make_element("capsfilter")?;
     let (encoder_factory, encoder) = pick_h264_encoder()?;
     // Converts the encoder's byte-stream H.264 to avcC for qtmux: the
     // hardware encoder (d3d12h264enc) and openh264/x264 emit byte-stream,
@@ -5820,11 +5895,19 @@ pub(crate) fn build_transcode_record_branch(
     // these events explicitly in start()/recycle(), because the bundled
     // GStreamer build can still lose the segment when a valve is closed.
     set_property_from_str_if_supported(&valve, "drop-mode", "forward-sticky-events");
-    // The branch must never back-pressure the live decode path: if the
-    // encoder or disk write lags, drop the oldest queued data instead of
-    // stalling the tap tee (which feeds the sink). 60 buffers ≈ 1 s at 60 fps.
-    queue.set_property_from_str("leaky", "downstream");
-    queue.set_property("max-size-buffers", 60u32);
+    // The branch must never back-pressure the live decode path. leaky=upstream
+    // drops the INCOMING buffer the moment the queue is full, so the tap tee's
+    // push always returns instantly and every frame the branch cannot consume
+    // returns to the decoder's buffer pool immediately. leaky=downstream is
+    // NOT enough here: it only leaks once the queue reaches its max, and if
+    // the decoder's buffer pool is smaller than the queue limit the queue
+    // simply holds all pool buffers and the decoder starves — the live sink
+    // then repeats its last frame (field flicker while recording). Keep the
+    // limit small (4 decoded 1080p frames ≈ 12 MB) so the branch can never
+    // hoard the decoder's pool; when the encoder keeps up it never fills and
+    // no frames are lost.
+    queue.set_property_from_str("leaky", "upstream");
+    queue.set_property("max-size-buffers", 4u32);
     queue.set_property("max-size-bytes", 0u32);
     queue.set_property("max-size-time", 0u64);
     // Swallow queue: the chunk/EOS probes live on its sink pad and return
@@ -5849,21 +5932,33 @@ pub(crate) fn build_transcode_record_branch(
         None => None,
     };
 
-    // Force deterministic, universal color: BT.709 (limited range) 4:2:0 8-bit.
-    // The source H.265 stream's VUI range is ambiguous (field files came out
-    // untagged and players mis-rendered them); videoconvert converts whatever
-    // range the decoder actually produced, and the capsfilter tags the output
-    // so every player decodes it the same way. d3d12h264enc takes NV12 (the
-    // decode chain's native output); the software encoders take I420.
+    // Universal color, made deterministic: BT.709 4:2:0 8-bit with an
+    // explicit FULL→LIMITED range conversion. The GFN H.265 stream is
+    // full-range PC video (decoder output is 0-255, range untagged), so the
+    // branch (1) declares the input full-range, (2) scales it to limited
+    // 16-235, and (3) feeds the encoder — whose limited VUI tag then matches
+    // the data, so every player renders the recording with the exact live
+    // colors. Without the declared conversion the encoder tags the 0-255
+    // data as limited and the file comes out washed-out (the field bug).
+    // d3d12h264enc takes NV12 (the decode chain's native output); the
+    // software encoders take I420.
     let encoder_format = if encoder_factory == "d3d12h264enc" {
         "NV12"
     } else {
         "I420"
     };
-    capsfilter.set_property(
+    declare_caps.set_property(
         "caps",
         format!(
-            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709,chroma-site=(string)mpeg2"
+            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/0-255,chroma-site=(string)mpeg2"
+        )
+        .parse::<gst::Caps>()
+        .map_err(|error| format!("Invalid recording transcode caps: {error}"))?,
+    );
+    encode_caps.set_property(
+        "caps",
+        format!(
+            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/16-235,chroma-site=(string)mpeg2"
         )
         .parse::<gst::Caps>()
         .map_err(|error| format!("Invalid recording transcode caps: {error}"))?,
@@ -5883,15 +5978,26 @@ pub(crate) fn build_transcode_record_branch(
     muxer.set_property("fragment-duration", 0u32);
     muxer.set_property("streamable", false);
 
-    // Chain order: valve → queue → [download] → videoconvert → capsfilter →
-    // encoder → h264parse → qtmux → swallow. The valve is deliberately FIRST
-    // so the encoder only runs while a recording is active (zero CPU when
-    // idle) and every element below it is stateless enough to reset in place.
+    // Chain order: valve → queue → [download] → videoconvert → capsfilter
+    // (declare FULL bt709) → videoconvert (FULL→LIMITED) → capsfilter
+    // (LIMITED bt709) → encoder → h264parse → qtmux → swallow. The valve is
+    // deliberately FIRST so the encoder only runs while a recording is
+    // active (zero CPU when idle) and every element below it is stateless
+    // enough to reset in place.
     let mut elements: Vec<&gst::Element> = vec![&valve, &queue];
     if let Some(download) = download.as_ref() {
         elements.push(download);
     }
-    elements.extend([&convert, &capsfilter, &encoder, &parse, &muxer, &swallow]);
+    elements.extend([
+        &convert,
+        &declare_caps,
+        &range_convert,
+        &encode_caps,
+        &encoder,
+        &parse,
+        &muxer,
+        &swallow,
+    ]);
     for element in &elements {
         pipeline.add(*element).map_err(|error| {
             format!("Failed to add recording transcode branch element: {error}")
@@ -5985,7 +6091,9 @@ pub(crate) fn build_transcode_record_branch(
         encoder_factory,
         h264_parse: parse,
         video_convert: convert,
-        video_capsfilter: capsfilter,
+        video_declare_caps: declare_caps,
+        video_range_convert: range_convert,
+        video_encode_caps: encode_caps,
         video_download: download,
         muxer,
         swallow,

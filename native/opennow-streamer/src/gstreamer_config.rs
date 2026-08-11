@@ -13,6 +13,13 @@ pub(crate) const AV1_DECODER_ENV: &str = "OPENNOW_NATIVE_AV1_DECODER";
 pub(crate) const H265_DECODER_ENV: &str = "OPENNOW_NATIVE_H265_DECODER";
 pub(crate) const PRESENT_LIMITER_AUTO_SENTINEL: u32 = u32::MAX;
 pub(crate) const PRESENT_LIMITER_VRR_SENTINEL: u32 = u32::MAX - 1;
+/// Default present policy without Cloud G-Sync: pace presentation to the
+/// stream's own frame rate. The sink runs `sync=false` (uncapped), so without
+/// this limiter a network jitter burst is decoded and presented at full
+/// speed — the visible "blinking / repeated previous frames" stutter. Pacing
+/// to the stream fps adds zero latency in steady state (frames pass as they
+/// arrive) and only thins catch-up bursts back to real-time.
+pub(crate) const PRESENT_LIMITER_STREAM_SENTINEL: u32 = u32::MAX - 2;
 const VRR_REFRESH_HEADROOM_FPS: u32 = 3;
 
 pub(crate) fn use_external_renderer_window() -> bool {
@@ -142,7 +149,7 @@ pub(crate) fn resolve_present_max_fps(cloud_gsync_enabled: bool) -> u32 {
     if cloud_gsync_enabled {
         PRESENT_LIMITER_VRR_SENTINEL
     } else {
-        0
+        PRESENT_LIMITER_STREAM_SENTINEL
     }
 }
 
@@ -212,8 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn default_present_policy_is_uncapped_without_vrr() {
-        assert_eq!(resolve_present_max_fps(false), 0);
+    fn default_present_policy_paces_to_stream_fps_without_vrr() {
+        assert_eq!(
+            resolve_present_max_fps(false),
+            PRESENT_LIMITER_STREAM_SENTINEL
+        );
         assert_eq!(resolve_present_max_fps(true), PRESENT_LIMITER_VRR_SENTINEL);
     }
 

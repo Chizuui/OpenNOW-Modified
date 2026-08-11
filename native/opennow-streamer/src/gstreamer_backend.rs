@@ -6,7 +6,7 @@ use crate::backend::{
 use crate::gstreamer_config::{
     resolve_d3d_fullscreen_sink, resolve_present_max_fps, use_internal_renderer,
     NATIVE_D3D_FULLSCREEN_ENV, NATIVE_PRESENT_MAX_FPS_ENV, PRESENT_LIMITER_AUTO_SENTINEL,
-    PRESENT_LIMITER_VRR_SENTINEL,
+    PRESENT_LIMITER_STREAM_SENTINEL, PRESENT_LIMITER_VRR_SENTINEL,
 };
 use crate::gstreamer_pipeline::{
     current_platform_label, init_gstreamer, native_video_backend_capabilities, GstreamerPipeline,
@@ -313,6 +313,7 @@ impl NativeStreamerBackend for GstreamerBackend {
         if present_max_fps > 0
             && present_max_fps != PRESENT_LIMITER_AUTO_SENTINEL
             && present_max_fps != PRESENT_LIMITER_VRR_SENTINEL
+            && present_max_fps != PRESENT_LIMITER_STREAM_SENTINEL
         {
             events.push(Event::Log {
                 level: "info",
@@ -334,6 +335,14 @@ impl NativeStreamerBackend for GstreamerBackend {
                 level: "info",
                 message: format!(
                     "Native VRR present limiter auto mode for {} fps stream (caps below the display refresh ceiling when needed).",
+                    context.settings.fps
+                ),
+            });
+        } else if present_max_fps == PRESENT_LIMITER_STREAM_SENTINEL {
+            events.push(Event::Log {
+                level: "info",
+                message: format!(
+                    "Native present limiter paced to the {} fps stream (default: renders network jitter bursts at real-time instead of blinking); set {NATIVE_PRESENT_MAX_FPS_ENV}=0 to disable.",
                     context.settings.fps
                 ),
             });
@@ -1351,6 +1360,35 @@ mod tests {
         );
         assert_eq!(
             effective_present_max_fps(0, Some(240), RtpVideoApi::D3D11, Some(165)),
+            0
+        );
+        // Default (non-G-Sync) policy paces to the stream fps on every path,
+        // regardless of display Hz: it thins jitter bursts back to real-time.
+        assert_eq!(
+            effective_present_max_fps(
+                PRESENT_LIMITER_STREAM_SENTINEL,
+                Some(60),
+                RtpVideoApi::D3D12,
+                Some(60)
+            ),
+            60
+        );
+        assert_eq!(
+            effective_present_max_fps(
+                PRESENT_LIMITER_STREAM_SENTINEL,
+                Some(60),
+                RtpVideoApi::D3D12,
+                Some(144)
+            ),
+            60
+        );
+        assert_eq!(
+            effective_present_max_fps(
+                PRESENT_LIMITER_STREAM_SENTINEL,
+                None,
+                RtpVideoApi::Software,
+                Some(60)
+            ),
             0
         );
         assert_eq!(

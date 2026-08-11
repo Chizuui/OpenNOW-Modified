@@ -122,6 +122,28 @@ test("disconnect recovery honors remote ICE grace and controlled disconnect orde
   }), "recover");
 });
 
+test("disconnect during ICE checking always recovers instead of being ignored", () => {
+  // Signaling dropped while the resume connection is still "checking" — no
+  // media is flowing yet, so ignoring it would leave the UI stuck forever
+  // with no stream and no retry (the field "resume shows nothing" bug).
+  assert.equal(decideSignalingDisconnect({
+    appUnloading: false,
+    streamStatus: "connecting",
+    reason: "network lost",
+    hasConfirmedRemoteIce: false,
+    iceState: "checking",
+    pendingControlledDisconnects: 0,
+  }), "fail-before-remote-ice");
+  assert.equal(decideSignalingDisconnect({
+    appUnloading: false,
+    streamStatus: "streaming",
+    reason: "network lost",
+    hasConfirmedRemoteIce: true,
+    iceState: "checking",
+    pendingControlledDisconnects: 0,
+  }), "recover");
+});
+
 test("recovery candidate stays on the same session before app or persisted fallbacks", () => {
   const result = selectRecoveryCandidate([
     { sessionId: "other", appId: 42, status: 2, serverIp: "10.0.0.3" },

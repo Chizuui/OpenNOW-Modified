@@ -33,11 +33,17 @@ export function decideSignalingDisconnect({
   if (streamStatus !== "idle" && isExpectedNativeSessionClose(reason)) {
     return "expected-session-close";
   }
+  // Only ignore the signaling drop while a media transport is actually
+  // established: "connected"/"completed" (and the renegotiation "new"
+  // window after remote ICE is confirmed) can keep streaming over the
+  // surviving RTP path. "checking" is deliberately NOT ignored — no media is
+  // flowing yet, so a signaling drop there (e.g. a flaky network right after
+  // pressing resume) would otherwise leave the UI stuck on a connection that
+  // will never produce frames, with no recovery ever attempted.
   if (
     (hasConfirmedRemoteIce && iceState === "new")
     || iceState === "connected"
     || iceState === "completed"
-    || iceState === "checking"
   ) {
     return "ignore-active-ice";
   }
