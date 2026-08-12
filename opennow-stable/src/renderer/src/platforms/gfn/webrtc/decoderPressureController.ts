@@ -44,6 +44,14 @@ interface DecoderPressureControllerDependencies {
   onStateChange: (state: DecoderPressureState) => void;
   /** Video element the stream renders into, used by the fast freeze watchdog. */
   getVideoElement?: () => HTMLVideoElement | null;
+  /**
+   * Optional: whether the decoder is still producing decoded frames right now
+   * (e.g. framesDecoded advanced in the latest getStats poll). The fast
+   * freeze watchdog only sees PRESENTATION gaps; a stuck present queue with a
+   * live decoder is a compositor/display issue that a keyframe cannot fix
+   * (it only adds decode load), so the watchdog skips the keyframe then.
+   */
+  isDecoderProgressing?: () => boolean;
   now?: () => number;
 }
 
@@ -100,6 +108,14 @@ export const DECODER_MIN_RECOVERY_BITRATE_KBPS = 4000;
 // frames at 60fps: a delivery hiccup never pauses presentation that long, but
 // a stalled decoder is flagged well within a second.
 const FREEZE_DETECT_TIMEOUT_MS = 600;
+// A single no-present window can be a transient decode hiccup (heavy keyframe
+// decode on a slower machine, a momentary compositor stall) that recovers by
+// itself. Escalating to a keyframe on the FIRST window turned every transient
+// gap into a keyframe request — and the keyframe decode itself is heavy, so
+// the watchdog re-armed and produced the "stutter every few seconds" loop
+// reported on slower hardware. Require the freeze to persist across two
+// consecutive windows (~1.2s) before interrupting the stream.
+const FREEZE_CONSECUTIVE_STRIKES = 2;
 // After a freeze-triggered keyframe, do not re-trigger for this long even if
 // the picture is still frozen — the keyframe needs time to arrive and render
 // before another request helps.
@@ -136,6 +152,31 @@ export function isVideoFreezeEligible(params: VideoFreezeEligibilityParams): boo
     && params.readyState >= 2 // HTMLMediaElement.HAVE_CURRENT_DATA
     && params.lastFrameAtMs > 0
     && params.nowMs - params.lastFrameAtMs >= params.timeoutMs;
+}
+
+export interface FreezeWatchdogEscalationParams {
+  /** Consecutive FREEZE_DETECT_TIMEOUT_MS windows with no presented frame. */
+  consecutiveStrikes: number;
+  /** Decoder still producing decoded frames (present gap, not a decode stall). */
+  decoderProgressing: boolean;
+  /** Retrigger cooldown since the last keyframe has elapsed. */
+  retriggerCooldownElapsed: boolean;
+}
+
+/**
+ * Whether the fast freeze watchdog should escalate to a keyframe: the freeze
+ * must persist across two consecutive no-present windows (a single window is
+ * a transient decode/compositor hiccup that self-recovers — escalating on the
+ * first window turned every gap into a keyframe request and caused the
+ * "stutter every few seconds" loop on slower machines), the decoder must NOT
+ * still be progressing (a present gap with a live decoder is a compositor
+ * issue a keyframe cannot fix), and the retrigger cooldown must have elapsed.
+ * Pure so it's unit-testable.
+ */
+export function shouldEscalateFreezeWatchdog(params: FreezeWatchdogEscalationParams): boolean {
+  return params.consecutiveStrikes >= FREEZE_CONSECUTIVE_STRIKES
+    && !params.decoderProgressing
+    && params.retriggerCooldownElapsed;
 }
 
 /**
@@ -237,6 +278,12 @@ export class DecoderPressureController {
   private freezeWatchdogTimer: number | null = null;
   private freezeLastFrameAtMs = 0;
   private freezeTriggeredAtMs = 0;
+  /**
+   * Consecutive FREEZE_DETECT_TIMEOUT_MS windows without a presented frame.
+   * A single window is a transient hiccup; only two consecutive windows
+   * (with a stalled decoder) escalate to a keyframe.
+   */
+  private freezeConsecutiveStrikes = 0;
   /** Consecutive polls whose loss stayed above the PLI threshold. */
   private lossConsecutivePolls = 0;
   private activeReceivers: Array<{
@@ -417,6 +464,7 @@ export class DecoderPressureController {
     this.stopFreezeMonitoring();
     this.lossConsecutivePolls = 0;
     this.freezeTriggeredAtMs = 0;
+    this.freezeConsecutiveStrikes = 0;
     this.emitState();
   }
 
@@ -534,6 +582,7 @@ export class DecoderPressureController {
       this.freezeWatchdogTimer = null;
     }
     this.freezeLastFrameAtMs = 0;
+    this.freezeConsecutiveStrikes = 0;
   }
 
   private armFreezeWatchdog(video: HTMLVideoElement): void {
@@ -557,6 +606,8 @@ export class DecoderPressureController {
       return;
     }
     this.freezeLastFrameAtMs = now;
+    // A presented frame breaks any freeze streak — the pipeline is alive.
+    this.freezeConsecutiveStrikes = 0;
     this.armFreezeWatchdog(video);
   }
 
@@ -573,14 +624,44 @@ export class DecoderPressureController {
       hidden: typeof document !== "undefined" && document.hidden,
       readyState: video.readyState,
     });
-    if (eligible && now - this.freezeTriggeredAtMs >= FREEZE_RETRIGGER_COOLDOWN_MS) {
+    if (!eligible) {
+      // Not playing/visible anymore (or a frame appeared) — reset the streak.
+      this.freezeConsecutiveStrikes = 0;
+      this.armFreezeWatchdog(video);
+      return;
+    }
+
+    this.freezeConsecutiveStrikes += 1;
+    const decoderProgressing = this.dependencies.isDecoderProgressing?.() ?? false;
+    const retriggerElapsed = now - this.freezeTriggeredAtMs >= FREEZE_RETRIGGER_COOLDOWN_MS;
+    if (shouldEscalateFreezeWatchdog({
+      consecutiveStrikes: this.freezeConsecutiveStrikes,
+      decoderProgressing,
+      retriggerCooldownElapsed: retriggerElapsed,
+    })) {
       this.freezeTriggeredAtMs = now;
+      this.freezeConsecutiveStrikes = 0;
+      this.dependencies.log(
+        `Freeze watchdog: ${FREEZE_CONSECUTIVE_STRIKES} consecutive ${FREEZE_DETECT_TIMEOUT_MS}ms windows with no presented frame and a stalled decoder — requesting keyframe`,
+      );
       void this.recover({
         active: true,
         reason: "video_freeze",
         backlogFrames: 0,
         dropRatePercent: 0,
       });
+    } else if (this.freezeConsecutiveStrikes >= FREEZE_CONSECUTIVE_STRIKES && decoderProgressing) {
+      // Present gap but the decoder is still decoding — a present/compositor
+      // lag, not a decode stall. A keyframe cannot fix it and only adds
+      // decode load, so hold without interrupting the stream.
+      this.freezeConsecutiveStrikes = 0;
+      this.dependencies.log(
+        "Freeze watchdog: presentation gap with decoder still progressing (present/compositor lag) — holding without a keyframe",
+      );
+    } else {
+      this.dependencies.log(
+        `Freeze watchdog: ${this.freezeConsecutiveStrikes}/${FREEZE_CONSECUTIVE_STRIKES} no-present window${this.freezeConsecutiveStrikes === 1 ? " (transient, holding)" : ""}`,
+      );
     }
     // Keep watching — the picture may recover before the next timeout.
     this.armFreezeWatchdog(video);

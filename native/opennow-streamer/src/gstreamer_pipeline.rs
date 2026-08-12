@@ -56,6 +56,18 @@ use std::thread;
 // usual WebRTC buffer while allowing normal Wi-Fi/Internet jitter to settle.
 const WEBRTC_LATENCY_MS: u32 = 100;
 const DEFAULT_GFN_STUN_SERVER: &str = "stun://stun2.l.google.com:19302";
+
+/// Display-path caps pinned to the FULL-RANGE BT.709-family colorimetry the
+/// GFN stream actually carries (`1:3:5:1` = primaries BT.709, transfer BT.709,
+/// matrix SMPTE240M, range 0-255). DXVA decoders on different GPUs/drivers
+/// may emit no colorimetry at all or a limited-range tag; without a pin the
+/// sink then converts full-range data with limited coefficients and the
+/// picture comes out washed-out gray. The recording branch already declares
+/// the same full-range input for the same reason. Pinning the numeric form
+/// keeps already-correct machines byte-identical (the tag matches what their
+/// decoder emits) while forcing the right range everywhere else.
+pub(crate) const DISPLAY_NV12_FULL_RANGE_CAPS: &str =
+    "video/x-raw,format=NV12,colorimetry=1:3:5:1";
 /// Compressed-frame jitter buffer between the parser and the decoder (leaky=no,
 /// so it blocks the RTP thread instead of dropping). This constant is the DEEP
 /// ceiling (~250 ms at 60 fps) that absorbs the 100-300 ms WAN jitter bursts
@@ -3924,18 +3936,15 @@ pub(crate) fn rtp_video_chain_definition(
         RtpVideoChainRole::Decoder,
     ));
 
-    let is_ten_bit_capable = matches!(codec.as_str(), "AV1" | "H265" | "HEVC");
     let is_d3d = matches!(video_api, RtpVideoApi::D3D11 | RtpVideoApi::D3D12);
-    // Keep D3D11 H264 zero-copy available, but avoid the D3D12 H264 zero-copy
-    // path. The field log showed d3d12h264dec producing D3D12Memory correctly
-    // for the first frame, then stopping decode while RTP continued flowing
-    // (decoded=0, sink=0, rendered=33). The download + system-memory path is
-    // already used successfully for H265/AV1 and avoids that driver/sink
-    // present deadlock. Ten-bit codecs still require the same path on both
-    // D3D backends because d3d11/d3d12videosink cannot reliably present their
-    // native D3D textures.
-    let needs_safe_system_memory_present =
-        is_d3d && (is_ten_bit_capable || video_api == RtpVideoApi::D3D12);
+    // Every D3D path (D3D11 H264 included) uses the download + system-memory
+    // present chain. The field logs showed d3d12h264dec zero-copy stopping
+    // decode after the first frame while RTP kept flowing, and D3D11 H264
+    // zero-copy D3DMemory presenting gray/pink garbage on some GPU/driver
+    // combos (the same class of bug the comment below flags for ten-bit
+    // codecs). Downloading to system NV12 avoids every driver/sink present
+    // deadlock and makes the colorimetry pin deterministic.
+    let needs_safe_system_memory_present = is_d3d;
     if needs_safe_system_memory_present {
         // Download the D3D texture, convert to 8-bit NV12, and let the sink
         // upload system memory. This also makes the H264 D3D12 path resilient
@@ -3955,7 +3964,7 @@ pub(crate) fn rtp_video_chain_definition(
         specs.push(RtpVideoChainSpec::with_caps(
             "capsfilter",
             RtpVideoChainRole::PostDecodeCapsFilter,
-            "video/x-raw,format=NV12",
+            DISPLAY_NV12_FULL_RANGE_CAPS,
         ));
     } else if let Some(memory_caps) = video_api.memory_caps() {
         specs.push(RtpVideoChainSpec::with_caps(
@@ -4016,11 +4025,6 @@ fn windows_vulkan_internal_present_chain_definition(codec: &str) -> Option<Vec<R
     } else {
         "d3d11videosink"
     };
-    let memory_api = if prefer_d3d12 {
-        RtpVideoApi::D3D12
-    } else {
-        RtpVideoApi::D3D11
-    };
     let mut specs = Vec::with_capacity(8);
     if let Some(filter) = h265_receive_caps_strip_filter(codec) {
         specs.push(filter);
@@ -4038,9 +4042,11 @@ fn windows_vulkan_internal_present_chain_definition(codec: &str) -> Option<Vec<R
         RtpVideoChainRole::PreDecodeQueue,
     ));
     specs.push(RtpVideoChainSpec::new(decoder, RtpVideoChainRole::Decoder));
-    if matches!(codec, "AV1" | "H265" | "HEVC") {
-        // Same safe present path as the main D3D chain: 10-bit-capable DXVA
-        // textures present as gray/pink garbage through zero-copy D3DMemory.
+    {
+        // Same safe present path as the main D3D chain for EVERY codec:
+        // 10-bit-capable DXVA textures present as gray/pink garbage through
+        // zero-copy D3DMemory, and H264 zero-copy has the same failure mode on
+        // some drivers. Download + convert to system NV12 always.
         let download = if prefer_d3d12 {
             "d3d12download"
         } else {
@@ -4057,13 +4063,7 @@ fn windows_vulkan_internal_present_chain_definition(codec: &str) -> Option<Vec<R
         specs.push(RtpVideoChainSpec::with_caps(
             "capsfilter",
             RtpVideoChainRole::PostDecodeCapsFilter,
-            "video/x-raw,format=NV12",
-        ));
-    } else if let Some(memory_caps) = memory_api.memory_caps() {
-        specs.push(RtpVideoChainSpec::with_caps(
-            "capsfilter",
-            RtpVideoChainRole::PostDecodeCapsFilter,
-            post_decode_caps_for(memory_api, codec, memory_caps),
+            DISPLAY_NV12_FULL_RANGE_CAPS,
         ));
     }
     specs.push(RtpVideoChainSpec::new(

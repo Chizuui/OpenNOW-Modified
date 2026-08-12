@@ -436,6 +436,13 @@ export class GfnWebRtcClient {
   private isHdr = false;
   private videoDecodeStallWarningSent = false;
   /**
+   * Timestamp (performance.now) of the last poll where framesDecoded advanced.
+   * Lets the fast freeze watchdog distinguish a real decode stall from a
+   * present/compositor gap (decoder alive but presentation stuck) — a
+   * keyframe cannot fix the latter, so the watchdog holds instead.
+   */
+  private lastDecodeProgressAtMs = 0;
+  /**
    * Whether the negotiated answer SDP carries BOTH the transport-wide-cc RTP
    * header extension and a transport-cc rtcp-fb for the video m-line. When
    * missing, the server's bandwidth estimator receives no feedback and holds
@@ -561,6 +568,8 @@ export class GfnWebRtcClient {
       getControlChannel: () => this.controlChannel,
       requestSignalingKeyframe: (request) => window.openNow.requestKeyframe(request),
       getVideoElement: () => this.options.videoElement,
+      isDecoderProgressing: () => this.lastDecodeProgressAtMs > 0
+        && performance.now() - this.lastDecodeProgressAtMs < 2500,
       onStateChange: (state) => {
         this.diagnostics.decoderPressureActive = state.active;
         this.diagnostics.decoderRecoveryAttempts = state.recoveryAttempts;
@@ -1448,6 +1457,14 @@ export class GfnWebRtcClient {
       this.diagnostics.framesReceived = framesReceived;
       this.diagnostics.framesDecoded = framesDecoded;
       this.diagnostics.framesDropped = framesDropped;
+
+      // Track decoder liveness for the freeze watchdog: as long as frames are
+      // still being decoded (count advancing), the pipeline is alive even if
+      // presentation is momentarily stuck — that is a present/compositor
+      // issue, not a decode stall, and a keyframe cannot fix it.
+      if (framesDecoded > this.lastStatsSample.framesDecoded) {
+        this.lastDecodeProgressAtMs = now;
+      }
 
       if (
         !this.videoDecodeStallWarningSent &&

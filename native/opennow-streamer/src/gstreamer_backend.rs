@@ -1007,7 +1007,7 @@ mod tests {
         configure_stats_overlay_element, default_rtp_video_api_priority, effective_present_max_fps,
         format_video_chain_selection, init_gstreamer, post_decode_caps_for,
         preferred_rtp_video_apis_for, resolve_gstreamer_stun_server, rtp_video_chain_definition,
-        RtpVideoApi, RtpVideoChainRole,
+        DISPLAY_NV12_FULL_RANGE_CAPS, RtpVideoApi, RtpVideoChainRole,
     };
     use crate::gstreamer_transitions::resolve_queue_mode;
     use crate::protocol::{IceServer, NativeQueueMode, StreamSettings, VideoCodec};
@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!(h265[5].factory, "d3d11download");
         assert_eq!(h265[6].factory, "videoconvert");
         assert_eq!(h265[7].role, RtpVideoChainRole::PostDecodeCapsFilter);
-        assert_eq!(h265[7].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(h265[7].caps.as_deref(), Some(DISPLAY_NV12_FULL_RANGE_CAPS));
         assert_eq!(h265[8].factory, "dwritetextoverlay");
         assert_eq!(h265[10].factory, "d3d11videosink");
 
@@ -1222,7 +1222,7 @@ mod tests {
         assert_eq!(h264[4].factory, "d3d12download");
         assert_eq!(h264[5].factory, "videoconvert");
         assert_eq!(h264[6].role, RtpVideoChainRole::PostDecodeCapsFilter);
-        assert_eq!(h264[6].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(h264[6].caps.as_deref(), Some(DISPLAY_NV12_FULL_RANGE_CAPS));
         assert_eq!(h264[7].factory, "dwritetextoverlay");
         assert_eq!(h264[9].factory, "d3d12videosink");
         assert!(!h264
@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(av1[4].factory, "d3d11download");
         assert_eq!(av1[5].factory, "videoconvert");
         assert_eq!(av1[6].role, RtpVideoChainRole::PostDecodeCapsFilter);
-        assert_eq!(av1[6].caps.as_deref(), Some("video/x-raw,format=NV12"));
+        assert_eq!(av1[6].caps.as_deref(), Some(DISPLAY_NV12_FULL_RANGE_CAPS));
         assert_eq!(av1[7].factory, "dwritetextoverlay");
         assert_eq!(av1[9].factory, "d3d11videosink");
         assert!(!av1
@@ -1284,14 +1284,14 @@ mod tests {
         );
         assert_eq!(d3d11_h264, "video/x-raw(memory:D3D11Memory)");
 
-        // The chain routes AV1/H265 through download + videoconvert to system
-        // NV12 instead of presenting the D3D texture zero-copy.
+        // The chain routes every D3D codec through download + videoconvert to
+        // system NV12 instead of presenting the D3D texture zero-copy.
         let chain = rtp_video_chain_definition("AV1", RtpVideoApi::D3D12).expect("AV1 D3D12 chain");
         assert!(chain.iter().any(|spec| spec.factory == "d3d12download"));
         assert!(chain.iter().any(|spec| spec.factory == "videoconvert"));
         assert!(chain.iter().any(|spec| {
             spec.role == RtpVideoChainRole::PostDecodeCapsFilter
-                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+                && spec.caps.as_deref() == Some(DISPLAY_NV12_FULL_RANGE_CAPS)
         }));
 
         // H264 on D3D12 uses the same safe system-memory path. This guards
@@ -1302,16 +1302,21 @@ mod tests {
         assert!(h264.iter().any(|spec| spec.factory == "videoconvert"));
         assert!(h264.iter().any(|spec| {
             spec.role == RtpVideoChainRole::PostDecodeCapsFilter
-                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+                && spec.caps.as_deref() == Some(DISPLAY_NV12_FULL_RANGE_CAPS)
         }));
 
-        // D3D11 H264 remains eligible for zero-copy; only the problematic
-        // D3D12 H264 path is forced through the safe present chain.
+        // D3D11 H264 uses the SAME safe present chain — zero-copy D3DMemory
+        // presented gray/pink garbage on some GPU/driver combos, so it is no
+        // longer eligible for zero-copy.
         let d3d11_h264 =
             rtp_video_chain_definition("H264", RtpVideoApi::D3D11).expect("H264 D3D11 chain");
-        assert!(!d3d11_h264
+        assert!(d3d11_h264
             .iter()
             .any(|spec| spec.factory == "d3d11download"));
+        assert!(d3d11_h264.iter().any(|spec| {
+            spec.role == RtpVideoChainRole::PostDecodeCapsFilter
+                && spec.caps.as_deref() == Some(DISPLAY_NV12_FULL_RANGE_CAPS)
+        }));
     }
 
     #[test]
@@ -1345,7 +1350,7 @@ mod tests {
         assert!(specs.iter().any(|spec| spec.factory == "videoconvert"));
         assert!(specs.iter().any(|spec| {
             spec.role == RtpVideoChainRole::PostDecodeCapsFilter
-                && spec.caps.as_deref() == Some("video/x-raw,format=NV12")
+                && spec.caps.as_deref() == Some(DISPLAY_NV12_FULL_RANGE_CAPS)
         }));
         assert_eq!(
             specs.last().map(|spec| spec.factory),

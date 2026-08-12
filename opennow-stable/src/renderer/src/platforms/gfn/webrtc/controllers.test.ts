@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   DecoderPressureController,
   isVideoFreezeEligible,
+  shouldEscalateFreezeWatchdog,
   shouldRequestLossKeyframe,
   type DecoderPressureSignal,
   type DecoderPressureState,
@@ -511,11 +512,12 @@ function flushMicrotasks(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-test("fast freeze watchdog signal requests an immediate keyframe like a drop burst", async () => {
+test("freeze watchdog requires two consecutive no-present windows before a keyframe", async () => {
   const states: DecoderPressureState[] = [];
+  const logs: string[] = [];
   let keyframeRequests = 0;
   const controller = new DecoderPressureController({
-    log: () => undefined,
+    log: (message) => logs.push(message),
     getPeerConnection: () => null,
     getControlChannel: () => null,
     requestSignalingKeyframe: async () => {
@@ -525,7 +527,14 @@ test("fast freeze watchdog signal requests an immediate keyframe like a drop bur
     now: () => 2_000,
   });
 
-  // A single video_freeze sample is urgent — no multi-poll debounce.
+  // The fast freeze watchdog fires after FREEZE_DETECT_TIMEOUT_MS (600ms) with
+  // no presented frame. A SINGLE window is a transient hiccup (heavy keyframe
+  // decode on a slower machine, momentary compositor stall) that recovers by
+  // itself — escalating on the first window turned every transient gap into a
+  // keyframe request and produced the "stutter every few seconds" loop.
+  // The controller's recover() path treats an already-confirmed video_freeze
+  // as urgent (no multi-poll debounce), but the watchdog itself must not emit
+  // that signal until the freeze has persisted across two windows.
   await controller.recover({
     active: true,
     reason: "video_freeze",
@@ -538,6 +547,38 @@ test("fast freeze watchdog signal requests an immediate keyframe like a drop bur
     recoveryAttempts: 1,
     recoveryAction: "signaling_keyframe",
   });
+  assert.ok(
+    logs.some((line) => line.includes("keyframe requested (reason=video_freeze")),
+    "a confirmed video_freeze escalates immediately",
+  );
+});
+
+test("freeze watchdog escalation needs two strikes, a stalled decoder, and elapsed cooldown", () => {
+  // A single no-present window is a transient hiccup — never escalate.
+  assert.equal(shouldEscalateFreezeWatchdog({
+    consecutiveStrikes: 1,
+    decoderProgressing: false,
+    retriggerCooldownElapsed: true,
+  }), false);
+  // Two consecutive windows + stalled decoder + cooldown elapsed → escalate.
+  assert.equal(shouldEscalateFreezeWatchdog({
+    consecutiveStrikes: 2,
+    decoderProgressing: false,
+    retriggerCooldownElapsed: true,
+  }), true);
+  // The decoder still progressing means a present/compositor gap, not a
+  // decode stall — a keyframe cannot fix it, so hold even at two strikes.
+  assert.equal(shouldEscalateFreezeWatchdog({
+    consecutiveStrikes: 2,
+    decoderProgressing: true,
+    retriggerCooldownElapsed: true,
+  }), false);
+  // The retrigger cooldown still gates repeated keyframes.
+  assert.equal(shouldEscalateFreezeWatchdog({
+    consecutiveStrikes: 3,
+    decoderProgressing: false,
+    retriggerCooldownElapsed: false,
+  }), false);
 });
 
 test("gamepad polling and keepalive decisions preserve adaptive timing", () => {
