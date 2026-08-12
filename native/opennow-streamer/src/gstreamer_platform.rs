@@ -663,6 +663,7 @@ pub(crate) mod win32_renderer_window {
         fn GetKeyState(virtual_key: i32) -> i16;
         fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: Uint, max: Uint) -> Bool;
         fn GetWindow(hwnd: Hwnd, command: Uint) -> Hwnd;
+        fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
         fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
         fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
         fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
@@ -857,14 +858,37 @@ pub(crate) mod win32_renderer_window {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
         target.last_rect = Some(window_rect);
+        // Diagnostics for the "slightly zoomed display" report: the sink is
+        // sized to the browser's OUTER rect, but d3d12videosink renders into
+        // the sink's CLIENT area. If the two differ (a leftover caption or
+        // DWM resize border), the video is upscaled/cropped a few pixels —
+        // a subtle zoom the recording (tapped at decode) never shows.
+        // Compare client vs outer so the next session pinpoints it.
+        let mut client_rect = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let client = GetClientRect(sink_hwnd, &mut client_rect);
         stacked_guard_log(
             "info",
             format!(
-                "Stacked sink revealed at first decoded frame: rect=({},{} {}x{}) below browser; sink=0x{:X}",
+                "Stacked sink revealed at first decoded frame: rect=({},{} {}x{}) below browser; client={}x{}; sink=0x{:X}",
                 window_rect.left,
                 window_rect.top,
                 window_rect.right.saturating_sub(window_rect.left),
                 window_rect.bottom.saturating_sub(window_rect.top),
+                if client != 0 {
+                    client_rect.right.saturating_sub(client_rect.left)
+                } else {
+                    0
+                },
+                if client != 0 {
+                    client_rect.bottom.saturating_sub(client_rect.top)
+                } else {
+                    0
+                },
                 sink_hwnd as usize
             ),
         );

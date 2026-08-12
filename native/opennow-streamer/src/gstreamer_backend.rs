@@ -349,6 +349,7 @@ impl NativeStreamerBackend for GstreamerBackend {
                 if let Some(ctx) = self.active_context.as_ref() {
                     let bitrate_kbps = ctx.settings.max_bitrate_mbps.saturating_mul(1000);
                     pipeline.configure_stats(ctx, bitrate_kbps);
+                    pipeline.set_record_bitrate_kbps(bitrate_kbps);
                 }
                 match pipeline.attach_nvst_video(
                     nvst,
@@ -446,6 +447,7 @@ impl NativeStreamerBackend for GstreamerBackend {
         pipeline.set_present_max_fps(present_max_fps);
         pipeline.set_d3d_fullscreen_sink(d3d_fullscreen_sink);
         pipeline.configure_stats(&context, prepared.nvst_params.max_bitrate_kbps);
+        pipeline.set_record_bitrate_kbps(prepared.nvst_params.max_bitrate_kbps);
         if present_max_fps > 0
             && present_max_fps != PRESENT_LIMITER_AUTO_SENTINEL
             && present_max_fps != PRESENT_LIMITER_VRR_SENTINEL
@@ -726,6 +728,10 @@ impl NativeStreamerBackend for GstreamerBackend {
         if let Some(context) = self.active_context.as_ref() {
             if let Some(pipeline) = self.pipeline.as_ref() {
                 pipeline.configure_stats(context, max_bitrate_kbps);
+                // Recording bitrate follows the negotiated cap too, so a
+                // mid-session bitrate change also applies to the NEXT
+                // recording (its branch is rebuilt fresh on each start).
+                pipeline.set_record_bitrate_kbps(max_bitrate_kbps);
                 message = format!("Updated native bitrate limit to {max_bitrate_kbps} Kbps.");
             }
         }

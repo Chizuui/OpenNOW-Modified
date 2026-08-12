@@ -96,6 +96,9 @@ const RECORDING_FINALIZE_TIMEOUT_MS: u64 = 4_000;
 /// (an EOS that overtakes a full queue can be lost inside the encoder/muxer
 /// on slow machines, leaving the recording un-finalized).
 const RECORDING_DRAIN_TIMEOUT_MS: u64 = 4_000;
+/// Default recording encoder bitrate (kbps) used until the backend supplies
+/// the session's negotiated maximum (session start always overrides it).
+const RECORD_BITRATE_DEFAULT_KBPS: u32 = 8_000;
 /// How long to wait after the muxer-direct EOS failsafe before giving up on
 /// finalizing the recording.
 const RECORDING_FAILSAFE_TIMEOUT_MS: u64 = 2_000;
@@ -1391,6 +1394,12 @@ pub(crate) struct GstreamerPipeline {
     native_window_input_bridge: Option<NativeWindowInputBridge>,
     render_state: GstreamerRenderState,
     present_max_fps: Arc<AtomicU32>,
+    /// Recording encoder bitrate cap (kbps). The recording branch re-encodes
+    /// the decoded stream, so its bitrate follows the session's negotiated
+    /// maximum (the user's "max bitrate" slider) instead of a fixed default:
+    /// the backend sets it at session start / bitrate change, and the
+    /// recording branch reads it whenever it is (re)built.
+    record_bitrate_kbps: Arc<AtomicU32>,
     d3d_fullscreen_sink: Arc<AtomicBool>,
     /// When true, WebRTC RTP video pads are ignored (classic NVST UDP owns video).
     skip_webrtc_video: Arc<AtomicBool>,
@@ -1458,6 +1467,7 @@ impl GstreamerPipeline {
             video_liveness.clone(),
         );
         let present_max_fps = Arc::new(AtomicU32::new(0));
+        let record_bitrate_kbps = Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS));
         let d3d_fullscreen_sink = Arc::new(AtomicBool::new(false));
         let skip_webrtc_video = Arc::new(AtomicBool::new(false));
         let screenshot_grab = Arc::new(Mutex::new(None));
@@ -1474,6 +1484,7 @@ impl GstreamerPipeline {
             event_sender.clone(),
             render_state.clone(),
             present_max_fps.clone(),
+            record_bitrate_kbps.clone(),
             d3d_fullscreen_sink.clone(),
             skip_webrtc_video.clone(),
             video_liveness.clone(),
@@ -1500,6 +1511,7 @@ impl GstreamerPipeline {
             native_window_input_bridge: None,
             render_state,
             present_max_fps,
+            record_bitrate_kbps,
             d3d_fullscreen_sink,
             skip_webrtc_video,
             nvst_receive: None,
@@ -1532,6 +1544,14 @@ impl GstreamerPipeline {
 
     pub(crate) fn set_d3d_fullscreen_sink(&self, enabled: bool) {
         self.d3d_fullscreen_sink.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Set the bitrate cap for the recording encoder (kbps). Called by the
+    /// backend at session start and on every mid-session bitrate change, so
+    /// the next recording (its branch is rebuilt fresh on each start) uses
+    /// the same cap the user negotiated for the stream.
+    pub(crate) fn set_record_bitrate_kbps(&self, kbps: u32) {
+        self.record_bitrate_kbps.store(kbps, Ordering::SeqCst);
     }
 
     pub(crate) fn configure_stats(
@@ -2425,12 +2445,14 @@ impl GstreamerPipeline {
         };
         old.teardown(&self.pipeline)?;
 
+        let record_bitrate_kbps = self.record_bitrate_kbps.load(Ordering::SeqCst);
         let mut fresh = build_transcode_record_branch(
             &self.pipeline,
             &tap_tee,
             video_api,
             zero_copy,
             self.event_sender.clone(),
+            record_bitrate_kbps,
         )
         .map_err(|error| format!("Recording rebuild: fresh video branch failed: {error}"))?;
         if let Some(audio_tee) = old_audio_rtp_tee {
@@ -3400,6 +3422,7 @@ fn wire_incoming_media_sink(
     event_sender: Option<Sender<Event>>,
     render_state: GstreamerRenderState,
     present_max_fps: Arc<AtomicU32>,
+    record_bitrate_kbps: Arc<AtomicU32>,
     d3d_fullscreen_sink: Arc<AtomicBool>,
     skip_webrtc_video: Arc<AtomicBool>,
     video_liveness: VideoLivenessMonitor,
@@ -3549,6 +3572,7 @@ fn wire_incoming_media_sink(
                 &event_sender,
                 &streaming_reported,
                 present_max_fps.clone(),
+                record_bitrate_kbps.clone(),
                 d3d_fullscreen_sink.load(Ordering::SeqCst),
                 video_liveness.clone(),
                 &video_tap,
@@ -4818,6 +4842,7 @@ fn link_rtp_video_pad(
     event_sender: &Option<Sender<Event>>,
     streaming_reported: &Arc<AtomicBool>,
     present_max_fps: Arc<AtomicU32>,
+    record_bitrate_kbps: Arc<AtomicU32>,
     d3d_fullscreen_sink: bool,
     video_liveness: VideoLivenessMonitor,
     video_tap: &Arc<Mutex<Option<GstreamerVideoTap>>>,
@@ -4892,6 +4917,7 @@ fn link_rtp_video_pad(
         })
         .unwrap_or((RtpVideoApi::Software, false));
     if let Some(tap_tee) = tap_tee {
+        let record_bitrate_kbps = record_bitrate_kbps.load(Ordering::SeqCst);
         let mut slot = recording
             .lock()
             .map_err(|_| "Recording state lock poisoned.".to_owned())?;
@@ -4902,6 +4928,7 @@ fn link_rtp_video_pad(
                 video_api,
                 zero_copy,
                 event_sender.clone(),
+                record_bitrate_kbps,
             )?);
         }
         // The game-audio tap tee lives at the pipeline level (the audio RTP
@@ -6168,6 +6195,7 @@ pub(crate) fn build_transcode_record_branch(
     video_api: RtpVideoApi,
     zero_copy: bool,
     event_sender: Option<Sender<Event>>,
+    record_bitrate_kbps: u32,
 ) -> Result<GstreamerRecordingState, String> {
     let valve = make_element("valve")?;
     let queue = make_element("queue")?;
@@ -6208,7 +6236,7 @@ pub(crate) fn build_transcode_record_branch(
     // Declares the LIMITED range at the encoder input (what the LUT scaler
     // below produces).
     let encode_caps = make_element("capsfilter")?;
-    let (encoder_factory, encoder) = pick_h264_encoder()?;
+    let (encoder_factory, encoder) = pick_h264_encoder(record_bitrate_kbps)?;
     // Converts the encoder's byte-stream H.264 to avcC for qtmux: the
     // hardware encoder (d3d12h264enc) and openh264/x264 emit byte-stream,
     // which qtmux cannot accept directly (link fails / unplayable).
@@ -6442,7 +6470,7 @@ pub(crate) fn build_transcode_record_branch(
         &event_sender,
         "info",
         format!(
-            "Attached native TRANSCODE recording branch (decoded → {encoder_factory} (insert-vui=false) → qtmux → swallow; FULL→LIMITED Y-plane LUT scaler → limited-range untagged H.264 MP4 matching the official GeForce Now recordings, never touches the decode/present chain)."
+            "Attached native TRANSCODE recording branch (decoded → {encoder_factory} (insert-vui=false, bitrate={record_bitrate_kbps} kbps) → qtmux → swallow; FULL→LIMITED Y-plane LUT scaler → limited-range untagged H.264 MP4 matching the official GeForce Now recordings, never touches the decode/present chain)."
         ),
     );
 
@@ -6489,7 +6517,7 @@ pub(crate) fn build_transcode_record_branch(
 /// colorimetry/range VUI at all), with openh264enc (which writes no range
 /// tag either) as fallback. `OPENNOW_RECORD_ENCODER` forces a specific
 /// factory for debugging/problem machines.
-fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
+fn pick_h264_encoder(record_bitrate_kbps: u32) -> Result<(String, gst::Element), String> {
     let forced = std::env::var("OPENNOW_RECORD_ENCODER")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -6541,7 +6569,7 @@ fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
     }
     for factory in candidates {
         if let Ok(element) = gst::ElementFactory::make(factory).build() {
-            configure_h264_encoder(&element, factory);
+            configure_h264_encoder(&element, factory, record_bitrate_kbps);
             // Hardware encoders create their device on the READY transition —
             // probe it now (back to NULL before adding to the pipeline) and
             // fall through to the next candidate when the device is missing.
@@ -6587,10 +6615,15 @@ fn hw_encoder_initializes(element: &gst::Element) -> bool {
     ready_ok
 }
 
-fn configure_h264_encoder(element: &gst::Element, factory: &str) {
-    // 8 Mbps ≈ the source stream's bitrate; moderate spikes so even a weak
-    // software decoder keeps up. GOP 60 ≈ 1 s keyframe interval at 60 fps:
-    // instant seeking, and the first GOP starts immediately at record start.
+fn configure_h264_encoder(element: &gst::Element, factory: &str, record_bitrate_kbps: u32) {
+    // The recording bitrate follows the session's negotiated maximum (the
+    // user's "max bitrate" slider) so a 15 Mbps setting records at 15 Mbps
+    // instead of the old fixed 8 Mbps — the field "recorder burik" bug. VBR
+    // lets the encoder spend up to ~25% above the target on motion spikes;
+    // GOP 60 ≈ 1 s keyframe interval at 60 fps: instant seeking, and the
+    // first GOP starts immediately at record start.
+    let bitrate_kbps = record_bitrate_kbps.max(500);
+    let max_bitrate_kbps = (bitrate_kbps * 5).div_ceil(4);
     match factory {
         // Hardware encoders (NV12 input). Property names differ per element
         // family, so every set is guarded — a wrong/missing property on a
@@ -6598,30 +6631,30 @@ fn configure_h264_encoder(element: &gst::Element, factory: &str) {
         // in kbps; GOP is `gop-size` on the D3D/QSG/NVENC families,
         // `keyframe-period` on VAAPI, `gop` on VideoToolbox.
         "d3d12h264enc" | "d3d11h264enc" | "qsvh264enc" | "mfh264enc" | "nvh264enc" => {
-            element.set_property("bitrate", 8000u32);
+            element.set_property("bitrate", bitrate_kbps);
             set_property_from_str_if_supported(element, "rate-control", "vbr");
             element.set_property("gop-size", 60u32);
-            set_property_from_str_if_supported(element, "max-bitrate", "10000");
+            set_property_from_str_if_supported(element, "max-bitrate", &max_bitrate_kbps.to_string());
         }
         "vaapih264enc" => {
-            element.set_property("bitrate", 8000u32);
+            element.set_property("bitrate", bitrate_kbps);
             set_property_from_str_if_supported(element, "rate-control", "vbr");
             set_property_from_str_if_supported(element, "keyframe-period", "60");
         }
         "vtenc_h264" => {
-            element.set_property("bitrate", 8000u32);
+            element.set_property("bitrate", bitrate_kbps);
             element.set_property("gop", 60u32);
-            set_property_from_str_if_supported(element, "max-bitrate", "10000");
+            set_property_from_str_if_supported(element, "max-bitrate", &max_bitrate_kbps.to_string());
             // Real-time encode: keeps encode latency from piling up behind
             // the live stream instead of buffering whole seconds of frames.
             set_property_from_str_if_supported(element, "realtime", "true");
         }
         "openh264enc" => {
-            element.set_property("bitrate", 8000u32);
+            element.set_property("bitrate", bitrate_kbps);
             element.set_property("gop-size", 60u32);
         }
         "x264enc" => {
-            element.set_property("bitrate", 8000u32);
+            element.set_property("bitrate", bitrate_kbps);
             set_property_from_str_if_supported(element, "speed-preset", "ultrafast");
             // No B-frames: lighter to decode on weak players AND no reordering.
             set_property_from_str_if_supported(element, "tune", "zerolatency");
@@ -6993,7 +7026,7 @@ mod mic_pipeline_tests {
     fn pick_h264_encoder_prefers_hardware_with_software_fallback() {
         gst::init().expect("gstreamer init");
         let (factory, _encoder) =
-            pick_h264_encoder().expect("at least one H.264 encoder must be available");
+            pick_h264_encoder(15_000).expect("at least one H.264 encoder must be available");
         // On any platform the picker must return a real encoder, preferring
         // hardware when one can initialize and falling back to software
         // otherwise — never an error while an encoder exists.
@@ -7014,9 +7047,9 @@ mod mic_pipeline_tests {
         let Some(element) = gst::ElementFactory::make("d3d12h264enc").build().ok() else {
             return; // runtime without the hardware encoder — nothing to configure
         };
-        configure_h264_encoder(&element, "d3d12h264enc");
+        configure_h264_encoder(&element, "d3d12h264enc", 15_000);
         let bitrate: u32 = element.property("bitrate");
-        assert_eq!(bitrate, 8000, "d3d12h264enc bitrate must be 8000 kbps");
+        assert_eq!(bitrate, 15_000, "d3d12h264enc bitrate must follow the session cap");
         let gop: u32 = element.property("gop-size");
         assert_eq!(gop, 60, "d3d12h264enc gop-size must be 60");
         // The whole point of configure_h264_encoder: it must not panic on

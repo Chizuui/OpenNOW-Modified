@@ -4998,6 +4998,7 @@ mod stacked_window_dance_diagnostics {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             None,
+            8_000,
         )
         .expect("build recording branch");
         let muxer_src = state.muxer.static_pad("src").expect("muxer src pad");
@@ -5031,6 +5032,7 @@ mod stacked_window_dance_diagnostics {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             None,
+            8_000,
         )
         .expect("build recording branch");
         let started_at = Instant::now();
@@ -5070,6 +5072,7 @@ mod stacked_window_dance_diagnostics {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             None,
+            8_000,
         )
         .expect("build recording branch");
         // The audio tap tee, stored the way the pad-added handler stores it:
@@ -5839,6 +5842,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx.clone()),
+            8_000,
         )
         .expect("build recording branch into PLAYING pipeline");
 
@@ -5945,6 +5949,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx.clone()),
+            8_000,
         )
         .expect("rebuild recording branch into PLAYING pipeline");
         let q_in = add_counter(&state.queue, "sink");
@@ -6068,6 +6073,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build video branch");
         state.audio_rtp_tee = Some(atee.clone());
@@ -6270,6 +6276,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build recording branch");
 
@@ -6439,6 +6446,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build video branch");
         state.audio_rtp_tee = Some(atee.clone());
@@ -6562,6 +6570,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build recording branch");
 
@@ -6695,6 +6704,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build recording branch");
 
@@ -6903,6 +6913,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx.clone()),
+            8_000,
         )
         .expect("build video branch");
 
@@ -7030,6 +7041,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::Software,
             false,
             Some(tx.clone()),
+            8_000,
         )
         .expect("rebuild video branch");
         if with_audio {
@@ -7107,6 +7119,7 @@ mod tests {
             crate::gstreamer_pipeline::RtpVideoApi::D3D12,
             false,
             Some(tx),
+            8_000,
         )
         .expect("build recording branch");
 
