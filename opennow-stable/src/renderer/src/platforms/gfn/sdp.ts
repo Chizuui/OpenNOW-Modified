@@ -13,5 +13,5 @@ export {
   rewriteH265LevelIdByProfile,
   rewriteH265TierFlag,
 } from "./sdp/codec";
-export { buildNvstSdp, OFFICIAL_MIN_BITRATE_KBPS } from "./sdp/nvstOffer";
+export { buildNvstSdp, OFFICIAL_MIN_BITRATE_KBPS, type NvstParams } from "./sdp/nvstOffer";
 export { ensureAudioRedInAnswer, mungeAnswerSdp } from "./sdp/answer";

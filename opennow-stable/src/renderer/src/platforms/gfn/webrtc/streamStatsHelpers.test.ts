@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   computeIntervalFrameRates,
   mapServerGpuType,
+  shouldWarnBweLow,
   smoothJitterMs,
   type IntervalFrameRateParams,
 } from "./streamStatsHelpers";
@@ -135,4 +136,130 @@ test("smoothJitterMs decays toward zero when the stream stops reporting", () => 
   const afterDecay = smoothJitterMs(0, 8);
   assert.ok(afterDecay < 8, `decayed to ${afterDecay}`);
   assert.ok(afterDecay > 0, `still holds residual ${afterDecay}`);
+});
+
+test("shouldWarnBweLow fires when the estimate is stuck below the floor on a healthy link", () => {
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 3400,
+      rttMs: 43,
+      packetLossPercent: 0.02,
+      measuredBitrateKbps: 3400,
+      sessionAgeMs: 30_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    true,
+  );
+});
+
+test("shouldWarnBweLow stays silent when the estimate is at or above the floor", () => {
+  for (const availableKbps of [4000, 5000, 15000]) {
+    assert.equal(
+      shouldWarnBweLow({
+        availableKbps,
+        rttMs: 43,
+        packetLossPercent: 0.02,
+        measuredBitrateKbps: 15000,
+        sessionAgeMs: 60_000,
+        alreadyWarned: false,
+        floorKbps: 4000,
+        graceMs: 15_000,
+        healthyRttMs: 100,
+        healthyLossPct: 1,
+      }),
+      false,
+      `estimate ${availableKbps} should not warn`,
+    );
+  }
+});
+
+test("shouldWarnBweLow stays silent when the link is congested", () => {
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 3000,
+      rttMs: 250,
+      packetLossPercent: 4.2,
+      measuredBitrateKbps: 3000,
+      sessionAgeMs: 60_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
+});
+
+test("shouldWarnBweLow stays silent during the startup BWE ramp and before any frames", () => {
+  // Within the grace window (slow ramp is not a false positive).
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 1000,
+      rttMs: 40,
+      packetLossPercent: 0,
+      measuredBitrateKbps: 1200,
+      sessionAgeMs: 5_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
+  // No stream yet (nothing received).
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 1000,
+      rttMs: 40,
+      packetLossPercent: 0,
+      measuredBitrateKbps: 0,
+      sessionAgeMs: 60_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
+  // No real estimate yet (Chromium placeholder 0).
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 0,
+      rttMs: 40,
+      packetLossPercent: 0,
+      measuredBitrateKbps: 5000,
+      sessionAgeMs: 60_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
+});
+
+test("shouldWarnBweLow is a one-shot guard per session", () => {
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 3400,
+      rttMs: 43,
+      packetLossPercent: 0.02,
+      measuredBitrateKbps: 3400,
+      sessionAgeMs: 30_000,
+      alreadyWarned: true,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
 });

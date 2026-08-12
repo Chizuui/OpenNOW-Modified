@@ -52,6 +52,7 @@ import {
   mungeAnswerSdp,
   OFFICIAL_MIN_BITRATE_KBPS,
   preferCodec,
+  type NvstParams,
   resolveNegotiationCandidates,
   rewriteIceCandidateEndpoint,
   rewriteH265LevelIdByProfile,
@@ -72,6 +73,7 @@ import {
   computeIntervalFrameRates,
   detectGpuType,
   mapServerGpuType,
+  shouldWarnBweLow,
   smoothJitterMs,
 } from "./webrtc/streamStatsHelpers";
 import {
@@ -433,6 +435,50 @@ export class GfnWebRtcClient {
   private currentResolution = "";
   private isHdr = false;
   private videoDecodeStallWarningSent = false;
+  /**
+   * Whether the negotiated answer SDP carries BOTH the transport-wide-cc RTP
+   * header extension and a transport-cc rtcp-fb for the video m-line. When
+   * missing, the server's bandwidth estimator receives no feedback and holds
+   * a conservative bitrate no matter what the NVST SDP requested — the same
+   * root cause as the native streamer's ~3.4 Mbps cap.
+   */
+  private negotiatedTransportCc = false;
+  /** Video m-line lines (rtpmap/fmtp/rtcp-fb/extmap) of the negotiated answer, dumped when the BWE anomaly fires. */
+  private negotiatedVideoSdpLines: string[] = [];
+  /** Session start wall-clock: the BWE-ramp grace window counts from here. */
+  private sessionStartedAtMs = 0;
+  /** One-shot guard so the BWE anomaly warning fires once per session. */
+  private bweLowWarned = false;
+  /**
+   * The NVST SDP params used at session start, kept so a mid-session max
+   * bitrate change can rebuild the NVST SDP with the new
+   * `vqos.bw.maximumBitrateKbps` and re-send it to the server WITHOUT a full
+   * reconnect. Cleared when the session ends.
+   */
+  private sessionNvstSdpParams: NvstParams | null = null;
+  /** The answer SDP last sent to the server (its credentials stay valid for the whole session). */
+  private lastAnswerSdp = "";
+  /** Cooldown so a slider drag does not spam the server with mid-session NVST updates. */
+  private lastNvstBitratePushAtMs = 0;
+  private static readonly NVST_BITRATE_PUSH_COOLDOWN_MS = 1_000;
+  /** How many mid-session NVST cap updates were actually sent this session (cooldown/param guards passed). */
+  private bitratePushesSent = 0;
+  /** Of those, how many were followed by the server BWE moving up by at least the threshold within the verify window. */
+  private bitratePushesBweVerified = 0;
+  /**
+   * Pending proof that a mid-session cap push took effect: the first
+   * `availableIncomingBitrate` sample after the push is the baseline, and the
+   * next samples are compared against it until it moves (server honored the
+   * push) or the window expires (server may apply it on the next
+   * offer/reconnect). Replaced when a newer push supersedes an unproven one.
+   */
+  private pushBweObservation: {
+    pushedAtMs: number;
+    baselineKbps: number;
+    pushNumber: number;
+  } | null = null;
+  private static readonly BITRATE_PUSH_BWE_VERIFY_WINDOW_MS = 10_000;
+  private static readonly BITRATE_PUSH_BWE_MOVE_THRESHOLD_KBPS = 500;
   private serverRegion = "";
   private serverZone = "";
   private serverLocationLabel = ""; // <--- NEW FIELD
@@ -953,6 +999,13 @@ export class GfnWebRtcClient {
     this.decoderPressureController.initializeBitrate(normalizedKbps);
     this.diagnostics.targetBitrateKbps = this.decoderPressureController.targetBitrateKbps;
     this.emitStats();
+    // Best-effort mid-session cap update: rebuild the NVST SDP with the new
+    // cap and re-send it to the server through the same signaling channel used
+    // at session start. The server reads the cap from
+    // `vqos.bw.maximumBitrateKbps` in nvstSdp; whether it honors a mid-session
+    // re-send varies by server build (the next offer/reconnect fallback still
+    // applies). Cooldown so a slider drag does not spam the server.
+    await this.pushMidSessionBitrate(normalizedKbps);
     if (!this.pc || !this.pc.localDescription) {
       return;
     }
@@ -969,6 +1022,55 @@ export class GfnWebRtcClient {
       this.log(
         `Bitrate target updated to ${normalizedKbps} kbps (HUD); server cap applies at next session negotiation`,
       );
+    }
+  }
+
+  /**
+   * Best-effort mid-session bitrate cap update: rebuild the NVST SDP with the
+   * new `vqos.bw.maximumBitrateKbps` and re-send it to the server via the same
+   * `sendAnswer` signaling channel used at session start (the answer SDP is
+   * unchanged — only the nvstSdp that carries the negotiated cap is rebuilt).
+   * Whether the server honors a mid-session re-send varies by server build;
+   * if it ignores it, the change still applies on the next offer/reconnect.
+   * Gated by a cooldown and by the session actually being negotiated.
+   */
+  private async pushMidSessionBitrate(kbps: number): Promise<void> {
+    const now = Date.now();
+    if (
+      !this.sessionNvstSdpParams ||
+      !this.lastAnswerSdp ||
+      now - this.lastNvstBitratePushAtMs < GfnWebRtcClient.NVST_BITRATE_PUSH_COOLDOWN_MS
+    ) {
+      return;
+    }
+    this.lastNvstBitratePushAtMs = now;
+    const updatedNvstSdp = buildNvstSdp({
+      ...this.sessionNvstSdpParams,
+      maxBitrateKbps: kbps,
+    });
+    const pushNumber = this.bitratePushesSent + 1;
+    this.log(
+      `[Bitrate] Pushing mid-session NVST cap update #${pushNumber} to ${kbps} kbps (vqos.bw.maximumBitrateKbps); the server may apply it immediately or on the next offer/reconnect.`,
+    );
+    try {
+      await window.openNow.sendAnswer({
+        sdp: this.lastAnswerSdp,
+        nvstSdp: updatedNvstSdp,
+      });
+      this.bitratePushesSent += 1;
+      // Arm the BWE proof: the next availableIncomingBitrate sample becomes
+      // the baseline, and later samples are compared until it moves (server
+      // honored this push) or the verify window expires.
+      this.pushBweObservation = {
+        pushedAtMs: now,
+        baselineKbps: -1,
+        pushNumber,
+      };
+      this.log(
+        `[Bitrate] Mid-session NVST cap update #${pushNumber} sent (${this.bitratePushesSent} sent, ${this.bitratePushesBweVerified} BWE-verified this session).`,
+      );
+    } catch (error) {
+      this.log(`[Bitrate] Mid-session NVST update #${pushNumber} send failed: ${String(error)}`);
     }
   }
 
@@ -1013,6 +1115,16 @@ export class GfnWebRtcClient {
     this.currentResolution = "";
     this.isHdr = false;
     this.videoDecodeStallWarningSent = false;
+    this.negotiatedTransportCc = false;
+    this.negotiatedVideoSdpLines = [];
+    this.sessionStartedAtMs = Date.now();
+    this.bweLowWarned = false;
+    this.sessionNvstSdpParams = null;
+    this.lastAnswerSdp = "";
+    this.lastNvstBitratePushAtMs = 0;
+    this.bitratePushesSent = 0;
+    this.bitratePushesBweVerified = 0;
+    this.pushBweObservation = null;
     this.decoderPressureController.reset();
     const mouseDiagnostics = this.domInputController.getMouseDiagnostics();
     this.diagnostics = {
@@ -1438,10 +1550,72 @@ export class GfnWebRtcClient {
       this.diagnostics.targetBitrateKbps = this.decoderPressureController.targetBitrateKbps;
     }
 
+    // Mid-session bitrate push proof: the first BWE sample after a push is the
+    // baseline; a later sample at least `MOVE_THRESHOLD` above it within the
+    // verify window means the server honored the push (its estimator ramped).
+    // No movement before the window closes is also logged — the cap then only
+    // applies on the next offer/reconnect, which is useful to know.
+    if (this.pushBweObservation) {
+      const obs = this.pushBweObservation;
+      if (obs.baselineKbps < 0) {
+        obs.baselineKbps = availableKbps;
+      } else if (availableKbps >= obs.baselineKbps + GfnWebRtcClient.BITRATE_PUSH_BWE_MOVE_THRESHOLD_KBPS) {
+        this.bitratePushesBweVerified += 1;
+        this.log(
+          `[Bitrate] Mid-session cap push #${obs.pushNumber} VERIFIED: server BWE moved ${obs.baselineKbps} → ${availableKbps} kbps (${Date.now() - obs.pushedAtMs}ms after push). BWE-verified ${this.bitratePushesBweVerified}/${this.bitratePushesSent} pushes this session.`,
+        );
+        this.pushBweObservation = null;
+      } else if (
+        Date.now() - obs.pushedAtMs > GfnWebRtcClient.BITRATE_PUSH_BWE_VERIFY_WINDOW_MS
+      ) {
+        this.log(
+          `[Bitrate] Mid-session cap push #${obs.pushNumber}: server BWE unchanged (${obs.baselineKbps} kbps) after ${GfnWebRtcClient.BITRATE_PUSH_BWE_VERIFY_WINDOW_MS}ms — the server likely applies the new cap on the next offer/reconnect.`,
+        );
+        this.pushBweObservation = null;
+      }
+    }
+
     // RTT from active candidate pair
     if (activePair?.currentRoundTripTime !== undefined) {
       const rtt = Number(activePair.currentRoundTripTime);
       this.diagnostics.rttMs = Math.round(rtt * 1000 * 10) / 10;
+    }
+
+    // BWE anomaly diagnostic (once per session): the receiver's bandwidth
+    // estimate sitting below the negotiated bitrate floor while the link is
+    // healthy means the server is not ramping its encoder — and the first
+    // thing to check is the transport-cc negotiation recorded above, because
+    // the server BWE is blind without TWCC feedback (the native streamer's
+    // ~3.4 Mbps root cause). Gated on a real estimate (Chromium exposes 0/300
+    // kbps placeholders early and some builds never populate
+    // availableIncomingBitrate), an established stream, and a grace period
+    // for the startup BWE ramp.
+    if (
+      shouldWarnBweLow({
+        availableKbps,
+        rttMs: this.diagnostics.rttMs,
+        packetLossPercent: this.diagnostics.packetLossPercent,
+        measuredBitrateKbps: this.diagnostics.bitrateKbps,
+        sessionAgeMs: Date.now() - this.sessionStartedAtMs,
+        alreadyWarned: this.bweLowWarned,
+        floorKbps: OFFICIAL_MIN_BITRATE_KBPS,
+        graceMs: 15_000,
+        healthyRttMs: 100,
+        healthyLossPct: 1,
+      })
+    ) {
+      this.bweLowWarned = true;
+      const twccState = this.negotiatedTransportCc
+        ? "transport-cc IS negotiated (extmap + rtcp-fb present), so TWCC feedback should be flowing — check the server/region or an external link cap"
+        : "transport-cc is NOT negotiated — the server BWE runs blind (the native ~3.4 Mbps root cause). The answer must carry BOTH the transport-wide-cc extmap and a=rtcp-fb transport-cc:";
+      this.log(
+        `[BWE] WARNING: receiver bandwidth estimate stuck at ${availableKbps} kbps — below the negotiated ${OFFICIAL_MIN_BITRATE_KBPS} kbps floor — on a healthy link (rtt=${this.diagnostics.rttMs}ms, loss=${this.diagnostics.packetLossPercent.toFixed(2)}%). The server is not ramping its encoder. ${twccState}`,
+      );
+      if (!this.negotiatedTransportCc && this.negotiatedVideoSdpLines.length > 0) {
+        for (const l of this.negotiatedVideoSdpLines) {
+          this.log(`  SDP< ${l}`);
+        }
+      }
     }
 
     // Grow the jitter buffer floor with the measured link RTT so NACK
@@ -2814,7 +2988,7 @@ export class GfnWebRtcClient {
         if (line.startsWith("m=") && inVideo) {
           break;
         }
-        if (inVideo && (line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") || line.startsWith("a=rtcp-fb:"))) {
+        if (inVideo && (line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") || line.startsWith("a=rtcp-fb:") || line.startsWith("a=extmap:"))) {
           negotiatedVideoLines.push(line);
         }
       }
@@ -2824,13 +2998,22 @@ export class GfnWebRtcClient {
           this.log(`  SDP< ${l}`);
         }
       }
+      // Remember the transport-cc negotiation state for the BWE-anomaly
+      // diagnostic below: the server BWE is driven by TWCC feedback, and a
+      // missing extmap/rtcp-fb transport-cc means it runs blind (the native
+      // ~3.4 Mbps root cause) no matter what the NVST SDP requested.
+      this.negotiatedVideoSdpLines = negotiatedVideoLines;
+      this.negotiatedTransportCc =
+        /a=extmap:\d+\s+http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(
+          finalSdp,
+        ) && /a=rtcp-fb:[^\s]+\s+transport-cc/.test(finalSdp);
     }
 
     const credentials = extractIceCredentials(finalSdp);
     this.log(`Extracted ICE credentials: ufrag=${credentials.ufrag}, pwd=${credentials.pwd.slice(0, 8)}...`);
     const { width, height } = parseResolution(settings.resolution);
 
-    const nvstSdp = buildNvstSdp({
+    const nvstParams: NvstParams = {
       width,
       height,
       fps: settings.fps,
@@ -2844,7 +3027,15 @@ export class GfnWebRtcClient {
       credentials,
       dynamicSplitEncodeUpdatesEnabled:
         settings.nativeTransitionDiagnostics?.disableDynamicSplitEncodeUpdates !== true,
-    });
+    };
+    const nvstSdp = buildNvstSdp(nvstParams);
+    // Keep the session-start NVST params + answer SDP so a mid-session max
+    // bitrate change can rebuild the NVST SDP (new
+    // `vqos.bw.maximumBitrateKbps`) and push it to the server without a full
+    // reconnect.
+    this.sessionNvstSdpParams = nvstParams;
+    this.lastAnswerSdp = finalSdp;
+    this.lastNvstBitratePushAtMs = 0;
 
     await window.openNow.sendAnswer({
       sdp: finalSdp,

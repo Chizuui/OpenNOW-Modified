@@ -104,6 +104,55 @@ export function detectGpuType(): string {
 export const JITTER_EWMA_ALPHA = 0.35;
 
 /**
+ * Inputs for the BWE-anomaly warning decision. See `shouldWarnBweLow`.
+ */
+export interface BweLowWarnCheck {
+  /** Receiver bandwidth estimate (kbps) from availableIncomingBitrate. */
+  availableKbps: number;
+  /** Measured link RTT (ms). */
+  rttMs: number;
+  /** Measured packet loss (%). */
+  packetLossPercent: number;
+  /** Measured receive bitrate (kbps) — proves the stream is actually flowing. */
+  measuredBitrateKbps: number;
+  /** Milliseconds since the session started (BWE-ramp grace). */
+  sessionAgeMs: number;
+  /** One-shot guard: only warn once per session. */
+  alreadyWarned: boolean;
+  /** Below this estimate (kbps) the server is under-using the link. */
+  floorKbps: number;
+  /** BWE ramp grace after session start — a slow ramp is not a false positive. */
+  graceMs: number;
+  /** RTT (ms) below which the link counts as healthy. */
+  healthyRttMs: number;
+  /** Packet loss (%) below which the link counts as healthy. */
+  healthyLossPct: number;
+}
+
+/**
+ * Whether to warn that the receiver's bandwidth estimate is stuck BELOW the
+ * bitrate floor the client negotiates (`vqos.bw.minimumBitrateKbps`, ~4000
+ * kbps) while the link is healthy. On a healthy path the estimate should sit
+ * far above the floor; a stuck-low value usually means the server is not
+ * ramping its encoder — and the first thing to check is whether transport-cc
+ * was negotiated, because the server BWE is blind without TWCC feedback (the
+ * native streamer's ~3.4 Mbps root cause). Pure + unit-tested.
+ */
+export function shouldWarnBweLow(check: BweLowWarnCheck): boolean {
+  if (check.alreadyWarned) return false;
+  // No real estimate yet (0 / placeholder) or above the floor: nothing to say.
+  if (check.availableKbps <= 0 || check.availableKbps >= check.floorKbps) return false;
+  // Only on a healthy link — a low estimate under congestion is expected.
+  if (check.rttMs <= 0 || check.rttMs >= check.healthyRttMs) return false;
+  if (check.packetLossPercent >= check.healthyLossPct) return false;
+  // Only once the stream is actually receiving (BWE is meaningless before).
+  if (check.measuredBitrateKbps <= 0) return false;
+  // Allow the startup BWE ramp to finish before judging it stuck.
+  if (check.sessionAgeMs < check.graceMs) return false;
+  return true;
+}
+
+/**
  * Exponential moving average of a raw WebRTC jitter reading (ms). The first
  * sample is returned as-is so the readout appears immediately instead of
  * ramping up from 0; afterwards it is blended with the previous EWMA so a

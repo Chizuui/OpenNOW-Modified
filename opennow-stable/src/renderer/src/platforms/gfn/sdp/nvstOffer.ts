@@ -19,7 +19,7 @@ interface IceCredentials {
   fingerprint: string;
 }
 
-interface NvstParams {
+export interface NvstParams {
   width: number;
   height: number;
   fps: number;
