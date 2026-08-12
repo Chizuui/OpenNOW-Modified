@@ -1574,6 +1574,13 @@ impl GstreamerPipeline {
         self.video_liveness.configure(context, target_bitrate_kbps);
     }
 
+    /// Record the video codec actually negotiated in the WebRTC answer so the
+    /// liveness startup watchdog can make a codec-downgrade decision against
+    /// the codec the server really sends (not the requested one).
+    pub(crate) fn set_negotiated_video_codec(&self, codec: &str) {
+        self.video_liveness.update_negotiated_codec(codec);
+    }
+
     /// Attach classic NVST UDP video: appsrc → parse → decoder → sink, plus UDP recv thread.
     /// Keeps webrtcbin for SCTP input; ignores WebRTC RTP video pads.
     pub(crate) fn attach_nvst_video(

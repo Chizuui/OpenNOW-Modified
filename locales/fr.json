@@ -412,6 +412,7 @@
       "fallbackCodec": "Codec de secours",
       "fallbackCodecHint": "Utilisé lorsque le codec sélectionné ne peut pas être négocié. Auto conserve tous les codecs pris en charge comme secours.",
       "codecMigratedNotice": "{{codec}} n'est pas pris en charge sur cet appareil — passage à Auto.",
+      "codecDowngradeNotice": "{{fromCodec}} n'a pas pu être décodé sur cet appareil — session redémarrée avec {{toCodec}}.",
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Décodeur",
       "encoder": "Encodeur",

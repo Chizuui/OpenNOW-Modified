@@ -412,6 +412,7 @@
       "fallbackCodec": "Codec de rezervă",
       "fallbackCodecHint": "Folosit când codecul selectat nu poate fi negociat. Auto păstrează toate codecurile acceptate ca rezervă.",
       "codecMigratedNotice": "{{codec}} nu este acceptat pe acest dispozitiv — s-a comutat pe Auto.",
+      "codecDowngradeNotice": "{{fromCodec}} nu a putut fi decodat pe acest dispozitiv — sesiunea a fost repornită cu {{toCodec}}.",
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decodor",
       "encoder": "Codificator",

@@ -412,6 +412,7 @@
       "fallbackCodec": "Fallback-Codec",
       "fallbackCodecHint": "Wird verwendet, wenn der gewählte Codec nicht verhandelt werden kann. Auto behält jeden unterstützten Codec als Fallback.",
       "codecMigratedNotice": "{{codec}} wird auf diesem Gerät nicht unterstützt — auf Auto umgestellt.",
+      "codecDowngradeNotice": "{{fromCodec}} konnte auf diesem Gerät nicht dekodiert werden — Sitzung mit {{toCodec}} neu gestartet.",
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decoder",
       "encoder": "Encoder",

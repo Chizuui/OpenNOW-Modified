@@ -412,6 +412,7 @@
       "fallbackCodec": "Yedek codec",
       "fallbackCodecHint": "Seçilen codec anlaşılamadığında kullanılır. Auto, desteklenen tüm codec'leri yedek olarak tutar.",
       "codecMigratedNotice": "{{codec}} bu cihazda desteklenmiyor — Auto olarak değiştirildi.",
+      "codecDowngradeNotice": "{{fromCodec}} bu cihazda çözülemedi — oturum {{toCodec}} ile yeniden başlatıldı.",
       "decoder": "Kod çözücü",
       "encoder": "Kodlayıcı",
       "colorDepth": "Renk Derinliği",

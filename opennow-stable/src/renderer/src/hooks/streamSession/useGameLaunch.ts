@@ -8,6 +8,7 @@ import type {
   SignalingConnectRequest,
   StreamSettings,
   SubscriptionInfo,
+  VideoCodec,
 } from "@shared/gfn";
 import { isSessionAdsRequired } from "@shared/gfn";
 import { discordGameImageUrl } from "@shared/discord";
@@ -47,8 +48,8 @@ export interface GameLaunchOptions {
   activeSessionProxyUrl?: string;
   allKnownGames: GameInfo[];
   authSession: AuthSession | null;
-  buildCurrentStreamSettings: (subscription?: SubscriptionInfo | null) => StreamSettings;
-  buildSignalingConnectRequest: (session: SessionInfo) => SignalingConnectRequest;
+  buildCurrentStreamSettings: (subscription?: SubscriptionInfo | null, codecOverride?: VideoCodec) => StreamSettings;
+  buildSignalingConnectRequest: (session: SessionInfo, codecOverride?: VideoCodec) => SignalingConnectRequest;
   canLaunch: boolean;
   claimAndConnectSession: (session: import("@shared/gfn").ActiveSessionInfo) => Promise<void>;
   disconnectSignalingControlled: () => Promise<void>;
@@ -117,8 +118,12 @@ export function useGameLaunch({
     streamStatus,
   } = runtime;
 
-  // Play game handler
-  const handlePlayGame = useCallback(async (game: GameInfo, options?: { bypassGuards?: boolean; streamingBaseUrl?: string; variantId?: string }) => {
+  // Play game handler. `codecOverride` forces a concrete video codec for this
+  // launch (used by the native AV1 → H265 auto-downgrade); `forceNewSession`
+  // skips the active-session claim/resume so a relaunch always creates a
+  // fresh session (the old one is being abandoned, e.g. after a codec
+  // downgrade request).
+  const handlePlayGame = useCallback(async (game: GameInfo, options?: { bypassGuards?: boolean; streamingBaseUrl?: string; variantId?: string; codecOverride?: VideoCodec; forceNewSession?: boolean }) => {
     if (!canLaunch) return;
 
     console.log("handlePlayGame entry", {
@@ -214,21 +219,24 @@ export function useGameLaunch({
       setStreamingStore(launchVariant?.store ?? null);
 
       const launchSubscription = await resolveSubscriptionInfoForLaunch();
-      const streamSettings = buildCurrentStreamSettings(launchSubscription);
+      const streamSettings = buildCurrentStreamSettings(launchSubscription, options?.codecOverride);
       const i2pStorageRegionBaseUrl = await resolveInstallToPlayStreamingBaseUrl(
         matchedGameContext.game,
         launchSubscription,
         token || undefined,
       );
       const launchStreamingBaseUrl = i2pStorageRegionBaseUrl ?? options?.streamingBaseUrl ?? effectiveStreamingBaseUrl;
-      let existingSessionStrategy: ExistingSessionStrategy | undefined;
+      let existingSessionStrategy: ExistingSessionStrategy | undefined = options?.forceNewSession ? "force-new" : undefined;
       // GPU reported by an existing session for this app (getActiveSessions
       // carries gpuType even when the create/poll payload omits it). Used as a
       // backfill when the freshly created session does not report one.
       let activeSessionGpuType: string | undefined;
 
-      // Check for active sessions first
-      if (token) {
+      // Check for active sessions first. forceNewSession (codec downgrade
+      // relaunch) skips the claim/resume branch entirely — resuming the old
+      // AV1 session would defeat the downgrade, so a fresh session is always
+      // created instead.
+      if (token && !options?.forceNewSession) {
         try {
           const activeSessions = await window.openNow.getActiveSessions(token, launchStreamingBaseUrl);
           if (activeSessions.length > 0) {
@@ -425,7 +433,7 @@ export function useGameLaunch({
         status: sessionToConnect.status,
       });
 
-      await window.openNow.connectSignaling(buildSignalingConnectRequest(sessionToConnect));
+      await window.openNow.connectSignaling(buildSignalingConnectRequest(sessionToConnect, options?.codecOverride));
     } catch (error) {
       if (launchAbortRef.current) {
         return;

@@ -1079,6 +1079,23 @@ export class NativeStreamerManager {
       return;
     }
 
+    if (message.type === "codec-downgrade-request") {
+      // The negotiated codec produced zero decoded frames during startup
+      // (every decoder candidate exhausted). Forward the request and end the
+      // black session; the renderer relaunches the game session with the
+      // fallback codec (GFN ladder: AV1 → H265). The subsequent
+      // native-stream-stopped is ignored by the renderer because it marks the
+      // shutdown as explicit before relaunching.
+      console.warn(`[NativeStreamer] Codec downgrade requested: ${message.fromCodec} → ${message.toCodec} (zero decoded frames during startup).`);
+      this.options.emit({
+        type: "native-codec-downgrade-request",
+        fromCodec: message.fromCodec,
+        toCodec: message.toCodec,
+      });
+      void this.stop(`native codec downgrade (${message.fromCodec} → ${message.toCodec})`);
+      return;
+    }
+
     if (message.type === "error") {
       this.options.emit({ type: "error", message: `Native streamer error: ${message.message}` });
     }

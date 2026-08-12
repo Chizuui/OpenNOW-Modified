@@ -412,6 +412,7 @@
       "fallbackCodec": "Kodek zapasowy",
       "fallbackCodecHint": "Używany, gdy wybrany kodek nie może zostać wynegocjowany. Auto zachowuje każdy obsługiwany kodek jako zapasowy.",
       "codecMigratedNotice": "{{codec}} nie jest obsługiwany na tym urządzeniu — przełączono na Auto.",
+      "codecDowngradeNotice": "{{fromCodec}} nie można było zdekodować na tym urządzeniu — sesja została uruchomiona ponownie z {{toCodec}}.",
       "decoder": "Dekoder",
       "encoder": "Enkoder",
       "colorDepth": "Głębia koloru",

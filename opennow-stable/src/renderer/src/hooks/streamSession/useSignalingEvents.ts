@@ -36,6 +36,13 @@ export interface SignalingEventOptions {
   attemptSessionRecovery: (reason: string) => Promise<boolean>;
   diagnosticsStore: StreamDiagnosticsStore;
   handleExpectedNativeSessionClose: (reason: string) => void;
+  /**
+   * Native AV1 → fallback codec auto-downgrade: the native streamer produced
+   * zero decoded frames with the negotiated codec during startup. The renderer
+   * marks the session as explicitly shut down and relaunches the same game
+   * with `toCodec`.
+   */
+  handleNativeCodecDowngrade: (fromCodec: string, toCodec: string) => void | Promise<void>;
   markDiscordStreamStarted: () => void;
   refreshNavbarActiveSession: () => Promise<void>;
   resetLaunchRuntime: ResetLaunchRuntime;
@@ -49,6 +56,7 @@ export function useSignalingEvents({
   attemptSessionRecovery,
   diagnosticsStore,
   handleExpectedNativeSessionClose,
+  handleNativeCodecDowngrade,
   markDiscordStreamStarted,
   refreshNavbarActiveSession,
   resetLaunchRuntime,
@@ -465,6 +473,14 @@ export function useSignalingEvents({
             void refreshNavbarActiveSession();
             launchInFlightRef.current = false;
           }
+        } else if (event.type === "native-codec-downgrade-request") {
+          // The native streamer's negotiated codec produced zero decoded
+          // frames during startup. The handler marks the session as
+          // explicitly shut down FIRST (synchronously) so the streamer-stop
+          // events the manager fires right after are ignored by recovery, then
+          // relaunches the same game with the fallback codec in a fresh
+          // session.
+          await handleNativeCodecDowngrade(event.fromCodec, event.toCodec);
         } else if (event.type === "remote-ice") {
           remoteIceSeenForSessionRef.current = sessionRef.current?.sessionId ?? null;
           hasConfirmedRemoteIceRef.current = true;
@@ -576,7 +592,7 @@ export function useSignalingEvents({
     });
 
     return () => unsubscribe();
-  }, [attemptSessionRecovery, diagnosticsStore, handleExpectedNativeSessionClose, markDiscordStreamStarted, nativeInputBridgeReady, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
+  }, [attemptSessionRecovery, diagnosticsStore, handleExpectedNativeSessionClose, handleNativeCodecDowngrade, markDiscordStreamStarted, nativeInputBridgeReady, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
 
   // Register the control-channel clipboard handler for the lifetime of this
   // session (native relay; web registers its own copy when the control channel

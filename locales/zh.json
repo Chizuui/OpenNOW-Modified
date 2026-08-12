@@ -412,6 +412,7 @@
       "fallbackCodec": "备用编解码器",
       "fallbackCodecHint": "当所选编解码器无法协商时使用。自动会保留所有受支持的编解码器作为备用。",
       "codecMigratedNotice": "此设备不支持{{codec}}，已自动切换为 Auto。",
+      "codecDowngradeNotice": "此设备无法解码{{fromCodec}} — 已使用{{toCodec}}重新启动会话。",
       "decoder": "解码器",
       "encoder": "编码器",
       "colorDepth": "颜色深度",

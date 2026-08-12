@@ -546,17 +546,12 @@ impl NativeStreamerBackend for GstreamerBackend {
                 };
             }
         };
-        self.remote_description_set = true;
-        events.extend(self.replay_pending_remote_ice());
-
-        events.push(Event::Log {
-            level: "info",
-            message:
-                "GStreamer created a local WebRTC answer and replayed queued remote ICE candidates."
-                    .to_owned(),
-        });
 
         if let Some(negotiated_codec) = extract_negotiated_video_codec(&answer_sdp) {
+            // The liveness startup watchdog decides an AV1 zero-frame startup
+            // against the codec the server actually sends, so feed it the
+            // negotiated codec (may differ from the requested one).
+            pipeline.set_negotiated_video_codec(negotiated_codec.as_str());
             if negotiated_codec != prepared.nvst_params.codec {
                 events.push(Event::Log {
                     level: "warn",
@@ -576,6 +571,16 @@ impl NativeStreamerBackend for GstreamerBackend {
                 });
             }
         }
+
+        self.remote_description_set = true;
+        events.extend(self.replay_pending_remote_ice());
+
+        events.push(Event::Log {
+            level: "info",
+            message:
+                "GStreamer created a local WebRTC answer and replayed queued remote ICE candidates."
+                    .to_owned(),
+        });
 
         // Diagnostic: dump the answer's video payload types and codec mappings
         // so a `not-negotiated` H265/AV1 receive failure can be matched against

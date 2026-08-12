@@ -412,6 +412,7 @@
       "fallbackCodec": "폴맍 코덱",
       "fallbackCodecHint": "선택한 코덱을 협상할 수 없을 때 사용됩니다. 자동은 지원되는 모든 코덱을 폴맍으로 유지합니다.",
       "codecMigratedNotice": "이 기기에서 {{codec}}을(를) 지원하지 않아 Auto로 전환했습니다.",
+      "codecDowngradeNotice": "이 기기에서 {{fromCodec}}을(를) 디코딩하지 못했습니다 — {{toCodec}}(으)로 세션을 다시 시작했습니다.",
       "decoder": "디코더",
       "encoder": "인코더",
       "colorDepth": "색상 심도",

@@ -152,6 +152,17 @@ export type MainToRendererSignalingEvent =
   | { type: "native-input-capture-changed"; captured: boolean }
   | { type: "native-stream-started"; message?: string }
   | { type: "native-stream-stopped"; reason?: string }
+  | {
+      /**
+       * The native streamer's negotiated video codec produced zero decoded
+       * frames during startup (every decoder candidate exhausted). The
+       * renderer restarts the game session with `toCodec` (GFN ladder: AV1 →
+       * H265) so the session keeps running instead of showing a black screen.
+       */
+      type: "native-codec-downgrade-request";
+      fromCodec: string;
+      toCodec: string;
+    }
   | { type: "native-stream-stats"; stats: NativeStreamStats }
   | { type: "native-stream-transition"; transition: NativeVideoTransition }
   | { type: "native-input-ready"; protocolVersion: number }

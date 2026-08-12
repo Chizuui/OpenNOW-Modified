@@ -603,6 +603,7 @@
       "fallbackCodec": "Fallback Codec",
       "fallbackCodecHint": "Used when the selected codec can't be negotiated. Auto keeps every supported codec as a fallback.",
       "codecMigratedNotice": "{{codec}} isn't supported on this device — switched to Auto.",
+      "codecDowngradeNotice": "{{fromCodec}} couldn't be decoded on this device — session restarted with {{toCodec}}.",
       "codecCpuDecodeHint": "{{codec}} only decodes on the CPU here — new sessions will request {{fallback}} instead, matching NVIDIA's web app.",
       "codecFallback": "Fallback from {{requested}}",
       "decoder": "Decoder",

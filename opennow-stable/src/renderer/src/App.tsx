@@ -17,6 +17,7 @@ import type {
   SignalingConnectRequest,
   StreamSettings,
   StreamRegion,
+  VideoCodec,
   VideoShaderSettings,
 } from "@shared/gfn";
 import { discordGameImageUrl } from "@shared/discord";
@@ -25,6 +26,7 @@ import {
   createDefaultSettings,
   createPlatformShortcutDefaults,
   resolveEntitledStreamProfile,
+  normalizeStreamPreferences,
   resolveRuntimePlatform,
   SAFE_FALLBACK_STREAM_PROFILE,
 } from "@shared/gfn";
@@ -181,6 +183,7 @@ export function App(): JSX.Element {
   const [consentSurfacePresent, setConsentSurfacePresent] = useState(false);
   const [gstScanState, setGstScanState] = useState<{ status: string; reason: string } | null>(null);
   const [codecMigratedNotice, setCodecMigratedNotice] = useState<{ fromCodec: string } | null>(null);
+  const [codecDowngradeNotice, setCodecDowngradeNotice] = useState<{ fromCodec: string; toCodec: string } | null>(null);
   const activeSessionProxyUrl = useMemo(
     () => getEnabledSessionProxyUrl(settings),
     [settings.sessionProxyEnabled, settings.sessionProxyUrl],
@@ -725,7 +728,7 @@ export function App(): JSX.Element {
   // launched with a direct-launch argument (frontend / big picture usage).
   const effectiveControllerMode = settings.controllerMode || directLaunchConsoleMode;
 
-  const buildCurrentStreamSettings = useCallback((subscriptionOverride?: SubscriptionInfo | null): StreamSettings => {
+  const buildCurrentStreamSettings = useCallback((subscriptionOverride?: SubscriptionInfo | null, codecOverride?: VideoCodec): StreamSettings => {
     const currentSubscription = subscriptionOverride === undefined ? subscriptionInfo : subscriptionOverride;
     const entitledProfile = resolveEntitledStreamProfile(currentSubscription?.entitledResolutions ?? [], {
       resolution: settings.resolution,
@@ -735,14 +738,20 @@ export function App(): JSX.Element {
 
     // Resolve "auto" to a concrete codec the device can receive, and re-pin
     // color quality against the resolved codec, before the preference reaches
-    // main (cloudmatch/native streamer) or the WebRTC client.
-    const resolvedCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+    // main (cloudmatch/native streamer) or the WebRTC client. `codecOverride`
+    // (native codec auto-downgrade relaunch: AV1 → H265 → H264) forces a
+    // concrete codec for exactly this launch, bypassing the user preference
+    // ladder — but still re-pins color quality through normalizeStreamPreferences
+    // so a H264 fallback (8-bit 4:2:0 only) never carries a 10-bit mode.
+    const resolvedCodecProfile = codecOverride
+      ? normalizeStreamPreferences(codecOverride, settings.colorQuality)
+      : resolveStreamProfileCodec(settings.codec, settings.colorQuality);
 
     return {
       resolution: streamProfile.resolution,
       fps: streamProfile.fps,
       maxBitrateMbps: settings.maxBitrateMbps,
-      codec: resolvedCodecProfile.codec,
+      codec: resolvedCodecProfile.codec as VideoCodec,
       colorQuality: resolvedCodecProfile.colorQuality,
       // "auto" means the full official ladder; only pin a concrete fallback.
       fallbackCodec: settings.fallbackCodec === "auto" ? undefined : settings.fallbackCodec,
@@ -1039,6 +1048,20 @@ export function App(): JSX.Element {
     return () => window.clearTimeout(timer);
   }, [codecMigratedNotice]);
 
+  // Auto-downgrade notice (native AV1 → H265 → H264 session restart): longer
+  // than the migration toast so it is still on screen when the relaunched
+  // session (session create + poll + connect takes a few seconds) appears.
+  useEffect(() => {
+    if (!codecDowngradeNotice) {
+      return;
+    }
+    const notice = codecDowngradeNotice;
+    const timer = window.setTimeout(() => {
+      setCodecDowngradeNotice((current) => (current === notice ? null : current));
+    }, 8000);
+    return () => window.clearTimeout(timer);
+  }, [codecDowngradeNotice]);
+
   const shortcuts = useMemo(() => {
     const parseWithFallback = (value: string, fallback: string) => {
       const parsed = normalizeShortcut(value);
@@ -1075,8 +1098,8 @@ export function App(): JSX.Element {
     toggleRecording: "",
   }), [shortcuts]);
 
-  const buildSignalingConnectRequest = useCallback((activeSession: SessionInfo): SignalingConnectRequest => {
-    const streamSettings = buildCurrentStreamSettings();
+  const buildSignalingConnectRequest = useCallback((activeSession: SessionInfo, codecOverride?: VideoCodec): SignalingConnectRequest => {
+    const streamSettings = buildCurrentStreamSettings(undefined, codecOverride);
     return {
       sessionId: activeSession.sessionId,
       signalingServer: activeSession.signalingServer,
@@ -2081,11 +2104,54 @@ export function App(): JSX.Element {
     void refreshNavbarActiveSession();
   }, [endPlaytimeSession, markExplicitSignalingShutdown, refreshNavbarActiveSession, resetLaunchRuntime]);
 
+  // handlePlayGame is defined by useGameLaunch AFTER useSignalingEvents below,
+  // so the downgrade handler reaches it through a ref that is assigned right
+  // after the hook. The downgrade event only ever arrives during a live
+  // session, long after the first render, so the ref is always populated.
+  const handlePlayGameRef = useRef<typeof handlePlayGame>(async () => {});
+
+  /**
+   * Native AV1 → H265 auto-downgrade: the native streamer detected zero
+   * decoded frames during startup with the negotiated AV1 codec and asked to
+   * restart the session with H265. Mark the current session as explicitly
+   * shut down (so the streamer-stop recovery path ignores it), dispose the
+   * WebRTC client, then relaunch the same game with the fallback codec and a
+   * forced-new session (resuming the old AV1 session would defeat the
+   * downgrade).
+   */
+  const handleNativeCodecDowngrade = useCallback(async (fromCodec: string, toCodec: string): Promise<void> => {
+    const game = streamingGameRef.current;
+    console.warn(`[Recovery] Native ${fromCodec} stream produced zero decoded frames during startup; downgrading session codec to ${toCodec} and relaunching.`);
+    markExplicitSignalingShutdown();
+    clientRef.current?.dispose();
+    clientRef.current = null;
+    launchInFlightRef.current = false;
+    if (!game) {
+      console.warn("[Recovery] No active game for codec downgrade; ending stream.");
+      resetLaunchRuntime();
+      void refreshNavbarActiveSession();
+      return;
+    }
+    if (toCodec !== "H264" && toCodec !== "H265" && toCodec !== "AV1") {
+      console.warn(`[Recovery] Ignoring codec downgrade with unknown target codec: ${toCodec}`);
+      return;
+    }
+    // Toast the reason the session is restarting, so the user does not think
+    // the game crashed mid-launch. Shown over the relaunch loading screen.
+    setCodecDowngradeNotice({ fromCodec, toCodec });
+    await handlePlayGameRef.current(game, {
+      bypassGuards: true,
+      forceNewSession: true,
+      codecOverride: toCodec as VideoCodec,
+    });
+  }, [markExplicitSignalingShutdown, refreshNavbarActiveSession, resetLaunchRuntime, setCodecDowngradeNotice]);
+
   useSignalingEvents({
     runtime: streamRuntime,
     attemptSessionRecovery,
     diagnosticsStore,
     handleExpectedNativeSessionClose,
+    handleNativeCodecDowngrade,
     markDiscordStreamStarted,
     refreshNavbarActiveSession,
     resetLaunchRuntime,
@@ -2119,6 +2185,8 @@ export function App(): JSX.Element {
     variantByGameId,
     warmNativeStreamerForLaunch,
   });
+
+  handlePlayGameRef.current = handlePlayGame;
 
   useEffect(() => {
     const request = pendingDirectLaunchRequest;
@@ -3246,6 +3314,17 @@ export function App(): JSX.Element {
         <div className="codec-migrated-toast" role="status">
           <span>
             {t("settings.video.codecMigratedNotice", { codec: codecMigratedNotice.fromCodec })}
+          </span>
+        </div>
+      )}
+      {/* Native codec auto-downgrade toast (AV1 → H265 → H264 session restart) */}
+      {codecDowngradeNotice && (
+        <div className="codec-migrated-toast" role="status">
+          <span>
+            {t("settings.video.codecDowngradeNotice", {
+              fromCodec: codecDowngradeNotice.fromCodec,
+              toCodec: codecDowngradeNotice.toCodec,
+            })}
           </span>
         </div>
       )}

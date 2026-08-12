@@ -746,6 +746,20 @@ pub enum Event {
         #[serde(rename = "thumbnailBase64", skip_serializing_if = "Option::is_none")]
         thumbnail_base64: Option<String>,
     },
+    /// The negotiated video codec produced zero decoded frames during startup
+    /// (every decoder candidate exhausted, keyframes and latency resyncs did
+    /// not help). Emitted ONCE per session so the Electron main process can
+    /// restart the session one step down the GFN codec ladder (`to_codec`):
+    /// AV1 → H265 → H264. Each downgrade relaunches the session with the next
+    /// codec, so a session that cannot decode the negotiated codec keeps
+    /// running instead of leaving the user on a black screen.
+    #[serde(rename = "codec-downgrade-request")]
+    CodecDowngradeRequest {
+        #[serde(rename = "fromCodec")]
+        from_codec: String,
+        #[serde(rename = "toCodec")]
+        to_codec: String,
+    },
     #[serde(rename = "error")]
     Error { code: String, message: String },
 }

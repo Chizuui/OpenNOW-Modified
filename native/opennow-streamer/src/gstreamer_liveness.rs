@@ -257,6 +257,10 @@ pub(crate) struct VideoLivenessState {
     startup_keyframe_requested: AtomicBool,
     startup_resync_requested: AtomicBool,
     startup_fatal_reported: AtomicBool,
+    /// Whether the AV1 → H265 codec downgrade request was already emitted for
+    /// this session. Guarded so the watchdog never spams the Electron main
+    /// process (the manager restarts the session with the fallback codec).
+    startup_downgrade_requested: AtomicBool,
     /// The current video sink element. The decoder-fallback rebuild replaces
     /// the whole decode chain (including the sink), so the watchdog must read
     /// the live sink from here instead of holding the element it captured at
@@ -339,6 +343,7 @@ impl VideoLivenessState {
             startup_keyframe_requested: AtomicBool::new(false),
             startup_resync_requested: AtomicBool::new(false),
             startup_fatal_reported: AtomicBool::new(false),
+            startup_downgrade_requested: AtomicBool::new(false),
             current_sink: Mutex::new(None),
             rtp_bitrate_probe_installed: AtomicBool::new(false),
             rtcp_send_probe_installed: AtomicBool::new(false),
@@ -425,6 +430,7 @@ impl VideoLivenessState {
         self.startup_resync_requested
             .store(false, Ordering::Relaxed);
         self.startup_fatal_reported.store(false, Ordering::Relaxed);
+        self.startup_downgrade_requested.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn update_hardware_acceleration(&self, value: impl Into<String>) {
@@ -668,6 +674,7 @@ impl VideoLivenessState {
         self.startup_resync_requested
             .store(false, Ordering::Relaxed);
         self.startup_fatal_reported.store(false, Ordering::Relaxed);
+        self.startup_downgrade_requested.store(false, Ordering::Relaxed);
     }
 
     fn zero_copy_d3d11(&self) -> bool {
@@ -975,6 +982,17 @@ impl VideoLivenessMonitor {
         target_bitrate_kbps: u32,
     ) {
         self.state.configure(context, target_bitrate_kbps);
+    }
+
+    /// Override the codec with the one actually negotiated in the WebRTC
+    /// answer (the requested codec from settings may differ, e.g. when the
+    /// server downgrades or the offer only carries another codec). The startup
+    /// watchdog uses the negotiated codec to decide whether an AV1
+    /// zero-frame startup warrants a session codec downgrade.
+    pub(crate) fn update_negotiated_codec(&self, codec: &str) {
+        if let Ok(mut current) = self.state.codec.lock() {
+            *current = codec.to_owned();
+        }
     }
 
     pub(crate) fn update_hardware_acceleration(&self, value: impl Into<String>) {
@@ -1559,6 +1577,46 @@ fn maybe_recover_video_startup(
         if try_decoder_chain_fallback(chain_rebuild, state, event_sender) {
             return;
         }
+        // Zero decoded frames across every decoder candidate means this
+        // client cannot decode the negotiated codec at all (e.g. the stock
+        // rtpav1depay drop-forever case on GFN AV1 payloads). Keyframes and
+        // latency resyncs cannot fix that — the only way to keep the session
+        // usable is to restart it one step down the GFN codec ladder
+        // (AV1 → H265 → H264). Each downgrade relaunches the session with the
+        // next codec; the fresh streamer process re-evaluates, so the ladder
+        // cascades naturally until H264 (the terminal codec, universally
+        // decodable) or a codec that actually decodes. Emit the request ONCE
+        // per session; the Electron main process stops the streamer and the
+        // renderer relaunches the game session with the fallback codec.
+        let codec = state
+            .codec
+            .lock()
+            .map(|codec| codec.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        let downgrade_to = codec_downgrade_target(&codec);
+        if let Some(downgrade_to) = downgrade_to {
+            if decoded_total == 0
+                && sink_total == 0
+                && !state
+                    .startup_downgrade_requested
+                    .swap(true, Ordering::Relaxed)
+            {
+                send_log(
+                    event_sender,
+                    "warn",
+                    format!(
+                        "Native {codec} startup produced zero decoded frames after {encoded_active_ms}ms of incoming RTP (decoded={decoded_total} sink={sink_total}) across every decoder candidate; requesting automatic codec downgrade to {downgrade_to} so the session can keep running."
+                    ),
+                );
+                if let Some(event_sender) = event_sender {
+                    let _ = event_sender.send(Event::CodecDowngradeRequest {
+                        from_codec: codec,
+                        to_codec: downgrade_to.to_owned(),
+                    });
+                }
+                return;
+            }
+        }
         send_log(
             event_sender,
             "error",
@@ -1574,6 +1632,23 @@ fn maybe_recover_video_startup(
                     .to_owned(),
             });
         }
+    }
+}
+
+/// GFN codec downgrade ladder: which codec to fall back to when `codec`
+/// produced zero decoded frames during startup (every decoder candidate
+/// exhausted). AV1 → H265 → H264; `None` for the terminal codec (H264) or
+/// unknown labels. Each downgrade relaunches the session with the next codec
+/// and the fresh streamer process re-evaluates, so the ladder cascades
+/// naturally until H264 (universally decodable) or a codec that actually
+/// decodes.
+fn codec_downgrade_target(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_uppercase().as_str() {
+        "AV1" => Some("H265"),
+        // Defensive: the negotiated codec always serializes as "H265", but
+        // some callers may pass the raw SDP spelling.
+        "H265" | "HEVC" => Some("H264"),
+        _ => None,
     }
 }
 
@@ -7412,5 +7487,22 @@ mod tests {
             median > 0 && median <= 100,
             "stale entry must be skipped; delta should be ~60ms, got {median}"
         );
+    }
+
+    /// The GFN codec downgrade ladder must cascade AV1 → H265 → H264 and stop
+    /// at the terminal codec: a zero-frame startup downgrades one step, the
+    /// relaunched session (new streamer process) re-evaluates with the next
+    /// codec, and H264 (universally decodable) has no further fallback.
+    #[test]
+    fn codec_downgrade_ladder_cascades_av1_to_h265_to_h264() {
+        assert_eq!(codec_downgrade_target("AV1"), Some("H265"));
+        assert_eq!(codec_downgrade_target("H265"), Some("H264"));
+        assert_eq!(codec_downgrade_target("HEVC"), Some("H264"));
+        assert_eq!(codec_downgrade_target("av1"), Some("H265")); // case-insensitive
+        // Terminal / unknown: no downgrade (the fatal startup error path
+        // runs instead).
+        assert_eq!(codec_downgrade_target("H264"), None);
+        assert_eq!(codec_downgrade_target(""), None);
+        assert_eq!(codec_downgrade_target("VP9"), None);
     }
 }

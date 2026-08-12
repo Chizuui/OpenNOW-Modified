@@ -412,6 +412,7 @@
       "fallbackCodec": "Códec de respaldo",
       "fallbackCodecHint": "Se usa cuando el códec seleccionado no se puede negociar. Auto mantiene todos los códecs compatibles como respaldo.",
       "codecMigratedNotice": "{{codec}} no es compatible con este dispositivo — se cambió a Auto.",
+      "codecDowngradeNotice": "{{fromCodec}} no pudo decodificarse en este dispositivo — la sesión se reinició con {{toCodec}}.",
       "decoder": "Decodificador",
       "encoder": "Codificador",
       "colorDepth": "Profundidad de color",

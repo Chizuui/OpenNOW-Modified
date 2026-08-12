@@ -412,6 +412,7 @@
       "fallbackCodec": "フォールバックコーデック",
       "fallbackCodecHint": "選択したコーデックをネゴシエートできない場合に使用されます。Auto では対応しているすべてのコーデックがフォールバックとして保持されます。",
       "codecMigratedNotice": "このデバイスでは{{codec}}をサポートしていないため、Autoに切り替えました。",
+      "codecDowngradeNotice": "このデバイスでは{{fromCodec}}をデコードできませんでした — {{toCodec}}でセッションを再開しました。",
       "decoder": "デコーダ",
       "encoder": "エンコーダ",
       "colorDepth": "色の濃さ",

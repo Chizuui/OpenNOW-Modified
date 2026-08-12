@@ -225,6 +225,17 @@ export type NativeStreamerEvent =
       thumbnailBase64?: string;
     }
   | {
+      /**
+       * The negotiated video codec produced zero decoded frames during
+       * startup (every decoder candidate exhausted). The manager forwards
+       * this to the renderer so it can restart the session with `toCodec`
+       * instead of leaving the user on a black screen.
+       */
+      type: "codec-downgrade-request";
+      fromCodec: string;
+      toCodec: string;
+    }
+  | {
       type: "error";
       code?: string;
       message: string;
