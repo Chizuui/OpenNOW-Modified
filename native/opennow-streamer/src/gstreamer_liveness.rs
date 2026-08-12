@@ -268,6 +268,23 @@ pub(crate) struct VideoLivenessState {
     /// torn down, only the chain elements), so re-adding it would double-count
     /// encoded bytes. Guarded per monitor instance.
     rtp_bitrate_probe_installed: AtomicBool,
+    /// Whether the outgoing-RTCP observability probe is already installed on
+    /// the webrtcbin rtpbin sessions. The rtpbin/sessions outlive decoder
+    /// rebuilds, so re-adding would double-count. Guarded per monitor.
+    rtcp_send_probe_installed: AtomicBool,
+    /// Cumulative counts of the RTCP packets the client actually SENDS to the
+    /// server (RR/SR/transport-cc feedback/NACK/PLI/FIR), classified by
+    /// `classify_rtcp_messages`. GFN's server BWE (`enableBandwidthEstimation`)
+    /// is driven by transport-cc feedback: if these stay at 0 the server runs
+    /// blind and holds a conservative bitrate (~3.4 Mbps observed) no matter
+    /// what the NVST SDP requested.
+    rtcp_sent_sr: AtomicU64,
+    rtcp_sent_rr: AtomicU64,
+    rtcp_sent_twcc: AtomicU64,
+    rtcp_sent_nack: AtomicU64,
+    rtcp_sent_pli: AtomicU64,
+    rtcp_sent_fir: AtomicU64,
+    rtcp_sent_other: AtomicU64,
     /// EMA (ms) of the effective network RTT (stats-channel server RTT, or the
     /// local RTCP measurement when available), used to resize the pre-decode
     /// jitter buffer adaptively.
@@ -324,6 +341,14 @@ impl VideoLivenessState {
             startup_fatal_reported: AtomicBool::new(false),
             current_sink: Mutex::new(None),
             rtp_bitrate_probe_installed: AtomicBool::new(false),
+            rtcp_send_probe_installed: AtomicBool::new(false),
+            rtcp_sent_sr: AtomicU64::new(0),
+            rtcp_sent_rr: AtomicU64::new(0),
+            rtcp_sent_twcc: AtomicU64::new(0),
+            rtcp_sent_nack: AtomicU64::new(0),
+            rtcp_sent_pli: AtomicU64::new(0),
+            rtcp_sent_fir: AtomicU64::new(0),
+            rtcp_sent_other: AtomicU64::new(0),
             network_rtt_ema_ms: AtomicU32::new(0),
             pre_decode_depth: AtomicU32::new(
                 crate::gstreamer_pipeline::VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
@@ -406,6 +431,34 @@ impl VideoLivenessState {
         if let Ok(mut hardware_acceleration) = self.hardware_acceleration.lock() {
             *hardware_acceleration = value.into();
         }
+    }
+
+    /// Add one outgoing RTCP packet (already classified) to the send counters.
+    /// Fired by the pad probe on the rtpbin sessions' RTCP src pads.
+    pub(crate) fn record_rtcp_message(&self, counts: RtcpMessageCounts) {
+        self.rtcp_sent_sr.fetch_add(counts.sr, Ordering::Relaxed);
+        self.rtcp_sent_rr.fetch_add(counts.rr, Ordering::Relaxed);
+        self.rtcp_sent_twcc.fetch_add(counts.twcc, Ordering::Relaxed);
+        self.rtcp_sent_nack.fetch_add(counts.nack, Ordering::Relaxed);
+        self.rtcp_sent_pli.fetch_add(counts.pli, Ordering::Relaxed);
+        self.rtcp_sent_fir.fetch_add(counts.fir, Ordering::Relaxed);
+        self.rtcp_sent_other.fetch_add(counts.other, Ordering::Relaxed);
+    }
+
+    /// Human-readable snapshot of the outgoing RTCP counters; `none` when the
+    /// client has not sent a single RTCP packet (feedback path dead).
+    pub(crate) fn rtcp_sent_summary(&self) -> String {
+        let sr = self.rtcp_sent_sr.load(Ordering::Relaxed);
+        let rr = self.rtcp_sent_rr.load(Ordering::Relaxed);
+        let twcc = self.rtcp_sent_twcc.load(Ordering::Relaxed);
+        let nack = self.rtcp_sent_nack.load(Ordering::Relaxed);
+        let pli = self.rtcp_sent_pli.load(Ordering::Relaxed);
+        let fir = self.rtcp_sent_fir.load(Ordering::Relaxed);
+        let other = self.rtcp_sent_other.load(Ordering::Relaxed);
+        if sr + rr + twcc + nack + pli + fir + other == 0 {
+            return "none".to_owned();
+        }
+        format!("SR={sr} RR={rr} TWCC={twcc} NACK={nack} PLI={pli} FIR={fir} other={other}")
     }
 
     pub(crate) fn record_encoded_buffer(&self, size: usize) {
@@ -932,6 +985,14 @@ impl VideoLivenessMonitor {
         self.state.record_encoded_buffer(size);
     }
 
+    pub(crate) fn record_rtcp_message(&self, counts: RtcpMessageCounts) {
+        self.state.record_rtcp_message(counts);
+    }
+
+    pub(crate) fn rtcp_sent_summary(&self) -> String {
+        self.state.rtcp_sent_summary()
+    }
+
     pub(crate) fn record_audio_buffer(&self) {
         self.state.record_audio_buffer();
     }
@@ -1242,7 +1303,7 @@ fn run_video_liveness_watchdog(
                     &event_sender,
                     "info",
                     format!(
-                        "[NetworkHealth] server rtt={}ms loss={:.4}% rtcp={} sinkDrop={:.2}% sink={:.1}fps bitrate={:.1}Mbps",
+                        "[NetworkHealth] server rtt={}ms loss={:.4}% rtcp={} sinkDrop={:.2}% sink={:.1}fps bitrate={:.1}Mbps rtcp_sent={}",
                         server_rtt,
                         loss_percent,
                         local_rtcp_rtt_ms
@@ -1251,6 +1312,7 @@ fn run_video_liveness_watchdog(
                         drop_percent,
                         rates.sink_fps,
                         rates.encoded_kbps / 1000.0,
+                        state.rtcp_sent_summary(),
                     ),
                 );
             }
@@ -2764,6 +2826,197 @@ pub(crate) fn sink_rendered_frame_count(sink: &gst::Element) -> Option<u64> {
 /// Current number of buffers in a queue element (`current-level-buffers`).
 pub(crate) fn read_queue_level(queue: &gst::Element) -> u32 {
     queue.property::<u32>("current-level-buffers")
+}
+
+/// True once the pad's sticky event list shows the mandatory media sequence
+/// STREAM_START + CAPS. Used as the deterministic "branch is ready" gate
+/// before the recording valve opens after a rebuild: a queue that receives a
+/// live buffer with no stream-start yet logs the field warning `Got data flow
+/// before stream-start` and the branch can stall so badly that stop() times
+/// out. CAPS is sticky and arrives AFTER stream-start in the replay order, so
+/// its presence proves the whole sequence landed.
+pub(crate) fn pad_has_media_sticky_events(pad: &gst::Pad) -> bool {
+    let mut seen_stream_start = false;
+    let mut seen_caps = false;
+    pad.sticky_events_foreach(|event| {
+        match event.type_() {
+            gst::EventType::StreamStart => seen_stream_start = true,
+            gst::EventType::Caps => seen_caps = true,
+            _ => {}
+        }
+        if seen_stream_start && seen_caps {
+            std::ops::ControlFlow::Break(gst::EventForeachAction::Keep)
+        } else {
+            std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
+        }
+    });
+    seen_stream_start && seen_caps
+}
+
+/// One outgoing RTCP message's classification (per RTCP packet walk).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RtcpMessageCounts {
+    pub(crate) sr: u64,
+    pub(crate) rr: u64,
+    pub(crate) twcc: u64,
+    pub(crate) nack: u64,
+    pub(crate) pli: u64,
+    pub(crate) fir: u64,
+    pub(crate) other: u64,
+}
+
+/// Walk a (possibly compound) RTCP buffer and classify each message by packet
+/// type. Used by the outgoing-RTCP observability probe so we can SEE whether
+/// the client's feedback (RR, and especially transport-cc) actually reaches
+/// the GFN server — the server's BWE is blind without it and holds a
+/// conservative bitrate. Pure function, unit-tested.
+///
+/// RTCP message header: byte0 = V(2)|P(1)|count/FMT(5), byte1 = PT,
+/// bytes2-3 = length in 32-bit words minus 1. PT 200=SR, 201=RR, 205=RTPFB
+/// (FMT 1=NACK, 15=transport-cc), 206=PSFB (FMT 1=PLI, 4=FIR).
+pub(crate) fn classify_rtcp_messages(buf: &[u8]) -> RtcpMessageCounts {
+    let mut counts = RtcpMessageCounts::default();
+    let mut offset = 0usize;
+    while offset + 4 <= buf.len() {
+        let pt = buf[offset + 1];
+        let length_words =
+            u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let message_len = (length_words + 1).saturating_mul(4);
+        // Only count a message whose full body is present; a truncated tail
+        // (partial last message) is dropped instead of misread.
+        if message_len < 4 || offset + message_len > buf.len() {
+            break;
+        }
+        let fmt = buf[offset] & 0x1F;
+        match pt {
+            200 => counts.sr += 1,
+            201 => counts.rr += 1,
+            205 => match fmt {
+                1 => counts.nack += 1,
+                15 => counts.twcc += 1,
+                _ => counts.other += 1,
+            },
+            206 => match fmt {
+                1 => counts.pli += 1,
+                4 => counts.fir += 1,
+                _ => counts.other += 1,
+            },
+            _ => counts.other += 1,
+        }
+        offset += message_len;
+    }
+    counts
+}
+
+/// Probe the webrtcbin's internal rtpbin rtpsession elements and count every
+/// RTCP packet the client SENDS to the server (RR/SR/transport-cc/NACK/PLI/
+/// FIR), classified by `classify_rtcp_messages`. The sessions outlive
+/// decoder-chain rebuilds, so the probe is installed once per monitor
+/// (guarded by `rtcp_send_probe_installed`, like the RTP bitrate probe). The
+/// counters land in the NetworkHealth log (`rtcp_sent=...`), turning "is the
+/// server BWE blind?" from speculation into data: TWCC stays 0 when the
+/// feedback path is dead.
+pub(crate) fn watch_rtcp_send_stats(
+    pipeline: &gst::Pipeline,
+    video_liveness: VideoLivenessMonitor,
+    event_sender: &Option<Sender<Event>>,
+) {
+    if video_liveness
+        .state()
+        .rtcp_send_probe_installed
+        .swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    let Some(webrtc) = pipeline.by_name("opennow-webrtcbin") else {
+        return;
+    };
+    let Ok(webrtc_bin) = webrtc.downcast::<gst::Bin>() else {
+        return;
+    };
+    let Some(rtpbin) = webrtc_bin.children().into_iter().find(|child| {
+        child
+            .factory()
+            .is_some_and(|factory| factory.name() == "rtpbin")
+    }) else {
+        return;
+    };
+    let Ok(rtpbin_bin) = rtpbin.downcast::<gst::Bin>() else {
+        return;
+    };
+    let mut probed = 0usize;
+    let mut configured_twcc = 0usize;
+    for session in rtpbin_bin.children() {
+        if !session
+            .factory()
+            .is_some_and(|factory| factory.name() == "rtpsession")
+        {
+            continue;
+        }
+        // Harden the feedback path: GStreamer's default TWCC policy sends
+        // transport-cc feedback only when the received RTP packet has its
+        // marker bit set (rtptwcc.c `rtp_twcc_manager_recv_packet`). If the
+        // GFN server does not set the marker bit, TWCC feedback is never
+        // generated and the server BWE stays blind (~3.4 Mbps regardless of
+        // the negotiated cap). A fixed interval forces periodic feedback
+        // (100 ms -> ~10 reports/s, negligible RTCP overhead) no matter what
+        // the sender does with the marker bit.
+        // The writable `twcc-feedback-interval` lives on the internal
+        // RTPSession GObject, not on the rtpsession element wrapper
+        // (gst-inspect on this runtime only exposes `twcc-stats` on the
+        // element). Reach through the readable `internal-session` property.
+        // `set_property` panics on an unknown property, so guard for runtimes
+        // without it and fall back to the default marker-bit behavior — the
+        // RTCP send probe below still reports whether any feedback is leaving
+        // at all.
+        if session.find_property("internal-session").is_some() {
+            let internal_session: gst::glib::Object = session.property("internal-session");
+            if internal_session.find_property("twcc-feedback-interval").is_some() {
+                internal_session.set_property(
+                    "twcc-feedback-interval",
+                    100u64 * gst::ClockTime::MSECOND,
+                );
+                configured_twcc += 1;
+            }
+        }
+        // Outgoing RTCP leaves the session through these src pads: the
+        // receive-path session emits RR + transport-cc/NACK/PLI feedback on
+        // `recv_rtcp_src`, and the send-path session (mic uplink) emits SRs on
+        // `send_rtcp_src`. Probing both covers every RTCP byte we push to the
+        // server without double-counting (the two pads carry distinct packets).
+        for pad_name in ["recv_rtcp_src", "send_rtcp_src"] {
+            let Some(pad) = session.static_pad(pad_name) else {
+                continue;
+            };
+            let monitor = video_liveness.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if let Some(buffer) = info.buffer() {
+                    if let Ok(mapped) = buffer.map_readable() {
+                        monitor.record_rtcp_message(classify_rtcp_messages(mapped.as_slice()));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+            probed += 1;
+        }
+    }
+    if probed > 0 {
+        send_log(
+            event_sender,
+            "info",
+            format!(
+                "Native RTCP send observability armed on {probed} rtpbin session pad(s); feedback counters will appear in NetworkHealth. TWCC feedback interval forced on {configured_twcc} session(s) (100 ms) so transport-cc reports flow even if the server never sets the RTP marker bit."
+            ),
+        );
+    } else if configured_twcc > 0 {
+        send_log(
+            event_sender,
+            "info",
+            format!(
+                "TWCC feedback interval forced on {configured_twcc} rtpbin session(s) (100 ms) but no RTCP send pads probed yet."
+            ),
+        );
+    }
 }
 
 pub(crate) fn caps_framerate_summary(caps: &str) -> Option<String> {
@@ -6953,6 +7206,73 @@ mod tests {
         assert_eq!(rtcp_jitter_to_ms(u32::MAX, 90_000), None);
     }
 
+    /// Build one RTCP message: byte0 = version(2)|P(0)|count/FMT(5),
+    /// byte1 = PT, bytes2-3 = length words minus 1, then `payload` padded to
+    /// a 32-bit boundary.
+    fn rtcp_message(count_or_fmt: u8, pt: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![count_or_fmt, pt, 0, 0];
+        let payload_len = payload.len();
+        let padded = payload_len.div_ceil(4) * 4;
+        body.extend_from_slice(payload);
+        body.resize(4 + padded, 0);
+        let length_words = (body.len() / 4 - 1) as u16;
+        body[2] = (length_words >> 8) as u8;
+        body[3] = (length_words & 0xFF) as u8;
+        body
+    }
+
+    #[test]
+    fn classify_rtcp_messages_counts_feedback_types() {
+        // Receiver Report (PT 201, RC 1, one 24-byte report block).
+        let rr = rtcp_message(1, 201, &[0u8; 24]);
+        // Sender Report (PT 200, RC 0).
+        let sr = rtcp_message(0, 200, &[0u8; 20]);
+        // Transport-wide congestion control feedback: RTPFB PT 205, FMT 15.
+        let twcc = rtcp_message(15, 205, &[0u8; 12]);
+        // Generic NACK: RTPFB PT 205, FMT 1.
+        let nack = rtcp_message(1, 205, &[0u8; 8]);
+        // Picture Loss Indication: PSFB PT 206, FMT 1.
+        let pli = rtcp_message(1, 206, &[0u8; 8]);
+        // Full Intra Request: PSFB PT 206, FMT 4.
+        let fir = rtcp_message(4, 206, &[0u8; 8]);
+        // SDES (PT 202) — counts as other.
+        let sdes = rtcp_message(1, 202, &[0u8; 8]);
+
+        let mut compound = Vec::new();
+        compound.extend_from_slice(&rr);
+        compound.extend_from_slice(&sr);
+        compound.extend_from_slice(&twcc);
+        compound.extend_from_slice(&nack);
+        compound.extend_from_slice(&pli);
+        compound.extend_from_slice(&fir);
+        compound.extend_from_slice(&sdes);
+
+        let counts = classify_rtcp_messages(&compound);
+        assert_eq!(counts.sr, 1);
+        assert_eq!(counts.rr, 1);
+        assert_eq!(counts.twcc, 1);
+        assert_eq!(counts.nack, 1);
+        assert_eq!(counts.pli, 1);
+        assert_eq!(counts.fir, 1);
+        assert_eq!(counts.other, 1);
+    }
+
+    #[test]
+    fn classify_rtcp_messages_handles_truncated_and_empty_buffers() {
+        // Empty buffer → all zero.
+        let counts = classify_rtcp_messages(&[]);
+        assert_eq!(counts, RtcpMessageCounts::default());
+        // Truncated header (fewer than 4 bytes) → not misread, all zero.
+        let counts = classify_rtcp_messages(&[0x80, 0xC9]);
+        assert_eq!(counts, RtcpMessageCounts::default());
+        // Truncated MID-message (length says 4 words but only 2 bytes follow)
+        // → the walk stops without counting garbage.
+        let mut truncated = rtcp_message(15, 205, &[0u8; 12]);
+        truncated.truncate(6);
+        let counts = classify_rtcp_messages(&truncated);
+        assert_eq!(counts, RtcpMessageCounts::default());
+    }
+
     #[test]
     fn median_of_deltas_ignores_a_single_inflated_spike() {
         // 31 healthy ~8ms deltas + one 5000ms stall artifact. A median stays
@@ -7028,6 +7348,36 @@ mod tests {
         // (the median holds its previous value instead of spiking).
         state.record_sink_buffer();
         assert_eq!(state.decode_present_median_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// Runtime round-trip for the TWCC hardening: the writable
+    /// `twcc-feedback-interval` lives on the internal RTPSession GObject (not
+    /// on the rtpsession element), so this proves the bundled GStreamer
+    /// actually exposes it there — otherwise forcing periodic transport-cc
+    /// feedback silently no-ops and the server BWE stays blind.
+    #[test]
+    fn twcc_feedback_interval_roundtrips_on_internal_session() {
+        gst::init().expect("gstreamer init");
+        let Some(session) = gst::ElementFactory::make("rtpsession").build().ok() else {
+            return; // factory missing (runtime without rtpmanager) — nothing to verify
+        };
+        assert!(
+            session.find_property("internal-session").is_some(),
+            "rtpsession element must expose the readable internal-session property"
+        );
+        let internal: gst::glib::Object = session.property("internal-session");
+        assert!(
+            internal.find_property("twcc-feedback-interval").is_some(),
+            "internal RTPSession must expose twcc-feedback-interval (the element wrapper does not)"
+        );
+        let interval_ns = 100u64 * gst::ClockTime::MSECOND.nseconds();
+        internal.set_property("twcc-feedback-interval", interval_ns);
+        let read_back: u64 = internal.property("twcc-feedback-interval");
+        assert_eq!(
+            read_back,
+            interval_ns,
+            "twcc-feedback-interval must round-trip through rtp_twcc_manager_set_feedback_interval"
+        );
     }
 
     /// Defensive expiry inside record_sink_buffer: an entry older than the

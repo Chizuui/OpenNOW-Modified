@@ -745,6 +745,75 @@ pub fn munge_answer_sdp(sdp: &str, max_bitrate_kbps: u32) -> String {
     result.join(ending)
 }
 
+/// Replace the `b=AS:<kbps>` value in the VIDEO m-line section of an answer
+/// SDP with the given ceiling, leaving the audio m-line's b=AS (128 kbps)
+/// untouched. Used when re-sending the answer with an updated bitrate cap
+/// mid-session so the b=AS hint stays consistent with the rebuilt nvstSdp.
+pub fn rewrite_answer_video_bitrate(sdp: &str, max_bitrate_kbps: u32) -> String {
+    let ending = line_ending(sdp);
+    let lines = split_lines_lossless(sdp);
+    let mut in_video_section = false;
+    let mut result = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.starts_with("m=") {
+            in_video_section = line.starts_with("m=video");
+        }
+        if in_video_section {
+            if let Some(rest) = line.strip_prefix("b=AS:") {
+                if rest.parse::<u32>().is_ok() {
+                    result.push(format!("b=AS:{max_bitrate_kbps}"));
+                    continue;
+                }
+            }
+        }
+        result.push(line.to_owned());
+    }
+    result.join(ending)
+}
+
+/// Rewrite per-payload `a=rtcp-fb:<pt> transport-cc` into the wildcard form
+/// `a=rtcp-fb:* transport-cc` in the WebRTC answer.
+///
+/// GFN offers transport-cc feedback only for its flexfec payload (pt 98), not
+/// for the video payload itself, so GStreamer's rtpbin never attaches TWCC to
+/// the video source — rtpsession only generates transport-wide feedback when
+/// the receiving session's caps carry `rtcp-fb-transport-cc` for that payload
+/// (the observed receive caps said `a-rtcp-fb="98 transport-cc"` while the
+/// video payload kept a bare `rtcp-fb-transport-cc` that never turns on
+/// feedback generation). The wildcard declares transport-cc for EVERY payload
+/// in the m-line — valid per RFC 4585: the mechanism itself was already
+/// offered, the wildcard just applies it to all payload types — so rtpbin
+/// links TWCC to the video source and the client's transport-cc feedback
+/// actually reaches the server. Without it the server BWE
+/// (`enableBandwidthEstimation`) runs blind and holds a conservative bitrate
+/// no matter what the NVST SDP requested (~3.4 Mbps observed with 15 Mbps
+/// requested). Non-transport-cc feedback lines (nack / pli / fir / remb) are
+/// left untouched; a wildcard that already exists is left as-is.
+pub fn rewrite_transport_cc_rtcp_fb(answer_sdp: &str) -> String {
+    let ending = line_ending(answer_sdp);
+    let lines = split_lines_lossless(answer_sdp);
+    let mut in_media_section = false;
+    let mut result = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.starts_with("m=") {
+            in_media_section = true;
+        }
+        if in_media_section {
+            if let Some(rest) = line.strip_prefix("a=rtcp-fb:") {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let pt = parts.next().unwrap_or_default();
+                let feedback = parts.next().unwrap_or_default();
+                if pt != "*" && feedback == "transport-cc" {
+                    result.push("a=rtcp-fb:* transport-cc".to_owned());
+                    continue;
+                }
+            }
+        }
+        result.push(line.to_owned());
+    }
+    result.join(ending)
+}
+
 /// RED audio redundancy data the server advertised for one audio m-line.
 #[derive(Debug, Clone)]
 struct RedAudioSection {
@@ -2003,5 +2072,102 @@ mod tests {
         assert!(munged.contains("a=rtpmap:63 red/48000/2\r\na=fmtp:63 111/111"));
         // No bare-LF line slipped in.
         assert!(!munged.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn rewrite_answer_video_bitrate_updates_only_the_video_b_as() {
+        let answer = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 103",
+            "a=rtpmap:103 H265/90000",
+            "b=AS:15000",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=rtpmap:111 opus/48000/2",
+            "b=AS:128",
+        ]
+        .join("\r\n");
+        let rewritten = rewrite_answer_video_bitrate(&answer, 8000);
+        assert!(rewritten.contains("b=AS:8000\r\nm=audio"));
+        assert!(rewritten.contains("\r\nb=AS:128"));
+        // No bare-LF slipped in.
+        assert!(!rewritten.replace("\r\n", "").contains('\n'));
+        // No-op when the video m-line has no b=AS.
+        let no_as = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 103",
+            "a=rtpmap:103 H265/90000",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=rtpmap:111 opus/48000/2",
+            "b=AS:128",
+        ]
+        .join("\n");
+        assert_eq!(rewrite_answer_video_bitrate(&no_as, 8000), no_as);
+    }
+
+    #[test]
+    fn rewrites_transport_cc_rtcp_fb_to_wildcard() {
+        // Mirrors the GFN offer shape: transport-cc declared only for the
+        // flexfec payload (98), video payload 103 keeps only nack/pli/fir.
+        let answer = [
+            "v=0",
+            "o=- 1 1 IN IP4 0.0.0.0",
+            "s=-",
+            "t=0 0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 103 98",
+            "c=IN IP4 0.0.0.0",
+            "a=rtpmap:103 H265/90000",
+            "a=rtpmap:98 flexfec-03/90000",
+            "a=rtcp-fb:98 transport-cc",
+            "a=rtcp-fb:103 nack",
+            "a=rtcp-fb:103 nack pli",
+            "a=rtcp-fb:103 ccm fir",
+            "a=rtcp-fb:98 goog-remb",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "c=IN IP4 0.0.0.0",
+            "a=rtpmap:111 opus/48000/2",
+            "a=rtcp-fb:111 transport-cc",
+            "a=rtcp-fb:111 nack",
+        ]
+        .join("\n");
+
+        let rewritten = rewrite_transport_cc_rtcp_fb(&answer);
+        assert!(rewritten.contains("a=rtcp-fb:* transport-cc"));
+        // Non-transport-cc feedback is untouched.
+        assert!(rewritten.contains("a=rtcp-fb:103 nack"));
+        assert!(rewritten.contains("a=rtcp-fb:103 nack pli"));
+        assert!(rewritten.contains("a=rtcp-fb:103 ccm fir"));
+        assert!(rewritten.contains("a=rtcp-fb:98 goog-remb"));
+        // Every per-payload transport-cc line (video AND audio) is gone.
+        assert!(!rewritten.contains("a=rtcp-fb:98 transport-cc"));
+        assert!(!rewritten.contains("a=rtcp-fb:111 transport-cc"));
+        // Wildcard is idempotent.
+        assert_eq!(rewrite_transport_cc_rtcp_fb(&rewritten), rewritten);
+    }
+
+    #[test]
+    fn rewrite_transport_cc_is_noop_without_transport_cc() {
+        let answer = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 103",
+            "a=rtpmap:103 H265/90000",
+            "a=rtcp-fb:103 nack pli",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=rtpmap:111 opus/48000/2",
+            "a=rtcp-fb:111 nack",
+        ]
+        .join("\n");
+        assert_eq!(rewrite_transport_cc_rtcp_fb(&answer), answer);
+    }
+
+    #[test]
+    fn rewrite_transport_cc_preserves_crlf() {
+        let answer = [
+            "m=video 9 UDP/TLS/RTP/SAVPF 103 98",
+            "a=rtpmap:103 H265/90000",
+            "a=rtcp-fb:98 transport-cc",
+        ]
+        .join("\r\n");
+        let rewritten = rewrite_transport_cc_rtcp_fb(&answer);
+        assert!(rewritten.contains("a=rtcp-fb:* transport-cc"));
+        // No bare-LF line slipped in (CRLF preserved throughout).
+        assert!(!rewritten.replace("\r\n", "").contains('\n'));
+        assert!(rewritten.starts_with("m=video 9 UDP/TLS/RTP/SAVPF 103 98\r\na=rtpmap:103 H265/90000\r\n"));
     }
 }

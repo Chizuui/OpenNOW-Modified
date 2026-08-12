@@ -20,8 +20,10 @@ use crate::protocol::{
 use gstreamer as gst;
 use crate::sdp::{
     build_nvst_sdp_for_answer, ensure_audio_red_in_answer, extract_negotiated_video_codec,
-    munge_answer_sdp, restore_h265_fmtp_params, rewrite_ice_candidate_endpoint,
+    munge_answer_sdp, restore_h265_fmtp_params, rewrite_answer_video_bitrate,
+    rewrite_ice_candidate_endpoint, NvstParams,
 };
+use std::sync::{mpsc, Arc};
 use std::sync::mpsc::Sender;
 
 pub(crate) fn send_log(event_sender: &Option<Sender<Event>>, level: &'static str, message: String) {
@@ -36,10 +38,114 @@ pub(crate) fn send_log(event_sender: &Option<Sender<Event>>, level: &'static str
 pub struct GstreamerBackend {
     active_context: Option<NativeStreamerSessionContext>,
     pending_remote_ice: Vec<IceCandidatePayload>,
-    pipeline: Option<GstreamerPipeline>,
+    pipeline: Option<Arc<GstreamerPipeline>>,
     event_sender: Option<Sender<Event>>,
     remote_description_set: bool,
     render_surface: Option<NativeRenderSurface>,
+    recording_worker: RecordingWorkerHandle,
+    /// The NVST params of the last negotiated offer, kept so a mid-session
+    /// max-bitrate change can rebuild the nvstSdp with the new
+    /// `vqos.bw.maximumBitrateKbps` and re-send the answer to the server
+    /// (the "request a re-offer" path) without waiting for a reconnect.
+    last_nvst_params: Option<NvstParams>,
+    /// The final munged answer SDP of the last negotiation (b=AS + H265 fmtp
+    /// + RED audio applied), re-sent unchanged (except its b=AS video line)
+    /// when the bitrate cap changes mid-session.
+    last_answer_sdp: Option<String>,
+}
+
+/// Recording work (valve open/close, branch rebuild, drain + EOS finalize)
+/// runs on a dedicated worker thread instead of the command loop. A recording
+/// stop can block for the whole drain/flush budget (up to ~11 s) and — when
+/// the branch is wedged — forever inside a GStreamer call; running it inline
+/// froze input, surface, and bitrate commands behind it (the field "record
+/// affects input / input-paused timeouts" bug: every `input-paused` and
+/// `surface` request timed out while stop-recording held the loop). With the
+/// worker, the command loop replies immediately and the app stays fully
+/// responsive while the recording finalizes (or fails) in the background.
+/// Commands are FIFO on one thread, so start/stop ordering is preserved and
+/// the `recording-finished` event (emitted inside the pipeline, after the
+/// muxer EOS) still lands strictly after every `recording-chunk`.
+#[derive(Debug)]
+struct RecordingWorkerHandle {
+    tx: Sender<RecordingCommand>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum RecordingCommand {
+    Start {
+        pipeline: Arc<GstreamerPipeline>,
+        event_sender: Option<Sender<Event>>,
+    },
+    Stop {
+        pipeline: Arc<GstreamerPipeline>,
+        finalize: bool,
+        event_sender: Option<Sender<Event>>,
+    },
+    Shutdown,
+}
+
+impl RecordingWorkerHandle {
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::channel::<RecordingCommand>();
+        let join = std::thread::Builder::new()
+            .name("recording-worker".to_owned())
+            .spawn(move || {
+                for command in rx {
+                    match command {
+                        RecordingCommand::Start {
+                            pipeline,
+                            event_sender,
+                        } => {
+                            if let Err(message) = pipeline.start_recording() {
+                                if let Some(sender) = &event_sender {
+                                    let _ = sender.send(Event::Error {
+                                        code: "recording-start-failed".to_owned(),
+                                        message,
+                                    });
+                                }
+                            }
+                        }
+                        RecordingCommand::Stop {
+                            pipeline,
+                            finalize,
+                            event_sender,
+                        } => {
+                            if let Err(message) = pipeline.stop_recording(finalize) {
+                                if let Some(sender) = &event_sender {
+                                    let _ = sender.send(Event::Error {
+                                        code: "recording-stop-failed".to_owned(),
+                                        message,
+                                    });
+                                }
+                            }
+                        }
+                        RecordingCommand::Shutdown => break,
+                    }
+                }
+            })
+            .expect("recording worker thread spawn");
+        Self {
+            tx,
+            join: Some(join),
+        }
+    }
+
+    /// Stop the worker and wait (bounded) for it to drain pending recording
+    /// work. A wedged GStreamer call can keep the thread alive past the
+    /// budget; the JoinHandle is then dropped (thread detached) rather than
+    /// blocking session teardown on it.
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(RecordingCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(3_000);
+            while !join.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 impl GstreamerBackend {
@@ -51,12 +157,19 @@ impl GstreamerBackend {
             event_sender,
             remote_description_set: false,
             render_surface: None,
+            recording_worker: RecordingWorkerHandle::spawn(),
+            last_nvst_params: None,
+            last_answer_sdp: None,
         }
     }
 
     fn replay_pending_remote_ice(&mut self) -> Vec<Event> {
         let candidates = std::mem::take(&mut self.pending_remote_ice);
-        let Some(pipeline) = self.pipeline.as_mut() else {
+        let Some(pipeline) = self
+            .pipeline
+            .as_mut()
+            .and_then(|arc| Arc::get_mut(arc))
+        else {
             self.pending_remote_ice = candidates;
             return Vec::new();
         };
@@ -140,7 +253,7 @@ impl NativeStreamerBackend for GstreamerBackend {
         let pipeline =
             match GstreamerPipeline::build(self.event_sender.clone(), &context.session.ice_servers)
             {
-                Ok(pipeline) => pipeline,
+                Ok(pipeline) => Arc::new(pipeline),
                 Err(message) => {
                     return BackendReply {
                         events: vec![Event::Error {
@@ -157,9 +270,23 @@ impl NativeStreamerBackend for GstreamerBackend {
                 }
             };
 
-        if let Some(old_pipeline) = self.pipeline.take() {
-            if let Err(message) = old_pipeline.stop() {
-                eprintln!("[NativeStreamer] {message}");
+        if let Some(mut old_pipeline) = self.pipeline.take() {
+            // No recording command may hold a clone of the old pipeline at
+            // this point: `stop` (session end) shuts the worker down before
+            // tearing down, and the worker drops each per-command Arc when the
+            // command finishes. When a wedged recording worker still holds a
+            // clone (should not happen — it is drained before `stop`), skip
+            // the explicit teardown; the process exits right after session
+            // end and GStreamer cleans up on drop.
+            match Arc::get_mut(&mut old_pipeline) {
+                Some(old_pipeline) => {
+                    if let Err(message) = old_pipeline.stop() {
+                        eprintln!("[NativeStreamer] {message}");
+                    }
+                }
+                None => eprintln!(
+                    "[NativeStreamer] Recording worker still holds the previous pipeline; skipping explicit teardown."
+                ),
             }
         }
 
@@ -212,7 +339,11 @@ impl NativeStreamerBackend for GstreamerBackend {
                 .map(|ctx| ctx.settings.enable_cloud_gsync)
                 .unwrap_or(false);
             let present_max_fps = resolve_present_max_fps(cloud_gsync_enabled);
-            if let Some(pipeline) = self.pipeline.as_mut() {
+            if let Some(pipeline) = self
+                .pipeline
+                .as_mut()
+                .and_then(|arc| Arc::get_mut(arc))
+            {
                 pipeline.set_present_max_fps(present_max_fps);
                 pipeline.set_d3d_fullscreen_sink(d3d_fullscreen);
                 if let Some(ctx) = self.active_context.as_ref() {
@@ -292,7 +423,11 @@ impl NativeStreamerBackend for GstreamerBackend {
             }
         };
 
-        let Some(pipeline) = self.pipeline.as_mut() else {
+        let Some(pipeline) = self
+            .pipeline
+            .as_mut()
+            .and_then(|arc| Arc::get_mut(arc))
+        else {
             return BackendReply {
                 events,
                 response: Some(Response::Error {
@@ -484,6 +619,13 @@ impl NativeStreamerBackend for GstreamerBackend {
                 .to_owned(),
         });
 
+        // Remember the negotiated params + final answer so a mid-session max
+        // bitrate change can rebuild the nvstSdp with the new cap and re-send
+        // the answer to the server (the "request a re-offer" path) instead of
+        // waiting for the next natural offer/reconnect.
+        self.last_nvst_params = Some(prepared.nvst_params.clone());
+        self.last_answer_sdp = Some(answer_sdp.clone());
+
         BackendReply {
             events,
             response: Some(Response::Answer {
@@ -504,7 +646,11 @@ impl NativeStreamerBackend for GstreamerBackend {
         let candidate = self.rewrite_remote_ice_candidate(candidate);
 
         if self.remote_description_set {
-            if let Some(pipeline) = self.pipeline.as_mut() {
+            if let Some(pipeline) = self
+                .pipeline
+                .as_mut()
+                .and_then(|arc| Arc::get_mut(arc))
+            {
                 if let Err(message) = pipeline.add_remote_ice(&candidate) {
                     return BackendReply::response(Response::Error {
                         id: Some(command.id),
@@ -584,12 +730,53 @@ impl NativeStreamerBackend for GstreamerBackend {
             }
         }
 
+        // Mid-session re-offer: rebuild the nvstSdp with the new cap and hand
+        // back a re-answer the Electron main pushes to the server immediately
+        // (the same channel used for the session-start answer). The server
+        // reads `vqos.bw.maximumBitrateKbps` from nvstSdp in answer messages;
+        // whether it honors a mid-session re-send varies by server build, and
+        // the next natural offer/reconnect still applies it either way. The
+        // answer SDP itself is unchanged apart from its video b=AS line.
+        let mut events = Vec::new();
+        let mut response = Response::Ok { id: command.id.clone() };
+        if let (Some(nvst_params), Some(answer_sdp)) =
+            (&self.last_nvst_params, &self.last_answer_sdp)
+        {
+            let updated_params = NvstParams {
+                max_bitrate_kbps,
+                ..nvst_params.clone()
+            };
+            match build_nvst_sdp_for_answer(&updated_params, answer_sdp) {
+                Ok(nvst_sdp) => {
+                    message = format!(
+                        "Updated native bitrate limit to {max_bitrate_kbps} Kbps and requested a mid-session server re-offer (re-sending the answer with the new vqos.bw.maximumBitrateKbps)."
+                    );
+                    response = Response::Answer {
+                        id: command.id,
+                        answer: SendAnswerRequest {
+                            sdp: rewrite_answer_video_bitrate(answer_sdp, max_bitrate_kbps),
+                            nvst_sdp: Some(nvst_sdp),
+                        },
+                    };
+                }
+                Err(error) => {
+                    events.push(Event::Log {
+                        level: "warn",
+                        message: format!(
+                            "Updated native bitrate limit to {max_bitrate_kbps} Kbps but could not rebuild the mid-session nvstSdp: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+        events.push(Event::Log {
+            level: "info",
+            message,
+        });
+
         BackendReply {
-            events: vec![Event::Log {
-                level: "info",
-                message,
-            }],
-            response: Some(Response::Ok { id: command.id }),
+            events,
+            response: Some(response),
             should_continue: true,
         }
     }
@@ -669,43 +856,68 @@ impl NativeStreamerBackend for GstreamerBackend {
 
     fn start_recording(&mut self, command: CommandEnvelope) -> BackendReply {
         let id = command.id;
-        let Some(pipeline) = self.pipeline.as_ref() else {
+        let Some(pipeline) = self.pipeline.clone() else {
             return BackendReply::response(Response::Error {
                 id: Some(id),
                 code: "gstreamer-not-started".to_owned(),
                 message: "GStreamer pipeline is not started.".to_owned(),
             });
         };
-
-        match pipeline.start_recording() {
-            Ok(()) => BackendReply::response(Response::Ok { id }),
-            Err(message) => BackendReply::response(Response::Error {
+        let event_sender = self.event_sender.clone();
+        if self
+            .recording_worker
+            .tx
+            .send(RecordingCommand::Start {
+                pipeline,
+                event_sender,
+            })
+            .is_err()
+        {
+            return BackendReply::response(Response::Error {
                 id: Some(id),
-                code: "recording-start-failed".to_owned(),
-                message,
-            }),
+                code: "recording-worker-unavailable".to_owned(),
+                message: "Recording worker is not available.".to_owned(),
+            });
         }
+        // Fire-and-forget: the valve open (or the spent-branch rebuild) runs
+        // on the worker, so the command loop never blocks and input/surface/
+        // bitrate commands keep flowing while recording starts.
+        BackendReply::response(Response::Ok { id })
     }
 
     fn stop_recording(&mut self, command: CommandEnvelope) -> BackendReply {
         let id = command.id;
         let finalize = command.finalize.unwrap_or(true);
-        let Some(pipeline) = self.pipeline.as_ref() else {
+        let Some(pipeline) = self.pipeline.clone() else {
             return BackendReply::response(Response::Error {
                 id: Some(id),
                 code: "gstreamer-not-started".to_owned(),
                 message: "GStreamer pipeline is not started.".to_owned(),
             });
         };
-
-        match pipeline.stop_recording(finalize) {
-            Ok(()) => BackendReply::response(Response::Ok { id }),
-            Err(message) => BackendReply::response(Response::Error {
+        let event_sender = self.event_sender.clone();
+        if self
+            .recording_worker
+            .tx
+            .send(RecordingCommand::Stop {
+                pipeline,
+                finalize,
+                event_sender,
+            })
+            .is_err()
+        {
+            return BackendReply::response(Response::Error {
                 id: Some(id),
-                code: "recording-stop-failed".to_owned(),
-                message,
-            }),
+                code: "recording-worker-unavailable".to_owned(),
+                message: "Recording worker is not available.".to_owned(),
+            });
         }
+        // Fire-and-forget: drain + EOS finalize runs on the worker and the
+        // `recording-finished` event still arrives strictly after the last
+        // `recording-chunk` (both flow through the same FIFO event channel,
+        // and the worker sends it only after the muxer EOS). The command loop
+        // stays responsive — input never blocks behind a slow recording stop.
+        BackendReply::response(Response::Ok { id })
     }
 
     fn send_data_channel_message(&mut self, command: CommandEnvelope) -> BackendReply {
@@ -739,20 +951,34 @@ impl NativeStreamerBackend for GstreamerBackend {
         self.pending_remote_ice.clear();
         self.remote_description_set = false;
         clear_native_shortcut_bindings();
-        if let Some(pipeline) = self.pipeline.take() {
-            if let Err(message) = pipeline.stop() {
-                return BackendReply {
-                    events: vec![Event::Error {
-                        code: "gstreamer-stop-failed".to_owned(),
-                        message: message.clone(),
-                    }],
-                    response: Some(Response::Error {
-                        id: Some(command.id),
-                        code: "gstreamer-stop-failed".to_owned(),
-                        message,
-                    }),
-                    should_continue: true,
-                };
+        // Drain the recording worker FIRST so no per-command Arc clone of the
+        // pipeline is still alive; then the backend's own Arc is the only one
+        // left and the pipeline can be torn down explicitly.
+        self.recording_worker.shutdown();
+        if let Some(mut pipeline) = self.pipeline.take() {
+            match Arc::get_mut(&mut pipeline) {
+                Some(pipeline) => {
+                    if let Err(message) = pipeline.stop() {
+                        return BackendReply {
+                            events: vec![Event::Error {
+                                code: "gstreamer-stop-failed".to_owned(),
+                                message: message.clone(),
+                            }],
+                            response: Some(Response::Error {
+                                id: Some(command.id),
+                                code: "gstreamer-stop-failed".to_owned(),
+                                message,
+                            }),
+                            should_continue: true,
+                        };
+                    }
+                }
+                None => send_log(
+                    &self.event_sender,
+                    "warn",
+                    "Recording worker still holds the pipeline after shutdown; skipping explicit teardown (process exits)."
+                        .to_owned(),
+                ),
             }
         }
         let message = command
@@ -786,7 +1012,7 @@ mod tests {
 
     #[test]
     fn builds_and_stops_webrtc_pipeline() {
-        let pipeline = GstreamerPipeline::build(None, &[]).expect("GStreamer webrtcbin pipeline");
+        let mut pipeline = GstreamerPipeline::build(None, &[]).expect("GStreamer webrtcbin pipeline");
         assert_eq!(pipeline.webrtc.name(), "opennow-webrtcbin");
         assert_eq!(
             pipeline.webrtc.property::<String>("stun-server"),
@@ -814,7 +1040,7 @@ mod tests {
             resolve_gstreamer_stun_server(&servers),
             "stun://192.0.2.10:19302"
         );
-        let pipeline =
+        let mut pipeline =
             GstreamerPipeline::build(None, &servers).expect("GStreamer webrtcbin pipeline");
         assert_eq!(
             pipeline.webrtc.property::<String>("stun-server"),

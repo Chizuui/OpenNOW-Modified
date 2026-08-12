@@ -15,10 +15,10 @@ use crate::gstreamer_input::{
 };
 use crate::gstreamer_ice::{log_remote_ice_candidate, wire_ice_observability};
 use crate::gstreamer_liveness::{
-    install_present_limiter, read_queue_level, sink_rendered_frame_count, watch_audio_activity,
-    watch_first_sink_buffer, watch_rtp_video_bitrate, watch_video_caps_transitions,
-    watch_video_decoded_rate, watch_video_sink_caps_transitions, watch_video_sink_rate,
-    VideoLivenessMonitor,
+    install_present_limiter, pad_has_media_sticky_events, read_queue_level,
+    sink_rendered_frame_count, watch_audio_activity, watch_first_sink_buffer, watch_rtcp_send_stats,
+    watch_rtp_video_bitrate, watch_video_caps_transitions, watch_video_decoded_rate,
+    watch_video_sink_caps_transitions, watch_video_sink_rate, VideoLivenessMonitor,
 };
 #[cfg(target_os = "windows")]
 use crate::gstreamer_platform::arm_internal_child_input;
@@ -99,6 +99,18 @@ const RECORDING_DRAIN_TIMEOUT_MS: u64 = 4_000;
 /// How long to wait after the muxer-direct EOS failsafe before giving up on
 /// finalizing the recording.
 const RECORDING_FAILSAFE_TIMEOUT_MS: u64 = 2_000;
+/// How long `start()` waits (after the sticky-event replay) for the rebuilt
+/// branch queue(s) to show the mandatory sticky CAPS event before opening the
+/// capture valve. On a rebuild the fresh branch is hot-plugged into a PLAYING
+/// pipeline: the tap tee re-emits its retained sticky events onto the new
+/// branch pad asynchronously (on the tee's streaming thread), and if the
+/// valve opens before stream-start/caps/segment land, the first live buffer
+/// hits the queue with no stream-start (the field warning `Got data flow
+/// before stream-start` on the rebuilt queue) and the branch can stall so
+/// badly that stop() times out. CAPS is sticky and arrives AFTER stream-start
+/// in the replay order, so its presence proves the whole sequence landed.
+/// Bounded — a genuinely broken branch degrades to a warning, never a hang.
+const RECORDING_STICKY_VERIFY_TIMEOUT_MS: u64 = 250;
 pub(crate) const VIDEO_QUEUE_MAX_BUFFERS: u32 = DEFAULT_VIDEO_QUEUE_DEPTH;
 const AUDIO_QUEUE_MAX_BUFFERS: u32 = 2;
 
@@ -909,6 +921,24 @@ impl GstreamerRecordingState {
                 replay_recording_sticky_events(audio_valve);
             }
         }
+        // Deterministic start gate for the REBUILT branches (video AND audio).
+        // The replay above pushes from each valve's SRC pad; the events still
+        // have to travel through the (PLAYING, async) queue task, and on a
+        // rebuild the tap tee additionally re-emits its retained sticky events
+        // onto the fresh branch pad asynchronously on the tee's streaming
+        // thread. If a valve opens before stream-start/caps/segment land on
+        // its queue, the first live buffer hits it with no stream-start — the
+        // field warning `Got data flow before stream-start` on the rebuilt
+        // queue — and the branch can stall so badly that stop() times out.
+        // Wait (bounded) for each queue sink pad to actually show STREAM_START
+        // + CAPS before opening its valve. CAPS is sticky and arrives AFTER
+        // stream-start in the replay order, so its presence proves the whole
+        // sequence landed. Bounded — a genuinely broken branch degrades to a
+        // warning, never a hang.
+        self.gate_branch_ready(&self.queue, "video");
+        if let Some(audio_queue) = &self.audio_queue {
+            self.gate_branch_ready(audio_queue, "audio");
+        }
         self.valve.set_property("drop", false);
         if let Some(audio_valve) = &self.audio_valve {
             audio_valve.set_property("drop", false);
@@ -925,6 +955,34 @@ impl GstreamerRecordingState {
             },
         );
         Ok(())
+    }
+
+    /// Bounded wait for one recording branch queue to show the replayed
+    /// STREAM_START + CAPS before its valve opens. Polls the queue SINK pad's
+    /// sticky-event list every 5 ms up to `RECORDING_STICKY_VERIFY_TIMEOUT_MS`;
+    /// if the sequence still has not landed the valve opens anyway with a
+    /// warning (a genuinely broken branch must degrade, never hang). `what`
+    /// names the branch in the warning ("video"/"audio").
+    fn gate_branch_ready(&self, queue: &gst::Element, what: &str) {
+        let Some(queue_sink) = queue.static_pad("sink") else {
+            return;
+        };
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(RECORDING_STICKY_VERIFY_TIMEOUT_MS);
+        while !pad_has_media_sticky_events(&queue_sink) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !pad_has_media_sticky_events(&queue_sink) {
+            send_log(
+                &self.event_sender,
+                "warn",
+                format!(
+                    "Recording {what} branch queue did not show the replayed STREAM_START/CAPS \
+                     within the sticky-verify window; opening the valve anyway (a wedge here \
+                     shows as `Got data flow before stream-start` on the rebuilt {what} queue)."
+                ),
+            );
+        }
     }
 
     /// Drain a branch queue and inject EOS below its valve, so qtmux sees the
@@ -1896,6 +1954,33 @@ impl GstreamerPipeline {
             .as_text()
             .map_err(|error| format!("Failed to serialize GStreamer answer SDP: {error}"))?;
 
+        // GFN offers transport-cc feedback only for its flexfec payload (pt
+        // 98), so webrtcbin's rtpbin never attaches TWCC to the video source
+        // and rtpsession generates no transport-wide feedback — the server
+        // BWE runs blind and holds a conservative bitrate no matter what the
+        // NVST SDP requested. Rewrite the answer's transport-cc rtcp-fb to the
+        // wildcard form (valid per RFC 4585: the mechanism was already
+        // offered, the wildcard just applies it to every payload) and hand
+        // THAT answer to set-local-description, so GStreamer's own rtpbin
+        // wires TWCC onto the video source. The server sees the same
+        // rewritten text in the returned answer.
+        let rewritten_answer_sdp = crate::sdp::rewrite_transport_cc_rtcp_fb(&answer_sdp);
+        if rewritten_answer_sdp != answer_sdp {
+            send_log(
+                &self.event_sender,
+                "debug",
+                "Rewrote answer transport-cc rtcp-fb to the wildcard form so rtpbin attaches TWCC feedback to the video source (server BWE gets feedback instead of running blind)."
+                    .to_owned(),
+            );
+        }
+        let rewritten_sdp = gst_sdp::SDPMessage::parse_buffer(rewritten_answer_sdp.as_bytes())
+            .map_err(|error| format!("Failed to re-parse the rewritten answer SDP: {error:?}"))?;
+        let answer = gst_webrtc::WebRTCSessionDescription::new(
+            gst_webrtc::WebRTCSDPType::Answer,
+            rewritten_sdp,
+        );
+        let answer_sdp = rewritten_answer_sdp;
+
         // Only attach once a concrete Opus payload type was negotiated for
         // the mic m-line (mirrors the web client, which sends Opus mic).
         let mic_payload = mic_transceiver
@@ -2847,7 +2932,7 @@ impl GstreamerPipeline {
         self.render_state.set_surface(surface, &self.event_sender);
     }
 
-    pub(crate) fn stop(mut self) -> Result<(), String> {
+    pub(crate) fn stop(&mut self) -> Result<(), String> {
         if let Some(handle) = self.nvst_receive.take() {
             handle.stop();
         }
@@ -5155,6 +5240,7 @@ fn build_rtp_video_chain(
             format!("Failed to link RTP {encoding} decode chain into the record tap tee: {error:?}")
         })?;
         watch_rtp_video_bitrate(src_pad, video_liveness.clone(), event_sender);
+        watch_rtcp_send_stats(pipeline, video_liveness.clone(), event_sender);
         video_liveness.start(pipeline.clone(), sink.clone(), event_sender.clone());
 
         Ok(())

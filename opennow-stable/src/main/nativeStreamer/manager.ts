@@ -43,6 +43,11 @@ import {
   isNativeStreamerResponse,
   type NativeStreamerCommandInput,
 } from "./protocol";
+import {
+  parseNetworkHealthBitrateMbps,
+  stepNativeBitratePushVerification,
+  type NativeBitratePushVerification,
+} from "./networkHealth";
 import { createNativeStreamerRuntimeEnvironment } from "./runtime";
 import { NativeSurfaceUpdateQueue } from "./surfaceUpdateQueue";
 
@@ -111,6 +116,15 @@ export class NativeStreamerManager {
   private pending = new Map<string, PendingRequest>();
   private capabilities: NativeStreamerCapabilities | null = null;
   private activeSessionId: string | null = null;
+  /** Mid-session NVST bitrate cap updates pushed to the server during the current session. */
+  private bitratePushesThisSession = 0;
+  /** Of those, how many were followed by the measured [NetworkHealth] bitrate rising by at least the threshold within the verify window. */
+  private bitratePushesVerifiedThisSession = 0;
+  /** Pending proof that a push took effect; fed by [NetworkHealth] log lines until verified or the window expires. */
+  private bitratePushObservation: NativeBitratePushVerification | null = null;
+  /** Cooldown so a slider drag does not spam the server with mid-session NVST updates (WebRTC parity). */
+  private lastBitratePushAtMs = 0;
+  private static readonly BITRATE_PUSH_COOLDOWN_MS = 1_000;
   private inputBackpressureWarned = false;
   private answerInFlight = false;
   /** Captured by `handleEvent` for the in-flight `take-screenshot` request. */
@@ -340,13 +354,103 @@ export class NativeStreamerManager {
     if (!this.child || !this.activeSessionId) {
       return;
     }
+    // Cooldown so a slider drag does not spam the server with identical
+    // mid-session NVST updates (WebRTC parity).
+    const now = Date.now();
+    if (now - this.lastBitratePushAtMs < NativeStreamerManager.BITRATE_PUSH_COOLDOWN_MS) {
+      return;
+    }
+    this.lastBitratePushAtMs = now;
 
     void this.request({
       type: "bitrate",
       maxBitrateKbps: normalizeBitrateKbps(maxBitrateKbps),
-    }, CONTROL_TIMEOUT_MS).catch((error) => {
-      console.warn("[NativeStreamer] Failed to update native bitrate limit:", error);
-    });
+    }, CONTROL_TIMEOUT_MS)
+      .then(async (response) => {
+        // Mid-session re-offer: the streamer rebuilt the answer + nvstSdp
+        // with the new cap. Push it to the server over the same signaling
+        // channel as the session-start answer; the server reads
+        // `vqos.bw.maximumBitrateKbps` from nvstSdp in answer messages.
+        if (response.type !== "answer") {
+          return;
+        }
+        await this.options.sendAnswer(response.answer);
+        this.bitratePushesThisSession += 1;
+        // Arm the proof: the first [NetworkHealth] bitrate sample after this
+        // push becomes the baseline; a later sample at least the threshold
+        // above it within the verify window means the server honored the push.
+        this.bitratePushObservation = {
+          pushedAtMs: Date.now(),
+          baselineMbps: null,
+          pushNumber: this.bitratePushesThisSession,
+        };
+        this.options.emit({
+          type: "log",
+          message: `[Bitrate] Pushed mid-session native bitrate cap update #${this.bitratePushesThisSession} to the GFN server (${normalizeBitrateKbps(maxBitrateKbps)} Kbps); watching [NetworkHealth] bitrate for the server honoring it.`,
+        });
+      })
+      .catch((error) => {
+        console.warn("[NativeStreamer] Failed to update native bitrate limit:", error);
+      });
+  }
+
+  /**
+   * Per-session observability for mid-session bitrate pushes: logs how many
+   * NVST cap updates were pushed to the server this session and how many were
+   * followed by the measured [NetworkHealth] bitrate rising (server honored
+   * the push), then resets the counters. The native streamer has no
+   * `availableIncomingBitrate`-style BWE estimate (that is a browser getStats
+   * metric), so the received RTP bitrate in `[NetworkHealth]` is the only
+   * proxy for whether the server honored a push.
+   */
+  private logBitratePushSessionSummary(): void {
+    if (this.bitratePushesThisSession > 0) {
+      console.log(
+        `[Bitrate] Mid-session native bitrate cap pushes this session: ${this.bitratePushesThisSession} sent, ${this.bitratePushesVerifiedThisSession} followed by a measured bitrate rise (server honored the cap); if the rest stayed flat, the cap applies on the next offer/reconnect.`,
+      );
+    }
+    this.bitratePushesThisSession = 0;
+    this.bitratePushesVerifiedThisSession = 0;
+    this.bitratePushObservation = null;
+  }
+
+  /**
+   * Feeds a streamer `[NetworkHealth]` log line into the pending mid-session
+   * bitrate push verification (if any): the first usable bitrate sample
+   * becomes the baseline, a later sample at least the threshold above it
+   * within the window is logged as VERIFIED (server honored the push), and an
+   * expired window without movement is logged as unchanged (the cap then only
+   * applies on the next offer/reconnect). Pure decision logic lives in
+   * `networkHealth.ts`.
+   */
+  private handleNetworkHealthLog(text: string): void {
+    const verification = this.bitratePushObservation;
+    if (!verification || !text.includes("[NetworkHealth]")) {
+      return;
+    }
+    const event = stepNativeBitratePushVerification(
+      verification,
+      parseNetworkHealthBitrateMbps(text),
+      Date.now(),
+    );
+    if (!event) {
+      return;
+    }
+    if (event.kind === "baseline") {
+      verification.baselineMbps = event.baselineMbps;
+      return;
+    }
+    this.bitratePushObservation = null;
+    if (event.kind === "verified") {
+      this.bitratePushesVerifiedThisSession += 1;
+      const text = `[Bitrate] Mid-session native cap push #${event.pushNumber} VERIFIED: measured bitrate moved ${event.baselineMbps} → ${event.currentMbps} Mbps in ${event.elapsedMs}ms after the push. Verified ${this.bitratePushesVerifiedThisSession}/${this.bitratePushesThisSession} pushes this session.`;
+      console.log(text);
+      this.options.emit({ type: "log", message: text });
+    } else {
+      const text = `[Bitrate] Mid-session native cap push #${event.pushNumber}: measured bitrate unchanged (${event.baselineMbps} Mbps) after ${event.elapsedMs}ms — the server likely applies the new cap on the next offer/reconnect.`;
+      console.log(text);
+      this.options.emit({ type: "log", message: text });
+    }
   }
 
   setInputPaused(paused: boolean): void {
@@ -497,6 +601,7 @@ export class NativeStreamerManager {
 
   async stop(reason = "stopped"): Promise<void> {
     const child = this.child;
+    this.logBitratePushSessionSummary();
     this.activeSessionId = null;
     this.capabilities = null;
     this.surfaceUpdates.markNotReady();
@@ -516,6 +621,7 @@ export class NativeStreamerManager {
   }
 
   dispose(reason = "disposed"): void {
+    this.logBitratePushSessionSummary();
     this.activeSessionId = null;
     this.capabilities = null;
     this.surfaceUpdates.markNotReady();
@@ -802,6 +908,9 @@ export class NativeStreamerManager {
         console.log(text);
       }
       this.options.emit({ type: "log", message: text });
+      // Mid-session bitrate push proof: [NetworkHealth] lines carry the
+      // measured receive bitrate, the proxy for the server honoring a push.
+      this.handleNetworkHealthLog(message.message);
       return;
     }
 
