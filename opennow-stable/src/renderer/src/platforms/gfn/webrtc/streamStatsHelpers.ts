@@ -92,6 +92,35 @@ export function detectGpuType(): string {
   }
 }
 
+/**
+ * EWMA smoothing factor for the HUD jitter readout. WebRTC reports the raw
+ * RFC 3550 interarrival jitter of the incoming video stream; per-packet
+ * arrival variance makes that value jump between polls, so the HUD applies
+ * an exponential moving average — the same spirit as the native streamer's
+ * preference for rtpsession's `avg-jitter` over the raw `jitter` field.
+ * 0.35 per ~1s poll stays responsive to sustained changes while clipping
+ * single-sample spikes.
+ */
+export const JITTER_EWMA_ALPHA = 0.35;
+
+/**
+ * Exponential moving average of a raw WebRTC jitter reading (ms). The first
+ * sample is returned as-is so the readout appears immediately instead of
+ * ramping up from 0; afterwards it is blended with the previous EWMA so a
+ * one-off spike does not move the HUD much while a sustained shift still
+ * lands within a few polls.
+ */
+export function smoothJitterMs(
+  rawJitterMs: number,
+  prevEwmaMs: number,
+  alpha: number = JITTER_EWMA_ALPHA,
+): number {
+  if (prevEwmaMs <= 0) {
+    return Math.max(0, rawJitterMs);
+  }
+  return alpha * Math.max(0, rawJitterMs) + (1 - alpha) * prevEwmaMs;
+}
+
 /** Average jitter buffer delay in ms from cumulative WebRTC inbound-rtp counters. */
 export function averageJitterBufferDelayMs(
   jitterBufferDelaySeconds: number,

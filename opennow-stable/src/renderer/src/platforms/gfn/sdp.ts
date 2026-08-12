@@ -14,4 +14,4 @@ export {
   rewriteH265TierFlag,
 } from "./sdp/codec";
 export { buildNvstSdp, OFFICIAL_MIN_BITRATE_KBPS } from "./sdp/nvstOffer";
-export { mungeAnswerSdp } from "./sdp/answer";
+export { ensureAudioRedInAnswer, mungeAnswerSdp } from "./sdp/answer";

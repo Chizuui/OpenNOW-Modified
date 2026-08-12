@@ -46,6 +46,7 @@ import {
 import {
   buildNvstSdp,
   extractIceCredentials,
+  ensureAudioRedInAnswer,
   extractNegotiatedVideoCodec,
   fixServerIp,
   mungeAnswerSdp,
@@ -71,6 +72,7 @@ import {
   computeIntervalFrameRates,
   detectGpuType,
   mapServerGpuType,
+  smoothJitterMs,
 } from "./webrtc/streamStatsHelpers";
 import {
   DecoderPressureController,
@@ -382,6 +384,12 @@ export class GfnWebRtcClient {
   } | null = null;
   private renderFpsCounter = { frames: 0, lastUpdate: 0, fps: 0 };
   private lastEmittedDiagnostics: StreamDiagnostics | null = null;
+  /**
+   * EWMA of the raw inbound-rtp jitter reading, smoothed for the HUD so
+   * per-packet arrival variance does not make the readout jump around
+   * (mirrors the native streamer's preference for rtpsession `avg-jitter`).
+   */
+  private jitterEwmaMs = 0;
 
   private statsChannelVersionLogged = false;
   /** Periodic network-diagnostics logging (surfaces in the exported log file). */
@@ -506,6 +514,7 @@ export class GfnWebRtcClient {
       getPeerConnection: () => this.pc,
       getControlChannel: () => this.controlChannel,
       requestSignalingKeyframe: (request) => window.openNow.requestKeyframe(request),
+      getVideoElement: () => this.options.videoElement,
       onStateChange: (state) => {
         this.diagnostics.decoderPressureActive = state.active;
         this.diagnostics.decoderRecoveryAttempts = state.recoveryAttempts;
@@ -999,6 +1008,7 @@ export class GfnWebRtcClient {
   private resetDiagnostics(): void {
     this.lastStatsSample = null;
     this.lastEmittedDiagnostics = null;
+    this.jitterEwmaMs = 0;
     this.currentCodec = "";
     this.currentResolution = "";
     this.isHdr = false;
@@ -1340,8 +1350,12 @@ export class GfnWebRtcClient {
       this.diagnostics.packetsLost = packetsLost;
       this.diagnostics.packetsReceived = packetsReceived;
 
-      // Jitter (converted to milliseconds)
-      this.diagnostics.jitterMs = Math.round(Number(inboundVideo.jitter ?? 0) * 1000 * 10) / 10;
+      // Jitter (converted to milliseconds). WebRTC's raw RFC 3550 interarrival
+      // jitter is noisy between ~1s polls, so the HUD shows an EWMA-smoothed
+      // value — same spirit as the native streamer's `avg-jitter` preference.
+      const rawJitterMs = Math.round(Number(inboundVideo.jitter ?? 0) * 1000 * 10) / 10;
+      this.jitterEwmaMs = smoothJitterMs(rawJitterMs, this.jitterEwmaMs);
+      this.diagnostics.jitterMs = this.jitterEwmaMs;
 
       // Jitter buffer delay — the actual buffering latency added by the jitter buffer.
       // jitterBufferDelay is cumulative seconds, jitterBufferEmittedCount is cumulative frames.
@@ -1404,6 +1418,11 @@ export class GfnWebRtcClient {
         prevSample,
       });
       await this.decoderPressureController.recover(pressureSignal);
+      // Sustained packet loss → request a keyframe (PLI) so a corrupted
+      // reference chain resyncs instead of staying broken until the next
+      // natural keyframe. Single lossy polls are ignored inside the
+      // controller (needs 2 consecutive ≥2% polls + cooldown).
+      this.decoderPressureController.reportPacketLoss(this.diagnostics.packetLossPercent);
     }
 
     // Browser BWE estimate: matches GFN's dynamic "Total Available" bitrate.
@@ -1427,8 +1446,13 @@ export class GfnWebRtcClient {
 
     // Grow the jitter buffer floor with the measured link RTT so NACK
     // retransmissions (one full RTT) land inside the buffer instead of
-    // dropping the frame and stuttering on high-latency routes.
-    this.decoderPressureController.updateJitterFloorFromRtt(this.diagnostics.rttMs);
+    // dropping the frame and stuttering on high-latency routes. Packet loss
+    // is the early indicator of jitter (it spikes before RTT climbs), so it
+    // also raises the floor; a raw RTT spike pins it at MAX briefly.
+    this.decoderPressureController.updateJitterFloorFromRtt(
+      this.diagnostics.rttMs,
+      this.diagnostics.packetLossPercent,
+    );
 
     const reliableBufferedAmount = this.reliableInputChannel?.bufferedAmount ?? 0;
     const partiallyReliableBufferedAmount = this.partiallyReliableInputChannel?.bufferedAmount ?? 0;
@@ -2403,6 +2427,10 @@ export class GfnWebRtcClient {
     this.createDataChannels(pc);
     this.domInputController.install(this.options.videoElement);
     this.setupStatsPolling();
+    // Fast freeze detection: watch the video element for a stalled decode
+    // pipeline via requestVideoFrameCallback (~10x faster than the 1s
+    // getStats poll + consecutive-poll debounce of the severe_stall path).
+    this.decoderPressureController.startFreezeMonitoring();
 
     let answerSent = false;
     const queuedLocalIce: IceCandidatePayload[] = [];
@@ -2750,7 +2778,17 @@ export class GfnWebRtcClient {
     // Munge answer SDP: inject b=AS: bitrate limits and stereo=1 for opus
     if (answer.sdp) {
       answer.sdp = mungeAnswerSdp(answer.sdp, settings.maxBitrateKbps);
-      this.log(`Answer SDP munged (b=AS:${settings.maxBitrateKbps}, stereo=1)`);
+      // Re-advertise the server's RED audio redundancy payload when the
+      // engine supports it but dropped it from the answer (official client
+      // parity: a redundant Opus copy survives one lost RTP packet). Never
+      // negotiate RED when the engine cannot unwrap it.
+      const audioCaps = RTCRtpReceiver.getCapabilities?.("audio");
+      const redSupported =
+        audioCaps?.codecs.some((c) => c.mimeType.toLowerCase().includes("red")) ?? false;
+      answer.sdp = ensureAudioRedInAnswer(answer.sdp, offerSdp, redSupported);
+      this.log(
+        `Answer SDP munged (b=AS:${settings.maxBitrateKbps}, stereo=1); RED audio ${redSupported ? "supported and ensured" : "unsupported (skipped)"}`,
+      );
     }
 
     await pc.setLocalDescription(answer);

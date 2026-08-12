@@ -9,6 +9,7 @@ test("sdp barrel preserves the public API", () => {
   assert.deepEqual(Object.keys(sdp).sort(), [
     "OFFICIAL_MIN_BITRATE_KBPS",
     "buildNvstSdp",
+    "ensureAudioRedInAnswer",
     "extractIceCredentials",
     "extractIceUfragFromOffer",
     "extractNegotiatedVideoCodec",

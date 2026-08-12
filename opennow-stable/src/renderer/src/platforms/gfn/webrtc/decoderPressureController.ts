@@ -42,6 +42,8 @@ interface DecoderPressureControllerDependencies {
     attempt: number;
   }) => Promise<unknown>;
   onStateChange: (state: DecoderPressureState) => void;
+  /** Video element the stream renders into, used by the fast freeze watchdog. */
+  getVideoElement?: () => HTMLVideoElement | null;
   now?: () => number;
 }
 
@@ -71,11 +73,83 @@ const VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR = 0.5;
 // Only re-apply receiver tuning when the floor moves by at least this much, so
 // oscillating RTT (43↔45ms) does not churn the jitter buffer target every poll.
 const JITTER_FLOOR_DEADBAND_MS = 5;
+// Port of the native streamer's pre-decode jitter depth logic (Rust):
+//   - an RTT spike (raw sample far above the RTT EMA) means a jitter burst is
+//     in flight RIGHT NOW, so the floor is pinned at MAX for this long to
+//     absorb the burst and the following ones (spikes arrive in clusters);
+//   - packet loss is the early indicator of jitter — it spikes before RTT
+//     climbs — so ≥0.1% raises the floor to MID and ≥0.5% pins it at MAX.
+const JITTER_BURST_HOLD_MS = 4000;
+const JITTER_LOSS_FLOOR_MID_MS = 70;
+const RTT_SPIKE_EMA_FACTOR = 1.5;
+const RTT_SPIKE_MIN_DELTA_MS = 30;
+// EMA blend for spike detection (75% history, 25% latest) — matches the native
+// streamer so raw per-poll RTT bounces don't false-trigger the burst hold.
+const RTT_EMA_HISTORY_WEIGHT = 3;
 const PRESSURE_CONSECUTIVE_POLLS = 3;
 const STABLE_CONSECUTIVE_POLLS = 6;
 const RECOVERY_COOLDOWN_MS = 1500;
 const KEYFRAME_COOLDOWN_MS = 1200;
 export const DECODER_MIN_RECOVERY_BITRATE_KBPS = 4000;
+
+// Fast freeze detection (requestVideoFrameCallback): if the video element
+// presents no new frame within this window while supposedly playing, the
+// decode pipeline is frozen — the same situation the getStats path calls
+// severe_stall, but caught ~10x faster (the stats path needs a 1s poll plus
+// PRESSURE_CONSECUTIVE_POLLS consecutive polls before acting). 600ms is ~36
+// frames at 60fps: a delivery hiccup never pauses presentation that long, but
+// a stalled decoder is flagged well within a second.
+const FREEZE_DETECT_TIMEOUT_MS = 600;
+// After a freeze-triggered keyframe, do not re-trigger for this long even if
+// the picture is still frozen — the keyframe needs time to arrive and render
+// before another request helps.
+const FREEZE_RETRIGGER_COOLDOWN_MS = 2500;
+// Sustained network loss high enough that NACK recovery is visibly failing:
+// the reference frames are corrupted and the picture would stay broken until
+// the next natural keyframe, so request one now (PLI) to resync. Threshold is
+// in percent and requires LOSS_PLI_CONSECUTIVE_POLLS consecutive polls
+// (~2s at a 1s poll) so a single lossy second does not interrupt the stream.
+const LOSS_PLI_THRESHOLD_PERCENT = 2;
+const LOSS_PLI_CONSECUTIVE_POLLS = 2;
+
+export interface VideoFreezeEligibilityParams {
+  /** Timestamp (ms) of the last presented video frame; 0 = none seen yet. */
+  lastFrameAtMs: number;
+  /** Current time (ms), same time origin as the frame timestamps. */
+  nowMs: number;
+  /** Freeze threshold in ms. */
+  timeoutMs: number;
+  paused: boolean;
+  hidden: boolean;
+  /** HTMLMediaElement.readyState (>= HAVE_CURRENT_DATA means frames exist). */
+  readyState: number;
+}
+
+/**
+ * Whether the video pipeline qualifies as frozen: a frame was seen, the
+ * element is playing (not paused / tab hidden), and no new frame was
+ * presented within the timeout window. Pure so it's unit-testable.
+ */
+export function isVideoFreezeEligible(params: VideoFreezeEligibilityParams): boolean {
+  return !params.paused
+    && !params.hidden
+    && params.readyState >= 2 // HTMLMediaElement.HAVE_CURRENT_DATA
+    && params.lastFrameAtMs > 0
+    && params.nowMs - params.lastFrameAtMs >= params.timeoutMs;
+}
+
+/**
+ * Whether sustained network loss justifies a keyframe: the loss is above the
+ * PLI threshold AND it has held for the required consecutive polls (so a
+ * single lossy poll cannot interrupt the stream). Pure so it's testable.
+ */
+export function shouldRequestLossKeyframe(
+  packetLossPercent: number,
+  consecutiveLossPolls: number,
+): boolean {
+  return packetLossPercent >= LOSS_PLI_THRESHOLD_PERCENT
+    && consecutiveLossPolls >= LOSS_PLI_CONSECUTIVE_POLLS;
+}
 
 export function classifyDecoderPressureSample(
   params: DecoderPressureSample,
@@ -154,6 +228,17 @@ export class DecoderPressureController {
   private baseJitterTargets: Record<"video" | "audio", number> = {
     ...JITTER_BUFFER_PRESETS.balanced,
   };
+  /** EMA of the link RTT used for spike detection (75% history, 25% latest). */
+  private rttEmaMs = 0;
+  /** Timestamp until which a detected RTT spike pins the floor at MAX. */
+  private burstHoldUntilMs = 0;
+  /** Fast-freeze watchdog (requestVideoFrameCallback) state. */
+  private freezeMonitoring = false;
+  private freezeWatchdogTimer: number | null = null;
+  private freezeLastFrameAtMs = 0;
+  private freezeTriggeredAtMs = 0;
+  /** Consecutive polls whose loss stayed above the PLI threshold. */
+  private lossConsecutivePolls = 0;
   private activeReceivers: Array<{
     receiver: RTCRtpReceiver;
     kind: "audio" | "video";
@@ -237,18 +322,61 @@ export class DecoderPressureController {
    * NACK retransmission (which takes one full RTT) still lands inside the
    * buffer instead of dropping the frame and stuttering. The preset's base
    * floor is the lower bound; the adaptive floor only ever grows from there.
+   *
+   * This is the WebRTC port of the native streamer's pre-decode jitter depth
+   * logic: a raw RTT spike far above the RTT EMA pins the floor at MAX for
+   * JITTER_BURST_HOLD_MS (the burst in flight is absorbed instead of the
+   * picture blinking the previous frame), and packet loss raises the floor
+   * early (≥0.1% → MID, ≥0.5% → MAX) because loss spikes before RTT climbs.
    * Called once per stats poll; no-op when the floor did not change.
    */
-  updateJitterFloorFromRtt(rttMs: number): void {
+  updateJitterFloorFromRtt(rttMs: number, packetLossPercent?: number): void {
     if (!Number.isFinite(rttMs) || rttMs <= 0) {
       return;
     }
-    const videoFloor = Math.round(
+
+    // EMA (75% history, 25% latest) — the stats-channel RTT is a raw
+    // per-sample value that can bounce between polls; the EMA gives the
+    // spike-detection baseline and the band-switch hysteresis.
+    const ema = this.rttEmaMs === 0
+      ? Math.round(rttMs)
+      : Math.round((this.rttEmaMs * RTT_EMA_HISTORY_WEIGHT + rttMs) / (RTT_EMA_HISTORY_WEIGHT + 1));
+    this.rttEmaMs = ema;
+
+    // Spike detection: a RAW sample far above the EMA means a jitter burst is
+    // in flight RIGHT NOW. The EMA would need ~2-4 samples to climb, during
+    // which the buffer starves and the picture freezes. Pin MAX and HOLD it
+    // for JITTER_BURST_HOLD_MS so the burst in flight is absorbed and the
+    // following bursts (spikes come in clusters) never leak through.
+    const now = this.dependencies.now?.() ?? performance.now();
+    const spike = rttMs > Math.floor(ema * RTT_SPIKE_EMA_FACTOR)
+      && rttMs - ema >= RTT_SPIKE_MIN_DELTA_MS;
+    if (spike) {
+      this.burstHoldUntilMs = now + JITTER_BURST_HOLD_MS;
+    }
+    const burstHold = now < this.burstHoldUntilMs;
+
+    // Packet-loss floor: loss is the early indicator of jitter — it spikes
+    // before RTT climbs, so it must raise the floor immediately, not after
+    // the EMA catches up. Percent → fraction to match the native thresholds.
+    const lossFraction = Number.isFinite(packetLossPercent)
+      ? Math.max(0, (packetLossPercent ?? 0) / 100)
+      : 0;
+    const lossFloor = lossFraction >= 0.005
+      ? MAX_VIDEO_JITTER_TARGET_MS
+      : lossFraction >= 0.001
+        ? JITTER_LOSS_FLOOR_MID_MS
+        : 0;
+
+    const rttFloor = Math.round(
       Math.min(
         MAX_VIDEO_JITTER_TARGET_MS,
         Math.max(this.presetJitterTargets.video, rttMs * VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR),
       ),
     );
+    const videoFloor = burstHold
+      ? MAX_VIDEO_JITTER_TARGET_MS
+      : Math.max(this.presetJitterTargets.video, rttFloor, lossFloor);
     const audioFloor = Math.max(this.presetJitterTargets.audio, videoFloor + 15);
     if (
       Math.abs(videoFloor - this.baseJitterTargets.video) < JITTER_FLOOR_DEADBAND_MS
@@ -258,8 +386,11 @@ export class DecoderPressureController {
     }
     this.baseJitterTargets.video = videoFloor;
     this.baseJitterTargets.audio = audioFloor;
+    const lossNote = lossFraction >= 0.001 || burstHold
+      ? ` loss=${lossFraction.toFixed(3)}${burstHold ? " burstHold" : ""}`
+      : "";
     this.dependencies.log(
-      `Jitter buffer floor adapted to link RTT ${rttMs}ms: video=${videoFloor}ms audio=${audioFloor}ms`,
+      `Jitter buffer floor adapted to link RTT ${rttMs}ms: video=${videoFloor}ms audio=${audioFloor}ms${lossNote}`,
     );
     for (const { receiver, kind } of this.activeReceivers) {
       this.configureReceiver(receiver, kind);
@@ -280,7 +411,12 @@ export class DecoderPressureController {
     this.receiverLatencyTargets.audio = null;
     this.presetJitterTargets = { ...JITTER_BUFFER_PRESETS[this.jitterBufferMode] };
     this.baseJitterTargets = { ...this.presetJitterTargets };
+    this.rttEmaMs = 0;
+    this.burstHoldUntilMs = 0;
     this.activeReceivers = [];
+    this.stopFreezeMonitoring();
+    this.lossConsecutivePolls = 0;
+    this.freezeTriggeredAtMs = 0;
     this.emitState();
   }
 
@@ -303,8 +439,10 @@ export class DecoderPressureController {
     // A drop burst is a single-sample event — waiting PRESSURE_CONSECUTIVE_POLLS
     // (≈3s) would leave the picture frozen for seconds. React immediately; the
     // keyframe cooldown still prevents spamming. severe_stall keeps the debounce
-    // (it already implies ~2s of received-but-undecoded frames).
-    const urgent = signal.reason === "drop_burst";
+    // (it already implies ~2s of received-but-undecoded frames). video_freeze
+    // (the fast watchdog) is likewise urgent — it already waited a full
+    // FREEZE_DETECT_TIMEOUT_MS with no presented frame.
+    const urgent = signal.reason === "drop_burst" || signal.reason === "video_freeze";
     if (!urgent && this.pressureConsecutivePolls < PRESSURE_CONSECUTIVE_POLLS) {
       return;
     }
@@ -320,9 +458,14 @@ export class DecoderPressureController {
     // keyframes (and the old bitrate step-downs via local-SDP rewrites) just
     // amplified the lag it was meant to fix — matching the "unexplained lag
     // with healthy ping" reports. Only a hard decode stall (frames received,
-    // zero decoded) or an actual drop burst (picture visibly froze) justifies
-    // a keyframe.
-    if (signal.reason !== "severe_stall" && signal.reason !== "drop_burst") {
+    // zero decoded), an actual drop burst (picture visibly froze), or the
+    // fast freeze watchdog (no frame presented for FREEZE_DETECT_TIMEOUT_MS)
+    // justifies a keyframe.
+    if (
+      signal.reason !== "severe_stall"
+      && signal.reason !== "drop_burst"
+      && signal.reason !== "video_freeze"
+    ) {
       return;
     }
 
@@ -335,6 +478,112 @@ export class DecoderPressureController {
       this.lastRecoveryAtMs = now;
       this.emitState();
     }
+  }
+
+  /**
+   * Network-loss-triggered keyframe (PLI path): when the locally measured
+   * packet loss stays above LOSS_PLI_THRESHOLD_PERCENT for consecutive polls,
+   * NACK retransmission is visibly failing and the reference frames are
+   * corrupted — the picture would stay broken until the next natural
+   * keyframe. Request one immediately (shared keyframe cooldown) so the
+   * stream resyncs. Single lossy polls are ignored so transient loss never
+   * interrupts the stream.
+   */
+  reportPacketLoss(packetLossPercent: number): void {
+    const loss = Number.isFinite(packetLossPercent) ? Math.max(0, packetLossPercent) : 0;
+    this.lossConsecutivePolls = loss >= LOSS_PLI_THRESHOLD_PERCENT
+      ? this.lossConsecutivePolls + 1
+      : 0;
+    if (!shouldRequestLossKeyframe(loss, this.lossConsecutivePolls)) {
+      return;
+    }
+    void this.requestKeyframe(0, "network_loss").then((requested) => {
+      if (requested) {
+        this.recoveryAttemptCount += 1;
+        this.emitState();
+      }
+    });
+  }
+
+  /**
+   * Watch the video element for a frozen decode pipeline via
+   * requestVideoFrameCallback: while frames are presented the callback fires
+   * continuously and keeps pushing the watchdog back; if no new frame is
+   * presented within FREEZE_DETECT_TIMEOUT_MS the watchdog fires and triggers
+   * an immediate keyframe recovery — ~10x faster than the getStats-based
+   * severe_stall path (1s poll + consecutive-poll debounce). This mirrors the
+   * native streamer's fast watchdog on the renderer side. Call once when the
+   * session starts; stopFreezeMonitoring() clears it on teardown.
+   */
+  startFreezeMonitoring(): void {
+    const video = this.dependencies.getVideoElement?.();
+    if (!video || this.freezeMonitoring) {
+      return;
+    }
+    this.freezeMonitoring = true;
+    this.freezeLastFrameAtMs = 0;
+    this.freezeWatchdogTimer = null;
+    this.freezeTriggeredAtMs = 0;
+    this.armFreezeWatchdog(video);
+  }
+
+  stopFreezeMonitoring(): void {
+    this.freezeMonitoring = false;
+    if (this.freezeWatchdogTimer !== null) {
+      window.clearTimeout(this.freezeWatchdogTimer);
+      this.freezeWatchdogTimer = null;
+    }
+    this.freezeLastFrameAtMs = 0;
+  }
+
+  private armFreezeWatchdog(video: HTMLVideoElement): void {
+    if (!this.freezeMonitoring) {
+      return;
+    }
+    if (this.freezeWatchdogTimer !== null) {
+      window.clearTimeout(this.freezeWatchdogTimer);
+    }
+    this.freezeWatchdogTimer = window.setTimeout(() => {
+      this.freezeWatchdogTimer = null;
+      this.onFreezeWatchdog(video);
+    }, FREEZE_DETECT_TIMEOUT_MS);
+    if (typeof video.requestVideoFrameCallback === "function") {
+      video.requestVideoFrameCallback((now) => this.onVideoFramePresented(video, now));
+    }
+  }
+
+  private onVideoFramePresented(video: HTMLVideoElement, now: number): void {
+    if (!this.freezeMonitoring) {
+      return;
+    }
+    this.freezeLastFrameAtMs = now;
+    this.armFreezeWatchdog(video);
+  }
+
+  private onFreezeWatchdog(video: HTMLVideoElement): void {
+    if (!this.freezeMonitoring) {
+      return;
+    }
+    const now = this.dependencies.now?.() ?? performance.now();
+    const eligible = isVideoFreezeEligible({
+      lastFrameAtMs: this.freezeLastFrameAtMs,
+      nowMs: now,
+      timeoutMs: FREEZE_DETECT_TIMEOUT_MS,
+      paused: video.paused,
+      hidden: typeof document !== "undefined" && document.hidden,
+      readyState: video.readyState,
+    });
+    if (eligible && now - this.freezeTriggeredAtMs >= FREEZE_RETRIGGER_COOLDOWN_MS) {
+      this.freezeTriggeredAtMs = now;
+      void this.recover({
+        active: true,
+        reason: "video_freeze",
+        backlogFrames: 0,
+        dropRatePercent: 0,
+      });
+    }
+    // Keep watching — the picture may recover before the next timeout.
+    this.armFreezeWatchdog(video);
   }
 
   private emitState(): void {

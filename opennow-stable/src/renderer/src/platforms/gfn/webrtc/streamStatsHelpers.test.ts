@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   computeIntervalFrameRates,
   mapServerGpuType,
+  smoothJitterMs,
   type IntervalFrameRateParams,
 } from "./streamStatsHelpers";
 
@@ -112,4 +113,26 @@ test("mapServerGpuType passes unknown codes through unchanged and trims input", 
   assert.equal(mapServerGpuType(" 2080d / T10 "), "GeForce RTX");
   assert.equal(mapServerGpuType("   "), "");
   assert.equal(mapServerGpuType(""), "");
+});
+
+test("smoothJitterMs returns the first sample as-is for an immediate readout", () => {
+  assert.equal(smoothJitterMs(8.4, 0), 8.4);
+});
+
+test("smoothJitterMs clips a one-off spike but lands sustained shifts", () => {
+  // Steady 5ms EWMA; a single 30ms spike moves the readout only partway.
+  const afterSpike = smoothJitterMs(30, 5);
+  assert.ok(afterSpike > 5 && afterSpike < 30, `spike blended to ${afterSpike}`);
+  // Sustained 30ms for a few polls converges toward the new level.
+  let ewma = 5;
+  for (let i = 0; i < 6; i += 1) {
+    ewma = smoothJitterMs(30, ewma);
+  }
+  assert.ok(ewma > 25, `converged to ${ewma}`);
+});
+
+test("smoothJitterMs decays toward zero when the stream stops reporting", () => {
+  const afterDecay = smoothJitterMs(0, 8);
+  assert.ok(afterDecay < 8, `decayed to ${afterDecay}`);
+  assert.ok(afterDecay > 0, `still holds residual ${afterDecay}`);
 });
