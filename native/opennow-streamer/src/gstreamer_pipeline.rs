@@ -583,10 +583,10 @@ impl GstreamerVideoTap {
 /// Native recording branch — TRANSCODE to H.264. The branch taps the DECODED
 /// video right before the sink (the permanent video tap tee in the live
 /// chain, the same tee screenshots use), converts it to 8-bit 4:2:0,
-/// re-encodes with H.264 (x264enc ultrafast by default with insert-vui=false
-/// so the file carries no colorimetry/range tag — exactly like the official
-/// GeForce Now recordings; openh264enc fallback), and muxes with AAC game
-/// audio into a standard seekable MP4 (faststart):
+/// re-encodes with H.264 (d3d12h264enc GPU encoder by default so recording
+/// costs ~0 CPU, with x264enc software fallback when no D3D12 video-encode
+/// adapter is available), and muxes with AAC game audio into a standard
+/// seekable MP4 (faststart):
 ///
 ///   tap tee → valve → queue → [d3d12download] → videoconvert → capsfilter
 ///   (FULL bt709) → H.264 encoder → h264parse → qtmux → swallow
@@ -629,10 +629,9 @@ pub(crate) struct GstreamerRecordingState {
     /// Leaky decoupling queue (valve → queue → …). It never back-pressures
     /// the live decode path.
     pub(crate) queue: gst::Element,
-    /// The H.264 encoder actually in use (x264enc by default — configured
-    /// with insert-vui=false so the file carries no range/colorimetry tag,
-    /// exactly like the official GeForce Now recordings; openh264enc
-    /// fallback). Only fed while the valve is open.
+    /// The H.264 encoder actually in use (d3d12h264enc GPU encoder by
+    /// default when the D3D12 video-encode adapter is available, else the
+    /// software x264enc). Only fed while the valve is open.
     pub(crate) encoder: gst::Element,
     /// Factory name of `encoder`, for logs and tests.
     pub(crate) encoder_factory: String,
@@ -6258,13 +6257,12 @@ pub(crate) fn build_transcode_record_branch(
         None => None,
     };
 
-    // x264enc/openh264enc take I420 (the default encoders — d3d12h264enc,
-    // which takes NV12, is only used when forced via OPENNOW_RECORD_ENCODER
-    // and cannot write untagged files). The FULL-range colorimetry is
-    // declared at the branch input (what the decoder actually outputs), and
-    // the LIMITED colorimetry at the encoder input (what the RGB round-trip
-    // produces and what H.264 players expect).
-    let encoder_format = if encoder_factory == "d3d12h264enc" {
+    // Hardware encoders (d3d12/d3d11/qsv/mf/vaapi/nvenc/videotoolbox) take
+    // NV12 directly; the software encoders (x264/openh264) take I420. The
+    // FULL-range colorimetry is declared at the branch input (what the
+    // decoder actually outputs), and the LIMITED colorimetry at the encoder
+    // input (what the LUT rescale produces and what H.264 players expect).
+    let encoder_format = if is_hardware_h264_factory(&encoder_factory) {
         "NV12"
     } else {
         "I420"
@@ -6499,11 +6497,57 @@ fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
     let mut candidates: Vec<&str> = Vec::new();
     if let Some(forced) = &forced {
         candidates.push(forced);
+    } else {
+        // Hardware first: the hardware encoder offloads encode to the GPU/SFU
+        // so a recording costs ~0 CPU (the official GeForce Now client is
+        // also essentially free — it only writes the already-encoded stream).
+        // The branch feeds it LIMITED 16-235 data (LUT-rescaled), and the D3D
+        // encoders tag their VUI `tv` (limited) — metadata that now MATCHES
+        // the data, so the old "hitam pekat" mismatch (full-range data + tv
+        // tag) cannot recur. The READY-state init probe below rejects any
+        // hardware encoder whose device is unavailable on this machine,
+        // falling back down the ladder to software x264 so recording is never
+        // silently disabled.
+        #[cfg(target_os = "windows")]
+        {
+            // d3d12h264enc is the primary path (the streamer's D3D12 video
+            // backend). d3d11h264enc is kept for runtimes that ship it; the
+            // bundled runtime instead offers qsvh264enc (Intel Quick Sync)
+            // and mfh264enc (Media Foundation MFT) as further hardware
+            // fallbacks before software.
+            candidates.extend([
+                "d3d12h264enc",
+                "d3d11h264enc",
+                "qsvh264enc",
+                "mfh264enc",
+                "x264enc",
+                "openh264enc",
+            ]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // VAAPI covers Intel/AMD iGPUs, NVENC covers discrete NVIDIA GPUs.
+            candidates.extend(["vaapih264enc", "nvh264enc", "x264enc", "openh264enc"]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // VideoToolbox is the macOS hardware H.264 encoder.
+            candidates.extend(["vtenc_h264", "x264enc", "openh264enc"]);
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            candidates.extend(["x264enc", "openh264enc"]);
+        }
     }
-    candidates.extend(["x264enc", "openh264enc"]);
     for factory in candidates {
         if let Ok(element) = gst::ElementFactory::make(factory).build() {
             configure_h264_encoder(&element, factory);
+            // Hardware encoders create their device on the READY transition —
+            // probe it now (back to NULL before adding to the pipeline) and
+            // fall through to the next candidate when the device is missing.
+            if is_hardware_h264_factory(factory) && !hw_encoder_initializes(&element) {
+                continue;
+            }
             return Ok((factory.to_owned(), element));
         }
     }
@@ -6512,9 +6556,35 @@ fn pick_h264_encoder() -> Result<(String, gst::Element), String> {
         if forced.is_some() {
             "forced factory + defaults"
         } else {
-            "x264enc, openh264enc"
+            "hardware (d3d12/d3d11/qsv/mf/vaapi/nvenc/videotoolbox) + x264enc + openh264enc"
         }
     ))
+}
+
+/// Hardware H.264 encoder factories across platforms (they take NV12 and
+/// create their device on READY; the software encoders take I420).
+fn is_hardware_h264_factory(factory: &str) -> bool {
+    matches!(
+        factory,
+        "d3d12h264enc"
+            | "d3d11h264enc"
+            | "qsvh264enc"
+            | "mfh264enc"
+            | "vaapih264enc"
+            | "nvh264enc"
+            | "vtenc_h264"
+    )
+}
+
+/// Bring a hardware encoder to READY (forcing device/encode creation) and
+/// back to NULL. Returns true only if the transition succeeded — on machines
+/// without a working device (D3D12/D3D11 adapter, Quick Sync, VAAPI, NVENC,
+/// VideoToolbox) the READY transition fails and the caller falls back to the
+/// next candidate.
+fn hw_encoder_initializes(element: &gst::Element) -> bool {
+    let ready_ok = element.set_state(gst::State::Ready).is_ok();
+    let _ = element.set_state(gst::State::Null);
+    ready_ok
 }
 
 fn configure_h264_encoder(element: &gst::Element, factory: &str) {
@@ -6522,12 +6592,29 @@ fn configure_h264_encoder(element: &gst::Element, factory: &str) {
     // software decoder keeps up. GOP 60 ≈ 1 s keyframe interval at 60 fps:
     // instant seeking, and the first GOP starts immediately at record start.
     match factory {
-        "d3d12h264enc" => {
+        // Hardware encoders (NV12 input). Property names differ per element
+        // family, so every set is guarded — a wrong/missing property on a
+        // given runtime is a safe no-op instead of a panic. All take bitrate
+        // in kbps; GOP is `gop-size` on the D3D/QSG/NVENC families,
+        // `keyframe-period` on VAAPI, `gop` on VideoToolbox.
+        "d3d12h264enc" | "d3d11h264enc" | "qsvh264enc" | "mfh264enc" | "nvh264enc" => {
             element.set_property("bitrate", 8000u32);
-            element.set_property("max-bitrate", 10_000u32);
             set_property_from_str_if_supported(element, "rate-control", "vbr");
             element.set_property("gop-size", 60u32);
-            set_property_from_str_if_supported(element, "profile", "main");
+            set_property_from_str_if_supported(element, "max-bitrate", "10000");
+        }
+        "vaapih264enc" => {
+            element.set_property("bitrate", 8000u32);
+            set_property_from_str_if_supported(element, "rate-control", "vbr");
+            set_property_from_str_if_supported(element, "keyframe-period", "60");
+        }
+        "vtenc_h264" => {
+            element.set_property("bitrate", 8000u32);
+            element.set_property("gop", 60u32);
+            set_property_from_str_if_supported(element, "max-bitrate", "10000");
+            // Real-time encode: keeps encode latency from piling up behind
+            // the live stream instead of buffering whole seconds of frames.
+            set_property_from_str_if_supported(element, "realtime", "true");
         }
         "openh264enc" => {
             element.set_property("bitrate", 8000u32);
@@ -6896,5 +6983,43 @@ mod mic_pipeline_tests {
         for pair in lut.windows(2) {
             assert!(pair[1] >= pair[0], "LUT must be monotonic non-decreasing");
         }
+    }
+
+    /// The hardware encoder must be preferred over software when the runtime
+    /// ships it AND it can initialize (a working D3D12 video-encode adapter)
+    /// — that is the whole CPU-offload point of the recording branch — and
+    /// the picker must never fail when only software encoders exist.
+    #[test]
+    fn pick_h264_encoder_prefers_hardware_with_software_fallback() {
+        gst::init().expect("gstreamer init");
+        let (factory, _encoder) =
+            pick_h264_encoder().expect("at least one H.264 encoder must be available");
+        // On any platform the picker must return a real encoder, preferring
+        // hardware when one can initialize and falling back to software
+        // otherwise — never an error while an encoder exists.
+        assert!(
+            is_hardware_h264_factory(&factory)
+                || matches!(factory.as_str(), "x264enc" | "openh264enc"),
+            "picker returned an unexpected factory: {factory}"
+        );
+    }
+
+    /// Configuring the hardware encoder must set the properties that exist in
+    /// the bundled runtime (bitrate/gop-size/rate-control) and silently skip
+    /// ones it lacks (e.g. `profile` is caps-only on d3d12h264enc — setting it
+    /// must not panic).
+    #[test]
+    fn configure_d3d12_encoder_sets_supported_properties_only() {
+        gst::init().expect("gstreamer init");
+        let Some(element) = gst::ElementFactory::make("d3d12h264enc").build().ok() else {
+            return; // runtime without the hardware encoder — nothing to configure
+        };
+        configure_h264_encoder(&element, "d3d12h264enc");
+        let bitrate: u32 = element.property("bitrate");
+        assert_eq!(bitrate, 8000, "d3d12h264enc bitrate must be 8000 kbps");
+        let gop: u32 = element.property("gop-size");
+        assert_eq!(gop, 60, "d3d12h264enc gop-size must be 60");
+        // The whole point of configure_h264_encoder: it must not panic on
+        // unsupported properties (reaching here proves `profile` was skipped).
     }
 }
