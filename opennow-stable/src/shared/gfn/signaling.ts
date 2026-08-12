@@ -176,12 +176,48 @@ export interface NativeStreamStats {
   /** Server-reported network round-trip time (ms) from the stats_channel. */
   networkRttMs?: number;
   /**
+   * Age (ms) of the `networkRttMs` sample — time since the last stats_channel
+   * frame carrying a valid RTT arrived. The stats channel cadence is
+   * irregular (bursty), so the renderer uses this to expire a server RTT
+   * that stopped refreshing instead of holding it as the "current" ping.
+   */
+  networkRttAgeMs?: number;
+  /**
    * Locally computed RTCP round-trip time (ms) from Receiver Reports the
    * server sends about our outgoing RTP (rtpsession LSR/DLSR). Absent for a
    * receiver-only pipeline — the native streamer sends no RTP today, so this
-   * stays undefined until outgoing RTP exists.
+   * stays undefined until outgoing RTP exists. The native streamer only
+   * reports the value while it is fresh (see `localRtcpRttAgeMs`):
+   * rtpsession's `have-rb` flag sticks once set, so without expiry the local
+   * value would override the server RTT forever.
    */
   localRtcpRttMs?: number;
+  /**
+   * Age (ms) of the `localRtcpRttMs` sample — time since the last Receiver
+   * Report from the server changed the measurement. Lets the renderer expire
+   * a local RTCP value whose RR stream stopped, and prefer the freshest
+   * source when both the local and server RTT are present.
+   */
+  localRtcpRttAgeMs?: number;
+  /**
+   * Locally computed interarrival jitter (ms) of the incoming video stream,
+   * from rtpsession's RFC 3550 `jitter`/`avg-jitter` source-stats fields
+   * converted from RTP timestamp units via the source clock rate. Unlike
+   * `localRtcpRttMs` this does not need outgoing RTP — it works in
+   * receiver-only mode. Absent while the stream is stalled (no RTP within
+   * the liveness window) so the HUD decays a frozen value.
+   */
+  localJitterMs?: number;
+  /**
+   * Target depth of the native adaptive pre-decode jitter buffer, in
+   * milliseconds of buffered video (compressed-frame count × frame
+   * interval) — the delay the streamer intentionally holds the stream at
+   * before decoding so retransmissions and jitter bursts land inside the
+   * buffer. The native analogue of the WebRTC `jitterBufferDelayMs` HUD
+   * metric. Absent while the stream is stalled (RTP liveness gate) so the
+   * HUD decays a frozen depth.
+   */
+  preDecodeJitterBufferMs?: number;
   /** Server-reported packet loss (percent) from the stats_channel. */
   networkPacketLossPercent?: number;
   /**

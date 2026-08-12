@@ -600,9 +600,43 @@ pub struct NativeStatsEvent {
     /// server sends about our outgoing RTP (rtpsession's LSR/DLSR
     /// `rb-round-trip`). None when there is no outgoing RTP (e.g.
     /// OPENNOW_NATIVE_MIC=0) — the server only sends RRs for streams it
-    /// receives.
+    /// receives. The native streamer only reports the value while it is
+    /// fresh (see `local_rtcp_rtt_age_ms`): rtpsession's `have-rb` flag
+    /// sticks once set, so without expiry the local value would override the
+    /// server RTT forever.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_rtcp_rtt_ms: Option<u32>,
+    /// Age (ms) of the server-reported `network_rtt_ms` sample — time since
+    /// the last stats_channel frame carrying a valid RTT arrived. The stats
+    /// channel cadence is irregular (bursty), so the renderer uses this to
+    /// expire a server RTT that stopped refreshing instead of holding it as
+    /// "current" ping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_rtt_age_ms: Option<u32>,
+    /// Age (ms) of the `local_rtcp_rtt_ms` sample — time since the last
+    /// Receiver Report from the server changed the measurement (rtpsession's
+    /// `rb-lsr` advances with every RR). Lets the renderer expire a local
+    /// RTCP value whose RR stream stopped, falling back to the server RTT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_rtcp_rtt_age_ms: Option<u32>,
+    /// Locally computed interarrival jitter (ms) of the INCOMING video
+    /// stream, from rtpsession's RFC 3550 `jitter`/`avg-jitter` source-stats
+    /// fields converted from RTP timestamp units via the source clock rate.
+    /// Unlike the local RTCP RTT it does not need outgoing RTP — it works in
+    /// receiver-only mode. None while the stream is stalled (no RTP within
+    /// the liveness window) so the HUD decays a frozen value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_jitter_ms: Option<u32>,
+    /// Target depth of the adaptive pre-decode jitter buffer, in milliseconds
+    /// of buffered video (compressed-frame count × frame interval). This is
+    /// the delay the streamer intentionally holds the stream at before
+    /// decoding so NACK retransmissions and jitter bursts land inside the
+    /// buffer — the native analogue of the WebRTC `jitterBufferDelayMs` HUD
+    /// metric. Gated on RTP liveness like the local jitter so a dead session
+    /// does not report a frozen depth as current. None until a network signal
+    /// has set a depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_decode_jitter_buffer_ms: Option<u32>,
     /// Server-reported packet loss (percent) from the stats_channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_packet_loss_percent: Option<f64>,

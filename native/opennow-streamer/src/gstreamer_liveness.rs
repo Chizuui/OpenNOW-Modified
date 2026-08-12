@@ -37,6 +37,26 @@ const VIDEO_STALL_FATAL_MS: u64 = 20_000;
 /// frame.
 const JITTER_BURST_HOLD_MS: u64 = 4_000;
 
+/// A locally computed RTCP round-trip (`rb-round-trip`) is only trusted while
+/// Receiver Reports keep arriving. rtpsession's `have-rb` flag sticks once
+/// set — the raw value would otherwise be reported forever as the current
+/// ping even after the server stopped sending RRs (the frozen-ping bug). The
+/// `rb-lsr` field (the SR timestamp the server echoes back in each RR)
+/// advances with every new RR, so a change is the freshness signal: if no RR
+/// has arrived within this window, the local measurement is expired and the
+/// HUD falls back to the server-reported stats_channel RTT.
+const LOCAL_RTCP_FRESH_AGE_MS: u32 = 15_000;
+
+/// Local receive jitter (rtpsession's RFC 3550 interarrival jitter of the
+/// INCOMING video stream) is only trusted while video RTP keeps arriving.
+/// The jitter value updates continuously as packets flow, but freezes at its
+/// last value when the stream stalls — so without a liveness gate a dead
+/// session would report the frozen jitter forever. The watchdog gates on the
+/// RTP bitrate probe (`last_encoded_ms`), which fires on every RTP buffer;
+/// 5 s without any RTP means the stream is stalled/dead and jitter is
+/// reported as None (the HUD then decays it like the ping).
+const JITTER_FRESH_AGE_MS: u64 = 5_000;
+
 /// Map the network signals to a pre-decode jitter-buffer depth in compressed
 /// frames. A CONTINUOUS ramp grows the buffer in proportion to the measured
 /// RTT (BASE ≈100 ms at ≤ 30 ms up to MAX ≈250 ms at ≥ 150 ms) instead of
@@ -86,6 +106,20 @@ const VIDEO_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// start dropping, which only happens if the sink stalls (latency then reads
 /// stale and is ignored anyway).
 const DECODE_TIMESTAMP_QUEUE_MAX: usize = 512;
+
+/// Maximum plausible decode→present latency (ms). The present queue holds at
+/// most a few frames (~250 ms at 60 fps) plus sink processing, so anything
+/// older than this is a frame that was decoded before a stall and is only now
+/// reaching the sink — or was dropped by the present limiter. Expiring such
+/// entries keeps the HUD decode time reading real pipeline latency instead of
+/// the stall duration.
+const DECODE_PRESENT_MAX_AGE_MS: u64 = 1_000;
+
+/// Median window (number of recent decode→present deltas) used for the HUD
+/// decode time (~0.5 s at 60 fps). A median is robust to the single inflated
+/// delta a stall or limiter-drop leaves behind, unlike the old 75%-history
+/// EMA which held the inflated value for seconds.
+const DECODE_PRESENT_MEDIAN_WINDOW: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct VideoRateSnapshot {
@@ -202,11 +236,18 @@ pub(crate) struct VideoLivenessState {
     first_startup_encoded_ms: AtomicU64,
     decoded_total: AtomicU64,
     sink_total: AtomicU64,
-    /// Decode finish timestamps, popped one per sink present to measure the
-    /// decode→present pipeline latency (filled into the HUD "Decode time").
+    /// Decode finish timestamps, popped one per sink event (present or
+    /// present-limiter drop) to measure the decode→present pipeline latency
+    /// (filled into the HUD "Decode time"). Frames dropped by the present
+    /// limiter pop their entry via `record_sink_limiter_drop`; stale entries
+    /// (a stall backlog) are cleared via `clear_decode_timestamps`.
     decode_timestamps: Mutex<VecDeque<u64>>,
-    /// EMA of decode→present latency in ms.
-    avg_decode_present_ms: AtomicU32,
+    /// Sliding window of recent decode→present deltas (ms); the reported
+    /// value is the window's MEDIAN — robust to the single inflated delta a
+    /// stall or limiter-drop leaves behind.
+    decode_present_deltas: Mutex<VecDeque<u32>>,
+    /// Median decode→present latency in ms.
+    decode_present_median_ms: AtomicU32,
     zero_copy_d3d11: AtomicBool,
     zero_copy_d3d12: AtomicBool,
     requested_fps: AtomicU32,
@@ -270,7 +311,8 @@ impl VideoLivenessState {
             decoded_total: AtomicU64::new(0),
             sink_total: AtomicU64::new(0),
             decode_timestamps: Mutex::new(VecDeque::new()),
-            avg_decode_present_ms: AtomicU32::new(0),
+            decode_present_deltas: Mutex::new(VecDeque::new()),
+            decode_present_median_ms: AtomicU32::new(0),
             zero_copy_d3d11: AtomicBool::new(false),
             zero_copy_d3d12: AtomicBool::new(false),
             requested_fps: AtomicU32::new(0),
@@ -447,28 +489,70 @@ impl VideoLivenessState {
         }
     }
 
+    /// A present-limiter drop happened on the sink pad BEFORE the sink-rate
+    /// probe ran (the limiter probe is installed first and returns Drop, which
+    /// short-circuits the probe chain), so `record_sink_buffer` never fired for
+    /// that frame. Pop its decode timestamp here to keep the pairing queue
+    /// balanced — otherwise the dropped frame's entry lingers and the next
+    /// presented frame pops a STALE (older) timestamp, inflating the measured
+    /// decode→present delta.
+    pub(crate) fn record_sink_limiter_drop(&self) {
+        if let Ok(mut timestamps) = self.decode_timestamps.lock() {
+            let _ = timestamps.pop_front();
+        }
+    }
+
+    /// Drop ALL pending decode timestamps. Called by the watchdog on every
+    /// tick while the sink is stalled: the entries pushed before/during the
+    /// stall belong to frames that will be presented (if ever) long after they
+    /// were decoded, so pairing them with post-recovery presents would report
+    /// the whole stall as decode time. Clearing on stall means the first
+    /// post-recovery presents find an empty queue (no delta recorded, the
+    /// median holds its last good value) and only fresh frames re-populate it.
+    /// Note this intentionally clears entries decoded DURING the stall too:
+    /// they are just as contaminated (their delta would still include the
+    /// stall's remaining wait).
+    pub(crate) fn clear_decode_timestamps(&self) {
+        if let Ok(mut timestamps) = self.decode_timestamps.lock() {
+            timestamps.clear();
+        }
+    }
+
     pub(crate) fn record_sink_buffer(&self) {
         let now_ms = self.now_ms();
         self.last_sink_ms.store(now_ms, Ordering::Relaxed);
         self.sink_total.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut timestamps) = self.decode_timestamps.lock() {
+            // Defensive expiry: a frame decoded more than the max plausible
+            // latency ago is stall backlog, not this present's pairing — pop it
+            // so it can never inflate the delta (the watchdog also expires on
+            // stall; this covers the window between watchdog ticks).
+            while timestamps
+                .front()
+                .is_some_and(|ts| now_ms.saturating_sub(*ts) > DECODE_PRESENT_MAX_AGE_MS)
+            {
+                timestamps.pop_front();
+            }
             if let Some(decoded_at_ms) = timestamps.pop_front() {
                 let delta = now_ms.saturating_sub(decoded_at_ms) as u32;
-                let current = self.avg_decode_present_ms.load(Ordering::Relaxed);
-                let next = if current == 0 {
-                    delta
-                } else {
-                    // EMA (75% history, 25% latest) — smooths frame-to-frame jitter.
-                    (current * 3 + delta) / 4
-                };
-                self.avg_decode_present_ms.store(next, Ordering::Relaxed);
+                if let Ok(mut deltas) = self.decode_present_deltas.lock() {
+                    deltas.push_back(delta);
+                    if deltas.len() > DECODE_PRESENT_MEDIAN_WINDOW {
+                        deltas.pop_front();
+                    }
+                    // Median of the window — robust to the single inflated
+                    // delta a stall/limiter-drop leaves behind (an EMA with
+                    // 75% history held it for seconds).
+                    self.decode_present_median_ms
+                        .store(median_of_deltas(&deltas), Ordering::Relaxed);
+                }
             }
         }
     }
 
-    /// Average decode→present latency in ms (None until the first present).
-    fn avg_decode_present_ms(&self) -> Option<u32> {
-        let value = self.avg_decode_present_ms.load(Ordering::Relaxed);
+    /// Median decode→present latency in ms (None until the first present).
+    fn decode_present_median_ms(&self) -> Option<u32> {
+        let value = self.decode_present_median_ms.load(Ordering::Relaxed);
         (value > 0).then_some(value)
     }
 
@@ -868,6 +952,10 @@ impl VideoLivenessMonitor {
         self.state.record_sink_buffer();
     }
 
+    pub(crate) fn record_sink_limiter_drop(&self) {
+        self.state.record_sink_limiter_drop();
+    }
+
     pub(crate) fn update_caps(&self, caps: &str) {
         self.state.update_caps(caps);
     }
@@ -1005,6 +1093,18 @@ fn run_video_liveness_watchdog(
         decoded_fps: 0.0,
         sink_fps: 0.0,
     };
+    // Local RTCP freshness tracking. rtpsession's `have-rb` sticks once set,
+    // so the raw `rb-round-trip` value alone can never tell "RRs still
+    // flowing" from "frozen at an old value" (the frozen-ping bug). The
+    // `rb-lsr` field (the SR timestamp the server echoes back in each RR)
+    // advances on EVERY new RR, so a change is the freshness signal. Track
+    // the full `(rtt, lsr)` pair so builds that leave `rb-lsr` at 0 still
+    // detect new RRs via the RTT changing: the timestamp is re-based
+    // whenever the sample changes, and a local RTCP that hasn't refreshed
+    // within LOCAL_RTCP_FRESH_AGE_MS is expired (reported as None so the
+    // HUD falls back to the server RTT).
+    let mut last_local_rtcp_sample: Option<(u32, u64)> = None;
+    let mut last_local_rtcp_at = Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(VIDEO_LIVENESS_POLL_INTERVAL);
@@ -1021,7 +1121,46 @@ fn run_video_liveness_watchdog(
         // (the "kedip-kedip frame sebelumnya" flicker). Kept shallow on
         // stable links for tight input feel. Packet loss rides along as the
         // leading indicator that floors the depth before RTT even climbs.
-        let local_rtcp_rtt_ms = query_rtcp_rtt_ms(&pipeline);
+        let local_rtcp_sample = query_rtcp_rtt_ms(&pipeline);
+        // Re-base the freshness timestamp whenever a new RR changed the
+        // measurement (rb-lsr advances with every RR; None → Some counts as
+        // the first RR).
+        if local_rtcp_sample != last_local_rtcp_sample {
+            last_local_rtcp_sample = local_rtcp_sample;
+            last_local_rtcp_at = Instant::now();
+        }
+        let local_rtcp_rtt_age_ms = last_local_rtcp_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        // Expire the local measurement once RRs stop refreshing it — the raw
+        // rtpsession value (gated only by the sticky `have-rb`) would
+        // otherwise override the server RTT forever. When expired, report
+        // None so both the jitter buffer and the HUD use the server RTT.
+        let local_rtcp_rtt_ms = local_rtcp_sample
+            .map(|(rtt, _)| rtt)
+            .filter(|_| local_rtcp_rtt_age_ms <= LOCAL_RTCP_FRESH_AGE_MS);
+        // Local receive jitter of the incoming video stream, gated by RTP
+        // liveness: the value freezes when packets stop, so only report it
+        // while the RTP bitrate probe (fires on every RTP buffer) is fresh.
+        let encoded_age_ms = age_since_ms(
+            state.now_ms(),
+            state.last_encoded_ms.load(Ordering::Relaxed),
+        );
+        let local_jitter_ms = query_rtcp_jitter_ms(&pipeline)
+            .filter(|_| encoded_age_ms.is_none_or(|age| age <= JITTER_FRESH_AGE_MS));
+        // Target depth of the adaptive pre-decode jitter buffer, converted
+        // from compressed frames to milliseconds of buffered video (frame
+        // interval from the negotiated stream rate, 60 fps fallback — the
+        // same assumption the resize log uses). Gated on RTP liveness so the
+        // HUD decays the depth once the stream stalls, like the jitter.
+        let pre_decode_depth = state.pre_decode_depth.load(Ordering::Relaxed);
+        let pre_decode_jitter_buffer_ms = (pre_decode_depth > 0)
+            .then(|| {
+                let fps = state.requested_fps().unwrap_or(60).max(1);
+                (u64::from(pre_decode_depth) * 1000 / u64::from(fps)) as u32
+            })
+            .filter(|_| encoded_age_ms.is_none_or(|age| age <= JITTER_FRESH_AGE_MS));
         let server_rtt_now = stats_channel_rtt_ms();
         let effective_rtt = local_rtcp_rtt_ms.or((server_rtt_now > 0).then_some(server_rtt_now));
         if let Some(rtt) = effective_rtt {
@@ -1063,6 +1202,8 @@ fn run_video_liveness_watchdog(
                 decoded_total,
                 sink_total,
                 local_rtcp_rtt_ms,
+                local_rtcp_rtt_age_ms,
+                local_jitter_ms,
             );
             emit_native_stats_event(
                 &event_sender,
@@ -1073,6 +1214,9 @@ fn run_video_liveness_watchdog(
                 decoded_total,
                 sink_total,
                 local_rtcp_rtt_ms,
+                local_rtcp_rtt_age_ms,
+                local_jitter_ms,
+                pre_decode_jitter_buffer_ms,
             );
             // Fine-grained network health: the server RTT field vs the local
             // RTCP LSR/DLSR measurement + local signals, logged every 5s so a
@@ -1129,6 +1273,17 @@ fn run_video_liveness_watchdog(
         let likely_stage = classify_video_stall(encoded_age_ms, decoded_age_ms, sink_age_ms);
         let transition_stall = likely_stage == "decode-chain-stalled"
             && encoded_age_ms.is_some_and(|age| age <= 1_000);
+
+        // Drop ALL decode→present timestamp entries while the sink is stalled.
+        // Entries pushed before/during the stall belong to frames that will be
+        // presented (if ever) long after decode — pairing them after recovery
+        // would report the whole stall as "decode time". Re-cleared every tick
+        // the sink stays idle (decode may keep producing during the stall), so
+        // the first post-recovery presents find an empty queue and the median
+        // holds its last good value instead of spiking to thousands of ms.
+        if sink_age_ms.is_some_and(|age| age >= VIDEO_STALL_WARNING_MS) {
+            state.clear_decode_timestamps();
+        }
 
         match tracker.evaluate(now_ms, last_sink_ms) {
             VideoStallAction::None => {}
@@ -1503,7 +1658,14 @@ fn request_video_keyframe(reason: &str, attempt: u8, event_sender: &Option<Sende
 /// stalls — see build_mic_pipeline). With the mic off (or
 /// OPENNOW_NATIVE_MIC=0) there is no outgoing RTP and this returns None,
 /// and the HUD falls back to the server-reported stats_channel field.
-fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
+///
+/// Returns `(rtt_ms, rb_lsr)`: the round-trip plus the `rb-lsr` field — the
+/// SR timestamp the server echoes back inside each Receiver Report. `rb-lsr`
+/// advances with EVERY new RR, so it is the freshness signal the watchdog
+/// uses to expire a local measurement whose RR stream stopped (rtpsession's
+/// `have-rb` sticks once set, so the raw `rb-round-trip` value alone can
+/// never tell "still flowing" from "frozen at an old value").
+fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<(u32, u64)> {
     let webrtc = pipeline.by_name("opennow-webrtcbin")?;
     let webrtc_bin = webrtc.downcast::<gst::Bin>().ok()?;
     let rtpbin = webrtc_bin.children().into_iter().find(|child| {
@@ -1530,6 +1692,7 @@ fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
                 continue;
             };
             if source.get::<bool>("have-rb").unwrap_or(false) {
+                let rb_lsr = source.get::<u64>("rb-lsr").unwrap_or(0);
                 // GStreamer versions expose rb-round-trip as either guint or
                 // guint64. Calling Value::get::<u32>() against a guint64
                 // emits GLib's g_value_get_uint critical (seen once per stats
@@ -1547,13 +1710,94 @@ fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<u32> {
                     // 16.16 fixed point: value / 65536 seconds → ms.
                     let rtt_ms = (rtt_fixed as f64 / 65536.0 * 1000.0).round();
                     if rtt_ms > 0.0 && rtt_ms <= 2000.0 {
-                        return Some(rtt_ms as u32);
+                        return Some((rtt_ms as u32, rb_lsr));
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Query the LOCAL receive jitter of the video stream from the webrtcbin's
+/// internal rtpbin session stats. rtpsession computes the RFC 3550
+/// interarrival jitter of the RTP packets it RECEIVES and exposes it as
+/// `jitter` (and its EWMA `avg-jitter`) in each source's `source-stats`
+/// entry, in RTP timestamp units. The video stream is the source with the
+/// most received packets (the mic uplink is send-only and has none). Unlike
+/// `query_rtcp_rtt_ms`, this does NOT need outgoing RTP — it measures the
+/// incoming video stream directly, so it works even with the mic off.
+fn query_rtcp_jitter_ms(pipeline: &gst::Pipeline) -> Option<u32> {
+    let webrtc = pipeline.by_name("opennow-webrtcbin")?;
+    let webrtc_bin = webrtc.downcast::<gst::Bin>().ok()?;
+    let rtpbin = webrtc_bin.children().into_iter().find(|child| {
+        child
+            .factory()
+            .is_some_and(|factory| factory.name() == "rtpbin")
+    })?;
+    let rtpbin_bin = rtpbin.downcast::<gst::Bin>().ok()?;
+    // (packets_received, jitter_units, clock_rate) of the best candidate so
+    // far — the video stream is the source receiving the most RTP packets.
+    let mut best: Option<(u64, u32, u32)> = None;
+    for session in rtpbin_bin.children() {
+        // Only rtpsession elements expose a "stats" property; guard before
+        // querying because `property()` panics on a missing property.
+        if session.find_property("stats").is_none() {
+            continue;
+        }
+        let stats = session.property::<gst::Structure>("stats");
+        let Ok(source_stats) = stats.value("source-stats") else {
+            continue;
+        };
+        let Ok(sources) = source_stats.get::<gst::glib::ValueArray>() else {
+            continue;
+        };
+        for source in sources.iter() {
+            let Ok(source) = source.get::<gst::Structure>() else {
+                continue;
+            };
+            let packets_received = source.get::<u64>("packets-received").unwrap_or(0);
+            if packets_received == 0 {
+                continue;
+            }
+            // RFC 3550 jitter of the packets received from this source.
+            // Prefer the EWMA (`avg-jitter`) — it is smoother and more stable
+            // for the HUD, so per-packet arrival variance does not make the
+            // readout jump around — and fall back to the raw `jitter` only
+            // when the EWMA is absent or still 0 (e.g. too few packets yet).
+            let jitter_units = source
+                .get::<u32>("avg-jitter")
+                .ok()
+                .filter(|j| *j > 0)
+                .or_else(|| source.get::<u32>("jitter").ok().filter(|j| *j > 0))
+                .unwrap_or(0);
+            if jitter_units == 0 {
+                continue;
+            }
+            let clock_rate = source.get::<u32>("clock-rate").unwrap_or(90_000);
+            if best
+                .as_ref()
+                .is_none_or(|(best_packets, _, _)| packets_received > *best_packets)
+            {
+                best = Some((packets_received, jitter_units, clock_rate));
+            }
+        }
+    }
+    let (_, jitter_units, clock_rate) = best?;
+    rtcp_jitter_to_ms(jitter_units, clock_rate)
+}
+
+/// Convert RFC 3550 interarrival jitter from RTP timestamp units to
+/// milliseconds: jitter_ms = units * 1000 / clock_rate (video RTP uses a
+/// 90 kHz clock, so 1 ms of jitter ≈ 90 units). Pure so it's unit-testable.
+fn rtcp_jitter_to_ms(jitter_units: u32, clock_rate: u32) -> Option<u32> {
+    if jitter_units == 0 || clock_rate == 0 {
+        return None;
+    }
+    let jitter_ms = (f64::from(jitter_units) * 1000.0 / f64::from(clock_rate)).round();
+    // Plausibility clamp: real jitter is sub-second; a garbage/overflowed
+    // counter must never reach the HUD.
+    (jitter_ms > 0.0 && jitter_ms <= 1000.0).then_some(jitter_ms as u32)
 }
 
 /// The stats_channel `avgGameFps` is a short-window server-side average of the
@@ -1595,6 +1839,9 @@ fn emit_native_stats_event(
     frames_decoded: u64,
     frames_rendered: u64,
     local_rtcp_rtt_ms: Option<u32>,
+    local_rtcp_rtt_age_ms: u32,
+    local_jitter_ms: Option<u32>,
+    pre_decode_jitter_buffer_ms: Option<u32>,
 ) {
     let Some(event_sender) = event_sender else {
         return;
@@ -1642,11 +1889,29 @@ fn emit_native_stats_event(
             render_fps: rates.sink_fps,
             game_fps: (game_fps > 0).then_some(game_fps),
             network_rtt_ms: (rtt_ms > 0).then_some(rtt_ms),
+            // Server RTT sample age (time since the last stats_channel frame
+            // carried a valid RTT) so the renderer can expire it too.
+            network_rtt_age_ms: crate::gstreamer_input::stats_channel_rtt_age_ms(),
             local_rtcp_rtt_ms,
+            // Local RTCP sample age (time since the last RR refreshed the
+            // value; the value is already gated on the native side, this age
+            // lets the renderer prefer the freshest source when both exist).
+            local_rtcp_rtt_age_ms: local_rtcp_rtt_ms.map(|_| local_rtcp_rtt_age_ms),
+            // Local receive jitter of the incoming video stream (rtpsession
+            // RFC 3550 interarrival jitter, converted from RTP timestamp
+            // units via the source clock rate). None while the stream is
+            // stalled (no RTP within JITTER_FRESH_AGE_MS) so the HUD decays
+            // a frozen value instead of holding it as current.
+            local_jitter_ms,
+            // Target depth of the adaptive pre-decode jitter buffer (ms of
+            // buffered video) — the delay the streamer intentionally holds
+            // before decoding. None while stalled (RTP liveness gate), so
+            // the HUD JitterBuf metric decays like the WebRTC one.
+            pre_decode_jitter_buffer_ms,
             network_packet_loss_percent: stats_channel_packet_loss_fraction()
                 .map(|loss| loss * 100.0),
             network_bitrate_kbps: stats_channel_bitrate_kbps(),
-            decode_time_ms: state.avg_decode_present_ms(),
+            decode_time_ms: state.decode_present_median_ms(),
             input_path,
             mouse_delta_latency_us,
             frames_decoded,
@@ -1689,6 +1954,8 @@ fn update_native_stats_overlay(
     _frames_decoded: u64,
     frames_rendered: u64,
     local_rtcp_rtt_ms: Option<u32>,
+    _local_rtcp_rtt_age_ms: u32,
+    local_jitter_ms: Option<u32>,
 ) {
     let target_bitrate_kbps = state.target_bitrate_kbps.load(Ordering::Relaxed);
     let bitrate_performance_percent = if target_bitrate_kbps > 0 {
@@ -1731,8 +1998,14 @@ fn update_native_stats_overlay(
     let rtt_ms = crate::gstreamer_input::stats_channel_rtt_ms();
     // Prefer the LOCAL RTCP round-trip (LSR/DLSR from RRs the server sends
     // about our outgoing RTP) over the server-reported stats_channel field
-    // whenever it is available; "-" until any source reports.
-    let ping_ms = local_rtcp_rtt_ms.or((rtt_ms > 0).then_some(rtt_ms));
+    // whenever it is available — but only while each source is fresh: the
+    // local value is already gated by the watchdog, and the server field is
+    // gated by its own sample age (time since the last stats_channel frame
+    // carried a valid RTT). "-" until any FRESH source reports.
+    let server_rtt_fresh = rtt_ms > 0
+        && crate::gstreamer_input::stats_channel_rtt_age_ms()
+            .is_none_or(|age| age <= LOCAL_RTCP_FRESH_AGE_MS);
+    let ping_ms = local_rtcp_rtt_ms.or(server_rtt_fresh.then_some(rtt_ms));
     // Server-reported session bitrate (stats_channel counter, confidence-gated
     // in the native streamer); "-" until enough consistent samples confirm the
     // counter is cumulative bytes.
@@ -1740,13 +2013,16 @@ fn update_native_stats_overlay(
         .map(|kbps| format!("{:.1}", f64::from(kbps) / 1000.0))
         .unwrap_or_else(|| "-".to_owned());
     let text = format!(
-        "{} {}  {:.1}/{:.1} Mbps  Bit {:.0}%  Ping {}ms  Srv {} Mbps\nGame {:.0}fps  Stream {:.0}fps  Decode {:.0}fps  Drop {:.2}%  {}",
+        "{} {}  {:.1}/{:.1} Mbps  Bit {:.0}%  Ping {}ms  Jit {}ms  Srv {} Mbps\nGame {:.0}fps  Stream {:.0}fps  Decode {:.0}fps  Drop {:.2}%  {}",
         codec,
         resolution,
         bitrate_mbps,
         target_mbps,
         bitrate_performance_percent,
         ping_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "-".to_owned()),
+        local_jitter_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
         server_bitrate,
         // Server-reported game render FPS (stats_channel), clamped to the
         // negotiated stream rate (short-window server averages can overshoot
@@ -1864,6 +2140,14 @@ fn emit_video_stall_event(
             recovery_attempt,
         }));
     }
+}
+
+/// Median of a small slice of recent decode→present deltas (lower-middle for
+/// an even count). Pure so the median robustness is unit-testable.
+fn median_of_deltas(deltas: &VecDeque<u32>) -> u32 {
+    let mut sorted: Vec<u32> = deltas.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted[(sorted.len() - 1) / 2]
 }
 
 fn age_since_ms(now_ms: u64, last_ms: u64) -> Option<u64> {
@@ -2251,6 +2535,16 @@ pub(crate) fn install_present_limiter(
         // motion).
         if now + PRESENT_LIMITER_EARLY_TOLERANCE < state.next_present_at {
             state.dropped = state.dropped.saturating_add(1);
+            // This frame is being dropped by the limiter probe, which runs
+            // BEFORE the sink-rate probe on the same pad — the sink-rate
+            // probe (and its record_sink_buffer) never fires for it. Pop its
+            // decode timestamp here so the pairing queue stays balanced: a
+            // dropped frame must consume exactly one entry, or the next
+            // presented frame pops a stale one and the HUD decode time
+            // inflates.
+            if let Some(monitor) = &monitor {
+                monitor.record_sink_limiter_drop();
+            }
             return gst::PadProbeReturn::Drop;
         }
 
@@ -6642,5 +6936,118 @@ mod tests {
         );
 
         let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    #[test]
+    fn rtcp_jitter_to_ms_converts_rtp_timestamp_units() {
+        // Video RTP uses a 90 kHz clock: 1 ms of jitter ≈ 90 units.
+        assert_eq!(rtcp_jitter_to_ms(90, 90_000), Some(1));
+        assert_eq!(rtcp_jitter_to_ms(450, 90_000), Some(5));
+        assert_eq!(rtcp_jitter_to_ms(900, 90_000), Some(10));
+        // Audio clock (48 kHz) — same units, different rate.
+        assert_eq!(rtcp_jitter_to_ms(48, 48_000), Some(1));
+        // 0 units or a missing/zero clock rate → None (no garbage in the HUD).
+        assert_eq!(rtcp_jitter_to_ms(0, 90_000), None);
+        assert_eq!(rtcp_jitter_to_ms(90, 0), None);
+        // Overflowed/absurd counters are clamped away.
+        assert_eq!(rtcp_jitter_to_ms(u32::MAX, 90_000), None);
+    }
+
+    #[test]
+    fn median_of_deltas_ignores_a_single_inflated_spike() {
+        // 31 healthy ~8ms deltas + one 5000ms stall artifact. A median stays
+        // at the healthy value; the old EMA (75% history) would have been
+        // lifted for seconds by the spike.
+        let mut deltas = VecDeque::new();
+        for _ in 0..31 {
+            deltas.push_back(8);
+        }
+        deltas.push_back(5_000);
+        assert_eq!(median_of_deltas(&deltas), 8);
+
+        // Even-count window: lower-middle of [7, 8, 8, 5000] is 8.
+        let mut even = VecDeque::new();
+        even.push_back(7);
+        even.push_back(8);
+        even.push_back(8);
+        even.push_back(5_000);
+        assert_eq!(median_of_deltas(&even), 8);
+    }
+
+    /// The decode→present pairing queue must be balanced: every decoded
+    /// frame pushes one entry, and every sink event (present OR present-
+    /// limiter drop) pops exactly one. If a limiter drop left its entry
+    /// behind, the next present would pop a STALE timestamp and the delta
+    /// would jump to the full drop age.
+    #[test]
+    fn present_limiter_drop_consumes_one_pairing_entry() {
+        let mut state = VideoLivenessState::new();
+        // `now_ms()` is elapsed-since-start (near 0 in a fresh test), so all
+        // `saturating_sub` offsets would clamp to 0. Offset the clock so the
+        // queued entries sit at real elapsed values.
+        state.started_at = Instant::now() - Duration::from_secs(60);
+        let now = state.now_ms();
+        {
+            let mut timestamps = state.decode_timestamps.lock().unwrap();
+            timestamps.push_back(now.saturating_sub(1_000)); // stale-ish
+            timestamps.push_back(now.saturating_sub(100));
+            timestamps.push_back(now.saturating_sub(50));
+        }
+        // The limiter drops the frame whose timestamp is at the front (the
+        // oldest un-consumed one) — record_sink_buffer would never run for
+        // it, so pop it here to keep the queue balanced.
+        state.record_sink_limiter_drop();
+        // Two presents now pair with the remaining entries — deltas are
+        // ~100ms and ~50ms, NOT ~1000ms.
+        state.record_sink_buffer();
+        state.record_sink_buffer();
+        let median = state.decode_present_median_ms.load(Ordering::Relaxed);
+        assert!(
+            median <= 100 && median > 0,
+            "decode→present median should stay small after a limiter drop, got {median}"
+        );
+    }
+
+    /// A stall backlog must be cleared so the first post-recovery presents
+    /// don't pair with pre-stall decode timestamps (the "decode time ribuan"
+    /// symptom).
+    #[test]
+    fn clear_decode_timestamps_drops_stall_backlog() {
+        let mut state = VideoLivenessState::new();
+        state.started_at = Instant::now() - Duration::from_secs(60);
+        let now = state.now_ms();
+        {
+            let mut timestamps = state.decode_timestamps.lock().unwrap();
+            timestamps.push_back(now.saturating_sub(5_000));
+            timestamps.push_back(now.saturating_sub(3_000));
+            timestamps.push_back(now.saturating_sub(2_500));
+        }
+        state.clear_decode_timestamps();
+        assert!(state.decode_timestamps.lock().unwrap().is_empty());
+        // A post-recovery present finds an empty queue → no delta is recorded
+        // (the median holds its previous value instead of spiking).
+        state.record_sink_buffer();
+        assert_eq!(state.decode_present_median_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// Defensive expiry inside record_sink_buffer: an entry older than the
+    /// max plausible decode→present latency is stall residue and must never
+    /// inflate the delta, even if the watchdog hasn't cleared it yet.
+    #[test]
+    fn record_sink_buffer_skips_stale_pairing_entry() {
+        let mut state = VideoLivenessState::new();
+        state.started_at = Instant::now() - Duration::from_secs(60);
+        let now = state.now_ms();
+        {
+            let mut timestamps = state.decode_timestamps.lock().unwrap();
+            timestamps.push_back(now.saturating_sub(4_000)); // stall residue
+            timestamps.push_back(now.saturating_sub(60));
+        }
+        state.record_sink_buffer();
+        let median = state.decode_present_median_ms.load(Ordering::Relaxed);
+        assert!(
+            median > 0 && median <= 100,
+            "stale entry must be skipped; delta should be ~60ms, got {median}"
+        );
     }
 }

@@ -54,6 +54,12 @@ static STATS_CHANNEL_GAME_FPS: OnceLock<AtomicU32> = OnceLock::new();
 /// offset 9 field is a small fraction (≈0.0001-0.0004) that looks like packet
 /// loss. Both are 0 / -1 sentinel when the server has no measurement yet.
 static STATS_CHANNEL_RTT_MS: OnceLock<AtomicU32> = OnceLock::new();
+/// Monotonic instant of the last stats_channel frame that carried a valid
+/// (non-zero) server RTT. The stats channel cadence is irregular — samples
+/// arrive in bursts with arbitrary gaps — so this lets the HUD expire a
+/// server RTT that stopped refreshing (the "ping frozen at an old spike"
+/// symptom) instead of holding it as current forever.
+static STATS_CHANNEL_RTT_LAST_SEEN_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 /// Server-reported packet loss fraction (0..1) from payload offset 9, stored as
 /// basis points (percent × 100) so it fits an atomic integer.
 static STATS_CHANNEL_LOSS_BPS: OnceLock<AtomicU32> = OnceLock::new();
@@ -257,6 +263,17 @@ pub(crate) fn stats_channel_rtt_ms() -> u32 {
     STATS_CHANNEL_RTT_MS
         .get_or_init(|| AtomicU32::new(0))
         .load(Ordering::Relaxed)
+}
+
+/// Age (ms) of the last server-reported RTT sample — time since the last
+/// stats_channel frame carrying a valid (non-zero) RTT arrived. None when no
+/// valid sample has been seen yet. Lets the renderer expire a server RTT
+/// that stopped refreshing.
+pub(crate) fn stats_channel_rtt_age_ms() -> Option<u32> {
+    STATS_CHANNEL_RTT_LAST_SEEN_AT
+        .get()
+        .and_then(|slot| slot.lock().ok())
+        .map(|last| last.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
 /// Read the most recently reported server-side packet loss fraction (0..1).
@@ -1662,6 +1679,12 @@ fn connect_remote_data_channel_callbacks(
                 STATS_CHANNEL_RTT_MS
                     .get_or_init(|| AtomicU32::new(0))
                     .store(network.rtt_ms, Ordering::Relaxed);
+                if let Ok(mut slot) = STATS_CHANNEL_RTT_LAST_SEEN_AT
+                    .get_or_init(|| Mutex::new(Instant::now()))
+                    .lock()
+                {
+                    *slot = Instant::now();
+                }
             }
             if let Some(loss) = network.packet_loss_fraction {
                 STATS_CHANNEL_LOSS_BPS

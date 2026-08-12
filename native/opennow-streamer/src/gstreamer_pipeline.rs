@@ -13,6 +13,7 @@ use crate::gstreamer_input::{
     create_input_data_channels, wire_remote_data_channels, GstreamerInputChannels,
     GstreamerInputState,
 };
+use crate::gstreamer_ice::{log_remote_ice_candidate, wire_ice_observability};
 use crate::gstreamer_liveness::{
     install_present_limiter, read_queue_level, sink_rendered_frame_count, watch_audio_activity,
     watch_first_sink_buffer, watch_rtp_video_bitrate, watch_video_caps_transitions,
@@ -1391,6 +1392,7 @@ impl GstreamerPipeline {
         let video_liveness = VideoLivenessMonitor::default();
         wire_local_ice_events(&webrtc, event_sender.clone())?;
         wire_webrtc_state_events(&webrtc, event_sender.clone());
+        wire_ice_observability(&webrtc, event_sender.clone());
         wire_remote_data_channels(&webrtc, event_sender.clone());
         start_gstreamer_bus_diagnostics(
             &pipeline,
@@ -2143,6 +2145,7 @@ impl GstreamerPipeline {
     }
 
     pub(crate) fn add_remote_ice(&mut self, candidate: &IceCandidatePayload) -> Result<(), String> {
+        log_remote_ice_candidate(&candidate.candidate, &self.event_sender);
         if candidate.candidate.trim().is_empty() {
             return Err("Remote ICE candidate is empty.".to_owned());
         }
@@ -3117,7 +3120,7 @@ fn wire_local_ice_events(
     Ok(())
 }
 
-fn glib_value_to_u32(value: &glib::Value) -> Option<u32> {
+pub(crate) fn glib_value_to_u32(value: &glib::Value) -> Option<u32> {
     let value_type = value.type_();
     if value_type == u32::static_type() {
         return value.get::<u32>().ok();

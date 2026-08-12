@@ -745,6 +745,169 @@ pub fn munge_answer_sdp(sdp: &str, max_bitrate_kbps: u32) -> String {
     result.join(ending)
 }
 
+/// RED audio redundancy data the server advertised for one audio m-line.
+#[derive(Debug, Clone)]
+struct RedAudioSection {
+    mid: Option<String>,
+    payload: String,
+    rtpmap: String,
+    fmtp: Vec<String>,
+    rtcp_fb: Vec<String>,
+}
+
+/// Re-inject the server's RED audio redundancy payload into the WebRTC answer.
+///
+/// GFN servers advertise RED for the game-audio m-line (`a=rtpmap:63
+/// red/48000/2` + `a=fmtp:63 111/111`), but GStreamer's webrtcbin answers with
+/// only the inner Opus payload (it does not auto-select `rtpreddepay` at
+/// answer time), so the server never sends the redundant copy and one lost RTP
+/// packet drops the audio sample outright. The official client negotiates RED
+/// so the server sends a duplicate of each Opus packet. Mirror the offer's RED
+/// payload back into the matching audio m-line of the answer — but ONLY when
+/// `red_supported` (the runtime has `rtpreddepay`) so we never negotiate a
+/// payload the receive path cannot unwrap.
+pub fn ensure_audio_red_in_answer(
+    answer_sdp: &str,
+    original_offer_sdp: &str,
+    red_supported: bool,
+) -> String {
+    if !red_supported {
+        return answer_sdp.to_owned();
+    }
+
+    // Collect the offer's RED audio sections (keyed by a=mid so the right
+    // answer section is patched; the mic uplink m-line never advertises RED,
+    // so it is naturally skipped).
+    let mut red_sections: Vec<RedAudioSection> = Vec::new();
+    {
+        let lines = split_lines_lossless(original_offer_sdp);
+        let mut index = 0usize;
+        while index < lines.len() {
+            if !lines[index].starts_with("m=audio") {
+                index += 1;
+                continue;
+            }
+            let mut cursor = index + 1;
+            let mut mid = None;
+            let mut red: Option<RedAudioSection> = None;
+            let mut fmtp: Vec<(String, String)> = Vec::new();
+            let mut rtcp_fb: Vec<(String, String)> = Vec::new();
+            while cursor < lines.len() && !lines[cursor].starts_with("m=") {
+                let line = lines[cursor];
+                if let Some(rest) = line.strip_prefix("a=mid:") {
+                    mid = Some(rest.to_owned());
+                } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let pt = parts.next().unwrap_or_default().trim();
+                    let encoding = parts.next().unwrap_or_default().trim();
+                    if encoding.starts_with("red/") {
+                        red = Some(RedAudioSection {
+                            mid: None,
+                            payload: pt.to_owned(),
+                            rtpmap: line.to_owned(),
+                            fmtp: Vec::new(),
+                            rtcp_fb: Vec::new(),
+                        });
+                    }
+                } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
+                    let pt = rest.splitn(2, char::is_whitespace).next().unwrap_or_default().trim();
+                    fmtp.push((pt.to_owned(), line.to_owned()));
+                } else if let Some(rest) = line.strip_prefix("a=rtcp-fb:") {
+                    let pt = rest.splitn(2, char::is_whitespace).next().unwrap_or_default().trim();
+                    rtcp_fb.push((pt.to_owned(), line.to_owned()));
+                }
+                cursor += 1;
+            }
+            if let Some(mut section) = red {
+                section.mid = mid;
+                section.fmtp = fmtp
+                    .iter()
+                    .filter(|(pt, _)| *pt == section.payload)
+                    .map(|(_, line)| line.clone())
+                    .collect();
+                section.rtcp_fb = rtcp_fb
+                    .iter()
+                    .filter(|(pt, _)| *pt == section.payload)
+                    .map(|(_, line)| line.clone())
+                    .collect();
+                red_sections.push(section);
+            }
+            index = cursor;
+        }
+    }
+    if red_sections.is_empty() {
+        return answer_sdp.to_owned();
+    }
+
+    // Find the answer audio sections that need RED, then patch them from the
+    // bottom up so the insertion indices stay valid.
+    let ending = line_ending(answer_sdp);
+    let mut lines: Vec<String> =
+        split_lines_lossless(answer_sdp).into_iter().map(str::to_owned).collect();
+    struct PendingPatch {
+        section_start: usize,
+        insert_at: usize,
+        payload: String,
+        rtpmap: String,
+        fmtp: Vec<String>,
+        rtcp_fb: Vec<String>,
+    }
+    let mut patches: Vec<PendingPatch> = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if !lines[index].starts_with("m=audio") {
+            index += 1;
+            continue;
+        }
+        let section_start = index;
+        let mut cursor = index + 1;
+        let mut mid: Option<String> = None;
+        while cursor < lines.len() && !lines[cursor].starts_with("m=") {
+            if let Some(rest) = lines[cursor].strip_prefix("a=mid:") {
+                mid = Some(rest.to_owned());
+            }
+            cursor += 1;
+        }
+        let matching_offer = red_sections.iter().find(|section| {
+            matches!((section.mid.as_deref(), mid.as_deref()), (Some(offer_mid), Some(answer_mid)) if offer_mid == answer_mid)
+        });
+        if let Some(offer_section) = matching_offer {
+            let already_present = lines[section_start]
+                .split_whitespace()
+                .any(|token| token == offer_section.payload);
+            let rtpmap_present = lines[section_start + 1..cursor]
+                .iter()
+                .any(|line| line == &offer_section.rtpmap);
+            if !already_present && !rtpmap_present {
+                patches.push(PendingPatch {
+                    section_start,
+                    insert_at: cursor,
+                    payload: offer_section.payload.clone(),
+                    rtpmap: offer_section.rtpmap.clone(),
+                    fmtp: offer_section.fmtp.clone(),
+                    rtcp_fb: offer_section.rtcp_fb.clone(),
+                });
+            }
+        }
+        index = cursor;
+    }
+    if patches.is_empty() {
+        return answer_sdp.to_owned();
+    }
+
+    for patch in patches.into_iter().rev() {
+        lines[patch.section_start].push(' ');
+        lines[patch.section_start].push_str(&patch.payload);
+        let mut extra = vec![patch.rtpmap];
+        extra.extend(patch.fmtp);
+        extra.extend(patch.rtcp_fb);
+        for (offset, line) in extra.into_iter().enumerate() {
+            lines.insert(patch.insert_at + offset, line);
+        }
+    }
+    lines.join(ending)
+}
+
 /// Remove H265 fmtp parameters that GStreamer's `rtph265depay` cannot accept.
 ///
 /// GFN echoes `profile-id`, `level-id`, and `tier-flag` from its offer into
@@ -1734,5 +1897,111 @@ mod tests {
         let nvst = build_nvst_sdp(&params);
 
         assert!(nvst.contains("a=video.videoSplitEncodeStripsPerFrame:63"));
+    }
+
+    #[test]
+    fn injects_offer_red_audio_into_matching_answer_section() {
+        let offer = [
+            "v=0",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 63 111",
+            "a=mid:0",
+            "a=rtpmap:63 red/48000/2",
+            "a=fmtp:63 111/111",
+            "a=rtpmap:111 opus/48000/2",
+            "a=fmtp:111 minptime=10;useinbandfec=1",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 0",
+            "a=mid:1",
+            "a=rtpmap:0 PCMU/8000",
+        ]
+        .join("\n");
+
+        let answer = [
+            "v=0",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=mid:0",
+            "a=rtpmap:111 opus/48000/2",
+            "a=fmtp:111 minptime=10;useinbandfec=1;stereo=1",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 0",
+            "a=mid:1",
+            "a=rtpmap:0 PCMU/8000",
+        ]
+        .join("\n");
+
+        let munged = ensure_audio_red_in_answer(&answer, &offer, true);
+
+        // RED payload re-advertised on the game-audio m-line only.
+        assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111 63"));
+        assert!(munged.contains("a=rtpmap:63 red/48000/2"));
+        assert!(munged.contains("a=fmtp:63 111/111"));
+        // The other audio section is untouched, and no duplicate rtpmap.
+        assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 0"));
+        assert_eq!(munged.matches("a=rtpmap:63 red/48000/2").count(), 1);
+    }
+
+    #[test]
+    fn skips_red_injection_when_unsupported_or_already_present() {
+        let offer = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 63 111",
+            "a=mid:0",
+            "a=rtpmap:63 red/48000/2",
+            "a=fmtp:63 111/111",
+            "a=rtpmap:111 opus/48000/2",
+        ]
+        .join("\n");
+
+        let answer = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=mid:0",
+            "a=rtpmap:111 opus/48000/2",
+        ]
+        .join("\n");
+
+        // Unsupported receive path: the answer is returned untouched.
+        assert_eq!(ensure_audio_red_in_answer(&answer, &offer, false), answer);
+
+        // Already negotiated: no double injection.
+        let already = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111 63",
+            "a=mid:0",
+            "a=rtpmap:111 opus/48000/2",
+            "a=rtpmap:63 red/48000/2",
+            "a=fmtp:63 111/111",
+        ]
+        .join("\n");
+        assert_eq!(ensure_audio_red_in_answer(&already, &offer, true), already);
+
+        // Offer without RED: nothing to mirror.
+        let plain_offer = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=mid:0",
+            "a=rtpmap:111 opus/48000/2",
+        ]
+        .join("\n");
+        assert_eq!(ensure_audio_red_in_answer(&answer, &plain_offer, true), answer);
+    }
+
+    #[test]
+    fn preserves_answer_line_endings_through_red_injection() {
+        let offer = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 63 111",
+            "a=mid:0",
+            "a=rtpmap:63 red/48000/2",
+            "a=fmtp:63 111/111",
+            "a=rtpmap:111 opus/48000/2",
+        ]
+        .join("\r\n");
+
+        let answer = [
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=mid:0",
+            "a=rtpmap:111 opus/48000/2",
+        ]
+        .join("\r\n");
+
+        let munged = ensure_audio_red_in_answer(&answer, &offer, true);
+        assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111 63"));
+        assert!(munged.contains("a=rtpmap:63 red/48000/2\r\na=fmtp:63 111/111"));
+        // No bare-LF line slipped in.
+        assert!(!munged.replace("\r\n", "").contains('\n'));
     }
 }

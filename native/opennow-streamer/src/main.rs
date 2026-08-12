@@ -11,6 +11,8 @@ mod gstreamer_backend;
 // even when the optional GStreamer feature is off.
 mod gstreamer_config;
 #[cfg(feature = "gstreamer")]
+mod gstreamer_ice;
+#[cfg(feature = "gstreamer")]
 mod gstreamer_input;
 #[cfg(feature = "gstreamer")]
 mod gstreamer_liveness;
@@ -20,6 +22,7 @@ mod gstreamer_pipeline;
 mod gstreamer_platform;
 #[cfg(feature = "gstreamer")]
 mod gstreamer_transitions;
+mod ice_observability;
 mod input;
 #[cfg(feature = "gstreamer")]
 mod internal_renderer;
@@ -150,6 +153,25 @@ fn handle_command(
 fn main() -> io::Result<()> {
     #[cfg(target_os = "windows")]
     windows_dpi::enable_per_monitor_awareness();
+
+    // Optional deep ICE/STUN diagnostics for NAT debugging: libnice gates its
+    // per-packet debug (STUN bindings, retransmissions, consent freshness)
+    // behind the NICE_DEBUG env var, and GLib only prints debug-level messages
+    // to stderr when G_MESSAGES_DEBUG allows the domain. Enable both early so
+    // libnice picks them up before the ICE agent is created; the main process
+    // already forwards the native stderr into the app log. Opt-in only: the
+    // output is extremely verbose.
+    if std::env::var_os("OPENNOW_NICE_DEBUG").is_some() {
+        if std::env::var_os("NICE_DEBUG").is_none() {
+            std::env::set_var("NICE_DEBUG", "all");
+        }
+        if std::env::var_os("G_MESSAGES_DEBUG").is_none() {
+            std::env::set_var("G_MESSAGES_DEBUG", "all");
+        }
+        eprintln!(
+            "[NativeStreamer] OPENNOW_NICE_DEBUG is set: libnice STUN/binding debug is routed to stderr."
+        );
+    }
 
     let stdin = io::stdin();
     let (event_sender, event_receiver) = mpsc::channel::<Event>();

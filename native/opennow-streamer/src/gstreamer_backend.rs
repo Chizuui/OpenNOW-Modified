@@ -17,9 +17,10 @@ use crate::protocol::{
     NativeStreamerCapabilities, NativeStreamerSessionContext, NativeVideoBackendCapability,
     Response, SendAnswerRequest, PROTOCOL_VERSION,
 };
+use gstreamer as gst;
 use crate::sdp::{
-    build_nvst_sdp_for_answer, extract_negotiated_video_codec, munge_answer_sdp,
-    restore_h265_fmtp_params, rewrite_ice_candidate_endpoint,
+    build_nvst_sdp_for_answer, ensure_audio_red_in_answer, extract_negotiated_video_codec,
+    munge_answer_sdp, restore_h265_fmtp_params, rewrite_ice_candidate_endpoint,
 };
 use std::sync::mpsc::Sender;
 
@@ -381,11 +382,20 @@ impl NativeStreamerBackend for GstreamerBackend {
                 // stripped (rtph265depay rejects them in the receive caps); put
                 // them back on the answer sent to GFN so the server sees the
                 // fmtp it expects in the answer.
-                if let Some(h265_fmtp) = prepared.h265_fmtp_params.as_deref() {
+                let munged = if let Some(h265_fmtp) = prepared.h265_fmtp_params.as_deref() {
                     restore_h265_fmtp_params(&munged, h265_fmtp)
                 } else {
                     munged
-                }
+                };
+                // webrtcbin drops the server's RED audio redundancy payload
+                // from its answer (no auto rtpreddepay at answer time);
+                // re-advertise it so the server sends the redundant Opus copy
+                // — but only when the bundled runtime can unwrap it.
+                ensure_audio_red_in_answer(
+                    &munged,
+                    &prepared.fixed_offer_sdp,
+                    gst::ElementFactory::find("rtpreddepay").is_some(),
+                )
             }
             Err(message) => {
                 return BackendReply {
