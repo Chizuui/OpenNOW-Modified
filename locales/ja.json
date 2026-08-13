@@ -419,6 +419,7 @@
       "maxBitrate": "最大ビットレート",
       "appliesAfterRestart": "アプリの再起動後に適用されます。",
       "requiresH265OrAv1": "このモードには H265 または AV1 が必要です。コーデックは自動で切り替わります。",
+      "nativeColorLockedHint": "ネイティブモードは8ビットBT.709（SDR）でレンダリングされます。色深度は8ビット4:2:0に固定されます。",
       "testing": "テスト中...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -449,7 +450,8 @@
       "sharperChroma": "よりシャープな彩度",
       "higherBitDepth": "より高いビット深度",
       "highestChromaAndBitDepth": "最高の彩度とビット深度",
-      "requiresH265OrAv1Title": "{{description}} - H265/AV1 が必要"
+      "requiresH265OrAv1Title": "{{description}} - H265/AV1 が必要",
+      "nativeModeOnlyTitle": "{{description}} - ネイティブモードでは8ビット4:2:0に固定（8ビットBT.709表示）"
     },
     "game": {
       "title": "ゲーム",

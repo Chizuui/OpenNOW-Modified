@@ -419,6 +419,7 @@
       "maxBitrate": "Макс. битрейт",
       "appliesAfterRestart": "Применяется после перезапуска приложения.",
       "requiresH265OrAv1": "Для этого режима требуется H265 или AV1. Кодек будет автоматически переключен.",
+      "nativeColorLockedHint": "Нативный режим рендерит 8-бит BT.709 (SDR); глубина цвета зафиксирована на 8-бит 4:2:0.",
       "testing": "Тестирование...",
       "gpu": "графический процессор",
       "cpu": "ЦП",
@@ -449,7 +450,8 @@
       "sharperChroma": "Более резкая цветность",
       "higherBitDepth": "Более высокая битовая глубина",
       "highestChromaAndBitDepth": "Высочайшая цветность и битовая глубина",
-      "requiresH265OrAv1Title": "{{description}} — требуется H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} — требуется H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} — зафиксировано на 8-бит 4:2:0 в нативном режиме (8-бит BT.709)"
     },
     "game": {
       "title": "Игра",

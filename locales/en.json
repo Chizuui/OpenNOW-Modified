@@ -622,6 +622,7 @@
       "jitterBufferSmooth": "Smooth",
       "appliesAfterRestart": "Applies after app restart.",
       "requiresH265OrAv1": "This mode requires H265 or AV1. Codec will be auto-switched.",
+      "nativeColorLockedHint": "Native mode renders 8-bit BT.709 (SDR); color depth is locked to 8-bit 4:2:0.",
       "testing": "Testing...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -684,7 +685,8 @@
       "sharperChroma": "Sharper chroma",
       "higherBitDepth": "Higher bit depth",
       "highestChromaAndBitDepth": "Highest chroma and bit depth",
-      "requiresH265OrAv1Title": "{{description}} - requires H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} - requires H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} - locked to 8-bit 4:2:0 in native mode (8-bit BT.709 display)"
     },
     "game": {
       "title": "Game",

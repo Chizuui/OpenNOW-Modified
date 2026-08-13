@@ -420,6 +420,7 @@
       "maxBitrate": "Maximale bitsnelheid",
       "appliesAfterRestart": "Van toepassing na herstart van de app.",
       "requiresH265OrAv1": "Deze modus vereist H265 of AV1. Codec wordt automatisch geschakeld.",
+      "nativeColorLockedHint": "Native modus rendert 8-bit BT.709 (SDR); kleurdiepte is vergrendeld op 8-bit 4:2:0.",
       "testing": "Testen...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -450,7 +451,8 @@
       "sharperChroma": "Scherpere chroma",
       "higherBitDepth": "Hogere bitdiepte",
       "highestChromaAndBitDepth": "Hoogste chroma en bitdiepte",
-      "requiresH265OrAv1Title": "{{description}} - vereist H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} - vereist H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} - vergrendeld op 8-bit 4:2:0 in native modus (8-bit BT.709-weergave)"
     },
     "game": {
       "title": "Spel",

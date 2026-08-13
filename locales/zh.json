@@ -419,6 +419,7 @@
       "maxBitrate": "最大比特率",
       "appliesAfterRestart": "应用程序重新启动后适用。",
       "requiresH265OrAv1": "此模式需要 H265 或 AV1。编解码器将自动切换。",
+      "nativeColorLockedHint": "原生模式以 8 位 BT.709（SDR）渲染；色深锁定为 8 位 4:2:0。",
       "testing": "测试...",
       "gpu": "图形处理器",
       "cpu": "中央处理器",
@@ -449,7 +450,8 @@
       "sharperChroma": "色度更锐利",
       "higherBitDepth": "更高的位深度",
       "highestChromaAndBitDepth": "最高色度和位深度",
-      "requiresH265OrAv1Title": "{{description}} - 需要 H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} - 需要 H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} - 原生模式锁定为 8 位 4:2:0（8 位 BT.709 显示）"
     },
     "game": {
       "title": "游戏",

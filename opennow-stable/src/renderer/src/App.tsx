@@ -5,6 +5,7 @@ import { AnimatePresence, m, useReducedMotion } from "motion/react";
 import type {
   ActiveSessionInfo,
   AuthSession,
+  ColorQuality,
   DirectLaunchRequest,
   GameInfo,
   LoginProvider,
@@ -743,9 +744,16 @@ export function App(): JSX.Element {
     // concrete codec for exactly this launch, bypassing the user preference
     // ladder — but still re-pins color quality through normalizeStreamPreferences
     // so a H264 fallback (8-bit 4:2:0 only) never carries a 10-bit mode.
+    // Native mode is additionally locked to 8-bit 4:2:0 at the MODE level
+    // (not just when the capability probe has loaded): the native display
+    // path renders 8-bit BT.709 full-range NV12, so 10-bit/4:4:4 would be
+    // negotiated and then converted down (banding, wrong HDR colors).
+    const effectiveColorQuality: ColorQuality = settings.streamClientMode === "native"
+      ? "8bit_420"
+      : settings.colorQuality;
     const resolvedCodecProfile = codecOverride
-      ? normalizeStreamPreferences(codecOverride, settings.colorQuality)
-      : resolveStreamProfileCodec(settings.codec, settings.colorQuality, codecResults, nativeAvailability);
+      ? normalizeStreamPreferences(codecOverride, effectiveColorQuality)
+      : resolveStreamProfileCodec(settings.codec, effectiveColorQuality, codecResults, nativeAvailability);
 
     return {
       resolution: streamProfile.resolution,

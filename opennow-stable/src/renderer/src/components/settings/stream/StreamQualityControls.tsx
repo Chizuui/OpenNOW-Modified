@@ -142,6 +142,14 @@ export function StreamQualityControls({
     useEntitledStreamOptions,
   ]);
 
+  const isNativeMode = settings.streamClientMode === "native";
+  // Native mode renders 8-bit BT.709 full-range NV12 (DISPLAY_NV12_FULL_RANGE_CAPS
+  // in the Rust pipeline), so 10-bit/4:4:4 would be negotiated and then converted
+  // down — banding, and wrong colors for true HDR. The session request clamps to
+  // 8-bit 4:2:0 (buildCurrentStreamSettings), so reflect that here: show 8-bit
+  // 4:2:0 as the active chip and lock the rest.
+  const effectiveColorQuality: ColorQuality = isNativeMode ? "8bit_420" : settings.colorQuality;
+
   const handleColorQualityChange = useCallback((colorQuality: ColorQuality): void => {
     if (colorQualityRequiresHevc(colorQuality) && settings.codec === "H264") {
       handleChange("codec", "H265");
@@ -376,6 +384,11 @@ export function StreamQualityControls({
           <div className="settings-chip-row">
             {colorQualityOptions.map((option) => {
               const needsHevc = colorQualityRequiresHevc(option.value);
+              // In native mode only 8-bit 4:2:0 is actually rendered — the
+              // display path is pinned to 8-bit BT.709 full-range NV12. Lock the
+              // other chips (disabled + tooltip) so the UI never promises a
+              // 10-bit/4:4:4 stream that gets converted down.
+              const nativeLocked = isNativeMode && option.value !== "8bit_420";
               const colorDescription = option.value === "8bit_420"
                 ? t("settings.colorQuality.mostCompatible")
                 : option.value === "8bit_444"
@@ -386,21 +399,31 @@ export function StreamQualityControls({
               return (
                 <button
                   key={option.value}
-                  className={`settings-chip ${settings.colorQuality === option.value ? "active" : ""}`}
-                  aria-pressed={settings.colorQuality === option.value}
+                  className={`settings-chip ${effectiveColorQuality === option.value ? "active" : ""}`}
+                  aria-pressed={effectiveColorQuality === option.value}
+                  disabled={nativeLocked}
                   onClick={() => handleColorQualityChange(option.value)}
-                  title={needsHevc
-                    ? t("settings.colorQuality.requiresH265OrAv1Title", {
+                  title={nativeLocked
+                    ? t("settings.colorQuality.nativeModeOnlyTitle", {
                         description: colorDescription,
                       })
-                    : colorDescription}
+                    : needsHevc
+                      ? t("settings.colorQuality.requiresH265OrAv1Title", {
+                          description: colorDescription,
+                        })
+                      : colorDescription}
                 >
                   <span>{option.label}</span>
                 </button>
               );
             })}
           </div>
-          {colorQualityRequiresHevc(settings.colorQuality) && settings.codec === "H264" && (
+          {isNativeMode && (
+            <span className="settings-input-hint">
+              {t("settings.video.nativeColorLockedHint")}
+            </span>
+          )}
+          {!isNativeMode && colorQualityRequiresHevc(settings.colorQuality) && settings.codec === "H264" && (
             <span className="settings-input-hint">
               {t("settings.video.requiresH265OrAv1")}
             </span>

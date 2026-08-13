@@ -419,6 +419,7 @@
       "maxBitrate": "최대 비트 전송률",
       "appliesAfterRestart": "앱을 다시 시작한 후 적용됩니다.",
       "requiresH265OrAv1": "이 모드에는 H265 또는 AV1이 필요합니다. 코덱이 자동으로 전환됩니다.",
+      "nativeColorLockedHint": "네이티브 모드는 8비트 BT.709(SDR)로 렌더링되며 색 심도는 8비트 4:2:0으로 고정됩니다.",
       "testing": "테스트 중...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -449,7 +450,8 @@
       "sharperChroma": "더 선명한 채도",
       "higherBitDepth": "더 높은 비트 심도",
       "highestChromaAndBitDepth": "가장 높은 채도 및 비트 심도",
-      "requiresH265OrAv1Title": "{{description}} - H265/AV1 필요"
+      "requiresH265OrAv1Title": "{{description}} - H265/AV1 필요",
+      "nativeModeOnlyTitle": "{{description}} - 네이티브 모드에서 8비트 4:2:0으로 고정(8비트 BT.709 디스플레이)"
     },
     "game": {
       "title": "게임",

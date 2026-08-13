@@ -420,6 +420,7 @@
       "maxBitrate": "Maximale Bitrate",
       "appliesAfterRestart": "Gilt nach dem Neustart der App.",
       "requiresH265OrAv1": "Dieser Modus erfordert H265 oder AV1. Der Codec wird automatisch umgeschaltet.",
+      "nativeColorLockedHint": "Der native Modus rendert 8-Bit BT.709 (SDR); die Farbtiefe ist auf 8-Bit 4:2:0 festgelegt.",
       "testing": "Testen...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -450,7 +451,8 @@
       "sharperChroma": "Schärferes Chroma",
       "higherBitDepth": "Höhere Bittiefe",
       "highestChromaAndBitDepth": "Höchste Chroma und Bittiefe",
-      "requiresH265OrAv1Title": "{{description}} – erfordert H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} – erfordert H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} – im nativen Modus auf 8-Bit 4:2:0 festgelegt (8-Bit-BT.709-Anzeige)"
     },
     "game": {
       "title": "Spiel",

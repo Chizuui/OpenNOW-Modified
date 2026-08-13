@@ -420,6 +420,7 @@
       "maxBitrate": "Rata de biți maximă",
       "appliesAfterRestart": "Se aplică după repornirea aplicației.",
       "requiresH265OrAv1": "Acest mod necesită H265 sau AV1. Codec-ul va fi comutat automat.",
+      "nativeColorLockedHint": "Modul nativ randează BT.709 pe 8 biți (SDR); adâncimea de culoare este blocată pe 4:2:0 pe 8 biți.",
       "testing": "Testare...",
       "gpu": "GPU",
       "cpu": "CPU",
@@ -450,7 +451,8 @@
       "sharperChroma": "Croma mai clară",
       "higherBitDepth": "Adâncime de biți mai mare",
       "highestChromaAndBitDepth": "Cea mai mare croma și adâncime de biți",
-      "requiresH265OrAv1Title": "{{description}} - necesită H265/AV1"
+      "requiresH265OrAv1Title": "{{description}} - necesită H265/AV1",
+      "nativeModeOnlyTitle": "{{description}} - blocat pe 4:2:0 pe 8 biți în modul nativ (afișaj BT.709 pe 8 biți)"
     },
     "game": {
       "title": "Joc",

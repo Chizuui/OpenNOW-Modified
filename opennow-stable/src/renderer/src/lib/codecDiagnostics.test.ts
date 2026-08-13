@@ -554,6 +554,54 @@ test("resolved stream profile honors native hardware gating", () => {
   });
 });
 
+test("native mode clamps color quality to 8-bit 4:2:0 even on explicit codec picks", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // The native display path renders 8-bit BT.709 full-range NV12 for EVERY
+  // codec (DISPLAY_NV12_FULL_RANGE_CAPS), so advertising 10-bit/4:4:4 would
+  // negotiate a stream that is converted down (banding, wrong HDR colors).
+  // An explicit H265 pick stays H265, but the color must clamp to 8-bit 4:2:0.
+  assert.deepEqual(resolveStreamProfileCodec("H265", "10bit_420", null, availability), {
+    codec: "H265",
+    colorQuality: "8bit_420",
+  });
+  assert.deepEqual(resolveStreamProfileCodec("H265", "8bit_444", null, availability), {
+    codec: "H265",
+    colorQuality: "8bit_420",
+  });
+  assert.deepEqual(resolveStreamProfileCodec("AV1", "10bit_420", null, availability), {
+    codec: "AV1",
+    colorQuality: "8bit_420",
+  });
+});
+
+test("native mode clamps color quality when auto resolves to hardware AV1", () => {
+  const availability = resolveNativeCodecAvailability(nativeStatus());
+  // Hardware D3D12 decode for all three → auto still picks AV1 (same priority
+  // as web mode), but color quality is clamped because the display path is
+  // 8-bit — the ladder and the effective profile must agree.
+  assert.deepEqual(resolveStreamProfileCodec("auto", "10bit_420", null, availability), {
+    codec: "AV1",
+    colorQuality: "8bit_420",
+  });
+});
+
+test("web mode keeps the requested color quality (no native clamp)", () => {
+  // Without native availability the 10-bit / 4:4:4 modes are valid: web mode
+  // renders through Chromium, not the 8-bit NV12 display path.
+  assert.deepEqual(resolveStreamProfileCodec("H265", "10bit_420"), {
+    codec: "H265",
+    colorQuality: "10bit_420",
+  });
+  assert.deepEqual(resolveStreamProfileCodec("auto", "8bit_444", [
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: true, webrtcSupported: true, hwAccelerated: true }),
+  ]), {
+    codec: "AV1",
+    colorQuality: "8bit_444",
+  });
+});
+
 test("native ladder excludes software-only AV1/HEVC but keeps H264", () => {
   const availability = resolveNativeCodecAvailability(softwareOnlyNativeStatus());
   // The streamer decodes all three, but only in software — the ladder must

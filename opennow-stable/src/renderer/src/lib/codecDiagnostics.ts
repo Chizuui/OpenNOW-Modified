@@ -570,7 +570,14 @@ export function resolveStreamProfileCodec(
   nativeAvailability?: NativeCodecAvailability | null,
 ): { codec: VideoCodec; colorQuality: ColorQuality } {
   const resolved = resolveEffectiveCodec(codecPreference, codecResults, nativeAvailability);
-  const normalized = normalizeStreamPreferences(resolved, colorQuality);
+  // Native mode: the display path is hard-pinned to 8-bit BT.709 full-range
+  // NV12 (DISPLAY_NV12_FULL_RANGE_CAPS in the Rust pipeline), so advertising
+  // 10-bit or 4:4:4 would negotiate a stream that is then converted down to
+  // 8-bit 4:2:0 — gradient banding, and for true HDR (PQ/BT.2020) wrong
+  // colors with no tonemap in the chain. Clamp to 8-bit 4:2:0 so the session
+  // request, the native SDP bitDepth, and the HUD all match what is shown.
+  const effectiveColorQuality: ColorQuality = nativeAvailability ? "8bit_420" : colorQuality;
+  const normalized = normalizeStreamPreferences(resolved, effectiveColorQuality);
   return {
     // `resolved` is concrete (never "auto"), so the normalization cannot turn
     // it into "auto" — the cast is safe.
