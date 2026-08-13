@@ -2893,10 +2893,30 @@ pub(crate) fn watch_video_sink_caps_transitions(
 }
 
 /// Frames arriving up to this much before their present slot pass instead of
-/// being dropped. Steady-state arrival jitter is usually ±2 ms; dropping those
-/// marginal frames against the fixed grid reads as "patah-patah" motion during
-/// a smooth drag. Real catch-up bursts (many ms early) are still thinned.
-const PRESENT_LIMITER_EARLY_TOLERANCE: Duration = Duration::from_millis(2);
+/// being dropped. This is the JITTER CATCH-UP budget, not a margin: the D3D
+/// present path (its internal present queue, sized like the ~250 ms pre-decode
+/// jitter buffer) absorbs and paces the backlog at the display cadence, so a
+/// WAN jitter burst must be handed through in FULL — shedding it was the
+/// field's "fps drops to 35-48 during jitter" report (a 2 ms tolerance dropped
+/// every frame after the first of each catch-up burst, permanently losing the
+/// delayed content and keeping the rendered average below the stream rate
+/// even though the frames were all present). Only a frame arriving more than
+/// this far before its slot — a deep backlog that would fast-forward more
+/// than ~250 ms of content at once — is dropped, bounding present latency
+/// instead of randomly shedding the stream.
+const PRESENT_LIMITER_BACKLOG_TOLERANCE: Duration = Duration::from_millis(250);
+
+/// Pure limiter decision: a frame is dropped only when it arrives so far
+/// before its present slot that passing it would fast-forward more than the
+/// catch-up budget of content in one instant. Everything else (steady-state
+/// jitter, normal catch-up bursts) passes.
+fn present_limiter_should_drop(
+    now: Instant,
+    next_present_at: Instant,
+    tolerance: Duration,
+) -> bool {
+    now + tolerance < next_present_at
+}
 
 pub(crate) fn install_present_limiter(
     sink: &gst::Element,
@@ -2941,13 +2961,19 @@ pub(crate) fn install_present_limiter(
         }
 
         let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
-        // Drop only frames arriving well before their slot (the jitter
-        // catch-up bursts the limiter exists to thin). A 2 ms tolerance keeps
-        // steady-state arrival jitter from dropping frames against the fixed
-        // grid; marginal early frames pass and re-anchor the grid instead of
-        // vanishing (dropped frames during a smooth drag read as "patah-patah"
-        // motion).
-        if now + PRESENT_LIMITER_EARLY_TOLERANCE < state.next_present_at {
+        // Drop only frames arriving MORE than the catch-up budget before
+        // their slot (a deep backlog that would fast-forward the picture).
+        // Everything within the budget passes — steady-state arrival jitter
+        // (±2 ms), the marginal early frames that used to read as
+        // "patah-patah" motion, AND the full jitter catch-up burst (the D3D
+        // present path holds and paces it at the display cadence, so the
+        // delayed content is preserved and the rendered average stays at the
+        // stream rate instead of the field's 35-48 fps dips).
+        if present_limiter_should_drop(
+            now,
+            state.next_present_at,
+            PRESENT_LIMITER_BACKLOG_TOLERANCE,
+        ) {
             state.dropped = state.dropped.saturating_add(1);
             // This frame is being dropped by the limiter probe, which runs
             // BEFORE the sink-rate probe on the same pad — the sink-rate
@@ -9209,6 +9235,52 @@ mod tests {
         even.push_back(8);
         even.push_back(5_000);
         assert_eq!(median_of_deltas(&even), 8);
+    }
+
+    /// The limiter must hand through the jitter catch-up burst (up to the
+    /// backlog budget) and only shed a frame that arrives so far before its
+    /// slot that passing it would fast-forward the picture. This is what
+    /// keeps the rendered average at the stream rate during WAN jitter.
+    #[test]
+    fn present_limiter_only_drops_deep_backlog() {
+        let base = Instant::now();
+        let grid = base + Duration::from_millis(16);
+        let budget = PRESENT_LIMITER_BACKLOG_TOLERANCE;
+
+        // Steady-state arrival jitter (±2 ms) passes.
+        assert!(!present_limiter_should_drop(base, grid, budget));
+        // A normal catch-up burst (frames arriving ~100 ms before their slot)
+        // passes — the D3D present path holds and paces it.
+        assert!(!present_limiter_should_drop(
+            base,
+            base + Duration::from_millis(100),
+            budget
+        ));
+        // A frame on or behind its slot passes (catch-up after a gap).
+        assert!(!present_limiter_should_drop(base, base, budget));
+        assert!(!present_limiter_should_drop(
+            base + Duration::from_millis(30),
+            base,
+            budget
+        ));
+        // Only a frame arriving MORE than the budget before its slot drops
+        // (a deep backlog that would fast-forward >250 ms of content).
+        assert!(present_limiter_should_drop(
+            base,
+            base + budget + Duration::from_millis(1),
+            budget
+        ));
+        assert!(present_limiter_should_drop(
+            base,
+            base + Duration::from_millis(1_000),
+            budget
+        ));
+        // Edge: exactly at the budget boundary passes (tolerance is strict).
+        assert!(!present_limiter_should_drop(
+            base,
+            base + budget,
+            budget
+        ));
     }
 
     /// The decode→present pairing queue must be balanced: every decoded

@@ -190,11 +190,15 @@ export class SignalingCoordinator {
 
     ipcMain.handle(
       IPC_CHANNELS.NATIVE_RECORDING_STOP,
-      async (): Promise<void> => {
+      async (): Promise<{ thumbnailBase64?: string; droppedFrames: number }> => {
         if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
           throw new Error("Native streamer is not active for this session.");
         }
-        await this.getNativeStreamerManager().stopNativeRecording();
+        // Return the resolved value — the renderer reads thumbnailBase64 /
+        // droppedFrames from the invoke result. (Regression: awaiting without
+        // returning made invoke resolve undefined, the renderer crashed on
+        // result.thumbnailBase64, and its catch path deleted the finished file.)
+        return await this.getNativeStreamerManager().stopNativeRecording();
       },
     );
 

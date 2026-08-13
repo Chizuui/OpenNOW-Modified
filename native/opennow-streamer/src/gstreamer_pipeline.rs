@@ -589,12 +589,14 @@ pub(crate) struct GstreamerVideoTap {
     /// deliberately downloads to system memory even when the preference is on.
     pub(crate) zero_copy: bool,
     /// RTP-level tap tee, permanently embedded between the webrtcbin video
-    /// src pad and the decode chain. The native remux recorder taps the raw
-    /// RTP stream here (before decode), so record start/stop never touches
-    /// the decode/present chain — and a decoder-fallback rebuild of the
-    /// decode chain (try_rebuild) keeps this tee and the recording branch on
-    /// it intact. Set once at the initial chain build, preserved across
-    /// rebuilds.
+    /// src pad and the decode chain. The native remux recorder taps the RTP
+    /// stream here (before decode), so record start/stop never touches the
+    /// decode/present chain — and a decoder-fallback rebuild of the decode
+    /// chain (try_rebuild) keeps this tee and the recording branch on it
+    /// intact. NOTE: this pad is the internal rtpbin session output — the
+    /// RTP is NACK/RTX/FEC-recovered and jitter-ordered — so the pass-through
+    /// recorder inherits the live session's loss recovery for free. Set once
+    /// at the initial chain build, preserved across rebuilds.
     pub(crate) rtp_tee: Option<gst::Element>,
 }
 
@@ -617,33 +619,42 @@ impl GstreamerVideoTap {
 
 /// How the native recording branch stores the video.
 ///
-/// `PassThrough` (the default) taps the RAW RTP stream at the source tee
-/// (before decode) and remuxes the received bitstream straight into the MP4
-/// (depay → parse → qtmux). Zero decode, zero re-encode, zero GPU/CPU — a
-/// recording costs nothing to the live stream, exactly like the official
-/// GeForce Now client ("just write what we receive to disk"). The file is
-/// H265/H264/AV1 (whatever the server sent) at the exact received quality.
-/// The MP4 carries the colour metadata (colr) for the stream's full-range
-/// BT.709 — no re-encode, so the recording is the exact received bitstream.
+/// `Encoded` (the DEFAULT) taps the DECODED video frames (the same reliable
+/// post-decode tee the transcode branch uses) and re-encodes to H.264 — so
+/// the recording captures EXACTLY what the user sees, immune to WAN RTP
+/// jitter/loss and GFN stream restarts that the raw-RTP tap cannot survive,
+/// and the file plays everywhere (universal H.264; no HEVC/AV1 codec needed
+/// on the playback device). The encoded ES is written to a temp file and
+/// muxed OFFLINE at stop (`remux_encoded_recording`) — no live muxer, so the
+/// branch can never wedge. The re-encode costs GPU/CPU while recording (the
+/// encoder competes with the decoder on single-iGPU laptops).
 ///
-/// `Encoded` taps the DECODED video frames (the same reliable post-decode
-/// tee the transcode branch uses) and re-encodes to H.264 — so the recording
-/// captures EXACTLY what the user sees, immune to WAN RTP jitter/loss and
-/// GFN stream restarts that the raw-RTP tap cannot survive (the field's
-/// truncated video + A/V desync: the raw branch lost 35-44% of frames and
-/// stalled ~43 s into long recordings while the live path stayed smooth,
-/// because the branch taps BEFORE webrtcbin's rtpbin and has no
-/// retransmission recovery). Unlike `Transcode`, the encoded ES is written to
-/// a temp file and muxed OFFLINE at stop (`remux_encoded_recording`) — no
-/// live muxer, so the branch can never wedge. The re-encode costs GPU/CPU
-/// while recording (the encoder competes with the decoder on single-iGPU
-/// laptops), so it is opt-in via OPENNOW_RECORDING_MODE=encoded.
+/// `PassThrough` taps the RAW RTP stream at the source tee (before decode)
+/// and remuxes the received bitstream straight into the MP4 (depay → parse →
+/// qtmux). Zero decode, zero re-encode, zero GPU/CPU — a recording costs
+/// nothing to the live stream, exactly like the official GeForce Now client
+/// ("just write what we receive to disk"). The file is H265/H264/AV1
+/// (whatever the server sent) at the exact received quality, tagged with the
+/// stream's colour metadata (colr nclx BT.709 full-range). Opt-in via
+/// OPENNOW_RECORDING_MODE=passthrough. Two field-proven caveats keep it
+/// opt-in rather than default: (1) the tap sits at the webrtcbin video SRC
+/// pad — the internal rtpbin session output — so NACK/RTX/FEC recovery and
+/// jitter reordering already happened before the branch sees a packet (the
+/// live decode chain, fed from the SAME tee without its own jitter buffer,
+/// renders lossless in the field; the branch sees only the video SSRC). What
+/// remains on a lossy link is a NACK-unrecoverable hole; the branch resyncs
+/// from the next PLI keyframe (request-keyframe + wait-for-keyframe) so the
+/// ES keeps clean GOPs instead of broken ones; (2) the file carries the
+/// stream codec, so H265/AV1 recordings need a player with HEVC/AV1 support
+/// (Windows' default player needs the HEVC extension).
 ///
 /// `Transcode` taps the DECODED video (post-decode tee), converts to 8-bit
-/// 4:2:0 and re-encodes with H.264 (d3d12h264enc GPU encoder by default).
-/// Universal H.264 output, but the encode competes with the decoder for the
-/// same GPU — on single-iGPU laptops this shows up as decode-time spikes and
-/// stream stutter while recording (the field report). Opt-in via
+/// 4:2:0 and re-encodes with H.264 (d3d12h264enc GPU encoder by default)
+/// into a LIVE qtmux (a live muxer wedged the recording branches in the
+/// field, which is why `Encoded` muxes offline instead). Universal H.264
+/// output, but the encode competes with the decoder for the same GPU — on
+/// single-iGPU laptops this shows up as decode-time spikes and stream
+/// stutter while recording (the field report). Opt-in via
 /// OPENNOW_RECORDING_MODE=transcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordingMode {
@@ -655,11 +666,14 @@ pub(crate) enum RecordingMode {
 impl RecordingMode {
     pub(crate) fn from_env() -> Self {
         match std::env::var("OPENNOW_RECORDING_MODE").as_deref() {
+            Ok("passthrough") => RecordingMode::PassThrough,
             Ok("transcode") => RecordingMode::Transcode,
             Ok("encoded") => RecordingMode::Encoded,
-            // Default: the zero-cost raw-RTP remux ("just write what we
-            // receive"), exactly like the official GeForce Now client.
-            _ => RecordingMode::PassThrough,
+            // Default: re-encode to universal H.264 from the reliable
+            // post-decode tap. PassThrough (zero cost, but raw-RTP holes on
+            // jitter + H265/AV1 files that need codec support on the player)
+            // stays available via OPENNOW_RECORDING_MODE=passthrough.
+            _ => RecordingMode::Encoded,
         }
     }
 }
@@ -722,8 +736,9 @@ pub(crate) struct PassThroughFlowDiag {
     /// Buffers pushed out of the parser's SRC pad (valid AUs after the
     /// parser's garbage rejection). Comparing parse_in vs parse_out tells a
     /// field wedge apart: parse_in > parse_out means the depayloader emitted
-    /// garbage AUs (incomplete FU reassembly from packet jitter) that the
-    /// parser dropped; parse_out > file_in would mean the ES capsfilter or
+    /// AUs with holes (NACK-unrecoverable packet gaps on a lossy link) that
+    /// the parser dropped — the field: 384/2197 on a lossy session vs 64/2555
+    /// on a clean one; parse_out > file_in would mean the ES capsfilter or
     /// filesink stalled.
     pub(crate) parse_out: Arc<AtomicU64>,
     pub(crate) file_in: Arc<AtomicU64>,
@@ -731,17 +746,15 @@ pub(crate) struct PassThroughFlowDiag {
     /// negotiated), captured once for diagnostics.
     pub(crate) parse_first_caps: Arc<Mutex<Option<String>>>,
     /// pt / ssrc / marker / len of the first few RTP buffers at the branch
-    /// valve sink pad (detects non-video traffic like FlexFEC on the shared
-    /// RTP tap tee).
+    /// valve sink pad (proves only the video SSRC reaches the post-rtpbin
+    /// tap — FlexFEC/RTX are consumed inside webrtcbin's rtpbin).
     pub(crate) valve_first_rtp: Arc<Mutex<Vec<String>>>,
     /// The negotiated video RTP payload type, learned from the first CAPS
-    /// event at the valve sink pad. Used to drop non-video RTP packets
-    /// (FlexFEC pt 98 / RTX / audio) that ride the SAME WebRTC session as
-    /// the video but are NOT part of the H26x/AV1 bitstream — the decode
-    /// chain is shielded from them by rtpbin's per-ssrc session split, but
-    /// the raw pass-through tap is not, and a stray FEC packet fed to
-    /// rtph265depay produces garbage that h265parse then discards (the
-    /// 0-byte video ES field wedge).
+    /// event at the valve sink pad. Defensive gate: drops any non-video RTP
+    /// that ever reaches the branch. The tap is post-rtpbin, so in the field
+    /// this filter drops nothing (dropped_non_video=0 — the session pad only
+    /// carries the video SSRC); it guards the depayloader in case a future
+    /// webrtcbin config exposes RTX/FEC ssrcs on the session pad.
     pub(crate) video_pt: Arc<AtomicU32>,
     /// How many RTP packets were dropped by the video_pt filter (non-video
     /// traffic that reached the shared tee), for diagnostics.
@@ -1515,13 +1528,27 @@ impl GstreamerRecordingState {
         // exact at this point. Surfaced to the user at stop so a choppy
         // recording (encoder could not keep up on a weak device) is
         // explained instead of silently degraded.
-        self.dropped_frames.store(
-            self
-                .queue_input
-                .load(Ordering::Relaxed)
-                .saturating_sub(self.queue_output.load(Ordering::Relaxed)),
-            Ordering::SeqCst,
-        );
+        //
+        // Pass-through additionally loses frames when the depayloader emits
+        // an AU with holes (a NACK-unrecoverable packet gap) and the parser
+        // sheds it (field: parse_in=2197 vs parse_out=1813 on a lossy link,
+        // while the queue shed nothing). Report the larger of the two — both
+        // mechanisms mean "video lost from the clip", and with
+        // wait-for-keyframe the parse gap is the one that stays observable.
+        let mut dropped = self
+            .queue_input
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.queue_output.load(Ordering::Relaxed));
+        if self.mode == RecordingMode::PassThrough {
+            if let Some(diag) = &self.pass_flow_diag {
+                let parse_dropped = diag
+                    .parse_in
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(diag.parse_out.load(Ordering::Relaxed));
+                dropped = dropped.max(parse_dropped);
+            }
+        }
+        self.dropped_frames.store(dropped, Ordering::SeqCst);
 
         match self.mode {
             RecordingMode::PassThrough | RecordingMode::Encoded => self.stop_pass_through(drain_ms),
@@ -7645,33 +7672,51 @@ pub(crate) fn build_pass_through_record_branch(
 
     let valve = make_element("valve")?;
     let queue = make_element("queue")?;
-    // The record tap sits BEFORE rtpbin, so the branch sees the same raw RTP
-    // as the decode chain — but the decode chain is shielded by rtpbin's
-    // per-ssrc session split and its compressed-frame jitter buffer, while a
-    // bare branch is not. GFN's low-latency servers burst/reorder packets on
-    // WAN jitter (the field logs: loss 0.05-0.2% yet sink fps dips, PLI
-    // floods, and the pass-through ES loses whole frames while the live path
-    // stays smooth): rtph26xdepay cannot reassemble an AU whose FU fragments
-    // arrive out of order, emits a garbage AU, and h265parse drops it — the
-    // recorded ES then has holes ("Could not find ref with POC …" decode
-    // glitches in the MP4). The jitterbuffer reorders packets by RTP
-    // timestamp and holds a short playout window before release, so the
-    // depayloader only ever sees ordered, gap-tolerant fragments.
-    // mode=2 (BUFFER): pure reorder + buffer with NO clock sync — the record
-    // tap has no RTCP/SR to slave to, and slave mode would hold packets
-    // forever waiting for a clock that never arrives. The window is deep
-    // enough to absorb the 100-300 ms WAN jitter bursts the live path's own
-    // adaptive buffer is sized for (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS).
-    let jitter = make_element("rtpjitterbuffer")?;
-    jitter.set_property("latency", 250u32);
-    // RTPJitterBufferMode::NONE (0): only RTP timestamps, no clock sync — the
-    // record tap has no RTCP/SR to slave to, and mode=buffer's low/high
-    // watermark logic holds everything until EOS in this GStreamer build.
-    jitter.set_property_from_str("mode", "none");
-    jitter.set_property("do-lost", false);
+    // as the decode chain — both see the SAME stream. The tap sits at the
+    // webrtcbin element's video SRC pad, which is the internal rtpbin session
+    // output: NACK/RTX/FEC recovery (rtpsession) and jitter reordering
+    // (rtpjitterbuffer) already happened INSIDE webrtcbin before the pad.
+    // Field proof: the decode chain — fed from the SAME tee with NO jitter
+    // buffer of its own — renders at a steady 60 fps with sink dropped=0;
+    // the branch only ever sees the video SSRC (dropped_non_video=0, no
+    // FlexFEC pt 98 / RTX ssrcs — they were consumed inside rtpbin); and the
+    // depay consumes the stream packet-exactly (field: 26796 RTP → 2197 AUs
+    // at ~12.2 pkt/AU, i.e. a correctly assembled stream). A recording branch
+    // therefore needs NO reordering element of its own: the stream it taps is
+    // already ordered and loss-recovered. What remains on a lossy link is a
+    // NACK-unrecoverable hole (the session gives up on a packet) — the
+    // depayloader then emits an AU with missing slices, h265parse sheds it,
+    // and the ES has a gap until the next keyframe. That is handled below
+    // with request-keyframe + wait-for-keyframe (resync from a PLI keyframe
+    // instead of a broken GOP), NOT with a second jitter buffer — an extra
+    // rtpjitterbuffer here can only hurt: mode=slave waits on an SR clock
+    // that never reaches the tap, and mode=buffer+do-lost pushes lost events
+    // into the depayloader (flush → garbage AU) and can mis-window the tail
+    // of a stream whose timestamps restart on GFN renegotiation.
     let rtp_caps = make_element("capsfilter")?;
     let depay = make_element(depay_factory)?;
     let parse = make_element(parse_factory)?;
+    // The branch must resync itself after a loss hole: rtph26xdepay with
+    // request-keyframe=true pushes a force-key-unit event upstream on seq-gap
+    // detection; it travels through the tee into webrtcbin's rtpbin session,
+    // whose rtpsession turns it into a PLI to the server — the same path the
+    // decode chain's depay uses (field-proven: the live path recovers after
+    // PLI floods). wait-for-keyframe=true then holds the ES output until that
+    // keyframe lands, so the file never contains a broken half-GOP: the
+    // recording jumps cleanly from the last good frame to the next keyframe
+    // (frames in the hole are honestly counted by the stop drop counter via
+    // parse_in−parse_out). The decode chain sets wait-for-keyframe=false (it
+    // must keep rendering); a recording has no live viewer and a clean GOP
+    // structure is worth more than the ~300 ms between loss and resync.
+    set_property_if_supported(&depay, "request-keyframe", true);
+    set_property_if_supported(&depay, "wait-for-keyframe", true);
+    // Force the parser to always parse (never passthrough) and re-emit the
+    // codec config (SPS/PPS) before every keyframe: the ES file becomes
+    // self-contained — every GOP starts with its own parameter sets, so the
+    // offline remux (and any player seeking mid-file) never depends on a
+    // config that lived in a lost packet. Same settings as the decode chain.
+    set_property_if_supported(&parse, "disable-passthrough", true);
+    set_property_if_supported(&parse, "config-interval", -1i32);
     // Force the ES file format the OFFLINE remux can auto-detect: the
     // parsers' default output against an unconstrained filesink is
     // length-prefixed avcC (h264parse/h265parse) or OBU-stream (av1parse).
@@ -7791,11 +7836,11 @@ pub(crate) fn build_pass_through_record_branch(
 
     // Chain order: valve → queue → capsfilter (RTP caps) → depayloader →
     // parser (normalizes the AUs for the offline remux) → ES-format
-    // capsfilter (byte-stream/OBU) → filesink.
+    // capsfilter (byte-stream/OBU) → filesink. NO jitter buffer: the tap is
+    // post-rtpbin (ordered + NACK/RTX/FEC-recovered), see the branch header.
     let elements: Vec<&gst::Element> = vec![
         &valve,
         &queue,
-        &jitter,
         &rtp_caps,
         &depay,
         &parse,
@@ -7871,16 +7916,16 @@ pub(crate) fn build_pass_through_record_branch(
             .static_pad("sink")
             .ok_or_else(|| "Pass-through valve has no sink pad.".to_owned())?;
         // Learn the negotiated video RTP payload type from the first CAPS
-        // event at the valve sink pad. The RTP tap tee sits BEFORE rtpbin,
-        // so it copies EVERY RTP packet of the WebRTC session — including
-        // FlexFEC (pt 98) and RTX retransmissions that share the same m-line
-        // (a-ssrc-group=FEC-FR 2 4). The decode chain is immune (rtpbin
-        // splits the session per ssrc), but the raw pass-through branch is
-        // not: a stray FEC packet fed to rtph265depay emits garbage NALs
-        // that h265parse discards, leaving a 0-byte video ES while the live
-        // path renders (the my-yes/cloudmatchbeta field wedge). Caps events
-        // always precede buffers (sticky), so video_pt is known before the
-        // first buffer arrives.
+        // event at the valve sink pad. The tap sits at the webrtcbin video
+        // SRC pad — the internal rtpbin session output — so FlexFEC (pt 98)
+        // and RTX retransmissions are already consumed inside rtpbin before
+        // the branch sees a packet (field proof: only the video SSRC ever
+        // reaches the branch, dropped_non_video=0 across sessions). The
+        // payload-type filter below is kept as a DEFENSIVE net for any
+        // future webrtcbin config that exposes a second SSRC on the session
+        // pad — it is expected to drop nothing today. Caps events always
+        // precede buffers (sticky), so video_pt is known before the first
+        // buffer arrives.
         let pt_slot = diag.video_pt.clone();
         valve_sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
             if let Some(event) = info.event() {
@@ -7930,11 +7975,14 @@ pub(crate) fn build_pass_through_record_branch(
                 // branch is fed.
                 diag.log("armed");
             }
-            // Drop non-video RTP (FlexFEC/RTX/other payloads) before the
-            // depayloader: only the negotiated video payload type belongs in
-            // the recorded ES. If the pt filter is still unknown (0), pass
-            // everything — sticky caps events arrive before buffers, so this
-            // only happens during the brief attach window.
+            // Defensive payload-type gate before the depayloader: only the
+            // negotiated video payload type belongs in the recorded ES. On
+            // today's tap (post-rtpbin) this drops nothing (the session pad
+            // carries only the video SSRC); it guards against a future
+            // webrtcbin exposing RTX/FEC ssrcs on the session pad. If the pt
+            // filter is still unknown (0), pass everything — sticky caps
+            // events arrive before buffers, so this only happens during the
+            // brief attach window.
             let video_pt = diag.video_pt.load(Ordering::Relaxed);
             if video_pt != 0 {
                 if let Some(buffer) = info.buffer() {
@@ -8032,7 +8080,7 @@ pub(crate) fn build_pass_through_record_branch(
         &event_sender,
         "info",
         format!(
-            "Attached native PASS-THROUGH recording branch (raw RTP → {depay_factory} → {parse_factory} → filesink ES file; zero re-encode — no decode/encode/GPU cost to the live stream; file = received {rtp_encoding} bitstream, muxed offline at stop)."
+            "Attached native PASS-THROUGH recording branch (post-rtpbin recovered RTP → {depay_factory} → {parse_factory} → filesink ES file; zero re-encode — no decode/encode/GPU cost to the live stream; NACK/RTX/FEC recovery inherited from the rtpbin session; file = received {rtp_encoding} bitstream, muxed offline at stop)."
         ),
     );
 
