@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  STATS_FAST_POLL_AFTER_RECOVERY_MS,
+  STATS_POLL_INTERVAL_ACTIVE_MS,
+  STATS_POLL_INTERVAL_IDLE_MS,
   computeIntervalFrameRates,
   mapServerGpuType,
+  selectStatsPollIntervalMs,
   shouldWarnBweLow,
   smoothJitterMs,
   type IntervalFrameRateParams,
@@ -24,6 +28,41 @@ function baseParams(overrides: Partial<IntervalFrameRateParams> = {}): IntervalF
     ...overrides,
   };
 }
+
+test("stats polling is fast while the HUD is visible, pressure is active, or recovery is recent", () => {
+  // HUD visible → 1s regardless of the rest.
+  assert.equal(selectStatsPollIntervalMs({
+    statsHudVisible: true,
+    pressureActive: false,
+    msSinceLastRecovery: 1_000_000,
+  }), STATS_POLL_INTERVAL_ACTIVE_MS);
+  // Decoder pressure active with the HUD closed → still 1s (recovery needs
+  // per-second visibility to converge).
+  assert.equal(selectStatsPollIntervalMs({
+    statsHudVisible: false,
+    pressureActive: true,
+    msSinceLastRecovery: 1_000_000,
+  }), STATS_POLL_INTERVAL_ACTIVE_MS);
+  // Closed HUD but inside the post-recovery grace window → 1s.
+  assert.equal(selectStatsPollIntervalMs({
+    statsHudVisible: false,
+    pressureActive: false,
+    msSinceLastRecovery: STATS_FAST_POLL_AFTER_RECOVERY_MS - 1,
+  }), STATS_POLL_INTERVAL_ACTIVE_MS);
+});
+
+test("stats polling drops to the idle cadence only on a healthy closed-HUD stream", () => {
+  assert.equal(selectStatsPollIntervalMs({
+    statsHudVisible: false,
+    pressureActive: false,
+    msSinceLastRecovery: STATS_FAST_POLL_AFTER_RECOVERY_MS,
+  }), STATS_POLL_INTERVAL_IDLE_MS);
+  assert.equal(selectStatsPollIntervalMs({
+    statsHudVisible: false,
+    pressureActive: false,
+    msSinceLastRecovery: 60_000,
+  }), STATS_POLL_INTERVAL_IDLE_MS);
+});
 
 test("computes 60fps RX and decode rates from a 60-frame interval", () => {
   const rates = computeIntervalFrameRates(baseParams());

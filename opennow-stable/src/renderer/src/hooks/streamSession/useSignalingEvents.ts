@@ -14,7 +14,7 @@ import { streamStatusToLoadingStage } from "../../lib/sessionState";
 import { mergeNativeStreamStats } from "../../lib/streamDiagnostics";
 import { decideSignalingDisconnect } from "../../lib/streamRecoveryDecisions";
 import { warningMessage, warningTone } from "../../lib/sessionWarnings";
-import { resolveStreamProfileCodec } from "../../lib/codecDiagnostics";
+import { resolveStreamProfileCodec, type CodecTestResult, type NativeCodecAvailability } from "../../lib/codecDiagnostics";
 import { GfnWebRtcClient } from "../../platforms/gfn/webrtcClient";
 import { dispatchNativeDataChannelMessage } from "../../lib/nativeDataChannelRegistry";
 import {
@@ -47,6 +47,10 @@ export interface SignalingEventOptions {
   refreshNavbarActiveSession: () => Promise<void>;
   resetLaunchRuntime: ResetLaunchRuntime;
   scheduleStableRecoveryReset: (sessionId: string) => void;
+  /** Codec probe results for hardware-aware auto resolution (codecDiagnostics). */
+  codecResults: CodecTestResult[] | null;
+  /** Native streamer decoder capabilities (codecDiagnostics), when in native mode. */
+  nativeAvailability: NativeCodecAvailability | null;
   settings: Settings;
   t: TranslateFunction;
 }
@@ -61,6 +65,8 @@ export function useSignalingEvents({
   refreshNavbarActiveSession,
   resetLaunchRuntime,
   scheduleStableRecoveryReset,
+  codecResults,
+  nativeAvailability,
   settings,
   t,
 }: SignalingEventOptions): void {
@@ -88,6 +94,7 @@ export function useSignalingEvents({
     setRemoteStreamWarning,
     setStreamStatus,
     signalingRecoveryRef,
+    statsMode,
     streamMicLevel,
     streamStatusRef,
     streamVolume,
@@ -115,6 +122,7 @@ export function useSignalingEvents({
         mouseAcceleration: settings.mouseAcceleration,
         keyboardLayout: settings.keyboardLayout,
         clipboardPaste: settings.clipboardPaste,
+        statsHudVisible: statsMode !== "off",
         readClipboardText: readStreamClipboardText,
         onLog: (line: string) => console.log(`[WebRTC] ${line}`),
         onStats: (stats) => {
@@ -226,7 +234,12 @@ export function useSignalingEvents({
         return;
       }
 
-      const resolvedCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+      const resolvedCodecProfile = resolveStreamProfileCodec(
+        settings.codec,
+        settings.colorQuality,
+        codecResults,
+        nativeAvailability,
+      );
 
       nativeStreamingRef.current = true;
       pendingControlledDisconnectsRef.current = 0;
@@ -339,7 +352,12 @@ export function useSignalingEvents({
           const client = ensureWebRtcClient();
 
           if (client) {
-            const offerCodecProfile = resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+            const offerCodecProfile = resolveStreamProfileCodec(
+              settings.codec,
+              settings.colorQuality,
+              codecResults,
+              nativeAvailability,
+            );
             await client.handleOffer(event.sdp, activeSession, {
               codec: offerCodecProfile.codec,
               colorQuality: offerCodecProfile.colorQuality,
@@ -593,6 +611,14 @@ export function useSignalingEvents({
 
     return () => unsubscribe();
   }, [attemptSessionRecovery, diagnosticsStore, handleExpectedNativeSessionClose, handleNativeCodecDowngrade, markDiscordStreamStarted, nativeInputBridgeReady, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
+
+  // Keep the WebRTC client's stats-polling cadence in sync with the stats HUD
+  // when the user toggles it mid-session (1s while visible / while recovering,
+  // 3s on a healthy hidden stream). The initial value is passed at client
+  // construction; this covers runtime changes.
+  useEffect(() => {
+    clientRef.current?.setStatsHudVisible(statsMode !== "off");
+  }, [clientRef, statsMode]);
 
   // Register the control-channel clipboard handler for the lifetime of this
   // session (native relay; web registers its own copy when the control channel

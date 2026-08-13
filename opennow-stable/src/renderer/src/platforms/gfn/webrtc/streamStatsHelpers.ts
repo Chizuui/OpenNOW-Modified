@@ -299,3 +299,40 @@ export function mapServerGpuType(raw: string): string {
   }
   return SERVER_GPU_NAME_MAP[trimmed] ?? trimmed;
 }
+
+/**
+ * Adaptive stats-polling cadence. `getStats()` is one of the larger recurring
+ * renderer costs (Chromium collects the whole report on the main thread), so
+ * the cadence drops when nothing needs per-second data: the stats HUD is
+ * closed, no decoder pressure/recovery is active or recent, and the stream is
+ * healthy. Any of those signals flips back to the fast cadence.
+ */
+export const STATS_POLL_INTERVAL_ACTIVE_MS = 1_000;
+export const STATS_POLL_INTERVAL_IDLE_MS = 3_000;
+// Keep fast polling for this long after the last pressure/recovery event even
+// with the HUD closed, so post-recovery convergence is still observable.
+export const STATS_FAST_POLL_AFTER_RECOVERY_MS = 30_000;
+
+/**
+ * Pick the getStats poll interval: fast (1s) while the stats HUD is visible,
+ * while decoder pressure/recovery is active, or within the post-recovery
+ * grace window; idle (3s) only on a healthy stream with a closed HUD. Pure so
+ * the cadence decision is unit-testable.
+ */
+export function selectStatsPollIntervalMs(params: {
+  /** Whether the stats HUD is currently visible (user opted in). */
+  statsHudVisible: boolean;
+  /** Whether decoder pressure/recovery is active right now. */
+  pressureActive: boolean;
+  /** Milliseconds since the last pressure/recovery event (large when none). */
+  msSinceLastRecovery: number;
+}): number {
+  if (
+    params.statsHudVisible
+    || params.pressureActive
+    || params.msSinceLastRecovery < STATS_FAST_POLL_AFTER_RECOVERY_MS
+  ) {
+    return STATS_POLL_INTERVAL_ACTIVE_MS;
+  }
+  return STATS_POLL_INTERVAL_IDLE_MS;
+}

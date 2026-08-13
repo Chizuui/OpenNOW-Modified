@@ -354,6 +354,170 @@ test("jitter buffer preset switch applies new floors live and resets the RTT flo
   assert.equal(logs.length, logCountBefore);
 });
 
+test("auto-low jitter engages after a clean-link streak and drops to low floors", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // Balanced preset initially (35/50ms).
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+  assert.equal(audioReceiver.jitterBufferTarget, 50);
+  assert.equal(controller.isAutoLowActive, false);
+
+  // A few clean polls do not engage yet — the streak needs AUTO_LOW_CLEAN_POLLS.
+  for (let poll = 0; poll < 5; poll++) {
+    controller.updateJitterFloorFromRtt(20);
+  }
+  assert.equal(controller.isAutoLowActive, false);
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+
+  // The 6th consecutive clean poll (low RTT, zero loss) drops the base to the
+  // "low" preset: less latency on a good link, same adaptive growth above it.
+  controller.updateJitterFloorFromRtt(20);
+  assert.equal(controller.isAutoLowActive, true);
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+  assert.equal(audioReceiver.jitterBufferTarget, 35);
+  assert.ok(
+    logs.some((line) => line.includes("switching to low-latency floors")),
+    "auto-low logs the switch",
+  );
+});
+
+test("auto-low reverts immediately when the link degrades and keeps the guard floor", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // Engage auto-low on a clean link.
+  for (let poll = 0; poll < 6; poll++) {
+    controller.updateJitterFloorFromRtt(20);
+  }
+  assert.equal(controller.isAutoLowActive, true);
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+
+  // A single lossy poll (0.3% loss) reverts to the user preset immediately —
+  // and the packet-loss floor (MID = 70ms) guards the transition so the
+  // degrading link does not run on a shallow buffer.
+  controller.updateJitterFloorFromRtt(20, 0.3);
+  assert.equal(controller.isAutoLowActive, false);
+  assert.equal(videoReceiver.jitterBufferTarget, 70);
+  assert.equal(audioReceiver.jitterBufferTarget, 85);
+  assert.ok(
+    logs.some((line) => line.includes("link degraded") && line.includes("restored to \"balanced\"")),
+    "auto-low logs the revert",
+  );
+});
+
+test("auto-low has RTT hysteresis and never engages on the low preset or borderline RTT", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  let now = 0;
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => now,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // RTT at 45ms is above the entry threshold (40ms): never engages even after
+  // many clean-ish polls.
+  for (let poll = 0; poll < 10; poll++) {
+    now += 1000;
+    controller.updateJitterFloorFromRtt(45);
+  }
+  assert.equal(controller.isAutoLowActive, false);
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+
+  // Clean 20ms link engages auto-low.
+  for (let poll = 0; poll < 6; poll++) {
+    now += 1000;
+    controller.updateJitterFloorFromRtt(20);
+  }
+  assert.equal(controller.isAutoLowActive, true);
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+
+  // Hysteresis: 45ms (above entry 40ms but below exit 50ms) keeps auto-low
+  // active instead of flapping the floors.
+  now += 1000;
+  controller.updateJitterFloorFromRtt(45);
+  assert.equal(controller.isAutoLowActive, true);
+  assert.equal(videoReceiver.jitterBufferTarget, 20);
+
+  // Crossing the exit threshold (50ms) reverts to the user preset.
+  now += 1000;
+  controller.updateJitterFloorFromRtt(55);
+  assert.equal(controller.isAutoLowActive, false);
+  assert.equal(videoReceiver.jitterBufferTarget, 35);
+
+  // User already on "low" preset: auto-low has nothing to gain and stays off.
+  const lowPresetController = new DecoderPressureController({
+    log: () => {},
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  lowPresetController.setJitterBufferMode("low");
+  for (let poll = 0; poll < 10; poll++) {
+    lowPresetController.updateJitterFloorFromRtt(20);
+  }
+  assert.equal(lowPresetController.isAutoLowActive, false);
+});
+
+test("changing the jitter preset clears active auto-low state", () => {
+  const logs: string[] = [];
+  const videoReceiver = makeFakeReceiver("video");
+  const audioReceiver = makeFakeReceiver("audio");
+  const controller = new DecoderPressureController({
+    log: (message) => logs.push(message),
+    getPeerConnection: () => null,
+    getControlChannel: () => null,
+    requestSignalingKeyframe: async () => {},
+    onStateChange: () => {},
+    now: () => 0,
+  });
+  controller.configureReceiver(videoReceiver, "video");
+  controller.configureReceiver(audioReceiver, "audio");
+
+  // Engage auto-low, then the user switches to "smooth" mid-session — the
+  // auto-low state must clear and the smooth floors apply.
+  for (let poll = 0; poll < 6; poll++) {
+    controller.updateJitterFloorFromRtt(20);
+  }
+  assert.equal(controller.isAutoLowActive, true);
+
+  controller.setJitterBufferMode("smooth");
+  assert.equal(controller.isAutoLowActive, false);
+  assert.equal(videoReceiver.jitterBufferTarget, 70);
+  assert.equal(audioReceiver.jitterBufferTarget, 100);
+});
+
 test("input policy preserves native, partially-reliable, and fallback routes", () => {
   const nativePackets: Array<{ payload: Uint8Array; partiallyReliable: boolean }> = [];
   const reliablePackets: Uint8Array[] = [];

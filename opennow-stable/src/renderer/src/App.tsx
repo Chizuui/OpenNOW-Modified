@@ -745,7 +745,7 @@ export function App(): JSX.Element {
     // so a H264 fallback (8-bit 4:2:0 only) never carries a 10-bit mode.
     const resolvedCodecProfile = codecOverride
       ? normalizeStreamPreferences(codecOverride, settings.colorQuality)
-      : resolveStreamProfileCodec(settings.codec, settings.colorQuality);
+      : resolveStreamProfileCodec(settings.codec, settings.colorQuality, codecResults, nativeAvailability);
 
     return {
       resolution: streamProfile.resolution,
@@ -772,6 +772,8 @@ export function App(): JSX.Element {
           : "default",
     };
   }, [
+    codecResults,
+    nativeAvailability,
     settings.codec,
     settings.colorQuality,
     settings.controllerMode,
@@ -2156,6 +2158,8 @@ export function App(): JSX.Element {
     refreshNavbarActiveSession,
     resetLaunchRuntime,
     scheduleStableRecoveryReset,
+    codecResults,
+    nativeAvailability,
     settings,
     t,
   });

@@ -159,8 +159,8 @@ export function StreamQualityControls({
   }, [handleChange, settings.colorQuality]);
 
   const autoPickedCodec = useMemo(
-    () => resolveEffectiveCodec("auto", nativeAvailability),
-    [nativeAvailability],
+    () => resolveEffectiveCodec("auto", codecResults, nativeAvailability),
+    [codecResults, nativeAvailability],
   );
 
   // GPU/CPU decode badge next to each concrete codec option (mirrors the

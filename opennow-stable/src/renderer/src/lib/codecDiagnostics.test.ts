@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   describeDecodeBackend,
   describeEncodeBackend,
+  getCodecDecodeBadgeState,
   getCodecToMigrateToAuto,
   getGpuDriverSubtitle,
   isCodecUsableForStream,
@@ -380,6 +381,7 @@ test("native codec availability resolves decodable codecs from the active backen
     assert.ok(availability);
     // The active D3D12 backend decodes all three codecs in hardware.
     assert.deepEqual([...availability!.codecs].sort(), ["AV1", "H264", "H265"]);
+    assert.deepEqual([...availability!.hardwareCodecs].sort(), ["AV1", "H264", "H265"]);
     assert.equal(availability!.hardware, true);
   });
 });
@@ -428,6 +430,7 @@ test("native codec availability marks software-only paths as CPU", () => {
     const availability = resolveNativeCodecAvailability(softwareOnly);
     assert.ok(availability);
     assert.deepEqual([...availability!.codecs], ["H264"]);
+    assert.deepEqual([...availability!.hardwareCodecs], []);
     assert.equal(availability!.hardware, false);
   });
 });
@@ -458,10 +461,135 @@ test("native availability wins over the browser probe but never removes codecs",
 
 test("auto codec resolution prefers the native codec order", () => {
   const availability = resolveNativeCodecAvailability(nativeStatus());
-  // Native set contains AV1 → auto picks AV1 (same priority as web mode).
-  assert.equal(resolveEffectiveCodec("auto", availability), "AV1");
+  // Native set contains AV1 on a hardware backend → auto picks AV1 (same
+  // priority as web mode).
+  assert.equal(resolveEffectiveCodec("auto", null, availability), "AV1");
   // Without native status the Node test env falls back to H264.
   assert.equal(resolveEffectiveCodec("auto", null), "H264");
+});
+
+function softwareOnlyNativeStatus(codecs: string[] = ["h264", "h265", "av1"]): NativeStreamerStatus {
+  const software = {
+    backend: "software",
+    platform: "cross-platform",
+    codecs: codecs.map((codec) => ({ codec, available: true, decoder: `avdec_${codec}` })),
+    zeroCopyModes: [],
+    sink: "autovideosink",
+    available: true,
+  };
+  return nativeStatus({
+    videoBackends: [software],
+    activeVideoBackend: software,
+  });
+}
+
+test("auto codec skips software-only AV1/HEVC in native mode and falls to H264", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    // The streamer can decode all three, but only through software backends
+    // (avdec_*/dav1d) — no GPU decode. Auto must NOT pick AV1 (the bug: weak
+    // iGPU falling into software 1080p60 decode); it lands on H264 instead.
+    const availability = resolveNativeCodecAvailability(softwareOnlyNativeStatus());
+    assert.ok(availability);
+    assert.deepEqual([...availability!.codecs].sort(), ["AV1", "H264", "H265"]);
+    assert.deepEqual([...availability!.hardwareCodecs], []);
+    assert.equal(resolveEffectiveCodec("auto", null, availability), "H264");
+    // Explicit picks are still honored (the user asked for it).
+    assert.equal(resolveEffectiveCodec("AV1", null, availability), "AV1");
+  });
+});
+
+test("auto codec prefers hardware HEVC over software AV1 in native mode", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    // AV1 only decodes in software; HEVC decodes on D3D12; no H264. Auto must
+    // skip AV1 (no hardware) and pick H265 instead of falling back to H264.
+    const d3d12Hevc = {
+      backend: "d3d12",
+      platform: "windows",
+      codecs: [{ codec: "h265", available: true, decoder: "d3d12h265dec" }],
+      zeroCopyModes: ["D3D12Memory"],
+      sink: "d3d12videosink",
+      available: true,
+    };
+    const software = {
+      backend: "software",
+      platform: "cross-platform",
+      codecs: [{ codec: "av1", available: true, decoder: "dav1ddec" }],
+      zeroCopyModes: [],
+      sink: "autovideosink",
+      available: true,
+    };
+    const availability = resolveNativeCodecAvailability(nativeStatus({
+      videoBackends: [d3d12Hevc, software],
+      activeVideoBackend: d3d12Hevc,
+    }));
+    assert.ok(availability);
+    assert.deepEqual([...availability!.codecs].sort(), ["AV1", "H265"]);
+    assert.deepEqual([...availability!.hardwareCodecs], ["H265"]);
+    assert.equal(resolveEffectiveCodec("auto", null, availability), "H265");
+  });
+});
+
+test("auto codec in web mode gates AV1 on hardware decode like the ladder", () => {
+  // Software-only AV1 (powerEfficient=false) → skipped, auto lands on H264.
+  assert.equal(resolveEffectiveCodec("auto", [
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: true, webrtcSupported: true, hwAccelerated: false }),
+  ]), "H264");
+  // Hardware AV1 decode → AV1 wins (same priority as GFN web's "Auto (AV1)").
+  assert.equal(resolveEffectiveCodec("auto", [
+    codecResult({ codec: "H264", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "H265", decodeSupported: true, webrtcSupported: true }),
+    codecResult({ codec: "AV1", decodeSupported: true, webrtcSupported: true, hwAccelerated: true }),
+  ]), "AV1");
+});
+
+test("resolved stream profile honors native hardware gating", () => {
+  const availability = resolveNativeCodecAvailability(softwareOnlyNativeStatus());
+  // Software-only native AV1 → auto profile resolves to H264 and pins color
+  // back to 8-bit 4:2:0, exactly like a device without hardware AV1/HEVC.
+  assert.deepEqual(resolveStreamProfileCodec("auto", "10bit_420", null, availability), {
+    codec: "H264",
+    colorQuality: "8bit_420",
+  });
+});
+
+test("native ladder excludes software-only AV1/HEVC but keeps H264", () => {
+  const availability = resolveNativeCodecAvailability(softwareOnlyNativeStatus());
+  // The streamer decodes all three, but only in software — the ladder must
+  // stop advertising AV1/HEVC for auto negotiation (would be software 1080p60)
+  // while keeping H264 as the universal fallback.
+  assert.deepEqual(resolveSupportedStreamCodecs([], availability), ["H264"]);
+});
+
+test("decode badge uses per-codec native hardware info", () => {
+  withNavigator("Win32", "OpenNOW Windows", () => {
+    // H264 only on a software backend, AV1 on D3D12 — the badge must differ
+    // per codec instead of using the coarse all-or-nothing `hardware` flag.
+    const d3d12Av1 = {
+      backend: "d3d12",
+      platform: "windows",
+      codecs: [{ codec: "av1", available: true, decoder: "d3d12av1dec" }],
+      zeroCopyModes: ["D3D12Memory"],
+      sink: "d3d12videosink",
+      available: true,
+    };
+    const software = {
+      backend: "software",
+      platform: "cross-platform",
+      codecs: [{ codec: "h264", available: true, decoder: "avdec_h264" }],
+      zeroCopyModes: [],
+      sink: "autovideosink",
+      available: true,
+    };
+    const availability = resolveNativeCodecAvailability(nativeStatus({
+      videoBackends: [d3d12Av1, software],
+      activeVideoBackend: d3d12Av1,
+    }));
+    assert.ok(availability);
+    assert.equal(getCodecDecodeBadgeState("H264", null, false, availability), "cpu");
+    assert.equal(getCodecDecodeBadgeState("AV1", null, false, availability), "gpu");
+  });
 });
 
 test("native capabilities add codecs to the supported list for the ladder/hint", () => {

@@ -128,6 +128,18 @@ const FREEZE_RETRIGGER_COOLDOWN_MS = 2500;
 const LOSS_PLI_THRESHOLD_PERCENT = 2;
 const LOSS_PLI_CONSECUTIVE_POLLS = 2;
 
+// Auto low-latency jitter mode: on a clean link (RTT below the entry
+// threshold and no packet loss for AUTO_LOW_CLEAN_POLLS consecutive polls)
+// the base floor drops to the "low" preset — the balanced/smooth floors only
+// add latency when there is jitter to absorb. Exits immediately on any
+// degradation signal (packet loss, a burst hold, or RTT climbing past the
+// exit threshold). Entry and exit RTT thresholds are separated (hysteresis)
+// so a borderline link cannot flap the floors back and forth.
+const AUTO_LOW_RTT_ENTER_MAX_MS = 40;
+const AUTO_LOW_RTT_EXIT_MIN_MS = 50;
+const AUTO_LOW_MAX_LOSS_PERCENT = 0.1;
+const AUTO_LOW_CLEAN_POLLS = 6;
+
 export interface VideoFreezeEligibilityParams {
   /** Timestamp (ms) of the last presented video frame; 0 = none seen yet. */
   lastFrameAtMs: number;
@@ -273,6 +285,16 @@ export class DecoderPressureController {
   private rttEmaMs = 0;
   /** Timestamp until which a detected RTT spike pins the floor at MAX. */
   private burstHoldUntilMs = 0;
+  /**
+   * Whether the base jitter floor is currently dropped to the "low" preset
+   * because the link has been clean (low RTT, no loss) for several polls.
+   * The user's preset stays the fallback and the RTT/loss adaptive floor
+   * still grows on top of the low base, so a degradation mid-session is
+   * still absorbed instead of dropping frames.
+   */
+  private autoLowActive = false;
+  /** Consecutive clean polls (low RTT + no loss) feeding auto-low activation. */
+  private cleanPollStreak = 0;
   /** Fast-freeze watchdog (requestVideoFrameCallback) state. */
   private freezeMonitoring = false;
   private freezeWatchdogTimer: number | null = null;
@@ -346,7 +368,9 @@ export class DecoderPressureController {
    * Switch the normal-playback jitter buffer preset. Re-applies the receiver
    * targets immediately so the change takes effect mid-stream, and resets the
    * RTT-adaptive floor back to the new preset's base (it grows again on the
-   * next stats poll). No-op when the mode is unchanged.
+   * next stats poll). Also clears any active auto-low state — the new preset
+   * needs a fresh clean-link streak to drop back down. No-op when the mode is
+   * unchanged.
    */
   setJitterBufferMode(mode: JitterBufferMode): void {
     const normalized = normalizeJitterBufferMode(mode);
@@ -354,6 +378,8 @@ export class DecoderPressureController {
       return;
     }
     this.jitterBufferMode = normalized;
+    this.autoLowActive = false;
+    this.cleanPollStreak = 0;
     this.presetJitterTargets = { ...JITTER_BUFFER_PRESETS[normalized] };
     this.baseJitterTargets = { ...this.presetJitterTargets };
     this.dependencies.log(
@@ -362,6 +388,11 @@ export class DecoderPressureController {
     for (const { receiver, kind } of this.activeReceivers) {
       this.configureReceiver(receiver, kind);
     }
+  }
+
+  /** Whether auto low-latency mode is currently active (link has been clean). */
+  get isAutoLowActive(): boolean {
+    return this.autoLowActive;
   }
 
   /**
@@ -409,22 +440,66 @@ export class DecoderPressureController {
     const lossFraction = Number.isFinite(packetLossPercent)
       ? Math.max(0, (packetLossPercent ?? 0) / 100)
       : 0;
+    const lossPercent = lossFraction * 100;
     const lossFloor = lossFraction >= 0.005
       ? MAX_VIDEO_JITTER_TARGET_MS
       : lossFraction >= 0.001
         ? JITTER_LOSS_FLOOR_MID_MS
         : 0;
 
+    // ── Auto low-latency mode ──
+    // On a clean link (RTT below AUTO_LOW_RTT_ENTER_MAX_MS and no packet loss
+    // for AUTO_LOW_CLEAN_POLLS consecutive polls) the base floor drops to the
+    // "low" preset — the balanced/smooth floors only add latency when there
+    // is jitter to absorb. While active, any degradation signal (packet loss,
+    // a burst hold, or RTT climbing past AUTO_LOW_RTT_EXIT_MIN_MS) reverts
+    // immediately to the user's preset; the adaptive floors below still guard
+    // the transition. Never engages when the user already picked "low"
+    // (nothing to gain).
+    const clean = !burstHold
+      && rttMs < AUTO_LOW_RTT_ENTER_MAX_MS
+      && lossPercent < AUTO_LOW_MAX_LOSS_PERCENT;
+    this.cleanPollStreak = clean ? this.cleanPollStreak + 1 : 0;
+    let autoLowActive: boolean;
+    if (this.autoLowActive) {
+      autoLowActive = !(
+        burstHold
+        || lossPercent >= AUTO_LOW_MAX_LOSS_PERCENT
+        || rttMs >= AUTO_LOW_RTT_EXIT_MIN_MS
+      );
+      if (!autoLowActive) {
+        this.cleanPollStreak = 0;
+      }
+    } else {
+      autoLowActive = this.jitterBufferMode !== "low" && this.cleanPollStreak >= AUTO_LOW_CLEAN_POLLS;
+    }
+    if (autoLowActive !== this.autoLowActive) {
+      this.autoLowActive = autoLowActive;
+      if (autoLowActive) {
+        this.dependencies.log(
+          `Auto jitter buffer: clean link (rtt=${rttMs}ms, loss=${lossPercent.toFixed(2)}%) — switching to low-latency floors (video=${JITTER_BUFFER_PRESETS.low.video}ms audio=${JITTER_BUFFER_PRESETS.low.audio}ms)`,
+        );
+      } else {
+        this.dependencies.log(
+          `Auto jitter buffer: link degraded (rtt=${rttMs}ms, loss=${lossPercent.toFixed(2)}%) — restored to "${this.jitterBufferMode}" floors (video=${this.presetJitterTargets.video}ms audio=${this.presetJitterTargets.audio}ms)`,
+        );
+      }
+    }
+    // The floor's preset base: "low" while auto-low is active, otherwise the
+    // user's preset. The deadband below still applies the switch immediately
+    // because the presets differ by well over JITTER_FLOOR_DEADBAND_MS.
+    const preset = this.autoLowActive ? JITTER_BUFFER_PRESETS.low : this.presetJitterTargets;
+
     const rttFloor = Math.round(
       Math.min(
         MAX_VIDEO_JITTER_TARGET_MS,
-        Math.max(this.presetJitterTargets.video, rttMs * VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR),
+        Math.max(preset.video, rttMs * VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR),
       ),
     );
     const videoFloor = burstHold
       ? MAX_VIDEO_JITTER_TARGET_MS
-      : Math.max(this.presetJitterTargets.video, rttFloor, lossFloor);
-    const audioFloor = Math.max(this.presetJitterTargets.audio, videoFloor + 15);
+      : Math.max(preset.video, rttFloor, lossFloor);
+    const audioFloor = Math.max(preset.audio, videoFloor + 15);
     if (
       Math.abs(videoFloor - this.baseJitterTargets.video) < JITTER_FLOOR_DEADBAND_MS
       && Math.abs(audioFloor - this.baseJitterTargets.audio) < JITTER_FLOOR_DEADBAND_MS
@@ -460,6 +535,8 @@ export class DecoderPressureController {
     this.baseJitterTargets = { ...this.presetJitterTargets };
     this.rttEmaMs = 0;
     this.burstHoldUntilMs = 0;
+    this.autoLowActive = false;
+    this.cleanPollStreak = 0;
     this.activeReceivers = [];
     this.stopFreezeMonitoring();
     this.lossConsecutivePolls = 0;

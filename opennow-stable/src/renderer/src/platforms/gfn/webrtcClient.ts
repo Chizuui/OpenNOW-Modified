@@ -73,6 +73,7 @@ import {
   computeIntervalFrameRates,
   detectGpuType,
   mapServerGpuType,
+  selectStatsPollIntervalMs,
   shouldWarnBweLow,
   smoothJitterMs,
 } from "./webrtc/streamStatsHelpers";
@@ -203,6 +204,12 @@ interface ClientOptions {
   onMicStateChange?: (state: MicStateChange) => void;
   onIceConnectionStateChange?: (state: RTCIceConnectionState) => void;
   onPeerConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+  /**
+   * Whether the stats HUD is visible at session start. Drives the adaptive
+   * getStats cadence (1s while visible / while recovering, 3s on a healthy
+   * hidden stream); updated live via setStatsHudVisible. Defaults to true.
+   */
+  statsHudVisible?: boolean;
   /** Optional host callback for controller overlay shortcut edge presses. */
   onControllerMetaPress?: (event: { controllerId: number; gamepad: Gamepad }) => void;
 }
@@ -392,6 +399,18 @@ export class GfnWebRtcClient {
    * (mirrors the native streamer's preference for rtpsession `avg-jitter`).
    */
   private jitterEwmaMs = 0;
+  /**
+   * Whether the stats HUD is currently visible — drives the adaptive getStats
+   * cadence (1s visible / 3s hidden + healthy). Updated live via
+   * setStatsHudVisible when the user toggles the HUD mid-session.
+   */
+  private statsHudVisible = true;
+  /**
+   * Last time decoder pressure/recovery went active — keeps fast polling for
+   * a grace window afterwards so post-recovery convergence is observable even
+   * with the HUD closed.
+   */
+  private lastRecoveryAtMs = 0;
 
   private statsChannelVersionLogged = false;
   /** Periodic network-diagnostics logging (surfaces in the exported log file). */
@@ -574,6 +593,9 @@ export class GfnWebRtcClient {
         this.diagnostics.decoderPressureActive = state.active;
         this.diagnostics.decoderRecoveryAttempts = state.recoveryAttempts;
         this.diagnostics.decoderRecoveryAction = state.recoveryAction;
+        if (state.active) {
+          this.lastRecoveryAtMs = performance.now();
+        }
       },
     });
     this.inputChannelPolicyController = new InputChannelPolicyController(
@@ -659,6 +681,7 @@ export class GfnWebRtcClient {
     this.autoFullScreenEnabled = options.autoFullScreen !== false;
     this.clipboardPasteEnabled = Boolean(options.clipboardPaste);
     this.clipboardMaxBytes = Math.max(0, Math.trunc(options.clipboardMaxBytes ?? DEFAULT_CLIPBOARD_MAX_BYTES));
+    this.statsHudVisible = options.statsHudVisible !== false;
 
     // Escape is intercepted by Electron before Chromium can leave fullscreen.
     // Keep this subscription alive for the whole stream-client lifetime: Windows
@@ -1120,6 +1143,7 @@ export class GfnWebRtcClient {
     this.lastStatsSample = null;
     this.lastEmittedDiagnostics = null;
     this.jitterEwmaMs = 0;
+    this.lastRecoveryAtMs = 0;
     this.currentCodec = "";
     this.currentResolution = "";
     this.isHdr = false;
@@ -1278,27 +1302,69 @@ export class GfnWebRtcClient {
       this.heartbeatTimer = null;
     }
     if (this.statsTimer !== null) {
-      window.clearInterval(this.statsTimer);
+      window.clearTimeout(this.statsTimer);
       this.statsTimer = null;
     }
     this.gamepadController.stop();
     this.domInputController.clearSyntheticEscapeSuppression();
   }
 
+  /**
+   * Set whether the stats HUD is visible. Toggles the getStats cadence live:
+   * turning it on polls immediately (0ms) so the readout fills within a
+   * second, then continues on the fast cadence.
+   */
+  public setStatsHudVisible(visible: boolean): void {
+    const next = Boolean(visible);
+    if (this.statsHudVisible === next) {
+      return;
+    }
+    this.statsHudVisible = next;
+    this.log(next
+      ? "Stats HUD visible — fast getStats polling"
+      : "Stats HUD hidden — getStats polling drops to 3s on a healthy stream");
+    if (next) {
+      this.scheduleStatsPoll(0);
+    }
+  }
+
+  /**
+   * Adaptive stats polling: 1s while the stats HUD is visible or while
+   * decoder pressure/recovery is active (or recently active), otherwise 3s —
+   * a closed HUD on a healthy stream does not need per-second stats and
+   * getStats() is one of the larger recurring renderer costs. The next poll
+   * is scheduled after each run completes, so polls never overlap.
+   */
   private setupStatsPolling(): void {
     if (this.statsTimer !== null) {
-      window.clearInterval(this.statsTimer);
+      window.clearTimeout(this.statsTimer);
+      this.statsTimer = null;
     }
+    this.scheduleStatsPoll();
+  }
 
-    this.statsTimer = window.setInterval(() => {
+  private scheduleStatsPoll(delayMs?: number): void {
+    if (this.statsTimer !== null) {
+      window.clearTimeout(this.statsTimer);
+      this.statsTimer = null;
+    }
+    const intervalMs = delayMs ?? selectStatsPollIntervalMs({
+      statsHudVisible: this.statsHudVisible,
+      pressureActive: this.diagnostics.decoderPressureActive,
+      msSinceLastRecovery: performance.now() - this.lastRecoveryAtMs,
+    });
+    this.statsTimer = window.setTimeout(() => {
+      this.statsTimer = null;
       if (this.statsPollInFlight) {
+        this.scheduleStatsPoll();
         return;
       }
       this.statsPollInFlight = true;
       void this.collectStats().finally(() => {
         this.statsPollInFlight = false;
+        this.scheduleStatsPoll();
       });
-    }, 1000);
+    }, intervalMs);
   }
 
   private updateRenderFps(): void {

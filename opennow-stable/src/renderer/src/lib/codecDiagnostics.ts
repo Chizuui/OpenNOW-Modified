@@ -33,6 +33,13 @@ export interface NativeCodecAvailability {
   codecs: Set<VideoCodec>;
   /** True when the native path decodes on a hardware backend (D3D12/D3D11/Vulkan/NVDEC/VAAPI/V4L2/VideoToolbox). */
   hardware: boolean;
+  /**
+   * Codecs the native streamer decodes on a hardware backend specifically.
+   * AV1/HEVC are only auto-picked when they land here: their software
+   * decoders (dav1d/avdec_*) stutter at 1080p60 on weak devices, while H264
+   * software decode is cheap enough to always be an acceptable fallback.
+   */
+  hardwareCodecs: Set<VideoCodec>;
 }
 
 const NATIVE_HARDWARE_BACKENDS = new Set<string>([
@@ -84,9 +91,11 @@ export function resolveNativeCodecAvailability(
   }
 
   const codecs = new Set<VideoCodec>();
+  const hardwareCodecs = new Set<VideoCodec>();
   let hardware = false;
   for (const backend of ordered) {
-    if (NATIVE_HARDWARE_BACKENDS.has(backend.backend)) {
+    const backendIsHardware = NATIVE_HARDWARE_BACKENDS.has(backend.backend);
+    if (backendIsHardware) {
       hardware = true;
     }
     for (const codec of backend.codecs ?? []) {
@@ -94,13 +103,16 @@ export function resolveNativeCodecAvailability(
       const upper = codec.codec.toUpperCase();
       if (upper === "H264" || upper === "H265" || upper === "AV1") {
         codecs.add(upper as VideoCodec);
+        if (backendIsHardware) {
+          hardwareCodecs.add(upper as VideoCodec);
+        }
       }
     }
   }
   if (codecs.size === 0) {
     return null;
   }
-  return { codecs, hardware };
+  return { codecs, hardware, hardwareCodecs };
 }
 
 const CODEC_TEST_CONFIGS: {
@@ -409,9 +421,11 @@ export function getCodecDecodeBadgeState(
 ): CodecDecodeBadgeState {
   // Native path is authoritative for the badge: the browser probe can say
   // "unsupported" (no HEVC extension) while the native streamer decodes in
-  // hardware via its own GStreamer decoders.
+  // hardware via its own GStreamer decoders. Per-codec hardware info beats the
+  // coarse `hardware` flag: a device can decode H264 on the GPU while AV1 only
+  // exists on a software backend.
   if (nativeAvailability?.codecs.has(codec)) {
-    return nativeAvailability.hardware ? "gpu" : "cpu";
+    return nativeAvailability.hardwareCodecs.has(codec) ? "gpu" : "cpu";
   }
   const result = codecResults?.find((entry) => entry.codec === codec);
   if (!result) {
@@ -486,22 +500,59 @@ export function getCodecToMigrateToAuto(
 }
 
 /**
+ * Whether `codec` is acceptable for AUTO selection from the native streamer's
+ * capability set. H264 is always acceptable — its hardware path is
+ * near-universal and even software H264 is far cheaper than AV1/HEVC software
+ * decode. AV1/HEVC require a hardware backend: on a weak iGPU without
+ * AV1/HEVC hardware decode, auto-selecting them lands on software 1080p60
+ * decode and stutters.
+ */
+function isNativeCodecAutoUsable(codec: VideoCodec, nativeAvailability: NativeCodecAvailability): boolean {
+  return codec === "H264" || nativeAvailability.hardwareCodecs.has(codec);
+}
+
+/**
  * Resolve a codec preference into a concrete codec for session negotiation.
  * `"auto"` picks the first codec the device can actually decode (AV1 → H264 →
  * H265, mirroring GFN web's "Auto (AV1)"), falling back to H264. An explicit
  * user choice is always honored, even if the device reports it unsupported.
+ *
+ * Applies the same hardware gating as `resolveSupportedStreamCodecs` so the
+ * effective codec and the createSession ladder can never disagree: AV1 (and
+ * in native mode HEVC) are skipped unless they decode in hardware, so a device
+ * without hardware AV1/HEVC falls to H264 instead of software 1080p60.
  */
 export function resolveEffectiveCodec(
   preference: CodecPreference,
+  codecResults?: CodecTestResult[] | null,
   nativeAvailability?: NativeCodecAvailability | null,
 ): VideoCodec {
   if (preference !== "auto") {
     return preference;
   }
   if (nativeAvailability) {
-    // Native mode: auto-pick from the codecs the streamer can decode (same
-    // AV1 → H264 → H265 priority as web mode).
-    return AUTO_CODEC_PREFERENCE_ORDER.find((codec) => nativeAvailability.codecs.has(codec)) ?? "H264";
+    // Native mode: auto-pick from the codecs the streamer can decode, gating
+    // AV1/HEVC on their hardware backends (isNativeCodecAutoUsable).
+    for (const codec of AUTO_CODEC_PREFERENCE_ORDER) {
+      if (nativeAvailability.codecs.has(codec) && isNativeCodecAutoUsable(codec, nativeAvailability)) {
+        return codec;
+      }
+    }
+    return "H264";
+  }
+  // Web mode: mirror the ladder — decode + WebRTC receiver support for every
+  // codec, plus hardware decode for AV1 (the official bundle's probe refuses
+  // software AV1). Falls back to the synchronous WebRTC capability check when
+  // no probe results exist yet.
+  for (const codec of AUTO_CODEC_PREFERENCE_ORDER) {
+    const result = codecResults?.find((entry) => entry.codec === codec);
+    if (result) {
+      const decodable = result.decodeSupported && result.webrtcSupported;
+      const usable = codec === "AV1" ? decodable && result.hwAccelerated : decodable;
+      if (usable) {
+        return codec;
+      }
+    }
   }
   return AUTO_CODEC_PREFERENCE_ORDER.find((codec) => isWebRtcCodecAvailable(codec)) ?? "H264";
 }
@@ -515,8 +566,10 @@ export function resolveEffectiveCodec(
 export function resolveStreamProfileCodec(
   codecPreference: CodecPreference,
   colorQuality: ColorQuality,
+  codecResults?: CodecTestResult[] | null,
+  nativeAvailability?: NativeCodecAvailability | null,
 ): { codec: VideoCodec; colorQuality: ColorQuality } {
-  const resolved = resolveEffectiveCodec(codecPreference);
+  const resolved = resolveEffectiveCodec(codecPreference, codecResults, nativeAvailability);
   const normalized = normalizeStreamPreferences(resolved, colorQuality);
   return {
     // `resolved` is concrete (never "auto"), so the normalization cannot turn
@@ -544,10 +597,15 @@ export function resolveSupportedStreamCodecs(
   const candidates: readonly VideoCodec[] = ["H264", "H265", "AV1"];
   const supported: VideoCodec[] = [];
   for (const codec of candidates) {
-    // Native decode is authoritative and not hardware-gated: the software
-    // backend (avdec_*/dav1d) is a valid native path too.
+    // Native decode is authoritative, but only H264 is advertised without a
+    // hardware backend — the software backend (avdec_*/dav1d) is a valid
+    // native path, yet auto-selecting AV1/HEVC there means software 1080p60
+    // decode on weak devices. Mirrors the resolveEffectiveCodec auto gating so
+    // the ladder and the effective codec can never disagree.
     if (nativeAvailability?.codecs.has(codec)) {
-      supported.push(codec);
+      if (isNativeCodecAutoUsable(codec, nativeAvailability)) {
+        supported.push(codec);
+      }
       continue;
     }
     const result = results?.find((entry) => entry.codec === codec);
