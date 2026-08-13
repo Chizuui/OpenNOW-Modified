@@ -71,6 +71,9 @@ export function useStreamRecorder({
   const recCarouselRef = useRef<HTMLDivElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const recordWorkerRef = useRef<Worker | null>(null);
+  // Fallback canvas used only when the worker/generator path can't start
+  // (see toggleRecording): holds the downscaled frame for thumbnails.
+  const recordFallbackCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoGeneratorRef = useRef<MediaStreamTrackGenerator | null>(null);
   // Writer on the generator's WritableStream (WritableStream itself has no
   // write(); TS 6.0's DOM lib models the real spec, so we must go through
@@ -257,6 +260,11 @@ export function useStreamRecorder({
     );
     setUsedMimeType(mimeType);
 
+    // The whole web start path below is guarded: a throw anywhere in the
+    // audio/canvas/MediaRecorder setup used to surface as an unhandled
+    // promise rejection ("Uncaught (in promise) …") with no UI feedback and
+    // leaked worker/generator/AudioContext — the field "clicking record does
+    // nothing". Every failure now cleans up and shows a visible error.
     const audioCtx = new AudioContext();
     audioCtxRef.current = audioCtx;
     const audioDest = audioCtx.createMediaStreamDestination();
@@ -290,6 +298,7 @@ export function useStreamRecorder({
     // draw loop, so there is nothing to count.
     let drawnFrames = 0;
     let recordVideoTrack: MediaStreamTrack | null = null;
+    try {
     if (!rawTrackMode && video.videoWidth > 0 && video.videoHeight > 0) {
       const scale = Math.min(
         1,
@@ -298,23 +307,30 @@ export function useStreamRecorder({
       );
       const capWidth = Math.max(1, Math.round(video.videoWidth * scale));
       const capHeight = Math.max(1, Math.round(video.videoHeight * scale));
-      // Downscale off the renderer main thread. The worker draws each frame
-      // into an OffscreenCanvas and returns a GPU-backed ImageBitmap; we feed
-      // it to a MediaStreamTrackGenerator whose track MediaRecorder consumes.
-      // The only main-thread work left is the frame handoff (VideoFrame in,
-      // ImageBitmap out) — no synchronous drawImage, no canvas rasterize
-      // timer.
-      const recordWorker = new Worker(
-        new URL("../recording/recordCanvasWorker.ts", import.meta.url),
-        { type: "module" },
-      );
-      recordWorkerRef.current = recordWorker;
-      const generator = new MediaStreamTrackGenerator({ kind: "video" });
-      videoGeneratorRef.current = generator;
-      videoGeneratorWriterRef.current = generator.writable.getWriter();
-      recordVideoTrack = generator.readable;
-      recordVideoTrack.contentHint = "detail";
-      recordingVideoTrackRef.current = recordVideoTrack;
+      // Worker path (preferred): downscale off the renderer main thread. The
+      // worker draws each frame into an OffscreenCanvas and returns a
+      // GPU-backed ImageBitmap; we feed it to a MediaStreamTrackGenerator
+      // whose track MediaRecorder consumes. The only main-thread work left is
+      // the frame handoff (VideoFrame in, ImageBitmap out) — no synchronous
+      // drawImage, no canvas rasterize timer.
+      try {
+        const recordWorker = new Worker(
+          new URL("../recording/recordCanvasWorker.ts", import.meta.url),
+          { type: "module" },
+        );
+        recordWorkerRef.current = recordWorker;
+        const generator = new MediaStreamTrackGenerator({ kind: "video" });
+        videoGeneratorRef.current = generator;
+        videoGeneratorWriterRef.current = generator.writable.getWriter();
+        recordVideoTrack = generator.readable;
+        if (!recordVideoTrack) {
+          // e.g. a runtime where the generator's track is unavailable — the
+          // contentHint-on-undefined field failure class. Fall through to the
+          // captureStream fallback below instead of crashing the start.
+          throw new Error("MediaStreamTrackGenerator produced no video track.");
+        }
+        recordVideoTrack.contentHint = "detail";
+        recordingVideoTrackRef.current = recordVideoTrack;
       recordWorker.onmessage = (
         event: MessageEvent<RecordCanvasWorkerOutboundMessage>,
       ): void => {
@@ -386,7 +402,71 @@ export function useStreamRecorder({
         }
         recordWorker.postMessage({ type: "frame", frame: videoFrame, timestamp }, [videoFrame]);
       };
-      recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
+        recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
+      } catch (workerError) {
+        // Tear down whatever the worker path partially created before it
+        // threw, then fall back to the universal captureStream path below.
+        console.warn(
+          "[StreamView] Worker recording path unavailable — falling back to canvas.captureStream:",
+          workerError,
+        );
+        stopRecordingVideoTrack();
+        recordVideoTrack = null;
+      }
+      if (!recordVideoTrack) {
+        // Fallback: classic main-thread canvas + captureStream (universal,
+        // no MediaStreamTrackGenerator needed). Draw the first frame
+        // synchronously so the track exists immediately — a blank canvas can
+        // hand back a stream with no video track (the field "Cannot set
+        // properties of undefined (setting 'contentHint')" failure).
+        const cap = document.createElement("canvas");
+        cap.width = capWidth;
+        cap.height = capHeight;
+        const capCtx = cap.getContext("2d", { alpha: false });
+        if (capCtx) {
+          capCtx.drawImage(video, 0, 0, capWidth, capHeight);
+        }
+        const capStream = cap.captureStream(0);
+        recordVideoTrack = capStream.getVideoTracks()[0] ?? null;
+        if (!recordVideoTrack) {
+          throw new Error("Canvas captureStream produced no video track.");
+        }
+        recordVideoTrack.contentHint = "detail";
+        recordingVideoTrackRef.current = recordVideoTrack;
+        recordFallbackCanvasRef.current = cap;
+        // Main-thread draw loop, bounded to the recording frame rate (the
+        // field-proven pre-worker loop): draw at most one frame per
+        // record-period into the capped canvas.
+        let lastDrawMs = 0;
+        const drawFallbackFrame = (now: number): void => {
+          recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawFallbackFrame);
+          if (video.videoWidth === 0 || video.readyState < 2) {
+            return;
+          }
+          if (now - lastDrawMs < 1000 / recordFps) {
+            return;
+          }
+          lastDrawMs = now;
+          drawnFrames += 1;
+          if (capCtx) {
+            capCtx.drawImage(video, 0, 0, capWidth, capHeight);
+          }
+        };
+        recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawFallbackFrame);
+      }
+    }
+    } catch (error) {
+      console.error("[StreamView] Failed to set up web recording source:", error);
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
+      }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
+      audioCtxRef.current?.close().catch(() => undefined);
+      audioCtxRef.current = null;
+      setRecordingError("Could not start recording.");
+      return;
     }
     const videoTracksForRecord =
       !rawTrackMode && recordVideoTrack ? [recordVideoTrack] : stream.getVideoTracks();
@@ -414,6 +494,7 @@ export function useStreamRecorder({
       return;
     }      recordingIdRef.current = recordingId;
     thumbnailDataUrlRef.current = null;
+    recordFallbackCanvasRef.current = null;
     recordingStartTimeRef.current = Date.now();
     setRecordingDurationMs(0);
     setRecordingDropNotice(null);
@@ -436,6 +517,7 @@ export function useStreamRecorder({
       // below the cap, so overriding it would only add encode load.
       recorderOptions.videoBitsPerSecond = recordBitrate;
     }
+    try {
     const recorder = new MediaRecorder(composed, recorderOptions);
 
     // Downscale a frame source to the small JPEG thumbnail. Used only in
@@ -463,12 +545,19 @@ export function useStreamRecorder({
       if (isFirstChunk) {
         isFirstChunk = false;
         // Canvas path: the worker already posted the thumbnail after its
-        // first drawn frame. Raw-track mode has no worker — fall back to the
-        // presented video frame (cheap there, no draw loop is running).
+        // first drawn frame. The captureStream fallback has no worker — take
+        // the thumbnail from its (already downscaled) canvas. Raw-track mode
+        // has neither — fall back to the presented video frame (cheap there,
+        // no draw loop is running).
         if (rawTrackMode) {
           const currentVideo = videoRef.current;
           if (currentVideo && currentVideo.videoWidth > 0 && currentVideo.videoHeight > 0) {
             thumbnailFromSource(currentVideo, currentVideo.videoWidth, currentVideo.videoHeight);
+          }
+        } else if (recordFallbackCanvasRef.current) {
+          const fallbackCanvas = recordFallbackCanvasRef.current;
+          if (fallbackCanvas.width > 0 && fallbackCanvas.height > 0) {
+            thumbnailFromSource(fallbackCanvas, fallbackCanvas.width, fallbackCanvas.height);
           }
         }
       }
@@ -562,6 +651,19 @@ export function useStreamRecorder({
 
     mediaRecorderRef.current = recorder;
     recorder.start(5000);
+    } catch (error) {
+      console.error("[StreamView] Failed to start web recording:", error);
+      const frameVideo = videoRef.current;
+      if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+        frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
+      }
+      recordingFrameCallbackRef.current = undefined;
+      stopRecordingVideoTrack();
+      audioCtxRef.current?.close().catch(() => undefined);
+      audioCtxRef.current = null;
+      setRecordingError("Could not start recording.");
+      return;
+    }
   }, [
     audioRef,
     gameTitle,
