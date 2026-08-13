@@ -17,7 +17,7 @@ import { useScreenshotGallery } from "../hooks/useScreenshotGallery";
 import { useStreamMenuNavigation } from "../hooks/useStreamMenuNavigation";
 import { useStreamRecorder } from "../hooks/useStreamRecorder";
 import { formatSessionTimeRemaining, formatWarningSeconds } from "./stream/streamFormatters";
-import { AntiAfkIndicator, MicrophoneIndicator, RecordingIndicator } from "./stream/StreamIndicators";
+import { AntiAfkIndicator, MicrophoneIndicator, ProcessingIndicator, RecordingIndicator } from "./stream/StreamIndicators";
 import { StreamTitleBar } from "./stream/StreamTitleBar";
 import {
   hasVisibleStreamVideo,
@@ -962,6 +962,15 @@ export function StreamView({
         onToggleMicrophone={onToggleMicrophone}
         recordingDurationMs={streamRecorder.recordingDurationMs}
       />
+
+      {/* Processing indicator: the brief window after STOP while the native
+          streamer remuxes the recording offline into the final MP4. */}
+      {streamRecorder.isProcessing && !streamRecorder.isRecording && (
+        <ProcessingIndicator
+          hideStreamButtons={hideStreamButtons}
+          isConnecting={isConnecting}
+        />
+      )}
 
       {exitPrompt.open && !isConnecting && typeof document !== "undefined" && createPortal(
         <div className="sv-exit" role="dialog" aria-modal="true" aria-label="Exit stream confirmation">

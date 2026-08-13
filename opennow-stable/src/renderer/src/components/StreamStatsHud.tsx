@@ -133,6 +133,21 @@ export function StreamStatsHud({
     ? `${stats.decodeFps} fps`
     : (stats.receiveFps > 0 ? "0 fps" : "--");
   const decodeTimeText = stats.decodeTimeMs > 0 ? `${stats.decodeTimeMs.toFixed(1)} ms` : "--";
+  // Duplicate-frame detector (native streamer): how much of the delivered
+  // stream is real motion vs repeated content. GFN re-encodes a frame twice
+  // when the game renders slower than the negotiated stream rate, so a
+  // noticeably lower unique share is expected for 30fps games on a 60fps
+  // session — not a network problem.
+  const duplicateSeen = stats.nativeDuplicateFramesSeen ?? 0;
+  const duplicateUnique = stats.nativeDuplicateFramesUnique ?? 0;
+  const hasDuplicateData = duplicateSeen > 0 && duplicateUnique > 0;
+  const duplicatePct = hasDuplicateData
+    ? Math.round((duplicateUnique / duplicateSeen) * 100)
+    : null;
+  const duplicateFramesText = hasDuplicateData
+    ? `${duplicateUnique}/${duplicateSeen} (${duplicatePct}% unik)`
+    : "--";
+  const duplicateHeavilyRepeated = hasDuplicateData && duplicatePct !== null && duplicatePct < 80;
   // Decode lagging the RX rate by >3fps, or decodeFps 0 while frames still
   // arrive (stall): the local decoder is the bottleneck. The `decodeFps > 0`
   // guard is intentionally absent so the stall case (0 < rx - 3) warns too.
@@ -420,6 +435,13 @@ export function StreamStatsHud({
             <div className="sv-stats-row" title={t("stream.stats.frameDecodeTimeHint")}>
               <span>{t("stream.stats.frameDecodeTime")}</span>
               <span style={{ color: decodeOverBudget ? "var(--warning)" : undefined }}>{decodeTimeText}</span>
+            </div>
+            <div
+              className="sv-stats-row"
+              title="Unique decoded frames vs total. A low unique share means the game renders slower than the negotiated stream rate (GFN repeats frames), not a network problem."
+            >
+              <span>Unique frames</span>
+              <span style={{ color: duplicateHeavilyRepeated ? "var(--warning)" : undefined }}>{duplicateFramesText}</span>
             </div>
           </section>
 

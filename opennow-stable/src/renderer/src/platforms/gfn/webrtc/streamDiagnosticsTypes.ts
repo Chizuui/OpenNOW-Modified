@@ -46,6 +46,16 @@ export interface StreamDiagnostics {
   framesReceived: number;
   framesDecoded: number;
   framesDropped: number;
+  /**
+   * Native duplicate-frame detector: decoded frames seen vs unique (differed
+   * from the previous frame by PTS or strided content checksum). GFN
+   * re-encodes a frame twice when the game renders slower than the negotiated
+   * stream rate, so unique < seen = how much of the stream is repeated
+   * content. Equal when pixels were not readable (zero-copy GPU memory →
+   * same-PTS check only).
+   */
+  nativeDuplicateFramesSeen?: number;
+  nativeDuplicateFramesUnique?: number;
 
   // Timing
   decodeTimeMs: number;

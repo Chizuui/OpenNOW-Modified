@@ -140,3 +140,33 @@ export function RecordingIndicator({
     </div>
   );
 }
+
+/**
+ * Shown in the few seconds between pressing STOP and the finalized MP4
+ * appearing: the native streamer finalizes the ES files and remuxes them
+ * OFFLINE into the final seekable MP4 (hardware decode/encode of the clip),
+ * so the file is not ready the instant the record pill clears. This pill
+ * keeps the UI from looking frozen during that window.
+ */
+export function ProcessingIndicator({
+  hideStreamButtons,
+  isConnecting,
+}: {
+  hideStreamButtons: boolean;
+  isConnecting: boolean;
+}): JSX.Element | null {
+  if (isConnecting || hideStreamButtons) {
+    return null;
+  }
+
+  return (
+    <div className="sv-rec sv-rec--processing" title="Finalizing recording…">
+      <m.span
+        className="sv-rec-dot"
+        animate={{ opacity: [0.4, 1, 0.4], rotate: [0, 360] }}
+        transition={{ duration: 1.1, repeat: Infinity, ease: "easeInOut" }}
+      />
+      <span className="sv-rec-label">PROCESSING…</span>
+    </div>
+  );
+}

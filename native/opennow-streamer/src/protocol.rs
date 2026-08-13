@@ -655,6 +655,16 @@ pub struct NativeStatsEvent {
     pub frames_decoded: u64,
     pub frames_rendered: u64,
     pub frames_pending_to_present: u64,
+    /// Decoded frames classified by the duplicate detector: total seen vs
+    /// unique (differed from the previous frame — either the PTS changed or
+    /// the strided content checksum differed). GFN re-encodes a frame twice
+    /// when the game renders slower than the negotiated stream rate, so
+    /// `duplicate_frames_unique` < `duplicate_frames_seen` shows how much of
+    /// the delivered stream is real motion vs repeated content. Equal when no
+    /// pixels were readable (zero-copy GPU memory → same-PTS check only) or
+    /// detection has not started.
+    pub duplicate_frames_seen: u64,
+    pub duplicate_frames_unique: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sink_rendered: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

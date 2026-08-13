@@ -262,6 +262,16 @@ export interface NativeStreamStats {
   framesDecoded: number;
   framesRendered: number;
   framesPendingToPresent?: number;
+  /**
+   * Duplicate-frame detector: decoded frames seen vs unique (differed from
+   * the previous frame by PTS or strided content checksum). GFN re-encodes a
+   * frame twice when the game renders slower than the negotiated stream rate,
+   * so unique < seen shows how much of the delivered stream is real motion.
+   * Equal when pixels were not readable (zero-copy GPU memory → same-PTS
+   * check only).
+   */
+  duplicateFramesSeen?: number;
+  duplicateFramesUnique?: number;
   sinkRendered?: number;
   sinkDropped?: number;
   zeroCopyD3D11: boolean;

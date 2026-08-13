@@ -45,6 +45,7 @@ export function useStreamRecorder({
   nativeRecordingEnabled,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [recordings, setRecordings] = useState<RecordingEntry[]>([]);
   const [recordingDurationMs, setRecordingDurationMs] = useState(0);
   const [recordingError, setRecordingError] = useState<string | null>(null);
@@ -115,10 +116,13 @@ export function useStreamRecorder({
 
     if (isRecording) {
       if (nativeRecordingEnabled) {
-        // Native: finalize the encoder (flush remaining chunks), then save via
-        // the same recording API. isRecording flips first so a second click
-        // during finalization cannot re-enter.
+        // Native: finalize the encoder (flush remaining chunks + OFFLINE remux
+        // into the final MP4 — takes a few seconds for longer clips), then save
+        // via the same recording API. isRecording flips first so a second click
+        // during finalization cannot re-enter; the PROCESSING pill covers the
+        // remux window so the UI shows feedback instead of appearing frozen.
         setIsRecording(false);
+        setIsProcessing(true);
         window.clearInterval(recordingTimerRef.current);
         recordingTimerRef.current = undefined;
         const id = recordingIdRef.current;
@@ -132,9 +136,13 @@ export function useStreamRecorder({
           if (id) {
             window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
           }
+          setIsProcessing(false);
           return;
         }
-        if (!id) return;
+        if (!id) {
+          setIsProcessing(false);
+          return;
+        }
         const durationMs = Date.now() - recordingStartTimeRef.current;
         try {
           const entry = await window.openNow.finishRecording({
@@ -151,6 +159,7 @@ export function useStreamRecorder({
           console.error("[StreamView] Failed to finish native recording:", error);
           setRecordingError("Recording could not be saved.");
         }
+        setIsProcessing(false);
         return;
       }
       mediaRecorderRef.current?.stop();
@@ -179,6 +188,7 @@ export function useStreamRecorder({
       recordingStartTimeRef.current = Date.now();
       setRecordingDurationMs(0);
       setIsRecording(true);
+      setIsProcessing(false);
       recordingTimerRef.current = window.setInterval(() => {
         setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
       }, 500);
@@ -438,6 +448,7 @@ export function useStreamRecorder({
 
   return {
     isRecording,
+    isProcessing,
     recordings,
     recordingDurationMs,
     recordingError,

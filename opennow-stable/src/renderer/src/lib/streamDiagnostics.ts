@@ -276,6 +276,10 @@ export function mergeNativeStreamStats(
     nativeCapsFramerate: stats.capsFramerate,
     nativeQueueMode: stats.queueMode,
     nativeFramesPendingToPresent: stats.framesPendingToPresent,
+    // Duplicate-frame detector: unique vs total decoded frames (see the type
+    // docs). Only reported by the native streamer; absent in WebRTC sessions.
+    nativeDuplicateFramesSeen: stats.duplicateFramesSeen,
+    nativeDuplicateFramesUnique: stats.duplicateFramesUnique,
     nativePartialFlushCount: stats.partialFlushCount,
     nativeCompleteFlushCount: stats.completeFlushCount,
     nativeTransitionSummary: stats.lastTransitionSummary,
