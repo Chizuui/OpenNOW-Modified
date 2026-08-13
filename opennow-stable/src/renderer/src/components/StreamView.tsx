@@ -498,6 +498,14 @@ export function StreamView({
       const rect = element.getBoundingClientRect();
       const width = Math.round(rect.width * dpr);
       const height = Math.round(rect.height * dpr);
+      // getBoundingClientRect() is VIEWPORT-relative (CSS px), but the native
+      // stacked sink is placed in SCREEN coordinates (physical px). The
+      // window's screenX/screenY (CSS px) converts it — without this, a
+      // non-origin window (windowed mode, second monitor) puts the video
+      // sink at (0,0) of the screen and crops the far corner = the
+      // "slightly zoomed / cropped" native display report.
+      const screenLeft = rect.left + (window.screenX || 0);
+      const screenTop = rect.top + (window.screenY || 0);
       const { showSideBar, exitOpen, statsMode, showNativeStats } = surfaceStateRef.current;
       // In stacked mode the native video window lives behind the transparent
       // shell for the whole session, so it must stay visible while overlays
@@ -515,8 +523,8 @@ export function StreamView({
         showStats: showNativeStats,
         rect: visible
           ? {
-              x: Math.round(rect.left * dpr),
-              y: Math.round(rect.top * dpr),
+              x: Math.round(screenLeft * dpr),
+              y: Math.round(screenTop * dpr),
               width,
               height,
             }

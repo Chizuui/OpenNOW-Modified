@@ -87,10 +87,14 @@ const OFFER_TIMEOUT_MS = 20000;
 const STOP_TIMEOUT_MS = 1200;
 const SCREENSHOT_TIMEOUT_MS = 5000;
 // Native stop(finalize=true) budget: queue drain (4s) + EOS flush (4s) +
-// muxer-direct EOS failsafe (2s) = 10s worst case, so the Electron side must
-// not give up first. A dead recording audio branch used to leave the muxer
-// waiting forever and this 5s timeout fired ("stop-recording timed out").
-const RECORDING_STOP_TIMEOUT_MS = 20000;
+// muxer-direct EOS failsafe (2s) = 10s, plus the OFFLINE pass-through remux
+// (45s cap: decode + FULL→LIMITED + H.264 re-encode of a tens-of-seconds
+// 1080p60 clip through the software x264 fallback on a weak CPU), so the
+// Electron side must not give up first. A dead recording audio branch used
+// to leave the muxer waiting forever and the old 5s/20s timeouts fired
+// ("stop-recording timed out") mid-remux — errors still resolve fast via
+// the recording-stop-failed event, this is only a ceiling.
+const RECORDING_STOP_TIMEOUT_MS = 60000;
 const DATA_CHANNEL_SEND_TIMEOUT_MS = 3000;
 const MAX_INPUT_STDIN_BUFFER_BYTES = 64 * 1024;
 const MIN_NATIVE_BITRATE_KBPS = 5_000;
@@ -133,6 +137,7 @@ export class NativeStreamerManager {
   private activeNativeRecordingId: string | null = null;
   /** Resolver for the in-flight `stop-recording` finalization wait. */
   private pendingRecordingFinishedResolve: ((thumbnailBase64?: string) => void) | null = null;
+  private pendingRecordingFinishedReject: ((error: Error) => void) | null = null;
   /** Serialize native chunk writes; stdout events can arrive faster than disk writes. */
   private recordingChunkQueue: Promise<void> = Promise.resolve();
   private queuedLocalIce: IceCandidatePayload[] = [];
@@ -543,14 +548,19 @@ export class NativeStreamerManager {
       throw new Error("Native streamer is not running.");
     }
 
-    const finished = new Promise<string | undefined>((resolve) => {
+    const finished = new Promise<string | undefined>((resolve, reject) => {
       this.pendingRecordingFinishedResolve = resolve;
+      this.pendingRecordingFinishedReject = reject;
     });
+    const clearPending = () => {
+      this.pendingRecordingFinishedResolve = null;
+      this.pendingRecordingFinishedReject = null;
+    };
     let thumbnailBase64: string | undefined;
     try {
       await this.request({ type: "stop-recording", finalize: true }, RECORDING_STOP_TIMEOUT_MS);
     } catch (error) {
-      this.pendingRecordingFinishedResolve = null;
+      clearPending();
       this.activeNativeRecordingId = null;
       throw error;
     }
@@ -559,7 +569,7 @@ export class NativeStreamerManager {
         finished,
         new Promise<never>((_, reject) => {
           const timeout = setTimeout(() => {
-            this.pendingRecordingFinishedResolve = null;
+            clearPending();
             reject(new Error("Native recording did not finalize in time."));
           }, RECORDING_STOP_TIMEOUT_MS);
           timeout.unref?.();
@@ -1063,6 +1073,7 @@ export class NativeStreamerManager {
     if (message.type === "recording-finished") {
       const resolve = this.pendingRecordingFinishedResolve;
       this.pendingRecordingFinishedResolve = null;
+      this.pendingRecordingFinishedReject = null;
       void this.recordingChunkQueue.finally(() => {
         resolve?.(message.thumbnailBase64);
       });
@@ -1097,6 +1108,16 @@ export class NativeStreamerManager {
     }
 
     if (message.type === "error") {
+      // A native recording finalize that errors (e.g. the offline remux found
+      // empty elementary streams) never emits `recording-finished` — reject the
+      // pending finalize promise now instead of letting the renderer time out
+      // ~20 s later. Anything else is surfaced as a plain streamer error.
+      if (message.code === "recording-stop-failed" && this.pendingRecordingFinishedReject) {
+        const reject = this.pendingRecordingFinishedReject;
+        this.pendingRecordingFinishedResolve = null;
+        this.pendingRecordingFinishedReject = null;
+        reject(new Error(message.message));
+      }
       this.options.emit({ type: "error", message: `Native streamer error: ${message.message}` });
     }
   }

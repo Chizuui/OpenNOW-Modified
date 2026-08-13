@@ -871,25 +871,45 @@ pub(crate) mod win32_renderer_window {
             bottom: 0,
         };
         let client = GetClientRect(sink_hwnd, &mut client_rect);
+        // Diagnostics for the "slightly zoomed display" report: compare the
+        // sink rect (browser outer), the sink CLIENT rect, and the rect the
+        // RENDERER published (video element CSS x dpr). If the renderer's
+        // published rect ever differs from the browser rect (window not at the
+        // origin, DPI mismatch, CSS overflow), the sink would be placed at the
+        // wrong screen position / size — showing as a crop/zoom the recording
+        // (tapped at decode) never has. The sink geometry itself is
+        // browser-rect-driven, so this log is the tiebreaker for the report.
+        let surface_rect = STACKED_PENDING_SURFACE
+            .get()
+            .and_then(|surface| surface.lock().ok().and_then(|surface| surface.as_ref().cloned()))
+            .map(|surface| {
+                surface.rect.map(|rect| {
+                    format!(
+                        "renderer_rect=({},{} {}x{}) dpr={}",
+                        rect.x, rect.y, rect.width, rect.height, surface.device_scale_factor
+                    )
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| "renderer_rect=none".to_owned());
+        let client_dim = if client != 0 {
+            format!(
+                "{}x{}",
+                client_rect.right.saturating_sub(client_rect.left),
+                client_rect.bottom.saturating_sub(client_rect.top)
+            )
+        } else {
+            "0x0".to_owned()
+        };
         stacked_guard_log(
             "info",
             format!(
-                "Stacked sink revealed at first decoded frame: rect=({},{} {}x{}) below browser; client={}x{}; sink=0x{:X}",
+                "Stacked sink revealed at first decoded frame: rect=({},{} {}x{}) below browser; client={client_dim}; sink=0x{:X}; {surface_rect}",
                 window_rect.left,
                 window_rect.top,
                 window_rect.right.saturating_sub(window_rect.left),
                 window_rect.bottom.saturating_sub(window_rect.top),
-                if client != 0 {
-                    client_rect.right.saturating_sub(client_rect.left)
-                } else {
-                    0
-                },
-                if client != 0 {
-                    client_rect.bottom.saturating_sub(client_rect.top)
-                } else {
-                    0
-                },
-                sink_hwnd as usize
+                sink_hwnd as usize,
             ),
         );
         true

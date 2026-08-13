@@ -272,6 +272,7 @@ pub(crate) struct VideoLivenessState {
     /// torn down, only the chain elements), so re-adding it would double-count
     /// encoded bytes. Guarded per monitor instance.
     rtp_bitrate_probe_installed: AtomicBool,
+    rtp_payload_dump_installed: AtomicBool,
     /// Whether the outgoing-RTCP observability probe is already installed on
     /// the webrtcbin rtpbin sessions. The rtpbin/sessions outlive decoder
     /// rebuilds, so re-adding would double-count. Guarded per monitor.
@@ -346,6 +347,7 @@ impl VideoLivenessState {
             startup_downgrade_requested: AtomicBool::new(false),
             current_sink: Mutex::new(None),
             rtp_bitrate_probe_installed: AtomicBool::new(false),
+            rtp_payload_dump_installed: AtomicBool::new(false),
             rtcp_send_probe_installed: AtomicBool::new(false),
             rtcp_sent_sr: AtomicU64::new(0),
             rtcp_sent_rr: AtomicU64::new(0),
@@ -2396,6 +2398,179 @@ pub(crate) fn watch_first_sink_buffer(
     });
 }
 
+/// Diagnostic: dump the raw RTP payload header + first bytes to the log so a
+/// decode-chain failure (0 frames across every decoder while RTP keeps
+/// flowing) can be traced to the actual payload format the server sends.
+/// Covers AV1 (aggregation header), H264 and H265 (NAL-type interpretation)
+/// — the GFN H265/AV1 field failures both showed decoded=0 with RTP flowing.
+///
+/// Attached on the video RTP source pad (before the tap tee / depay), so it
+/// fires even when the depay itself drops every packet. Logs the first few
+/// payloads of the session only (not a per-session flood). The RTP sequence
+/// numbers of the first packets are logged too: a server that sends with
+/// large sequence gaps (or reuses a sparse space for NACK/FEC slots) makes
+/// `rtph*depay` see continuous loss — every frame drops as incomplete, the
+/// depay pushes UpstreamForceKeyUnit (request-keyframe=true) and the client
+/// FIR-storms the server (observed at ~100 FIR/s in the field), which keeps
+/// resetting its encoder and never delivers a decodable stream.
+pub(crate) fn watch_rtp_payload_dump(
+    pad: &gst::Pad,
+    codec: &str,
+    video_liveness: VideoLivenessMonitor,
+    event_sender: &Option<Sender<Event>>,
+) {
+    let codec_upper = codec.to_ascii_uppercase();
+    if !matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC" | "AV1") {
+        return;
+    }
+    let sender = event_sender.clone();
+    let dumped = video_liveness
+        .state()
+        .rtp_payload_dump_installed
+        .swap(true, Ordering::Relaxed);
+    if dumped {
+        return;
+    }
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let mut prev_seq = std::sync::atomic::AtomicU32::new(u32::MAX);
+    let mut first_seq = std::sync::atomic::AtomicU32::new(u32::MAX);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_probe_pad, info| {
+        let n = count.fetch_add(1, Ordering::Relaxed);
+        if n >= 6 {
+            return gst::PadProbeReturn::Ok;
+        }
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let map = buffer.map_readable();
+        let bytes = map.as_deref().unwrap_or(&[]);
+        // Skip the 12-byte RTP header: payload starts after it (no CSRC/extension
+        // handling here — GFN video packets carry the standard 12-byte header).
+        let payload = bytes.get(12..).unwrap_or(&[]);
+        let marker = bytes.get(1).map(|b| b & 0x80 != 0).unwrap_or(false);
+        let mut seq_bytes = [0u8; 2];
+        if let Some(slice) = bytes.get(2..4) {
+            seq_bytes.copy_from_slice(slice);
+        }
+        let seq = u16::from_be_bytes(seq_bytes);
+        let mut ts_bytes = [0u8; 4];
+        if let Some(slice) = bytes.get(4..8) {
+            ts_bytes.copy_from_slice(slice);
+        }
+        let ts = u32::from_be_bytes(ts_bytes);
+        let hex = payload
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Sequence continuity across the first packets: a first-packet gap of
+        // more than 1 means the server (or the rtpbin jitterbuffer) delivers
+        // non-contiguous sequence numbers — the depay will see "loss".
+        let prev = prev_seq.swap(seq as u32, Ordering::Relaxed);
+        let first = first_seq.compare_exchange(
+            u32::MAX,
+            seq as u32,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        let first = if first.is_ok() { seq as u32 } else { first_seq.load(Ordering::Relaxed) };
+        let gap = if prev != u32::MAX {
+            (seq as u32).wrapping_sub(prev) as i64
+        } else {
+            0
+        };
+        // Codec-specific payload interpretation.
+        let layout = if codec_upper == "AV1" {
+            let agg = payload.first().copied().unwrap_or(0);
+            let z = (agg & 0x80) != 0;
+            let y = (agg & 0x40) != 0;
+            let w = (agg >> 4) & 0x03;
+            let n = (agg & 0x08) != 0;
+            format!("aggr=0x{agg:02x} (Z={z} Y={y} W={w} N={n})")
+        } else if codec_upper == "H264" {
+            let first_byte = payload.first().copied().unwrap_or(0);
+            let nal = first_byte & 0x1F;
+            let kind = match nal {
+                24 => "STAP-A",
+                25 => "STAP-B",
+                26 => "MTAP16",
+                27 => "MTAP24",
+                28 => "FU-A",
+                29 => "FU-B",
+                _ => "single-nal",
+            };
+            format!("h264_nal=0x{first_byte:02x} type={nal} ({kind})")
+        } else {
+            let first_byte = payload.first().copied().unwrap_or(0);
+            let nal = (first_byte >> 1) & 0x3F;
+            let kind = match nal {
+                48 => "AP",
+                49 => "FU",
+                50 => "PACI",
+                _ => "single-nal",
+            };
+            format!("h265_nal=0x{first_byte:02x} type={nal} ({kind})")
+        };
+        send_log(
+            &sender,
+            "warn",
+            format!(
+                "[{codec_upper}PayloadDump] rtp_buffer#{n} len={} marker={marker} seq={seq} first_seq={first} seq_gap={gap:+} ts={ts} {layout} payload=[{hex}]",
+                bytes.len()
+            ),
+        );
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Diagnostic: count buffers arriving at the parser SINK pad (i.e. what the
+/// depayloader actually emits) and log the first few plus the first caps. A
+/// session where the RTP probe keeps firing (`encodedAge` fresh) but this
+/// counter stays 0 pins the failure on the depayloader itself (receives RTP,
+/// emits nothing); a counter that climbs while `decoded` stays 0 pins it on
+/// the parser/decoder boundary (caps negotiation).
+pub(crate) fn watch_depay_output(
+    parser: &gst::Element,
+    encoding: &str,
+    event_sender: &Option<Sender<Event>>,
+) {
+    let Some(sink_pad) = parser.static_pad("sink") else {
+        return;
+    };
+    let sender = event_sender.clone();
+    let encoding_owned = encoding.to_owned();
+    let count = std::sync::atomic::AtomicU64::new(0);
+    let logged = std::sync::atomic::AtomicUsize::new(0);
+    let caps_pad = sink_pad.clone();
+    sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        let total = count.fetch_add(1, Ordering::Relaxed);
+        let first_3 = logged.fetch_add(1, Ordering::Relaxed);
+        if first_3 < 3 {
+            let size = info.buffer().map(|b| b.size()).unwrap_or(0);
+            send_log(
+                &sender,
+                "warn",
+                format!(
+                    "[{encoding_owned}DepayOutput] buffer#{first_3} size={size} total_after={total}"
+                ),
+            );
+        }
+        if first_3 == 0 {
+            let caps = caps_pad
+                .current_caps()
+                .map(|caps| caps.to_string())
+                .unwrap_or_else(|| "unknown caps".to_owned());
+            send_log(
+                &sender,
+                "warn",
+                format!("[{encoding_owned}DepayOutput] first depay output caps: {caps}"),
+            );
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 pub(crate) fn watch_rtp_video_bitrate(
     pad: &gst::Pad,
     video_liveness: VideoLivenessMonitor,
@@ -2903,29 +3078,37 @@ pub(crate) fn read_queue_level(queue: &gst::Element) -> u32 {
     queue.property::<u32>("current-level-buffers")
 }
 
-/// True once the pad's sticky event list shows the mandatory media sequence
-/// STREAM_START + CAPS. Used as the deterministic "branch is ready" gate
-/// before the recording valve opens after a rebuild: a queue that receives a
+/// True once the pad's sticky event list shows the FULL mandatory media
+/// sequence STREAM_START + CAPS + SEGMENT. Used as the deterministic "branch
+/// is ready" gate before the recording valve opens: a queue that receives a
 /// live buffer with no stream-start yet logs the field warning `Got data flow
 /// before stream-start` and the branch can stall so badly that stop() times
 /// out. CAPS is sticky and arrives AFTER stream-start in the replay order, so
-/// its presence proves the whole sequence landed.
+/// its presence proves stream-start landed. SEGMENT is the critical third:
+/// a closed recording valve in `forward-sticky-events` mode forwards the
+/// STICKY events (stream-start/caps) from the live stream but DROPS the
+/// non-sticky SEGMENT, so the replayed segment is the only one the queue ever
+/// gets — and if the valve opens before it lands, the first live buffer hits
+/// the queue with `Got data flow before segment` and GStreamer returns
+/// FLOW_ERROR, which stalls the whole RTP flow through the shared tee.
 pub(crate) fn pad_has_media_sticky_events(pad: &gst::Pad) -> bool {
     let mut seen_stream_start = false;
     let mut seen_caps = false;
+    let mut seen_segment = false;
     pad.sticky_events_foreach(|event| {
         match event.type_() {
             gst::EventType::StreamStart => seen_stream_start = true,
             gst::EventType::Caps => seen_caps = true,
+            gst::EventType::Segment => seen_segment = true,
             _ => {}
         }
-        if seen_stream_start && seen_caps {
+        if seen_stream_start && seen_caps && seen_segment {
             std::ops::ControlFlow::Break(gst::EventForeachAction::Keep)
         } else {
             std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
         }
     });
-    seen_stream_start && seen_caps
+    seen_stream_start && seen_caps && seen_segment
 }
 
 /// One outgoing RTCP message's classification (per RTCP packet walk).
@@ -5076,8 +5259,10 @@ mod stacked_window_dance_diagnostics {
             8_000,
         )
         .expect("build recording branch");
-        let muxer_src = state.muxer.static_pad("src").expect("muxer src pad");
-        let swallow_sink = state.swallow.static_pad("sink").expect("swallow sink pad");
+        let muxer = state.muxer.as_ref().expect("transcode muxer");
+        let swallow = state.swallow.as_ref().expect("transcode swallow");
+        let muxer_src = muxer.static_pad("src").expect("muxer src pad");
+        let swallow_sink = swallow.static_pad("sink").expect("swallow sink pad");
         let linked = muxer_src.peer().is_some_and(|peer| peer == swallow_sink);
         eprintln!("DIAG muxer->swallow linked: {linked}");
         let _ = pipeline.set_state(gst::State::Null);
@@ -5111,12 +5296,27 @@ mod stacked_window_dance_diagnostics {
         )
         .expect("build recording branch");
         let started_at = Instant::now();
-        state.start().expect("start recording");
+        let started = state.start();
         assert!(
             started_at.elapsed() < Duration::from_secs(2),
             "start-recording must return promptly (valve-only operation)"
         );
-        state.stop(false).expect("abort recording");
+        match started {
+            Ok(()) => {
+                state.stop(false).expect("abort recording");
+            }
+            Err(message) => {
+                // This test's tap tee is EMPTY (no data ever flowed), so no
+                // media sequence can ever land on the branch queue. The sticky
+                // gate therefore aborts the record start instead of opening
+                // the valve into an event-less queue — which would stall the
+                // stream with `Got data flow before segment` (the pass-through
+                // wedge). The contract under test is that start() returns
+                // promptly and never touches the live chain; the abort is the
+                // safe behavior for an event-less tee.
+                eprintln!("DIAG empty-tee start aborted cleanly: {message}");
+            }
+        }
         let _ = pipeline.set_state(gst::State::Null);
     }
 
@@ -5213,7 +5413,7 @@ mod stacked_window_dance_diagnostics {
         eprintln!(
             "DIAG audio depayloader src linked to {:?} (muxer has {} sink pads)",
             pad.name(),
-            state.muxer.sink_pads().len()
+            state.muxer.as_ref().expect("muxer").sink_pads().len()
         );
         assert!(
             pad.name() == "sink" || pad.name().starts_with("audio_"),
@@ -6035,6 +6235,814 @@ mod tests {
         let _ = pipeline.set_state(gst::State::Null);
     }
 
+    /// Pass-through (bitstream remux) recording: build the branch off the RAW
+    /// RTP tee (pre-decode), open the valve, and verify the muxer emits a
+    /// real MP4 (ftyp + mdat) from the received H.264 RTP — with zero decode
+    /// or encode inside the branch. Also proves the live RTP path keeps
+    /// flowing through record start/stop (the zero-cost guarantee: nothing in
+    /// this branch can starve the decode chain).
+    #[test]
+    fn pass_through_recording_remuxes_received_bitstream() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipeline = gst::Pipeline::new();
+
+        // Video source: raw video → H.264 encode → RTP payload → RTP tap tee
+        // (exactly what the RTP tap tee carries in production: the received
+        // bitstream BEFORE decode).
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("convert");
+        let enc = gst::ElementFactory::make("x264enc").build().expect("x264enc");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("bitrate", 1500u32);
+        enc.set_property("key-int-max", 30u32);
+        let pay = gst::ElementFactory::make("rtph264pay").build().expect("rtph264pay");
+        pay.set_property("pt", 96u32);
+        let rtp_tee = gst::ElementFactory::make("tee").build().expect("rtp tee");
+        let sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+
+        for element in [&src, &src_caps, &convert, &enc, &pay, &rtp_tee, &sink] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("link src");
+        src_caps.link(&convert).expect("link caps");
+        convert.link(&enc).expect("link enc");
+        enc.link(&pay).expect("link pay");
+        pay.link(&rtp_tee).expect("link tee");
+        rtp_tee.link(&sink).expect("link sink");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));        let mut state = crate::gstreamer_pipeline::build_pass_through_record_branch(
+            &pipeline,
+            &rtp_tee,
+            "H264",
+            30,
+            Some(tx),
+        )
+        .expect("build pass-through branch");
+
+
+        // Let the live stream flow through the CLOSED valve for a while, like
+        // the field (branch armed at session start, valve closed until the
+        // user presses record). The branch must cost the live path nothing
+        // while idle.
+        std::thread::sleep(Duration::from_millis(1_000));
+
+        let counter = {
+            let counter = Arc::new(AtomicU64::new(0));
+            let probe_counter = counter.clone();
+            let pad = sink.static_pad("sink").expect("sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                probe_counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+            counter
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let before = counter.load(Ordering::SeqCst);
+        assert!(
+            before > 0,
+            "live RTP path must be flowing before record start"
+        );
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(2_000));
+
+        let after = counter.load(Ordering::SeqCst);
+        assert!(
+            after > before + 30,
+            "live RTP path must keep flowing through record start: {before} -> {after}"
+        );
+
+        state.stop(true).expect("finalize recording");
+
+        // The finalized MP4 must arrive as at least one chunk starting with
+        // ftyp and carrying a real mdat payload (the IDR gate opened on the
+        // stream's keyframes, so the file has actual video data).
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks.push(
+                    BASE64_STANDARD
+                        .decode(&chunk_base64)
+                        .expect("valid base64 chunk"),
+                );
+            }
+        }
+        assert!(
+            !chunks.is_empty(),
+            "pass-through recording produced no muxer chunks"
+        );
+        let file = chunks.concat();
+        assert!(
+            file.len() >= 8 && &file[4..8] == b"ftyp",
+            "pass-through file must be an MP4 (size+ftyp), got {:?}",
+            String::from_utf8_lossy(&file[..file.len().min(8)])
+        );
+        assert!(
+            file.windows(4).any(|window| window == b"mdat"),
+            "pass-through file must contain an mdat box"
+        );
+        assert!(
+            file.len() > 1_000,
+            "pass-through recording looks empty ({} bytes)",
+            file.len()
+        );
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Field reproduction of the pass-through recording wedge: the user's
+    /// pass-through recording (2026-08-12T14:53Z) wrote a 24 s AAC audio
+    /// track but only a 2.06 s HEVC video track (82 frames) — the video
+    /// branch silently stopped delivering to qtmux ~2 s after record start
+    /// while audio kept flowing. Feed a LIVE H265 RTP stream into the real
+    /// pass-through branch and measure how long after `start()` the parse
+    /// keeps receiving depayloaded access units. If the branch wedges, the
+    /// parse sink pad stops receiving buffers while the live RTP path keeps
+    /// flowing.
+    #[test]
+    fn pass_through_recording_video_branch_stays_live() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipeline = gst::Pipeline::new();
+
+        // Live H264 RTP source: raw video → H.264 encode → RTP payload → RTP
+        // tap tee (mirrors the field: the tee carries received RTP before
+        // decode). x264enc is used because it is the proven-working encoder in
+        // the harness (x265enc stalls its first output here). 30 fps so the
+        // frame-rate math is easy.
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("convert");
+        let enc = gst::ElementFactory::make("x264enc").build().expect("x264enc");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("key-int-max", 60u32);
+        enc.set_property("bitrate", 1500u32);
+        let pay = gst::ElementFactory::make("rtph264pay").build().expect("rtph264pay");
+        pay.set_property("pt", 96u32);
+        let rtp_tee = gst::ElementFactory::make("tee").build().expect("rtp tee");
+        let sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+
+        for element in [&src, &src_caps, &convert, &enc, &pay, &rtp_tee, &sink] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("link src");
+        src_caps.link(&convert).expect("link caps");
+        convert.link(&enc).expect("link enc");
+        enc.link(&pay).expect("link pay");
+        pay.link(&rtp_tee).expect("link tee");
+        rtp_tee.link(&sink).expect("link sink");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let mut state = crate::gstreamer_pipeline::build_pass_through_record_branch(
+            &pipeline,
+            &rtp_tee,
+            "H264",
+            30,
+            Some(tx),
+        )
+        .expect("build pass-through branch");
+
+        // Count depayloaded access units at the parse SINK pad (pre-IDR-gate,
+        // so the count reflects data reaching the branch regardless of the
+        // gate) and remember the timestamp of the LAST one.
+        let parse_sink_buffers = Arc::new(AtomicU64::new(0));
+        let last_buffer = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        {
+            let counter = parse_sink_buffers.clone();
+            let stamp = last_buffer.clone();
+            let parse_src = state
+                .h264_parse
+                .static_pad("sink")
+                .expect("parse sink pad");
+            parse_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if info.buffer().is_some() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut guard) = stamp.lock() {
+                        *guard = Some(std::time::Instant::now());
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+
+        // Branch armed with the valve closed; live RTP must keep flowing.
+        std::thread::sleep(Duration::from_millis(1_000));
+        assert_eq!(
+            parse_sink_buffers.load(Ordering::SeqCst),
+            0,
+            "no depayloaded AUs may reach the parse while the valve is closed"
+        );
+
+        // Live-path probe installed BEFORE record start, so we can measure it
+        // mid-recording as well as after stop.
+        let live_sink_buffers = Arc::new(AtomicU64::new(0));
+        {
+            let counter = live_sink_buffers.clone();
+            let pad = sink.static_pad("sink").expect("live sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let live_before_start = live_sink_buffers.load(Ordering::SeqCst);
+        assert!(
+            live_before_start > 0,
+            "live RTP path was not flowing BEFORE record start (test setup?)"
+        );
+
+        state.start().expect("start recording");
+        let record_started = std::time::Instant::now();
+        // Record for ~10 s, like the field clip.
+        std::thread::sleep(Duration::from_millis(5_000));
+        let live_mid = live_sink_buffers.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(5_000));
+
+        let live_before_stop = live_sink_buffers.load(Ordering::SeqCst);
+        let total = parse_sink_buffers.load(Ordering::SeqCst);
+        let last_seen = *last_buffer.lock().expect("last stamp");
+        let stop_age_ms = last_seen
+            .map(|seen| seen.duration_since(record_started).as_millis())
+            .unwrap_or(0);
+
+        assert!(
+            live_mid > 0 && live_before_stop > live_mid,
+            "live RTP path stopped DURING recording (back-pressure?): mid={live_mid} beforeStop={live_before_stop}"
+        );
+        state.stop(true).expect("finalize recording");
+
+        // The finalize must deliver the muxed MP4 as a chunk (the swallow's
+        // sticky seeding keeps the EOS buffer from being dropped with
+        // FLOW_ERROR).
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks.push(
+                    BASE64_STANDARD
+                        .decode(&chunk_base64)
+                        .expect("valid base64 chunk"),
+                );
+            }
+        }
+        assert!(
+            !chunks.is_empty(),
+            "pass-through finalize lost the MP4 chunk (swallow FLOW_ERROR?)"
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+        // 10 s at 30 fps ≈ 300 AUs. A wedge at ~2 s leaves only ~60-80 AUs
+        // and a stop_age of ~2000 ms. The recorded field clip showed exactly
+        // this: 82 frames / 2.06 s.
+        assert!(
+            total >= 200,
+            "pass-through video branch wedged: only {total} AUs reached the parse in 10 s (last buffer {stop_age_ms} ms after record start)"
+        );
+        assert!(
+            stop_age_ms >= 8_000,
+            "pass-through video branch stopped delivering {stop_age_ms} ms after record start ({total} AUs total)"
+        );
+    }
+
+    /// Pass-through recording WITH game audio: both the video ES (H264
+    /// byte-stream) and the audio ES (AAC re-framed to ADTS by the live
+    /// branch's aacparse) are remuxed OFFLINE at stop into ONE MP4 with a
+    /// FIELD REPRO (temporary): the live H265 pass-through branch writes ZERO
+    /// bytes to its ES file while audio writes 169 KB (2026-08-12T22:58 log).
+    /// The branch is attached to the tee BEFORE the source starts flowing
+    /// (the field order: tee embedded → branch attached → source linked), fed
+    /// with REAL GFN H265 bitstream via rtph265pay, then `start()` opens the
+    /// valve. Reproduction check: the ES file must grow after `start()`.
+    ///
+    /// IGNORED: the harness cannot produce H265 RTP at all — rtph265pay
+    /// holds every frame when its input AUs carry NONE timestamps (a raw ES
+    /// file has none), so `filesrc → h265parse → rtph265pay` never emits a
+    /// single RTP packet here (pay_src stays 0) and the test fails at its
+    /// "live path must flow" precondition, not at the recording branch. The
+    /// attach-order question is covered instead by
+    /// `field_order_pass_through_branch_attached_before_flow_writes_es`
+    /// (H264 source, which the harness can encode) and the live-branch
+    /// payload/caps shape by the offline gst-launch reproductions.
+    #[test]
+    #[ignore = "harness cannot produce H265 RTP (rtph265pay stalls on NONE timestamps from raw ES files)"]
+    fn field_repro_pass_through_h265_writes_es() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipeline = gst::Pipeline::new();
+
+        let es_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("gfn_field.h265");
+        assert!(es_path.exists(), "missing testdata/gfn_field.h265");
+        let src = gst::ElementFactory::make("filesrc").build().expect("filesrc");
+        src.set_property(
+            "location",
+            es_path.to_str().expect("es path utf8"),
+        );
+        let parse_in = gst::ElementFactory::make("h265parse").build().expect("h265parse");
+        let pay = gst::ElementFactory::make("rtph265pay").build().expect("rtph265pay");
+        pay.set_property("pt", 103u32);
+        let rtp_tee = gst::ElementFactory::make("tee").build().expect("rtp tee");
+        let sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        // sync=true paces the whole pipeline at the media clock, so the
+        // 5.8 MB GFN file plays at ~real-time like the live session instead
+        // of being pushed through in under a second.
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+
+        for element in [&src, &parse_in, &pay, &rtp_tee, &sink] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&parse_in).expect("link src");
+        parse_in.link(&pay).expect("link pay");
+        pay.link(&rtp_tee).expect("link tee");
+        rtp_tee.link(&sink).expect("link sink");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        // Count buffers at every hop of the source chain from the very start,
+        // so a file that finishes before a later probe is still visible.
+        let pay_src = Arc::new(AtomicU64::new(0));
+        {
+            let counter = pay_src.clone();
+            let pad = pay.static_pad("src").expect("pay src pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let parse_src_count = Arc::new(AtomicU64::new(0));
+        {
+            let counter = parse_src_count.clone();
+            let pad = parse_in.static_pad("src").expect("parse src pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let filesrc_src_count = Arc::new(AtomicU64::new(0));
+        {
+            let counter = filesrc_src_count.clone();
+            let pad = src.static_pad("src").expect("filesrc src pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+
+        // FIELD ORDER: the live chain is PLAYING first, then the branch is
+        // attached HOT to the tee (the field embeds the tee + attaches the
+        // branch while the pipeline is already PLAYING, then links the source
+        // last).
+        let _ = pipeline.set_state(gst::State::Playing);
+        std::thread::sleep(Duration::from_millis(1_200));
+        let (state_result, pipeline_state, pending) = pipeline.state(gst::ClockTime::from_seconds(3));
+        let _ = pending;
+        let pay_at_attach = pay_src.load(Ordering::SeqCst);
+        eprintln!(
+            "FIELD-REPRO pipeline state before branch attach: result={state_result:?} current={pipeline_state:?} filesrc_src={} parse_src={} pay_src_total={pay_at_attach}",
+            filesrc_src_count.load(Ordering::SeqCst),
+            parse_src_count.load(Ordering::SeqCst)
+        );
+
+        let mut state = crate::gstreamer_pipeline::build_pass_through_record_branch(
+            &pipeline,
+            &rtp_tee,
+            "H265",
+            60,
+            Some(tx),
+        )
+        .expect("build pass-through branch");
+        std::thread::sleep(Duration::from_millis(600));
+
+        // Drain any bus error/warning emitted by the branch attach.
+        while let Some(msg) = pipeline.bus().and_then(|b| b.timed_pop(gst::ClockTime::from_mseconds(50))) {
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    eprintln!("FIELD-REPRO bus ERROR after attach: {} :: {:?}", err.error(), err.debug());
+                }
+                gst::MessageView::Warning(warn) => {
+                    eprintln!("FIELD-REPRO bus WARNING after attach: {} :: {:?}", warn.error(), warn.debug());
+                }
+                _ => {}
+            }
+        }
+
+        // Live path must be flowing (both before and with the branch attached).
+        let live = Arc::new(AtomicU64::new(0));
+        {
+            let counter = live.clone();
+            let pad = sink.static_pad("sink").expect("sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let live_with_branch = live.load(Ordering::SeqCst);
+        let pay_after = pay_src.load(Ordering::SeqCst);
+        eprintln!(
+            "FIELD-REPRO live path buffers with branch attached: {live_with_branch} (filesrc_src={} parse_src={} pay src total after attach window={pay_after})",
+            filesrc_src_count.load(Ordering::SeqCst),
+            parse_src_count.load(Ordering::SeqCst)
+        );
+        assert!(live_with_branch > 0, "live path not flowing");
+
+        let es_file = state.video_es_path.clone().expect("es path");
+        let size_before = std::fs::metadata(&es_file).map(|m| m.len()).unwrap_or(0);
+        eprintln!("FIELD-REPRO es size BEFORE start: {size_before} bytes ({})", es_file.display());
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(4_000));
+
+        let size_after = std::fs::metadata(&es_file).map(|m| m.len()).unwrap_or(0);
+        eprintln!("FIELD-REPRO es size AFTER start: {size_after} bytes (live buffers: {})", live.load(Ordering::SeqCst));
+        assert!(
+            size_after > size_before,
+            "FIELD-REPRO BUG REPRODUCED: H265 pass-through branch wrote no ES bytes after start() (before={size_before} after={size_after})"
+        );
+
+        state.stop(true).expect("finalize recording");
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks.push(
+                    BASE64_STANDARD
+                        .decode(&chunk_base64)
+                        .expect("valid base64 chunk"),
+                );
+            }
+        }
+        assert!(
+            !chunks.is_empty(),
+            "pass-through finalize produced no chunk"
+        );
+        eprintln!(
+            "FIELD-REPRO mp4 chunk: {} bytes",
+            chunks.iter().map(|c| c.len()).sum::<usize>()
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// FIELD-ORDER reproduction of the 22:58 recording bug (video ES 0 bytes
+    /// while audio wrote 169 KB): the RTP record tap tee is embedded and the
+    /// pass-through branch is attached HOT (pipeline already PLAYING) BEFORE
+    /// the source is linked into the tee — so the tee has zero flow when the
+    /// branch pad is requested. Then flow starts. `start()` opens the branch
+    /// valve; the ES file must grow. A branch pad that was never activated
+    /// (requested+linked while the tee is PLAYING but pre-flow) receives no
+    /// buffers even after flow starts — that reproduces the field: EOS flows
+    /// (injected below the valve), sticky-event replay passes, but no bytes.
+    /// The source is H264 (x264enc — the only encoder that reliably produces
+    /// RTP in this harness) gated by a `valve` so flow into the tee starts
+    /// only after the branch is attached.
+    #[test]
+    fn field_order_pass_through_branch_attached_before_flow_writes_es() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipeline = gst::Pipeline::new();
+
+        let src = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("videotestsrc");
+        src.set_property("is-live", false);
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("src capsfilter");
+        src_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("convert");
+        let enc = gst::ElementFactory::make("x264enc").build().expect("x264enc");
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property("key-int-max", 60u32);
+        enc.set_property("bitrate", 1500u32);
+        let pay = gst::ElementFactory::make("rtph264pay").build().expect("rtph264pay");
+        pay.set_property("pt", 96u32);
+        // The gate: flow into the tee does NOT start until this valve opens,
+        // which happens AFTER the record branch is attached (field order).
+        let gate = gst::ElementFactory::make("valve").build().expect("gate valve");
+        gate.set_property("drop", true);
+        let rtp_tee = gst::ElementFactory::make("tee").build().expect("rtp tee");
+        let sink = gst::ElementFactory::make("fakesink").build().expect("sink");
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+
+        for element in [
+            &src, &src_caps, &convert, &enc, &pay, &gate, &rtp_tee, &sink,
+        ] {
+            pipeline.add(element).expect("add element");
+        }
+        src.link(&src_caps).expect("link src");
+        src_caps.link(&convert).expect("link caps");
+        convert.link(&enc).expect("link enc");
+        enc.link(&pay).expect("link pay");
+        pay.link(&gate).expect("link gate");
+        gate.link(&rtp_tee).expect("link tee");
+        rtp_tee.link(&sink).expect("link sink");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(600));
+
+        // The tee is PLAYING but has ZERO flow (gate closed). Attach the
+        // record branch NOW — exactly the field: "tee embedded → branch
+        // attached → source linked".
+        let mut state = crate::gstreamer_pipeline::build_pass_through_record_branch(
+            &pipeline,
+            &rtp_tee,
+            "H264",
+            30,
+            Some(tx),
+        )
+        .expect("build pass-through branch");
+
+        // Count buffers that arrive at the branch's FIRST pad (valve sink) —
+        // this distinguishes "tee never pushes to the branch pad" from "the
+        // branch drops them internally".
+        let branch_pad_buffers = Arc::new(AtomicU64::new(0));
+        {
+            let counter = branch_pad_buffers.clone();
+            let pad = state.valve.static_pad("sink").expect("branch valve sink");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let live = Arc::new(AtomicU64::new(0));
+        {
+            let counter = live.clone();
+            let pad = sink.static_pad("sink").expect("live sink pad");
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gst::PadProbeReturn::Ok
+            });
+        }
+
+        // Sanity: no flow yet, so neither path has buffers.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "live path must be quiescent while the gate is closed"
+        );
+
+        // Start the flow (the field's source link).
+        gate.set_property("drop", false);
+        std::thread::sleep(Duration::from_millis(800));
+        let live_flowing = live.load(Ordering::SeqCst);
+        let branch_received = branch_pad_buffers.load(Ordering::SeqCst);
+        assert!(
+            live_flowing > 0,
+            "live RTP path must flow once the gate opens"
+        );
+        eprintln!(
+            "FIELD-ORDER after flow start: live={live_flowing} branch_pad_received={branch_received}"
+        );
+
+        let es_file = state.video_es_path.clone().expect("es path");
+        let size_before = std::fs::metadata(&es_file).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            size_before, 0,
+            "ES file must be empty while the branch valve is closed"
+        );
+
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(3_000));
+
+        let size_after = std::fs::metadata(&es_file).map(|m| m.len()).unwrap_or(0);
+        let branch_after_start = branch_pad_buffers.load(Ordering::SeqCst);
+        eprintln!(
+            "FIELD-ORDER after start(): es={size_before}->{size_after} branch_pad_received={branch_after_start} live={}",
+            live.load(Ordering::SeqCst)
+        );
+        assert!(
+            size_after > size_before,
+            "FIELD-ORDER BUG REPRODUCED: branch attached before flow writes no ES bytes after start() (valve sink saw {branch_after_start} buffers)"
+        );
+
+        state.stop(true).expect("finalize recording");
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks.push(
+                    BASE64_STANDARD
+                        .decode(&chunk_base64)
+                        .expect("valid base64 chunk"),
+                );
+            }
+        }
+        assert!(
+            !chunks.is_empty(),
+            "field-order pass-through finalize produced no chunk"
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// video AND an audio track. Exercises the audio PTS reconstruction
+    /// (1024 samples/frame at the caps rate) and the aacparse → qtmux path
+    /// that the video-only tests cannot reach.
+    #[test]
+    fn pass_through_recording_remuxes_game_audio_with_video() {
+        gst::init().expect("gstreamer init");
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipeline = gst::Pipeline::new();
+
+        // Live video: raw → H.264 → RTP → video tap tee → fakesink.
+        let vsrc = gst::ElementFactory::make("videotestsrc")
+            .build()
+            .expect("vsrc");
+        vsrc.set_property("is-live", false);
+        let v_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("v caps");
+        v_caps.set_property(
+            "caps",
+            "video/x-raw,format=(string)NV12,width=(int)640,height=(int)360,framerate=(fraction)30/1"
+                .parse::<gst::Caps>()
+                .expect("valid caps"),
+        );
+        let v_convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .expect("v convert");
+        let venc = gst::ElementFactory::make("x264enc").build().expect("x264enc");
+        venc.set_property_from_str("tune", "zerolatency");
+        venc.set_property("key-int-max", 30u32);
+        venc.set_property("bitrate", 1500u32);
+        let vpay = gst::ElementFactory::make("rtph264pay").build().expect("rtph264pay");
+        vpay.set_property("pt", 96u32);
+        let rtp_tee = gst::ElementFactory::make("tee").build().expect("video tee");
+        let vsink = gst::ElementFactory::make("fakesink").build().expect("v sink");
+        vsink.set_property("sync", false);
+        vsink.set_property("async", false);
+        for element in [
+            &vsrc, &v_caps, &v_convert, &venc, &vpay, &rtp_tee, &vsink,
+        ] {
+            pipeline.add(element).expect("add video chain");
+        }
+        vsrc.link(&v_caps).expect("link v");
+        v_caps.link(&v_convert).expect("link v");
+        v_convert.link(&venc).expect("link v");
+        venc.link(&vpay).expect("link v");
+        vpay.link(&rtp_tee).expect("link v");
+        rtp_tee.link(&vsink).expect("link v");
+
+        // Live audio: tone → Opus → RTP → audio tap tee → fakesink.
+        let asrc = gst::ElementFactory::make("audiotestsrc")
+            .build()
+            .expect("asrc");
+        // Unlimited (default -1): the tone must keep flowing for the whole
+        // recording, unlike the finite videotestsrc EOS behaviour.
+        let a_caps = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("a caps");
+        a_caps.set_property(
+            "caps",
+            "audio/x-raw,format=(string)S16LE,rate=(int)48000,channels=(int)2"
+                .parse::<gst::Caps>()
+                .expect("valid audio caps"),
+        );
+        let opusenc = gst::ElementFactory::make("opusenc").build().expect("opusenc");
+        let apay = gst::ElementFactory::make("rtpopuspay").build().expect("rtpopuspay");
+        apay.set_property("pt", 111u32);
+        let audio_tee = gst::ElementFactory::make("tee").build().expect("audio tee");
+        let asink = gst::ElementFactory::make("fakesink").build().expect("a sink");
+        asink.set_property("sync", false);
+        asink.set_property("async", false);
+        for element in [&asrc, &a_caps, &opusenc, &apay, &audio_tee, &asink] {
+            pipeline.add(element).expect("add audio chain");
+        }
+        asrc.link(&a_caps).expect("link a");
+        a_caps.link(&opusenc).expect("link a");
+        opusenc.link(&apay).expect("link a");
+        apay.link(&audio_tee).expect("link a");
+        audio_tee.link(&asink).expect("link a");
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let mut state = crate::gstreamer_pipeline::build_pass_through_record_branch(
+            &pipeline,
+            &rtp_tee,
+            "H264",
+            30,
+            Some(tx),
+        )
+        .expect("build pass-through branch");
+        // Transfer the pipeline-level audio tee into the state, exactly like
+        // `link_rtp_video_pad` does, then build the pass-through audio branch
+        // (aacparse → ADTS capsfilter → audio ES filesink).
+        state.audio_rtp_tee = Some(audio_tee.clone());
+        state
+            .build_audio_branch(&pipeline)
+            .expect("build pass-through audio branch");
+        assert!(
+            state.audio_aac_parse.is_some() && state.audio_adts_caps.is_some(),
+            "pass-through audio branch must include aacparse + ADTS capsfilter"
+        );
+        assert!(
+            state.audio_filesink.is_some() && state.audio_es_path.is_some(),
+            "pass-through audio branch must own an audio ES filesink + path"
+        );
+
+        // Let both live streams flow through the closed valves, then record.
+        std::thread::sleep(Duration::from_millis(500));
+        state.start().expect("start recording");
+        std::thread::sleep(Duration::from_millis(2_500));
+        state.stop(true).expect("finalize recording with audio");
+
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingChunk { chunk_base64 } = event {
+                chunks.push(
+                    BASE64_STANDARD
+                        .decode(&chunk_base64)
+                        .expect("valid base64 chunk"),
+                );
+            }
+        }
+        assert!(
+            !chunks.is_empty(),
+            "pass-through recording with audio produced no MP4 chunk"
+        );
+        let file = chunks.concat();
+        assert!(
+            file.len() >= 8 && &file[4..8] == b"ftyp",
+            "pass-through file must be an MP4 (size+ftyp)"
+        );
+        // The faststart moov carries one sample entry per track: avc1 for the
+        // H264 video and mp4a for the AAC audio. Their presence proves BOTH
+        // ES files were remuxed offline (not just video).
+        let has_video = file.windows(4).any(|window| window == b"avc1");
+        let has_audio = file.windows(4).any(|window| window == b"mp4a");
+        assert!(
+            has_video && has_audio,
+            "pass-through file must contain BOTH a video (avc1) and an audio (mp4a) track; video={has_video} audio={has_audio} ({} bytes)",
+            file.len()
+        );
+        assert!(
+            file.windows(4).any(|window| window == b"mdat"),
+            "pass-through file must contain an mdat box"
+        );
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
     /// Field reproduction of the record-start transport kill, in the new
     /// transcode topology. Production records by OPENING a valve-gated
     /// TRANSCODE branch tapped off the decoded-video tap tee (video + game
@@ -6371,7 +7379,7 @@ mod tests {
         // sink carries the chunk probe that returns DROP (which prevents any
         // later probe on that pad from running), so a counter there would
         // always read 0 even when qtmux produces output.
-        let mux_out = add_counter(&state.muxer, "src");
+        let mux_out = add_counter(state.muxer.as_ref().expect("muxer"), "src");
 
         // Let the tee stream into the closed valve for a while, like the
         // field (branch idle from session start until record is pressed).

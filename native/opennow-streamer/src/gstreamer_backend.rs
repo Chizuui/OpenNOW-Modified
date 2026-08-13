@@ -1235,7 +1235,9 @@ mod tests {
             .any(|spec| spec.role == RtpVideoChainRole::ReceiveCapsFilter));
 
         let av1 = rtp_video_chain_definition("AV1", RtpVideoApi::D3D11).expect("AV1 D3D11 chain");
-        assert_eq!(av1[0].factory, "rtpav1depay");
+        // The stock rtpav1depay produced zero frames on some GFN AV1 streams;
+        // AV1 chains now use the custom lenient gfnav1depay.
+        assert_eq!(av1[0].factory, "gfnav1depay");
         assert_eq!(av1[3].factory, "d3d11av1dec");
         assert_eq!(av1[4].factory, "d3d11download");
         assert_eq!(av1[5].factory, "videoconvert");

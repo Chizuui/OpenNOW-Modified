@@ -16,9 +16,10 @@ use crate::gstreamer_input::{
 use crate::gstreamer_ice::{log_remote_ice_candidate, wire_ice_observability};
 use crate::gstreamer_liveness::{
     install_present_limiter, pad_has_media_sticky_events, read_queue_level,
-    sink_rendered_frame_count, watch_audio_activity, watch_first_sink_buffer, watch_rtcp_send_stats,
-    watch_rtp_video_bitrate, watch_video_caps_transitions, watch_video_decoded_rate,
-    watch_video_sink_caps_transitions, watch_video_sink_rate, VideoLivenessMonitor,
+    sink_rendered_frame_count, watch_audio_activity, watch_depay_output, watch_first_sink_buffer,
+    watch_rtcp_send_stats, watch_rtp_payload_dump, watch_rtp_video_bitrate,
+    watch_video_caps_transitions, watch_video_decoded_rate, watch_video_sink_caps_transitions,
+    watch_video_sink_rate, VideoLivenessMonitor,
 };
 #[cfg(target_os = "windows")]
 use crate::gstreamer_platform::arm_internal_child_input;
@@ -45,7 +46,7 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -114,6 +115,14 @@ const RECORD_BITRATE_DEFAULT_KBPS: u32 = 8_000;
 /// How long to wait after the muxer-direct EOS failsafe before giving up on
 /// finalizing the recording.
 const RECORDING_FAILSAFE_TIMEOUT_MS: u64 = 2_000;
+/// How long the OFFLINE pass-through remux (temp ES files → limited H.264
+/// MP4 via decode + range conversion + re-encode, in a throwaway pipeline)
+/// may run before giving up. The Electron `stop-recording` request and the
+/// `recording-finished` wait must budget for it (they were raised to 60 s in
+/// step with this). A short clip remuxes in a few seconds; a long one (tens
+/// of seconds at 1080p60) can take 15-40 s through the software x264
+/// fallback on a weak CPU, so 45 s leaves headroom for the drain + EOS waits.
+const RECORDING_REMUX_TIMEOUT_MS: u64 = 45_000;
 /// How long `start()` waits (after the sticky-event replay) for the rebuilt
 /// branch queue(s) to show the mandatory sticky CAPS event before opening the
 /// capture valve. On a rebuild the fresh branch is hot-plugged into a PLAYING
@@ -595,6 +604,36 @@ impl GstreamerVideoTap {
     }
 }
 
+/// How the native recording branch stores the video.
+///
+/// `PassThrough` (the default) taps the RAW RTP stream at the source tee
+/// (before decode) and remuxes the received bitstream straight into the MP4
+/// (depay → parse → qtmux). Zero decode, zero re-encode, zero GPU/CPU — a
+/// recording costs nothing to the live stream, exactly like the official
+/// GeForce Now client ("just write what we receive to disk"). The file is
+/// H265/H264/AV1 (whatever the server sent) at the exact received quality.
+///
+/// `Transcode` taps the DECODED video (post-decode tee), converts to 8-bit
+/// 4:2:0 and re-encodes with H.264 (d3d12h264enc GPU encoder by default).
+/// Universal H.264 output, but the encode competes with the decoder for the
+/// same GPU — on single-iGPU laptops this shows up as decode-time spikes and
+/// stream stutter while recording (the field report). Set
+/// OPENNOW_RECORDING_MODE=transcode to opt back in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingMode {
+    PassThrough,
+    Transcode,
+}
+
+impl RecordingMode {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("OPENNOW_RECORDING_MODE").as_deref() {
+            Ok("transcode") => RecordingMode::Transcode,
+            _ => RecordingMode::PassThrough,
+        }
+    }
+}
+
 /// Native recording branch — TRANSCODE to H.264. The branch taps the DECODED
 /// video right before the sink (the permanent video tap tee in the live
 /// chain, the same tee screenshots use), converts it to 8-bit 4:2:0,
@@ -635,6 +674,102 @@ impl GstreamerVideoTap {
 /// the swallow queue tail with DROP probes is the same hot-plug-safe shape
 /// as the old remux branch). The encoder runs only while the valve is open,
 /// so recording costs no CPU when idle.
+///
+/// PASS-THROUGH branch flow diagnostics: zero-cost buffer counters at every
+/// hop of the live recording branch, so a field session where the video ES
+/// stays 0 bytes while the live stream renders (2026-08-12T22:58 log) can be
+/// pinned to the exact element that stops flowing — tee→valve (valve_in),
+/// valve→queue (queue_in), queue→depay (depay_in), depay→parse (parse_in),
+/// parse→filesink (file_in). The counters are read and logged as one line by
+/// `log()`, called on every start()/stop() and on the branch's first buffer.
+#[derive(Debug, Clone)]
+pub(crate) struct PassThroughFlowDiag {
+    pub(crate) label: String,
+    pub(crate) valve_in: Arc<AtomicU64>,
+    pub(crate) queue_in: Arc<AtomicU64>,
+    pub(crate) depay_in: Arc<AtomicU64>,
+    pub(crate) parse_in: Arc<AtomicU64>,
+    /// Buffers pushed out of the parser's SRC pad (valid AUs after the
+    /// parser's garbage rejection). Comparing parse_in vs parse_out tells a
+    /// field wedge apart: parse_in > parse_out means the depayloader emitted
+    /// garbage AUs (incomplete FU reassembly from packet jitter) that the
+    /// parser dropped; parse_out > file_in would mean the ES capsfilter or
+    /// filesink stalled.
+    pub(crate) parse_out: Arc<AtomicU64>,
+    pub(crate) file_in: Arc<AtomicU64>,
+    /// First CAPS event seen at the parse sink pad (what the depayloader
+    /// negotiated), captured once for diagnostics.
+    pub(crate) parse_first_caps: Arc<Mutex<Option<String>>>,
+    /// pt / ssrc / marker / len of the first few RTP buffers at the branch
+    /// valve sink pad (detects non-video traffic like FlexFEC on the shared
+    /// RTP tap tee).
+    pub(crate) valve_first_rtp: Arc<Mutex<Vec<String>>>,
+    /// The negotiated video RTP payload type, learned from the first CAPS
+    /// event at the valve sink pad. Used to drop non-video RTP packets
+    /// (FlexFEC pt 98 / RTX / audio) that ride the SAME WebRTC session as
+    /// the video but are NOT part of the H26x/AV1 bitstream — the decode
+    /// chain is shielded from them by rtpbin's per-ssrc session split, but
+    /// the raw pass-through tap is not, and a stray FEC packet fed to
+    /// rtph265depay produces garbage that h265parse then discards (the
+    /// 0-byte video ES field wedge).
+    pub(crate) video_pt: Arc<AtomicU32>,
+    /// How many RTP packets were dropped by the video_pt filter (non-video
+    /// traffic that reached the shared tee), for diagnostics.
+    pub(crate) dropped_non_video: Arc<AtomicU64>,
+    pub(crate) event_sender: Option<Sender<Event>>,
+}
+
+impl PassThroughFlowDiag {
+    pub(crate) fn new(label: String, event_sender: Option<Sender<Event>>) -> Self {
+        Self {
+            label,
+            valve_in: Arc::new(AtomicU64::new(0)),
+            queue_in: Arc::new(AtomicU64::new(0)),
+            depay_in: Arc::new(AtomicU64::new(0)),
+            parse_in: Arc::new(AtomicU64::new(0)),
+            parse_out: Arc::new(AtomicU64::new(0)),
+            file_in: Arc::new(AtomicU64::new(0)),
+            parse_first_caps: Arc::new(Mutex::new(None)),
+            valve_first_rtp: Arc::new(Mutex::new(Vec::new())),
+            video_pt: Arc::new(AtomicU32::new(0)),
+            dropped_non_video: Arc::new(AtomicU64::new(0)),
+            event_sender,
+        }
+    }
+
+    pub(crate) fn log(&self, tag: &str) {
+        let caps = self
+            .parse_first_caps
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "none".to_owned());
+        let first_rtp = self
+            .valve_first_rtp
+            .lock()
+            .ok()
+            .map(|slot| slot.join(" "))
+            .unwrap_or_default();
+        let video_pt = self.video_pt.load(Ordering::Relaxed);
+        let dropped = self.dropped_non_video.load(Ordering::Relaxed);
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "[RecBranchFlow:{tag}] {} valve_in={} queue_in={} depay_in={} parse_in={} parse_out={} file_in={} video_pt={video_pt} dropped_non_video={dropped} parse_caps={} first_rtp=[{first_rtp}]",
+                self.label,
+                self.valve_in.load(Ordering::Relaxed),
+                self.queue_in.load(Ordering::Relaxed),
+                self.depay_in.load(Ordering::Relaxed),
+                self.parse_in.load(Ordering::Relaxed),
+                self.parse_out.load(Ordering::Relaxed),
+                self.file_in.load(Ordering::Relaxed),
+                caps,
+            ),
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GstreamerRecordingState {
     /// Video branch valve, FIRST element after the video tap tee. Closed
@@ -650,6 +785,11 @@ pub(crate) struct GstreamerRecordingState {
     pub(crate) encoder: gst::Element,
     /// Factory name of `encoder`, for logs and tests.
     pub(crate) encoder_factory: String,
+    /// Recording encoder bitrate (kbps) for the OFFLINE pass-through remux
+    /// re-encode. Copied from the render state at stop time (the session's
+    /// negotiated "max bitrate"); defaults to RECORD_BITRATE_DEFAULT_KBPS
+    /// for test callers that build a branch without a session.
+    pub(crate) record_bitrate_kbps: Arc<AtomicU32>,
     /// Converts the encoder's byte-stream H.264 into avcC for qtmux. After a
     /// finalized recording (EOS) it stays EOS'd and would silently swallow
     /// the next recording's buffers, so the whole branch is torn down and
@@ -686,19 +826,66 @@ pub(crate) struct GstreamerRecordingState {
     /// zero-copy is active). Rebuilt fresh with the branch between
     /// recordings.
     pub(crate) video_download: Option<gst::Element>,
-    /// The qtmux element (standard seekable MP4, faststart). After a
-    /// finalized recording it is spent (moov already emitted / EOS seen), so
-    /// the whole branch is rebuilt fresh between recordings.
-    pub(crate) muxer: gst::Element,
-    /// Swallow queue at the muxer output. The chunk + EOS probes live on its
-    /// sink pad and return DROP, so the muxer's push always returns FLOW_OK
-    /// and its src task keeps running. Deliberately NO sink in the branch: a
-    /// sink that cannot preroll while the valve is closed would complete its
-    /// deferred async transition later and re-preroll the whole pipeline
-    /// (non-sinks transition synchronously, so the branch is hot-plug-safe).
-    pub(crate) swallow: gst::Element,
+    /// The qtmux element (standard seekable MP4, faststart). TRANSCODE mode
+    /// only — pass-through muxes OFFLINE at stop in a throwaway pipeline (the
+    /// live-path muxer was the wedge: both the video and audio branches froze
+    /// at the muxer input mid-recording while the live stream stayed healthy).
+    /// After a finalized recording it is spent (moov already emitted / EOS
+    /// seen), so the whole branch is rebuilt fresh between recordings.
+    pub(crate) muxer: Option<gst::Element>,
+    /// Swallow queue at the muxer output. TRANSCODE mode only. The chunk +
+    /// EOS probes live on its sink pad and return DROP, so the muxer's push
+    /// always returns FLOW_OK and its src task keeps running. Deliberately
+    /// NO sink in the branch: a sink that cannot preroll while the valve is
+    /// closed would complete its deferred async transition later and
+    /// re-preroll the whole pipeline (non-sinks transition synchronously, so
+    /// the branch is hot-plug-safe).
+    pub(crate) swallow: Option<gst::Element>,
+    /// PASS-THROUGH mode: the temp elementary-stream file the video branch
+    /// (depay → parse → filesink) writes into while recording. Remuxed
+    /// offline to MP4 at stop, then deleted. None for transcode mode.
+    pub(crate) video_es_path: Option<std::path::PathBuf>,
+    /// PASS-THROUGH mode: the temp AAC elementary-stream file (game audio,
+    /// avenc_aac output) remuxed offline into the MP4 at stop.
+    pub(crate) audio_es_path: Option<std::path::PathBuf>,
+    /// PASS-THROUGH mode: capsfilter between the parser and the video ES
+    /// filesink. Forces the self-identifying byte-stream (H264/H265) or
+    /// OBU-stream (AV1) format — the parsers' DEFAULT output against an
+    /// unconstrained filesink is length-prefixed avcC, which the OFFLINE
+    /// remux parser cannot auto-detect from a bare file ("No caps set").
+    pub(crate) es_caps: Option<gst::Element>,
+    /// PASS-THROUGH mode: the filesink writing `video_es_path`.
+    pub(crate) video_filesink: Option<gst::Element>,
+    /// PASS-THROUGH mode: the filesink writing `audio_es_path`.
+    pub(crate) audio_filesink: Option<gst::Element>,
+    /// PASS-THROUGH mode: set by an EOS probe on the video filesink sink pad
+    /// — once true, the ES file is closed and safe to remux offline.
+    filesink_eos: Arc<AtomicBool>,
+    /// PASS-THROUGH mode: EOS seen at the audio filesink.
+    audio_filesink_eos: Arc<AtomicBool>,
     eos_seen: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    /// Recording mode this branch was built for. `PassThrough` taps the raw
+    /// RTP stream (zero cost); `Transcode` re-encodes decoded frames. The
+    /// rebuild path re-builds the SAME mode so the next recording matches.
+    pub(crate) mode: RecordingMode,
+    /// Codec of the video bitstream for `PassThrough` branches ("H265",
+    /// "H264", "AV1") — picks the depayloader/parser. For `Transcode` the
+    /// output codec is always "H264".
+    pub(crate) codec: String,
+    /// Pass-through mode: the negotiated stream frame rate. The OFFLINE remux
+    /// uses it to reconstruct the PTS/DTS that raw ES files cannot carry
+    /// (timestamps do not survive file I/O — qtmux rejects buffers with no
+    /// PTS). GFN's low-latency encoders emit no B-frames (has_b_frames=0 on
+    /// every real H264 AND H265 recording), so decode order == presentation
+    /// order and a monotonic PTS ladder at `fps` is exact. Transcode mode
+    /// never uses it (0).
+    pub(crate) fps: u32,
+    /// Pass-through IDR gate: while false, buffers are dropped until the
+    /// first sync (IDR) access unit arrives, so the remuxed file never starts
+    /// mid-GOP with orphan P-frames (the old remux glitch). `start()` resets
+    /// it to false so every recording starts at a fresh IDR.
+    pub(crate) idr_gate: Arc<AtomicBool>,
     /// RTP-level tap tee on the game-audio stream (between the webrtcbin
     /// audio src pad and the decode chain). Created when the audio RTP pad
     /// arrives in `wire_incoming_media_sink`; the audio transcode branch
@@ -728,6 +915,13 @@ pub(crate) struct GstreamerRecordingState {
     audio_opusdec: Option<gst::Element>,
     audio_audioconvert: Option<gst::Element>,
     audio_aac_encoder: Option<gst::Element>,
+    /// PASS-THROUGH mode: aacparse + ADTS capsfilter between the AAC encoder
+    /// and the audio ES filesink. The encoders (avenc_aac/voaacenc) emit raw
+    /// AAC frames with no sync word; aacparse re-frames them into ADTS so the
+    /// OFFLINE remux (`filesrc → aacparse`) can frame the file without
+    /// external caps.
+    pub(crate) audio_aac_parse: Option<gst::Element>,
+    pub(crate) audio_adts_caps: Option<gst::Element>,
     /// The video tap tee (post-decode, before the sink) that feeds this
     /// recording branch. Keeping the tee (which is NOT torn down) lets
     /// start() replay its retained sticky stream events
@@ -743,6 +937,11 @@ pub(crate) struct GstreamerRecordingState {
     /// second file without a fresh moov (unplayable), and in-place resets of
     /// the queue/encoder/muxer are unreliable in this GStreamer build.
     spent: Arc<AtomicBool>,
+    /// PASS-THROUGH mode only: hop-by-hop buffer counters + first-caps for
+    /// field flow diagnostics (see `PassThroughFlowDiag`). Logged on
+    /// start/stop/first-buffer so a 0-byte ES file can be pinned to the hop
+    /// that stopped flowing.
+    pub(crate) pass_flow_diag: Option<PassThroughFlowDiag>,
     event_sender: Option<Sender<Event>>,
 }
 
@@ -793,7 +992,7 @@ impl GstreamerRecordingState {
         // the audio queue is already leaky (drops oldest when full), so the
         // chain cannot stall the tap tee.
 
-        let elements = [
+        let mut elements: Vec<gst::Element> = vec![
             valve.clone(),
             capsfilter.clone(),
             queue.clone(),
@@ -802,6 +1001,58 @@ impl GstreamerRecordingState {
             audioconvert.clone(),
             aac_encoder.clone(),
         ];
+        // PASS-THROUGH mode: the audio branch ends at its own filesink
+        // writing the AAC elementary stream into a temp file (remuxed
+        // OFFLINE at stop, exactly like the video ES — no live muxer, so the
+        // branch cannot wedge). The raw AAC encoder frames are re-framed into
+        // self-describing ADTS (aacparse + adts capsfilter) so the offline
+        // remux's aacparse can consume the file with no external caps.
+        if self.mode == RecordingMode::PassThrough {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let audio_es_path = std::env::temp_dir().join(format!(
+                "opennow-rec-{}-{stamp}.aac.es",
+                std::process::id()
+            ));
+            let audio_filesink = make_element("filesink")?;
+            audio_filesink.set_property(
+                "location",
+                audio_es_path
+                    .to_str()
+                    .ok_or_else(|| "Pass-through audio ES path is not valid UTF-8.".to_owned())?,
+            );
+            audio_filesink.set_property("sync", false);
+            audio_filesink.set_property("async", false);
+            let audio_aac_parse = make_element("aacparse")?;
+            let adts_caps = make_element("capsfilter")?;
+            adts_caps.set_property(
+                "caps",
+                "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"
+                    .parse::<gst::Caps>()
+                    .map_err(|error| format!("Invalid pass-through ADTS caps: {error}"))?,
+            );
+            let eos_flag = self.audio_filesink_eos.clone();
+            let audio_sink_pad = audio_filesink
+                .static_pad("sink")
+                .ok_or_else(|| "Pass-through audio filesink has no sink pad.".to_owned())?;
+            audio_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                if let Some(event) = info.event() {
+                    if event.type_() == gst::EventType::Eos {
+                        eos_flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+            elements.push(audio_aac_parse.clone());
+            elements.push(adts_caps.clone());
+            elements.push(audio_filesink.clone());
+            self.audio_es_path = Some(audio_es_path);
+            self.audio_filesink = Some(audio_filesink);
+            self.audio_aac_parse = Some(audio_aac_parse);
+            self.audio_adts_caps = Some(adts_caps);
+        }
         for element in &elements {
             pipeline.add(element).map_err(|error| {
                 format!("Failed to add recording audio branch element: {error}")
@@ -812,23 +1063,28 @@ impl GstreamerRecordingState {
                 .link(&pair[1])
                 .map_err(|error| format!("Failed to link recording audio branch: {error:?}"))?;
         }
-        // Link the AAC encoder into the EXISTING qtmux (already PLAYING).
-        // qtmux names its sink-pad templates by media type (video_%u,
-        // audio_%u) — request the audio one for this stream. qtmux negotiates
-        // the pad on the first caps; this is a plain pad link, no state
-        // change.
-        let aac_src = aac_encoder
-            .static_pad("src")
-            .ok_or_else(|| "Recording audio encoder has no src pad.".to_owned())?;
-        let muxer_sink = self
-            .muxer
-            .request_pad_simple("audio_%u")
-            .ok_or_else(|| "Recording muxer refused an audio sink pad.".to_owned())?;
-        if let Err(error) = aac_src.link(&muxer_sink) {
-            let _ = self.muxer.release_request_pad(&muxer_sink);
-            return Err(format!(
-                "Failed to link recording audio branch into muxer: {error:?}"
-            ));
+        // TRANSCODE mode only: link the AAC encoder into the EXISTING qtmux
+        // (already PLAYING). qtmux names its sink-pad templates by media type
+        // (video_%u, audio_%u) — request the audio one for this stream.
+        // qtmux negotiates the pad on the first caps; this is a plain pad
+        // link, no state change.
+        if self.mode == RecordingMode::Transcode {
+            let muxer = self
+                .muxer
+                .clone()
+                .ok_or_else(|| "Recording muxer is missing for the transcode audio branch.".to_owned())?;
+            let aac_src = aac_encoder
+                .static_pad("src")
+                .ok_or_else(|| "Recording audio encoder has no src pad.".to_owned())?;
+            let muxer_sink = muxer
+                .request_pad_simple("audio_%u")
+                .ok_or_else(|| "Recording muxer refused an audio sink pad.".to_owned())?;
+            if let Err(error) = aac_src.link(&muxer_sink) {
+                let _ = muxer.release_request_pad(&muxer_sink);
+                return Err(format!(
+                    "Failed to link recording audio branch into muxer: {error:?}"
+                ));
+            }
         }
         // Sync BEFORE linking the branch into the audio tap tee (the tee is
         // already PLAYING). Non-sinks: synchronous, re-preroll-free.
@@ -865,11 +1121,18 @@ impl GstreamerRecordingState {
         self.audio_audioconvert = Some(audioconvert.clone());
         self.audio_aac_encoder = Some(aac_encoder.clone());
         self.audio_branch_built.store(true, Ordering::SeqCst);
-        send_log(
-            &self.event_sender,
-            "info",
-            format!("Attached native game-audio transcode branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → qtmux; never touches the audio playback chain)."),
-        );
+        match self.mode {
+            RecordingMode::Transcode => send_log(
+                &self.event_sender,
+                "info",
+                format!("Attached native game-audio transcode branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → qtmux; never touches the audio playback chain)."),
+            ),
+            RecordingMode::PassThrough => send_log(
+                &self.event_sender,
+                "info",
+                format!("Attached native game-audio PASS-THROUGH branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → filesink AAC ES; remuxed offline at stop — never touches the audio playback chain)."),
+            ),
+        }
         Ok(())
     }
 
@@ -949,37 +1212,100 @@ impl GstreamerRecordingState {
         // stream-start in the replay order, so its presence proves the whole
         // sequence landed. Bounded — a genuinely broken branch degrades to a
         // warning, never a hang.
-        self.gate_branch_ready(&self.queue, "video");
-        if let Some(audio_queue) = &self.audio_queue {
-            self.gate_branch_ready(audio_queue, "audio");
+        let video_ready = self.gate_branch_ready(&self.queue, "video");
+        let audio_ready = self
+            .audio_queue
+            .as_ref()
+            .map(|audio_queue| self.gate_branch_ready(audio_queue, "audio"))
+            .unwrap_or(true);
+        if !(video_ready && audio_ready) {
+            // Fail-safe: NEVER open a valve into a queue that lacks the full
+            // stream-start/caps/segment sequence. The closed valve forwards
+            // sticky events only, so a missing segment means the replayed one
+            // never landed — opening now would push the first live buffer into
+            // the queue with `Got data flow before segment`, GStreamer returns
+            // FLOW_ERROR, and the whole RTP flow stalls through the shared
+            // tap tee (the field wedge: 2 s of video in a 24 s recording).
+            // Failing the record start keeps the live stream untouched.
+            self.active.store(false, Ordering::SeqCst);
+            return Err(
+                "Recording start aborted: the recording branch did not receive the mandatory \
+                 stream-start/caps/segment sequence in time; the live stream was left untouched."
+                    .to_owned(),
+            );
+        }
+        match self.mode {
+            RecordingMode::PassThrough => {
+                // Re-arm the IDR gate so THIS recording starts at a fresh
+                // keyframe (the probe drops mid-GOP frames until the first
+                // sync access unit, so the file never opens with orphan
+                // P-frames).
+                self.idr_gate.store(true, Ordering::SeqCst);
+                // Ask the server for an IDR right now (via the signaling/data
+                // channel — NEVER an in-pipeline GstForceKeyUnit, which kills
+                // the UDP receiver; see the NOTE above). The IDR lands a
+                // frame later and the gate opens on it: clean file start.
+                if let Some(sender) = &self.event_sender {
+                    let _ = sender.send(Event::VideoKeyframeRequest(
+                        crate::protocol::VideoKeyframeRequest {
+                            reason: "record-start".to_owned(),
+                            attempt: 0,
+                        },
+                    ));
+                }
+            }
+            RecordingMode::Transcode => {}
         }
         self.valve.set_property("drop", false);
         if let Some(audio_valve) = &self.audio_valve {
             audio_valve.set_property("drop", false);
         }
+        if let Some(diag) = &self.pass_flow_diag {
+            diag.log("start");
+        }
         let with_audio = self.audio_branch_built.load(Ordering::SeqCst);
-        send_log(
-            &self.event_sender,
-            "info",
-            if with_audio {
-                "Native recording started (video + game audio transcoded to a universal H.264/AAC MP4)."
-                    .to_owned()
-            } else {
-                "Native recording started (video transcoded to a universal H.264 MP4).".to_owned()
-            },
-        );
+        let started_log = match self.mode {
+            RecordingMode::PassThrough => {
+                let codec = &self.codec;
+                if with_audio {
+                    format!(
+                        "Native recording started (video + game audio remuxed from the received {codec} bitstream; zero re-encode — no GPU/CPU cost to the live stream)."
+                    )
+                } else {
+                    format!(
+                        "Native recording started (video remuxed from the received {codec} bitstream; zero re-encode — no GPU/CPU cost to the live stream)."
+                    )
+                }
+            }
+            RecordingMode::Transcode => {
+                if with_audio {
+                    "Native recording started (video + game audio transcoded to a universal H.264/AAC MP4)."
+                        .to_owned()
+                } else {
+                    "Native recording started (video transcoded to a universal H.264 MP4).".to_owned()
+                }
+            }
+        };
+        send_log(&self.event_sender, "info", started_log);
         Ok(())
     }
 
-    /// Bounded wait for one recording branch queue to show the replayed
-    /// STREAM_START + CAPS before its valve opens. Polls the queue SINK pad's
-    /// sticky-event list every 5 ms up to `RECORDING_STICKY_VERIFY_TIMEOUT_MS`;
-    /// if the sequence still has not landed the valve opens anyway with a
-    /// warning (a genuinely broken branch must degrade, never hang). `what`
-    /// names the branch in the warning ("video"/"audio").
-    fn gate_branch_ready(&self, queue: &gst::Element, what: &str) {
+    /// Bounded wait for one recording branch queue to show the FULL replayed
+    /// media sequence STREAM_START + CAPS + SEGMENT before its valve opens.
+    /// Polls the queue SINK pad's sticky-event list every 5 ms up to
+    /// `RECORDING_STICKY_VERIFY_TIMEOUT_MS`. Returns true when the sequence
+    /// landed. A timed-out gate returns false and the caller MUST NOT open the
+    /// valve: a closed recording valve only forwards sticky events
+    /// (stream-start/caps) — the SEGMENT never reaches the queue from the live
+    /// stream, so the replay is its only source, and opening into a queue with
+    /// no segment makes the first live buffer hit `Got data flow before
+    /// segment` → FLOW_ERROR → the whole RTP flow stalls through the shared
+    /// tap tee (the pass-through wedge: 2 s of video in a 24 s recording while
+    /// audio kept flowing). Failing the record start is strictly safer than
+    /// stalling the game stream. `what` names the branch ("video"/"audio").
+    fn gate_branch_ready(&self, queue: &gst::Element, what: &str) -> bool {
         let Some(queue_sink) = queue.static_pad("sink") else {
-            return;
+            return false;
         };
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(RECORDING_STICKY_VERIFY_TIMEOUT_MS);
@@ -991,11 +1317,15 @@ impl GstreamerRecordingState {
                 &self.event_sender,
                 "warn",
                 format!(
-                    "Recording {what} branch queue did not show the replayed STREAM_START/CAPS \
-                     within the sticky-verify window; opening the valve anyway (a wedge here \
-                     shows as `Got data flow before stream-start` on the rebuilt {what} queue)."
+                    "Recording {what} branch queue did not show the replayed \
+                     STREAM_START/CAPS/SEGMENT within the sticky-verify window; aborting \
+                     record start (opening the valve here would stall the stream with \
+                     `Got data flow before segment`)."
                 ),
             );
+            false
+        } else {
+            true
         }
     }
 
@@ -1044,41 +1374,233 @@ impl GstreamerRecordingState {
 
     pub(crate) fn stop(&self, finalize: bool) -> Result<(), String> {
         // Stop new data entering the branches first; data already inside
-        // (queue → depayloader → parse → muxer) keeps flowing.
+        // (queue → depayloader → parse → …) keeps flowing.
         self.valve.set_property("drop", true);
         if let Some(audio_valve) = &self.audio_valve {
             audio_valve.set_property("drop", true);
         }
         if !finalize {
             self.active.store(false, Ordering::SeqCst);
-            send_log(
-                &self.event_sender,
-                "info",
-                "Native recording aborted; capture valves closed (branch kept for the next recording)."
-                    .to_owned(),
-            );
+            if self.mode == RecordingMode::PassThrough {
+                // A pass-through filesink stays OPEN after an abort and would
+                // APPEND to the same ES file on a later start(), so flush +
+                // close it now with EOS and mark the branch spent — the next
+                // recording rebuilds it fresh with a new temp file.
+                self.close_es_files();
+                self.spent.store(true, Ordering::SeqCst);
+                send_log(
+                    &self.event_sender,
+                    "info",
+                    "Native recording aborted; capture valves closed (pass-through ES files flushed; branch rebuilt fresh for the next recording)."
+                        .to_owned(),
+                );
+            } else {
+                send_log(
+                    &self.event_sender,
+                    "info",
+                    "Native recording aborted; capture valves closed (branch kept for the next recording)."
+                        .to_owned(),
+                );
+            }
             return Ok(());
         }
 
         // IMPORTANT: the valves are closed (drop=true) BEFORE this point, and
         // in the bundled GStreamer the valve drops EOS events while closed —
-        // sending EOS into a valve's sink pad never reaches the muxer, AND as
-        // an upstream event it also propagates back through the shared RTP tap
-        // tee into the live decode chain. Enter EOS BELOW each valve instead
-        // (the next element's sink pad): data already buffered in the queue
-        // drains first, then EOS, so qtmux finalizes normally and the live
-        // path is untouched.
+        // sending EOS into a valve's sink pad never reaches the muxer /
+        // filesink, AND as an upstream event it also propagates back through
+        // the shared RTP tap tee into the live decode chain. Enter EOS BELOW
+        // each valve instead (the next element's sink pad): data already
+        // buffered in the queue drains first, then EOS, so the tail finalizes
+        // normally and the live path is untouched.
         let drain_ms = std::time::Instant::now();
         // Video branch: the valve sits at the tap (before the queue), so the
         // queue must drain before EOS — an EOS that overtakes a full queue can
-        // be dropped inside the muxer (buffers-after-EOS). Drain then inject
-        // EOS below the valve, exactly like the audio branch.
+        // be dropped inside the muxer/filesink (buffers-after-EOS). Drain then
+        // inject EOS below the valve, exactly like the audio branch.
         self.drain_and_eos(&self.valve, &self.queue)?;
         if let (Some(audio_valve), Some(audio_queue)) = (&self.audio_valve, &self.audio_queue) {
             self.drain_and_eos(audio_valve, audio_queue)?;
         }
         let drain_ms = drain_ms.elapsed().as_millis();
 
+        match self.mode {
+            RecordingMode::PassThrough => self.stop_pass_through(drain_ms),
+            RecordingMode::Transcode => self.stop_transcode(drain_ms),
+        }
+    }
+
+    /// PASS-THROUGH finalize: wait for EOS to reach both ES filesinks (the
+    /// temp files are fully flushed/closed only then), remux them into a
+    /// standard seekable MP4 OFFLINE in a throwaway pipeline — the live
+    /// pipeline contains NO muxer for pass-through recordings, so a muxer
+    /// stall can never freeze the recording branch (the field wedge: both
+    /// branches froze at the live qtmux input ~16 s in while the stream
+    /// stayed healthy) — and hand the finished MP4 to Electron as a single
+    /// `recording-chunk` (the same handoff as the transcode branch's
+    /// faststart single chunk). Then the temp files are deleted and the
+    /// branch is marked spent for a fresh rebuild.
+    fn stop_pass_through(&self, drain_ms: u128) -> Result<(), String> {
+        let has_audio = self.audio_branch_built.load(Ordering::SeqCst);
+        let video_es = self.video_es_path.clone();
+        let audio_es = if has_audio {
+            self.audio_es_path.clone()
+        } else {
+            None
+        };
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(RECORDING_FINALIZE_TIMEOUT_MS);
+        while !self.filesink_eos.load(Ordering::SeqCst)
+            && (!has_audio || !self.audio_filesink_eos.load(Ordering::SeqCst))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !(self.filesink_eos.load(Ordering::SeqCst)
+            && (!has_audio || self.audio_filesink_eos.load(Ordering::SeqCst)))
+        {
+            // The first EOS may have been lost racing the last in-flight
+            // data; a second EOS after the drain is harmless and often
+            // completes the flush. If the flag still never lands, the ES file
+            // is merely truncated at the tail — the offline remux still
+            // produces a playable file from what was written.
+            for valve in [Some(&self.valve), self.audio_valve.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(src_pad) = valve.static_pad("src") {
+                    if let Some(below) = src_pad.peer() {
+                        let _ = below.send_event(gst::event::Eos::new());
+                    }
+                }
+            }
+            let retry_deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(1_000);
+            while !(self.filesink_eos.load(Ordering::SeqCst)
+                && (!has_audio || self.audio_filesink_eos.load(Ordering::SeqCst)))
+                && std::time::Instant::now() < retry_deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if let Some(diag) = &self.pass_flow_diag {
+            diag.log("stop");
+        }
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Native recording stop: ES files EOS seen (video={}, audio={}; queue drained in {drain_ms} ms); remuxing the MP4 offline.",
+                self.filesink_eos.load(Ordering::SeqCst),
+                self.audio_filesink_eos.load(Ordering::SeqCst),
+            ),
+        );
+
+        // Close the ES files NOW: EOS alone does not close the fd until a
+        // state change (an open handle makes remove_file fail silently on
+        // Windows — the field left temp ES files behind). The valves are
+        // closed and EOS'd, so no data can reach the sinks anymore.
+        if let Some(filesink) = &self.video_filesink {
+            let _ = filesink.set_state(gst::State::Null);
+        }
+        if let Some(filesink) = &self.audio_filesink {
+            let _ = filesink.set_state(gst::State::Null);
+        }
+
+        let remux_out = std::env::temp_dir().join(format!(
+            "opennow-rec-{}-{}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+        ));
+        // The remux can fail (e.g. a 0-byte ES file: the video branch never
+        // received data — the exact field 22:58 bug). Whatever the cause, the
+        // recording is OVER: reset `active` so the next start_recording is a
+        // real start (not a silent no-op that leaves the valves closed — the
+        // field's zombie second recording), and mark the branch spent so the
+        // next recording rebuilds fresh with new temp files.
+        let remux_result = remux_pass_through_recording(
+            video_es.as_deref(),
+            audio_es.as_deref(),
+            &remux_out,
+            &self.codec,
+            self.fps,
+            self.record_bitrate_kbps.load(Ordering::SeqCst),
+            &self.event_sender,
+        );
+        let bytes = match remux_result {
+            Ok(_size) => match std::fs::read(&remux_out) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                _ => {
+                    let _ = std::fs::remove_file(&remux_out);
+                    for path in [video_es.as_ref(), audio_es.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    self.active.store(false, Ordering::SeqCst);
+                    self.spent.store(true, Ordering::SeqCst);
+                    send_log(
+                        &self.event_sender,
+                        "error",
+                        "Recording captured no media (empty elementary streams); nothing saved."
+                            .to_owned(),
+                    );
+                    return Err(
+                        "Recording captured no media (empty elementary streams); nothing saved."
+                            .to_owned(),
+                    );
+                }
+            },
+            Err(error) => {
+                let _ = std::fs::remove_file(&remux_out);
+                for path in [video_es.as_ref(), audio_es.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.active.store(false, Ordering::SeqCst);
+                self.spent.store(true, Ordering::SeqCst);
+                let message = format!("Pass-through remux failed: {error}");
+                send_log(&self.event_sender, "error", message.clone());
+                return Err(message);
+            }
+        };
+        if let Some(sender) = &self.event_sender {
+            let _ = sender.send(Event::RecordingChunk {
+                chunk_base64: BASE64_STANDARD.encode(&bytes),
+            });
+        }
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Native recording finalized: {} bytes remuxed offline into a standard seekable MP4.",
+                bytes.len()
+            ),
+        );
+        // Cleanup: delete the temp ES files and the remux output; the branch
+        // is spent (filesinks saw EOS) so the next recording rebuilds fresh.
+        for path in [Some(&remux_out), video_es.as_ref(), audio_es.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        self.active.store(false, Ordering::SeqCst);
+        self.spent.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// TRANSCODE finalize: the existing live-muxer path — wait for the muxer
+    /// EOS (the whole faststart MP4 is emitted as one chunk by the swallow
+    /// probe), retry the EOS once, then fall back to sending EOS directly on
+    /// the muxer's sink pads.
+    fn stop_transcode(&self, drain_ms: u128) -> Result<(), String> {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(RECORDING_FINALIZE_TIMEOUT_MS);
         while !self.eos_seen.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
@@ -1120,8 +1642,10 @@ impl GstreamerRecordingState {
                 "warn",
                 "Native recording stop: normal EOS path did not finalize the muxer; sending EOS directly on the muxer sink pads.".to_owned(),
             );
-            for pad in self.muxer.sink_pads() {
-                let _ = pad.send_event(gst::event::Eos::new());
+            if let Some(muxer) = &self.muxer {
+                for pad in muxer.sink_pads() {
+                    let _ = pad.send_event(gst::event::Eos::new());
+                }
             }
             let failsafe_deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(RECORDING_FAILSAFE_TIMEOUT_MS);
@@ -1155,6 +1679,27 @@ impl GstreamerRecordingState {
             "Native recording finalized; MP4 chunks flushed.".to_owned(),
         );
         Ok(())
+    }
+
+    /// Abort path for pass-through: send EOS below each valve so the ES
+    /// filesinks flush and CLOSE their temp files (a filesink left open after
+    /// an abort would append stale pre-abort data on a later start()). The
+    /// caller marks the branch spent so the next recording rebuilds it fresh.
+    fn close_es_files(&self) {
+        for valve in [Some(&self.valve), self.audio_valve.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(src_pad) = valve.static_pad("src") {
+                if let Some(below) = src_pad.peer() {
+                    let _ = below.send_event(gst::event::Eos::new());
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !self.filesink_eos.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Tear the ENTIRE recording branch (video + audio) out of the pipeline:
@@ -1191,8 +1736,6 @@ impl GstreamerRecordingState {
             self.queue.clone(),
             self.encoder.clone(),
             self.h264_parse.clone(),
-            self.muxer.clone(),
-            self.swallow.clone(),
             self.video_convert.clone(),
             self.video_declare_caps.clone(),
             self.range_convert.clone(),
@@ -1200,6 +1743,21 @@ impl GstreamerRecordingState {
         ];
         if let Some(download) = &self.video_download {
             elements.push(download.clone());
+        }
+        if let Some(muxer) = &self.muxer {
+            elements.push(muxer.clone());
+        }
+        if let Some(swallow) = &self.swallow {
+            elements.push(swallow.clone());
+        }
+        if let Some(es_caps) = &self.es_caps {
+            elements.push(es_caps.clone());
+        }
+        if let Some(filesink) = &self.video_filesink {
+            elements.push(filesink.clone());
+        }
+        if let Some(filesink) = &self.audio_filesink {
+            elements.push(filesink.clone());
         }
         for element in [
             &self.audio_valve,
@@ -1209,12 +1767,21 @@ impl GstreamerRecordingState {
             &self.audio_opusdec,
             &self.audio_audioconvert,
             &self.audio_aac_encoder,
+            &self.audio_aac_parse,
+            &self.audio_adts_caps,
         ]
         .into_iter()
         .flatten()
         {
             elements.push(element.clone());
         }
+        // The pass-through branch aliases its RTP capsfilter across several
+        // fields (video_convert/video_declare_caps/video_encode_caps/
+        // range_convert all point at the same element), so de-duplicate by
+        // element name before NULLing/removing — pipeline.remove() on the
+        // same element twice errors out.
+        let mut seen = std::collections::HashSet::new();
+        elements.retain(|element| seen.insert(element.name().to_string()));
         for element in &elements {
             element.set_state(gst::State::Null).map_err(|error| {
                 format!(
@@ -1230,6 +1797,14 @@ impl GstreamerRecordingState {
                     element.name()
                 )
             })?;
+        }
+        // Remove leftover pass-through temp ES files (already remuxed+deleted
+        // on finalize; this covers aborts and rebuilds).
+        for path in [self.video_es_path.as_ref(), self.audio_es_path.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(path);
         }
         send_log(
             &self.event_sender,
@@ -2448,32 +3023,51 @@ impl GstreamerPipeline {
                 .ok_or_else(|| "Recording state vanished.".to_owned())?;
             (state.clone(), state.audio_rtp_tee.clone())
         };
-        let (tap_tee, video_api, zero_copy) = {
+        let (rtp_tee, tap_tee, video_api, zero_copy) = {
             let slot = self
                 .video_tap
                 .lock()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned())
                 .ok_or_else(|| "Recording rebuild: video tap tee is gone.".to_owned())?;
-            (
-                slot.tee
-                    .ok_or_else(|| "Recording rebuild: video tap has no tee.".to_owned())?,
-                slot.video_api,
-                slot.zero_copy,
-            )
+            (slot.rtp_tee, slot.tee, slot.video_api, slot.zero_copy)
         };
+        // Rebuild the SAME mode the old branch was built for, so a second
+        // recording matches the first (pass-through stays zero-cost, transcode
+        // stays universal H.264).
+        let mode = old.mode;
+        let codec = old.codec.clone();
         old.teardown(&self.pipeline)?;
 
-        let record_bitrate_kbps = self.record_bitrate_kbps.load(Ordering::SeqCst);
-        let mut fresh = build_transcode_record_branch(
-            &self.pipeline,
-            &tap_tee,
-            video_api,
-            zero_copy,
-            self.event_sender.clone(),
-            record_bitrate_kbps,
-        )
-        .map_err(|error| format!("Recording rebuild: fresh video branch failed: {error}"))?;
+        let mut fresh = match mode {
+            RecordingMode::PassThrough => {
+                let rtp_tee = rtp_tee.ok_or_else(|| {
+                    "Recording rebuild: RTP video tap tee is gone.".to_owned()
+                })?;
+                build_pass_through_record_branch(
+                    &self.pipeline,
+                    &rtp_tee,
+                    &codec,
+                    old.fps,
+                    self.event_sender.clone(),
+                )
+                .map_err(|error| format!("Recording rebuild: fresh video branch failed: {error}"))?
+            }
+            RecordingMode::Transcode => {
+                let tap_tee = tap_tee
+                    .ok_or_else(|| "Recording rebuild: decoded video tap tee is gone.".to_owned())?;
+                let record_bitrate_kbps = self.record_bitrate_kbps.load(Ordering::SeqCst);
+                build_transcode_record_branch(
+                    &self.pipeline,
+                    &tap_tee,
+                    video_api,
+                    zero_copy,
+                    self.event_sender.clone(),
+                    record_bitrate_kbps,
+                )
+                .map_err(|error| format!("Recording rebuild: fresh video branch failed: {error}"))?
+            }
+        };
         if let Some(audio_tee) = old_audio_rtp_tee {
             fresh.audio_rtp_tee = Some(audio_tee);
             fresh.build_audio_branch(&self.pipeline).map_err(|error| {
@@ -2506,6 +3100,12 @@ impl GstreamerPipeline {
         if !state.active.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // The OFFLINE pass-through remux re-encodes at the session's
+        // negotiated max bitrate (the same value the transcode branch uses).
+        state.record_bitrate_kbps.store(
+            self.record_bitrate_kbps.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         state.stop(finalize)?;
         if finalize {
             // The remux recorder has no decoded frames, so no thumbnail is
@@ -3045,6 +3645,16 @@ fn nice_stream_from_ice_transport(
 
 pub(crate) fn init_gstreamer() -> Result<(), String> {
     gst::init().map_err(|error| format!("Failed to initialize GStreamer: {error}"))?;
+    // Register the custom lenient GFN AV1 depayloader. The stock
+    // gst-plugins-rs `rtpav1depay` produces zero frames on some GFN AV1
+    // streams (see gfn_av1_depay.rs), so AV1 chains use `gfnav1depay`.
+    static CUSTOM_AV1_DEPAY_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+    CUSTOM_AV1_DEPAY_REGISTERED
+        .get_or_init(|| {
+            crate::gfn_av1_depay::register_element()
+                .map_err(|error| format!("Failed to register gfnav1depay: {error}"))
+        })
+        .clone()?;
     #[cfg(target_os = "linux")]
     {
         static RTP_PLUGIN_REGISTRATION: OnceLock<Result<(), String>> = OnceLock::new();
@@ -3858,7 +4468,10 @@ fn rtp_video_depayloader_factory(codec: &str) -> Option<&'static str> {
     match codec {
         "H265" | "HEVC" => Some("rtph265depay"),
         "H264" => Some("rtph264depay"),
-        "AV1" => Some("rtpav1depay"),
+        // The stock gst-plugins-rs `rtpav1depay` produces zero output on some
+        // GFN AV1 streams; the custom lenient `gfnav1depay` auto-detects the
+        // payload layout and never wedges (see gfn_av1_depay.rs).
+        "AV1" => Some("gfnav1depay"),
         _ => None,
     }
 }
@@ -4900,12 +5513,17 @@ fn link_rtp_video_pad(
         elements,
     );
 
-    // Build the native TRANSCODE recording branch off the video tap tee (the
-    // post-decode tee that also serves screenshots). It is built HERE (session
-    // start, pipeline NULL/READY) and its tee pad stays linked for the
-    // session, so record start/stop never touches the live chain. A
+    // Build the native recording branch off the video tap tees. It is built
+    // HERE (session start, pipeline NULL/READY) and its tee pad stays linked
+    // for the session, so record start/stop never touches the live chain. A
     // decoder-fallback rebuild reconnects the SAME tap tee, so the branch
     // survives it intact.
+    //
+    // Mode selection: PASS-THROUGH by default (raw RTP → MP4, zero re-encode
+    // — recording costs nothing to the live stream; the d3d12h264enc transcode
+    // competes with the decoder for the same GPU and stutters the stream on
+    // single-iGPU laptops). Set OPENNOW_RECORDING_MODE=transcode to opt back
+    // into the universal H.264 transcode.
     let rtp_tee = video_tap
         .lock()
         .ok()
@@ -4923,26 +5541,67 @@ fn link_rtp_video_pad(
                 .unwrap_or((RtpVideoApi::Software, false))
         })
         .unwrap_or((RtpVideoApi::Software, false));
-    if let Some(tap_tee) = tap_tee {
-        let record_bitrate_kbps = record_bitrate_kbps.load(Ordering::SeqCst);
+    let recording_mode = RecordingMode::from_env();
+    {
         let mut slot = recording
             .lock()
             .map_err(|_| "Recording state lock poisoned.".to_owned())?;
         if slot.is_none() {
-            *slot = Some(build_transcode_record_branch(
-                pipeline,
-                &tap_tee,
-                video_api,
-                zero_copy,
-                event_sender.clone(),
-                record_bitrate_kbps,
-            )?);
+            let built = match recording_mode {
+                RecordingMode::PassThrough => match rtp_tee.as_ref() {
+                    Some(tee) => build_pass_through_record_branch(
+                        pipeline,
+                        tee,
+                        encoding,
+                        requested_fps.unwrap_or(60),
+                        event_sender.clone(),
+                    )
+                    .map(Some),
+                    None => {
+                        send_log(
+                            event_sender,
+                            "warn",
+                            "Recording not armed: no RTP video tap tee (recording will be unavailable until a WebRTC video session starts)."
+                                .to_owned(),
+                        );
+                        Ok(None)
+                    }
+                },
+                RecordingMode::Transcode => match tap_tee.as_ref() {
+                    Some(tee) => {
+                        let record_bitrate_kbps = record_bitrate_kbps.load(Ordering::SeqCst);
+                        build_transcode_record_branch(
+                            pipeline,
+                            tee,
+                            video_api,
+                            zero_copy,
+                            event_sender.clone(),
+                            record_bitrate_kbps,
+                        )
+                        .map(Some)
+                    }
+                    None => {
+                        send_log(
+                            event_sender,
+                            "warn",
+                            "Recording not armed: no decoded video tap tee (recording will be unavailable until a WebRTC video session starts)."
+                                .to_owned(),
+                        );
+                        Ok(None)
+                    }
+                },
+            }?;
+            if let Some(state) = built {
+                *slot = Some(state);
+            }
         }
-        // The game-audio tap tee lives at the pipeline level (the audio RTP
-        // pad arrives BEFORE the video pad). Transfer it into the recording
-        // state and hang the audio branch off the same muxer now that it
-        // exists. If the audio pad arrives later, the pad-added handler
-        // builds the branch instead. Either way it is built exactly once.
+    }
+    {
+        // (Keep the lock guard scoped: the audio-branch build below also
+        // locks the audio tee, so drop the recording lock first.)
+        let mut slot = recording
+            .lock()
+            .map_err(|_| "Recording state lock poisoned.".to_owned())?;
         if let Some(state) = slot.as_mut() {
             if state.audio_rtp_tee.is_none() {
                 if let Ok(mut tee_slot) = audio_rtp_tee.lock() {
@@ -4953,20 +5612,20 @@ fn link_rtp_video_pad(
             }
             state.build_audio_branch(pipeline)?;
         }
-        // Link the WebRTC RTP source only after every recording branch that
-        // belongs to this tee has been created and synced. A late tee branch
-        // misses the original stream-start/caps/segment sticky events; qtmux
-        // then receives buffers without a segment and writes an empty MP4.
-        // Keeping the source unlinked until this point makes the initial source
-        // link fan out the complete event sequence to both decode and remux.
-        if let Some(rtp_tee) = rtp_tee {
-            link_rtp_video_source_to_tee(src_pad, &rtp_tee, encoding)?;
-        }
+    }
+    // Link the WebRTC RTP source only after every recording branch that
+    // belongs to this tee has been created and synced. A late tee branch
+    // misses the original stream-start/caps/segment sticky events; qtmux
+    // then receives buffers without a segment and writes an empty MP4.
+    // Keeping the source unlinked until this point makes the initial source
+    // link fan out the complete event sequence to both decode and remux.
+    if let Some(rtp_tee) = rtp_tee {
+        link_rtp_video_source_to_tee(src_pad, &rtp_tee, encoding)?;
     } else {
         send_log(
             event_sender,
             "warn",
-            "Native recording not armed: no video tap tee (recording will be unavailable until a WebRTC video session starts).".to_owned(),
+            "Native recording not armed: no RTP video tap tee (recording will be unavailable until a WebRTC video session starts).".to_owned(),
         );
     }
     send_log(
@@ -5176,6 +5835,7 @@ fn build_rtp_video_chain(
             .find_map(|(spec, element)| (spec.role == RtpVideoChainRole::Parser).then_some(element))
         {
             watch_video_caps_transitions(parser, "parser", event_sender, video_liveness.clone());
+            watch_depay_output(parser, encoding, event_sender);
         }
         if let Some(decoder) = specs
             .iter()
@@ -5273,6 +5933,7 @@ fn build_rtp_video_chain(
             format!("Failed to link RTP {encoding} decode chain into the record tap tee: {error:?}")
         })?;
         watch_rtp_video_bitrate(src_pad, video_liveness.clone(), event_sender);
+        watch_rtp_payload_dump(src_pad, encoding, video_liveness.clone(), event_sender);
         watch_rtcp_send_stats(pipeline, video_liveness.clone(), event_sender);
         video_liveness.start(pipeline.clone(), sink.clone(), event_sender.clone());
 
@@ -6493,10 +7154,22 @@ pub(crate) fn build_transcode_record_branch(
         range_lut_probe: lut_probe_id,
         range_convert,
         video_download: download,
-        muxer,
-        swallow,
+        muxer: Some(muxer),
+        swallow: Some(swallow),
+        video_es_path: None,
+        audio_es_path: None,
+        es_caps: None,
+        video_filesink: None,
+        audio_filesink: None,
+        filesink_eos: Arc::new(AtomicBool::new(false)),
+        audio_filesink_eos: Arc::new(AtomicBool::new(false)),
         eos_seen,
         active,
+        mode: RecordingMode::Transcode,
+        codec: "H264".to_owned(),
+        fps: 0,
+        record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
+        idr_gate: Arc::new(AtomicBool::new(true)),
         video_tap_tee: tap_tee.clone(),
         audio_rtp_tee: None,
         audio_valve: None,
@@ -6506,10 +7179,908 @@ pub(crate) fn build_transcode_record_branch(
         audio_opusdec: None,
         audio_audioconvert: None,
         audio_aac_encoder: None,
+        audio_aac_parse: None,
+        audio_adts_caps: None,
         audio_branch_built: Arc::new(AtomicBool::new(false)),
         spent: Arc::new(AtomicBool::new(false)),
+        pass_flow_diag: None,
         event_sender,
     })
+}
+
+/// Native recording branch — PASS-THROUGH (bitstream remux). Taps the RAW
+/// RTP stream at the source tee (before decode), depayloads and parses it,
+/// and writes the received H.265/H.264/AV1 elementary stream into a temp
+/// file:
+///
+///   rtp tap tee → valve → queue → capsfilter (RTP caps) → rtph*depay →
+///   h*parse → filesink (temp ES file)
+///
+/// There is NO decoder, NO encoder, NO videoconvert, NO colour transform and
+/// NO GPU work anywhere in this branch — recording costs nothing to the live
+/// stream (the reason the transcode branch stutters on single-iGPU laptops:
+/// d3d12h264enc competes with the decoder for the same GPU). The file is the
+/// exact received bitstream at the exact received quality, so it is never
+/// "burik-er" than the stream itself. Playback on the user's own machine is
+/// fine (HEVC decode is hardware-supported on the same iGPU).
+///
+/// MUXING HAPPENS OFFLINE AT STOP (`remux_pass_through_recording`) in a
+/// throwaway pipeline: the temp ES file (and the game-audio AAC file) are
+/// remuxed into a standard seekable MP4 only after the recording ends. No
+/// qtmux lives in the live pipeline, so a muxer stall can never freeze the
+/// recording branch (the field wedge: a pass-through recording whose video
+/// AND audio branches both froze at the qtmux input ~16 s in while the live
+/// stream stayed healthy). A filesink always accepts, so the branch cannot
+/// wedge.
+///
+/// The IDR gate (drop everything until the first sync access unit, so the
+/// file never starts mid-GOP with orphan P-frames) is applied at the OFFLINE
+/// remux, where it cannot stall the live stream. Because the live branch
+/// writes EVERYTHING it receives, a server keyframe that lands late (GFN
+/// H265 GOPs can run ~9 s) no longer black-holes the head of the recording.
+pub(crate) fn build_pass_through_record_branch(
+    pipeline: &gst::Pipeline,
+    rtp_tee: &gst::Element,
+    codec: &str,
+    fps: u32,
+    event_sender: Option<Sender<Event>>,
+) -> Result<GstreamerRecordingState, String> {
+    let codec_upper = codec.to_ascii_uppercase();
+    let (depay_factory, parse_factory, rtp_encoding) = match codec_upper.as_str() {
+        "H264" => ("rtph264depay", "h264parse", "H264"),
+        "H265" | "HEVC" => ("rtph265depay", "h265parse", "H265"),
+        "AV1" => ("gfnav1depay", "av1parse", "AV1"),
+        other => {
+            return Err(format!(
+                "Pass-through recording: unsupported codec {other} (H264/H265/AV1 expected)."
+            ))
+        }
+    };
+
+    let valve = make_element("valve")?;
+    let queue = make_element("queue")?;
+    // The record tap sits BEFORE rtpbin, so the branch sees the same raw RTP
+    // as the decode chain — but the decode chain is shielded by rtpbin's
+    // per-ssrc session split and its compressed-frame jitter buffer, while a
+    // bare branch is not. GFN's low-latency servers burst/reorder packets on
+    // WAN jitter (the field logs: loss 0.05-0.2% yet sink fps dips, PLI
+    // floods, and the pass-through ES loses whole frames while the live path
+    // stays smooth): rtph26xdepay cannot reassemble an AU whose FU fragments
+    // arrive out of order, emits a garbage AU, and h265parse drops it — the
+    // recorded ES then has holes ("Could not find ref with POC …" decode
+    // glitches in the MP4). The jitterbuffer reorders packets by RTP
+    // timestamp and holds a short playout window before release, so the
+    // depayloader only ever sees ordered, gap-tolerant fragments.
+    // mode=2 (BUFFER): pure reorder + buffer with NO clock sync — the record
+    // tap has no RTCP/SR to slave to, and slave mode would hold packets
+    // forever waiting for a clock that never arrives. The window is deep
+    // enough to absorb the 100-300 ms WAN jitter bursts the live path's own
+    // adaptive buffer is sized for (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS).
+    let jitter = make_element("rtpjitterbuffer")?;
+    jitter.set_property("latency", 250u32);
+    // RTPJitterBufferMode::NONE (0): only RTP timestamps, no clock sync — the
+    // record tap has no RTCP/SR to slave to, and mode=buffer's low/high
+    // watermark logic holds everything until EOS in this GStreamer build.
+    jitter.set_property_from_str("mode", "none");
+    jitter.set_property("do-lost", false);
+    let rtp_caps = make_element("capsfilter")?;
+    let depay = make_element(depay_factory)?;
+    let parse = make_element(parse_factory)?;
+    // Force the ES file format the OFFLINE remux can auto-detect: the
+    // parsers' default output against an unconstrained filesink is
+    // length-prefixed avcC (h264parse/h265parse) or OBU-stream (av1parse).
+    // A bare avcC file carries no start codes, so the offline filesrc →
+    // parse chain cannot detect it ("No caps set" → not-negotiated).
+    // Byte-stream H264/H265 self-identifies via 00 00 01 start codes; AV1
+    // OBU-stream is what av1parse emits natively.
+    let es_caps = make_element("capsfilter")?;
+    let es_caps_string = match codec_upper.as_str() {
+        "H264" => "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au",
+        "H265" | "HEVC" => "video/x-h265,stream-format=(string)byte-stream,alignment=(string)au",
+        _ => "video/x-av1,stream-format=(string)obu-stream,alignment=(string)frame",
+    };
+    es_caps.set_property(
+        "caps",
+        es_caps_string
+            .parse::<gst::Caps>()
+            .map_err(|error| format!("Invalid pass-through ES caps: {error}"))?,
+    );
+
+    valve.set_property("drop", true);
+    // Forward sticky events while buffers are gated, so qtmux never receives
+    // a first buffer before its stream-start/caps/segment (same pattern as
+    // the transcode branch).
+    set_property_from_str_if_supported(&valve, "drop-mode", "forward-sticky-events");
+    // Same leaky decoupling as the transcode branch: the branch can NEVER
+    // back-pressure the live RTP flow — if the muxer lags, the queue drops
+    // the oldest RTP packets (a few dropped packets are far better than a
+    // stuttering stream). The limit must hold a WHOLE FRAME, not 4 packets:
+    // this branch carries raw RTP (≈13 packets/frame for 1080p60 H265, more
+    // for AV1), so max-size-buffers=4 held a third of a frame and the queue
+    // dropped packets mid-frame constantly — the depayloader then could not
+    // assemble a single complete frame (the pass-through wedge: 3 AUs in 10 s
+    // in the harness; the 2.06 s video track in the field recording). 512
+    // packets ≈ 0.5-1 s of video at GFN rates — enough to ride out a brief
+    // muxer hiccup and assemble frames, while leaky=upstream still guarantees
+    // the tap tee's push never blocks.
+    queue.set_property_from_str("leaky", "upstream");
+    // 2048 packets ≈ 6 s of 1080p60 H265 at ~345 pkt/s (512 packets was only
+    // ~1.5 s, so a brief downstream stall — depay/parse/filesink hiccup, disk
+    // or Defender scan on the fresh temp .es file — filled it and the leaky
+    // head-drop killed whole mid-frame fragments, which cascaded into the
+    // garbage-AU/parse-drop holes above). The branch still never back-poses
+    // the live flow (leaky=upstream), but now only a >6 s stall sheds data.
+    queue.set_property("max-size-buffers", 2048u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+    // Normalize the RTP caps (media/encoding-name/clock-rate only) before the
+    // depayloader, mirroring the game-audio branch's capsfilter.
+    rtp_caps.set_property(
+        "caps",
+        format!(
+            "application/x-rtp,media=(string)video,encoding-name=(string){rtp_encoding},clock-rate=(int)90000"
+        )
+        .parse::<gst::Caps>()
+        .map_err(|error| format!("Invalid pass-through recording RTP caps: {error}"))?,
+    );
+
+    // The tail is a plain filesink writing the raw elementary stream into a
+    // temp file. NO muxer lives in the live pipeline: muxing happens OFFLINE
+    // at stop (`remux_pass_through_recording`) in a throwaway pipeline, so a
+    // muxer stall can never freeze the recording branch (the field wedge: a
+    // pass-through recording whose video AND audio branches both froze at the
+    // qtmux input ~16 s in while the live stream stayed healthy). A filesink
+    // always accepts — the branch cannot wedge. `async=false` + `sync=false`
+    // keep the sink a synchronous non-prerolling element like the rest of
+    // the branch (a prerolling sink would complete its deferred transition
+    // later and re-preroll the whole pipeline).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let es_ext = match codec_upper.as_str() {
+        "H264" => "h264",
+        "AV1" => "av1",
+        _ => "h265",
+    };
+    let video_es_path = std::env::temp_dir()
+        .join(format!("opennow-rec-{}-{stamp}.{es_ext}.es", std::process::id()));
+    let video_filesink = make_element("filesink")?;
+    video_filesink.set_property(
+        "location",
+        video_es_path
+            .to_str()
+            .ok_or_else(|| "Pass-through ES path is not valid UTF-8.".to_owned())?,
+    );
+    video_filesink.set_property("sync", false);
+    video_filesink.set_property("async", false);
+
+    // Chain order: valve → queue → capsfilter (RTP caps) → depayloader →
+    // parser (normalizes the AUs for the offline remux) → ES-format
+    // capsfilter (byte-stream/OBU) → filesink.
+    let elements: Vec<&gst::Element> = vec![
+        &valve,
+        &queue,
+        &jitter,
+        &rtp_caps,
+        &depay,
+        &parse,
+        &es_caps,
+        &video_filesink,
+    ];
+    for element in &elements {
+        pipeline.add(*element).map_err(|error| {
+            format!("Failed to add recording pass-through branch element: {error}")
+        })?;
+    }
+    for pair in elements.windows(2) {
+        pair[0]
+            .link(pair[1])
+            .map_err(|error| format!("Failed to link recording pass-through branch: {error:?}"))?;
+    }
+    // Sync the branch to the pipeline state BEFORE linking it into the RTP
+    // tap tee (the pipeline is PLAYING by the time this runs — an unsynced
+    // element would fail the tee's first push and kill the whole RTP flow).
+    for element in &elements {
+        element.sync_state_with_parent().map_err(|error| {
+            format!("Failed to sync recording pass-through branch element state: {error}")
+        })?;
+    }
+
+    // EOS flag on the filesink: `stop()` waits for it before the offline
+    // remux reads the ES file, so the file is always fully flushed/closed.
+    let filesink_eos = Arc::new(AtomicBool::new(false));
+    let eos_flag = filesink_eos.clone();
+    let filesink_sink_pad = video_filesink
+        .static_pad("sink")
+        .ok_or_else(|| "Pass-through filesink has no sink pad.".to_owned())?;
+    filesink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        if let Some(event) = info.event() {
+            if event.type_() == gst::EventType::Eos {
+                eos_flag.store(true, Ordering::SeqCst);
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    // Link the branch into the RTP tap tee. The valve starts closed
+    // (drop=true), so the filesink writes nothing until a recording is
+    // active, while the decode/present chain keeps flowing untouched.
+    let first_sink = valve
+        .static_pad("sink")
+        .ok_or_else(|| "Pass-through recording valve has no sink pad.".to_owned())?;
+    let branch_pad = rtp_tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| "Failed to request a recording pad from the RTP tap tee.".to_owned())?;
+    if let Err(error) = branch_pad.link(&first_sink) {
+        let _ = rtp_tee.release_request_pad(&branch_pad);
+        return Err(format!(
+            "Failed to link RTP tap into the pass-through recording branch: {error:?}"
+        ));
+    }
+
+    // PASS-THROUGH flow diagnostics: zero-cost buffer counters at every hop
+    // of the live branch. A field session whose video ES stays 0 bytes while
+    // the live path renders gets pinned to the exact hop that stopped
+    // flowing by `[RecBranchFlow]` log lines (valve_in=tee→branch, queue_in,
+    // depay_in, parse_in, file_in=ES bytes written). The parse sink CAPS
+    // event shows what the depayloader negotiated; the valve's first RTP
+    // buffers expose any non-video traffic (e.g. FlexFEC, pt 98) riding the
+    // shared tap tee.
+    let pass_flow_diag = PassThroughFlowDiag::new(
+        format!("codec={rtp_encoding}"),
+        event_sender.clone(),
+    );
+    {
+        let diag = pass_flow_diag.clone();
+        let valve_sink = valve
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through valve has no sink pad.".to_owned())?;
+        // Learn the negotiated video RTP payload type from the first CAPS
+        // event at the valve sink pad. The RTP tap tee sits BEFORE rtpbin,
+        // so it copies EVERY RTP packet of the WebRTC session — including
+        // FlexFEC (pt 98) and RTX retransmissions that share the same m-line
+        // (a-ssrc-group=FEC-FR 2 4). The decode chain is immune (rtpbin
+        // splits the session per ssrc), but the raw pass-through branch is
+        // not: a stray FEC packet fed to rtph265depay emits garbage NALs
+        // that h265parse discards, leaving a 0-byte video ES while the live
+        // path renders (the my-yes/cloudmatchbeta field wedge). Caps events
+        // always precede buffers (sticky), so video_pt is known before the
+        // first buffer arrives.
+        let pt_slot = diag.video_pt.clone();
+        valve_sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if let gst::EventView::Caps(caps) = event.view() {
+                    let caps = caps.caps();
+                    if let Some(structure) = caps.structure(0) {
+                        if let Ok(payload) = structure.get::<i32>("payload") {
+                            if payload > 0 && payload < 128 {
+                                pt_slot.store(payload as u32, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        valve_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            let count = diag
+                .valve_in
+                .fetch_add(1, Ordering::Relaxed);
+            // Capture the first few RTP packets (12-byte header present on the
+            // raw tap): pt / ssrc / marker / len reveal any non-video flow.
+            if count < 5 {
+                if let Some(buffer) = info.buffer() {
+                    let map = buffer.map_readable();
+                    let bytes = map.as_deref().unwrap_or(&[]);
+                    let pt = bytes.get(1).map(|b| b & 0x7f).unwrap_or(0);
+                    let ssrc = if bytes.len() >= 12 {
+                        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+                    } else {
+                        0
+                    };
+                    let marker = bytes.get(1).map(|b| b & 0x80 != 0).unwrap_or(false);
+                    if let Ok(mut slot) = diag.valve_first_rtp.lock() {
+                        if slot.len() < 5 {
+                            slot.push(format!(
+                                "pt={pt} ssrc={ssrc} m={marker} len={}",
+                                bytes.len()
+                            ));
+                        }
+                    }
+                }
+            }
+            if count == 0 {
+                // First buffer ever to reach the branch (record armed, valve
+                // closed): log the zeroed counters once so the log shows the
+                // branch is fed.
+                diag.log("armed");
+            }
+            // Drop non-video RTP (FlexFEC/RTX/other payloads) before the
+            // depayloader: only the negotiated video payload type belongs in
+            // the recorded ES. If the pt filter is still unknown (0), pass
+            // everything — sticky caps events arrive before buffers, so this
+            // only happens during the brief attach window.
+            let video_pt = diag.video_pt.load(Ordering::Relaxed);
+            if video_pt != 0 {
+                if let Some(buffer) = info.buffer() {
+                    let map = buffer.map_readable();
+                    let bytes = map.as_deref().unwrap_or(&[]);
+                    let pt = bytes.get(1).map(|b| b & 0x7f).unwrap_or(0) as u32;
+                    if pt != video_pt {
+                        diag.dropped_non_video.fetch_add(1, Ordering::Relaxed);
+                        return gst::PadProbeReturn::Drop;
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let counter = pass_flow_diag.queue_in.clone();
+        let queue_sink = queue
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through queue has no sink pad.".to_owned())?;
+        queue_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let counter = pass_flow_diag.depay_in.clone();
+        let depay_sink = depay
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through depay has no sink pad.".to_owned())?;
+        depay_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let counter = pass_flow_diag.parse_in.clone();
+        let caps_slot = pass_flow_diag.parse_first_caps.clone();
+        let parse_sink = parse
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through parse has no sink pad.".to_owned())?;
+        parse_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+        parse_sink.add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |_pad, info| {
+                if let Some(event) = info.event() {
+                    if let gst::EventView::Caps(caps) = event.view() {
+                        if let Ok(mut slot) = caps_slot.lock() {
+                            if slot.is_none() {
+                                *slot = Some(caps.caps().to_string());
+                            }
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+    {
+        let counter = pass_flow_diag.parse_out.clone();
+        let parse_src = parse
+            .static_pad("src")
+            .ok_or_else(|| "Pass-through parse has no src pad.".to_owned())?;
+        parse_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let counter = pass_flow_diag.file_in.clone();
+        let filesink_sink = video_filesink
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through filesink has no sink pad.".to_owned())?;
+        filesink_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    // No live IDR gate: the ES file captures EVERYTHING the branch receives,
+    // and the gate (drop-until-first-keyframe) is applied at the OFFLINE
+    // remux where it cannot stall anything. This also means a server keyframe
+    // that lands late (GFN H265 GOP) no longer black-holes the head of the
+    // file — the pre-keyframe data is written and the remux simply starts at
+    // the first keyframe that exists.
+    let idr_gate = Arc::new(AtomicBool::new(true));
+
+    // Inactive until the first `start()` (the transcode chunk probe pattern).
+    let active = Arc::new(AtomicBool::new(false));
+
+    send_log(
+        &event_sender,
+        "info",
+        format!(
+            "Attached native PASS-THROUGH recording branch (raw RTP → {depay_factory} → {parse_factory} → filesink ES file; zero re-encode — no decode/encode/GPU cost to the live stream; file = received {rtp_encoding} bitstream, muxed offline at stop)."
+        ),
+    );
+
+    Ok(GstreamerRecordingState {
+        valve,
+        queue,
+        encoder: depay.clone(),
+        encoder_factory: format!("{depay_factory}→{parse_factory}"),
+        h264_parse: parse,
+        video_convert: rtp_caps.clone(),
+        video_declare_caps: rtp_caps.clone(),
+        video_encode_caps: rtp_caps.clone(),
+        range_lut_probe: Arc::new(Mutex::new(None)),
+        range_convert: rtp_caps.clone(),
+        video_download: None,
+        muxer: None,
+        swallow: None,
+        video_es_path: Some(video_es_path),
+        audio_es_path: None,
+        es_caps: Some(es_caps),
+        video_filesink: Some(video_filesink),
+        audio_filesink: None,
+        filesink_eos,
+        audio_filesink_eos: Arc::new(AtomicBool::new(false)),
+        eos_seen: Arc::new(AtomicBool::new(false)),
+        active,
+        mode: RecordingMode::PassThrough,
+        codec: rtp_encoding.to_owned(),
+        fps,
+        record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
+        idr_gate,
+        video_tap_tee: rtp_tee.clone(),
+        audio_rtp_tee: None,
+        audio_valve: None,
+        audio_queue: None,
+        audio_capsfilter: None,
+        audio_depayloader: None,
+        audio_opusdec: None,
+        audio_audioconvert: None,
+        audio_aac_encoder: None,
+        audio_aac_parse: None,
+        audio_adts_caps: None,
+        audio_branch_built: Arc::new(AtomicBool::new(false)),
+        spent: Arc::new(AtomicBool::new(false)),
+        pass_flow_diag: Some(pass_flow_diag),
+        event_sender,
+    })
+}
+
+/// Remux the pass-through temp ES files (video + optional game-audio AAC)
+/// into a standard seekable MP4 (faststart) in a THROWAWAY pipeline. The live
+/// pipeline contains NO muxer for pass-through recordings — a live qtmux
+/// froze both recording branches ~16 s in while the stream stayed healthy
+/// (the field wedge) — so all muxing happens here, offline, at stop, where a
+/// stall cannot touch the stream. Returns the output file size in bytes
+/// (0 = nothing was written, e.g. both ES files were empty).
+fn remux_pass_through_recording(
+    video_es: Option<&std::path::Path>,
+    audio_es: Option<&std::path::Path>,
+    out_path: &std::path::Path,
+    codec: &str,
+    fps: u32,
+    record_bitrate_kbps: u32,
+    event_sender: &Option<Sender<Event>>,
+) -> Result<u64, String> {
+    let Some(video_es) = video_es else {
+        return Err("Pass-through remux: no video elementary stream file.".to_owned());
+    };
+    let codec_upper = codec.to_ascii_uppercase();
+    let parse_factory = match codec_upper.as_str() {
+        "H264" => "h264parse",
+        "H265" | "HEVC" => "h265parse",
+        "AV1" => "av1parse",
+        other => return Err(format!("Pass-through remux: unsupported codec {other}.")),
+    };
+
+    let pipeline = gst::Pipeline::new();
+    let video_src = make_element("filesrc")?;
+    video_src.set_property(
+        "location",
+        video_es
+            .to_str()
+            .ok_or_else(|| "Pass-through remux video ES path is not valid UTF-8.".to_owned())?,
+    );
+    let parse = make_element(parse_factory)?;
+    // The captured ES is now DECODED and re-encoded offline (at stop, in this
+    // throwaway pipeline — the live stream never touches it). Two reasons:
+    //  1. COLOUR: the GFN H.265 bitstream is FULL-RANGE (0-255, VUI
+    //     video_full_range_flag=1), and players on the field assume LIMITED
+    //     range for untagged files — full-range data then renders with
+    //     crushed blacks ("hitam pekat"; the old transcode recordings were
+    //     limited and rendered correctly). The decode output is rescaled
+    //     0-255 → 16-235 by the same LUT probe the transcode branch uses,
+    //     then re-encoded untagged (x264 insert-vui=false) into the same
+    //     limited, byte-for-byte-untagged shape as the official GeForce Now
+    //     recordings.
+    //  2. DECODE RECOVERY: a bitstream with small holes (RTP jitter during
+    //     the capture) plays back with reference-frame glitches when remuxed
+    //     raw; the decoder conceals the holes at the nearest keyframe instead
+    //     of propagating "Could not find ref with POC" corruption.
+    // Decoder: hardware first (matches the live decode path), software
+    // fallback. A D3D12 decoder hands the chain D3D12 texture memory that
+    // videoconvert/x264 cannot import, so a d3d12download is inserted after
+    // it (same shape as the transcode branch's zero-copy download).
+    let (decoder_factory, decoder) = pick_remux_decoder(&codec_upper)?;
+    let decoder_is_hw = matches!(
+        decoder_factory.as_str(),
+        "d3d12h265dec" | "d3d12h264dec" | "d3d12av1dec"
+    );
+    let download = if decoder_is_hw {
+        Some(make_element("d3d12download")?)
+    } else {
+        None
+    };
+    // Format conversion: decoder's native output (NV12 for D3D12, I420 for
+    // the software decoders) → the encoder's input format.
+    let convert = make_element("videoconvert")?;
+    // Declares the FULL-RANGE (0-255) BT.709 input the decoder actually
+    // outputs, then the LUT probe below rescales it to LIMITED (16-235).
+    let declare_caps = make_element("capsfilter")?;
+    // Bridges the FULL→LIMITED colourimetry change between the two caps
+    // filters (the caps must intersect for the elements to link; the range
+    // is actually rescaled by the LUT probe on its sink pad).
+    let range_convert = make_element("videoconvert")?;
+    // Declares the LIMITED range at the encoder input (what the LUT scaler
+    // produces) — H.264 playback expects limited, and the untagged encoder
+    // output then matches the official GFN recordings.
+    let encode_caps = make_element("capsfilter")?;
+    let (encoder_factory, encoder) = pick_h264_encoder(record_bitrate_kbps)?;
+    // Converts the encoder's byte-stream H.264 to avcC for qtmux.
+    let h264_parse = make_element("h264parse")?;
+    let muxer = make_element("qtmux")?;
+    muxer.set_property("faststart", true);
+    muxer.set_property("fragment-duration", 0u32);
+    muxer.set_property("streamable", false);
+    let out_sink = make_element("filesink")?;
+    out_sink.set_property(
+        "location",
+        out_path
+            .to_str()
+            .ok_or_else(|| "Pass-through remux output path is not valid UTF-8.".to_owned())?,
+    );
+    out_sink.set_property("sync", false);
+    out_sink.set_property("async", false);
+
+    let encoder_format = if is_hardware_h264_factory(&encoder_factory) {
+        "NV12"
+    } else {
+        "I420"
+    };
+    declare_caps.set_property(
+        "caps",
+        format!(
+            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/0-255,chroma-site=(string)mpeg2"
+        )
+        .parse::<gst::Caps>()
+        .map_err(|error| format!("Invalid remux declare caps: {error}"))?,
+    );
+    encode_caps.set_property(
+        "caps",
+        format!(
+            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/16-235,chroma-site=(string)mpeg2"
+        )
+        .parse::<gst::Caps>()
+        .map_err(|error| format!("Invalid remux encode caps: {error}"))?,
+    );
+
+    // Chain order: filesrc → parse → [download] → videoconvert → capsfilter
+    // (FULL bt709) → videoconvert (range bridge + LUT probe) → capsfilter
+    // (LIMITED bt709) → H.264 encoder → h264parse → qtmux → filesink.
+    let mut video_chain: Vec<&gst::Element> = vec![&video_src, &parse, &decoder];
+    if let Some(download) = download.as_ref() {
+        video_chain.push(download);
+    }
+    video_chain.extend([
+        &convert,
+        &declare_caps,
+        &range_convert,
+        &encode_caps,
+        &encoder,
+        &h264_parse,
+    ]);
+    for element in &video_chain {
+        pipeline
+            .add(*element)
+            .map_err(|error| format!("Failed to add pass-through remux element: {error}"))?;
+    }
+    pipeline
+        .add(&muxer)
+        .map_err(|error| format!("Failed to add pass-through remux muxer: {error}"))?;
+    pipeline
+        .add(&out_sink)
+        .map_err(|error| format!("Failed to add pass-through remux sink: {error}"))?;
+    for pair in video_chain.windows(2) {
+        pair[0]
+            .link(pair[1])
+            .map_err(|error| format!("Failed to link pass-through remux video chain: {error:?}"))?;
+    }
+    // qtmux sink pads are REQUEST pads (video_%u / audio_%u) — request and
+    // link explicitly, then link the muxer src to the output filesink.
+    let video_muxer_pad = muxer
+        .request_pad_simple("video_%u")
+        .ok_or_else(|| "Pass-through remux: qtmux refused a video sink pad.".to_owned())?;
+    let h264_src = h264_parse
+        .static_pad("src")
+        .ok_or_else(|| "Pass-through remux: h264parse has no src pad.".to_owned())?;
+    if let Err(error) = h264_src.link(&video_muxer_pad) {
+        let _ = muxer.release_request_pad(&video_muxer_pad);
+        return Err(format!("Failed to link remux h264parse into qtmux: {error:?}"));
+    }
+    let muxer_out = muxer
+        .static_pad("src")
+        .ok_or_else(|| "Pass-through remux: qtmux has no src pad.".to_owned())?;
+    let out_sink_sink = out_sink
+        .static_pad("sink")
+        .ok_or_else(|| "Pass-through remux: output filesink has no sink pad.".to_owned())?;
+    muxer_out
+        .link(&out_sink_sink)
+        .map_err(|error| format!("Failed to link remux muxer to output: {error:?}"))?;
+
+    // The LUT scaler: full-range (0-255) → limited (16-235) on the Y plane,
+    // identical to the transcode branch (videoconvert only CLIPS extremes, it
+    // does not rescale mid-tones — that is the "hitam pekat" bug).
+    let range_sink = range_convert
+        .static_pad("sink")
+        .ok_or_else(|| "Pass-through remux: range bridge has no sink pad.".to_owned())?;
+    range_sink.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
+        if let Some(buffer) = info.buffer_mut() {
+            scale_y_plane_full_to_limited(buffer, pad.current_caps().as_ref());
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    // Reconstruct the VIDEO timestamps the raw ES file cannot carry: files
+    // store no PTS, and qtmux rejects buffers with none ("Buffer has no PTS").
+    // GFN's low-latency encoders emit no B-frames (has_b_frames=0 on every
+    // real H264 AND H265 recording), so decode order == presentation order and
+    // a monotonic PTS ladder at the negotiated fps is exact. Attached to the
+    // h264parse src pad (right before qtmux): whichever element in the
+    // decode→encode chain carries PTS through wins, and anything without one
+    // gets the ladder (the encoder and the D3D12 download can drop PTS on
+    // some runtime/GPU combinations — the field's "Buffer has no PTS" remux
+    // failure).
+    let frame_duration_ns = (1_000_000_000u64 / (fps.max(1) as u64)).max(1);
+    let video_counter = Arc::new(std::sync::Mutex::new(0u64));
+    {
+        let counter = video_counter.clone();
+        let parse_src_pad = h264_parse
+            .static_pad("src")
+            .ok_or_else(|| "Pass-through remux: h264parse has no src pad.".to_owned())?;
+        parse_src_pad.add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad: &gst::Pad, info: &mut gst::PadProbeInfo| {
+                if let Some(buffer) = info.buffer_mut() {
+                    // gstreamer-rs 0.25 keeps the mutating setters on the
+                    // borrowed BufferRef; Buffer has no DerefMut, so get the
+                    // mutable view with make_mut() (copy-on-write).
+                    let buffer = buffer.make_mut();
+                    if buffer.pts().is_none() {
+                        let mut guard =
+                            counter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let pts = gst::ClockTime::from_nseconds(*guard * frame_duration_ns);
+                        *guard += 1;
+                        let duration = gst::ClockTime::from_nseconds(frame_duration_ns);
+                        buffer.set_pts(pts);
+                        buffer.set_dts(pts);
+                        buffer.set_duration(duration);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+
+    // Optional game-audio AAC track (ADTS elementary stream from the live
+    // branch's AAC encoder). Only linked when the file actually has data.
+    if let Some(audio_es) = audio_es {
+        if audio_es.exists()
+            && std::fs::metadata(audio_es)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+                > 0
+        {
+            let audio_src = make_element("filesrc")?;
+            audio_src.set_property(
+                "location",
+                audio_es.to_str().ok_or_else(|| {
+                    "Pass-through remux audio ES path is not valid UTF-8.".to_owned()
+                })?,
+            );
+            let aac_parse = make_element("aacparse")?;
+            pipeline
+                .add_many(&[&audio_src, &aac_parse])
+                .map_err(|error| format!("Failed to add pass-through remux audio: {error}"))?;
+            audio_src
+                .link(&aac_parse)
+                .map_err(|error| format!("Failed to link remux audio source: {error:?}"))?;
+            // Same timestamp reconstruction for AUDIO: each AAC frame is
+            // exactly 1024 samples, so a monotonic PTS ladder at 1024/rate is
+            // exact (rate read from the aacparse caps, e.g. 48000).
+            let audio_counter = Arc::new(std::sync::Mutex::new(0u64));
+            {
+                let counter = audio_counter.clone();
+                let aac_src_pad = aac_parse
+                    .static_pad("src")
+                    .ok_or_else(|| "Pass-through remux: aacparse has no src pad.".to_owned())?;
+                aac_src_pad.add_probe(
+                    gst::PadProbeType::BUFFER,
+                    move |pad: &gst::Pad, info: &mut gst::PadProbeInfo| {
+                        if let Some(buffer) = info.buffer_mut() {
+                            let buffer = buffer.make_mut();
+                            if buffer.pts().is_none() {
+                                // Opus is always 48 kHz; the AAC encoder keeps
+                                // the decoded rate, so 48000 is the norm. Read
+                                // it from the caps when present (the borrowed
+                                // StructureRef is copied out to an owned i32
+                                // before the Caps temporary drops).
+                                let rate = match pad.current_caps() {
+                                    Some(caps) => match caps.structure(0) {
+                                        Some(structure) => structure
+                                            .get::<i32>("rate")
+                                            .unwrap_or(48_000)
+                                            .max(1) as u64,
+                                        None => 48_000,
+                                    },
+                                    None => 48_000,
+                                };
+                                let frame_ns = 1_024u64 * 1_000_000_000u64 / rate;
+                                let mut guard = counter
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let pts = gst::ClockTime::from_nseconds(*guard * frame_ns);
+                                *guard += 1;
+                                buffer.set_pts(pts);
+                                buffer.set_dts(pts);
+                                buffer.set_duration(gst::ClockTime::from_nseconds(frame_ns));
+                            }
+                        }
+                        gst::PadProbeReturn::Ok
+                    },
+                );
+            }
+            let audio_muxer_pad = muxer
+                .request_pad_simple("audio_%u")
+                .ok_or_else(|| "Pass-through remux: qtmux refused an audio sink pad.".to_owned())?;
+            let aac_src = aac_parse
+                .static_pad("src")
+                .ok_or_else(|| "Pass-through remux: aacparse has no src pad.".to_owned())?;
+            if let Err(error) = aac_src.link(&audio_muxer_pad) {
+                let _ = muxer.release_request_pad(&audio_muxer_pad);
+                return Err(format!("Failed to link remux AAC into qtmux: {error:?}"));
+            }
+        }
+    }
+
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(format!("Pass-through remux failed to start: {error:?}"));
+    }
+    let Some(bus) = pipeline.bus() else {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err("Pass-through remux pipeline has no bus.".to_owned());
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(RECORDING_REMUX_TIMEOUT_MS);
+    let mut finished = false;
+    while std::time::Instant::now() < deadline {
+        let Some(message) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(100),
+            &[
+                gst::MessageType::Eos,
+                gst::MessageType::Error,
+                gst::MessageType::Warning,
+            ],
+        ) else {
+            continue;
+        };
+        match message.view() {
+            gst::MessageView::Eos(_) => {
+                finished = true;
+                break;
+            }
+            gst::MessageView::Error(error) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(format!(
+                    "Pass-through remux failed: {} (debug: {:?})",
+                    error.error(),
+                    error.debug()
+                ));
+            }
+            gst::MessageView::Warning(warning) => send_log(
+                event_sender,
+                "warn",
+                format!(
+                    "Pass-through remux warning: {} (debug: {:?})",
+                    warning.error(),
+                    warning.debug()
+                ),
+            ),
+            _ => {}
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    if !finished {
+        return Err("Pass-through remux timed out while muxing the recording.".to_owned());
+    }
+    // Neutralize any colour-metadata box qtmux wrote (it derives a BT.709
+    // `colr` from the encode caps): the official GeForce Now recordings carry
+    // NO colour tags, and some field players misinterpret a tag and render
+    // the limited 16-235 data without expansion ("hitam pekat"). The box
+    // type is renamed colr→free (same size) so offsets stay valid.
+    if let Ok(mut bytes) = std::fs::read(out_path) {
+        let stripped = strip_mp4_colr_boxes(&mut bytes);
+        if stripped > 0 {
+            if std::fs::write(out_path, &bytes).is_ok() {
+                send_log(
+                    event_sender,
+                    "info",
+                    format!(
+                        "Remuxed recording: neutralized {stripped} colour-metadata box(es) (colr→free); the file carries no colour tags, matching the official GeForce Now recordings."
+                    ),
+                );
+            }
+        }
+    }
+    let size = std::fs::metadata(out_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    send_log(
+        event_sender,
+        "info",
+        format!(
+            "Pass-through remux finished: {size} bytes (decoded with {decoder_factory}, re-encoded with {encoder_factory})."
+        ),
+    );
+    Ok(size)
+}
+
+/// Pick a decoder for the OFFLINE pass-through remux (temp ES file → limited
+/// H.264 MP4, in a throwaway pipeline at stop — never touches the live
+/// stream). Hardware first (fast, matches the live decode path), software
+/// fallback (always present in the bundled runtime). Hardware decoders create
+/// their device on the READY transition, so the same init probe used for the
+/// recording encoders rejects a machine without the device and falls down
+/// the ladder.
+fn pick_remux_decoder(codec: &str) -> Result<(String, gst::Element), String> {
+    let candidates: Vec<&str> = match codec {
+        "H265" | "HEVC" => {
+            if cfg!(target_os = "windows") {
+                vec!["d3d12h265dec", "avdec_h265"]
+            } else {
+                vec!["avdec_h265"]
+            }
+        }
+        "H264" => {
+            if cfg!(target_os = "windows") {
+                vec!["d3d12h264dec", "avdec_h264"]
+            } else {
+                vec!["avdec_h264"]
+            }
+        }
+        "AV1" => {
+            if cfg!(target_os = "windows") {
+                vec!["d3d12av1dec", "dav1ddec"]
+            } else {
+                vec!["dav1ddec"]
+            }
+        }
+        other => return Err(format!("Pass-through remux: unsupported codec {other}.")),
+    };
+    let tried = candidates.join(", ");
+    for factory in candidates {
+        if let Ok(element) = gst::ElementFactory::make(factory).build() {
+            if factory.starts_with("d3d12") && !hw_encoder_initializes(&element) {
+                continue;
+            }
+            return Ok((factory.to_owned(), element));
+        }
+    }
+    Err(format!(
+        "No video decoder available in the GStreamer runtime for {codec} (tried {tried}); recording remux disabled."
+    ))
 }
 
 /// Pick the H.264 encoder for the recording branch. The recording carries

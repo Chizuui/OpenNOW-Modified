@@ -11,6 +11,8 @@ mod gstreamer_backend;
 // even when the optional GStreamer feature is off.
 mod gstreamer_config;
 #[cfg(feature = "gstreamer")]
+mod gfn_av1_depay;
+#[cfg(feature = "gstreamer")]
 mod gstreamer_ice;
 #[cfg(feature = "gstreamer")]
 mod gstreamer_input;
