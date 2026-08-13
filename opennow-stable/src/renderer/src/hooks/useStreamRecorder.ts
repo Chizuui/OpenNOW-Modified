@@ -2,16 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { RecordingEntry } from "@shared/gfn";
 import {
+  clampRecordingBitrate,
   computeRecordingFrameShortfall,
   fitThumbnailSize,
-  selectRecordingMimeType,
+  selectRecordingStrategy,
 } from "../components/stream/streamRuntimeHelpers";
+import type { RecordCanvasWorkerOutboundMessage } from "../recording/recordCanvasWorker";
 
-// Record via canvas downscale to keep MediaRecorder encode cost low (it shares
-// the main thread with the WebRTC decoder). GFN uses a GPU encoder off-pipeline;
-// this is the closest the web client can get without new tooling. The cap
-// resolution/FPS are user-selectable via settings (recordingResolution /
-// recordingFps) and default to 720p30.
+// Web recording uses one of two strategies (see selectRecordingStrategy):
+// "raw-track" hands MediaRecorder the incoming WebRTC track directly (hardware
+// AVC encoder off the decode pipeline — the GFN-native model, ~zero main-thread
+// cost), or "canvas-downscale" bounds the encode cost when only software codecs
+// exist (720p30 by default; cap resolution/FPS are user-selectable via
+// recordingResolution / recordingFps settings).
 const DEFAULT_RECORD_CAP_WIDTH = 1280;
 const DEFAULT_RECORD_CAP_HEIGHT = 720;
 const DEFAULT_RECORD_CAP_FPS = 30;
@@ -67,16 +70,48 @@ export function useStreamRecorder({
   const thumbnailDataUrlRef = useRef<string | null>(null);
   const recCarouselRef = useRef<HTMLDivElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const recordWorkerRef = useRef<Worker | null>(null);
+  const videoGeneratorRef = useRef<MediaStreamTrackGenerator | null>(null);
+  // Writer on the generator's WritableStream (WritableStream itself has no
+  // write(); TS 6.0's DOM lib models the real spec, so we must go through
+  // getWriter()). Kept so cleanup can close the stream.
+  const videoGeneratorWriterRef = useRef<WritableStreamDefaultWriter<VideoFrame> | null>(null);
+  // True while a frame is in flight (worker draw + generator write). The draw
+  // loop skips frames while this is set, which both bounds the pipeline and
+  // feeds the honest shortfall notice at stop.
+  const writePendingRef = useRef(false);
+  // Serialized queue of recording chunk sends (read + IPC + disk write). Each
+  // chunk awaits the previous one, so at most one send is in flight — bounded
+  // memory on slow disks, and onstop can drain the queue before
+  // finishRecording (no more "Unknown recording id" race with the final
+  // chunk). The chain never rejects (each link catches), so awaiting it is
+  // always safe.
+  const chunkSendChainRef = useRef<Promise<void>>(Promise.resolve());
 
-  // The canvas capture track runs its own internal rasterize timer at the
-  // capture rate even when drawImage is never called, so it must be stopped
-  // explicitly or it keeps burning main-thread CPU after recording ends.
+  // Stops the recording's video feed: the generator track (which ends the
+  // MediaRecorder's video), the writer (which closes the frame input), and
+  // the downscale worker. The worker is terminated outright — it owns no
+  // state worth flushing once recording has ended.
   const stopRecordingVideoTrack = (): void => {
     const track = recordingVideoTrackRef.current;
     if (track && track.readyState === "live") {
       track.stop();
     }
     recordingVideoTrackRef.current = null;
+    const writer = videoGeneratorWriterRef.current;
+    if (writer) {
+      videoGeneratorWriterRef.current = null;
+      writer.close().catch(() => undefined);
+    }
+    const generator = videoGeneratorRef.current;
+    if (generator) {
+      videoGeneratorRef.current = null;
+    }
+    const worker = recordWorkerRef.current;
+    if (worker) {
+      recordWorkerRef.current = null;
+      worker.terminate();
+    }
   };
   const recordingApiAvailable =
     typeof window.openNow?.beginRecording === "function" &&
@@ -217,7 +252,9 @@ export function useStreamRecorder({
     }
 
     const stream = video.srcObject as MediaStream;
-    const mimeType = selectRecordingMimeType((candidate) => MediaRecorder.isTypeSupported(candidate));
+    const { strategy, mimeType } = selectRecordingStrategy(
+      (candidate) => MediaRecorder.isTypeSupported(candidate),
+    );
     setUsedMimeType(mimeType);
 
     const audioCtx = new AudioContext();
@@ -235,24 +272,25 @@ export function useStreamRecorder({
       audioCtx.createMediaStreamSource(micStream).connect(audioDest);
     }
 
-    // Record via a canvas downscale (720p30 by default) instead of re-encoding
-    // the raw stream track. MediaRecorder encodes on the same main thread as the
-    // WebRTC decoder, so full-res re-encode starves the CPU and makes the stream
-    // stutter — and in severe cases drops ICE back to the home screen. Capping
-    // pixels keeps encode cost low (GFN-native uses a GPU H.264 encoder off the
-    // frame pipeline; the web client can't, so this is the closest parity). The
-    // cap follows the user's recordingResolution/recordingFps settings.
+    // Raw-track path: no canvas, no draw loop — MediaRecorder encodes every
+    // decoded frame directly. Canvas-downscale path (fallback for software-only
+    // platforms): draw at most one frame per record-period into a capped canvas
+    // so a full-res software re-encode can't starve the main thread that also
+    // runs the WebRTC decoder. The cap follows the user's
+    // recordingResolution/recordingFps settings.
+    const rawTrackMode = strategy === "raw-track";
     const recordCap = RECORD_CAP_BY_RESOLUTION[recordingResolution]
       ?? { width: DEFAULT_RECORD_CAP_WIDTH, height: DEFAULT_RECORD_CAP_HEIGHT };
     const recordFps = Number.isFinite(recordingFps) && recordingFps > 0
       ? Math.min(60, Math.round(recordingFps))
       : DEFAULT_RECORD_CAP_FPS;
-    // Actual draw count for the whole recording; compared against the target
-    // rate at stop (computeRecordingFrameShortfall) so the user is told when
-    // the recording was choppier than its nominal fps.
+    // Canvas path only: actual draw count vs the target rate is compared at
+    // stop (computeRecordingFrameShortfall) so the user is told when the
+    // recording was choppier than its nominal fps. The raw-track path has no
+    // draw loop, so there is nothing to count.
     let drawnFrames = 0;
     let recordVideoTrack: MediaStreamTrack | null = null;
-    if (video.videoWidth > 0 && video.videoHeight > 0) {
+    if (!rawTrackMode && video.videoWidth > 0 && video.videoHeight > 0) {
       const scale = Math.min(
         1,
         recordCap.width / video.videoWidth,
@@ -260,36 +298,98 @@ export function useStreamRecorder({
       );
       const capWidth = Math.max(1, Math.round(video.videoWidth * scale));
       const capHeight = Math.max(1, Math.round(video.videoHeight * scale));
-      const cap = document.createElement("canvas");
-      cap.width = capWidth;
-      cap.height = capHeight;
-      const capCtx = cap.getContext("2d");
-      const capStream = cap.captureStream(recordFps);
-      recordVideoTrack = capStream.getVideoTracks()[0];
-      if (recordVideoTrack) {
-        recordVideoTrack.contentHint = "detail";
-        recordingVideoTrackRef.current = recordVideoTrack;
-      }
-      // Draw only when a NEW video frame is presented and cap it to the
-      // recording frame rate. The old loop re-queued requestAnimationFrame
-      // unconditionally, so on 120/144 fps streams the main thread ran a
-      // synchronous full-frame drawImage per display refresh — starving the
-      // WebRTC decoder/compositor and dropping stream FPS.
+      // Downscale off the renderer main thread. The worker draws each frame
+      // into an OffscreenCanvas and returns a GPU-backed ImageBitmap; we feed
+      // it to a MediaStreamTrackGenerator whose track MediaRecorder consumes.
+      // The only main-thread work left is the frame handoff (VideoFrame in,
+      // ImageBitmap out) — no synchronous drawImage, no canvas rasterize
+      // timer.
+      const recordWorker = new Worker(
+        new URL("../recording/recordCanvasWorker.ts", import.meta.url),
+        { type: "module" },
+      );
+      recordWorkerRef.current = recordWorker;
+      const generator = new MediaStreamTrackGenerator({ kind: "video" });
+      videoGeneratorRef.current = generator;
+      videoGeneratorWriterRef.current = generator.writable.getWriter();
+      recordVideoTrack = generator.readable;
+      recordVideoTrack.contentHint = "detail";
+      recordingVideoTrackRef.current = recordVideoTrack;
+      recordWorker.onmessage = (
+        event: MessageEvent<RecordCanvasWorkerOutboundMessage>,
+      ): void => {
+        const message = event.data;
+        if (message.type === "bitmap") {
+          // Wrap the returned bitmap in a frame carrying the pacing timestamp
+          // the draw loop assigned, then hand it to the encoder.
+          const videoFrame = new VideoFrame(message.bitmap, {
+            timestamp: message.timestamp,
+          });
+          message.bitmap.close();
+          const writer = videoGeneratorWriterRef.current;
+          if (!writer) {
+            // Cleanup already ran (recording stopped) — drop the frame.
+            videoFrame.close();
+            writePendingRef.current = false;
+            return;
+          }
+          const write = writer.write(videoFrame);
+          write
+            .then(() => {
+              writePendingRef.current = false;
+            })
+            .catch(() => {
+              writePendingRef.current = false;
+            });
+        } else if (message.type === "thumb") {
+          thumbnailDataUrlRef.current = message.dataUrl;
+        }
+      };
+      const { width: thumbWidth, height: thumbHeight } = fitThumbnailSize(capWidth, capHeight);
+      recordWorker.postMessage({
+        type: "init",
+        width: capWidth,
+        height: capHeight,
+        thumbWidth,
+        thumbHeight,
+      });
+      // Hand one frame to the worker per record-period, at most — draw only
+      // when a NEW video frame is presented and the record-period elapsed. If
+      // the previous frame is still in flight (worker draw or generator write
+      // pending), skip: the missed frames surface in the shortfall notice at
+      // stop instead of backing up the pipeline.
       let lastDrawMs = 0;
+      let frameTimestampUs = 0;
       const drawLatestFrame = (now: number): void => {
         recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
-        if (!capCtx || video.videoWidth === 0 || video.readyState < 2) {
+        if (video.videoWidth === 0 || video.readyState < 2) {
           return;
         }
-        if (now - lastDrawMs >= 1000 / recordFps) {
-          lastDrawMs = now;
-          drawnFrames += 1;
-          capCtx.drawImage(video, 0, 0, capWidth, capHeight);
+        if (now - lastDrawMs < 1000 / recordFps) {
+          return;
         }
+        lastDrawMs = now;
+        if (writePendingRef.current) {
+          return;
+        }
+        writePendingRef.current = true;
+        drawnFrames += 1;
+        const timestamp = frameTimestampUs;
+        frameTimestampUs += Math.round(1_000_000 / recordFps);
+        let videoFrame: VideoFrame;
+        try {
+          videoFrame = new VideoFrame(video);
+        } catch (error) {
+          console.error("[StreamView] Failed to grab recording frame:", error);
+          writePendingRef.current = false;
+          return;
+        }
+        recordWorker.postMessage({ type: "frame", frame: videoFrame, timestamp }, [videoFrame]);
       };
       recordingFrameCallbackRef.current = video.requestVideoFrameCallback(drawLatestFrame);
     }
-    const videoTracksForRecord = recordVideoTrack ? [recordVideoTrack] : stream.getVideoTracks();
+    const videoTracksForRecord =
+      !rawTrackMode && recordVideoTrack ? [recordVideoTrack] : stream.getVideoTracks();
 
     const composed = new MediaStream([
       ...videoTracksForRecord,
@@ -325,47 +425,66 @@ export function useStreamRecorder({
 
     let isFirstChunk = true;
     const recorderOptions: MediaRecorderOptions = { mimeType };
-    if (recordingBitrateMbps !== null) {
-      // 720p30 never benefits from more than ~12 Mbps; capping avoids burning
-      // main-thread MediaRecorder encode budget on a bitrate the picture can't
-      // use (a major source of stream FPS drops during recording). Auto mode
-      // (null) is intentionally left untouched: Chromium picks a conservative
-      // resolution-based default (~2.5 Mbps for 720p) that's already below the
-      // cap, so overriding it would only add encode load.
-      recorderOptions.videoBitsPerSecond =
-        Math.max(1, Math.min(12, Math.round(recordingBitrateMbps))) * 1_000_000;
+    const recordBitrate = clampRecordingBitrate(recordingBitrateMbps, strategy);
+    if (recordBitrate !== undefined) {
+      // Canvas path caps at 12 Mbps — 720p30 never benefits from more, and the
+      // cap avoids burning encode budget on a bitrate the picture can't use (a
+      // major source of stream FPS drops during recording). The raw-track path
+      // records at stream resolution, so the user's explicit bitrate is honored
+      // up to the slider's ceiling instead. Auto mode (null) is left untouched
+      // in both: Chromium's conservative resolution-based default is already
+      // below the cap, so overriding it would only add encode load.
+      recorderOptions.videoBitsPerSecond = recordBitrate;
     }
     const recorder = new MediaRecorder(composed, recorderOptions);
+
+    // Downscale a frame source to the small JPEG thumbnail. Used only in
+    // raw-track mode — the canvas path gets its thumbnail from the worker —
+    // and the encode itself is at thumb size.
+    const thumbnailFromSource = (
+      source: CanvasImageSource,
+      sourceWidth: number,
+      sourceHeight: number,
+    ): void => {
+      const { width, height } = fitThumbnailSize(sourceWidth, sourceHeight);
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(source, 0, 0, width, height);
+        thumbnailDataUrlRef.current = canvas.toDataURL("image/jpeg", 0.72);
+      }
+    };
 
     recorder.ondataavailable = (event: BlobEvent) => {
       if (!event.data || event.data.size === 0) return;
 
       if (isFirstChunk) {
         isFirstChunk = false;
-        const currentVideo = videoRef.current;
-        if (currentVideo && currentVideo.videoWidth > 0 && currentVideo.videoHeight > 0) {
-          const { width, height } = fitThumbnailSize(
-            currentVideo.videoWidth,
-            currentVideo.videoHeight,
-          );
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          const context = canvas.getContext("2d");
-          if (context) {
-            context.drawImage(currentVideo, 0, 0, width, height);
-            thumbnailDataUrlRef.current = canvas.toDataURL("image/jpeg", 0.72);
+        // Canvas path: the worker already posted the thumbnail after its
+        // first drawn frame. Raw-track mode has no worker — fall back to the
+        // presented video frame (cheap there, no draw loop is running).
+        if (rawTrackMode) {
+          const currentVideo = videoRef.current;
+          if (currentVideo && currentVideo.videoWidth > 0 && currentVideo.videoHeight > 0) {
+            thumbnailFromSource(currentVideo, currentVideo.videoWidth, currentVideo.videoHeight);
           }
         }
       }
 
-      void event.data.arrayBuffer().then((buffer) => {
-        const id = recordingIdRef.current;
-        if (!id) return;
-        window.openNow.sendRecordingChunk({ recordingId: id, chunk: buffer }).catch((error: unknown) => {
+      // Serialize the send: append this chunk (read + IPC + disk write) to
+      // the send chain. This runs synchronously inside dataavailable, which
+      // always fires before onstop — so by the time onstop drains the chain,
+      // every chunk including the final one is already queued.
+      const recordingId = recordingIdRef.current;
+      if (!recordingId) return;
+      chunkSendChainRef.current = chunkSendChainRef.current
+        .then(() => event.data.arrayBuffer())
+        .then((buffer) => window.openNow.sendRecordingChunk({ recordingId, chunk: buffer }))
+        .catch((error: unknown) => {
           console.error("[StreamView] Failed to send recording chunk:", error);
         });
-      });
     };
 
     recorder.onstop = () => {
@@ -386,19 +505,30 @@ export function useStreamRecorder({
       if (!id) return;
 
       const durationMs = Date.now() - recordingStartTimeRef.current;
-      const lostFrames = computeRecordingFrameShortfall(drawnFrames, durationMs, recordFps);
-      if (lostFrames > 0) {
-        setRecordingDropNotice(
-          `Recording missed ${lostFrames} frame${lostFrames === 1 ? "" : "s"} — the device could not keep up.`,
-        );
+      // Frame-deficit accounting only applies to the canvas path — the
+      // raw-track path has no draw loop to fall behind.
+      if (strategy === "canvas-downscale") {
+        const lostFrames = computeRecordingFrameShortfall(drawnFrames, durationMs, recordFps);
+        if (lostFrames > 0) {
+          setRecordingDropNotice(
+            `Recording missed ${lostFrames} frame${lostFrames === 1 ? "" : "s"} — the device could not keep up.`,
+          );
+        }
       }
-      void window.openNow
-        .finishRecording({
-          recordingId: id,
-          durationMs,
-          gameTitle,
-          thumbnailDataUrl: thumbnailDataUrlRef.current ?? undefined,
-        })
+      // Drain the chunk queue first: finishRecording moves the temp file, so
+      // any chunk still in flight (read or IPC write) would hit "Unknown
+      // recording id" on the main process and truncate the file. The chain
+      // always resolves (each link catches), so a failed send can't hang this
+      // — only a genuinely wedged disk would.
+      void chunkSendChainRef.current
+        .then(() =>
+          window.openNow.finishRecording({
+            recordingId: id,
+            durationMs,
+            gameTitle,
+            thumbnailDataUrl: thumbnailDataUrlRef.current ?? undefined,
+          }),
+        )
         .then((entry) => {
           setRecordings((prev) => [entry, ...prev].slice(0, 20));
           thumbnailDataUrlRef.current = null;

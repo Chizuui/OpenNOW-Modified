@@ -40,6 +40,50 @@ export function selectRecordingMimeType(
   return RECORDING_MIME_TYPES.find(isTypeSupported) ?? "video/webm";
 }
 
+export type RecordingStrategy = "raw-track" | "canvas-downscale";
+
+export interface RecordingStrategyChoice {
+  strategy: RecordingStrategy;
+  mimeType: string;
+}
+
+/**
+ * Pick the recording path for web mode.
+ *
+ * "raw-track": Chromium records AVC with a platform hardware encoder (Media
+ * Foundation / VideoToolbox / VAAPI) that consumes frames straight off the
+ * decode pipeline. Recording the raw WebRTC track then costs ~nothing on the
+ * renderer main thread — the GFN-native model. "canvas-downscale": only
+ * software codecs are available (e.g. VP8 on Linux without VAAPI), so a
+ * full-res re-encode would starve the main thread that also runs the WebRTC
+ * decoder; the canvas downscale bounds that cost.
+ */
+export function selectRecordingStrategy(
+  isTypeSupported: (mimeType: string) => boolean,
+): RecordingStrategyChoice {
+  const mimeType = selectRecordingMimeType(isTypeSupported);
+  const strategy: RecordingStrategy = mimeType.includes("avc1")
+    ? "raw-track"
+    : "canvas-downscale";
+  return { strategy, mimeType };
+}
+
+/**
+ * Bound the user's recording bitrate per strategy. Canvas-downscale caps at
+ * 12 Mbps (720p30 never benefits from more). Raw-track records at stream
+ * resolution, so the user's explicit choice is honored up to the settings
+ * slider's ceiling. `null` (auto) returns `undefined` — Chromium's
+ * conservative resolution-based default is left untouched.
+ */
+export function clampRecordingBitrate(
+  recordingBitrateMbps: number | null,
+  strategy: RecordingStrategy,
+): number | undefined {
+  if (recordingBitrateMbps === null) return undefined;
+  const max = strategy === "raw-track" ? 75 : 12;
+  return Math.max(1, Math.min(max, Math.round(recordingBitrateMbps))) * 1_000_000;
+}
+
 export interface ThumbnailSize {
   width: number;
   height: number;

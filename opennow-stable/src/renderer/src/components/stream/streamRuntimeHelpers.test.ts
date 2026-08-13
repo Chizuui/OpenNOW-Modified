@@ -4,10 +4,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  clampRecordingBitrate,
   computeRecordingFrameShortfall,
   fitThumbnailSize,
   getShortcutConflictError,
   selectRecordingMimeType,
+  selectRecordingStrategy,
 } from "./streamRuntimeHelpers";
 
 test("shortcut conflict validation preserves empty, invalid, and conflict errors", () => {
@@ -26,6 +28,46 @@ test("recording MIME selection uses the first supported preference", () => {
     "video/webm;codecs=h264",
   );
   assert.equal(selectRecordingMimeType(() => false), "video/webm");
+});
+
+test("recording strategy uses raw track when hardware AVC is available", () => {
+  // Everything supported → AVC MP4 wins and records the raw track (GFN-like).
+  assert.deepEqual(selectRecordingStrategy(() => true), {
+    strategy: "raw-track",
+    mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  });
+  // Only non-baseline AVC MP4 supported → still raw-track.
+  assert.deepEqual(
+    selectRecordingStrategy((mimeType) => mimeType === "video/mp4;codecs=avc1"),
+    { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1" },
+  );
+  // Software-only platforms (e.g. VP8 on Linux without VAAPI) → canvas downscale.
+  assert.deepEqual(
+    selectRecordingStrategy((mimeType) => mimeType === "video/webm;codecs=vp8"),
+    { strategy: "canvas-downscale", mimeType: "video/webm;codecs=vp8" },
+  );
+  // Nothing supported → last-resort webm still routes through the canvas.
+  assert.deepEqual(selectRecordingStrategy(() => false), {
+    strategy: "canvas-downscale",
+    mimeType: "video/webm",
+  });
+});
+
+test("recording bitrate clamp honors strategy ceilings", () => {
+  // Auto mode is left untouched in both strategies.
+  assert.equal(clampRecordingBitrate(null, "raw-track"), undefined);
+  assert.equal(clampRecordingBitrate(null, "canvas-downscale"), undefined);
+  // Canvas-downscale caps at 12 Mbps (720p30 ceiling).
+  assert.equal(clampRecordingBitrate(12, "canvas-downscale"), 12_000_000);
+  assert.equal(clampRecordingBitrate(50, "canvas-downscale"), 12_000_000);
+  assert.equal(clampRecordingBitrate(3, "canvas-downscale"), 3_000_000);
+  // Raw-track records at stream resolution — the slider ceiling (75) applies.
+  assert.equal(clampRecordingBitrate(30, "raw-track"), 30_000_000);
+  assert.equal(clampRecordingBitrate(80, "raw-track"), 75_000_000);
+  assert.equal(clampRecordingBitrate(10.4, "raw-track"), 10_000_000);
+  // Degenerate inputs stay at the floor.
+  assert.equal(clampRecordingBitrate(0, "raw-track"), 1_000_000);
+  assert.equal(clampRecordingBitrate(-5, "canvas-downscale"), 1_000_000);
 });
 
 test("thumbnail sizing preserves aspect ratio within recording bounds", () => {
