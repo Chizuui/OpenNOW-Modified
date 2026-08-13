@@ -30,27 +30,69 @@ test("recording MIME selection uses the first supported preference", () => {
   assert.equal(selectRecordingMimeType(() => false), "video/webm");
 });
 
-test("recording strategy uses raw track when hardware AVC is available", () => {
-  // Everything supported → AVC MP4 wins and records the raw track (GFN-like).
-  assert.deepEqual(selectRecordingStrategy(() => true), {
-    strategy: "raw-track",
-    mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-  });
-  // Only non-baseline AVC MP4 supported → still raw-track.
+test("recording strategy uses raw track only when AVC encode is hardware", async () => {
+  // AVC supported AND power-efficient (hardware) → raw track (GFN-like).
   assert.deepEqual(
-    selectRecordingStrategy((mimeType) => mimeType === "video/mp4;codecs=avc1"),
-    { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1" },
+    await selectRecordingStrategy(() => true, async () => ({ powerEfficient: true })),
+    {
+      strategy: "raw-track",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: true,
+    },
   );
-  // Software-only platforms (e.g. VP8 on Linux without VAAPI) → canvas downscale.
+  // Only non-baseline AVC MP4 supported, hardware → still raw-track.
   assert.deepEqual(
-    selectRecordingStrategy((mimeType) => mimeType === "video/webm;codecs=vp8"),
-    { strategy: "canvas-downscale", mimeType: "video/webm;codecs=vp8" },
+    await selectRecordingStrategy(
+      (mimeType) => mimeType === "video/mp4;codecs=avc1",
+      async () => ({ powerEfficient: true }),
+    ),
+    { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1", hwAccelerated: true },
+  );
+  // AVC supported but the encoder is SOFTWARE (OpenH264 fallback) → the
+  // full-res raw track would starve the WebRTC decoder (8-fps field report),
+  // so it falls back to the bounded canvas downscale.
+  assert.deepEqual(
+    await selectRecordingStrategy(() => true, async () => ({ powerEfficient: false })),
+    {
+      strategy: "canvas-downscale",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: false,
+    },
+  );
+  // Probe unavailable / throws → safe canvas path, never a software full-res
+  // raw track.
+  assert.deepEqual(
+    await selectRecordingStrategy(() => true, async () => undefined),
+    {
+      strategy: "canvas-downscale",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: false,
+    },
+  );
+  assert.deepEqual(
+    await selectRecordingStrategy(() => true, async () => {
+      throw new Error("no mediaCapabilities");
+    }),
+    {
+      strategy: "canvas-downscale",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: false,
+    },
+  );
+  // Software-only platforms (e.g. VP8 on Linux without VAAPI) → canvas
+  // downscale regardless of the probe.
+  assert.deepEqual(
+    await selectRecordingStrategy(
+      (mimeType) => mimeType === "video/webm;codecs=vp8",
+      async () => ({ powerEfficient: true }),
+    ),
+    { strategy: "canvas-downscale", mimeType: "video/webm;codecs=vp8", hwAccelerated: false },
   );
   // Nothing supported → last-resort webm still routes through the canvas.
-  assert.deepEqual(selectRecordingStrategy(() => false), {
-    strategy: "canvas-downscale",
-    mimeType: "video/webm",
-  });
+  assert.deepEqual(
+    await selectRecordingStrategy(() => false, async () => ({ powerEfficient: true })),
+    { strategy: "canvas-downscale", mimeType: "video/webm", hwAccelerated: false },
+  );
 });
 
 test("recording bitrate clamp honors strategy ceilings", () => {

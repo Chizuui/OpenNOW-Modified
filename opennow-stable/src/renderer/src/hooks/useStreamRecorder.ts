@@ -252,7 +252,7 @@ export function useStreamRecorder({
     }
 
     const stream = video.srcObject as MediaStream;
-    const { strategy, mimeType } = selectRecordingStrategy(
+    const { strategy, mimeType } = await selectRecordingStrategy(
       (candidate) => MediaRecorder.isTypeSupported(candidate),
     );
     setUsedMimeType(mimeType);

@@ -45,27 +45,89 @@ export type RecordingStrategy = "raw-track" | "canvas-downscale";
 export interface RecordingStrategyChoice {
   strategy: RecordingStrategy;
   mimeType: string;
+  /** True when the chosen encoder runs on hardware (power-efficient). */
+  hwAccelerated: boolean;
 }
+
+/**
+ * MediaCapabilities encode probe, injected so tests can stub it. Defaults to
+ * `navigator.mediaCapabilities.encodingInfo` for a MediaRecorder session.
+ */
+export type RecordingEncodeProbe = (
+  config: {
+    contentType: string;
+    width: number;
+    height: number;
+    bitrate: number;
+    framerate: number;
+  },
+) => Promise<{ powerEfficient?: boolean } | undefined>;
 
 /**
  * Pick the recording path for web mode.
  *
- * "raw-track": Chromium records AVC with a platform hardware encoder (Media
- * Foundation / VideoToolbox / VAAPI) that consumes frames straight off the
- * decode pipeline. Recording the raw WebRTC track then costs ~nothing on the
- * renderer main thread — the GFN-native model. "canvas-downscale": only
- * software codecs are available (e.g. VP8 on Linux without VAAPI), so a
- * full-res re-encode would starve the main thread that also runs the WebRTC
- * decoder; the canvas downscale bounds that cost.
+ * "raw-track": the raw WebRTC video track goes straight into MediaRecorder
+ * (GFN-native model). "canvas-downscale": a downscaled canvas track bounds
+ * the encode cost.
+ *
+ * Raw-track is ONLY chosen when `avc1` is supported AND the encoder is
+ * hardware (power-efficient per MediaCapabilities). `isTypeSupported` alone
+ * is not enough: on machines without Media Foundation / VideoToolbox / VAAPI
+ * hardware AVC encode, Chromium silently falls back to the software OpenH264
+ * encoder, and a full-resolution software re-encode of a 1080p60 stream
+ * saturates the CPU that also runs the WebRTC decoder — the stream drops to
+ * single-digit FPS while recording (the field report). Software encodes
+ * instead go through the bounded 720p30 canvas downscale.
  */
-export function selectRecordingStrategy(
+export async function selectRecordingStrategy(
   isTypeSupported: (mimeType: string) => boolean,
-): RecordingStrategyChoice {
+  encodeProbe: RecordingEncodeProbe = defaultRecordingEncodeProbe,
+): Promise<RecordingStrategyChoice> {
   const mimeType = selectRecordingMimeType(isTypeSupported);
-  const strategy: RecordingStrategy = mimeType.includes("avc1")
-    ? "raw-track"
-    : "canvas-downscale";
-  return { strategy, mimeType };
+  if (!mimeType.includes("avc1")) {
+    return { strategy: "canvas-downscale", mimeType, hwAccelerated: false };
+  }
+  try {
+    const info = await encodeProbe({
+      contentType: mimeType,
+      width: 1920,
+      height: 1080,
+      bitrate: 12_000_000,
+      framerate: 60,
+    });
+    if (info?.powerEfficient) {
+      return { strategy: "raw-track", mimeType, hwAccelerated: true };
+    }
+  } catch {
+    // Probe unavailable (old runtime / sandbox) — fall through to the safe
+    // canvas path rather than risk a software full-res encode.
+  }
+  return { strategy: "canvas-downscale", mimeType, hwAccelerated: false };
+}
+
+async function defaultRecordingEncodeProbe(
+  config: {
+    contentType: string;
+    width: number;
+    height: number;
+    bitrate: number;
+    framerate: number;
+  },
+): Promise<{ powerEfficient?: boolean } | undefined> {
+  if (!navigator.mediaCapabilities?.encodingInfo) {
+    return undefined;
+  }
+  const result = await navigator.mediaCapabilities.encodingInfo({
+    type: "record",
+    video: {
+      contentType: config.contentType,
+      width: config.width,
+      height: config.height,
+      bitrate: config.bitrate,
+      framerate: config.framerate,
+    },
+  });
+  return { powerEfficient: result.powerEfficient };
 }
 
 /**
