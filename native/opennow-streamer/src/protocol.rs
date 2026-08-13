@@ -751,10 +751,15 @@ pub enum Event {
     /// The Electron main process waits for this before finalizing the file.
     /// `thumbnail_base64` is a JPEG of the first encoded recording frame
     /// (base64, no data URL prefix); `None` when no frame was captured.
+    /// `dropped_frames` is how many recording frames the branch dropped
+    /// because the encoder/queue could not keep up (leaky queue drops) —
+    /// surfaced to the user so a choppy recording is explained, not a mystery.
     #[serde(rename = "recording-finished")]
     RecordingFinished {
         #[serde(rename = "thumbnailBase64", skip_serializing_if = "Option::is_none")]
         thumbnail_base64: Option<String>,
+        #[serde(rename = "droppedFrames")]
+        dropped_frames: u64,
     },
     /// The negotiated video codec produced zero decoded frames during startup
     /// (every decoder candidate exhausted, keyframes and latency resyncs did
@@ -914,16 +919,20 @@ mod tests {
 
         let finished = serde_json::to_value(Event::RecordingFinished {
             thumbnail_base64: Some("L3RodW1ibmFpbA==".to_owned()),
+            dropped_frames: 0,
         })
         .expect("serializes");
         assert_eq!(finished["type"], "recording-finished");
         assert_eq!(finished["thumbnailBase64"], "L3RodW1ibmFpbA==");
+        assert_eq!(finished["droppedFrames"], 0);
 
         let finished_none = serde_json::to_value(Event::RecordingFinished {
             thumbnail_base64: None,
+            dropped_frames: 12,
         })
         .expect("serializes");
         assert!(finished_none.get("thumbnailBase64").is_none());
+        assert_eq!(finished_none["droppedFrames"], 12);
     }
 
     #[test]

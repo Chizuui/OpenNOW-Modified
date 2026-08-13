@@ -236,9 +236,11 @@ export interface OpenNowApi {
 
   /**
    * Finalize the native recording; resolves after every chunk was written.
-   * Returns the base64 JPEG thumbnail of the first encoded frame, if any.
+   * Returns the base64 JPEG thumbnail of the first encoded frame (if any)
+   * plus how many recording frames were dropped because the encoder/queue
+   * could not keep up (0 = clean recording).
    */
-  stopNativeRecording(): Promise<string | undefined>;
+  stopNativeRecording(): Promise<{ thumbnailBase64?: string; droppedFrames: number }>;
 
   /** Abort the native recording without finalizing the file. */
   abortNativeRecording(): Promise<void>;

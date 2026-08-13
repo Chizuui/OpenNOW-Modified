@@ -420,6 +420,8 @@
       "appliesAfterRestart": "앱을 다시 시작한 후 적용됩니다.",
       "requiresH265OrAv1": "이 모드에는 H265 또는 AV1이 필요합니다. 코덱이 자동으로 전환됩니다.",
       "nativeColorLockedHint": "네이티브 모드는 8비트 BT.709(SDR)로 렌더링되며 색 심도는 8비트 4:2:0으로 고정됩니다.",
+      "recording": "녹화",
+      "recordingAtStreamQuality": "네이티브 모드는 스트림을 원래 품질 그대로 녹화합니다 — 해상도, FPS, 비트레이트는 스트림을 따르며 여기서 변경할 수 없습니다.",
       "testing": "테스트 중...",
       "gpu": "GPU",
       "cpu": "CPU",

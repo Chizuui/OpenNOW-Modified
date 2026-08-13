@@ -136,7 +136,9 @@ export class NativeStreamerManager {
   /** recordingId of the active native recording; chunks are appended to it. */
   private activeNativeRecordingId: string | null = null;
   /** Resolver for the in-flight `stop-recording` finalization wait. */
-  private pendingRecordingFinishedResolve: ((thumbnailBase64?: string) => void) | null = null;
+  private pendingRecordingFinishedResolve:
+    | ((result: { thumbnailBase64?: string; droppedFrames: number }) => void)
+    | null = null;
   private pendingRecordingFinishedReject: ((error: Error) => void) | null = null;
   /** Serialize native chunk writes; stdout events can arrive faster than disk writes. */
   private recordingChunkQueue: Promise<void> = Promise.resolve();
@@ -540,23 +542,25 @@ export class NativeStreamerManager {
   /**
    * Finalize the native recording: flush the encoder/muxer with EOS, wait for
    * the `recording-finished` event (which arrives strictly after every chunk
-   * has been emitted and appended), then resolve.
+   * has been emitted and appended), then resolve with the thumbnail (if the
+   * streamer captured one) and the dropped-frame count.
    */
-  async stopNativeRecording(): Promise<string | undefined> {
+  async stopNativeRecording(): Promise<{ thumbnailBase64?: string; droppedFrames: number }> {
     if (!this.child || !this.activeSessionId) {
       this.activeNativeRecordingId = null;
       throw new Error("Native streamer is not running.");
     }
 
-    const finished = new Promise<string | undefined>((resolve, reject) => {
-      this.pendingRecordingFinishedResolve = resolve;
-      this.pendingRecordingFinishedReject = reject;
-    });
+    const finished = new Promise<{ thumbnailBase64?: string; droppedFrames: number }>(
+      (resolve, reject) => {
+        this.pendingRecordingFinishedResolve = resolve;
+        this.pendingRecordingFinishedReject = reject;
+      },
+    );
     const clearPending = () => {
       this.pendingRecordingFinishedResolve = null;
       this.pendingRecordingFinishedReject = null;
     };
-    let thumbnailBase64: string | undefined;
     try {
       await this.request({ type: "stop-recording", finalize: true }, RECORDING_STOP_TIMEOUT_MS);
     } catch (error) {
@@ -565,7 +569,7 @@ export class NativeStreamerManager {
       throw error;
     }
     try {
-      thumbnailBase64 = await Promise.race([
+      const result = await Promise.race([
         finished,
         new Promise<never>((_, reject) => {
           const timeout = setTimeout(() => {
@@ -575,10 +579,10 @@ export class NativeStreamerManager {
           timeout.unref?.();
         }),
       ]);
+      return result;
     } finally {
       this.activeNativeRecordingId = null;
     }
-    return thumbnailBase64;
   }
 
   /** Abort the native recording without finalizing (keeps the branch usable). */
@@ -1075,7 +1079,10 @@ export class NativeStreamerManager {
       this.pendingRecordingFinishedResolve = null;
       this.pendingRecordingFinishedReject = null;
       void this.recordingChunkQueue.finally(() => {
-        resolve?.(message.thumbnailBase64);
+        resolve?.({
+          thumbnailBase64: message.thumbnailBase64,
+          droppedFrames: message.droppedFrames ?? 0,
+        });
       });
       return;
     }

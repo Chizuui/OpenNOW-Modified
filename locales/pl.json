@@ -420,6 +420,8 @@
       "appliesAfterRestart": "Stosuje się po ponownym uruchomieniu aplikacji.",
       "requiresH265OrAv1": "Ten tryb potrzebuje H265 albo AV1. Kodek będzie automatycznie przełączony.",
       "nativeColorLockedHint": "Tryb natywny renderuje 8-bit BT.709 (SDR); głębia kolorów jest zablokowana na 8-bit 4:2:0.",
+      "recording": "Nagrywanie",
+      "recordingAtStreamQuality": "Tryb natywny nagrywa stream w pełnej jakości — rozdzielczość, FPS i bitrate są zgodne ze streamem i nie można ich tutaj zmienić.",
       "testing": "Testowanie...",
       "gpu": "GPU",
       "cpu": "CPU",

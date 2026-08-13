@@ -421,6 +421,8 @@
       "appliesAfterRestart": "Gilt nach dem Neustart der App.",
       "requiresH265OrAv1": "Dieser Modus erfordert H265 oder AV1. Der Codec wird automatisch umgeschaltet.",
       "nativeColorLockedHint": "Der native Modus rendert 8-Bit BT.709 (SDR); die Farbtiefe ist auf 8-Bit 4:2:0 festgelegt.",
+      "recording": "Aufnahme",
+      "recordingAtStreamQuality": "Der native Modus zeichnet den Stream in voller Qualität auf — Auflösung, FPS und Bitrate folgen dem Stream und können hier nicht geändert werden.",
       "testing": "Testen...",
       "gpu": "GPU",
       "cpu": "CPU",

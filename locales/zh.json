@@ -420,6 +420,8 @@
       "appliesAfterRestart": "应用程序重新启动后适用。",
       "requiresH265OrAv1": "此模式需要 H265 或 AV1。编解码器将自动切换。",
       "nativeColorLockedHint": "原生模式以 8 位 BT.709（SDR）渲染；色深锁定为 8 位 4:2:0。",
+      "recording": "录制",
+      "recordingAtStreamQuality": "原生模式按流的原始质量录制 — 分辨率、帧率和码率跟随流，无法在此更改。",
       "testing": "测试...",
       "gpu": "图形处理器",
       "cpu": "中央处理器",

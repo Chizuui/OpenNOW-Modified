@@ -420,6 +420,8 @@
       "appliesAfterRestart": "Uygulama yeniden başlatıldıktan sonra geçerlidir.",
       "requiresH265OrAv1": "Bu mod H265 veya AV1 gerektirir. Codec otomatik olarak değiştirilecektir.",
       "nativeColorLockedHint": "Yerel mod 8 bit BT.709 (SDR) oluşturur; renk derinliği 8 bit 4:2:0 ile kilitlidir.",
+      "recording": "Kayıt",
+      "recordingAtStreamQuality": "Yerel mod, akışı tam kalitesiyle kaydeder — çözünürlük, FPS ve bit hızı akışı takip eder ve burada değiştirilemez.",
       "testing": "Test ediliyor...",
       "gpu": "GPU",
       "cpu": "CPU",

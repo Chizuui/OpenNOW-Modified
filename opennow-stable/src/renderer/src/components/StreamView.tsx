@@ -855,6 +855,8 @@ export function StreamView({
         recordingBitrateMbps={recordingBitrateMbps}
         recordingResolution={recordingResolution}
         recordingFps={recordingFps}
+        nativeRecording={nativeRendererActive}
+        recordingDropNotice={streamRecorder.recordingDropNotice}
         onRecordingResolutionChange={onRecordingResolutionChange}
         onRecordingFpsChange={onRecordingFpsChange}
         onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}

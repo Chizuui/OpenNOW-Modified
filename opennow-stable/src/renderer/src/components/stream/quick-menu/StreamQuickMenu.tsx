@@ -64,6 +64,9 @@ interface StreamQuickMenuProps {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  nativeRecording: boolean;
+  /** Shown after a recording that dropped frames (encoder/queue could not keep up). */
+  recordingDropNotice: string | null;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
@@ -116,6 +119,8 @@ export function StreamQuickMenu({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  nativeRecording,
+  recordingDropNotice,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
@@ -307,6 +312,8 @@ export function StreamQuickMenu({
                 recordingBitrateMbps={recordingBitrateMbps}
                 recordingResolution={recordingResolution}
                 recordingFps={recordingFps}
+                nativeRecording={nativeRecording}
+                recordingDropNotice={recordingDropNotice}
                 onRecordingResolutionChange={onRecordingResolutionChange}
                 onRecordingFpsChange={onRecordingFpsChange}
                 onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}

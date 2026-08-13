@@ -45,6 +45,29 @@ export interface ThumbnailSize {
   height: number;
 }
 
+/**
+ * How many frames the recording fell short of its target frame rate.
+ *
+ * The web-mode recorder draws at most one video frame per record-period
+ * (canvas downscale + MediaRecorder). When the main thread cannot keep up
+ * (drawImage + encode saturate the CPU, the weak-device case), draws happen
+ * less often than the target and the recording plays back with repeated
+ * frames. This counts the deficit against the wall-clock target; stream-side
+ * stalls show up here too, which is the user-facing truth — the recording IS
+ * choppier than its nominal rate either way.
+ */
+export function computeRecordingFrameShortfall(
+  drawnFrames: number,
+  elapsedMs: number,
+  recordFps: number,
+): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0 || !(recordFps > 0)) {
+    return 0;
+  }
+  const expectedFrames = Math.ceil((elapsedMs / 1000) * recordFps);
+  return Math.max(0, expectedFrames - Math.max(0, Math.round(drawnFrames)));
+}
+
 export function fitThumbnailSize(
   width: number,
   height: number,

@@ -623,25 +623,28 @@ impl GstreamerVideoTap {
 /// recording costs nothing to the live stream, exactly like the official
 /// GeForce Now client ("just write what we receive to disk"). The file is
 /// H265/H264/AV1 (whatever the server sent) at the exact received quality.
+/// The MP4 carries the colour metadata (colr) for the stream's full-range
+/// BT.709 — no re-encode, so the recording is the exact received bitstream.
+///
+/// `Encoded` taps the DECODED video frames (the same reliable post-decode
+/// tee the transcode branch uses) and re-encodes to H.264 — so the recording
+/// captures EXACTLY what the user sees, immune to WAN RTP jitter/loss and
+/// GFN stream restarts that the raw-RTP tap cannot survive (the field's
+/// truncated video + A/V desync: the raw branch lost 35-44% of frames and
+/// stalled ~43 s into long recordings while the live path stayed smooth,
+/// because the branch taps BEFORE webrtcbin's rtpbin and has no
+/// retransmission recovery). Unlike `Transcode`, the encoded ES is written to
+/// a temp file and muxed OFFLINE at stop (`remux_encoded_recording`) — no
+/// live muxer, so the branch can never wedge. The re-encode costs GPU/CPU
+/// while recording (the encoder competes with the decoder on single-iGPU
+/// laptops), so it is opt-in via OPENNOW_RECORDING_MODE=encoded.
 ///
 /// `Transcode` taps the DECODED video (post-decode tee), converts to 8-bit
 /// 4:2:0 and re-encodes with H.264 (d3d12h264enc GPU encoder by default).
 /// Universal H.264 output, but the encode competes with the decoder for the
 /// same GPU — on single-iGPU laptops this shows up as decode-time spikes and
-/// stream stutter while recording (the field report). Set
-/// OPENNOW_RECORDING_MODE=transcode to opt back in.
-///
-/// `Encoded` (the DEFAULT) taps the DECODED video frames (the same reliable
-/// post-decode tee the transcode branch uses) and re-encodes to H.264 — so
-/// the recording captures EXACTLY what the user sees, immune to WAN RTP
-/// jitter/loss and GFN stream restarts that the raw-RTP tap cannot survive
-/// (the field's truncated video + A/V desync: the raw branch lost 35-44% of
-/// frames and stalled ~43 s into long recordings while the live path stayed
-/// smooth, because the branch taps BEFORE webrtcbin's rtpbin and has no
-/// retransmission recovery). Unlike `Transcode`, the encoded ES is written to
-/// a temp file and muxed OFFLINE at stop (`remux_encoded_recording`) — no
-/// live muxer, so the branch can never wedge. Set
-/// OPENNOW_RECORDING_MODE=passthrough for the zero-cost raw-RTP remux.
+/// stream stutter while recording (the field report). Opt-in via
+/// OPENNOW_RECORDING_MODE=transcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordingMode {
     PassThrough,
@@ -652,9 +655,11 @@ pub(crate) enum RecordingMode {
 impl RecordingMode {
     pub(crate) fn from_env() -> Self {
         match std::env::var("OPENNOW_RECORDING_MODE").as_deref() {
-            Ok("passthrough") => RecordingMode::PassThrough,
             Ok("transcode") => RecordingMode::Transcode,
-            _ => RecordingMode::Encoded,
+            Ok("encoded") => RecordingMode::Encoded,
+            // Default: the zero-cost raw-RTP remux ("just write what we
+            // receive"), exactly like the official GeForce Now client.
+            _ => RecordingMode::PassThrough,
         }
     }
 }
@@ -921,6 +926,21 @@ pub(crate) struct GstreamerRecordingState {
     pub(crate) rec_frames_first_pts: Arc<AtomicU64>,
     pub(crate) rec_frames_last_pts: Arc<AtomicU64>,
     pub(crate) rec_frames_count: Arc<AtomicU64>,
+    /// Buffers pushed into the recording branch's decoupling queue (valve
+    /// sink side). Every recording frame enters here; buffers dropped by the
+    /// leaky queue (encoder/queue could not keep up — the choppy-recording
+    /// case on weak devices) are counted in `queue_input` but never reach
+    /// `queue_output`. Reset on `start()`; the drop count is exact at `stop()`
+    /// after the queue drains.
+    pub(crate) queue_input: Arc<AtomicU64>,
+    /// Buffers that left the recording branch's decoupling queue (src side)
+    /// and were handed to the encoder/filesink.
+    pub(crate) queue_output: Arc<AtomicU64>,
+    /// Dropped recording frames of the LAST finished recording
+    /// (`queue_input − queue_output` after the drain at stop) — sent to
+    /// Electron in `recording-finished` so the UI can tell the user why the
+    /// clip is choppier than the stream.
+    pub(crate) dropped_frames: Arc<AtomicU64>,
     /// Pass-through IDR gate: while false, buffers are dropped until the
     /// first sync (IDR) access unit arrives, so the remuxed file never starts
     /// mid-GOP with orphan P-frames (the old remux glitch). `start()` resets
@@ -1185,6 +1205,12 @@ impl GstreamerRecordingState {
         self.rec_frames_first_pts.store(0, Ordering::SeqCst);
         self.rec_frames_last_pts.store(0, Ordering::SeqCst);
         self.rec_frames_count.store(0, Ordering::SeqCst);
+        // Reset the queue drop counters so each recording measures its own
+        // window (an aborted + restarted recording on the KEPT branch must
+        // never blend two windows).
+        self.queue_input.store(0, Ordering::SeqCst);
+        self.queue_output.store(0, Ordering::SeqCst);
+        self.dropped_frames.store(0, Ordering::SeqCst);
         // Set active before opening the valves so the chunk probe never drops
         // the first muxer output (ftyp + moov).
         self.active.store(true, Ordering::SeqCst);
@@ -1483,6 +1509,20 @@ impl GstreamerRecordingState {
         }
         let drain_ms = drain_ms.elapsed().as_millis();
 
+        // The video queue is drained (empty) after the wait above, so every
+        // input buffer either left the queue into the encoder/filesink or was
+        // dropped by the leaky queue while it was full — `dropped_frames` is
+        // exact at this point. Surfaced to the user at stop so a choppy
+        // recording (encoder could not keep up on a weak device) is
+        // explained instead of silently degraded.
+        self.dropped_frames.store(
+            self
+                .queue_input
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.queue_output.load(Ordering::Relaxed)),
+            Ordering::SeqCst,
+        );
+
         match self.mode {
             RecordingMode::PassThrough | RecordingMode::Encoded => self.stop_pass_through(drain_ms),
             RecordingMode::Transcode => self.stop_transcode(drain_ms),
@@ -1614,35 +1654,11 @@ impl GstreamerRecordingState {
                 &remux_out,
                 &self.codec,
                 self.fps,
-                self.record_bitrate_kbps.load(Ordering::SeqCst),
                 &self.event_sender,
             ),
         };
-        let bytes = match remux_result {
-            Ok(_size) => match std::fs::read(&remux_out) {
-                Ok(bytes) if !bytes.is_empty() => bytes,
-                _ => {
-                    let _ = std::fs::remove_file(&remux_out);
-                    for path in [video_es.as_ref(), audio_es.as_ref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    self.active.store(false, Ordering::SeqCst);
-                    self.spent.store(true, Ordering::SeqCst);
-                    send_log(
-                        &self.event_sender,
-                        "error",
-                        "Recording captured no media (empty elementary streams); nothing saved."
-                            .to_owned(),
-                    );
-                    return Err(
-                        "Recording captured no media (empty elementary streams); nothing saved."
-                            .to_owned(),
-                    );
-                }
-            },
+        let finalize_size = match remux_result {
+            Ok(size) => size,
             Err(error) => {
                 let _ = std::fs::remove_file(&remux_out);
                 for path in [video_es.as_ref(), audio_es.as_ref()]
@@ -1658,18 +1674,49 @@ impl GstreamerRecordingState {
                 return Err(message);
             }
         };
-        if let Some(sender) = &self.event_sender {
-            send_recording_chunks(sender, &bytes);
+        if finalize_size == 0 {
+            let _ = std::fs::remove_file(&remux_out);
+            for path in [video_es.as_ref(), audio_es.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            self.active.store(false, Ordering::SeqCst);
+            self.spent.store(true, Ordering::SeqCst);
+            send_log(
+                &self.event_sender,
+                "error",
+                "Recording captured no media (empty elementary streams); nothing saved."
+                    .to_owned(),
+            );
+            return Err(
+                "Recording captured no media (empty elementary streams); nothing saved."
+                    .to_owned(),
+            );
         }
-        send_log(
-            &self.event_sender,
-            "info",
-            format!(
-                "Native recording finalized: {} bytes remuxed offline into a standard seekable MP4 (delivered in {} chunk(s)).",
-                bytes.len(),
-                bytes.chunks(RECORDING_CHUNK_BYTES).count()
-            ),
-        );
+        // Stream the finalized MP4 to Electron in fixed-size chunks — the
+        // whole file is never read into memory (each helper reads one window
+        // at a time), so a long recording cannot OOM the finalize on a weak
+        // device. PassThrough recordings additionally get their `colr` box
+        // (BT.709 full-range, matching the received bitstream) tagged into
+        // the head while streaming — no re-encode, so the colour fix is pure
+        // metadata.
+        if let Some(sender) = &self.event_sender {
+            let streamed = if self.mode == RecordingMode::PassThrough {
+                stream_recording_with_colr_tag(sender, &remux_out, &self.event_sender)?
+            } else {
+                stream_recording_file_as_chunks(sender, &remux_out)?
+            };
+            send_log(
+                &self.event_sender,
+                "info",
+                format!(
+                    "Native recording finalized: {streamed} bytes remuxed offline into a standard seekable MP4, delivered in {} chunk(s).",
+                    (streamed as usize).div_ceil(RECORDING_CHUNK_BYTES),
+                ),
+            );
+        }
         // Cleanup: delete the temp ES files and the remux output; the branch
         // is spent (filesinks saw EOS) so the next recording rebuilds fresh.
         for path in [Some(&remux_out), video_es.as_ref(), audio_es.as_ref()]
@@ -3213,9 +3260,12 @@ impl GstreamerPipeline {
         if finalize {
             // The remux recorder has no decoded frames, so no thumbnail is
             // captured (the gallery can generate one from the file later).
+            // `dropped_frames` is the queue-drop count computed inside
+            // `state.stop` after the drain — 0 when the encoder kept up.
             if let Some(event_sender) = &self.event_sender {
                 let _ = event_sender.send(Event::RecordingFinished {
                     thumbnail_base64: None,
+                    dropped_frames: state.dropped_frames.load(Ordering::SeqCst),
                 });
             }
         }
@@ -7087,6 +7137,35 @@ pub(crate) fn build_transcode_record_branch(
     queue.set_property("max-size-buffers", 4u32);
     queue.set_property("max-size-bytes", 0u32);
     queue.set_property("max-size-time", 0u64);
+
+    // Count recording-frame drops: every frame enters the queue (sink pad)
+    // and either leaves it (src pad) or is dropped by leaky=upstream while
+    // the queue is full — the exact "encoder could not keep up" case on weak
+    // devices. After the drain at stop the queue is empty, so `input − output`
+    // is the precise drop count for the recording (surfaced via
+    // `recording-finished.droppedFrames`).
+    let queue_input = Arc::new(AtomicU64::new(0));
+    let queue_output = Arc::new(AtomicU64::new(0));
+    {
+        let input = queue_input.clone();
+        let queue_sink = queue
+            .static_pad("sink")
+            .ok_or_else(|| "Recording queue has no sink pad.".to_owned())?;
+        queue_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            input.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let output = queue_output.clone();
+        let queue_src = queue
+            .static_pad("src")
+            .ok_or_else(|| "Recording queue has no src pad.".to_owned())?;
+        queue_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            output.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
     // Swallow queue: the chunk/EOS probes live on its sink pad and return
     // DROP, so qtmux's push always returns FLOW_OK and its src task keeps
     // running with an otherwise-unlinked tail (no NOT_LINKED parking).
@@ -7155,7 +7234,8 @@ pub(crate) fn build_transcode_record_branch(
     // written raw and muxed OFFLINE at stop by `remux_encoded_recording` — no
     // live muxer in the pipeline, so a muxer stall can never freeze the
     // recording branch (the field wedge that killed the live-qtmux versions
-    // of this branch). `Encoded` mode (the default) is exactly this.
+    // of this branch). `Encoded` mode (opt-in via OPENNOW_RECORDING_MODE) is
+    // exactly this.
     let muxer = if es_tail { None } else { Some(make_element("qtmux")?) };
     if let Some(muxer) = muxer.as_ref() {
         muxer.set_property("faststart", true);
@@ -7446,6 +7526,9 @@ pub(crate) fn build_transcode_record_branch(
         rec_frames_first_pts,
         rec_frames_last_pts,
         rec_frames_count,
+        queue_input,
+        queue_output,
+        dropped_frames: Arc::new(AtomicU64::new(0)),
         record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
         idr_gate: Arc::new(AtomicBool::new(true)),
         video_tap_tee: tap_tee.clone(),
@@ -7466,12 +7549,13 @@ pub(crate) fn build_transcode_record_branch(
     })
 }
 
-/// Native recording branch — ENCODED (the DEFAULT). Taps the DECODED video
-/// frames at the permanent post-decode tee (the same tee the transcode
-/// branch and screenshots use) and re-encodes them to a limited-range
-/// untagged H.264 elementary stream in a temp file, exactly like the
-/// transcode branch but WITHOUT the live qtmux — muxing happens OFFLINE at
-/// stop (`remux_encoded_recording`), so the branch can never wedge.
+/// Native recording branch — ENCODED (opt-in via OPENNOW_RECORDING_MODE).
+/// Taps the DECODED video frames at the permanent post-decode tee (the same
+/// tee the transcode branch and screenshots use) and re-encodes them to a
+/// limited-range untagged H.264 elementary stream in a temp file, exactly
+/// like the transcode branch but WITHOUT the live qtmux — muxing happens
+/// OFFLINE at stop (`remux_encoded_recording`), so the branch can never
+/// wedge.
 ///
 /// Recording from the DECODED frames is what makes the recording reliable:
 /// the live decode chain is shielded by webrtcbin's rtpbin (jitter buffer +
@@ -7635,6 +7719,34 @@ pub(crate) fn build_pass_through_record_branch(
     queue.set_property("max-size-buffers", 2048u32);
     queue.set_property("max-size-bytes", 0u32);
     queue.set_property("max-size-time", 0u64);
+
+    // Count shed data: same sink/src probes as the transcode branch — every
+    // RTP packet enters the queue and either leaves it or is dropped by
+    // leaky=upstream (a >6 s downstream stall). After the drain at stop the
+    // queue is empty, so `input − output` is the exact packet-drop count,
+    // surfaced as droppedFrames (packets shed ≈ frames lost from the clip).
+    let queue_input = Arc::new(AtomicU64::new(0));
+    let queue_output = Arc::new(AtomicU64::new(0));
+    {
+        let input = queue_input.clone();
+        let queue_sink = queue
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through queue has no sink pad.".to_owned())?;
+        queue_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            input.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    {
+        let output = queue_output.clone();
+        let queue_src = queue
+            .static_pad("src")
+            .ok_or_else(|| "Pass-through queue has no src pad.".to_owned())?;
+        queue_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            output.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
     // Normalize the RTP caps (media/encoding-name/clock-rate only) before the
     // depayloader, mirroring the game-audio branch's capsfilter.
     rtp_caps.set_property(
@@ -7949,6 +8061,9 @@ pub(crate) fn build_pass_through_record_branch(
         rec_frames_first_pts: Arc::new(AtomicU64::new(0)),
         rec_frames_last_pts: Arc::new(AtomicU64::new(0)),
         rec_frames_count: Arc::new(AtomicU64::new(0)),
+        queue_input,
+        queue_output,
+        dropped_frames: Arc::new(AtomicU64::new(0)),
 
         mode: RecordingMode::PassThrough,
         codec: rtp_encoding.to_owned(),
@@ -7995,13 +8110,304 @@ fn send_recording_chunks(sender: &Sender<Event>, bytes: &[u8]) {
     }
 }
 
+/// Stream a finalized MP4 to Electron as fixed-size `recording-chunk` events
+/// WITHOUT loading the whole file into memory (the old finalize read the
+/// entire file with `std::fs::read` — a multi-GB long recording peaked at
+/// ~4× the file size across the Rust base64 + Electron buffers and could OOM
+/// an 8 GB device exactly at the moment the user clicked stop). The file is
+/// opened once and read in RECORDING_CHUNK_BYTES windows, each window encoded
+/// and sent immediately, so peak memory is one chunk + its base64. Returns
+/// the number of bytes streamed.
+fn stream_recording_file_as_chunks(
+    sender: &Sender<Event>,
+    path: &std::path::Path,
+) -> Result<u64, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        format!("Failed to open finalized recording for chunk streaming: {error}")
+    })?;
+    let mut window = vec![0u8; RECORDING_CHUNK_BYTES];
+    let mut total: u64 = 0;
+    loop {
+        let read = file.read(&mut window).map_err(|error| {
+            format!("Failed to read finalized recording for chunk streaming: {error}")
+        })?;
+        if read == 0 {
+            break;
+        }
+        send_recording_chunks(sender, &window[..read]);
+        total += read as u64;
+    }
+    Ok(total)
+}
+
+/// Upper bound on the MP4 head (the moov/faststart index) read for colr
+/// tagging. Even long recordings keep the index at a few KB to a couple MB
+/// (the stco chunk table dominates); if a moov ever exceeds this, the box is
+/// left untagged rather than risk partial-box parsing (the SPS VUI still
+/// carries the range info).
+const MP4_COLR_HEAD_LIMIT: usize = 16 * 1024 * 1024;
+
+/// A parsed MP4 box header (size field location, content offset, size, type).
+struct Mp4BoxInfo {
+    /// Offset of the box's 32-bit size field (or its 64-bit largesize field
+    /// at `size_offset + 8` when `largesize`).
+    size_offset: usize,
+    largesize: bool,
+    /// Offset of the first content byte (after the full header).
+    content_offset: usize,
+    /// Full box size including the header.
+    size: usize,
+    fourcc: [u8; 4],
+}
+
+/// Walk the child boxes of a parent whose content spans `[start, end)` and
+/// return their headers. Stops safely at `end` or the data end; boxes that
+/// would overrun are skipped.
+fn mp4_box_children(data: &[u8], start: usize, end: usize) -> Vec<Mp4BoxInfo> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    while pos + 8 <= end && pos + 8 <= data.len() {
+        let size32 =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let fourcc = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+        let (largesize, header_size, size) = if size32 == 1 {
+            if pos + 16 > end || pos + 16 > data.len() {
+                break;
+            }
+            let size64 = u64::from_be_bytes([
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]);
+            (true, 16, usize::try_from(size64).unwrap_or(usize::MAX))
+        } else if size32 == 0 {
+            // size 0 = extends to the end of the containing box.
+            (false, 8, end.saturating_sub(pos))
+        } else {
+            (false, 8, size32 as usize)
+        };
+        if size < header_size {
+            break;
+        }
+        out.push(Mp4BoxInfo {
+            size_offset: pos,
+            largesize,
+            content_offset: pos + header_size,
+            size,
+            fourcc,
+        });
+        pos = pos.saturating_add(size);
+    }
+    out
+}
+
+fn mp4_find_child<'a>(children: &'a [Mp4BoxInfo], fourcc: &[u8; 4]) -> Option<&'a Mp4BoxInfo> {
+    children.iter().find(|child| &child.fourcc == fourcc)
+}
+
+/// Add `delta` to a box's stored size (handles the 64-bit largesize form).
+fn bump_mp4_box_size(data: &mut [u8], info: &Mp4BoxInfo, delta: usize) {
+    if info.largesize {
+        let field = info.size_offset + 8;
+        let value =
+            u64::from_be_bytes(data[field..field + 8].try_into().expect("largesize field"))
+                + delta as u64;
+        data[field..field + 8].copy_from_slice(&value.to_be_bytes());
+    } else {
+        let value =
+            u32::from_be_bytes(data[info.size_offset..info.size_offset + 4].try_into().expect("size field"))
+                + delta as u32;
+        data[info.size_offset..info.size_offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+}
+
+/// Bump every chunk offset in an stco/co64 table by `delta` (the insertion
+/// shifted mdat's absolute position).
+fn bump_mp4_chunk_offsets(data: &mut [u8], info: &Mp4BoxInfo, delta: usize) {
+    let is_co64 = &info.fourcc == b"co64";
+    let entry_size = if is_co64 { 8 } else { 4 };
+    let payload = &mut data[info.content_offset..];
+    if payload.len() < 4 {
+        return;
+    }
+    let count = u32::from_be_bytes(payload[0..4].try_into().expect("entry count")) as usize;
+    let table = &mut payload[4..];
+    let entries = count.min(table.len() / entry_size);
+    for i in 0..entries {
+        let at = i * entry_size;
+        if is_co64 {
+            let value = u64::from_be_bytes(table[at..at + 8].try_into().expect("co64 entry"))
+                + delta as u64;
+            table[at..at + 8].copy_from_slice(&value.to_be_bytes());
+        } else {
+            let value =
+                u32::from_be_bytes(table[at..at + 4].try_into().expect("stco entry")) + delta as u32;
+            table[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+/// Inject a `colr` box (nclx: BT.709 primaries/transfer/matrix,
+/// full_range_flag=1) into the FIRST video sample entry of the MP4 held in
+/// `data`, bumping every affected ancestor size and chunk offset so the file
+/// stays structurally valid. Returns 1 when a box was injected, 0 when the
+/// sample entry already carries a colr box or the structure could not be
+/// parsed (leaves the file untouched).
+///
+/// The GFN stream is FULL-RANGE BT.709 PC video (SPS VUI
+/// video_full_range_flag=1); tagging the container the same way lets players
+/// that read colr render the received full-range bitstream with correct
+/// colours — the pass-through recording keeps the exact server bitstream (no
+/// re-encode) and the colour fix is pure metadata.
+fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
+    let top = mp4_box_children(data, 0, data.len());
+    let Some(moov) = mp4_find_child(&top, b"moov") else {
+        return 0;
+    };
+    // Never operate on a partially-loaded moov (a recording whose index is
+    // larger than the head read) — the SPS VUI still carries the range info.
+    if moov.size > data.len() {
+        return 0;
+    }
+    let moov_end = moov.content_offset + moov.size;
+    let moov_children = mp4_box_children(data, moov.content_offset, moov_end);
+    let Some(trak) = mp4_find_child(&moov_children, b"trak") else {
+        return 0;
+    };
+    let trak_children =
+        mp4_box_children(data, trak.content_offset, trak.content_offset + trak.size);
+    let Some(mdia) = mp4_find_child(&trak_children, b"mdia") else {
+        return 0;
+    };
+    let mdia_children =
+        mp4_box_children(data, mdia.content_offset, mdia.content_offset + mdia.size);
+    let Some(minf) = mp4_find_child(&mdia_children, b"minf") else {
+        return 0;
+    };
+    let minf_children =
+        mp4_box_children(data, minf.content_offset, minf.content_offset + minf.size);
+    let Some(stbl) = mp4_find_child(&minf_children, b"stbl") else {
+        return 0;
+    };
+    let stbl_end = stbl.content_offset + stbl.size;
+    let stbl_children = mp4_box_children(data, stbl.content_offset, stbl_end);
+    let Some(stsd) = mp4_find_child(&stbl_children, b"stsd") else {
+        return 0;
+    };
+    let stsd_end = stsd.content_offset + stsd.size;
+    // stsd payload: version/flags (4) + entry_count (4), then sample entries.
+    let stsd_children = mp4_box_children(data, stsd.content_offset + 8, stsd_end);
+    let Some(entry) = stsd_children.first() else {
+        return 0;
+    };
+    // Only video sample entries; audio tracks (mp4a/Opus) are skipped.
+    if !matches!(
+        &entry.fourcc,
+        b"avc1" | b"hvc1" | b"hev1" | b"av01" | b"vp09"
+    ) {
+        return 0;
+    }
+    // VisualSampleEntry: 8 bytes of header (6 reserved + 2 data_reference)
+    // after the box header, then the child boxes (avcC/hvcC/av1C/vpcC...).
+    let children_start = entry.content_offset + 8;
+    let entry_children = mp4_box_children(data, children_start, entry.content_offset + entry.size);
+    if mp4_find_child(&entry_children, b"colr").is_some() {
+        return 0;
+    }
+    // colr box, 20 bytes: nclx, primaries=transfer=matrix=BT.709 (1),
+    // full_range_flag=1, reserved.
+    let colr: [u8; 20] = [
+        0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x01, 0x01, 0x00,
+    ];
+    let delta = colr.len();
+    data.splice(children_start..children_start, colr);
+    // All size fields sit BEFORE the insertion point, so the pre-splice box
+    // infos stay valid for the bumps.
+    for info in [entry, stsd, stbl, minf, mdia, trak, moov] {
+        bump_mp4_box_size(data, info, delta);
+    }
+    // When moov precedes mdat (faststart — always the case here), the
+    // insertion shifted mdat's absolute position, so the stco/co64 chunk
+    // offsets must be bumped to keep the file seekable.
+    let mdat_before_moov = mp4_find_child(&top, b"mdat")
+        .map(|mdat| mdat.content_offset < moov.content_offset)
+        .unwrap_or(false);
+    if !mdat_before_moov {
+        for stbl_box in &stbl_children {
+            if stbl_box.fourcc == *b"stco" || stbl_box.fourcc == *b"co64" {
+                bump_mp4_chunk_offsets(data, stbl_box, delta);
+            }
+        }
+    }
+    1
+}
+
+/// Stream a finalized PassThrough recording to Electron as fixed-size
+/// `recording-chunk` events, tagging the colour metadata (colr nclx BT.709
+/// full-range) into the MP4 head on the way. Memory stays bounded: only the
+/// head (the moov index) is held, and the body is streamed window-by-window
+/// from the file — never the whole file in RAM.
+fn stream_recording_with_colr_tag(
+    sender: &Sender<Event>,
+    path: &std::path::Path,
+    event_sender: &Option<Sender<Event>>,
+) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        format!("Failed to open finalized recording for colour tagging: {error}")
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("Failed to stat finalized recording: {error}"))?
+        .len() as usize;
+    if file_len == 0 {
+        return Ok(0);
+    }
+    let head_len = file_len.min(MP4_COLR_HEAD_LIMIT);
+    let mut head = vec![0u8; head_len];
+    file.read_exact(&mut head)
+        .map_err(|error| format!("Failed to read finalized recording head: {error}"))?;
+    let injected = inject_mp4_colr_box(&mut head);
+    send_log(
+        event_sender,
+        "info",
+        if injected > 0 {
+            "Recording colour metadata: injected colr (nclx BT.709 full-range) into the MP4 — players render the received full-range bitstream with correct colours, no re-encode.".to_owned()
+        } else {
+            "Recording colour metadata: colr already present or moov not fully in the head — the SPS VUI still carries the range info.".to_owned()
+        },
+    );
+    send_recording_chunks(sender, &head);
+    let mut total = head.len() as u64;
+    file.seek(SeekFrom::Start(head_len as u64))
+        .map_err(|error| format!("Failed to seek finalized recording for streaming: {error}"))?;
+    let mut window = vec![0u8; RECORDING_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut window).map_err(|error| {
+            format!("Failed to read finalized recording for streaming: {error}")
+        })?;
+        if read == 0 {
+            break;
+        }
+        send_recording_chunks(sender, &window[..read]);
+        total += read as u64;
+    }
+    Ok(total)
+}
+
 fn remux_pass_through_recording(
     video_es: Option<&std::path::Path>,
     audio_es: Option<&std::path::Path>,
     out_path: &std::path::Path,
     codec: &str,
     fps: u32,
-    record_bitrate_kbps: u32,
     event_sender: &Option<Sender<Event>>,
 ) -> Result<u64, String> {
     let Some(video_es) = video_es else {
@@ -8024,52 +8430,18 @@ fn remux_pass_through_recording(
             .ok_or_else(|| "Pass-through remux video ES path is not valid UTF-8.".to_owned())?,
     );
     let parse = make_element(parse_factory)?;
-    // The captured ES is now DECODED and re-encoded offline (at stop, in this
-    // throwaway pipeline — the live stream never touches it). Two reasons:
-    //  1. COLOUR: the GFN H.265 bitstream is FULL-RANGE (0-255, VUI
-    //     video_full_range_flag=1), and players on the field assume LIMITED
-    //     range for untagged files — full-range data then renders with
-    //     crushed blacks ("hitam pekat"; the old transcode recordings were
-    //     limited and rendered correctly). The decode output is rescaled
-    //     0-255 → 16-235 by the same LUT probe the transcode branch uses,
-    //     then re-encoded untagged (x264 insert-vui=false) into the same
-    //     limited, byte-for-byte-untagged shape as the official GeForce Now
-    //     recordings.
-    //  2. DECODE RECOVERY: a bitstream with small holes (RTP jitter during
-    //     the capture) plays back with reference-frame glitches when remuxed
-    //     raw; the decoder conceals the holes at the nearest keyframe instead
-    //     of propagating "Could not find ref with POC" corruption.
-    // Decoder: hardware first (matches the live decode path), software
-    // fallback. A D3D12 decoder hands the chain D3D12 texture memory that
-    // videoconvert/x264 cannot import, so a d3d12download is inserted after
-    // it (same shape as the transcode branch's zero-copy download).
-    let (decoder_factory, decoder) = pick_remux_decoder(&codec_upper)?;
-    let decoder_is_hw = matches!(
-        decoder_factory.as_str(),
-        "d3d12h265dec" | "d3d12h264dec" | "d3d12av1dec"
-    );
-    let download = if decoder_is_hw {
-        Some(make_element("d3d12download")?)
-    } else {
-        None
-    };
-    // Format conversion: decoder's native output (NV12 for D3D12, I420 for
-    // the software decoders) → the encoder's input format.
-    let convert = make_element("videoconvert")?;
-    // Declares the FULL-RANGE (0-255) BT.709 input the decoder actually
-    // outputs, then the LUT probe below rescales it to LIMITED (16-235).
-    let declare_caps = make_element("capsfilter")?;
-    // Bridges the FULL→LIMITED colourimetry change between the two caps
-    // filters (the caps must intersect for the elements to link; the range
-    // is actually rescaled by the LUT probe on its sink pad).
-    let range_convert = make_element("videoconvert")?;
-    // Declares the LIMITED range at the encoder input (what the LUT scaler
-    // produces) — H.264 playback expects limited, and the untagged encoder
-    // output then matches the official GFN recordings.
-    let encode_caps = make_element("capsfilter")?;
-    let (encoder_factory, encoder) = pick_h264_encoder(record_bitrate_kbps)?;
-    // Converts the encoder's byte-stream H.264 to avcC for qtmux.
-    let h264_parse = make_element("h264parse")?;
+    // PLAIN remux — no decode, no re-encode, no colour transform. The file is
+    // the exact received server bitstream at the exact received quality,
+    // zero GPU/CPU at finalize (the official GeForce Now approach: "just
+    // write what we receive"). Colour is carried by METADATA instead of a
+    // data transform: the GFN stream is FULL-RANGE BT.709 (SPS VUI
+    // video_full_range_flag=1), and after the remux the MP4's video sample
+    // entry is given a `colr` box (nclx, primaries/transfer/matrix=BT.709,
+    // full_range_flag=1) by `stream_recording_with_colr_tag` — players that
+    // read colr/VUI render the recording with the same colours as the live
+    // stream, without the old decode→LUT→re-encode generation. The old
+    // limited-range universal-H.264 path is still one env var away
+    // (OPENNOW_RECORDING_MODE=encoded).
     let muxer = make_element("qtmux")?;
     muxer.set_property("faststart", true);
     muxer.set_property("fragment-duration", 0u32);
@@ -8084,43 +8456,9 @@ fn remux_pass_through_recording(
     out_sink.set_property("sync", false);
     out_sink.set_property("async", false);
 
-    let encoder_format = if is_hardware_h264_factory(&encoder_factory) {
-        "NV12"
-    } else {
-        "I420"
-    };
-    declare_caps.set_property(
-        "caps",
-        format!(
-            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/0-255,chroma-site=(string)mpeg2"
-        )
-        .parse::<gst::Caps>()
-        .map_err(|error| format!("Invalid remux declare caps: {error}"))?,
-    );
-    encode_caps.set_property(
-        "caps",
-        format!(
-            "video/x-raw,format=(string){encoder_format},colorimetry=(string)bt709/bt709/bt709/16-235,chroma-site=(string)mpeg2"
-        )
-        .parse::<gst::Caps>()
-        .map_err(|error| format!("Invalid remux encode caps: {error}"))?,
-    );
-
-    // Chain order: filesrc → parse → [download] → videoconvert → capsfilter
-    // (FULL bt709) → videoconvert (range bridge + LUT probe) → capsfilter
-    // (LIMITED bt709) → H.264 encoder → h264parse → qtmux → filesink.
-    let mut video_chain: Vec<&gst::Element> = vec![&video_src, &parse, &decoder];
-    if let Some(download) = download.as_ref() {
-        video_chain.push(download);
-    }
-    video_chain.extend([
-        &convert,
-        &declare_caps,
-        &range_convert,
-        &encode_caps,
-        &encoder,
-        &h264_parse,
-    ]);
+    // Chain order: filesrc → parse → qtmux → filesink (plain remux, no
+    // decode/re-encode — see above).
+    let mut video_chain: Vec<&gst::Element> = vec![&video_src, &parse];
     for element in &video_chain {
         pipeline
             .add(*element)
@@ -8142,12 +8480,12 @@ fn remux_pass_through_recording(
     let video_muxer_pad = muxer
         .request_pad_simple("video_%u")
         .ok_or_else(|| "Pass-through remux: qtmux refused a video sink pad.".to_owned())?;
-    let h264_src = h264_parse
+    let parse_src = parse
         .static_pad("src")
-        .ok_or_else(|| "Pass-through remux: h264parse has no src pad.".to_owned())?;
-    if let Err(error) = h264_src.link(&video_muxer_pad) {
+        .ok_or_else(|| "Pass-through remux: codec parser has no src pad.".to_owned())?;
+    if let Err(error) = parse_src.link(&video_muxer_pad) {
         let _ = muxer.release_request_pad(&video_muxer_pad);
-        return Err(format!("Failed to link remux h264parse into qtmux: {error:?}"));
+        return Err(format!("Failed to link remux parser into qtmux: {error:?}"));
     }
     let muxer_out = muxer
         .static_pad("src")
@@ -8159,36 +8497,19 @@ fn remux_pass_through_recording(
         .link(&out_sink_sink)
         .map_err(|error| format!("Failed to link remux muxer to output: {error:?}"))?;
 
-    // The LUT scaler: full-range (0-255) → limited (16-235) on the Y plane,
-    // identical to the transcode branch (videoconvert only CLIPS extremes, it
-    // does not rescale mid-tones — that is the "hitam pekat" bug).
-    let range_sink = range_convert
-        .static_pad("sink")
-        .ok_or_else(|| "Pass-through remux: range bridge has no sink pad.".to_owned())?;
-    range_sink.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
-        if let Some(buffer) = info.buffer_mut() {
-            scale_y_plane_full_to_limited(buffer, pad.current_caps().as_ref());
-        }
-        gst::PadProbeReturn::Ok
-    });
-
     // Reconstruct the VIDEO timestamps the raw ES file cannot carry: files
     // store no PTS, and qtmux rejects buffers with none ("Buffer has no PTS").
     // GFN's low-latency encoders emit no B-frames (has_b_frames=0 on every
     // real H264 AND H265 recording), so decode order == presentation order and
     // a monotonic PTS ladder at the negotiated fps is exact. Attached to the
-    // h264parse src pad (right before qtmux): whichever element in the
-    // decode→encode chain carries PTS through wins, and anything without one
-    // gets the ladder (the encoder and the D3D12 download can drop PTS on
-    // some runtime/GPU combinations — the field's "Buffer has no PTS" remux
-    // failure).
+    // codec parser's src pad (right before qtmux).
     let frame_duration_ns = (1_000_000_000u64 / (fps.max(1) as u64)).max(1);
     let video_counter = Arc::new(std::sync::Mutex::new(0u64));
     {
         let counter = video_counter.clone();
-        let parse_src_pad = h264_parse
+        let parse_src_pad = parse
             .static_pad("src")
-            .ok_or_else(|| "Pass-through remux: h264parse has no src pad.".to_owned())?;
+            .ok_or_else(|| "Pass-through remux: codec parser has no src pad.".to_owned())?;
         parse_src_pad.add_probe(
             gst::PadProbeType::BUFFER,
             move |_pad: &gst::Pad, info: &mut gst::PadProbeInfo| {
@@ -8345,25 +8666,6 @@ fn remux_pass_through_recording(
     if !finished {
         return Err("Pass-through remux timed out while muxing the recording.".to_owned());
     }
-    // Neutralize any colour-metadata box qtmux wrote (it derives a BT.709
-    // `colr` from the encode caps): the official GeForce Now recordings carry
-    // NO colour tags, and some field players misinterpret a tag and render
-    // the limited 16-235 data without expansion ("hitam pekat"). The box
-    // type is renamed colr→free (same size) so offsets stay valid.
-    if let Ok(mut bytes) = std::fs::read(out_path) {
-        let stripped = strip_mp4_colr_boxes(&mut bytes);
-        if stripped > 0 {
-            if std::fs::write(out_path, &bytes).is_ok() {
-                send_log(
-                    event_sender,
-                    "info",
-                    format!(
-                        "Remuxed recording: neutralized {stripped} colour-metadata box(es) (colr→free); the file carries no colour tags, matching the official GeForce Now recordings."
-                    ),
-                );
-            }
-        }
-    }
     let size = std::fs::metadata(out_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -8371,7 +8673,7 @@ fn remux_pass_through_recording(
         event_sender,
         "info",
         format!(
-            "Pass-through remux finished: {size} bytes (decoded with {decoder_factory}, re-encoded with {encoder_factory})."
+            "Pass-through remux finished: {size} bytes (plain remux of the received {codec_upper} bitstream — no decode/re-encode; colour metadata is tagged at finalize)."
         ),
     );
     Ok(size)
@@ -8691,49 +8993,6 @@ fn remux_encoded_recording(
 /// Pick a decoder for the OFFLINE pass-through remux (temp ES file → limited
 /// H.264 MP4, in a throwaway pipeline at stop — never touches the live
 /// stream). Hardware first (fast, matches the live decode path), software
-/// fallback (always present in the bundled runtime). Hardware decoders create
-/// their device on the READY transition, so the same init probe used for the
-/// recording encoders rejects a machine without the device and falls down
-/// the ladder.
-fn pick_remux_decoder(codec: &str) -> Result<(String, gst::Element), String> {
-    let candidates: Vec<&str> = match codec {
-        "H265" | "HEVC" => {
-            if cfg!(target_os = "windows") {
-                vec!["d3d12h265dec", "avdec_h265"]
-            } else {
-                vec!["avdec_h265"]
-            }
-        }
-        "H264" => {
-            if cfg!(target_os = "windows") {
-                vec!["d3d12h264dec", "avdec_h264"]
-            } else {
-                vec!["avdec_h264"]
-            }
-        }
-        "AV1" => {
-            if cfg!(target_os = "windows") {
-                vec!["d3d12av1dec", "dav1ddec"]
-            } else {
-                vec!["dav1ddec"]
-            }
-        }
-        other => return Err(format!("Pass-through remux: unsupported codec {other}.")),
-    };
-    let tried = candidates.join(", ");
-    for factory in candidates {
-        if let Ok(element) = gst::ElementFactory::make(factory).build() {
-            if factory.starts_with("d3d12") && !hw_encoder_initializes(&element) {
-                continue;
-            }
-            return Ok((factory.to_owned(), element));
-        }
-    }
-    Err(format!(
-        "No video decoder available in the GStreamer runtime for {codec} (tried {tried}); recording remux disabled."
-    ))
-}
-
 /// Pick the H.264 encoder for the recording branch. The recording carries
 /// LIMITED (16-235) data — the RGB round-trip converts the decoder's
 /// full-range output to the limited range H.264 playback expects — and the
@@ -9285,13 +9544,15 @@ mod mic_pipeline_tests {
     }
 
     /// End-to-end offline remux on a REAL field H.265 elementary stream
-    /// (testdata/gfn_field.h265 — a GFN capture): the new remux must decode
-    /// the full-range HEVC, rescale to limited, re-encode to H.264, and mux
-    /// into a playable MP4 whose video track is H.264 LIMITED range — the
-    /// exact output that fixes the field "hitam pekat" bug (players expand
-    /// untagged H.264 as limited; full-range data renders crushed).
+    /// (testdata/gfn_field.h265 — a GFN capture): the pass-through remux must
+    /// PRESERVE the received bitstream (no decode/re-encode — zero GPU/CPU,
+    /// exact server quality, the official GeForce Now approach), producing a
+    /// playable MP4 whose video sample entry is the RECEIVED codec (hvc1),
+    /// and the colour metadata (colr nclx BT.709 full-range — the stream's
+    /// SPS VUI says video_full_range_flag=1) must be tagged into the file
+    /// without a data transform.
     #[test]
-    fn remux_h265_field_es_produces_h264_limited_mp4() {
+    fn remux_h265_field_es_preserves_bitstream_and_tags_colr() {
         gst::init().expect("gstreamer init");
         let es_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
@@ -9302,142 +9563,146 @@ mod mic_pipeline_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&out_path);
-        let size = remux_pass_through_recording(
-            Some(&es_path),
-            None,
-            &out_path,
-            "H265",
-            60,
-            15_000,
-            &None,
-        )
-        .expect("field H265 ES must remux offline");
+        let size = remux_pass_through_recording(Some(&es_path), None, &out_path, "H265", 60, &None)
+            .expect("field H265 ES must remux offline");
         assert!(size > 100_000, "remux output suspiciously small: {size}");
-        let bytes = std::fs::read(&out_path).expect("read remux output");
-        // Must be an MP4 with an mdat. (The file is kept on disk for the
-        // pixel-level decode check below; it is removed at the end.)
+        let mut bytes = std::fs::read(&out_path).expect("read remux output");
+        // Must be a seekable MP4 with an mdat.
         assert!(bytes.len() >= 8 && &bytes[4..8] == b"ftyp", "must be ftyp MP4");
         assert!(bytes.windows(4).any(|w| w == b"mdat"), "must contain mdat");
-        // The video sample entry must be avc1 (H.264), NOT hvc1/hev1 — the
-        // whole point of the offline decode→encode remux. Scan stsd children
-        // for a fourcc.
+        // The video sample entry must be the RECEIVED codec (hvc1/hev1 for
+        // H.265), NOT avc1 — the pass-through remux must never re-encode.
         let has_h264_entry = bytes.windows(4).any(|w| w == b"avc1");
         let has_h265_entry = bytes.windows(4).any(|w| w == b"hvc1" || w == b"hev1");
         assert!(
-            has_h264_entry && !has_h265_entry,
-            "remux must produce H.264 avc1 (h264={has_h264_entry}, h265={has_h265_entry})"
+            has_h265_entry && !has_h264_entry,
+            "pass-through remux must keep the received H.265 (h265={has_h265_entry}, h264={has_h264_entry})"
         );
-
-        // PIXEL-LEVEL check: decode the remuxed file and verify the luma is
-        // genuinely LIMITED (16-235) — not just tagged `tv`. This is the
-        // actual "hitam pekat" guard: the source is full-range (0-255, VUI
-        // video_full_range_flag=1), and a remux that only re-tags (or clips)
-        // leaves the data full-range, which every player then crushes.
-        // Decode with the software decoder (avdec_h264) into I420 and scan
-        // the Y plane: <3% of pixels may fall outside 16-235 (encoder
-        // overshoot on hard edges), and the mid-tone must survive
-        // (avg stays within ±12 of the source's avg, i.e. the LUT rescales
-        // rather than darkening everything).
-        let pipeline = gst::Pipeline::new();
-        let src = gst::ElementFactory::make("filesrc").build().expect("filesrc");
-        src.set_property(
-            "location",
-            out_path.to_str().expect("remux path utf8"),
-        );
-        let demux = gst::ElementFactory::make("qtdemux").build().expect("qtdemux");
-        let parse = gst::ElementFactory::make("h264parse").build().expect("h264parse");
-        let decode = gst::ElementFactory::make("avdec_h264").build().expect("avdec_h264");
-        let convert = gst::ElementFactory::make("videoconvert").build().expect("videoconvert");
-        let caps = gst::ElementFactory::make("capsfilter").build().expect("capsfilter");
-        caps.set_property(
-            "caps",
-            "video/x-raw,format=(string)I420".parse::<gst::Caps>().expect("valid caps"),
-        );
-        let sink = gst::ElementFactory::make("fakesink").build().expect("fakesink");
-        for element in [&src, &demux, &parse, &decode, &convert, &caps, &sink] {
-            pipeline.add(element).expect("add decode element");
-        }
-        src.link(&demux).expect("link src");
-        let parse_for_cb = parse.clone();
-        demux.connect_pad_added(move |_demux, pad| {
-            if pad.name() == "video_0" || pad.name().starts_with("video_") {
-                let _ = pad.link(&parse_for_cb.static_pad("sink").expect("parse sink"));
-            }
-        });
-        parse.link(&decode).expect("link parse");
-        decode.link(&convert).expect("link convert");
-        convert.link(&caps).expect("link caps");
-        caps.link(&sink).expect("link sink");
-
-        let y_stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64))); // (total, outside16-235, sum, count)
-        {
-            let stats = y_stats.clone();
-            let sink_pad = sink.static_pad("sink").expect("sink pad");
-            sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-                if let Some(buffer) = info.buffer() {
-                    if let Ok(map) = buffer.map_readable() {
-                        let data = map.as_slice();
-                        // I420: Y plane is the first width*height bytes.
-                        let info = gstreamer_video::VideoInfo::from_caps(
-                            _pad.current_caps().as_ref().expect("caps"),
-                        )
-                        .ok();
-                        if let Some(info) = info {
-                            let stride = usize::try_from(info.stride()[0]).unwrap_or(0);
-                            let width = info.width() as usize;
-                            let height = info.height() as usize;
-                            if stride > 0 && width <= stride && data.len() >= stride * height {
-                                let mut stats = stats.lock().unwrap();
-                                for row in 0..height {
-                                    let start = row * stride;
-                                    for &v in &data[start..start + width] {
-                                        stats.3 += 1;
-                                        stats.2 += v as u64;
-                                        if v < 16 || v > 235 {
-                                            stats.1 += 1;
-                                        }
-                                    }
-                                }
-                                stats.0 += 1;
-                            }
-                        }
-                    }
-                }
-                gst::PadProbeReturn::Ok
-            });
-        }
-        pipeline.set_state(gst::State::Playing).expect("playing");
-        let bus = pipeline.bus().expect("bus");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if let Some(message) = bus.timed_pop_filtered(
-                gst::ClockTime::from_mseconds(100),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            ) {
-                match message.view() {
-                    gst::MessageView::Eos(_) => break,
-                    gst::MessageView::Error(_) => break,
-                    _ => {}
-                }
-            }
-        }
-        let _ = pipeline.set_state(gst::State::Null);
-        let (frames, outside, sum, count) = *y_stats.lock().unwrap();
+        // Colour metadata tagging: injecting the colr box must land inside
+        // the video sample entry, grow the file by exactly the box size, keep
+        // moov's size covering the gap to mdat, leave the mdat payload
+        // (the tail of the faststart file) untouched, and be idempotent on a
+        // second call.
+        let len_before = bytes.len();
+        let tail = bytes[bytes.len().saturating_sub(64)..].to_vec();
+        assert_eq!(inject_mp4_colr_box(&mut bytes), 1, "colr must be injected");
+        assert_eq!(bytes.len(), len_before + 20, "injection adds exactly the 20-byte colr box");
+        let colr: [u8; 20] = [
+            0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x01, 0x00,
+        ];
         assert!(
-            count > 0,
-            "remux output decode produced no pixels to verify"
+            bytes.windows(20).any(|w| w == colr),
+            "colr nclx BT.709 full-range box must be present after injection"
         );
-        let outside_pct = 100.0 * outside as f64 / count as f64;
-        let avg = sum as f64 / count as f64;
-        assert!(
-            outside_pct < 3.0,
-            "remux luma must be LIMITED 16-235 (overshoot allowed <3%); got {outside_pct:.2}% outside, frames={frames}"
+        let top = mp4_box_children(&bytes, 0, bytes.len());
+        let moov = mp4_find_child(&top, b"moov").expect("moov");
+        let mdat = mp4_find_child(&top, b"mdat").expect("mdat");
+        assert_eq!(
+            moov.content_offset + moov.size,
+            mdat.content_offset,
+            "moov size must still cover the gap to mdat after the injection"
         );
-        assert!(
-            (120.0..=130.0).contains(&avg),
-            "remux mid-tone must be preserved (source avg ~125); got avg={avg:.1}"
+        assert_eq!(
+            &bytes[bytes.len() - tail.len()..],
+            tail.as_slice(),
+            "mdat payload must be untouched by the injection"
+        );
+        assert_eq!(
+            inject_mp4_colr_box(&mut bytes),
+            0,
+            "second injection must be a no-op (colr already present)"
         );
         let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// Deterministic unit test for the colr injection on a SYNTHETIC
+    /// faststart MP4 (moov first, then mdat): the box lands in the video
+    /// sample entry, all ancestor sizes grow by 20, the stco chunk offsets
+    /// are bumped by 20, and an already-tagged file is left untouched.
+    #[test]
+    fn inject_mp4_colr_box_tags_synthetic_faststart_mp4() {
+        fn box4(fourcc: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(fourcc);
+            out.extend_from_slice(&payload);
+            out
+        }
+        let avc1_payload = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&[0u8; 6]); // VisualSampleEntry reserved
+            p.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+            p.extend_from_slice(&box4(b"avcC", vec![1, 2, 3, 4]));
+            p
+        };
+        let stsd_payload = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&box4(b"avc1", avc1_payload));
+            p
+        };
+        let stco_payload = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+            p.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+            p.extend_from_slice(&1000u32.to_be_bytes());
+            p.extend_from_slice(&2000u32.to_be_bytes());
+            p
+        };
+        let stbl = box4(
+            b"stbl",
+            {
+                let mut p = box4(b"stsd", stsd_payload);
+                p.extend_from_slice(&box4(b"stco", stco_payload));
+                p
+            },
+        );
+        let moov = box4(b"moov", box4(b"trak", box4(b"mdia", box4(b"minf", stbl))));
+        let mut mp4 = moov;
+        mp4.extend_from_slice(&box4(b"mdat", vec![0xAB; 64]));
+        let len_before = mp4.len();
+        assert_eq!(inject_mp4_colr_box(&mut mp4), 1);
+        assert_eq!(mp4.len(), len_before + 20);
+        let colr: [u8; 20] = [
+            0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x01, 0x00,
+        ];
+        assert!(
+            mp4.windows(20).any(|w| w == colr),
+            "colr nclx BT.709 full-range box must be present"
+        );
+        // moov must still exactly cover the gap to mdat (ancestor sizes bumped).
+        let top = mp4_box_children(&mp4, 0, mp4.len());
+        let moov = mp4_find_child(&top, b"moov").expect("moov");
+        let mdat = mp4_find_child(&top, b"mdat").expect("mdat");
+        assert_eq!(moov.content_offset + moov.size, mdat.content_offset);
+        // stco chunk offsets must be bumped by 20 so mdat stays reachable.
+        let moov_children =
+            mp4_box_children(&mp4, moov.content_offset, moov.content_offset + moov.size);
+        let trak = mp4_find_child(&moov_children, b"trak").expect("trak");
+        let trak_children =
+            mp4_box_children(&mp4, trak.content_offset, trak.content_offset + trak.size);
+        let mdia = mp4_find_child(&trak_children, b"mdia").expect("mdia");
+        let mdia_children =
+            mp4_box_children(&mp4, mdia.content_offset, mdia.content_offset + mdia.size);
+        let minf = mp4_find_child(&mdia_children, b"minf").expect("minf");
+        let minf_children =
+            mp4_box_children(&mp4, minf.content_offset, minf.content_offset + minf.size);
+        let stbl = mp4_find_child(&minf_children, b"stbl").expect("stbl");
+        let stbl_children = mp4_box_children(&mp4, stbl.content_offset, stbl.content_offset + stbl.size);
+        let stco = mp4_find_child(&stbl_children, b"stco").expect("stco");
+        let table = &mp4[stco.content_offset + 4..];
+        let count = u32::from_be_bytes([table[0], table[1], table[2], table[3]]) as usize;
+        assert_eq!(count, 2);
+        let first = u32::from_be_bytes([table[4], table[5], table[6], table[7]]);
+        let second = u32::from_be_bytes([table[8], table[9], table[10], table[11]]);
+        assert_eq!(first, 1020, "stco entry 0 must be bumped by 20");
+        assert_eq!(second, 2020, "stco entry 1 must be bumped by 20");
+        // mdat payload untouched and the second call is a no-op.
+        assert!(mp4.windows(64).any(|w| w.iter().all(|&b| b == 0xAB)));
+        assert_eq!(inject_mp4_colr_box(&mut mp4), 0);
     }
 
     /// The finalized MP4 must be delivered to Electron as MULTIPLE

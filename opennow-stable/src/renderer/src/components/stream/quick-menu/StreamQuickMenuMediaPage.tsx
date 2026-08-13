@@ -40,6 +40,14 @@ interface StreamQuickMenuMediaPageProps {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  /**
+   * Native streamer mode: the recording happens in the native pipeline at the
+   * stream's own resolution/FPS/bitrate — the web-mode encode settings below
+   * do not apply, so the Resolution/FPS/Bitrate controls are hidden.
+   */
+  nativeRecording: boolean;
+  /** Shown after a recording that dropped frames (encoder/queue could not keep up). */
+  recordingDropNotice: string | null;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
@@ -69,6 +77,8 @@ export function StreamQuickMenuMediaPage({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  nativeRecording,
+  recordingDropNotice,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
@@ -82,8 +92,19 @@ export function StreamQuickMenuMediaPage({
       <section className="sidebar-section">
         <div className="sidebar-section-header">
           <span>Recording Settings</span>
-          <span className="sidebar-section-sub">Applies to the next recording.</span>
+          <span className="sidebar-section-sub">
+            {nativeRecording ? "Records at stream quality" : "Applies to the next recording."}
+          </span>
         </div>
+        {nativeRecording ? (
+          <div className="sidebar-row sidebar-row--column">
+            <span className="sidebar-hint">
+              Native mode records the stream at its full quality — resolution, frame rate, and
+              bitrate follow the stream and cannot be changed here.
+            </span>
+          </div>
+        ) : (
+        <>
         <div className="sidebar-row sidebar-row--column">
           <div className="sidebar-row-top">
             <span className="sidebar-label">Resolution</span>
@@ -163,6 +184,8 @@ export function StreamQuickMenuMediaPage({
             can drop stream FPS on weaker machines.
           </span>
         </div>
+        </>
+        )}
       </section>
       <div className="sidebar-separator" aria-hidden="true" />
       <section className="sidebar-section">
@@ -243,6 +266,9 @@ export function StreamQuickMenuMediaPage({
         </div>
         {recordingError && (
           <span className="sidebar-hint sidebar-hint--error">{recordingError}</span>
+        )}
+        {recordingDropNotice && (
+          <span className="sidebar-hint sidebar-hint--drop">{recordingDropNotice}</span>
         )}
         {recordings.length === 0 ? (
           <span className="sidebar-hint">No recordings yet. Press {recordingShortcut} to record.</span>

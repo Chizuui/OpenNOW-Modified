@@ -10503,6 +10503,12 @@ button.game-card-store-chip.owned.active:hover {
   color: #fda4af;
 }
 
+/* Recording dropped frames — a warning tone (amber), distinct from an error. */
+.sidebar-hint--drop {
+  color: #fcd34d;
+  display: block;
+}
+
 .sidebar-hint--codec {
   font-family: monospace;
   font-size: 0.67rem;

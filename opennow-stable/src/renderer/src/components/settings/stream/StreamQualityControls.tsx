@@ -450,6 +450,18 @@ export function StreamQualityControls({
         />
       </div>
 
+      {isNativeMode && (
+        <div className="settings-row settings-row--column">
+          <div className="settings-row-top">
+            <label className="settings-label">{t("settings.video.recording")}</label>
+          </div>
+          <span className="settings-subtle-hint">
+            {t("settings.video.recordingAtStreamQuality")}
+          </span>
+        </div>
+      )}
+      {!isNativeMode && (
+        <>
       <div className="settings-row">
         <label className="settings-label" htmlFor="settings-stream-recording-resolution">
           {t("settings.video.recordingResolution")}
@@ -533,6 +545,8 @@ export function StreamQualityControls({
           {t("settings.video.recordingBitrateHint")}
         </span>
       </div>
+        </>
+      )}
 
       <div className="settings-row settings-row--column">
         <div className="settings-row-top">

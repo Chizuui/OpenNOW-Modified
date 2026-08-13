@@ -421,6 +421,8 @@
       "appliesAfterRestart": "Se aplică după repornirea aplicației.",
       "requiresH265OrAv1": "Acest mod necesită H265 sau AV1. Codec-ul va fi comutat automat.",
       "nativeColorLockedHint": "Modul nativ randează BT.709 pe 8 biți (SDR); adâncimea de culoare este blocată pe 4:2:0 pe 8 biți.",
+      "recording": "Înregistrare",
+      "recordingAtStreamQuality": "Modul nativ înregistrează fluxul la calitate completă — rezoluția, FPS-ul și bitrate-ul urmează fluxul și nu pot fi schimbate aici.",
       "testing": "Testare...",
       "gpu": "GPU",
       "cpu": "CPU",

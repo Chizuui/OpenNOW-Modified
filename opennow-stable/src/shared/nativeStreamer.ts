@@ -223,6 +223,12 @@ export type NativeStreamerEvent =
       type: "recording-finished";
       /** Base64 JPEG of the first encoded recording frame (gallery thumbnail). */
       thumbnailBase64?: string;
+      /**
+       * Recording frames the branch dropped because the encoder/queue could
+       * not keep up (leaky queue drops) — surfaced so a choppy recording is
+       * explained. 0 when the encoder kept up.
+       */
+      droppedFrames: number;
     }
   | {
       /**

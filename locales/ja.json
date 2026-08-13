@@ -420,6 +420,8 @@
       "appliesAfterRestart": "アプリの再起動後に適用されます。",
       "requiresH265OrAv1": "このモードには H265 または AV1 が必要です。コーデックは自動で切り替わります。",
       "nativeColorLockedHint": "ネイティブモードは8ビットBT.709（SDR）でレンダリングされます。色深度は8ビット4:2:0に固定されます。",
+      "recording": "録画",
+      "recordingAtStreamQuality": "ネイティブモードはストリームを元の品質で録画します — 解像度・FPS・ビットレートはストリームに従い、ここでは変更できません。",
       "testing": "テスト中...",
       "gpu": "GPU",
       "cpu": "CPU",

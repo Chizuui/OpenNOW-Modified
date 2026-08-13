@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { RecordingEntry } from "@shared/gfn";
-import { fitThumbnailSize, selectRecordingMimeType } from "../components/stream/streamRuntimeHelpers";
+import {
+  computeRecordingFrameShortfall,
+  fitThumbnailSize,
+  selectRecordingMimeType,
+} from "../components/stream/streamRuntimeHelpers";
 
 // Record via canvas downscale to keep MediaRecorder encode cost low (it shares
 // the main thread with the WebRTC decoder). GFN uses a GPU encoder off-pipeline;
@@ -49,6 +53,10 @@ export function useStreamRecorder({
   const [recordings, setRecordings] = useState<RecordingEntry[]>([]);
   const [recordingDurationMs, setRecordingDurationMs] = useState(0);
   const [recordingError, setRecordingError] = useState<string | null>(null);
+  // Set after a recording that dropped frames (native: queue drops;
+  // web: draw loop could not sustain the target rate), cleared on the next
+  // start — so a choppy recording is explained, not a mystery.
+  const [recordingDropNotice, setRecordingDropNotice] = useState<string | null>(null);
   const [usedMimeType, setUsedMimeType] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIdRef = useRef<string | null>(null);
@@ -129,7 +137,13 @@ export function useStreamRecorder({
         recordingIdRef.current = null;
         let thumbnailBase64: string | undefined;
         try {
-          thumbnailBase64 = await window.openNow.stopNativeRecording();
+          const result = await window.openNow.stopNativeRecording();
+          thumbnailBase64 = result.thumbnailBase64;
+          if (result.droppedFrames > 0) {
+            setRecordingDropNotice(
+              `Recording lost ${result.droppedFrames} frame${result.droppedFrames === 1 ? "" : "s"} (the device could not keep up).`,
+            );
+          }
         } catch (error) {
           console.error("[StreamView] Failed to finalize native recording:", error);
           setRecordingError("Recording could not be saved.");
@@ -187,6 +201,7 @@ export function useStreamRecorder({
       recordingIdRef.current = recordingId;
       recordingStartTimeRef.current = Date.now();
       setRecordingDurationMs(0);
+      setRecordingDropNotice(null);
       setIsRecording(true);
       setIsProcessing(false);
       recordingTimerRef.current = window.setInterval(() => {
@@ -232,6 +247,10 @@ export function useStreamRecorder({
     const recordFps = Number.isFinite(recordingFps) && recordingFps > 0
       ? Math.min(60, Math.round(recordingFps))
       : DEFAULT_RECORD_CAP_FPS;
+    // Actual draw count for the whole recording; compared against the target
+    // rate at stop (computeRecordingFrameShortfall) so the user is told when
+    // the recording was choppier than its nominal fps.
+    let drawnFrames = 0;
     let recordVideoTrack: MediaStreamTrack | null = null;
     if (video.videoWidth > 0 && video.videoHeight > 0) {
       const scale = Math.min(
@@ -264,6 +283,7 @@ export function useStreamRecorder({
         }
         if (now - lastDrawMs >= 1000 / recordFps) {
           lastDrawMs = now;
+          drawnFrames += 1;
           capCtx.drawImage(video, 0, 0, capWidth, capHeight);
         }
       };
@@ -292,12 +312,11 @@ export function useStreamRecorder({
       audioCtxRef.current = null;
       setRecordingError("Could not start recording.");
       return;
-    }
-
-    recordingIdRef.current = recordingId;
+    }      recordingIdRef.current = recordingId;
     thumbnailDataUrlRef.current = null;
     recordingStartTimeRef.current = Date.now();
     setRecordingDurationMs(0);
+    setRecordingDropNotice(null);
     setIsRecording(true);
 
     recordingTimerRef.current = window.setInterval(() => {
@@ -367,6 +386,12 @@ export function useStreamRecorder({
       if (!id) return;
 
       const durationMs = Date.now() - recordingStartTimeRef.current;
+      const lostFrames = computeRecordingFrameShortfall(drawnFrames, durationMs, recordFps);
+      if (lostFrames > 0) {
+        setRecordingDropNotice(
+          `Recording missed ${lostFrames} frame${lostFrames === 1 ? "" : "s"} — the device could not keep up.`,
+        );
+      }
       void window.openNow
         .finishRecording({
           recordingId: id,
@@ -452,6 +477,7 @@ export function useStreamRecorder({
     recordings,
     recordingDurationMs,
     recordingError,
+    recordingDropNotice,
     usedMimeType,
     recCarouselRef,
     recordingApiAvailable,

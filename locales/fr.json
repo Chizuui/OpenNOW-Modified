@@ -421,6 +421,8 @@
       "appliesAfterRestart": "S'applique après le redémarrage de l'application.",
       "requiresH265OrAv1": "Ce mode nécessite H265 ou AV1. Le codec sera automatiquement commuté.",
       "nativeColorLockedHint": "Le mode natif affiche du BT.709 8 bits (SDR) ; la profondeur de couleur est verrouillée sur 4:2:0 8 bits.",
+      "recording": "Enregistrement",
+      "recordingAtStreamQuality": "Le mode natif enregistre le flux à sa pleine qualité — la résolution, les FPS et le débit suivent le flux et ne peuvent pas être modifiés ici.",
       "testing": "Test...",
       "gpu": "GPU",
       "cpu": "Processeur",
