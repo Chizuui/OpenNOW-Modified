@@ -101,6 +101,61 @@ fn target_pre_decode_depth(rtt_ema_ms: u32, loss_fraction: Option<f64>, burst_ho
                 / span
     }
 }
+
+/// Map the network signals to the webrtcbin RTP playout latency in ms (the
+/// runtime value of the `latency` property on `opennow-webrtcbin`). Stable
+/// links rest at BASE (~40 ms) for tight input feel; degraded networks ramp
+/// it up to MAX (~100 ms, the old fixed default) using the SAME signals as
+/// the pre-decode buffer: a burst hold / heavy loss forces the ceiling,
+/// packet loss floors the depth, and the measured receive jitter + RTT EMA
+/// ramp continuously so even a modest rise buys playout depth immediately.
+fn target_webrtc_latency_ms(
+    local_jitter_ms: Option<u32>,
+    rtt_ema_ms: u32,
+    loss_fraction: Option<f64>,
+    burst_hold: bool,
+) -> u32 {
+    use crate::gstreamer_pipeline::{
+        WEBRTC_LATENCY_BASE_MS, WEBRTC_LATENCY_MAX_MS, WEBRTC_LATENCY_MID_MS,
+    };
+    if burst_hold || loss_fraction.is_some_and(|loss| loss >= 0.005) {
+        return WEBRTC_LATENCY_MAX_MS;
+    }
+    if loss_fraction.is_some_and(|loss| loss >= 0.0015) {
+        return WEBRTC_LATENCY_MID_MS;
+    }
+    // Continuous ramps, the largest signal wins.
+    let mut target = WEBRTC_LATENCY_BASE_MS;
+    // Receive jitter: 5 ms → BASE, 40 ms → MAX. This is the direct measure
+    // of what the RTP jitter buffer absorbs (rtpsession's RFC 3550
+    // interarrival jitter, EWMA-smoothed upstream).
+    const JITTER_RAMP_LO_MS: u32 = 5;
+    const JITTER_RAMP_HI_MS: u32 = 40;
+    if let Some(jitter) = local_jitter_ms {
+        if jitter > JITTER_RAMP_LO_MS {
+            let span = JITTER_RAMP_HI_MS - JITTER_RAMP_LO_MS;
+            let frac = (jitter - JITTER_RAMP_LO_MS).min(span);
+            target = target.max(
+                WEBRTC_LATENCY_BASE_MS
+                    + (WEBRTC_LATENCY_MAX_MS - WEBRTC_LATENCY_BASE_MS) * frac / span,
+            );
+        }
+    }
+    // RTT EMA: 30 ms → BASE, 150 ms → MAX — the same ramp as the pre-decode
+    // buffer, so the two buffers follow one smoothed network picture and do
+    // not fight each other.
+    const RAMP_LO_MS: u32 = 30;
+    const RAMP_HI_MS: u32 = 150;
+    if rtt_ema_ms > RAMP_LO_MS {
+        let span = RAMP_HI_MS - RAMP_LO_MS;
+        let frac = (rtt_ema_ms - RAMP_LO_MS).min(span);
+        target = target.max(
+            WEBRTC_LATENCY_BASE_MS
+                + (WEBRTC_LATENCY_MAX_MS - WEBRTC_LATENCY_BASE_MS) * frac / span,
+        );
+    }
+    target
+}
 const VIDEO_STALL_MIN_KEYFRAME_REQUEST_MS: u64 = 2_000;
 const VIDEO_STARTUP_KEYFRAME_MS: u64 = 2_500;
 const VIDEO_STARTUP_RESYNC_MS: u64 = 5_000;
@@ -326,6 +381,12 @@ pub(crate) struct VideoLivenessState {
     /// Current pre-decode queue depth in compressed frames, so the adaptive
     /// resize only touches the element when the target actually changes.
     pre_decode_depth: AtomicU32,
+    /// Current webrtcbin RTP playout latency (ms) — the runtime value of the
+    /// `latency` property on `opennow-webrtcbin`, raised/lowered by the same
+    /// network signals as the pre-decode queue (see
+    /// `adjust_webrtc_latency_for_network`) so the resize only touches the
+    /// element when the target actually changes.
+    webrtc_latency_ms: AtomicU32,
     /// Monotonic watchdog clock (ms) until which the jitter buffer must stay
     /// at MAX depth after a detected RTT spike: the spike starves the decoder
     /// in the seconds the EMA needs to catch up, so the deep buffer is HELD
@@ -394,6 +455,9 @@ impl VideoLivenessState {
             network_loss_ema: AtomicU64::new(0),
             pre_decode_depth: AtomicU32::new(
                 crate::gstreamer_pipeline::VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
+            ),
+            webrtc_latency_ms: AtomicU32::new(
+                crate::gstreamer_pipeline::WEBRTC_LATENCY_BASE_MS,
             ),
             burst_hold_until_ms: AtomicU64::new(0),
         }
@@ -812,7 +876,7 @@ impl VideoLivenessState {
 
     /// Adaptive pre-decode jitter buffer depth: DEEP (15 frames ≈ 250 ms)
     /// while the network is degraded so WAN jitter bursts never starve the
-    /// decoder (the anti-flicker fix), SHALLOW (6 frames ≈ 100 ms) on stable
+    /// decoder (the anti-flicker fix), SHALLOW (3 frames ≈ 50 ms) on stable
     /// links so in-game drags and aiming stay tight — a fixed 15-frame depth
     /// added ~150 ms of constant latency and made drags feel "patah-patah".
     /// Returns the new depth in frames when it changed, else None.
@@ -876,6 +940,62 @@ impl VideoLivenessState {
         // shrinking never fast-forwards the picture.
         set_property_if_supported(&queue, "max-size-buffers", target);
         self.pre_decode_depth.store(target, Ordering::Relaxed);
+        Some(target)
+    }
+
+    /// Current EMA (ms) of the effective network RTT — the smoothed signal
+    /// the pre-decode ramp is driven by, read here so the webrtcbin playout
+    /// latency follows the SAME EMA instead of maintaining an independent
+    /// one.
+    fn rtt_ema_ms(&self) -> u32 {
+        self.network_rtt_ema_ms.load(Ordering::Relaxed)
+    }
+
+    /// Current packet-loss EMA as a fraction (None until the first loss
+    /// sample).
+    fn loss_ema_fraction(&self) -> Option<f64> {
+        let scaled = self.network_loss_ema.load(Ordering::Relaxed);
+        (scaled > 0).then_some(scaled as f64 / 100_000.0)
+    }
+
+    /// Whether a detected RTT spike is still holding the buffers at MAX
+    /// depth (spikes arrive in clusters, so the deep buffers are HELD past
+    /// the first one).
+    fn burst_hold_active(&self) -> bool {
+        self.now_ms() < self.burst_hold_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// Adaptive webrtcbin RTP playout latency: BASE (~40 ms) on stable
+    /// links, raised toward MAX (~100 ms) as the measured receive jitter,
+    /// packet loss and RTT spikes climb — the RTP-side twin of
+    /// `adjust_pre_decode_queue_for_network` (that one absorbs bursts
+    /// between depayload and decoder; this one holds packets long enough for
+    /// NACK retransmissions and reordering inside webrtcbin's rtpbin).
+    /// Returns the new latency in ms when it changed, else None.
+    pub(crate) fn adjust_webrtc_latency_for_network(
+        &self,
+        pipeline: &gst::Pipeline,
+        local_jitter_ms: Option<u32>,
+    ) -> Option<u32> {
+        let target = target_webrtc_latency_ms(
+            local_jitter_ms,
+            self.rtt_ema_ms(),
+            self.loss_ema_fraction(),
+            self.burst_hold_active(),
+        );
+        if target == self.webrtc_latency_ms.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(webrtc) = pipeline.by_name("opennow-webrtcbin") else {
+            return None;
+        };
+        set_property_if_supported(&webrtc, "latency", target);
+        // Re-run the pipeline latency computation so the new playout delay
+        // takes effect immediately (webrtcbin's setter updates its internal
+        // rtpbin jitter buffers; the pipeline must re-aggregate the
+        // per-element latencies for the sinks to honor it).
+        let _ = pipeline.recalculate_latency();
+        self.webrtc_latency_ms.store(target, Ordering::Relaxed);
         Some(target)
     }
 
@@ -1353,6 +1473,24 @@ fn run_video_liveness_watchdog(
                     ),
                 );
             }
+        }
+        // RTP-side twin: adjust the webrtcbin playout latency from the same
+        // smoothed network picture (receive jitter, RTT EMA, loss EMA, burst
+        // hold). Runs every tick so a stable link DROPS back to the BASE as
+        // soon as the network recovers, and only logs when it changes.
+        if let Some(latency_ms) = state.adjust_webrtc_latency_for_network(&pipeline, local_jitter_ms)
+        {
+            send_log(
+                &event_sender,
+                "info",
+                format!(
+                    "Native webrtcbin RTP playout latency adjusted to {latency_ms} ms (receive jitter={} ms, rtt EMA={} ms).",
+                    local_jitter_ms
+                        .map(|ms| ms.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    state.rtt_ema_ms(),
+                ),
+            );
         }
 
         let elapsed = last_rate_at.elapsed();
@@ -2906,6 +3044,87 @@ pub(crate) fn watch_video_sink_caps_transitions(
 /// instead of randomly shedding the stream.
 const PRESENT_LIMITER_BACKLOG_TOLERANCE: Duration = Duration::from_millis(250);
 
+/// EMA weight of the real present cadence kept by the limiter (75% history,
+/// 25% latest) — same convention as the network RTT/loss EMAs, so a burst
+/// sample (a stall gap or a catch-up cluster) cannot jerk the VRR correction
+/// more than a fraction of a frame.
+const PRESENT_DURATION_EMA_HISTORY: f64 = 0.75;
+
+/// VRR-aware per-frame present duration (Geronimo
+/// `AsyncFrameQueue::vrrPresentDurationForFrame`): when the EMA of the real
+/// present cadence runs slower than the stream's natural frame interval —
+/// e.g. a 59.94 Hz display on a 60 fps stream — shorten the next scheduled
+/// step by ≤1% of the gap, capped at 1% of the step
+/// (`fmin(step * 0.01, (ema - natural) * 0.01)`). The bounded per-frame
+/// correction eases the schedule back toward sync imperceptibly instead of
+/// letting a fixed grid accumulate phase error until a periodic
+/// repeated/dropped frame (the 2-2-3 judder). Returns the corrected step.
+fn vrr_corrected_present_duration(
+    frame_interval: Duration,
+    natural_interval: Duration,
+    present_duration_ema: Option<f64>,
+) -> Duration {
+    let Some(ema) = present_duration_ema else {
+        return frame_interval;
+    };
+    let natural = natural_interval.as_secs_f64();
+    let step = frame_interval.as_secs_f64();
+    if ema <= natural {
+        return frame_interval;
+    }
+    // fmin(step * 0.01, (ema - natural) * 0.01): proportional to the gap,
+    // capped at 1% of the step so no single frame jumps the cadence.
+    let correction = step.min(ema - natural) * 0.01;
+    Duration::from_secs_f64((step - correction).max(0.0))
+}
+
+/// Cinematic present cadence (Geronimo
+/// `AsyncFrameQueue::cinematicPresentIntervalsForFrameLocked`): when the
+/// display refreshes FASTER than the stream at a non-integer multiple (e.g.
+/// a 60 fps stream on a 144 Hz monitor, 2.4 refresh/frame), a 1:1 stream
+/// grid leaves each frame spanning an irregular 2-2-3 pattern of display
+/// refreshes. Presenting every N = round(display_hz / stream_fps) refresh
+/// intervals (clamped 1..=4) anchors the delivery grid to clean N-refresh
+/// slots. Mirrors Geronimo's budget check (reduce by one when the frame
+/// cannot sustain the budget): when the real cadence EMA runs more than 25%
+/// behind the stream interval — the pipeline is genuinely falling behind,
+/// not jittering — one interval is dropped so the grid stops demanding an
+/// unsustainably tight cadence. Never below 1 (the caller then falls back
+/// to the VRR/stream pacing).
+fn cinematic_present_intervals(
+    display_hz: u32,
+    stream_fps: u32,
+    cadence_ema_s: Option<f64>,
+) -> u32 {
+    if display_hz <= 1 || stream_fps == 0 {
+        return 1;
+    }
+    // round() handles the threshold for free: a display only slightly faster
+    // than the stream (75 Hz on 60 fps → 1.25) rounds to 1 interval (no
+    // cinematic re-grid — the VRR correction owns the near-1 fractional
+    // mismatch); a genuinely faster display (144 Hz on 60 fps → 2.4) rounds
+    // to a clean N-interval cadence.
+    let base = (f64::from(display_hz) / f64::from(stream_fps))
+        .round()
+        .clamp(1.0, 4.0) as u32;
+    let intervals = base.max(1);
+    if intervals <= 1 {
+        return 1;
+    }
+    // Geronimo: `if actual_cadence > budget { intervals -= 1 }`. The 25%
+    // hysteresis keeps arrival jitter (EMA hovers ±1-2 ms around the stream
+    // interval on a healthy link) from oscillating the cadence; only a
+    // sustained shortfall — decode/network falling behind — steps the grid
+    // back down.
+    if let Some(ema) = cadence_ema_s {
+        let natural_s = 1.0 / f64::from(stream_fps);
+        if ema > natural_s * 1.25 {
+            return (intervals - 1).max(1);
+        }
+    }
+    intervals
+}
+
 /// Pure limiter decision: a frame is dropped only when it arrives so far
 /// before its present slot that passing it would fast-forward more than the
 /// catch-up budget of content in one instant. Everything else (steady-state
@@ -2930,12 +3149,17 @@ pub(crate) fn install_present_limiter(
 
     let sender = event_sender.clone();
     let monitor = video_liveness.clone();
+    let now = Instant::now();
     let state = Arc::new(Mutex::new(PresentLimiterState {
-        next_present_at: Instant::now(),
-        last_log_at: Instant::now(),
+        next_present_at: now,
+        last_log_at: now,
         passed: 0,
         dropped: 0,
         active_fps: 0,
+        last_frame_at: None,
+        present_duration_ema: None,
+        display_hz: crate::gstreamer_platform::primary_display_refresh_hz(),
+        last_display_query_at: now,
     }));
 
     sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
@@ -2955,12 +3179,35 @@ pub(crate) fn install_present_limiter(
             state.last_log_at = now;
             state.passed = 0;
             state.dropped = 0;
+            state.last_frame_at = None;
+            state.present_duration_ema = None;
+            state.display_hz = crate::gstreamer_platform::primary_display_refresh_hz();
+            state.last_display_query_at = now;
             if let Some(monitor) = &monitor {
                 monitor.record_present_pacing_change();
             }
         }
 
         let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
+        // The natural (stream) frame interval the VRR correction converges
+        // toward: the NEGOTIATED stream rate when known, the limiter target
+        // otherwise. In auto mode the target is the display Hz (which may be
+        // far from the stream rate) — the schedule must still ease toward the
+        // STREAM so the display-paced sink always has a fresh frame.
+        let stream_fps = monitor
+            .as_ref()
+            .and_then(|monitor| monitor.requested_fps())
+            .filter(|fps| *fps > 0);
+        let natural_interval = stream_fps
+            .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)))
+            .unwrap_or(frame_interval);
+        // Refresh the display refresh rate once a second (mode switches /
+        // DPMS wake change it mid-session) so the cinematic cadence always
+        // tracks the current monitor.
+        if state.last_display_query_at.elapsed() >= VIDEO_SINK_RATE_LOG_INTERVAL {
+            state.display_hz = crate::gstreamer_platform::primary_display_refresh_hz();
+            state.last_display_query_at = now;
+        }
         // Drop only frames arriving MORE than the catch-up budget before
         // their slot (a deep backlog that would fast-forward the picture).
         // Everything within the budget passes — steady-state arrival jitter
@@ -2989,24 +3236,74 @@ pub(crate) fn install_present_limiter(
         }
 
         state.passed = state.passed.saturating_add(1);
+        // VRR cadence EMA: measure the REAL present-to-present delta of the
+        // passed frames (not the schedule) so a display running fractionally
+        // off the stream rate drifts the correction instead of a fixed grid
+        // accumulating phase error into periodic judder.
+        if let Some(last) = state.last_frame_at {
+            let delta = now.saturating_duration_since(last).as_secs_f64();
+            state.present_duration_ema = Some(
+                state.present_duration_ema.map_or(delta, |ema| {
+                    ema * PRESENT_DURATION_EMA_HISTORY + delta * (1.0 - PRESENT_DURATION_EMA_HISTORY)
+                }),
+            );
+        }
+        state.last_frame_at = Some(now);
+        // Cinematic cadence: when the display refreshes much faster than the
+        // stream (e.g. 60 fps on a 144 Hz monitor), anchor the delivery grid
+        // to N refresh intervals instead of the 1:1 stream grid, so each
+        // frame spans a clean N-refresh slot instead of the irregular 2-2-3
+        // pattern. Falls back to the VRR-corrected stream pacing when the
+        // ratio is near 1 (the fractional mismatch is the VRR correction's
+        // job) or the display rate is unknown.
+        let mut cadence_label = "stream".to_owned();
+        let step = match (state.display_hz, stream_fps) {
+            (Some(display_hz), Some(stream_fps)) => {
+                let intervals = cinematic_present_intervals(
+                    display_hz,
+                    stream_fps,
+                    state.present_duration_ema,
+                );
+                if intervals > 1 {
+                    cadence_label = format!("cinematic {intervals}x{display_hz} Hz");
+                    Duration::from_secs_f64(f64::from(intervals) / f64::from(display_hz))
+                } else {
+                    vrr_corrected_present_duration(
+                        frame_interval,
+                        natural_interval,
+                        state.present_duration_ema,
+                    )
+                }
+            }
+            _ => vrr_corrected_present_duration(
+                frame_interval,
+                natural_interval,
+                state.present_duration_ema,
+            ),
+        };
         if now < state.next_present_at {
             // Within tolerance: present at the actual arrival and anchor the
             // next slot to it, so the grid keeps a stable cadence.
-            state.next_present_at = now + frame_interval;
+            state.next_present_at = now + step;
         } else {
             while state.next_present_at <= now {
-                state.next_present_at += frame_interval;
+                state.next_present_at += step;
             }
         }
         let elapsed = state.last_log_at.elapsed();
         if elapsed >= VIDEO_SINK_RATE_LOG_INTERVAL {
             let passed = state.passed;
             let dropped = state.dropped;
+            let step_ms = step.as_secs_f64() * 1000.0;
+            let ema_ms = state
+                .present_duration_ema
+                .map(|ema| ema * 1000.0)
+                .unwrap_or(0.0);
             send_log(
                 &sender,
                 "debug",
                 format!(
-                    "Native present limiter: target={target_fps} fps; passed={passed}; dropped={dropped} over {:.1}s.",
+                    "Native present limiter: target={target_fps} fps; {cadence_label} step={step_ms:.2} ms (cadence ema {ema_ms:.2} ms); passed={passed}; dropped={dropped} over {:.1}s.",
                     elapsed.as_secs_f64()
                 ),
             );
@@ -3026,6 +3323,22 @@ struct PresentLimiterState {
     passed: u32,
     dropped: u32,
     active_fps: u32,
+    /// Real arrival time of the last PASSED frame, for the cadence EMA
+    /// (None until the first passed frame).
+    last_frame_at: Option<Instant>,
+    /// EMA (seconds) of the real present-to-present cadence measured at the
+    /// limiter; the VRR correction shortens the next step by ≤1% of the gap
+    /// when this runs slower than the stream interval, and the cinematic
+    /// cadence uses it as its budget check.
+    present_duration_ema: Option<f64>,
+    /// Primary display refresh rate (Hz) driving the cinematic cadence
+    /// (present every N refresh intervals when the display runs much faster
+    /// than the stream). Cached — the GDI query is a per-frame cost if done
+    /// in the probe — and refreshed on pacing changes and once a second
+    /// (mode switches / DPMS wake).
+    display_hz: Option<u32>,
+    /// Last time `display_hz` was (re)queried, for the 1 s refresh throttle.
+    last_display_query_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5982,7 +6295,7 @@ mod tests {
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
             VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
         };
-        // Stable links: shallow (≈100 ms), no loss, no burst.
+        // Stable links: shallow (≈50 ms at 60 fps), no loss, no burst.
         assert_eq!(
             target_pre_decode_depth(0, None, false),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
@@ -5993,13 +6306,14 @@ mod tests {
         );
         // Continuous ramp: even a modest RTT rise buys buffer depth — a
         // slightly-elevated ping (60 ms) must NOT stay at the shallow floor
-        // (that was the 3-band step's blind spot: it held 6 frames until RTT
-        // hit 60 ms, so the burst between 38 and 60 ms starved the decoder).
-        // 45 ms → 6 + 9*15/120 = 7; 60 ms → 6 + 9*30/120 = 8; 100 ms → 6 +
-        // 9*70/120 = 11; ≥ 150 ms → 15.
-        assert_eq!(target_pre_decode_depth(45, None, false), 7);
-        assert_eq!(target_pre_decode_depth(60, None, false), 8);
-        assert_eq!(target_pre_decode_depth(100, None, false), 11);
+        // (that was the old banded logic's blind spot: it held the shallow
+        // depth until RTT crossed a band boundary, so the burst in between
+        // starved the decoder). With the 3-frame shallow floor:
+        // 45 ms → 3 + 12*15/120 = 4; 60 ms → 3 + 12*30/120 = 6; 100 ms →
+        // 3 + 12*70/120 = 10; ≥ 150 ms → 15.
+        assert_eq!(target_pre_decode_depth(45, None, false), 4);
+        assert_eq!(target_pre_decode_depth(60, None, false), 6);
+        assert_eq!(target_pre_decode_depth(100, None, false), 10);
         assert_eq!(
             target_pre_decode_depth(150, None, false),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
@@ -6047,6 +6361,76 @@ mod tests {
                 "depth must not decrease as RTT grows: rtt={rtt} depth={depth} < last={last}"
             );
             last = depth;
+        }
+    }
+
+    /// The webrtcbin RTP playout latency must rest at the BASE on stable
+    /// links (tight input feel), ramp CONTINUOUSLY with receive jitter and
+    /// the RTT EMA, floor up on packet loss (the leading indicator), and
+    /// force MAX on a detected burst hold — the same signals as the
+    /// pre-decode buffer, so the two buffers follow one smoothed network
+    /// picture and a degraded link never reverts to the shallow RTP buffer.
+    #[test]
+    fn webrtc_latency_adapts_to_jitter_loss_and_bursts() {
+        use crate::gstreamer_pipeline::{
+            WEBRTC_LATENCY_BASE_MS, WEBRTC_LATENCY_MAX_MS, WEBRTC_LATENCY_MID_MS,
+        };
+        // Stable links: BASE (~40 ms), no jitter/loss/RTT, no burst.
+        assert_eq!(target_webrtc_latency_ms(None, 0, None, false), WEBRTC_LATENCY_BASE_MS);
+        assert_eq!(target_webrtc_latency_ms(Some(5), 0, None, false), WEBRTC_LATENCY_BASE_MS);
+        assert_eq!(target_webrtc_latency_ms(None, 30, None, false), WEBRTC_LATENCY_BASE_MS);
+        // Continuous jitter ramp: 5 ms → BASE, 40 ms → MAX. 20 ms →
+        // 40 + 60*15/35 = 65.
+        assert_eq!(target_webrtc_latency_ms(Some(20), 0, None, false), 65);
+        assert_eq!(
+            target_webrtc_latency_ms(Some(40), 0, None, false),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        // Continuous RTT ramp: 30 ms → BASE, 150 ms → MAX. 90 ms →
+        // 40 + 60*60/120 = 70.
+        assert_eq!(target_webrtc_latency_ms(None, 90, None, false), 70);
+        assert_eq!(
+            target_webrtc_latency_ms(None, 150, None, false),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        // The largest signal wins when both are present.
+        assert_eq!(
+            target_webrtc_latency_ms(Some(40), 90, None, false),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        // Packet loss floors the latency while the RTT/jitter are still
+        // stable — 0.1% stays BASE, ≥0.15% goes MID, ≥0.5% goes MAX.
+        assert_eq!(
+            target_webrtc_latency_ms(None, 0, Some(0.001), false),
+            WEBRTC_LATENCY_BASE_MS
+        );
+        assert_eq!(
+            target_webrtc_latency_ms(None, 0, Some(0.0015), false),
+            WEBRTC_LATENCY_MID_MS
+        );
+        assert_eq!(
+            target_webrtc_latency_ms(None, 0, Some(0.005), false),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        // A detected RTT spike (burst hold) forces MAX immediately.
+        assert_eq!(
+            target_webrtc_latency_ms(None, 0, None, true),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        assert_eq!(
+            target_webrtc_latency_ms(Some(0), 0, Some(0.005), true),
+            WEBRTC_LATENCY_MAX_MS
+        );
+        // Monotonic in jitter: each +1 ms of receive jitter may never reduce
+        // the latency.
+        let mut last = target_webrtc_latency_ms(Some(0), 0, None, false);
+        for jitter in 1..=60 {
+            let latency = target_webrtc_latency_ms(Some(jitter), 0, None, false);
+            assert!(
+                latency >= last,
+                "latency must not decrease as jitter grows: jitter={jitter} latency={latency} < last={last}"
+            );
+            last = latency;
         }
     }
 
@@ -9281,6 +9665,139 @@ mod tests {
             base + budget,
             budget
         ));
+    }
+
+    /// The VRR correction must be a no-op on stable links (EMA ≤ natural
+    /// interval or no data yet), shorten the next step by ≤1% of the gap
+    /// when the real cadence runs slower than the stream (fractional refresh
+    /// mismatch, e.g. 59.94 Hz vs a 60 fps stream), scale with the gap up to
+    /// the 1% cap, and always reference the STREAM interval even when the
+    /// limiter target is the display Hz (auto mode).
+    #[test]
+    fn vrr_correction_eases_schedule_toward_stream_interval() {
+        let frame = Duration::from_secs_f64(1.0 / 60.0);
+        let natural = Duration::from_secs_f64(1.0 / 60.0);
+        let step_s = frame.as_secs_f64();
+
+        // No cadence data yet / cadence at or faster than the stream: the
+        // scheduled step is unchanged.
+        assert_eq!(vrr_corrected_present_duration(frame, natural, None), frame);
+        assert_eq!(
+            vrr_corrected_present_duration(frame, natural, Some(step_s)),
+            frame
+        );
+        assert_eq!(
+            vrr_corrected_present_duration(frame, natural, Some(step_s - 0.001)),
+            frame
+        );
+
+        // Display slightly slower than the stream (59.94 Hz → 16.683 ms vs
+        // 16.667 ms): shorten by ≤1% of the gap (here 0.01% of the step).
+        let ema_slow = 1.0 / 59.94;
+        let corrected = vrr_corrected_present_duration(frame, natural, Some(ema_slow));
+        let expected_slow = step_s - step_s.min(ema_slow - natural.as_secs_f64()) * 0.01;
+        assert!(
+            (corrected.as_secs_f64() - expected_slow).abs() < 1e-9,
+            "gap-proportional correction: got {} s, want {} s",
+            corrected.as_secs_f64(),
+            expected_slow
+        );
+
+        // Big mismatch (real cadence 30 fps on a 60 fps stream): the
+        // correction grows with the gap but never exceeds 1% of the step.
+        let corrected_big = vrr_corrected_present_duration(frame, natural, Some(1.0 / 30.0));
+        let expected_big = step_s - step_s * 0.01;
+        assert!(
+            (corrected_big.as_secs_f64() - expected_big).abs() < 1e-9,
+            "1% cap: got {} s, want {} s",
+            corrected_big.as_secs_f64(),
+            expected_big
+        );
+
+        // Auto mode: limiter paced to the display (165 Hz) on a 60 fps
+        // stream — the real cadence (6.06 ms) is FASTER than the stream
+        // interval, so the step stays unchanged (the 60-on-165 refresh
+        // pattern is the cinematic cadence's job, not the VRR drift
+        // easement).
+        let display_step = Duration::from_secs_f64(1.0 / 165.0);
+        assert_eq!(
+            vrr_corrected_present_duration(display_step, natural, Some(1.0 / 165.0)),
+            display_step
+        );
+        // But when the display cadence is SLOWER than the stream (165 Hz
+        // limiter on a 240 fps stream: 6.06 ms real cadence vs 4.17 ms
+        // stream), the correction still references the STREAM interval and
+        // eases the step down (≤1% of the gap, here under the 1% cap), so
+        // the display-paced sink is fed slightly ahead of its cadence
+        // instead of accumulating lag.
+        let natural_240 = Duration::from_secs_f64(1.0 / 240.0);
+        let ema_display = 1.0 / 165.0;
+        let corrected_display =
+            vrr_corrected_present_duration(display_step, natural_240, Some(ema_display));
+        let expected_display = display_step.as_secs_f64()
+            - display_step
+                .as_secs_f64()
+                .min(ema_display - natural_240.as_secs_f64())
+                * 0.01;
+        assert!(
+            (corrected_display.as_secs_f64() - expected_display).abs() < 1e-9,
+            "stream-reference in auto mode: got {} s, want {} s",
+            corrected_display.as_secs_f64(),
+            expected_display
+        );
+
+        // Monotonic: a larger gap (slower real cadence) never produces a
+        // LONGER step than a smaller one.
+        let mut last = vrr_corrected_present_duration(frame, natural, Some(step_s));
+        for fps in (31..=60).rev() {
+            let step = vrr_corrected_present_duration(frame, natural, Some(1.0 / f64::from(fps)));
+            assert!(
+                step <= last + Duration::from_nanos(1),
+                "step must not grow with the cadence gap: fps={fps}"
+            );
+            last = step;
+        }
+    }
+
+    /// The cinematic cadence must engage only for genuinely faster displays
+    /// (round(display/stream) ≥ 2), compute the exact N-refresh cadence for
+    /// integer and non-integer multiples (144/60 = 2.4 → 2; 165/60 = 2.75 →
+    /// 3; 240/60 = 4; 480/60 → clamp 4), stay at 1 for near-1 ratios (the
+    /// VRR correction owns the fractional mismatch), and step back down when
+    /// the real cadence cannot sustain the stream interval (the Geronimo
+    /// budget check, with hysteresis against arrival jitter).
+    #[test]
+    fn cinematic_cadence_anchors_grid_to_refresh_intervals() {
+        // Near-1 ratios / unknown inputs: no cinematic re-grid.
+        assert_eq!(cinematic_present_intervals(59, 60, None), 1);
+        assert_eq!(cinematic_present_intervals(75, 60, None), 1);
+        assert_eq!(cinematic_present_intervals(0, 60, None), 1);
+        assert_eq!(cinematic_present_intervals(144, 0, None), 1);
+        // Exact integer multiple: uniform pattern already, but the grid
+        // anchors to 2 refresh intervals (120 Hz on 60 fps → 16.67 ms).
+        assert_eq!(cinematic_present_intervals(120, 60, None), 2);
+        // 144 Hz on 60 fps → round(2.4) = 2; 165 Hz → round(2.75) = 3.
+        assert_eq!(cinematic_present_intervals(144, 60, None), 2);
+        assert_eq!(cinematic_present_intervals(165, 60, None), 3);
+        // 240 Hz on 60 fps → exactly 4 (clamp keeps it); 480 Hz → clamp 4.
+        assert_eq!(cinematic_present_intervals(240, 60, None), 4);
+        assert_eq!(cinematic_present_intervals(480, 60, None), 4);
+        // 144 Hz on 120 fps → round(1.2) = 1: display barely faster, the
+        // 120-on-144 cadence is handled by the VRR correction, not cinema.
+        assert_eq!(cinematic_present_intervals(144, 120, None), 1);
+
+        // Budget check: an on-time cadence EMA keeps the cadence; a cadence
+        // more than 25% behind the stream interval (the pipeline genuinely
+        // falling behind, not jittering) steps the grid back down one
+        // interval — but never below 1.
+        let on_time = 1.0 / 60.0;
+        assert_eq!(cinematic_present_intervals(144, 60, Some(on_time)), 2);
+        let jittery = 1.0 / 60.0 * 1.1; // 10% behind: still cinematic
+        assert_eq!(cinematic_present_intervals(144, 60, Some(jittery)), 2);
+        let falling_behind = 1.0 / 60.0 * 1.3; // 30% behind: step down
+        assert_eq!(cinematic_present_intervals(144, 60, Some(falling_behind)), 1);
+        let very_behind = 1.0 / 30.0; // way behind on a 4-interval cadence
+        assert_eq!(cinematic_present_intervals(480, 60, Some(very_behind)), 3);
     }
 
     /// The decode→present pairing queue must be balanced: every decoded

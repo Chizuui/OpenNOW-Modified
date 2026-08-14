@@ -51,11 +51,25 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-// Two milliseconds is below the jitter of a real WAN connection and makes
-// RTP frame reordering visible as repeated/back-and-forward frames. Keep a
-// small playout buffer instead; this is still far below the browser client's
-// usual WebRTC buffer while allowing normal Wi-Fi/Internet jitter to settle.
-const WEBRTC_LATENCY_MS: u32 = 100;
+// The webrtcbin `latency` property is the playout delay the pipeline holds
+// before its internal rtpbin jitter buffers drain — the RTP side of the
+// total stream latency. A 2 ms buffer would make RTP frame reordering
+// visible as repeated/back-and-forward frames, so a small playout buffer is
+// kept — but it must stay well below the browser client's usual WebRTC
+// buffer. The liveness watchdog sets it to the BASE (~40 ms) on stable
+// links and raises it toward the MAX (~100 ms, the old fixed default) as
+// the measured receive jitter and packet loss climb (see
+// target_webrtc_latency_ms in gstreamer_liveness), so tight links keep
+// near-minimal input latency while degraded links still absorb jitter
+// bursts and NACK retransmissions.
+pub(crate) const WEBRTC_LATENCY_BASE_MS: u32 = 40;
+/// Mid RTP playout latency (~60 ms): the packet-loss floor (≥0.15%) and the
+/// middle of the jitter/RTT ramp.
+pub(crate) const WEBRTC_LATENCY_MID_MS: u32 = 60;
+/// Degraded ceiling of the RTP playout latency (~100 ms): forced by heavy
+/// loss (≥0.5%) / detected RTT spikes, top of the jitter ramp — matches the
+/// old fixed default so degraded links behave exactly as before.
+pub(crate) const WEBRTC_LATENCY_MAX_MS: u32 = 100;
 const DEFAULT_GFN_STUN_SERVER: &str = "stun://stun2.l.google.com:19302";
 
 /// Display-path caps pinned to the FULL-RANGE BT.709-family colorimetry the
@@ -83,10 +97,12 @@ pub(crate) const DISPLAY_NV12_FULL_RANGE_CAPS: &str =
 /// steady-state latency stays tight and the anti-flicker protection engages
 /// while the network actually needs it.
 pub(crate) const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
-/// Shallow floor of the adaptive compressed-frame jitter buffer (~100 ms at
+/// Shallow floor of the adaptive compressed-frame jitter buffer (~50 ms at
 /// 60 fps). On stable links (RTT ≤ ~30 ms) the buffer rests here, keeping
-/// drag/input feel tight.
-pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 6;
+/// drag/input feel tight. Combined with the WEBRTC_LATENCY_BASE_MS RTP
+/// playout buffer, a stable session now holds ~90 ms total instead of the
+/// ~200 ms the old fixed 100+100 ms configuration added.
+pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 3;
 /// Mid depth (~167 ms at 60 fps) used as the packet-loss floor (≥0.1%) and
 /// around the middle of the RTT ramp.
 pub(crate) const VIDEO_COMPRESSED_QUEUE_MID_BUFFERS: u32 = 10;
@@ -3881,7 +3897,11 @@ pub(crate) fn set_property_from_str_if_supported(element: &gst::Element, name: &
 }
 
 pub(crate) fn configure_webrtc_low_latency(webrtc: &gst::Element) {
-    set_property_if_supported(webrtc, "latency", WEBRTC_LATENCY_MS);
+    // BASE, not MAX: the liveness watchdog raises the latency at runtime
+    // when the network actually degrades (adjust_webrtc_latency_for_network
+    // in gstreamer_liveness), so a stable link never pays the degraded
+    // buffer depth.
+    set_property_if_supported(webrtc, "latency", WEBRTC_LATENCY_BASE_MS);
 }
 
 pub(crate) fn configure_queue_for_low_latency(element: &gst::Element, media_label: &str) {
