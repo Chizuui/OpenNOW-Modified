@@ -28,7 +28,8 @@ export type NativeStreamerShortcutAction =
   | "toggleAntiAfk"
   | "toggleMicrophone"
   | "screenshot"
-  | "toggleRecording";
+  | "toggleRecording"
+  | "cyclePacing";
 
 export interface NativeStreamerShortcutBindings {
   toggleStats: string;
@@ -39,6 +40,7 @@ export interface NativeStreamerShortcutBindings {
   toggleMicrophone: string;
   screenshot: string;
   toggleRecording: string;
+  cyclePacing: string;
 }
 
 export interface NativeStreamerSessionContext {
@@ -166,6 +168,28 @@ export type MainToRendererSignalingEvent =
   | { type: "native-stream-stats"; stats: NativeStreamStats }
   | { type: "native-stream-transition"; transition: NativeVideoTransition }
   | { type: "native-input-ready"; protocolVersion: number }
+  | {
+      /**
+       * Native runtime network assessment (the analogue of GFN's pre-stream
+       * "stream test"): verdict + recovery recommendations. The manager
+       * already requests a keyframe when `suggestKeyframe` is set; the
+       * renderer surfaces the verdict (HUD/toast) and may trigger the
+       * auto-downgrade.
+       */
+      type: "native-network-assessment";
+      assessment: import("@shared/nativeStreamer").NativeNetworkAssessment;
+    }
+  | {
+      /**
+       * The native streamer's network assessment went `poor` while the
+       * session still runs — the negotiated fps is no longer sustainable.
+       * The renderer relaunches the same game with a lower fps (and
+       * resolution once fps is already minimal) in a forced-new session,
+       * mirroring the codec auto-downgrade path.
+       */
+      type: "native-network-downgrade-request";
+      reason: string;
+    }
   | { type: "error"; message: string }
   | { type: "log"; message: string };
 

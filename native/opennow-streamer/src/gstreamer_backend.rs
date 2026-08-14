@@ -792,6 +792,41 @@ impl NativeStreamerBackend for GstreamerBackend {
         }
     }
 
+    fn set_pacing_mode(&mut self, command: CommandEnvelope) -> BackendReply {
+        let Some(mode) = command.pacing_mode.clone() else {
+            return BackendReply::response(missing_field(&command.id, "pacingMode"));
+        };
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return BackendReply::response(Response::Error {
+                id: Some(command.id),
+                code: "no-pipeline".to_owned(),
+                message: "No active pipeline to configure pacing for; start a session first.".to_owned(),
+            });
+        };
+        match pipeline.set_pacing_mode(&mode) {
+            Ok(message) => BackendReply {
+                events: vec![Event::Log {
+                    level: "info",
+                    message: message.clone(),
+                }],
+                response: Some(Response::Ok { id: command.id }),
+                should_continue: true,
+            },
+            Err(message) => BackendReply {
+                events: vec![Event::Log {
+                    level: "warn",
+                    message: message.clone(),
+                }],
+                response: Some(Response::Error {
+                    id: Some(command.id),
+                    code: "invalid-pacing-mode".to_owned(),
+                    message,
+                }),
+                should_continue: true,
+            },
+        }
+    }
+
     fn update_shortcuts(&mut self, command: CommandEnvelope) -> BackendReply {
         let Some(shortcuts) = command.shortcuts else {
             return BackendReply::response(missing_field(&command.id, "shortcuts"));

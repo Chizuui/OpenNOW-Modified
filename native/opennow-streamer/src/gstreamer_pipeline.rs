@@ -2209,6 +2209,27 @@ impl GstreamerPipeline {
             .build()
             .map_err(|error| format!("Failed to create webrtcbin: {error}"))?;
         configure_webrtc_low_latency(&webrtc);
+        // Forward Error Correction (RED/ULP-FEC): when the server encoder
+        // supports it, ask webrtcbin to negotiate RED alongside the media so
+        // loss bursts are repaired in-transit instead of a NACK round trip
+        // (the client-side half of GFN's `FEC VBR mode`; the server half is
+        // requested through `StreamingFeatures.enabled_fec`). Optional — the
+        // property is absent on some GStreamer builds, in which case RTX/NACK
+        // retransmission remains the recovery path.
+        if webrtc.find_property("do-fec").is_some() {
+            webrtc.set_property("do-fec", true);
+            send_log(
+                &event_sender,
+                "info",
+                "Enabled webrtcbin RED/ULP-FEC negotiation (do-fec) for loss resilience.".to_owned(),
+            );
+        } else {
+            send_log(
+                &event_sender,
+                "debug",
+                "webrtcbin has no do-fec property on this GStreamer build; loss recovery stays on RTX/NACK.".to_owned(),
+            );
+        }
         let stun_server = resolve_gstreamer_stun_server(ice_servers);
         webrtc.set_property("stun-server", &stun_server);
         send_log(
@@ -2304,6 +2325,21 @@ impl GstreamerPipeline {
 
     pub(crate) fn set_present_max_fps(&self, fps: u32) {
         self.present_max_fps.store(fps, Ordering::SeqCst);
+    }
+
+    /// Apply a runtime pacing-mode change to the present limiter (the native
+    /// analogue of GFN's NVST p-f pacing framework control). Accepts `auto`,
+    /// `stream`, `vrr`, `off`/`disabled`, or an explicit fps. The limiter
+    /// probe re-reads `present_max_fps` every frame, so the change applies
+    /// immediately without rebuilding the pipeline.
+    pub(crate) fn set_pacing_mode(&self, mode: &str) -> Result<String, String> {
+        let (fps, label) = resolve_pacing_mode(mode)?;
+        self.set_present_max_fps(fps);
+        // Keep the HUD pacing line in sync with the limiter target: the stats
+        // overlay reads the mode back from the shared liveness state on its
+        // next tick, so a runtime change is visible immediately.
+        self.video_liveness.set_pacing_mode(mode);
+        Ok(format!("Native present limiter pacing set to {label}."))
     }
 
     pub(crate) fn set_d3d_fullscreen_sink(&self, enabled: bool) {
@@ -4987,6 +5023,36 @@ pub(crate) fn preferred_rtp_video_apis_for(
         "vulkan" | "vk" => vec![RtpVideoApi::Vulkan],
         "software" | "sw" => vec![RtpVideoApi::Software],
         _ => default_rtp_video_api_priority(requested_fps),
+    }
+}
+
+/// Resolve a runtime pacing-mode string into the present-limiter target fps
+/// (the native analogue of GFN's NVST p-f pacing framework control): `auto`
+/// (display-paced, VRR/cinematic aware), `stream` (the negotiated stream
+/// rate), `vrr` (cloud G-Sync), `off`/`disabled` (uncapped), or an explicit
+/// fps. Pure so the mapping is unit-testable; `set_pacing_mode` applies the
+/// result to the live limiter.
+pub(crate) fn resolve_pacing_mode(mode: &str) -> Result<(u32, String), String> {
+    let mode = mode.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "auto" => Ok((
+            PRESENT_LIMITER_AUTO_SENTINEL,
+            "auto (display-paced, VRR/cinematic aware)".to_owned(),
+        )),
+        "stream" => Ok((PRESENT_LIMITER_STREAM_SENTINEL, "stream rate".to_owned())),
+        "vrr" => Ok((
+            PRESENT_LIMITER_VRR_SENTINEL,
+            "VRR (cloud G-Sync) mode".to_owned(),
+        )),
+        "off" | "disabled" | "none" => Ok((0, "disabled (uncapped)".to_owned())),
+        other => {
+            let fps: u32 = other.parse().map_err(|_| {
+                format!(
+                    "Invalid pacing mode \"{other}\": expected auto | stream | vrr | off | <fps>."
+                )
+            })?;
+            Ok((fps, format!("capped at {fps} fps")))
+        }
     }
 }
 
@@ -9871,5 +9937,46 @@ mod mic_pipeline_tests {
             measured_recording_frame_duration_ns(100, 0, 3_333_333_337, 60),
             33_670_033
         );
+    }
+}
+
+#[cfg(test)]
+mod pacing_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_pacing_mode_maps_all_modes_and_rejects_garbage() {
+        // Named modes map to the sentinels / 0 (uncapped).
+        let (auto, _) = resolve_pacing_mode("auto").unwrap();
+        assert_eq!(auto, PRESENT_LIMITER_AUTO_SENTINEL);
+        let (stream, _) = resolve_pacing_mode("stream").unwrap();
+        assert_eq!(stream, PRESENT_LIMITER_STREAM_SENTINEL);
+        let (vrr, _) = resolve_pacing_mode("vrr").unwrap();
+        assert_eq!(vrr, PRESENT_LIMITER_VRR_SENTINEL);
+        let (off, label) = resolve_pacing_mode("off").unwrap();
+        assert_eq!(off, 0);
+        assert!(label.contains("disabled"));
+        assert_eq!(resolve_pacing_mode("disabled").unwrap().0, 0);
+        assert_eq!(resolve_pacing_mode("none").unwrap().0, 0);
+
+        // Case/whitespace tolerance.
+        let (auto_upper, _) = resolve_pacing_mode("  AUTO ").unwrap();
+        assert_eq!(auto_upper, PRESENT_LIMITER_AUTO_SENTINEL);
+
+        // Explicit fps.
+        let (fps, label) = resolve_pacing_mode("144").unwrap();
+        assert_eq!(fps, 144);
+        assert!(label.contains("144"));
+        assert_eq!(resolve_pacing_mode("60").unwrap().0, 60);
+
+        // Garbage is rejected with an actionable message.
+        let error = resolve_pacing_mode("turbo").unwrap_err();
+        assert!(error.contains("turbo"));
+        assert!(error.contains("auto"));
+        assert!(error.contains("stream"));
+        assert!(error.contains("vrr"));
+        assert!(error.contains("off"));
+        assert!(resolve_pacing_mode("").is_err());
+        assert!(resolve_pacing_mode("12x").is_err());
     }
 }

@@ -168,6 +168,7 @@ test("buildNativeStreamerSessionContext forwards requested/finalized streaming f
       toggleMicrophone: "Ctrl+Shift+M",
       screenshot: "F11",
       toggleRecording: "F12",
+      cyclePacing: "Ctrl+Shift+P",
     },
   );
 

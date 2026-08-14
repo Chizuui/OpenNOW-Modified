@@ -3,6 +3,13 @@ import type { StreamClientMode } from "./stream";
 export type NativeStreamerBackend = "stub" | "gstreamer";
 export type NativeStreamerBackendPreference = "auto" | NativeStreamerBackend;
 export type NativeStreamerFeatureMode = "auto" | "disabled" | "forced";
+/**
+ * Present-limiter pacing mode (the GFN NVST p-f pacing framework analogue):
+ * `auto` (display-paced, VRR/cinematic aware), `stream` (negotiated stream
+ * rate), `vrr` (cloud G-Sync), `off` (uncapped), or an explicit fps like
+ * `120`. `number` is a string so the setting serializes cleanly.
+ */
+export type NativePacingMode = "auto" | "stream" | "vrr" | "off" | string;
 export type NativeVideoBackendPreference =
   | "auto"
   | "d3d11"

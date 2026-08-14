@@ -99,6 +99,14 @@ const DATA_CHANNEL_SEND_TIMEOUT_MS = 3000;
 const MAX_INPUT_STDIN_BUFFER_BYTES = 64 * 1024;
 const MIN_NATIVE_BITRATE_KBPS = 5_000;
 const MAX_NATIVE_BITRATE_KBPS = 150_000;
+/**
+ * Cooldown between automatic network-triggered profile downgrades. The poor
+ * verdict oscillates under jitter, and every downgrade restarts the session
+ * (a ~10-20 s disruption) — the GFN pre-stream test equivalent must not fire
+ * repeatedly. A session restarts at the lower profile, so one step per
+ * cooldown is the safe cadence.
+ */
+const NETWORK_DOWNGRADE_COOLDOWN_MS = 60_000;
 
 function normalizeBitrateKbps(value: number): number {
   if (!Number.isFinite(value)) {
@@ -129,6 +137,10 @@ export class NativeStreamerManager {
   /** Cooldown so a slider drag does not spam the server with mid-session NVST updates (WebRTC parity). */
   private lastBitratePushAtMs = 0;
   private static readonly BITRATE_PUSH_COOLDOWN_MS = 1_000;
+  /** Wall-clock of the last automatic network-triggered profile downgrade (0 = none yet this process). */
+  private lastNetworkDowngradeAtMs = 0;
+  /** Guards the automatic profile downgrade so it fires at most once per session (the relaunch restarts at the lower profile). */
+  private networkDowngradeFiredThisSession = false;
   private inputBackpressureWarned = false;
   private answerInFlight = false;
   /** Captured by `handleEvent` for the in-flight `take-screenshot` request. */
@@ -166,6 +178,10 @@ export class NativeStreamerManager {
     if (this.activeSessionId && this.activeSessionId !== context.session.sessionId) {
       await this.stop("new native streamer session");
     }
+    // A fresh session starts at the negotiated profile; re-arm the automatic
+    // network downgrade so the new (already lower) profile can downgrade
+    // again if the network is still too weak.
+    this.networkDowngradeFiredThisSession = false;
     this.prepareRemoteIceQueue(context.session.sessionId);
 
     await this.ensureProcess();
@@ -355,6 +371,25 @@ export class NativeStreamerManager {
 
   updateSurface(surface: NativeRenderSurface): void {
     this.surfaceUpdates.update(surface);
+  }
+
+  /**
+   * Apply a runtime present-limiter pacing mode (the native analogue of GFN's
+   * NVST p-f pacing framework control): `auto` | `stream` | `vrr` | `off` |
+   * a fixed fps. The native streamer applies it to the live present limiter
+   * immediately without rebuilding the pipeline. No-op when no session is
+   * running (the mode is per-session and resets with the pipeline).
+   */
+  setPacingMode(pacingMode: string): void {
+    if (!this.child || this.activeSessionId === null) {
+      console.log(
+        `[NativeStreamer] Ignoring pacing mode "${pacingMode}": no active session.`,
+      );
+      return;
+    }
+    this.request({ type: "pacing", pacingMode }, CONTROL_TIMEOUT_MS).catch((error) => {
+      console.warn(`[NativeStreamer] Failed to set pacing mode "${pacingMode}":`, error);
+    });
   }
 
   updateBitrateLimit(maxBitrateKbps: number): void {
@@ -1111,6 +1146,58 @@ export class NativeStreamerManager {
         toCodec: message.toCodec,
       });
       void this.stop(`native codec downgrade (${message.fromCodec} → ${message.toCodec})`);
+      return;
+    }
+
+    if (message.type === "network-assessment") {
+      const { assessment } = message;
+      console.log(
+        `[NativeStreamer] Network assessment: verdict=${assessment.verdict} rtt=${assessment.rttMs ?? "n/a"}ms loss=${assessment.lossPercent ?? "n/a"}% jitter=${assessment.jitterMs ?? "n/a"}ms lowerFps=${assessment.recommendLowerFps} lowerRes=${assessment.recommendLowerResolution} keyframe=${assessment.suggestKeyframe}`,
+      );
+      // Surface the verdict to the renderer so the user sees why the session
+      // is degrading (and why a downgrade restart may follow).
+      this.options.emit({
+        type: "native-network-assessment",
+        assessment,
+      });
+      // Client half of LTR/PLI recovery: loss is climbing while the stream is
+      // still alive — ask for a fresh keyframe NOW so recovery starts before
+      // the picture visibly corrupts (cheap: RTCP PLI over signaling).
+      if (assessment.suggestKeyframe) {
+        void this.options
+          .requestKeyframe({
+            reason: "native-network-assessment",
+            backlogFrames: 0,
+            attempt: 0,
+          })
+          .catch((error) => {
+            console.warn("[NativeStreamer] Failed to request keyframe after network assessment:", error);
+          });
+      }
+      // Auto-downgrade: the negotiated profile is no longer sustainable
+      // (poor verdict). Relaunch at a lower profile instead of letting the
+      // session keep flickering. Guarded so it fires at most once per session
+      // and with a cooldown — the relaunch itself restarts at the lower
+      // profile, and repeated restarts would be worse than the degradation.
+      const now = Date.now();
+      const cooldownElapsed = now - this.lastNetworkDowngradeAtMs >= NETWORK_DOWNGRADE_COOLDOWN_MS;
+      if (
+        assessment.verdict === "poor"
+        && assessment.recommendLowerFps
+        && !this.networkDowngradeFiredThisSession
+        && cooldownElapsed
+      ) {
+        this.networkDowngradeFiredThisSession = true;
+        this.lastNetworkDowngradeAtMs = now;
+        console.warn(
+          "[NativeStreamer] Network assessment is poor; downgrading session profile and relaunching.",
+        );
+        this.options.emit({
+          type: "native-network-downgrade-request",
+          reason: `native network assessment poor (rtt=${assessment.rttMs ?? "n/a"}ms, loss=${assessment.lossPercent ?? "n/a"}%)`,
+        });
+        void this.stop(`native network downgrade (${assessment.verdict})`);
+      }
       return;
     }
 

@@ -47,6 +47,7 @@ export const IPC_CHANNELS = {
   NATIVE_RENDER_SURFACE: "gfn:native-render-surface",
   NATIVE_UPDATE_SHORTCUTS: "gfn:native-update-shortcuts",
   NATIVE_UPDATE_BITRATE: "gfn:native-update-bitrate",
+  NATIVE_PACING: "gfn:native-pacing",
   NATIVE_MICROPHONE: "gfn:native-microphone",
   NATIVE_SCREENSHOT: "gfn:native-screenshot",
   NATIVE_RECORDING_START: "gfn:native-recording-start",

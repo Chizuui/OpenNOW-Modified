@@ -54,6 +54,12 @@ import { formatServerLocation } from "./utils/streamDiagnosticsFormat";
 import type { StreamStatus } from "./lib/appTypes";
 import { getCodecToMigrateToAuto, loadStoredCodecResults, resolveNativeCodecAvailability, resolveStreamProfileCodec, saveStoredCodecResults, testCodecSupport, type CodecTestResult } from "./lib/codecDiagnostics";
 import {
+  cyclePacingMode,
+  isCustomPacingFps,
+  nextLowerFps,
+  nextLowerResolution,
+} from "./lib/streamOptions";
+import {
   detectDisplayRefreshRate,
   hasResolvedAutoFps,
   markFpsAutoResolved,
@@ -184,7 +190,15 @@ export function App(): JSX.Element {
   const [consentSurfacePresent, setConsentSurfacePresent] = useState(false);
   const [gstScanState, setGstScanState] = useState<{ status: string; reason: string } | null>(null);
   const [codecMigratedNotice, setCodecMigratedNotice] = useState<{ fromCodec: string } | null>(null);
-  const [codecDowngradeNotice, setCodecDowngradeNotice] = useState<{ fromCodec: string; toCodec: string } | null>(null);
+  const [codecDowngradeNotice, setCodecDowngradeNotice] = useState<{
+    fromCodec: string;
+    toCodec: string;
+    /** `codec` (AV1 → H265 relaunch) or `network` (poor-verdict profile downgrade relaunch). */
+    kind?: "codec" | "network";
+    detail?: string;
+  } | null>(null);
+  /** Short-lived confirmation toast after the pacing-mode cycle shortcut. */
+  const [pacingCycleNotice, setPacingCycleNotice] = useState<{ label: string } | null>(null);
   const activeSessionProxyUrl = useMemo(
     () => getEnabledSessionProxyUrl(settings),
     [settings.sessionProxyEnabled, settings.sessionProxyUrl],
@@ -729,11 +743,11 @@ export function App(): JSX.Element {
   // launched with a direct-launch argument (frontend / big picture usage).
   const effectiveControllerMode = settings.controllerMode || directLaunchConsoleMode;
 
-  const buildCurrentStreamSettings = useCallback((subscriptionOverride?: SubscriptionInfo | null, codecOverride?: VideoCodec): StreamSettings => {
+  const buildCurrentStreamSettings = useCallback((subscriptionOverride?: SubscriptionInfo | null, codecOverride?: VideoCodec, fpsOverride?: number, resolutionOverride?: string): StreamSettings => {
     const currentSubscription = subscriptionOverride === undefined ? subscriptionInfo : subscriptionOverride;
     const entitledProfile = resolveEntitledStreamProfile(currentSubscription?.entitledResolutions ?? [], {
-      resolution: settings.resolution,
-      fps: settings.fps,
+      resolution: resolutionOverride ?? settings.resolution,
+      fps: fpsOverride ?? settings.fps,
     });
     const streamProfile = entitledProfile ?? SAFE_FALLBACK_STREAM_PROFILE;
 
@@ -1072,6 +1086,20 @@ export function App(): JSX.Element {
     return () => window.clearTimeout(timer);
   }, [codecDowngradeNotice]);
 
+  // Pacing-mode cycle toast: short-lived — the mode change is instantly
+  // visible in the native HUD (Pace line) and the setting chip, so it does
+  // not need the long downgrade display window.
+  useEffect(() => {
+    if (!pacingCycleNotice) {
+      return;
+    }
+    const notice = pacingCycleNotice;
+    const timer = window.setTimeout(() => {
+      setPacingCycleNotice((current) => (current === notice ? null : current));
+    }, 3500);
+    return () => window.clearTimeout(timer);
+  }, [pacingCycleNotice]);
+
   const shortcuts = useMemo(() => {
     const parseWithFallback = (value: string, fallback: string) => {
       const parsed = normalizeShortcut(value);
@@ -1085,7 +1113,8 @@ export function App(): JSX.Element {
     const toggleMicrophone = parseWithFallback(settings.shortcutToggleMicrophone, DEFAULT_SHORTCUTS.shortcutToggleMicrophone);
     const screenshot = parseWithFallback(settings.shortcutScreenshot, DEFAULT_SHORTCUTS.shortcutScreenshot);
     const recording = parseWithFallback(settings.shortcutToggleRecording, DEFAULT_SHORTCUTS.shortcutToggleRecording);
-    return { toggleStats, togglePointerLock, toggleFullscreen, stopStream, toggleAntiAfk, toggleMicrophone, screenshot, recording };
+    const cyclePacing = parseWithFallback(settings.shortcutCyclePacing, DEFAULT_SHORTCUTS.shortcutCyclePacing);
+    return { toggleStats, togglePointerLock, toggleFullscreen, stopStream, toggleAntiAfk, toggleMicrophone, screenshot, recording, cyclePacing };
   }, [
     settings.shortcutToggleStats,
     settings.shortcutTogglePointerLock,
@@ -1095,6 +1124,7 @@ export function App(): JSX.Element {
     settings.shortcutToggleMicrophone,
     settings.shortcutScreenshot,
     settings.shortcutToggleRecording,
+    settings.shortcutCyclePacing,
   ]);
 
   const nativeStreamerShortcuts = useMemo(() => ({
@@ -1106,6 +1136,7 @@ export function App(): JSX.Element {
     toggleMicrophone: shortcuts.toggleMicrophone.canonical,
     screenshot: "",
     toggleRecording: "",
+    cyclePacing: shortcuts.cyclePacing.canonical,
   }), [shortcuts]);
 
   const buildSignalingConnectRequest = useCallback((activeSession: SessionInfo, codecOverride?: VideoCodec): SignalingConnectRequest => {
@@ -2156,12 +2187,69 @@ export function App(): JSX.Element {
     });
   }, [markExplicitSignalingShutdown, refreshNavbarActiveSession, resetLaunchRuntime, setCodecDowngradeNotice]);
 
+  /**
+   * Native network auto-downgrade: the streamer's runtime network assessment
+   * went `poor` (the negotiated profile is no longer sustainable — the
+   * runtime half of GFN's pre-stream "stream test" rejection). Mark the
+   * current session as explicitly shut down, then relaunch the same game at
+   * the next-lower fps (and, once fps is already minimal, the next-lower
+   * resolution) in a forced-new session — mirroring the codec auto-downgrade
+   * path so the stream stays watchable instead of flickering at an
+   * unsustainable rate.
+   */
+  const handleNativeNetworkDowngrade = useCallback(async (reason: string): Promise<void> => {
+    const game = streamingGameRef.current;
+    console.warn(`[Recovery] Native network assessment triggered profile downgrade (${reason}); relaunching at a lower profile.`);
+    markExplicitSignalingShutdown();
+    clientRef.current?.dispose();
+    clientRef.current = null;
+    launchInFlightRef.current = false;
+    if (!game) {
+      console.warn("[Recovery] No active game for network downgrade; ending stream.");
+      resetLaunchRuntime();
+      void refreshNavbarActiveSession();
+      return;
+    }
+    const currentFps = settings.fps;
+    const currentResolution = settings.resolution;
+    const fpsOverride = nextLowerFps(currentFps);
+    // Step resolution down only once fps is already minimal (30 fps) — a
+    // lower fps is the gentler, entitlement-safe first step.
+    const resolutionOverride = fpsOverride === null ? nextLowerResolution(currentResolution) : undefined;
+    if (fpsOverride === null && resolutionOverride === undefined) {
+      console.warn("[Recovery] Network downgrade has no lower profile to step to; keeping the session.");
+      return;
+    }
+    setCodecDowngradeNotice({
+      fromCodec: "",
+      toCodec: "",
+      kind: "network",
+      detail: fpsOverride !== null
+        ? `fps ${currentFps} → ${fpsOverride}`
+        : `resolution ${currentResolution} → ${resolutionOverride}`,
+    });
+    await handlePlayGameRef.current(game, {
+      bypassGuards: true,
+      forceNewSession: true,
+      fpsOverride: fpsOverride ?? undefined,
+      resolutionOverride: resolutionOverride ?? undefined,
+    });
+  }, [
+    markExplicitSignalingShutdown,
+    refreshNavbarActiveSession,
+    resetLaunchRuntime,
+    setCodecDowngradeNotice,
+    settings.fps,
+    settings.resolution,
+  ]);
+
   useSignalingEvents({
     runtime: streamRuntime,
     attemptSessionRecovery,
     diagnosticsStore,
     handleExpectedNativeSessionClose,
     handleNativeCodecDowngrade,
+    handleNativeNetworkDowngrade,
     markDiscordStreamStarted,
     refreshNavbarActiveSession,
     resetLaunchRuntime,
@@ -2689,8 +2777,35 @@ export function App(): JSX.Element {
           dispatchStreamShortcutAction(action);
         }
         return;
+      case "cyclePacing":
+        // Cycle the native present-limiter pacing mode (auto → stream → vrr →
+        // off). Persist the new mode (the next session uses it too) and push
+        // it to the live limiter immediately; the native HUD Pace line and the
+        // settings chip update right away.
+        {
+          const next = cyclePacingMode(settings.nativePacingMode ?? "auto");
+          const label = isCustomPacingFps(next)
+            ? `${next} fps`
+            : next === "auto"
+              ? t("settings.video.pacingModeAuto")
+              : next === "stream"
+                ? t("settings.video.pacingModeStream")
+                : next === "vrr"
+                  ? t("settings.video.pacingModeVrr")
+                  : t("settings.video.pacingModeOff");
+          setSettings((prev) => (
+            Object.is(prev.nativePacingMode, next) ? prev : { ...prev, nativePacingMode: next }
+          ));
+          try {
+            window.openNow.setNativePacingMode(next);
+          } catch {
+            /* best-effort */
+          }
+          setPacingCycleNotice({ label });
+        }
+        return;
     }
-  }, [handlePromptedStopStream, handleToggleMicrophone, requestPointerLockCapture, streamStatus, toggleSessionFullscreen]);
+  }, [handlePromptedStopStream, handleToggleMicrophone, requestPointerLockCapture, settings.nativePacingMode, streamStatus, t, toggleSessionFullscreen]);
 
   useEffect(() => {
     handleStreamShortcutActionRef.current = handleStreamShortcutAction;
@@ -2792,6 +2907,13 @@ export function App(): JSX.Element {
         if (streamStatus === "streaming") {
           clientRef.current?.toggleMicrophone();
         }
+      }
+
+      if (isShortcutMatch(e, shortcuts.cyclePacing)) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        handleStreamShortcutAction("cyclePacing");
       }
     };
 
@@ -3329,14 +3451,26 @@ export function App(): JSX.Element {
           </span>
         </div>
       )}
-      {/* Native codec auto-downgrade toast (AV1 → H265 → H264 session restart) */}
+      {/* Native codec / network auto-downgrade toast (session restart) */}
       {codecDowngradeNotice && (
         <div className="codec-migrated-toast" role="status">
           <span>
-            {t("settings.video.codecDowngradeNotice", {
-              fromCodec: codecDowngradeNotice.fromCodec,
-              toCodec: codecDowngradeNotice.toCodec,
-            })}
+            {codecDowngradeNotice.kind === "network" && codecDowngradeNotice.detail
+              ? t("settings.video.networkDowngradeNotice", {
+                detail: codecDowngradeNotice.detail,
+              })
+              : t("settings.video.codecDowngradeNotice", {
+                fromCodec: codecDowngradeNotice.fromCodec,
+                toCodec: codecDowngradeNotice.toCodec,
+              })}
+          </span>
+        </div>
+      )}
+      {/* Pacing-mode cycle shortcut toast */}
+      {pacingCycleNotice && (
+        <div className="codec-migrated-toast" role="status">
+          <span>
+            {t("settings.video.pacingCycleNotice", { mode: pacingCycleNotice.label })}
           </span>
         </div>
       )}

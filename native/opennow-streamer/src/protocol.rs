@@ -44,6 +44,13 @@ pub struct CommandEnvelope {
     pub label: Option<String>,
     #[serde(default, rename = "payloadBase64")]
     pub payload_base64: Option<String>,
+    /// For `pacing`: the present-limiter pacing mode to apply at runtime
+    /// (`auto` | `stream` | `vrr` | `off` | a fixed fps like `144`). Mirrors
+    /// the GFN NVST p-f (pacing framework) control: the client's frame
+    /// delivery grid can be re-shaped mid-session without restarting the
+    /// pipeline.
+    #[serde(default)]
+    pub pacing_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +194,19 @@ pub struct StreamingFeatures {
     pub enabled_l4s: Option<bool>,
     #[serde(default)]
     pub true_hdr: Option<bool>,
+    /// Request Forward Error Correction (RED/ULP-FEC) from the server encoder
+    /// so packet loss is repaired in-transit instead of waiting for a NACK
+    /// retransmission round trip (the GFN NVST `FEC VBR mode` / `legacy CBR`
+    /// family). Client-side webrtcbin also negotiates RED when `do-fec` is
+    /// enabled on the element.
+    #[serde(default)]
+    pub enabled_fec: Option<bool>,
+    /// Request Long-Term Reference (LTR) frame support from the server
+    /// encoder: after a loss burst the encoder can recover from a recent LTR
+    /// frame instead of a full keyframe request (the GFN
+    /// `video.encoderLtrFeatureSetting` / `allowLtr` control).
+    #[serde(default)]
+    pub enabled_ltr: Option<bool>,
 }
 
 #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
@@ -210,6 +230,12 @@ impl StreamingFeatures {
         }
         if let Some(true_hdr) = self.true_hdr {
             parts.push(format!("trueHdr={true_hdr}"));
+        }
+        if let Some(enabled_fec) = self.enabled_fec {
+            parts.push(format!("fec={enabled_fec}"));
+        }
+        if let Some(enabled_ltr) = self.enabled_ltr {
+            parts.push(format!("ltr={enabled_ltr}"));
         }
         if parts.is_empty() {
             "none".to_owned()
@@ -381,6 +407,8 @@ pub struct NativeStreamerShortcutBindings {
     pub screenshot: String,
     #[serde(default)]
     pub toggle_recording: String,
+    #[serde(default)]
+    pub cycle_pacing: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -394,6 +422,7 @@ pub enum NativeStreamerShortcutAction {
     ToggleMicrophone,
     Screenshot,
     ToggleRecording,
+    CyclePacing,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -775,8 +804,65 @@ pub enum Event {
         #[serde(rename = "toCodec")]
         to_codec: String,
     },
+    /// Pre-flight / steady-state network health assessment (the native
+    /// analogue of GFN's pre-stream "stream test": bandwidth/jitter/loss
+    /// probe). Emitted when the verdict changes or a recommended recovery
+    /// action appears, so the Electron main process can adapt the session
+    /// profile (fps/resolution) or trigger a keyframe without waiting for a
+    /// full video stall.
+    #[serde(rename = "network-assessment")]
+    NetworkAssessment { assessment: NativeNetworkAssessment },
     #[serde(rename = "error")]
     Error { code: String, message: String },
+}
+
+/// Steady-state network health verdict (native analogue of the GFN
+/// pre-stream "stream test"). `Stable` = the negotiated profile is safely
+/// supported; `Degraded` = jitter/RTT/loss are climbing and the session
+/// should consider a lower bitrate (or accept a deeper jitter buffer);
+/// `Poor` = the network cannot sustain the profile — recommend dropping
+/// fps/resolution and proactively request a keyframe so recovery is fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkVerdict {
+    Stable,
+    Degraded,
+    Poor,
+}
+
+impl NetworkVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Degraded => "degraded",
+            Self::Poor => "poor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeNetworkAssessment {
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    /// Packet loss percent (0-100), smoothed EMA from the stats channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_percent: Option<f64>,
+    /// True when the network can no longer sustain the negotiated fps — the
+    /// session should step down (GFN's pre-stream test rejects profiles that
+    /// exceed the measured bandwidth; this is the runtime equivalent).
+    pub recommend_lower_fps: bool,
+    /// True when even a lower fps is unlikely to help (loss/jitter too high)
+    /// — recommend stepping down resolution too.
+    pub recommend_lower_resolution: bool,
+    /// True when the client should ask the server for a fresh keyframe now
+    /// (loss burst detected while the stream is still alive — the LTR/keyframe
+    /// recovery analogue) so recovery starts before the picture visibly
+    /// corrupts.
+    pub suggest_keyframe: bool,
 }
 
 pub fn parse_command(value: Value) -> Result<CommandEnvelope, String> {

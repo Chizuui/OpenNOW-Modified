@@ -26,6 +26,11 @@ import {
   type NativeCodecAvailability,
 } from "../../../lib/codecDiagnostics";
 import { useNativeStreamerStatus } from "../../../hooks/useNativeStreamerStatus";
+import {
+  isCustomPacingFps,
+  pacingFpsOptions,
+  pacingModeOptions,
+} from "../../../lib/streamOptions";
 import { useTranslation } from "../../../i18n";
 import { MotionSpinner } from "../../MotionSpinner";
 import { SelectDropdown, type SelectDropdownOption } from "../../ui/SelectDropdown";
@@ -115,6 +120,19 @@ export function StreamQualityControls({
         })),
     [resolutionGroups, useEntitledStreamOptions],
   );
+
+  // Persist the pacing mode to settings AND push it to the native present
+  // limiter immediately — the streamer supports runtime pacing changes, so a
+  // chip click takes effect on the live session without a restart. When no
+  // session is running the main-process manager no-ops with a log.
+  const handlePacingModeChange = useCallback((mode: string): void => {
+    handleChange("nativePacingMode", mode);
+    try {
+      window.openNow.setNativePacingMode(mode);
+    } catch {
+      /* best-effort */
+    }
+  }, [handleChange]);
 
   const handleResolutionChange = useCallback((resolution: string): void => {
     handleChange("resolution", resolution);
@@ -576,6 +594,58 @@ export function StreamQualityControls({
           {t("settings.video.jitterBufferHint")}
         </span>
       </div>
+
+      {isNativeMode && (
+        <div className="settings-row settings-row--column">
+          <div className="settings-row-top">
+            <label className="settings-label">{t("settings.video.pacingMode")}</label>
+          </div>
+          <div className="settings-chip-row">
+            {pacingModeOptions.map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                className={`settings-chip ${settings.nativePacingMode === mode ? "active" : ""}`}
+                aria-pressed={settings.nativePacingMode === mode}
+                onClick={() => handlePacingModeChange(mode)}
+              >
+                <span>{t(`settings.video.pacingMode${mode[0].toUpperCase()}${mode.slice(1)}`)}</span>
+              </button>
+            ))}
+            <button
+              key="custom"
+              type="button"
+              className={`settings-chip ${isCustomPacingFps(settings.nativePacingMode) ? "active" : ""}`}
+              aria-pressed={isCustomPacingFps(settings.nativePacingMode)}
+              onClick={() => {
+                if (!isCustomPacingFps(settings.nativePacingMode)) {
+                  handlePacingModeChange(String(pacingFpsOptions[0]));
+                }
+              }}
+            >
+              <span>{t("settings.video.pacingModeCustom")}</span>
+            </button>
+          </div>
+          {isCustomPacingFps(settings.nativePacingMode) && (
+            <div className="settings-chip-row">
+              {pacingFpsOptions.map((fps) => (
+                <button
+                  key={fps}
+                  type="button"
+                  className={`settings-chip ${settings.nativePacingMode === String(fps) ? "active" : ""}`}
+                  aria-pressed={settings.nativePacingMode === String(fps)}
+                  onClick={() => handlePacingModeChange(String(fps))}
+                >
+                  <span>{fps}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <span className="settings-subtle-hint">
+            {t("settings.video.pacingModeHint")}
+          </span>
+        </div>
+      )}
     </>
   );
 }

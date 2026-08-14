@@ -113,6 +113,11 @@ impl NativeShortcutMatcher {
             NativeStreamerShortcutAction::ToggleRecording,
             &bindings.toggle_recording,
         );
+        append_binding(
+            &mut parsed,
+            NativeStreamerShortcutAction::CyclePacing,
+            &bindings.cycle_pacing,
+        );
         Self { bindings: parsed }
     }
 
@@ -291,6 +296,7 @@ mod tests {
             toggle_microphone: "Ctrl+Shift+M".to_owned(),
             screenshot: "F11".to_owned(),
             toggle_recording: "F12".to_owned(),
+            cycle_pacing: "Ctrl+Shift+P".to_owned(),
         }
     }
 
@@ -305,6 +311,27 @@ mod tests {
         assert_eq!(
             matcher.match_keydown(VK_F1 + 10, 0, 0),
             Some(NativeStreamerShortcutAction::Screenshot)
+        );
+    }
+
+    #[test]
+    fn matches_cycle_pacing_modifier_combination() {
+        let matcher = NativeShortcutMatcher::from_bindings(&bindings());
+
+        // Ctrl+Shift+P cycles the present-limiter pacing mode.
+        assert_eq!(
+            matcher.match_keydown(
+                u16::from(b'P'),
+                0,
+                MODIFIER_CTRL | MODIFIER_SHIFT
+            ),
+            Some(NativeStreamerShortcutAction::CyclePacing)
+        );
+        // Without both modifiers it is not a pacing shortcut (P alone, Ctrl+P).
+        assert_eq!(matcher.match_keydown(u16::from(b'P'), 0, 0), None);
+        assert_eq!(
+            matcher.match_keydown(u16::from(b'P'), 0, MODIFIER_CTRL),
+            None
         );
     }
 

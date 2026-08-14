@@ -43,6 +43,12 @@ export interface SignalingEventOptions {
    * with `toCodec`.
    */
   handleNativeCodecDowngrade: (fromCodec: string, toCodec: string) => void | Promise<void>;
+  /**
+   * Native runtime network auto-downgrade: the streamer's network assessment
+   * went `poor`; the renderer relaunches the same game at a lower profile
+   * (fps, then resolution).
+   */
+  handleNativeNetworkDowngrade: (reason: string) => void | Promise<void>;
   markDiscordStreamStarted: () => void;
   refreshNavbarActiveSession: () => Promise<void>;
   resetLaunchRuntime: ResetLaunchRuntime;
@@ -61,6 +67,7 @@ export function useSignalingEvents({
   diagnosticsStore,
   handleExpectedNativeSessionClose,
   handleNativeCodecDowngrade,
+  handleNativeNetworkDowngrade,
   markDiscordStreamStarted,
   refreshNavbarActiveSession,
   resetLaunchRuntime,
@@ -383,6 +390,14 @@ export function useSignalingEvents({
         } else if (event.type === "native-stream-started") {
           console.log("[App] Native streamer started:", event.message ?? "");
           activateNativeInputForCurrentSession(nativeInputProtocolVersionRef.current ?? undefined);
+          // Re-apply the user's pacing mode on every session start — the native
+          // streamer only receives its base config at spawn, so the runtime
+          // command is re-sent here to honor a setting changed since launch.
+          try {
+            window.openNow.setNativePacingMode(settings.nativePacingMode);
+          } catch {
+            /* best-effort */
+          }
         } else if (event.type === "native-input-ready") {
           console.log("[App] Native input protocol ready:", event.protocolVersion);
           nativeInputProtocolVersionRef.current = event.protocolVersion;
@@ -499,6 +514,18 @@ export function useSignalingEvents({
           // relaunches the same game with the fallback codec in a fresh
           // session.
           await handleNativeCodecDowngrade(event.fromCodec, event.toCodec);
+        } else if (event.type === "native-network-assessment") {
+          // Runtime network verdict (the analogue of GFN's pre-stream "stream
+          // test"): surface it so the user sees why the session may restart.
+          const { assessment } = event;
+          console.log(
+            `[Network] Native assessment: verdict=${assessment.verdict} rtt=${assessment.rttMs ?? "n/a"}ms loss=${assessment.lossPercent ?? "n/a"}% jitter=${assessment.jitterMs ?? "n/a"}ms lowerFps=${assessment.recommendLowerFps} lowerRes=${assessment.recommendLowerResolution} keyframe=${assessment.suggestKeyframe}`,
+          );
+        } else if (event.type === "native-network-downgrade-request") {
+          // The manager already stopped the native streamer; relaunch the
+          // same game at a lower profile (fps, then resolution) in a fresh
+          // session so the stream stays watchable on a degraded link.
+          await handleNativeNetworkDowngrade(event.reason);
         } else if (event.type === "remote-ice") {
           remoteIceSeenForSessionRef.current = sessionRef.current?.sessionId ?? null;
           hasConfirmedRemoteIceRef.current = true;

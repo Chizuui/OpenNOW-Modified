@@ -171,6 +171,12 @@ export interface OpenNowApi {
 
   /** Update the native streamer receive bitrate limit mid-session (Kbps) */
   updateNativeBitrateLimit(maxBitrateKbps: number): void;
+  /**
+   * Apply a runtime present-limiter pacing mode (`auto` | `stream` | `vrr` |
+   * `off` | a fixed fps) — the native analogue of GFN's NVST p-f pacing
+   * framework control.
+   */
+  setNativePacingMode(pacingMode: string): void;
   /** Mute/unmute the native streamer microphone (WASAPI send path) mid-session. */
   setNativeMicrophoneEnabled(enabled: boolean): void;
   requestKeyframe(input: KeyframeRequest): Promise<void>;

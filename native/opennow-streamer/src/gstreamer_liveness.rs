@@ -11,7 +11,10 @@ use crate::gstreamer_transitions::{
     format_transition_summary, resolve_queue_mode, TransitionSnapshot, TransitionTelemetry,
     DEFAULT_VIDEO_QUEUE_DEPTH,
 };
-use crate::protocol::{Event, NativeQueueMode, NativeStreamerSessionContext, VideoStallEvent};
+use crate::protocol::{
+    Event, NativeNetworkAssessment, NativeQueueMode, NativeStreamerSessionContext, NetworkVerdict,
+    VideoStallEvent,
+};
 use gst::prelude::*;
 use gstreamer as gst;
 use std::collections::VecDeque;
@@ -156,6 +159,135 @@ fn target_webrtc_latency_ms(
     }
     target
 }
+/// ADJB (Adaptive Jitter Buffer) tuning, ported from GFN NVST's
+/// `video.adjb*` configuration family:
+/// - `video.adjbQuantile` → the jitter sample the buffers are sized for is
+///   the 99th percentile of the recent history, not the EWMA average — a
+///   rare 30 ms outlier must not be averaged away when sizing the playout
+///   buffer (that is exactly the burst that starves the decoder).
+/// - `video.adjbQuantileConvergenceFactor` → the buffer target moves toward
+///   the new target by a fraction per tick (EMA-style convergence) instead
+///   of stepping, so a single degraded sample cannot jolt latency.
+/// - `video.adjbMinLengthMs` / `video.adjbMaxLengthMs` → the WEBRTC_LATENCY
+///   BASE/MAX range already implements the min/max bounds.
+const ADJB_JITTER_HISTORY_MAX: usize = 96;
+const ADJB_QUANTILE: f64 = 0.99;
+const ADJB_CONVERGENCE_FACTOR: f64 = 0.35;
+/// Minimum interval (ms) between network-assessment re-emits when only the
+/// verdict flips (the degraded/poor boundary oscillates under jitter, so
+/// without a throttle the event would spam the main process). A NEW
+/// keyframe suggestion is always emitted immediately — that is the action
+/// item and must not be throttled away.
+const NETWORK_ASSESSMENT_EMIT_INTERVAL_MS: u64 = 5_000;
+
+/// Nearest-rank quantile of a jitter-history window — the GFN NVST
+/// `video.adjbQuantile` analogue. Returns None for an empty window.
+fn percentile_quantile(history: &VecDeque<u32>, quantile: f64) -> Option<u32> {
+    if history.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u32> = history.iter().copied().collect();
+    sorted.sort_unstable();
+    // Nearest-rank method: the ceil(p·N)-th smallest value (1-indexed). For
+    // N=96, p=0.99 → ceil(95.04) = 96th smallest = the single 40 ms outlier
+    // in a 95×3 ms + 1×40 ms window, which is exactly the tail the ADJB
+    // buffer must absorb.
+    let rank = ((sorted.len() as f64) * quantile.clamp(0.0, 1.0)).ceil() as usize;
+    Some(sorted[rank.saturating_sub(1).min(sorted.len() - 1)])
+}
+
+/// ADJB convergence step (GFN `video.adjbQuantileConvergenceFactor`): move
+/// `current` a fraction of the way toward `target` per tick instead of
+/// stepping, so a single degraded sample cannot jolt latency. Tiny deltas
+/// (where a fractional step would round to zero) converge all the way so the
+/// buffer never stalls just below its target.
+fn adjb_converged(current: u32, target: u32, factor: f64) -> u32 {
+    if current == target || factor <= 0.0 {
+        return current;
+    }
+    let delta = i64::from(target) - i64::from(current);
+    let step = ((delta as f64) * factor.clamp(0.0, 1.0)).round() as i64;
+    if step == 0 {
+        // Tiny delta: a fractional step would round to zero — converge all
+        // the way so the buffer never stalls just below its target.
+        return target;
+    }
+    (i64::from(current) + step).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// Runtime network assessment — the native analogue of GFN's pre-stream
+/// "stream test" (bandwidth/jitter/loss probe, profile rejection when below
+/// `minRecommendedBandwidthMbps`). Classifies the smoothed network picture
+/// into a verdict plus recovery recommendations. Thresholds mirror the
+/// adaptive-buffer ramps so the verdict always agrees with what the buffers
+/// are already doing: loss ≥0.15% / RTT ≥60 ms / jitter ≥15 ms = degraded
+/// (step fps or bitrate down), loss ≥0.5% / RTT ≥150 ms / jitter ≥40 ms =
+/// poor (step resolution down too), and any loss while the stream is alive
+/// suggests a proactive keyframe so recovery starts before visible
+/// corruption (the client half of LTR/PLI recovery).
+fn assess_network(
+    jitter_ms: Option<u32>,
+    rtt_ema_ms: u32,
+    loss_ema_fraction: Option<f64>,
+) -> (NetworkVerdict, bool, bool, bool) {
+    let loss = loss_ema_fraction.unwrap_or(0.0);
+    let jitter = jitter_ms.unwrap_or(0);
+    let poor = loss >= 0.005 || rtt_ema_ms >= 150 || jitter >= 40;
+    let degraded = loss >= 0.0015 || rtt_ema_ms >= 60 || jitter >= 15;
+    let verdict = if poor {
+        NetworkVerdict::Poor
+    } else if degraded {
+        NetworkVerdict::Degraded
+    } else {
+        NetworkVerdict::Stable
+    };
+    (
+        verdict,
+        degraded,
+        poor,
+        loss >= 0.002,
+    )
+}
+
+/// HUD overlay verdict colors (dwritetextoverlay `color` is a guint ARGB,
+/// 0xAARRGGBB). The whole HUD tint shifts to amber/red while the runtime
+/// network assessment is degraded/poor; a healthy (stable) session keeps the
+/// default white so the HUD looks normal.
+const OVERLAY_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+const OVERLAY_COLOR_DEGRADED: u32 = 0xFFFF_B300; // amber
+const OVERLAY_COLOR_POOR: u32 = 0xFFFF_3B30; // red
+
+/// Map a network verdict to the HUD tint (see OVERLAY_COLOR_*). Unknown /
+/// stable verdicts keep the default white.
+fn verdict_overlay_color_for(verdict: &str) -> u32 {
+    match verdict {
+        "degraded" => OVERLAY_COLOR_DEGRADED,
+        "poor" => OVERLAY_COLOR_POOR,
+        _ => OVERLAY_COLOR_DEFAULT,
+    }
+}
+
+/// Compact HUD label for the present-limiter pacing mode (the native
+/// analogue of GFN's NVST p-f pacing framework control). Mirrors the mode
+/// normalization in `resolve_pacing_mode` so the HUD stays in sync with
+/// `set_pacing_mode` regardless of the alias used ("disabled"/"none" →
+/// "off", explicit fps → "144fps"). Unknown values render as "?" so a
+/// desync between the limiter target and the HUD is visible.
+fn pacing_mode_hud_label(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "auto" => "auto".to_owned(),
+        "stream" => "stream".to_owned(),
+        "vrr" => "vrr".to_owned(),
+        "off" | "disabled" | "none" => "off".to_owned(),
+        // Empty string would vacuously pass the all-digits check; require at
+        // least one digit so "" falls through to the unknown "?" marker.
+        other if !other.is_empty() && other.chars().all(|c| c.is_ascii_digit()) => {
+            format!("{other}fps")
+        }
+        _ => "?".to_owned(),
+    }
+}
+
 const VIDEO_STALL_MIN_KEYFRAME_REQUEST_MS: u64 = 2_000;
 const VIDEO_STARTUP_KEYFRAME_MS: u64 = 2_500;
 const VIDEO_STARTUP_RESYNC_MS: u64 = 5_000;
@@ -393,6 +525,32 @@ pub(crate) struct VideoLivenessState {
     /// past the spike instead of being released the moment RTT dips once
     /// (that dip is followed by another burst).
     burst_hold_until_ms: AtomicU64,
+    /// Sliding window of recent receive-jitter samples (ms) used to compute
+    /// the ADJB 99th-percentile quantile (see ADJB_QUANTILE). Ring buffer
+    /// capped at ADJB_JITTER_HISTORY_MAX samples (~24 s at one sample per
+    /// 250 ms watchdog tick).
+    jitter_history: Mutex<VecDeque<u32>>,
+    /// 99th-percentile of `jitter_history` (ms) — the jitter value the
+    /// adaptive playout buffers are sized for (the GFN `video.adjbQuantile`
+    /// analogue). 0 = no samples yet.
+    adjb_jitter_p99: AtomicU32,
+    /// Last emitted network assessment, so the watchdog only re-emits the
+    /// `network-assessment` event when the verdict or a recommendation
+    /// actually changed (the degraded/poor boundary oscillates under
+    /// jitter).
+    last_assessment: Mutex<Option<NativeNetworkAssessment>>,
+    /// Watchdog clock (ms) of the last network-assessment emit, for the
+    /// NETWORK_ASSESSMENT_EMIT_INTERVAL_MS throttle on verdict-only flips.
+    last_assessment_emitted_ms: AtomicU64,
+    /// Last HUD tint applied from the verdict (0 = never applied yet, so the
+    /// first update always writes the current color). Avoids re-setting the
+    /// dwritetextoverlay `color` property on every stats tick.
+    overlay_color_applied: AtomicU32,
+    /// Present-limiter pacing mode last applied via the `pacing` command
+    /// (normalized raw value, e.g. "auto", "stream", "vrr", "off", "144").
+    /// Displayed on the HUD stats overlay so the active mode is visible and
+    /// stays in sync with `set_pacing_mode`.
+    pacing_mode: Mutex<String>,
 }
 
 impl VideoLivenessState {
@@ -460,6 +618,12 @@ impl VideoLivenessState {
                 crate::gstreamer_pipeline::WEBRTC_LATENCY_BASE_MS,
             ),
             burst_hold_until_ms: AtomicU64::new(0),
+            jitter_history: Mutex::new(VecDeque::new()),
+            adjb_jitter_p99: AtomicU32::new(0),
+            last_assessment: Mutex::new(None),
+            last_assessment_emitted_ms: AtomicU64::new(0),
+            overlay_color_applied: AtomicU32::new(0),
+            pacing_mode: Mutex::new("auto".to_owned()),
         }
     }
 
@@ -633,6 +797,62 @@ impl VideoLivenessState {
                     "visible",
                     self.stats_overlay_visible.load(Ordering::Relaxed) && !text.is_empty(),
                 );
+            }
+        }
+    }
+
+    /// Snapshot of the last emitted network assessment (verdict + recovery
+    /// recommendations) for the HUD overlay; None before the first one.
+    fn last_network_assessment(&self) -> Option<NativeNetworkAssessment> {
+        self.last_assessment
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
+    }
+
+    /// Record a present-limiter pacing mode change (from the runtime `pacing`
+    /// command); the HUD reads it back on the next stats tick.
+    fn set_pacing_mode(&self, mode: &str) {
+        if let Ok(mut current) = self.pacing_mode.lock() {
+            *current = mode.trim().to_ascii_lowercase();
+        }
+    }
+
+    /// Compact HUD label for the active pacing mode (see
+    /// `pacing_mode_hud_label`). Defaults to "auto" until the first `pacing`
+    /// command (the present limiter starts at the auto sentinel).
+    fn pacing_mode_hud_label(&self) -> String {
+        let mode = self
+            .pacing_mode
+            .lock()
+            .map(|mode| mode.clone())
+            .unwrap_or_default();
+        pacing_mode_hud_label(&mode)
+    }
+
+    /// HUD tint for the current network verdict: amber when degraded, red
+    /// when poor, white (default) when stable or unknown.
+    fn verdict_overlay_color(&self) -> u32 {
+        let verdict = self
+            .last_network_assessment()
+            .map(|assessment| assessment.verdict)
+            .unwrap_or_default();
+        verdict_overlay_color_for(&verdict)
+    }
+
+    /// Apply the verdict tint to the stats overlay, only when it changed
+    /// (the `color` property would otherwise be re-set on every 1 s stats
+    /// tick). Stable verdicts restore the default white.
+    fn apply_verdict_overlay_color(&self) {
+        let color = self.verdict_overlay_color();
+        let applied = self.overlay_color_applied.load(Ordering::Relaxed);
+        if applied == color {
+            return;
+        }
+        if let Ok(current) = self.stats_overlay.lock() {
+            if let Some(overlay) = current.as_ref() {
+                set_property_if_supported(overlay, "color", color);
+                self.overlay_color_applied.store(color, Ordering::Relaxed);
             }
         }
     }
@@ -965,6 +1185,30 @@ impl VideoLivenessState {
         self.now_ms() < self.burst_hold_until_ms.load(Ordering::Relaxed)
     }
 
+    /// Record a fresh receive-jitter sample into the ADJB sliding window and
+    /// update the 99th-percentile quantile it is sized by.
+    fn record_jitter_sample(&self, jitter_ms: u32) {
+        let mut history = self
+            .jitter_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        history.push_back(jitter_ms);
+        while history.len() > ADJB_JITTER_HISTORY_MAX {
+            history.pop_front();
+        }
+        let p99 = percentile_quantile(&history, ADJB_QUANTILE).unwrap_or(jitter_ms);
+        self.adjb_jitter_p99.store(p99, Ordering::Relaxed);
+    }
+
+    /// Current ADJB 99th-percentile receive jitter (ms); None until the
+    /// first sample. The quantile is the jitter the buffers are sized for:
+    /// it is ≥ every EWMA of the same window, so a rare outlier burst is
+    /// buffered instead of averaged away.
+    fn adjb_jitter_p99(&self) -> Option<u32> {
+        let p99 = self.adjb_jitter_p99.load(Ordering::Relaxed);
+        (p99 > 0).then_some(p99)
+    }
+
     /// Adaptive webrtcbin RTP playout latency: BASE (~40 ms) on stable
     /// links, raised toward MAX (~100 ms) as the measured receive jitter,
     /// packet loss and RTT spikes climb — the RTP-side twin of
@@ -977,26 +1221,37 @@ impl VideoLivenessState {
         pipeline: &gst::Pipeline,
         local_jitter_ms: Option<u32>,
     ) -> Option<u32> {
+        // Size the playout buffer for the ADJB 99th-percentile jitter when
+        // history exists (a rare outlier must be buffered, not averaged
+        // away), falling back to the raw per-tick sample.
+        let jitter_for_target = self.adjb_jitter_p99().or(local_jitter_ms);
         let target = target_webrtc_latency_ms(
-            local_jitter_ms,
+            jitter_for_target,
             self.rtt_ema_ms(),
             self.loss_ema_fraction(),
             self.burst_hold_active(),
         );
-        if target == self.webrtc_latency_ms.load(Ordering::Relaxed) {
+        let current = self.webrtc_latency_ms.load(Ordering::Relaxed);
+        // ADJB convergence: ease toward the target by a fraction per tick
+        // (GFN `video.adjbQuantileConvergenceFactor`) instead of stepping, so
+        // a single degraded sample cannot jolt the input latency. The ramp
+        // still engages fast (factor 0.35 × 4 ticks/s ≈ 0.7 s time constant)
+        // and, crucially, also eases BACK down smoothly on recovery.
+        let converged = adjb_converged(current, target, ADJB_CONVERGENCE_FACTOR);
+        if converged == current {
             return None;
         }
         let Some(webrtc) = pipeline.by_name("opennow-webrtcbin") else {
             return None;
         };
-        set_property_if_supported(&webrtc, "latency", target);
+        set_property_if_supported(&webrtc, "latency", converged);
         // Re-run the pipeline latency computation so the new playout delay
         // takes effect immediately (webrtcbin's setter updates its internal
         // rtpbin jitter buffers; the pipeline must re-aggregate the
         // per-element latencies for the sinks to honor it).
         let _ = pipeline.recalculate_latency();
-        self.webrtc_latency_ms.store(target, Ordering::Relaxed);
-        Some(target)
+        self.webrtc_latency_ms.store(converged, Ordering::Relaxed);
+        Some(converged)
     }
 
     pub(crate) fn set_decoder(&self, decoder: gst::Element) {
@@ -1211,6 +1466,12 @@ impl VideoLivenessMonitor {
 
     pub(crate) fn update_hardware_acceleration(&self, value: impl Into<String>) {
         self.state.update_hardware_acceleration(value);
+    }
+
+    /// Record the present-limiter pacing mode applied via the runtime `pacing`
+    /// command so the HUD stats overlay shows the active mode.
+    pub(crate) fn set_pacing_mode(&self, mode: &str) {
+        self.state.set_pacing_mode(mode);
     }
 
     pub(crate) fn record_encoded_buffer(&self, size: usize) {
@@ -1446,6 +1707,13 @@ fn run_video_liveness_watchdog(
         );
         let local_jitter_ms = query_rtcp_jitter_ms(&pipeline)
             .filter(|_| encoded_age_ms.is_none_or(|age| age <= JITTER_FRESH_AGE_MS));
+        // Feed the ADJB jitter-history window: the 99th-percentile quantile
+        // is what the playout buffers are sized by (see ADJB_QUANTILE). Only
+        // fresh samples count — a frozen jitter value from a dead stream
+        // would pollute the history.
+        if let Some(jitter) = local_jitter_ms {
+            state.record_jitter_sample(jitter);
+        }
         // Target depth of the adaptive pre-decode jitter buffer, converted
         // from compressed frames to milliseconds of buffered video (frame
         // interval from the negotiated stream rate, 60 fps fallback — the
@@ -1484,14 +1752,32 @@ fn run_video_liveness_watchdog(
                 &event_sender,
                 "info",
                 format!(
-                    "Native webrtcbin RTP playout latency adjusted to {latency_ms} ms (receive jitter={} ms, rtt EMA={} ms).",
+                    "Native webrtcbin RTP playout latency adjusted to {latency_ms} ms (receive jitter={} ms, adjb p99={} ms, rtt EMA={} ms).",
                     local_jitter_ms
+                        .map(|ms| ms.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    state
+                        .adjb_jitter_p99()
                         .map(|ms| ms.to_string())
                         .unwrap_or_else(|| "-".to_owned()),
                     state.rtt_ema_ms(),
                 ),
             );
         }
+        // Network assessment (the native analogue of GFN's pre-stream
+        // "stream test"): classify the smoothed network picture and emit the
+        // `network-assessment` event when the verdict or a recovery
+        // recommendation changes, so the main process can adapt the session
+        // profile (fps/resolution) or trigger a keyframe without waiting for
+        // a full stall. The verdict uses the ADJB quantile jitter (what the
+        // buffers are actually sized for) so it agrees with the pacing.
+        emit_network_assessment(
+            &event_sender,
+            &state,
+            local_jitter_ms,
+            state.rtt_ema_ms(),
+            state.loss_ema_fraction(),
+        );
 
         let elapsed = last_rate_at.elapsed();
         if elapsed >= VIDEO_SINK_RATE_LOG_INTERVAL {
@@ -2203,6 +2489,72 @@ fn clamped_server_game_fps(state: &VideoLivenessState) -> u32 {
     }
 }
 
+/// Compute and (when changed) emit the `network-assessment` event — the
+/// runtime analogue of GFN's pre-stream "stream test". Sized by the ADJB
+/// quantile jitter so the verdict agrees with the adaptive buffers. Emitted
+/// on every verdict/recommendation change with a 5 s throttle for pure
+/// verdict flips (the degraded/poor boundary oscillates under jitter), but a
+/// NEW keyframe suggestion is always emitted immediately — it is the action
+/// item (the main process turns it into a keyframe request, the client half
+/// of LTR/PLI recovery).
+fn emit_network_assessment(
+    event_sender: &Option<Sender<Event>>,
+    state: &VideoLivenessState,
+    raw_jitter_ms: Option<u32>,
+    rtt_ema_ms: u32,
+    loss_ema_fraction: Option<f64>,
+) {
+    let (verdict, lower_fps, lower_res, keyframe) = assess_network(
+        state.adjb_jitter_p99().or(raw_jitter_ms),
+        rtt_ema_ms,
+        loss_ema_fraction,
+    );
+    let assessment = NativeNetworkAssessment {
+        verdict: verdict.as_str().to_owned(),
+        jitter_ms: raw_jitter_ms,
+        rtt_ms: (rtt_ema_ms > 0).then_some(rtt_ema_ms),
+        loss_percent: loss_ema_fraction.map(|loss| loss * 100.0),
+        recommend_lower_fps: lower_fps,
+        recommend_lower_resolution: lower_res,
+        suggest_keyframe: keyframe,
+    };
+    let mut last = state
+        .last_assessment
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let changed = last.as_ref() != Some(&assessment);
+    let new_keyframe_suggestion = keyframe && !last.as_ref().is_some_and(|old| old.suggest_keyframe);
+    let now_ms = state.now_ms();
+    let last_emitted_ms = state.last_assessment_emitted_ms.load(Ordering::Relaxed);
+    let throttled = now_ms.saturating_sub(last_emitted_ms) < NETWORK_ASSESSMENT_EMIT_INTERVAL_MS;
+    if !changed || (throttled && !new_keyframe_suggestion) {
+        return;
+    }
+    state
+        .last_assessment_emitted_ms
+        .store(now_ms, Ordering::Relaxed);
+    *last = Some(assessment.clone());
+    if let Some(sender) = event_sender {
+        let _ = sender.send(Event::NetworkAssessment {
+            assessment: assessment.clone(),
+        });
+    }
+    send_log(
+        event_sender,
+        "info",
+        format!(
+            "[NetworkAssessment] verdict={} rtt={}ms loss={:.3}% jitter={}ms recommendLowerFps={} recommendLowerResolution={} suggestKeyframe={}.",
+            assessment.verdict,
+            rtt_ema_ms,
+            loss_ema_fraction.map(|loss| loss * 100.0).unwrap_or(0.0),
+            raw_jitter_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "-".to_owned()),
+            lower_fps,
+            lower_res,
+            keyframe,
+        ),
+    );
+}
+
 fn emit_native_stats_event(
     event_sender: &Option<Sender<Event>>,
     sink: &gst::Element,
@@ -2417,7 +2769,39 @@ fn update_native_stats_overlay(
             format!("{hardware_acceleration} {memory_path}")
         },
     );
+    // Status line: the active present-limiter pacing mode (synced with every
+    // runtime `pacing` command) plus the runtime network verdict (the analogue
+    // of GFN's pre-stream "stream test") with the recovery recommendations
+    // the assessment computed, so the HUD explains exactly why the session may
+    // degrade or restart:
+    //   Pace stream  Net STABLE
+    //   Pace auto  Net DEGRADED (lowerFps)
+    //   Pace 144fps  Net POOR (lowerFps, lowerRes, keyframe)
+    let mut status_line = format!("Pace {}", state.pacing_mode_hud_label());
+    if let Some(assessment) = state.last_network_assessment() {
+        let mut flags = Vec::new();
+        if assessment.recommend_lower_fps {
+            flags.push("lowerFps".to_owned());
+        }
+        if assessment.recommend_lower_resolution {
+            flags.push("lowerRes".to_owned());
+        }
+        if assessment.suggest_keyframe {
+            flags.push("keyframe".to_owned());
+        }
+        let mut net = format!("Net {}", assessment.verdict.to_uppercase());
+        if !flags.is_empty() {
+            net.push_str(&format!(" ({})", flags.join(", ")));
+        }
+        status_line.push_str("  ");
+        status_line.push_str(&net);
+    }
+    let text = format!("{text}\n{status_line}");
     state.update_stats_overlay_text(&text);
+    // Tint the whole HUD by verdict: amber while degraded, red while poor,
+    // back to default white when stable. The color is only written when it
+    // changes (see `apply_verdict_overlay_color`).
+    state.apply_verdict_overlay_color();
 }
 
 fn emit_video_stall_event(
@@ -9922,5 +10306,136 @@ mod tests {
         assert_eq!(codec_downgrade_target("H264"), None);
         assert_eq!(codec_downgrade_target(""), None);
         assert_eq!(codec_downgrade_target("VP9"), None);
+    }
+
+    #[test]
+    fn adjb_percentile_quantile_reports_tail_not_average() {
+        // A rare 40 ms outlier must not be averaged away: with 95 samples at
+        // ~3 ms and 1 at 40 ms, the 99th percentile is 40 ms while the mean
+        // is ~3.4 ms.
+        let mut history = VecDeque::new();
+        for _ in 0..95 {
+            history.push_back(3);
+        }
+        history.push_back(40);
+        assert_eq!(percentile_quantile(&history, ADJB_QUANTILE), Some(40));
+        // A 50th percentile (median) sees the cluster, not the tail.
+        assert_eq!(percentile_quantile(&history, 0.50), Some(3));
+        // Empty window.
+        assert_eq!(percentile_quantile(&VecDeque::new(), ADJB_QUANTILE), None);
+        // Single sample = that sample at any quantile.
+        let mut one = VecDeque::new();
+        one.push_back(17);
+        assert_eq!(percentile_quantile(&one, ADJB_QUANTILE), Some(17));
+        // Quantile is clamped to [0, 1].
+        assert_eq!(percentile_quantile(&one, 2.0), Some(17));
+    }
+
+    #[test]
+    fn adjb_convergence_eases_toward_target_without_stepping() {
+        // Moving 100 → 60 by 35% lands mid-way, not at the target: the
+        // convergence factor prevents a single sample from jolting latency.
+        assert_eq!(adjb_converged(100, 60, ADJB_CONVERGENCE_FACTOR), 86);
+        // Same target = no-op.
+        assert_eq!(adjb_converged(60, 60, ADJB_CONVERGENCE_FACTOR), 60);
+        // Tiny deltas converge all the way so the buffer never stalls just
+        // below its target.
+        assert_eq!(adjb_converged(100, 99, ADJB_CONVERGENCE_FACTOR), 99);
+        // Clamped factor behaves like a step (factor 1 = jump).
+        assert_eq!(adjb_converged(100, 60, 1.0), 60);
+        assert_eq!(adjb_converged(100, 60, 0.0), 100);
+        // Works in both directions (recovery eases back down smoothly).
+        assert_eq!(adjb_converged(60, 100, ADJB_CONVERGENCE_FACTOR), 74);
+        // Monotonic: closer after one step, never overshoots.
+        let step = adjb_converged(100, 60, ADJB_CONVERGENCE_FACTOR);
+        assert!(step > 60 && step < 100);
+    }
+
+    #[test]
+    fn assess_network_verdicts_track_the_buffer_ramps() {
+        use crate::protocol::NetworkVerdict;
+        // Clean link: stable, no recommendations.
+        let (v, fps, res, keyframe) = assess_network(Some(3), 20, Some(0.0001));
+        assert_eq!(v, NetworkVerdict::Stable);
+        assert!(!fps && !res && !keyframe);
+        // Degraded: jitter ≥15 ms / rtt ≥60 ms / loss ≥0.15% recommend lower
+        // fps but not resolution, and loss while alive suggests a keyframe.
+        let (v, fps, res, keyframe) = assess_network(Some(18), 30, Some(0.0005));
+        assert_eq!(v, NetworkVerdict::Degraded);
+        assert!(fps && !res);
+        let (v, fps, _res, keyframe) = assess_network(None, 80, None);
+        assert_eq!(v, NetworkVerdict::Degraded);
+        assert!(fps);
+        let (v, fps, res, keyframe) = assess_network(Some(5), 20, Some(0.002));
+        assert_eq!(v, NetworkVerdict::Degraded);
+        assert!(fps && !res && keyframe);
+        // Poor: loss ≥0.5% / rtt ≥150 ms / jitter ≥40 ms recommends lowering
+        // resolution too.
+        let (v, fps, res, _keyframe) = assess_network(Some(45), 30, Some(0.0001));
+        assert_eq!(v, NetworkVerdict::Poor);
+        assert!(fps && res);
+        let (v, fps, res, _keyframe) = assess_network(None, 200, None);
+        assert_eq!(v, NetworkVerdict::Poor);
+        assert!(fps && res);
+        let (v, fps, res, keyframe) = assess_network(None, 20, Some(0.01));
+        assert_eq!(v, NetworkVerdict::Poor);
+        assert!(fps && res && keyframe);
+        // No network signal yet = stable (None inputs must not panic).
+        let (v, fps, res, keyframe) = assess_network(None, 0, None);
+        assert_eq!(v, NetworkVerdict::Stable);
+        assert!(!fps && !res && !keyframe);
+    }
+
+    #[test]
+    fn verdict_overlay_color_tints_only_degraded_and_poor() {
+        // Stable / unknown keep the default white so a healthy session HUD
+        // looks normal.
+        assert_eq!(verdict_overlay_color_for("stable"), OVERLAY_COLOR_DEFAULT);
+        assert_eq!(verdict_overlay_color_for(""), OVERLAY_COLOR_DEFAULT);
+        assert_eq!(verdict_overlay_color_for("bogus"), OVERLAY_COLOR_DEFAULT);
+        // Degraded → amber, poor → red, distinct from each other.
+        assert_eq!(verdict_overlay_color_for("degraded"), OVERLAY_COLOR_DEGRADED);
+        assert_eq!(verdict_overlay_color_for("poor"), OVERLAY_COLOR_POOR);
+        assert_ne!(OVERLAY_COLOR_DEGRADED, OVERLAY_COLOR_POOR);
+        // Case-sensitive match on the native verdict strings (as_str()).
+        assert_eq!(verdict_overlay_color_for("POOR"), OVERLAY_COLOR_DEFAULT);
+    }
+
+    #[test]
+    fn pacing_mode_hud_label_matches_limiter_modes() {
+        // Named modes map to compact HUD labels; aliases normalize the same
+        // way resolve_pacing_mode does so the HUD always agrees with the
+        // limiter target set by the `pacing` command.
+        assert_eq!(pacing_mode_hud_label("auto"), "auto");
+        assert_eq!(pacing_mode_hud_label("  AUTO "), "auto");
+        assert_eq!(pacing_mode_hud_label("stream"), "stream");
+        assert_eq!(pacing_mode_hud_label("vrr"), "vrr");
+        assert_eq!(pacing_mode_hud_label("off"), "off");
+        assert_eq!(pacing_mode_hud_label("disabled"), "off");
+        assert_eq!(pacing_mode_hud_label("none"), "off");
+        // Explicit fps serializes as "Nfps" on the HUD.
+        assert_eq!(pacing_mode_hud_label("144"), "144fps");
+        assert_eq!(pacing_mode_hud_label("60"), "60fps");
+        assert_eq!(pacing_mode_hud_label(" 120 "), "120fps");
+        // Anything the limiter would reject renders as "?" so a desync is
+        // visible instead of silently showing a stale mode.
+        assert_eq!(pacing_mode_hud_label("turbo"), "?");
+        assert_eq!(pacing_mode_hud_label(""), "?");
+    }
+
+    #[test]
+    fn pacing_mode_hud_tracks_set_pacing_mode_command() {
+        let mut state = VideoLivenessState::new();
+        // Defaults to auto (the limiter's starting sentinel).
+        assert_eq!(state.pacing_mode_hud_label(), "auto");
+        // Each runtime `pacing` command updates the HUD label immediately.
+        state.set_pacing_mode("stream");
+        assert_eq!(state.pacing_mode_hud_label(), "stream");
+        state.set_pacing_mode(" 144 ");
+        assert_eq!(state.pacing_mode_hud_label(), "144fps");
+        state.set_pacing_mode("disabled");
+        assert_eq!(state.pacing_mode_hud_label(), "off");
+        state.set_pacing_mode("vrr");
+        assert_eq!(state.pacing_mode_hud_label(), "vrr");
     }
 }

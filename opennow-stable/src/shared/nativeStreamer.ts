@@ -75,6 +75,12 @@ export type NativeStreamerCommand =
     }
   | {
       id: string;
+      type: "pacing";
+      /** `auto` | `stream` | `vrr` | `off` | a fixed fps like `144`. */
+      pacingMode: string;
+    }
+  | {
+      id: string;
       type: "stop";
       reason?: string;
     }
@@ -242,9 +248,31 @@ export type NativeStreamerEvent =
       toCodec: string;
     }
   | {
+      /**
+       * Runtime network health verdict (the native analogue of GFN's
+       * pre-stream "stream test"). Emitted when the verdict or a recovery
+       * recommendation changes; the manager already acted on the keyframe
+       * suggestion, the renderer surfaces it and may trigger the profile
+       * downgrade.
+       */
+      type: "network-assessment";
+      assessment: NativeNetworkAssessment;
+    }
+  | {
       type: "error";
       code?: string;
       message: string;
     };
+
+export interface NativeNetworkAssessment {
+  verdict: "stable" | "degraded" | "poor";
+  jitterMs?: number;
+  rttMs?: number;
+  /** Packet loss percent (0-100), smoothed EMA from the stats channel. */
+  lossPercent?: number;
+  recommendLowerFps: boolean;
+  recommendLowerResolution: boolean;
+  suggestKeyframe: boolean;
+}
 
 export type NativeStreamerMessage = NativeStreamerResponse | NativeStreamerEvent;

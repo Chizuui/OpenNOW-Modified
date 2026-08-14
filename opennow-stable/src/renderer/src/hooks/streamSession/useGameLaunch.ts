@@ -48,7 +48,12 @@ export interface GameLaunchOptions {
   activeSessionProxyUrl?: string;
   allKnownGames: GameInfo[];
   authSession: AuthSession | null;
-  buildCurrentStreamSettings: (subscription?: SubscriptionInfo | null, codecOverride?: VideoCodec) => StreamSettings;
+  buildCurrentStreamSettings: (
+    subscription?: SubscriptionInfo | null,
+    codecOverride?: VideoCodec,
+    fpsOverride?: number,
+    resolutionOverride?: string,
+  ) => StreamSettings;
   buildSignalingConnectRequest: (session: SessionInfo, codecOverride?: VideoCodec) => SignalingConnectRequest;
   canLaunch: boolean;
   claimAndConnectSession: (session: import("@shared/gfn").ActiveSessionInfo) => Promise<void>;
@@ -123,7 +128,7 @@ export function useGameLaunch({
   // skips the active-session claim/resume so a relaunch always creates a
   // fresh session (the old one is being abandoned, e.g. after a codec
   // downgrade request).
-  const handlePlayGame = useCallback(async (game: GameInfo, options?: { bypassGuards?: boolean; streamingBaseUrl?: string; variantId?: string; codecOverride?: VideoCodec; forceNewSession?: boolean }) => {
+  const handlePlayGame = useCallback(async (game: GameInfo, options?: { bypassGuards?: boolean; streamingBaseUrl?: string; variantId?: string; codecOverride?: VideoCodec; forceNewSession?: boolean; fpsOverride?: number; resolutionOverride?: string }) => {
     if (!canLaunch) return;
 
     console.log("handlePlayGame entry", {
@@ -219,7 +224,12 @@ export function useGameLaunch({
       setStreamingStore(launchVariant?.store ?? null);
 
       const launchSubscription = await resolveSubscriptionInfoForLaunch();
-      const streamSettings = buildCurrentStreamSettings(launchSubscription, options?.codecOverride);
+      const streamSettings = buildCurrentStreamSettings(
+        launchSubscription,
+        options?.codecOverride,
+        options?.fpsOverride,
+        options?.resolutionOverride,
+      );
       const i2pStorageRegionBaseUrl = await resolveInstallToPlayStreamingBaseUrl(
         matchedGameContext.game,
         launchSubscription,

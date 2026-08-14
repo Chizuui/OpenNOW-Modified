@@ -8,6 +8,7 @@ import type {
   VideoAccelerationPreference,
 } from "./stream";
 import type {
+  NativePacingMode,
   NativeStreamerBackendPreference,
   NativeStreamerFeatureMode,
   NativeVideoBackendPreference,
@@ -67,6 +68,12 @@ export interface Settings {
   nativeVideoBackend: NativeVideoBackendPreference;
   nativeStreamerExecutablePath: string;
   nativeCloudGsyncMode: NativeStreamerFeatureMode;
+  /**
+   * Present-limiter pacing mode applied to the native streamer (`auto` |
+   * `stream` | `vrr` | `off` | an fps like `120`) — the GFN NVST p-f pacing
+   * framework analogue. Applied at session start and on change.
+   */
+  nativePacingMode: NativePacingMode;
   nativeD3dFullscreenMode: NativeStreamerFeatureMode;
   nativeExternalRenderer: boolean;
   /** GFN-style stacked video window behind a transparent Electron shell */
@@ -105,6 +112,8 @@ export interface Settings {
   shortcutToggleMicrophone: string;
   shortcutScreenshot: string;
   shortcutToggleRecording: string;
+  /** Cycle the native present-limiter pacing mode (auto → stream → vrr → off) while streaming. */
+  shortcutCyclePacing: string;
   microphoneMode: MicrophoneMode;
   microphoneDeviceId: string;
   hideStreamButtons: boolean;
@@ -181,6 +190,7 @@ export const SHORTCUT_SETTING_KEYS = [
   "shortcutToggleMicrophone",
   "shortcutScreenshot",
   "shortcutToggleRecording",
+  "shortcutCyclePacing",
 ] as const satisfies readonly (keyof Settings)[];
 
 export type ShortcutSettingKey = typeof SHORTCUT_SETTING_KEYS[number];
@@ -195,6 +205,7 @@ export const DEFAULT_SHORTCUT_SETTINGS: Readonly<ShortcutSettings> = Object.free
   shortcutToggleMicrophone: "Ctrl+Shift+M",
   shortcutScreenshot: "F11",
   shortcutToggleRecording: "F12",
+  shortcutCyclePacing: "Ctrl+Shift+P",
 });
 
 export interface PlatformShortcutDefaults {
@@ -258,6 +269,7 @@ export function createDefaultSettings(platform: string): Settings {
     nativeVideoBackend: "auto",
     nativeStreamerExecutablePath: "",
     nativeCloudGsyncMode: "auto",
+    nativePacingMode: "auto",
     nativeD3dFullscreenMode: "auto",
     nativeExternalRenderer: false,
     nativeStackedRenderer: false,

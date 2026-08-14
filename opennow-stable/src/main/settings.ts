@@ -95,6 +95,9 @@ const SIDEBAR_RESERVED_SHORTCUT_FALLBACKS: Record<ShortcutSettingKey, readonly s
   shortcutToggleMicrophone: [defaultMicShortcut, "Ctrl+Alt+M", "Ctrl+Alt+Shift+M"],
   shortcutScreenshot: ["F11", "Ctrl+Shift+S", "Ctrl+Alt+S", "Ctrl+Shift+F11", "Ctrl+Alt+Shift+S"],
   shortcutToggleRecording: ["F12", "Ctrl+Shift+R", "Ctrl+Alt+R", "Ctrl+Shift+F12", "Ctrl+Alt+Shift+R"],
+  // New shortcut: no legacy aliases to accept yet, so an empty list (the
+  // sidebar-reserved check only ever consults non-empty aliases).
+  shortcutCyclePacing: [],
 };
 
 function normalizeShortcutForComparison(value: string): string {

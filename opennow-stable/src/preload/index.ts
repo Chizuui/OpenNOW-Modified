@@ -163,6 +163,9 @@ const api: OpenNowApi = {
   updateNativeBitrateLimit: (maxBitrateKbps) => {
     ipcRenderer.send(IPC_CHANNELS.NATIVE_UPDATE_BITRATE, maxBitrateKbps);
   },
+  setNativePacingMode: (pacingMode: string) => {
+    ipcRenderer.send(IPC_CHANNELS.NATIVE_PACING, pacingMode);
+  },
   setNativeMicrophoneEnabled: (enabled: boolean) => {
     ipcRenderer.send(IPC_CHANNELS.NATIVE_MICROPHONE, enabled);
   },

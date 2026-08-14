@@ -119,6 +119,9 @@ fn handle_command(
         "bitrate" => {
             return write_reply(backend.update_bitrate_limit(command));
         }
+        "pacing" => {
+            return write_reply(backend.set_pacing_mode(command));
+        }
         "update-shortcuts" => {
             return write_reply(backend.update_shortcuts(command));
         }

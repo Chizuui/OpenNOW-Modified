@@ -155,6 +155,16 @@ export class SignalingCoordinator {
     );
 
     ipcMain.on(
+      IPC_CHANNELS.NATIVE_PACING,
+      (_event, pacingMode: string) => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          return;
+        }
+        this.getNativeStreamerManager().setPacingMode(String(pacingMode));
+      },
+    );
+
+    ipcMain.on(
       IPC_CHANNELS.NATIVE_MICROPHONE,
       (_event, enabled: boolean) => {
         if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {

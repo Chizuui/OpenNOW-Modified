@@ -23,6 +23,7 @@ pub trait NativeStreamerBackend {
     fn set_input_paused(&mut self, command: CommandEnvelope) -> BackendReply;
     fn update_render_surface(&mut self, command: CommandEnvelope) -> BackendReply;
     fn update_bitrate_limit(&mut self, command: CommandEnvelope) -> BackendReply;
+    fn set_pacing_mode(&mut self, command: CommandEnvelope) -> BackendReply;
     fn update_shortcuts(&mut self, command: CommandEnvelope) -> BackendReply;
     fn set_microphone_enabled(&mut self, command: CommandEnvelope) -> BackendReply;
     fn take_screenshot(&mut self, command: CommandEnvelope) -> BackendReply;
@@ -640,6 +641,14 @@ impl NativeStreamerBackend for StubBackend {
             response: Some(Response::Ok { id: command.id }),
             should_continue: true,
         }
+    }
+
+    fn set_pacing_mode(&mut self, command: CommandEnvelope) -> BackendReply {
+        if command.pacing_mode.is_none() {
+            return BackendReply::response(missing_field(&command.id, "pacingMode"));
+        }
+        // Stub backend has no present limiter; accept the command without applying it.
+        BackendReply::response(Response::Ok { id: command.id })
     }
 
     fn update_shortcuts(&mut self, command: CommandEnvelope) -> BackendReply {
