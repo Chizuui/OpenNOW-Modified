@@ -406,10 +406,19 @@ export function useStreamRecorder({
       } catch (workerError) {
         // Tear down whatever the worker path partially created before it
         // threw, then fall back to the universal captureStream path below.
+        // The worker draw loop must be un-registered explicitly: it keeps
+        // re-queuing requestVideoFrameCallback and posting frames to the now-
+        // terminated worker forever (inflating the drop accounting and
+        // leaking an rVFC chain) if left running.
         console.warn(
           "[StreamView] Worker recording path unavailable — falling back to canvas.captureStream:",
           workerError,
         );
+        const frameVideo = videoRef.current;
+        if (recordingFrameCallbackRef.current !== undefined && frameVideo) {
+          frameVideo.cancelVideoFrameCallback?.(recordingFrameCallbackRef.current);
+        }
+        recordingFrameCallbackRef.current = undefined;
         stopRecordingVideoTrack();
         recordVideoTrack = null;
       }
@@ -426,7 +435,13 @@ export function useStreamRecorder({
         if (capCtx) {
           capCtx.drawImage(video, 0, 0, capWidth, capHeight);
         }
-        const capStream = cap.captureStream(0);
+        // captureStream must run at a NON-ZERO rate: with 0, the track only
+        // emits on canvas invalidation, which this Chromium never delivers
+        // for a detached canvas — the MediaRecorder saw a single frame and
+        // the file came back as a frozen black frame. With a real rate the
+        // track samples the canvas on its own rasterize timer, so every
+        // drawn frame is captured and the timeline stays alive.
+        const capStream = cap.captureStream(recordFps);
         recordVideoTrack = capStream.getVideoTracks()[0] ?? null;
         if (!recordVideoTrack) {
           throw new Error("Canvas captureStream produced no video track.");
