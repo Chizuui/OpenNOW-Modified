@@ -20,7 +20,7 @@ use gstreamer as gst;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -3443,6 +3443,24 @@ pub(crate) fn watch_video_sink_caps_transitions(
     });
 }
 
+/// Fraction of the present slot a frame may arrive early and still pass
+/// straight through (the delayed-delivery grid tolerance). Frames arriving
+/// earlier are HELD until their slot by the pacer (the Geronimo
+/// AsyncFrameQueue present gate), so a WAN jitter burst presents one frame
+/// per slot instead of fast-forwarding the backlog; frames at/near the slot
+/// pass so the grid follows the stream phase and steady-state latency stays
+/// ~0. Scaled with the frame interval (10%) so high-fps streams don't hold
+/// every frame.
+const PRESENT_GRID_TOLERANCE_FRACTION: f64 = 0.1;
+
+/// How long the present pacer waits for sink-pad probe activity before
+/// giving up. Backstop for a torn-down chain that never delivered EOS: the
+/// stream is dead if no buffer has hit the pad for this long, so the pacer
+/// exits instead of holding the pad alive forever (session stop / decoder
+/// chain rebuild both end with EOS on the chain, but the timeout covers the
+/// paths where that EOS never reaches the sink pad).
+const PRESENT_PACER_IDLE_STOP_MS: u64 = 5_000;
+
 /// Frames arriving up to this much before their present slot pass instead of
 /// being dropped. This is the JITTER CATCH-UP budget, not a margin: the D3D
 /// present path (its internal present queue, sized like the ~250 ms pre-decode
@@ -3538,6 +3556,16 @@ fn cinematic_present_intervals(
     intervals
 }
 
+/// Delayed-delivery gate: a frame arriving this far before its present slot
+/// is HELD by the pacer (released exactly at the slot) instead of being
+/// passed — a burst then presents one frame per slot instead of a
+/// fast-forward. Frames arriving at or after `now + tolerance` pass straight
+/// through, so the grid follows the stream phase and steady-state latency
+/// stays ~0.
+fn present_limiter_should_hold(now: Instant, next_present_at: Instant, step: Duration) -> bool {
+    now + step.mul_f64(PRESENT_GRID_TOLERANCE_FRACTION) < next_present_at
+}
+
 /// Pure limiter decision: a frame is dropped only when it arrives so far
 /// before its present slot that passing it would fast-forward more than the
 /// catch-up budget of content in one instant. Everything else (steady-state
@@ -3573,17 +3601,206 @@ pub(crate) fn install_present_limiter(
         present_duration_ema: None,
         display_hz: crate::gstreamer_platform::primary_display_refresh_hz(),
         last_display_query_at: now,
+        held_buffer: None,
+        last_probe_activity: now,
+        present_step: Duration::ZERO,
+        pacer_thread: None,
     }));
 
-    sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+    // Delayed delivery (the Geronimo AsyncFrameQueue present gate): frames
+    // arriving well before their grid slot are HELD and released exactly at
+    // the slot by the pacer thread, so the sink receives a steady cadence
+    // even when the decode/network path bursts. Frames arriving at or near
+    // the slot pass straight through (the grid follows the stream phase), so
+    // steady-state latency stays ~0 and only the jitter is smoothed. The
+    // pacer is the ONLY pusher to the pad while pacing is active (the probe
+    // drops held frames), so release order is preserved; a `releasing` flag
+    // lets the re-pushed buffer through the probe untouched.
+    let pacing_stop = Arc::new(AtomicBool::new(false));
+    let pacing_releasing = Arc::new(AtomicBool::new(false));
+    let pacing_wake = Arc::new((Mutex::new(()), Condvar::new()));
+
+    {
+        let stop = pacing_stop.clone();
+        let releasing = pacing_releasing.clone();
+        let wake = pacing_wake.clone();
+        let pad = sink_pad.clone();
+        let st = state.clone();
+        let sender = sender.clone();
+        std::thread::Builder::new()
+            .name("opennow-present-pacer".into())
+            .spawn(move || {
+                {
+                    let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.pacer_thread = Some(std::thread::current().id());
+                }
+                let (lock, cvar) = &*wake;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let (hold_slot, idle_ms) = {
+                        let guard = st.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        (
+                            guard.held_buffer.as_ref().map(|_| guard.next_present_at),
+                            guard.last_probe_activity.elapsed().as_millis() as u64,
+                        )
+                    };
+                    // Backstop: no buffers for PRESENT_PACER_IDLE_STOP_MS =
+                    // the stream is dead and this limiter is being torn down
+                    // (or already was) — exit instead of holding the pad.
+                    if idle_ms >= PRESENT_PACER_IDLE_STOP_MS {
+                        return;
+                    }
+                    match hold_slot {
+                        None => {
+                            // Nothing to present yet: sleep until a buffer is
+                            // held or the stop flag is set.
+                            let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                            let _ = cvar
+                                .wait_timeout(guard, Duration::from_millis(50))
+                                .expect("pacer wake condvar");
+                        }
+                        Some(slot) => {
+                            let now = Instant::now();
+                            if now < slot {
+                                let wait = slot.saturating_duration_since(now);
+                                let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                                let _ = cvar
+                                    .wait_timeout(guard, wait)
+                                    .expect("pacer slot condvar");
+                                continue;
+                            }
+                            if stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            // Slot due: release the newest held frame. Present
+                            // cadence EMA is measured on the actual
+                            // release-to-release delta (the probe measures
+                            // pass-through frames the same way).
+                            let buffer = {
+                                let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+                                let now = Instant::now();
+                                if let Some(last) = guard.last_frame_at {
+                                    let delta = now.saturating_duration_since(last).as_secs_f64();
+                                    guard.present_duration_ema = Some(
+                                        guard.present_duration_ema.map_or(delta, |ema| {
+                                            ema * PRESENT_DURATION_EMA_HISTORY
+                                                + delta * (1.0 - PRESENT_DURATION_EMA_HISTORY)
+                                        }),
+                                    );
+                                }
+                                guard.last_frame_at = Some(now);
+                                // Advance the schedule past the slot that just
+                                // fired so the NEXT early frame waits for its
+                                // own slot instead of firing immediately at
+                                // this one. `present_step` is guaranteed
+                                // non-zero once a frame has been held, but
+                                // never loop on a zero step.
+                                let step = guard.present_step;
+                                if step.is_zero() {
+                                    guard.next_present_at = now + Duration::from_millis(16);
+                                } else if now < guard.next_present_at {
+                                    guard.next_present_at = now + step;
+                                } else {
+                                    while guard.next_present_at <= now {
+                                        guard.next_present_at += step;
+                                    }
+                                }
+                                guard.passed = guard.passed.saturating_add(1);
+                                guard.held_buffer.take()
+                            };
+                            if let Some(buffer) = buffer {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                // Let the re-pushed buffer through the probe
+                                // untouched, then push into the sink.
+                                // gst_pad_push takes the pad STREAM_LOCK,
+                                // serializing against event pushes from the
+                                // streaming thread.
+                                releasing.store(true, Ordering::SeqCst);
+                                if let Err(error) = pad.push(buffer) {
+                                    releasing.store(false, Ordering::SeqCst);
+                                    send_log(
+                                        &sender,
+                                        "warn",
+                                        format!("Native present pacer push failed: {error}"),
+                                    );
+                                    return; // pad is gone / not linked — stop
+                                }
+                                releasing.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn the native present pacer thread");
+    }
+
+    // EOS: the stream ended or the chain is being torn down (decoder
+    // fallback rebuild / session stop both EOS the old chain). Drop any held
+    // frame and stop the pacer — the final frame is invisible anyway.
+    {
+        let stop = pacing_stop.clone();
+        let wake = pacing_wake.clone();
+        let st = state.clone();
+        sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(event) = info.event() {
+                if event.type_() == gst::EventType::Eos {
+                    {
+                        let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(held) = guard.held_buffer.take() {
+                            drop(held);
+                            guard.dropped = guard.dropped.saturating_add(1);
+                        }
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                    let (lock, cvar) = &*wake;
+                    let wake_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    cvar.notify_all();
+                    drop(wake_guard);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    let pacer_releasing = pacing_releasing.clone();
+    let pacer_wake = pacing_wake.clone();
+    sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         let target_fps = present_max_fps.load(Ordering::Relaxed);
-        if target_fps == 0 {
-            return gst::PadProbeReturn::Ok;
+        let mut state = match state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return gst::PadProbeReturn::Ok,
+        };
+        state.last_probe_activity = Instant::now();
+        // A release is in flight: the pacer re-pushed a held frame at its
+        // slot. Its OWN push passes through untouched; any frame arriving
+        // from the streaming thread at the same moment must not overtake the
+        // released frame downstream, so it is dropped instead (the pacer
+        // holds the newest early frame anyway, so a lost collision frame is
+        // invisible).
+        if pacer_releasing.load(Ordering::SeqCst) {
+            if state.pacer_thread == Some(std::thread::current().id()) {
+                return gst::PadProbeReturn::Ok;
+            }
+            return gst::PadProbeReturn::Drop;
         }
 
-        let Ok(mut state) = state.lock() else {
+        if target_fps == 0 {
+            // Pacing off: pass everything through. Release any frame held
+            // under a previous pacing mode — it is stale by definition (a
+            // newer frame is arriving right now), so drop it silently.
+            if let Some(held) = state.held_buffer.take() {
+                drop(held);
+                state.dropped = state.dropped.saturating_add(1);
+                if let Some(monitor) = &monitor {
+                    monitor.record_sink_limiter_drop();
+                }
+            }
             return gst::PadProbeReturn::Ok;
-        };
+        }
 
         let now = Instant::now();
         if state.active_fps != target_fps {
@@ -3596,6 +3813,16 @@ pub(crate) fn install_present_limiter(
             state.present_duration_ema = None;
             state.display_hz = crate::gstreamer_platform::primary_display_refresh_hz();
             state.last_display_query_at = now;
+            // A frame held under the old pacing schedule is stale once the
+            // slot grid changes — drop it instead of releasing it at a
+            // now-invalid slot after newer frames were presented.
+            if let Some(held) = state.held_buffer.take() {
+                drop(held);
+                state.dropped = state.dropped.saturating_add(1);
+                if let Some(monitor) = &monitor {
+                    monitor.record_sink_limiter_drop();
+                }
+            }
             if let Some(monitor) = &monitor {
                 monitor.record_present_pacing_change();
             }
@@ -3648,20 +3875,6 @@ pub(crate) fn install_present_limiter(
             return gst::PadProbeReturn::Drop;
         }
 
-        state.passed = state.passed.saturating_add(1);
-        // VRR cadence EMA: measure the REAL present-to-present delta of the
-        // passed frames (not the schedule) so a display running fractionally
-        // off the stream rate drifts the correction instead of a fixed grid
-        // accumulating phase error into periodic judder.
-        if let Some(last) = state.last_frame_at {
-            let delta = now.saturating_duration_since(last).as_secs_f64();
-            state.present_duration_ema = Some(
-                state.present_duration_ema.map_or(delta, |ema| {
-                    ema * PRESENT_DURATION_EMA_HISTORY + delta * (1.0 - PRESENT_DURATION_EMA_HISTORY)
-                }),
-            );
-        }
-        state.last_frame_at = Some(now);
         // Cinematic cadence: when the display refreshes much faster than the
         // stream (e.g. 60 fps on a 144 Hz monitor), anchor the delivery grid
         // to N refresh intervals instead of the 1:1 stream grid, so each
@@ -3694,6 +3907,65 @@ pub(crate) fn install_present_limiter(
                 state.present_duration_ema,
             ),
         };
+        // Remember the active present step for the pacer: when it releases a
+        // held frame at its slot it must advance the schedule to the NEXT
+        // slot, or a following early frame would fire immediately at the
+        // already-fired slot.
+        state.present_step = step;
+        // Delayed delivery (the Geronimo AsyncFrameQueue present gate): a
+        // frame arriving this far before its slot is HELD by the pacer and
+        // released at exactly the slot — a decode/network burst then
+        // presents one frame per slot instead of fast-forwarding the
+        // picture. Frames within the grid tolerance pass straight through,
+        // so the grid follows the stream phase and steady-state latency
+        // stays ~0.
+        if present_limiter_should_hold(now, state.next_present_at, step) {
+            // BUFFER probes always carry a buffer; without one there is
+            // nothing to hold — fall through to the pass path.
+            let Some(buffer) = info.buffer().cloned() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            // Latest-wins: a newer early frame replaces a held one — the
+            // replaced frame is stale by the time the slot fires, so it is
+            // counted as a limiter drop (and consumes its decode-timestamp
+            // pairing entry).
+            if state.held_buffer.replace(buffer).is_some() {
+                state.dropped = state.dropped.saturating_add(1);
+                if let Some(monitor) = &monitor {
+                    monitor.record_sink_limiter_drop();
+                }
+            }
+            drop(state);
+            let (lock, cvar) = &*pacer_wake;
+            let wake_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            cvar.notify_all();
+            drop(wake_guard);
+            return gst::PadProbeReturn::Drop;
+        }
+        state.passed = state.passed.saturating_add(1);
+        // A frame passing within tolerance of (or after) its slot supersedes
+        // any frame still held for that (earlier) slot — presenting the held
+        // older frame after this newer one would move the picture backwards.
+        if let Some(held) = state.held_buffer.take() {
+            drop(held);
+            state.dropped = state.dropped.saturating_add(1);
+            if let Some(monitor) = &monitor {
+                monitor.record_sink_limiter_drop();
+            }
+        }
+        // VRR cadence EMA: measure the REAL present-to-present delta of the
+        // passed frames (not the schedule) so a display running fractionally
+        // off the stream rate drifts the correction instead of a fixed grid
+        // accumulating phase error into periodic judder.
+        if let Some(last) = state.last_frame_at {
+            let delta = now.saturating_duration_since(last).as_secs_f64();
+            state.present_duration_ema = Some(
+                state.present_duration_ema.map_or(delta, |ema| {
+                    ema * PRESENT_DURATION_EMA_HISTORY + delta * (1.0 - PRESENT_DURATION_EMA_HISTORY)
+                }),
+            );
+        }
+        state.last_frame_at = Some(now);
         if now < state.next_present_at {
             // Within tolerance: present at the actual arrival and anchor the
             // next slot to it, so the grid keeps a stable cadence.
@@ -3725,6 +3997,13 @@ pub(crate) fn install_present_limiter(
             state.dropped = 0;
         }
 
+        // Final race guard: a release may have started while this frame was
+        // being processed (the pacer is pushing the released frame). Drop
+        // this frame rather than let it overtake the released one downstream.
+        if pacer_releasing.load(Ordering::SeqCst) {
+            return gst::PadProbeReturn::Drop;
+        }
+
         gst::PadProbeReturn::Ok
     });
 }
@@ -3752,6 +4031,25 @@ struct PresentLimiterState {
     display_hz: Option<u32>,
     /// Last time `display_hz` was (re)queried, for the 1 s refresh throttle.
     last_display_query_at: Instant,
+    /// The newest frame waiting for its present slot (delayed delivery): the
+    /// pacer releases it at `next_present_at`. Latest-wins — a newer arrival
+    /// replaces the held frame (the replaced one is counted as a limiter
+    /// drop). None while pacing is off or nothing is early.
+    held_buffer: Option<gst::Buffer>,
+    /// Last time the BUFFER probe ran, for the pacer's idle backstop
+    /// (PRESENT_PACER_IDLE_STOP_MS): no activity = the stream is dead and
+    /// the pacer should exit.
+    last_probe_activity: Instant,
+    /// The active present step (cinematic / VRR-corrected interval) computed
+    /// by the last probe run; the pacer uses it to advance `next_present_at`
+    /// past the slot it just fired so a following early frame waits for its
+    /// own slot instead of firing at the already-fired one.
+    present_step: Duration,
+    /// ThreadId of the present pacer thread, set at spawn: the probe lets
+    /// the pacer's own re-push through untouched, but drops any frame
+    /// arriving from another thread while a release is in flight so a newer
+    /// frame never overtakes the released one downstream.
+    pacer_thread: Option<std::thread::ThreadId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10113,6 +10411,43 @@ mod tests {
             base,
             base + budget,
             budget
+        ));
+    }
+
+    /// The delayed-delivery gate (Geronimo AsyncFrameQueue present gate): a
+    /// frame arriving well before its slot is HELD for it (released at the
+    /// slot by the pacer); frames within the grid tolerance (10% of the
+    /// step) or at/after the slot pass straight through so the grid follows
+    /// the stream phase and steady-state latency stays ~0.
+    #[test]
+    fn present_limiter_holds_frames_before_their_slot() {
+        let base = Instant::now();
+        let step = Duration::from_millis(16);
+        // Frames arriving well before their slot are HELD for the slot.
+        assert!(present_limiter_should_hold(base, base + step, step));
+        assert!(present_limiter_should_hold(
+            base + step.mul_f64(0.5),
+            base + step,
+            step
+        ));
+        // The tolerance window is 10% of the step measured from the SLOT: a
+        // frame 1.6 ms before the slot passes straight through.
+        assert!(!present_limiter_should_hold(
+            base + step.mul_f64(0.9),
+            base + step,
+            step
+        ));
+        // A frame at/after its slot never holds.
+        assert!(!present_limiter_should_hold(base + step, base + step, step));
+        assert!(!present_limiter_should_hold(base + step * 2, base + step, step));
+        // Longer steps widen the hold window proportionally (0.5 step before
+        // a 33 ms slot is far outside the 3.3 ms tolerance).
+        let step33 = Duration::from_millis(33);
+        assert!(present_limiter_should_hold(base, base + step33, step33));
+        assert!(!present_limiter_should_hold(
+            base + step33.mul_f64(0.9),
+            base + step33,
+            step33
         ));
     }
 
