@@ -8,11 +8,18 @@ interface MediaStreamTrackGeneratorInit {
   kind: "video" | "audio";
 }
 
-declare class MediaStreamTrackGenerator {
+// Chromium's current IDL (unchanged since ~M100) makes the generator itself
+// the track: `interface MediaStreamTrackGenerator : MediaStreamTrack` — the
+// object you construct IS the MediaStreamTrack, so it can be handed straight
+// to `new MediaStream([...])`. The legacy `readable` accessor (Chrome 94-99
+// era, pre-M100) was removed years ago; it is declared as an optional member
+// only so runtime code can still probe for both API shapes.
+declare class MediaStreamTrackGenerator extends MediaStreamTrack {
   constructor(init: MediaStreamTrackGeneratorInit);
-  /** VideoFrames written here are exposed as a track on `readable`. */
+  /** VideoFrames written here are pushed into the generator's own track. */
   readonly writable: WritableStream<VideoFrame>;
-  readonly readable: MediaStreamTrack;
+  /** Legacy (removed in Chromium ~M100): older runtimes exposed the track here. */
+  readonly readable?: MediaStreamTrack;
 }
 
 interface FileReaderSync {

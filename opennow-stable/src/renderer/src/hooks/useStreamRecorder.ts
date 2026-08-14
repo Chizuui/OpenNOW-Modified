@@ -25,6 +25,71 @@ const RECORD_CAP_BY_RESOLUTION: Record<string, { width: number; height: number }
   "720p": { width: 1280, height: 720 },
 };
 
+// Resolver that extracts the video track a MediaStreamTrackGenerator exposes
+// for MediaRecorder, regardless of which API shape the runtime ships.
+type GeneratorTrackResolver = (generator: MediaStreamTrackGenerator) => MediaStreamTrack | null;
+
+// Module-level cache: the generator API cannot appear or disappear within a
+// session, so probe once and reuse. `undefined` = not probed yet, `null` =
+// unusable (recording goes straight to the captureStream fallback).
+let cachedGeneratorTrackResolver: GeneratorTrackResolver | null | undefined;
+
+/**
+ * Probes whether a usable MediaStreamTrackGenerator exists and returns a
+ * resolver that extracts its video track. Runs once per app session, BEFORE
+ * any worker or generator is created, so an unsupported runtime never
+ * half-starts the worker path (no worker spawn, no rVFC chain, no generator
+ * that has to be torn down mid-start).
+ *
+ * The API shape changed in Chromium ~M100: the legacy `readable` accessor was
+ * removed and the generator object itself became the track (the class now
+ * inherits MediaStreamTrack). Both shapes are accepted here; anything else —
+ * constructor missing/throws, no writable stream, no usable track — resolves
+ * to null.
+ */
+const getGeneratorTrackResolver = (): GeneratorTrackResolver | null => {
+  if (cachedGeneratorTrackResolver !== undefined) {
+    return cachedGeneratorTrackResolver;
+  }
+  if (typeof MediaStreamTrackGenerator === "undefined") {
+    cachedGeneratorTrackResolver = null;
+    return null;
+  }
+  let probe: MediaStreamTrackGenerator;
+  try {
+    probe = new MediaStreamTrackGenerator({ kind: "video" });
+  } catch {
+    cachedGeneratorTrackResolver = null;
+    return null;
+  }
+  try {
+    if (!probe.writable) {
+      return null;
+    }
+    // Legacy Chromium (Chrome 94-99 era): the track lives on `readable`.
+    const legacyTrack = probe.readable;
+    if (legacyTrack && typeof legacyTrack.stop === "function") {
+      cachedGeneratorTrackResolver = (generator) => generator.readable ?? null;
+      return cachedGeneratorTrackResolver;
+    }
+    // Modern Chromium (~M100+): the generator object itself IS the track.
+    if (typeof probe.stop === "function") {
+      cachedGeneratorTrackResolver = (generator) => generator as unknown as MediaStreamTrack;
+      return cachedGeneratorTrackResolver;
+    }
+  } finally {
+    // Stop the throwaway probe track (no-op where the legacy shape lacks
+    // `stop` — never let cleanup throw and void the resolver above).
+    try {
+      probe.stop();
+    } catch {
+      /* noop */
+    }
+  }
+  cachedGeneratorTrackResolver = null;
+  return null;
+};
+
 interface UseStreamRecorderOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   audioRef: RefObject<HTMLAudioElement | null>;
@@ -314,6 +379,17 @@ export function useStreamRecorder({
       // the frame handoff (VideoFrame in, ImageBitmap out) — no synchronous
       // drawImage, no canvas rasterize timer.
       try {
+        // Early capability probe — see getGeneratorTrackResolver. Runs BEFORE
+        // the worker, generator, or rVFC chain exist: when this runtime
+        // cannot produce a usable generator track (Chromium removed the
+        // legacy `readable` accessor; the generator object itself is now the
+        // track), throw immediately so the catch below tears down nothing and
+        // recording falls through to captureStream with zero half-started
+        // state — no worker spawn, no frame loop to cancel.
+        const generatorTrackResolver = getGeneratorTrackResolver();
+        if (!generatorTrackResolver) {
+          throw new Error("MediaStreamTrackGenerator unavailable in this runtime.");
+        }
         const recordWorker = new Worker(
           new URL("../recording/recordCanvasWorker.ts", import.meta.url),
           { type: "module" },
@@ -322,7 +398,7 @@ export function useStreamRecorder({
         const generator = new MediaStreamTrackGenerator({ kind: "video" });
         videoGeneratorRef.current = generator;
         videoGeneratorWriterRef.current = generator.writable.getWriter();
-        recordVideoTrack = generator.readable;
+        recordVideoTrack = generatorTrackResolver(generator);
         if (!recordVideoTrack) {
           // e.g. a runtime where the generator's track is unavailable — the
           // contentHint-on-undefined field failure class. Fall through to the
