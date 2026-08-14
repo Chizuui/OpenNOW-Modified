@@ -78,7 +78,12 @@ const JITTER_FRESH_AGE_MS: u64 = 5_000;
 ///     the queue oscillate between depths (field logs: raw loss 0.02% ↔ 0.44%
 ///     around 0.1% flipped the queue 6 ↔ 10 frames every second, jolting
 ///     input latency each time).
-fn target_pre_decode_depth(rtt_ema_ms: u32, loss_fraction: Option<f64>, burst_hold: bool) -> u32 {
+fn target_pre_decode_depth(
+    rtt_ema_ms: u32,
+    loss_fraction: Option<f64>,
+    burst_hold: bool,
+    jitter_p99: Option<u32>,
+) -> u32 {
     use crate::gstreamer_pipeline::{
         VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
         VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
@@ -89,20 +94,40 @@ fn target_pre_decode_depth(rtt_ema_ms: u32, loss_fraction: Option<f64>, burst_ho
     if loss_fraction.is_some_and(|loss| loss >= 0.0015) {
         return VIDEO_COMPRESSED_QUEUE_MID_BUFFERS;
     }
+    // ADJB parity (GFN `video.adjbQuantile`): the decode-side jitter buffer
+    // is sized by the SAME 99th-percentile receive-jitter quantile that sizes
+    // the webrtcbin RTP playout latency, so a jittery link deepens BOTH
+    // buffers together. A link can have high interarrival jitter while RTT
+    // and loss stay flat (wifi, congested last mile) — without this input
+    // the pre-decode buffer would rest at the shallow floor and the decoder
+    // would starve on every jitter burst, sawtoothing the output fps.
+    // Mirrors the RTP-side ramp: 5 ms → BASE, 40 ms → MAX, larger signal
+    // wins.
+    const JITTER_RAMP_LO_MS: u32 = 5;
+    const JITTER_RAMP_HI_MS: u32 = 40;
+    let jitter_depth = jitter_p99.map_or(0, |jitter| {
+        if jitter <= JITTER_RAMP_LO_MS {
+            0
+        } else {
+            let span = JITTER_RAMP_HI_MS - JITTER_RAMP_LO_MS;
+            let frac = (jitter - JITTER_RAMP_LO_MS).min(span);
+            (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS - VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS) * frac
+                / span
+        }
+    });
     // Continuous ramp: 30 ms → BASE, 150 ms → MAX.
     const RAMP_LO_MS: u32 = 30;
     const RAMP_HI_MS: u32 = 150;
-    if rtt_ema_ms <= RAMP_LO_MS {
-        VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
+    let rtt_depth = if rtt_ema_ms <= RAMP_LO_MS {
+        0
     } else if rtt_ema_ms >= RAMP_HI_MS {
-        VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS - VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
     } else {
         let span = RAMP_HI_MS - RAMP_LO_MS;
         let frac = rtt_ema_ms - RAMP_LO_MS;
-        VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
-            + (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS - VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS) * frac
-                / span
-    }
+        (VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS - VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS) * frac / span
+    };
+    VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS + jitter_depth.max(rtt_depth)
 }
 
 /// Map the network signals to the webrtcbin RTP playout latency in ms (the
@@ -1148,7 +1173,11 @@ impl VideoLivenessState {
             next as f64 / 100_000.0
         });
         let burst_hold = self.now_ms() < self.burst_hold_until_ms.load(Ordering::Relaxed);
-        let target = target_pre_decode_depth(ema, loss_ema, burst_hold);
+        // Size the decode-side buffer by the ADJB jitter quantile too — the
+        // same p99 that sizes the RTP playout latency (GFN
+        // `video.adjbQuantile`): a jittery link with flat RTT/loss must not
+        // rest at the shallow floor and starve the decoder.
+        let target = target_pre_decode_depth(ema, loss_ema, burst_hold, self.adjb_jitter_p99());
         if target == self.pre_decode_depth.load(Ordering::Relaxed) {
             return None;
         }
@@ -6679,13 +6708,14 @@ mod tests {
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS, VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS,
             VIDEO_COMPRESSED_QUEUE_MID_BUFFERS,
         };
-        // Stable links: shallow (≈50 ms at 60 fps), no loss, no burst.
+        // Stable links: shallow (≈50 ms at 60 fps), no loss, no burst, no
+        // jitter.
         assert_eq!(
-            target_pre_decode_depth(0, None, false),
+            target_pre_decode_depth(0, None, false, None),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
         );
         assert_eq!(
-            target_pre_decode_depth(38, None, false),
+            target_pre_decode_depth(38, None, false, Some(3)),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
         );
         // Continuous ramp: even a modest RTT rise buys buffer depth — a
@@ -6695,17 +6725,41 @@ mod tests {
         // starved the decoder). With the 3-frame shallow floor:
         // 45 ms → 3 + 12*15/120 = 4; 60 ms → 3 + 12*30/120 = 6; 100 ms →
         // 3 + 12*70/120 = 10; ≥ 150 ms → 15.
-        assert_eq!(target_pre_decode_depth(45, None, false), 4);
-        assert_eq!(target_pre_decode_depth(60, None, false), 6);
-        assert_eq!(target_pre_decode_depth(100, None, false), 10);
+        assert_eq!(target_pre_decode_depth(45, None, false, None), 4);
+        assert_eq!(target_pre_decode_depth(60, None, false, None), 6);
+        assert_eq!(target_pre_decode_depth(100, None, false, None), 10);
         assert_eq!(
-            target_pre_decode_depth(150, None, false),
+            target_pre_decode_depth(150, None, false, None),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
         assert_eq!(
-            target_pre_decode_depth(250, None, false),
+            target_pre_decode_depth(250, None, false, None),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
+        // ADJB quantile parity (GFN `video.adjbQuantile`): the decode-side
+        // buffer deepens on the 99th-percentile receive jitter even while
+        // RTT/loss stay flat — the jittery-wifi case that used to starve the
+        // decoder at the shallow floor. Same ramp as the RTP playout latency:
+        // 5 ms → floor, 40 ms → ceiling, larger signal wins.
+        assert_eq!(
+            target_pre_decode_depth(10, None, false, Some(10)),
+            3 + 12 * 5 / 35
+        );
+        assert_eq!(
+            target_pre_decode_depth(10, None, false, Some(20)),
+            3 + 12 * 15 / 35
+        );
+        assert_eq!(
+            target_pre_decode_depth(10, None, false, Some(40)),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        assert_eq!(
+            target_pre_decode_depth(10, None, false, Some(80)),
+            VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
+        );
+        // The larger of the two ramps wins: RTT 60 ms alone gives 6 frames;
+        // adding a 20 ms jitter p99 raises it further.
+        assert_eq!(target_pre_decode_depth(60, None, false, Some(20)), 3 + 12 * 15 / 35);
         // Packet loss is the leading indicator of jitter: it must floor the
         // depth even while the RTT is still stable. The mid band is WIDE
         // (≥0.15% → mid) so the raw per-sample loss oscillating around the
@@ -6713,36 +6767,47 @@ mod tests {
         // depths every sample — 0.1% stays shallow, ≥0.15% goes mid, ≥0.5%
         // goes max.
         assert_eq!(
-            target_pre_decode_depth(38, Some(0.001), false),
+            target_pre_decode_depth(38, Some(0.001), false, None),
             VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS
         );
         assert_eq!(
-            target_pre_decode_depth(38, Some(0.0015), false),
+            target_pre_decode_depth(38, Some(0.0015), false, None),
             VIDEO_COMPRESSED_QUEUE_MID_BUFFERS
         );
         assert_eq!(
-            target_pre_decode_depth(38, Some(0.005), false),
+            target_pre_decode_depth(38, Some(0.005), false, None),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
         // A detected RTT spike (burst hold) forces MAX immediately — the
         // EMA would take seconds to climb, during which the decoder starves
         // and the sink blinks the previous frame.
         assert_eq!(
-            target_pre_decode_depth(38, None, true),
+            target_pre_decode_depth(38, None, true, None),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
         assert_eq!(
-            target_pre_decode_depth(250, Some(0.005), true),
+            target_pre_decode_depth(250, Some(0.005), true, None),
             VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS
         );
         // Monotonic in RTT (no flat/clipped regions): each +1 ms of RTT may
         // never reduce the depth.
-        let mut last = target_pre_decode_depth(0, None, false);
+        let mut last = target_pre_decode_depth(0, None, false, None);
         for rtt in 1..=200 {
-            let depth = target_pre_decode_depth(rtt, None, false);
+            let depth = target_pre_decode_depth(rtt, None, false, None);
             assert!(
                 depth >= last,
                 "depth must not decrease as RTT grows: rtt={rtt} depth={depth} < last={last}"
+            );
+            last = depth;
+        }
+        // Monotonic in jitter p99 as well: each +1 ms of quantile jitter may
+        // never reduce the depth.
+        let mut last = target_pre_decode_depth(10, None, false, Some(0));
+        for jitter in 1..=80 {
+            let depth = target_pre_decode_depth(10, None, false, Some(jitter));
+            assert!(
+                depth >= last,
+                "depth must not decrease as jitter p99 grows: jitter={jitter} depth={depth} < last={last}"
             );
             last = depth;
         }
