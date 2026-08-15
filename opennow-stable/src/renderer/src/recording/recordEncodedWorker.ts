@@ -31,6 +31,7 @@ import {
   AUDIO_RTP_CLOCK,
   DEFAULT_MIC_MIX_GAIN,
   MicPcmFifo,
+  MicSync,
   VIDEO_RTP_CLOCK,
   type EncodedCaptureCodec,
   type EncodedCaptureContainer,
@@ -68,6 +69,13 @@ interface EncodedCaptureStop {
 interface EncodedCaptureMicPcm {
   type: "mic-pcm";
   samples: Float32Array;
+  /**
+   * performance.now() at capture — a real clock, independent of the
+   * AudioContext (whose currentTime is tied to its own sample counter). The
+   * worker measures the mic's actual sample rate from these tags and consumes
+   * by RTP frame duration, so the voice cannot drift from the game audio.
+   */
+  capturedAtMs: number;
 }
 
 /** Message delivered to the worker for each RTCRtpScriptTransform attached. */
@@ -153,6 +161,10 @@ const pumpTasks: Promise<void>[] = [];
 // Mic mixing (GFN parity: mic is mixed into the audio track, video untouched).
 let micMixActive = false;
 let micFifo: MicPcmFifo | null = null;
+// Real-clock sync between the mic PCM and the game RTP timeline (see
+// MicSync): consumes mic samples by RTP frame duration × the MEASURED mic
+// rate, not by the game frame's sample count — the two clocks drift.
+let micSync: MicSync | null = null;
 let gameDecoder: AudioDecoder | null = null;
 let mixEncoder: AudioEncoder | null = null;
 
@@ -195,7 +207,15 @@ function setupMicMix(init: EncodedCaptureInit): void {
       const game = new Float32Array(frames * 2);
       data.copyTo(game, { planeIndex: 0, format: "f32" });
       data.close();
-      const mic = micFifo?.pull(frames) ?? new Float32Array(0);
+      // Consume mic samples by the RTP frame duration × the measured mic
+      // rate (anchored to the first frame) instead of `frames` — the game
+      // RTP clock and the mic's hardware clock drift, so a per-sample
+      // assumption slowly walks the voice away from the game. Underruns
+      // (mic momentarily behind) fold into the next frame via commitPulled.
+      const desired = micSync?.samplesForFrame(timestampUs) ?? 0;
+      const mic =
+        desired > 0 ? (micFifo?.pull(desired) ?? new Float32Array(0)) : new Float32Array(0);
+      if (mic.length > 0) micSync?.commitPulled(mic.length);
       const mixed = mixGameAudioWithMic(game, mic, DEFAULT_MIC_MIX_GAIN);
       mixEncoder?.encode(
         new AudioData({
@@ -263,12 +283,14 @@ function setupMicMix(init: EncodedCaptureInit): void {
   gameDecoder = decoder;
   mixEncoder = encoder;
   micFifo = new MicPcmFifo();
+  micSync = new MicSync();
   micMixActive = true;
 }
 
 function teardownMicMix(): void {
   micMixActive = false;
   micFifo = null;
+  micSync = null;
   if (gameDecoder) {
     gameDecoder.close();
     gameDecoder = null;
@@ -514,8 +536,10 @@ self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
   if (data.type === "init") {
     setup(data);
   } else if (data.type === "mic-pcm") {
-    // Raw mic PCM (48 kHz mono) — handed to the mixing FIFO for the next
-    // decoded game-audio frame.
+    // Raw mic PCM (48 kHz mono) + the real-clock capture time. The sync
+    // measures the mic's actual rate from the tags; the FIFO holds the
+    // samples for the next decoded game-audio frame's pull.
+    micSync?.push(data.samples.length, data.capturedAtMs);
     micFifo?.push(data.samples);
   } else if (data.type === "rtc-transform-event") {
     const kind = data.transformer.options?.kind ?? "video";

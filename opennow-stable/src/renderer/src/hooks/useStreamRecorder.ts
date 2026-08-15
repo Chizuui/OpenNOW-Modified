@@ -106,6 +106,12 @@ interface UseStreamRecorderOptions {
    * untouched. Requires an active mic (micTrack live).
    */
   mixMic: boolean;
+  /**
+   * Called when a recording requested mic mix but no live mic was available
+   * — lets the caller auto-reset the setting so a recording is never
+   * silently captured without the user's voice.
+   */
+  onMixMicUnavailable?: () => void;
 }
 
 export function useStreamRecorder({
@@ -118,6 +124,7 @@ export function useStreamRecorder({
   recordingFps,
   nativeRecordingEnabled,
   mixMic,
+  onMixMicUnavailable,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -263,6 +270,9 @@ export function useStreamRecorder({
       const track = micTrack;
       if (!track || track.readyState !== "live") {
         console.warn("[StreamView] Mic mix requested but no live mic available — recording without mic.");
+        // Auto-reset the toggle: a recording that silently omits the user's
+        // voice should not leave "Mix Mic" looking active.
+        onMixMicUnavailable?.();
         return false;
       }
       try {
@@ -276,7 +286,13 @@ export function useStreamRecorder({
           const input = event.inputBuffer.getChannelData(0);
           const samples = new Float32Array(input.length);
           samples.set(input);
-          worker.postMessage({ type: "mic-pcm", samples }, [samples.buffer]);
+          // Real-clock capture time: the worker measures the mic's actual
+          // sample rate from these tags and consumes by RTP frame duration,
+          // so the voice cannot drift from the game audio.
+          worker.postMessage(
+            { type: "mic-pcm", samples, capturedAtMs: performance.now() },
+            [samples.buffer],
+          );
         };
         // Keep the graph pulled without routing the mic to the speakers.
         const mute = context.createGain();
@@ -293,7 +309,7 @@ export function useStreamRecorder({
         return false;
       }
     },
-    [micTrack],
+    [micTrack, onMixMicUnavailable],
   );
 
   const startEncodedRecording = useCallback(

@@ -17,6 +17,7 @@ import {
   rtpTimestampToMicroseconds,
   unwrapRtpTimestamp,
   MicPcmFifo,
+  MicSync,
 } from "./encodedCapture";
 
 /** Build an Annex-B H.264-style NAL payload with a 4-byte start code. */
@@ -273,6 +274,78 @@ test("MicPcmFifo pushes, pulls oldest-first, and drains cleanly", () => {
   // Empty pushes are no-ops.
   fifo.push(new Float32Array(0));
   assert.equal(fifo.available, 0);
+});
+
+test("MicSync measures the real mic rate from capture tags", () => {
+  const sync = new MicSync();
+  assert.equal(sync.measuredRatePerUs, 48_000 / 1_000_000); // nominal until measured
+  // Mic actually runs at 48_010 Hz: 4096-sample chunks arrive every
+  // 4096/48010 s = 85.315 ms of real time.
+  const chunkLen = 4096;
+  const chunkMs = (chunkLen / 48_010) * 1000;
+  for (let i = 1; i <= 5; i += 1) {
+    sync.push(chunkLen, i * chunkMs);
+  }
+  assert.ok(Math.abs(sync.measuredRatePerUs - 48_010 / 1_000_000) < 1e-7);
+  // A garbage tag (huge time gap) is clamped to the sane window.
+  sync.push(chunkLen, 1e9);
+  assert.ok(sync.measuredRatePerUs >= 45_600 / 1_000_000);
+  assert.ok(sync.measuredRatePerUs <= 50_400 / 1_000_000);
+});
+
+test("MicSync anchors on the first frame and drops pre-recording mic", () => {
+  const sync = new MicSync();
+  // Mic captured since real t=0; by the anchor moment (game tsUs = 1 s) the
+  // worker has received 45056 samples (11 × 4096).
+  const chunkLen = 4096;
+  const chunkMs = (chunkLen / 48_000) * 1000;
+  for (let i = 1; i <= 11; i += 1) sync.push(chunkLen, i * chunkMs);
+  assert.equal(sync.pushed, 45_056);
+  // Anchor frame: consumes nothing (its mic window is captured later).
+  assert.equal(sync.samplesForFrame(1_000_000), 0);
+  // Next frame, 20 ms later: consume one frame duration × measured rate.
+  assert.equal(sync.samplesForFrame(1_020_000), 960);
+});
+
+test("MicSync consumes by RTP duration × measured rate — no drift with an off-nominal mic clock", () => {
+  const sync = new MicSync();
+  // Mic hardware runs at 48_010 Hz (0.02% fast — a realistic crystal error).
+  const micRate = 48_010;
+  const chunkLen = 4096;
+  const chunkMs = (chunkLen / micRate) * 1000;
+  const gameStartUs = 1_000_000;
+  const frameUs = 20_000; // opus 20 ms packets
+  const frames = 500; // 10 s of game audio
+  // Simulate: feed mic chunks up to a real-clock moment, then process one
+  // game frame (mic arrives at the real moment of its game position).
+  let chunk = 0;
+  let pushed = 0;
+  let givenToMixer = 0;
+  const feedMicThrough = (realMs: number): void => {
+    while ((chunk + 1) * chunkMs <= realMs) {
+      chunk += 1;
+      sync.push(chunkLen, chunk * chunkMs);
+      pushed += chunkLen;
+    }
+  };
+  feedMicThrough(gameStartUs / 1000); // mic up to the anchor moment
+  for (let i = 0; i < frames; i += 1) {
+    const tsUs = gameStartUs + i * frameUs;
+    feedMicThrough((gameStartUs + i * frameUs) / 1000);
+    const desired = sync.samplesForFrame(tsUs);
+    const take = Math.min(desired, Math.max(0, pushed - givenToMixer));
+    givenToMixer += take;
+    sync.commitPulled(take);
+  }
+  // The mixer received exactly as many mic samples as the mic produced
+  // during the recorded game window — the timelines never drifted.
+  const elapsedUs = (frames - 1) * frameUs;
+  const expected = (elapsedUs / 1_000_000) * micRate;
+  // The mixer received exactly as many mic samples as the mic produced during
+  // the recorded game window — the timelines never drifted (bounded ±1 rounding).
+  assert.ok(Math.abs(givenToMixer - expected) < 2, `consumed ${givenToMixer}, expected ~${expected}`);
+  // And the FIFO never starved: every frame's requested pull was satisfiable.
+  assert.equal(givenToMixer, Math.round(expected));
 });
 
 test("mixGameAudioWithMic adds the mono mic to both channels and clamps", () => {

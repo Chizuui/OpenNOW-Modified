@@ -1800,6 +1800,29 @@ export function App(): JSX.Element {
     }
   }, [diagnosticsStore, streamStatus, updateSetting]);
 
+  // "Mix Mic" recordings need a live microphone. Auto-reset the toggle when
+  // the mic is unavailable (mode disabled) or dies mid-session (device
+  // unplugged) so the user is never left with a setting that silently
+  // records without their voice. The mic track is created on demand (e.g.
+  // push-to-talk), so a null track while the mode is active is left alone —
+  // the recorder itself falls back gracefully when the mic is actually
+  // missing at record-start.
+  useEffect(() => {
+    if (!settings.recordingMixMic) return;
+    const disableMixMic = (): void => {
+      console.warn("[Settings] Microphone unavailable — disabling Mix Mic for recordings.");
+      void updateSetting("recordingMixMic", false);
+    };
+    if (settings.microphoneMode === "disabled") {
+      disableMixMic();
+      return;
+    }
+    const micTrack = clientRef.current?.getMicTrack() ?? null;
+    if (!micTrack) return;
+    micTrack.addEventListener("ended", disableMixMic);
+    return () => micTrack.removeEventListener("ended", disableMixMic);
+  }, [clientRef, settings.microphoneMode, settings.recordingMixMic, streamStatus, updateSetting]);
+
   const resolveSessionClaimAppId = useCallback((existingSession: ActiveSessionInfo): string => {
     const trackedAppId = signalingRecoveryRef.current.appId;
     const persistedAppId = runtimeSnapshotRef.current?.sessionAppId ?? runtimeSnapshotRef.current?.recoveryAppId;

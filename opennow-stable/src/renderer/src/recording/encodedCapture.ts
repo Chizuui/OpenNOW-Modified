@@ -582,6 +582,108 @@ export class MicPcmFifo {
 }
 
 /**
+ * Real-clock sync between the mic PCM and the game audio timeline.
+ *
+ * The mic chunks are captured on the main thread and tagged with
+ * `performance.now()` (a real clock — NOT `AudioContext.currentTime`, which
+ * is tied to the context's own sample counter and therefore always "perfectly
+ * in sync" with its sample count). The game timeline is the RTP-derived µs of
+ * the encoded audio frames. Naively consuming one mic sample per game sample
+ * assumes both clocks tick at exactly the same rate; real devices drift (a
+ * mic's hardware clock is typically ±0.1% and the server's RTP clock is its
+ * own oscillator), so the FIFO gradually empties or piles up and the voice
+ * walks away from the game.
+ *
+ * This class measures the mic's ACTUAL sample rate from the capture tags and
+ * consumes mic samples proportional to the RTP frame duration (anchored to
+ * the first decoded game frame) instead of the game frame's sample count.
+ * Drift is gone by construction — the only residue is a bounded ±1-sample
+ * phase jitter from rounding. Pure and deterministic; the worker owns one
+ * instance per recording.
+ */
+export class MicSync {
+  /** Samples per microsecond — nominal 48 kHz, corrected by measurement. */
+  private ratePerUs = 48_000 / 1_000_000;
+  /** Cumulative mic samples ever fed via push(). */
+  private totalPushed = 0;
+  private lastTag: { realMs: number; total: number } | null = null;
+  /** Game tsUs (RTP-derived µs) of the first decoded game frame. */
+  private anchorGameUs: number | null = null;
+  /** Mic sample index captured at the real moment of the anchor frame. */
+  private anchorMicSample = 0;
+  /** Mic samples handed to the mixer so far (anchor-relative). */
+  private consumed = 0;
+
+  /** Currently measured mic rate (samples per µs). */
+  get measuredRatePerUs(): number {
+    return this.ratePerUs;
+  }
+
+  /** Cumulative mic samples fed via push(). */
+  get pushed(): number {
+    return this.totalPushed;
+  }
+
+  /**
+   * Feed one captured mic chunk: its sample count plus the real-clock time it
+   * was captured (performance.now() on the main thread). The rate is measured
+   * from the DELTA between consecutive tags — delivery jitter cannot skew it
+   * because the tag is stamped at capture, not at postMessage. Clamped to a
+   * sane ±5% window so a garbage tag cannot yank the timeline.
+   */
+  push(samples: number, capturedAtMs: number): void {
+    this.totalPushed += samples;
+    const prev = this.lastTag;
+    if (prev) {
+      const dMs = capturedAtMs - prev.realMs;
+      const dSamples = this.totalPushed - prev.total;
+      // Chunks arrive every ~85 ms (4096 samples / 48 kHz); only re-measure
+      // over a meaningful window.
+      if (dMs >= 50) {
+        this.ratePerUs = clamp((dSamples / dMs) / 1000, 45_600 / 1_000_000, 50_400 / 1_000_000);
+        this.lastTag = { realMs: capturedAtMs, total: this.totalPushed };
+      }
+    } else {
+      this.lastTag = { realMs: capturedAtMs, total: this.totalPushed };
+    }
+  }
+
+  /**
+   * How many mic samples the mixer should consume for the game frame
+   * presented at `gameTsUs` (RTP-derived µs). Anchors on the first frame:
+   * mic samples captured before the game window started belong before the
+   * recording, so they are dropped (the anchor remembers their count), and
+   * the anchor frame itself consumes none — its mic window is only captured
+   * over the following frame duration. Returns the count to pull (0 = none
+   * yet); underruns are handled by the caller via commitPulled().
+   */
+  samplesForFrame(gameTsUs: number): number {
+    if (this.anchorGameUs === null) {
+      this.anchorGameUs = gameTsUs;
+      this.anchorMicSample = this.totalPushed;
+      this.consumed = this.totalPushed;
+      return 0;
+    }
+    const target = this.anchorMicSample + (gameTsUs - this.anchorGameUs) * this.ratePerUs;
+    const desired = Math.round(target - this.consumed);
+    return desired > 0 ? desired : 0;
+  }
+
+  /**
+   * Report how many samples were actually handed to the mixer (fewer than
+   * requested on a FIFO underrun). The shortfall is folded into the next
+   * frame's request, so the timeline re-syncs as soon as mic data arrives.
+   */
+  commitPulled(count: number): void {
+    this.consumed += count;
+  }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
  * Mix a mono mic chunk into interleaved stereo game audio (both 48 kHz). The
  * mic is duplicated to both channels at `gain`; samples are clamped so the
  * sum cannot exceed the PCM range. `game` must be interleaved stereo (length

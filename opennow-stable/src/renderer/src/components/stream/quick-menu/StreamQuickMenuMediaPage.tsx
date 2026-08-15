@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import type { JSX, RefObject } from "react";
 import {
   Camera,
@@ -13,6 +14,7 @@ import type { RecordingEntry, ScreenshotEntry } from "@shared/gfn";
 import { SettingRange } from "../../settings/SettingRange";
 import { formatElapsed } from "../../../utils/timeFormat";
 import { formatFileSize } from "../streamFormatters";
+import { useMicMeter } from "../../../hooks/useMicMeter";
 
 const RESOLUTION_OPTIONS = [
   { value: "720p", label: "720p" },
@@ -43,6 +45,12 @@ interface StreamQuickMenuMediaPageProps {
   recordingResolution: string;
   recordingFps: number;
   recordingMixMic: boolean;
+  /**
+   * Live microphone track (same one the app sends to the stream). Shown on a
+   * level meter while an encoded recording is mixing the mic, so the user can
+   * confirm the mic is actually being picked up by the recording path.
+   */
+  micTrack: MediaStreamTrack | null;
   /**
    * Native streamer mode: the recording happens in the native pipeline at the
    * stream's own resolution/FPS/bitrate — the web-mode encode settings below
@@ -83,6 +91,7 @@ export function StreamQuickMenuMediaPage({
   recordingResolution,
   recordingFps,
   recordingMixMic,
+  micTrack,
   nativeRecording,
   recordingDropNotice,
   onRecordingResolutionChange,
@@ -94,6 +103,15 @@ export function StreamQuickMenuMediaPage({
   onDeleteRecording,
   onScrollRecordings,
 }: StreamQuickMenuMediaPageProps): JSX.Element {
+  // Live mic level meter: while an encoded bitstream recording is actively
+  // mixing the microphone, show the real signal level so the user can confirm
+  // the mic is being picked up (or not) by the recording path. Reuses the
+  // same segmented RMS meter as the Controls page, but scoped to this page
+  // and gated on the recording actually running with mic mix enabled.
+  const micMeterRef = useRef<HTMLCanvasElement | null>(null);
+  const micLevelMeterActive =
+    isRecording && usedStrategy === "encoded-transform" && recordingMixMic;
+  useMicMeter(micMeterRef, micTrack, micLevelMeterActive);
   return (
     <div className="sidebar-page" role="tabpanel">
       <section className="sidebar-section">
@@ -224,6 +242,23 @@ export function StreamQuickMenuMediaPage({
             zero-cost. Requires an active mic.
           </span>
         </div>
+        {micLevelMeterActive && (
+          <div className="sidebar-row sidebar-row--column">
+            <div className="sidebar-row-top">
+              <span className="sidebar-label">Mic level</span>
+              <span className="settings-value-badge">Live</span>
+            </div>
+            <canvas
+              ref={micMeterRef}
+              className="mic-meter-canvas"
+              aria-label="Microphone level being mixed into the recording"
+            />
+            <span className="sidebar-hint">
+              Live level of the mic being mixed into this recording — silence means the mic
+              is not being picked up.
+            </span>
+          </div>
+        )}
         </>
         )}
       </section>

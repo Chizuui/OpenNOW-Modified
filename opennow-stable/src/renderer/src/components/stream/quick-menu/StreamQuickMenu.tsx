@@ -318,6 +318,7 @@ export function StreamQuickMenu({
                 recordingResolution={recordingResolution}
                 recordingFps={recordingFps}
                 recordingMixMic={recordingMixMic}
+                micTrack={micTrack}
                 nativeRecording={nativeRecording}
                 recordingDropNotice={recordingDropNotice}
                 onRecordingResolutionChange={onRecordingResolutionChange}

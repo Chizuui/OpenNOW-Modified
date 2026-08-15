@@ -383,6 +383,9 @@ export function StreamView({
     recordingResolution,
     recordingFps,
     mixMic: recordingMixMic,
+    // Auto-reset the setting when a recording finds no live mic — a silent
+    // recording must not leave "Mix Mic" looking active.
+    onMixMicUnavailable: () => onRecordingMixMicChange(false),
   });
   const releasePointerLockForMenu = useCallback(() => {
     if (document.pointerLockElement) {
