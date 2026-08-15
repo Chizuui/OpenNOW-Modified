@@ -23,6 +23,10 @@ native/opennow-streamer/bin/*/*
 native/opennow-streamer/bin/*.dll
 native/opennow-streamer/bin/.gitkeep
 
+# Stale committed copy of the packaged native runtime (the packaged app gets
+# it via electron-builder extraResources from ../native/opennow-streamer/bin).
+opennow-stable/native/
+
 # IDE
 .idea/
 .vscode/
