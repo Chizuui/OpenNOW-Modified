@@ -1225,7 +1225,9 @@ export class NativeStreamerManager {
           type: "native-network-downgrade-request",
           reason: `native network assessment poor (rtt=${assessment.rttMs ?? "n/a"}ms, loss=${assessment.lossPercent ?? "n/a"}%)`,
         });
-        void this.stop(`native network downgrade (${assessment.verdict})`);
+        // [ponytail: disabled network auto-downgrade]
+        // The stream should NOT restart on temporary network lag — wait for user or server.
+        // void this.stop(`native network downgrade (${assessment.verdict})`);
       }
       return;
     }
