@@ -133,14 +133,19 @@ impl RecordingWorkerHandle {
     }
 
     /// Stop the worker and wait (bounded) for it to drain pending recording
-    /// work. A wedged GStreamer call can keep the thread alive past the
-    /// budget; the JoinHandle is then dropped (thread detached) rather than
-    /// blocking session teardown on it.
+    /// work. The budget covers a recording FINALIZE in flight (queue drain 4s
+    /// + EOS flush 4s + retry 1s + offline remux of a typical clip), because
+    /// killing the worker mid-finalize discards the finished MP4 AND leaves
+    /// its pipeline Arc alive so the explicit teardown is skipped. A wedged
+    /// GStreamer call can still keep the thread alive past the budget; the
+    /// JoinHandle is then dropped (thread detached) rather than blocking
+    /// session teardown on it, and `Arc::get_mut` in the caller falls back to
+    /// "skip explicit teardown, process exits".
     fn shutdown(&mut self) {
         let _ = self.tx.send(RecordingCommand::Shutdown);
         if let Some(join) = self.join.take() {
             let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(3_000);
+                std::time::Instant::now() + std::time::Duration::from_millis(20_000);
             while !join.is_finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

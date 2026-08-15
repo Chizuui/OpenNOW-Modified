@@ -84,7 +84,14 @@ const CONTROL_TIMEOUT_MS = 8000;
 const SESSION_START_TIMEOUT_MS = process.platform === "win32" ? 90000 : 45000;
 const SURFACE_UPDATE_TIMEOUT_MS = 15000;
 const OFFER_TIMEOUT_MS = 20000;
-const STOP_TIMEOUT_MS = 1200;
+// Session-stop budget. The native side drains its recording worker FIRST
+// (the worker may be mid-FINALIZE: queue drain 4s + EOS flush 4s + retry 1s
+// + the OFFLINE remux of a typical clip), so a 1.2s ceiling made every stop
+// issued while a recording finalize was in flight time out — the process was
+// then force-killed mid-remux and the finished MP4 was discarded. 25s covers
+// the worker grace (20s) + the explicit pipeline teardown; the reply still
+// lands in milliseconds when no recording work is pending.
+const STOP_TIMEOUT_MS = 25000;
 const SCREENSHOT_TIMEOUT_MS = 5000;
 // Native stop(finalize=true) budget: queue drain (4s) + EOS flush (4s) +
 // muxer-direct EOS failsafe (2s) = 10s, plus the OFFLINE pass-through remux

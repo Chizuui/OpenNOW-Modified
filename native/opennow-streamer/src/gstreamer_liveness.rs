@@ -2414,7 +2414,7 @@ fn query_rtcp_rtt_ms(pipeline: &gst::Pipeline) -> Option<(u32, u64)> {
                 continue;
             };
             if source.get::<bool>("have-rb").unwrap_or(false) {
-                let rb_lsr = source.get::<u64>("rb-lsr").unwrap_or(0);
+                let rb_lsr = structure_uint64(&source, "rb-lsr").unwrap_or(0);
                 // GStreamer versions expose rb-round-trip as either guint or
                 // guint64. Calling Value::get::<u32>() against a guint64
                 // emits GLib's g_value_get_uint critical (seen once per stats
@@ -2478,7 +2478,7 @@ fn query_rtcp_jitter_ms(pipeline: &gst::Pipeline) -> Option<u32> {
             let Ok(source) = source.get::<gst::Structure>() else {
                 continue;
             };
-            let packets_received = source.get::<u64>("packets-received").unwrap_or(0);
+            let packets_received = structure_uint64(&source, "packets-received").unwrap_or(0);
             if packets_received == 0 {
                 continue;
             }
@@ -2487,16 +2487,14 @@ fn query_rtcp_jitter_ms(pipeline: &gst::Pipeline) -> Option<u32> {
             // for the HUD, so per-packet arrival variance does not make the
             // readout jump around — and fall back to the raw `jitter` only
             // when the EWMA is absent or still 0 (e.g. too few packets yet).
-            let jitter_units = source
-                .get::<u32>("avg-jitter")
-                .ok()
+            let jitter_units = structure_u32(&source, "avg-jitter")
                 .filter(|j| *j > 0)
-                .or_else(|| source.get::<u32>("jitter").ok().filter(|j| *j > 0))
+                .or_else(|| structure_u32(&source, "jitter").filter(|j| *j > 0))
                 .unwrap_or(0);
             if jitter_units == 0 {
                 continue;
             }
-            let clock_rate = source.get::<u32>("clock-rate").unwrap_or(90_000);
+            let clock_rate = structure_u32(&source, "clock-rate").unwrap_or(90_000);
             if best
                 .as_ref()
                 .is_none_or(|(best_packets, _, _)| packets_received > *best_packets)
@@ -4311,6 +4309,35 @@ fn structure_uint64(structure: &gst::Structure, field: &str) -> Option<u64> {
             .get::<i64>()
             .ok()
             .and_then(|value| u64::try_from(value).ok()),
+        _ => None,
+    }
+}
+
+/// Type-safe u32 read from a `GstStructure` field. rtpsession exposes most
+/// scalar stats (avg-jitter, jitter, clock-rate, …) as guint on some
+/// runtimes and guint64 on others; calling `Value::get::<u32>()` against a
+/// guint64 emits GLib's `g_value_get_uint` critical (the once-per-poll noise
+/// in the field log, including right before a session stop), so inspect the
+/// GType before reading.
+fn structure_u32(structure: &gst::Structure, field: &str) -> Option<u32> {
+    let value = structure.value(field).ok()?;
+    let type_name = value.type_().name().to_string();
+    match type_name.as_str() {
+        "guint" => value.get::<u32>().ok(),
+        "guint64" => value.get::<u64>().ok().and_then(|v| u32::try_from(v).ok()),
+        "gint" => value
+            .get::<i32>()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok()),
+        "gint64" => value
+            .get::<i64>()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok()),
+        "guchar" => value.get::<u8>().ok().map(u32::from),
+        "gchar" => value
+            .get::<i8>()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok()),
         _ => None,
     }
 }
