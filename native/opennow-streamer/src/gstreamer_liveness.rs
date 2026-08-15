@@ -3578,6 +3578,17 @@ fn present_limiter_should_drop(
     now + tolerance < next_present_at
 }
 
+/// Clamp a stored present-limiter target fps to a sane range before the probe
+/// interprets it as a real frame rate. `0` (pacing off) stays 0; everything
+/// else is capped at 1000 fps so a corrupt/huge value (an un-resolved
+/// sentinel such as `u32::MAX`) can never produce a sub-nanosecond frame
+/// interval → `Duration::ZERO` present step → the schedule-advance loop spins
+/// forever and the sink pad streaming thread hangs.
+fn clamped_present_target_fps(raw: u32) -> u32 {
+    const MAX_SANE_PRESENT_FPS: u32 = 1_000;
+    raw.min(MAX_SANE_PRESENT_FPS)
+}
+
 pub(crate) fn install_present_limiter(
     sink: &gst::Element,
     present_max_fps: Arc<AtomicU32>,
@@ -3769,7 +3780,14 @@ pub(crate) fn install_present_limiter(
     let pacer_releasing = pacing_releasing.clone();
     let pacer_wake = pacing_wake.clone();
     sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-        let target_fps = present_max_fps.load(Ordering::Relaxed);
+        // Defensive ceiling: the probe treats the stored value as a REAL fps,
+        // so a bogus/huge target (e.g. an un-resolved `auto` sentinel that
+        // slipped past `set_pacing_mode`'s resolution) must never compute a
+        // sub-nanosecond frame interval → `Duration::ZERO` present step → the
+        // schedule-advance loop spins forever and the sink pad streaming
+        // thread hangs. No real present path runs above 1000 fps, so clamp
+        // there; `0` still means pacing off.
+        let target_fps = clamped_present_target_fps(present_max_fps.load(Ordering::Relaxed));
         let mut state = match state.lock() {
             Ok(guard) => guard,
             Err(_) => return gst::PadProbeReturn::Ok,
@@ -3970,6 +3988,12 @@ pub(crate) fn install_present_limiter(
             // Within tolerance: present at the actual arrival and anchor the
             // next slot to it, so the grid keeps a stable cadence.
             state.next_present_at = now + step;
+        } else if step.is_zero() {
+            // Safety net (mirror of the pacer's release-path guard): a zero
+            // step would make the advance loop below spin forever, hanging
+            // the sink pad streaming thread. Fall back to a 16 ms grid so a
+            // degenerate schedule can never freeze the session.
+            state.next_present_at = now + Duration::from_millis(16);
         } else {
             while state.next_present_at <= now {
                 state.next_present_at += step;
@@ -10347,6 +10371,34 @@ mod tests {
             base + budget,
             budget
         ));
+    }
+
+    /// The black-screen regression: the renderer re-sends
+    /// `setNativePacingMode("auto")` on every session start, and the runtime
+    /// command stored the raw `u32::MAX` sentinel — the probe read it as a
+    /// REAL fps and computed a ~0.23 ns frame interval, which truncates to
+    /// `Duration::ZERO` → zero present step → the schedule-advance loop spins
+    /// forever and the sink pad streaming thread hangs (decoded=60fps while
+    /// sink=0). The clamp must keep the probe's target within a range whose
+    /// frame interval is never sub-nanosecond.
+    #[test]
+    fn present_target_fps_clamp_never_zeroes_the_frame_interval() {
+        // 0 (pacing off) stays 0.
+        assert_eq!(clamped_present_target_fps(0), 0);
+        // Normal targets pass through unchanged.
+        assert_eq!(clamped_present_target_fps(60), 60);
+        assert_eq!(clamped_present_target_fps(144), 144);
+        assert_eq!(clamped_present_target_fps(240), 240);
+        // Every mode sentinel (auto = u32::MAX, vrr = MAX-1, stream = MAX-2)
+        // clamps to the sane ceiling, so the probe's frame interval stays
+        // >= 1 ms and the present step can never be Duration::ZERO.
+        assert_eq!(clamped_present_target_fps(u32::MAX), 1_000);
+        assert_eq!(clamped_present_target_fps(u32::MAX - 1), 1_000);
+        assert_eq!(clamped_present_target_fps(u32::MAX - 2), 1_000);
+        assert_eq!(
+            Duration::from_secs_f64(1.0 / f64::from(clamped_present_target_fps(u32::MAX))),
+            Duration::from_millis(1)
+        );
     }
 
     /// The delayed-delivery gate (Geronimo AsyncFrameQueue present gate): a

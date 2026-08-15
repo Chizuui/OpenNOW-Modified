@@ -2545,7 +2545,30 @@ impl GstreamerPipeline {
     /// immediately without rebuilding the pipeline.
     pub(crate) fn set_pacing_mode(&self, mode: &str) -> Result<String, String> {
         let (fps, label) = resolve_pacing_mode(mode)?;
-        self.set_present_max_fps(fps);
+        // Resolve the mode SENTINELS (auto / stream / vrr) to a concrete fps
+        // with the ACTIVE chain's parameters before storing — never store the
+        // raw sentinel. The limiter probe re-reads `present_max_fps` on every
+        // frame and treats it as a real fps: a sentinel (e.g. u32::MAX for
+        // `auto`) computes a ~0.23 ns frame interval, which truncates to
+        // `Duration::ZERO`, so the present step becomes zero and the
+        // schedule-advance loop (`while next <= now { next += step }`) never
+        // terminates — the sink pad streaming thread hangs and the session
+        // freezes on a black screen with decoded=60fps / sink=0 (the runtime
+        // `setNativePacingMode("auto")` re-sent by the renderer on every
+        // session start hit exactly this).
+        let video_api = self
+            .video_tap
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|tap| tap.video_api))
+            .unwrap_or(RtpVideoApi::Software);
+        let effective = effective_present_max_fps(
+            fps,
+            self.video_liveness.requested_fps(),
+            video_api,
+            crate::gstreamer_platform::primary_display_refresh_hz(),
+        );
+        self.set_present_max_fps(effective);
         // Keep the HUD pacing line in sync with the limiter target: the stats
         // overlay reads the mode back from the shared liveness state on its
         // next tick, so a runtime change is visible immediately.
