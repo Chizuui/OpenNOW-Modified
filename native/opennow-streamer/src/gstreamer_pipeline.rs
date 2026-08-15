@@ -8647,9 +8647,13 @@ fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
     ) {
         return 0;
     }
-    // VisualSampleEntry: 8 bytes of header (6 reserved + 2 data_reference)
-    // after the box header, then the child boxes (avcC/hvcC/av1C/vpcC...).
-    let children_start = entry.content_offset + 8;
+    // VisualSampleEntry: 78 bytes of fixed fields after the box header
+    // (6 reserved + 2 data_reference + 2 pre_defined + 2 reserved + 12
+    // pre_defined + 2 width + 2 height + 4 horizresolution + 4
+    // vertresolution + 4 reserved + 2 frame_count + 32 compressorname + 2
+    // depth + 2 pre_defined), THEN the child boxes (avcC/hvcC/av1C/vpcC...).
+    // Splicing earlier corrupts width/height (players see 1x256 → black).
+    let children_start = entry.content_offset + 78;
     let entry_children = mp4_box_children(data, children_start, entry.content_offset + entry.size);
     if mp4_find_child(&entry_children, b"colr").is_some() {
         return 0;
@@ -10360,21 +10364,64 @@ mod mic_pipeline_tests {
             "pass-through remux must keep the received H.265 (h265={has_h265_entry}, h264={has_h264_entry})"
         );
         // Colour metadata tagging: injecting the colr box must land inside
-        // the video sample entry, grow the file by exactly the box size, keep
-        // moov's size covering the gap to mdat, leave the mdat payload
-        // (the tail of the faststart file) untouched, and be idempotent on a
-        // second call.
+        // the video sample entry AFTER the 78-byte fixed block (never inside
+        // width/height), keep moov's size covering the gap to mdat, leave the
+        // mdat payload (the tail of the faststart file) untouched, and be
+        // idempotent on a second call. If qtmux already wrote a colr box
+        // (H.265 VUI colorimetry carries through h265parse caps), the
+        // injection is a correct no-op — the file already carries the tag.
         let len_before = bytes.len();
         let tail = bytes[bytes.len().saturating_sub(64)..].to_vec();
-        assert_eq!(inject_mp4_colr_box(&mut bytes), 1, "colr must be injected");
-        assert_eq!(bytes.len(), len_before + 20, "injection adds exactly the 20-byte colr box");
-        let colr: [u8; 20] = [
-            0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x01, 0x01, 0x00,
-        ];
+        let injected = inject_mp4_colr_box(&mut bytes);
         assert!(
-            bytes.windows(20).any(|w| w == colr),
-            "colr nclx BT.709 full-range box must be present after injection"
+            injected == 0 || injected == 1,
+            "colr injection must return 0 (already present) or 1 (injected), got {injected}"
+        );
+        if injected == 1 {
+            assert_eq!(
+                bytes.len(),
+                len_before + 20,
+                "injection adds exactly the 20-byte colr box"
+            );
+        } else {
+            assert_eq!(bytes.len(), len_before, "no-op injection must not grow the file");
+        }
+        // The sample entry's geometry must be intact — the regression that
+        // made native recordings render black (colr spliced into the 78-byte
+        // fixed block turned width/height into 1x256).
+        let entry_off = bytes
+            .windows(4)
+            .position(|w| w == b"hvc1" || w == b"hev1")
+            .expect("h265 sample entry");
+        let entry_content = entry_off + 4;
+        assert_eq!(
+            u16::from_be_bytes([bytes[entry_content + 24], bytes[entry_content + 25]]),
+            1920,
+            "colr handling must not corrupt sample-entry width"
+        );
+        assert_eq!(
+            u16::from_be_bytes([bytes[entry_content + 26], bytes[entry_content + 27]]),
+            1080,
+            "colr handling must not corrupt sample-entry height"
+        );
+        // The colr box must be a REAL aligned child of the sample entry
+        // (either injected by us or written by qtmux from the ES VUI
+        // colorimetry — the exact nclx payload differs between those paths).
+        let children_start = entry_content + 78;
+        let entry_children = mp4_box_children(
+            &bytes,
+            children_start,
+            bytes.len().min(children_start + 512),
+        );
+        let colr_child = mp4_find_child(&entry_children, b"colr")
+            .expect("a colr box must be present in the video sample entry");
+        // qtmux can already carry a colr (written from the ES VUI colorimetry,
+        // nclc for BT.601-style or nclx for BT.709) — either is a valid tag.
+        let colour_type =
+            &bytes[colr_child.content_offset..colr_child.content_offset + 4];
+        assert!(
+            colour_type == b"nclx" || colour_type == b"nclc",
+            "colr box must be an ncl-type colour info box, got {colour_type:?}"
         );
         let top = mp4_box_children(&bytes, 0, bytes.len());
         let moov = mp4_find_child(&top, b"moov").expect("moov");
@@ -10412,8 +10459,14 @@ mod mic_pipeline_tests {
         }
         let avc1_payload = {
             let mut p = Vec::new();
-            p.extend_from_slice(&[0u8; 6]); // VisualSampleEntry reserved
-            p.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+            // Full VisualSampleEntry fixed block (78 bytes) — NOT just the
+            // 8-byte header: real qtmux entries carry width/height/resolution
+            // here, and the colr box must land AFTER all of it or players
+            // read garbage geometry (the 1x256 black-screen regression).
+            p.extend_from_slice(&[0u8; 78]);
+            // Realistic geometry: width=1920, height=1080.
+            p[24..26].copy_from_slice(&1920u16.to_be_bytes());
+            p[26..28].copy_from_slice(&1080u16.to_be_bytes());
             p.extend_from_slice(&box4(b"avcC", vec![1, 2, 3, 4]));
             p
         };
@@ -10453,6 +10506,31 @@ mod mic_pipeline_tests {
         assert!(
             mp4.windows(20).any(|w| w == colr),
             "colr nclx BT.709 full-range box must be present"
+        );
+        // The video sample entry's geometry must be untouched: the colr box
+        // lands AFTER the 78-byte fixed block, never inside width/height
+        // (the 1x256 black-screen regression).
+        let entry_off = mp4
+            .windows(4)
+            .position(|w| w == b"avc1")
+            .expect("avc1 entry");
+        // Box layout: [size(4)][fourcc(4)][content] — the fourcc search hits
+        // the fourcc, so content starts 4 bytes after it.
+        let entry_content = entry_off + 4;
+        assert_eq!(
+            u16::from_be_bytes([mp4[entry_content + 24], mp4[entry_content + 25]]),
+            1920,
+            "colr injection must not corrupt sample-entry width"
+        );
+        assert_eq!(
+            u16::from_be_bytes([mp4[entry_content + 26], mp4[entry_content + 27]]),
+            1080,
+            "colr injection must not corrupt sample-entry height"
+        );
+        assert_eq!(
+            &mp4[entry_content + 78..entry_content + 98],
+            &colr[..],
+            "colr must land right after the 78-byte fixed block, before avcC"
         );
         // moov must still exactly cover the gap to mdat (ancestor sizes bumped).
         let top = mp4_box_children(&mp4, 0, mp4.len());
