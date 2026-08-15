@@ -683,7 +683,6 @@ pub(crate) mod win32_renderer_window {
         fn SetFocus(hwnd: Hwnd) -> Hwnd;
         fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
         fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, new_long: isize) -> isize;
-        fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> Bool;
         fn SetWindowPos(
             hwnd: Hwnd,
             insert_after: Hwnd,
@@ -1036,36 +1035,24 @@ pub(crate) mod win32_renderer_window {
     /// This is idempotent and cheap, so it can run from the guard hook on
     /// every relevant event without flicker.
     unsafe fn enforce_stacked_renderer_window_style(sink_hwnd: Hwnd) {
-        // Never steal focus or activation (keyboard/mouse input stays on the
-        // Electron shell), and never force a taskbar entry. The sink is NOT a
-        // tool window anymore: it must show up in Alt-Tab and in window-capture
-        // pickers (Discord/OBS/Game Bar), otherwise the user sees only the
-        // transparent shell's overlay when alt-tabbing or sharing — the video
-        // window itself never appears (the GFN-app behavior people expect).
+        // Never steal focus, never appear in alt-tab/taskbar, and remove
+        // WS_EX_APPWINDOW (which forces a taskbar entry) in case GStreamer
+        // ever sets it.
         let ex_style = GetWindowLongPtrW(sink_hwnd, GWL_EXSTYLE);
-        let desired_ex = (ex_style | WS_EX_NOACTIVATE) & !(WS_EX_TOOLWINDOW | WS_EX_APPWINDOW);
+        let desired_ex = (ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
         if desired_ex != ex_style {
             SetWindowLongPtrW(sink_hwnd, GWL_EXSTYLE, desired_ex);
             stacked_guard_log_throttled(
                 "sink-exstyle",
                 "info",
                 format!(
-                    "Stacked sink ex-style changed: 0x{:08X} -> 0x{:08X} (kept NOACTIVATE, cleared TOOLWINDOW/APPWINDOW)",
+                    "Stacked sink ex-style changed: 0x{:08X} -> 0x{:08X} (added NOACTIVATE/TOOLWINDOW, cleared APPWINDOW)",
                     ex_style as u32,
                     desired_ex as u32,
                 ),
                 Duration::from_millis(1000),
             );
         }
-
-        // Recognizable title for Alt-Tab and capture pickers — GStreamer's
-        // sink window otherwise carries its generic class name. Cheap and
-        // idempotent; also covers GStreamer re-creating the window mid-session.
-        let title: Vec<u16> = "OpenNOW — Video"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        SetWindowTextW(sink_hwnd, title.as_ptr());
 
         // Strip the caption/frame so the sink is borderless.
         let style = GetWindowLongPtrW(sink_hwnd, GWL_STYLE);
