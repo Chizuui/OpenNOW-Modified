@@ -298,6 +298,7 @@ impl NativeStreamerBackend for GstreamerBackend {
             context.settings.mouse_sensitivity,
             context.settings.mouse_acceleration_percent,
         );
+        crate::gstreamer_input::set_native_mouse_server_resolution(&context.settings.resolution);
         crate::gstreamer_input::set_native_sink_input_capture_enabled(
             context.settings.native_sink_input_capture,
         );

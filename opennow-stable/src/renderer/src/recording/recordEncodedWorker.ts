@@ -78,23 +78,31 @@ interface EncodedCaptureMicPcm {
   capturedAtMs: number;
 }
 
-/** Message delivered to the worker for each RTCRtpScriptTransform attached. */
-interface RtcTransformEventData {
-  type: "rtc-transform-event";
-  transformer: {
-    options?: { kind?: "video" | "audio" };
-    readable: ReadableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
-    writable: WritableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
-  };
+/**
+ * The transformer delivered to the worker for each RTCRtpScriptTransform
+ * attached (video + audio receivers) via the `rtctransform` event.
+ */
+interface RtcTransformer {
+  options?: { kind?: "video" | "audio" };
+  readable: ReadableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
+  writable: WritableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
 }
 
-type WorkerInbound = EncodedCaptureInit | EncodedCaptureStop | EncodedCaptureMicPcm | RtcTransformEventData;
+type WorkerInbound = EncodedCaptureInit | EncodedCaptureStop | EncodedCaptureMicPcm;
 
 // Minimal worker-global typing: the DOM lib's `self` (Window) is a lie inside
 // a dedicated worker, and pulling lib.webworker into this DOM project would
 // collide with the DOM declarations (same pattern as recordCanvasWorker.ts).
 declare const self: {
   onmessage: ((event: MessageEvent<WorkerInbound>) => void) | null;
+  /**
+   * `new RTCRtpScriptTransform(worker, options)` delivers the transformer via
+   * an `rtctransform` EVENT at the worker global scope — it does NOT come
+   * through postMessage/onmessage. Without this handler the attached
+   * transforms never receive a single frame and the recording finalizes as a
+   * header-only (~1 KB) file.
+   */
+  onrtctransform: ((event: { transformer: RtcTransformer }) => void) | null;
   postMessage(message: EncodedWorkerOutboundMessage, transfer?: Transferable[]): void;
 };
 
@@ -475,7 +483,7 @@ function captureAudio(frame: RTCEncodedAudioFrame): void {
 }
 
 async function pump(
-  transformer: RtcTransformEventData["transformer"],
+  transformer: RtcTransformer,
   kind: "video" | "audio",
 ): Promise<void> {
   try {
@@ -531,6 +539,15 @@ async function finalize(): Promise<void> {
   }
 }
 
+// The RTCRtpScriptTransform constructor fires this event at the worker for
+// EACH transform attached (video + audio receivers), carrying the transformer
+// with its readable/writable stream pair + the options passed at construction
+// ({ kind: "video" | "audio" }).
+self.onrtctransform = (event: { transformer: RtcTransformer }): void => {
+  const kind = event.transformer.options?.kind ?? "video";
+  pumpTasks.push(pump(event.transformer, kind));
+};
+
 self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
   const data = event.data;
   if (data.type === "init") {
@@ -541,9 +558,6 @@ self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
     // samples for the next decoded game-audio frame's pull.
     micSync?.push(data.samples.length, data.capturedAtMs);
     micFifo?.push(data.samples);
-  } else if (data.type === "rtc-transform-event") {
-    const kind = data.transformer.options?.kind ?? "video";
-    pumpTasks.push(pump(data.transformer, kind));
   } else if (data.type === "stop") {
     void finalize();
   }

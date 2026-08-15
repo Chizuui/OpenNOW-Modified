@@ -56,6 +56,33 @@ export function mimeTypeForEncodedCapture(codec: EncodedCaptureCodec): string {
 }
 
 /**
+ * Decide whether the encoded recorder can carry the audio track, from the
+ * receiver's negotiated codec list. Returns the opus codec params when audio
+ * can be muxed, else null.
+ *
+ * Two GFN realities are handled:
+ * - the game-audio m-line negotiates RED (redundant encoding) in front of
+ *   opus (`a=rtpmap:63 red/48000/2`, fmtp `111/111`), so codecs[0] is RED,
+ *   not opus — the opus payload is found by scanning the FULL list;
+ * - when RED is negotiated, the receiver-side encoded transform delivers the
+ *   RED-WRAPPED packets (RED unwrapping happens inside the engine's audio
+ *   decoder, after the transform) — muxing those bytes as opus would corrupt
+ *   the track, so the audio track is skipped rather than recorded as garbage.
+ *   The recording stays playable (video-only).
+ */
+export function encodedAudioParamsForCodecs(
+  codecs: Array<{ mimeType?: string | null; channels?: number }>,
+): { codec: { mimeType?: string | null; channels?: number }; channels: number } | null {
+  const opus = codecs.find((codec) => (codec.mimeType ?? "").toLowerCase().includes("opus"));
+  const hasRed = codecs.some((codec) => (codec.mimeType ?? "").toLowerCase().includes("red"));
+  if (!opus || hasRed) return null;
+  return {
+    codec: opus,
+    channels: Math.max(1, Math.min(2, opus.channels ?? 2)),
+  };
+}
+
+/**
  * Convert an RTP timestamp (codec clock ticks) to microseconds for the
  * muxer. Handles the unsigned 32-bit wraparound of the RTP clock via
  * `unwrapRtpTimestamp`.
@@ -738,11 +765,13 @@ export function inspectEncodedCapture(
       ? Math.max(1, Math.round(videoTrackSettings.frameRate))
       : 60;
   const audioReceiver = receivers.find((receiver) => receiver.track?.kind === "audio") ?? null;
-  const audioParams = audioReceiver?.getParameters().codecs[0];
-  const hasAudio =
-    audioReceiver !== null &&
-    audioParams !== undefined &&
-    (audioParams.mimeType ?? "").toLowerCase().includes("opus");
+  const audioParams = encodedAudioParamsForCodecs(
+    (audioReceiver?.getParameters().codecs ?? []).map((codec) => ({
+      mimeType: codec.mimeType,
+      channels: codec.channels,
+    })),
+  );
+  const hasAudio = audioReceiver !== null && audioParams !== null;
   return {
     codec,
     container: containerForCodec(codec),
@@ -751,7 +780,7 @@ export function inspectEncodedCapture(
     height,
     fps,
     hasAudio,
-    audioChannels: Math.max(1, Math.min(2, audioParams?.channels ?? 2)),
+    audioChannels: audioParams?.channels ?? 2,
     audioSampleRate: 48_000,
   };
 }

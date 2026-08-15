@@ -8,6 +8,7 @@ import {
   buildHvcCFromNalus,
   buildOpusHead,
   containerForCodec,
+  encodedAudioParamsForCodecs,
   encodedCodecFromMime,
   extractNalUnits,
   mimeTypeForEncodedCapture,
@@ -305,6 +306,33 @@ test("MicSync anchors on the first frame and drops pre-recording mic", () => {
   assert.equal(sync.samplesForFrame(1_000_000), 0);
   // Next frame, 20 ms later: consume one frame duration × measured rate.
   assert.equal(sync.samplesForFrame(1_020_000), 960);
+});
+
+test("encodedAudioParamsForCodecs finds opus after RED and skips the audio track when RED is negotiated", () => {
+  // GFN game-audio m-line: RED in front of opus (codecs[0] = RED).
+  assert.equal(
+    encodedAudioParamsForCodecs([
+      { mimeType: "audio/red" },
+      { mimeType: "audio/opus", channels: 2 },
+    ]),
+    null,
+  );
+  // Opus-only receiver (no RED): audio is capturable.
+  assert.deepEqual(encodedAudioParamsForCodecs([{ mimeType: "audio/opus", channels: 2 }]), {
+    codec: { mimeType: "audio/opus", channels: 2 },
+    channels: 2,
+  });
+  // Opus hidden after another payload type (non-RED case): still found.
+  assert.deepEqual(
+    encodedAudioParamsForCodecs([
+      { mimeType: "audio/telephone-event" },
+      { mimeType: "audio/opus", channels: 1 },
+    ]),
+    { codec: { mimeType: "audio/opus", channels: 1 }, channels: 1 },
+  );
+  // No opus at all: no audio.
+  assert.equal(encodedAudioParamsForCodecs([{ mimeType: "audio/red" }]), null);
+  assert.equal(encodedAudioParamsForCodecs([]), null);
 });
 
 test("MicSync consumes by RTP duration × measured rate — no drift with an off-nominal mic clock", () => {

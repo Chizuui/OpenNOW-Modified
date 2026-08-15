@@ -2354,6 +2354,57 @@ pub(crate) mod win32_renderer_window {
         }
     }
 
+    /// Server-stream CSS size ÷ the sink window's CSS size (physical rect /
+    /// device-pixel-ratio) — the same normalization the renderer's
+    /// getPointerScale applies to the addon / DOM pointer-lock paths. A mouse
+    /// sweep across the full window must move the game cursor the full server
+    /// width; raw HID counts alone move it faster than the OS cursor on
+    /// displays larger than the stream (a 1080p stream fullscreen on a 1440p
+    /// monitor needs ×0.75, not ×1.0). Falls back to 1.0 when the server
+    /// resolution or the window geometry is unknown yet.
+    fn mouse_display_scale() -> (f64, f64) {
+        let server = crate::gstreamer_input::native_mouse_server_resolution();
+        let css = STACKED_PENDING_SURFACE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|pending| {
+                pending.as_ref().and_then(|surface| {
+                    surface.rect.as_ref().map(|rect| {
+                        let dpr = surface.device_scale_factor.max(0.25);
+                        (rect.width as f64 / dpr, rect.height as f64 / dpr)
+                    })
+                })
+            })
+            .or_else(|| {
+                STACKED_TARGET
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .ok()
+                    .and_then(|target| target.as_ref().and_then(|target| target.last_rect))
+                    .map(|rect| {
+                        (
+                            f64::from(rect.right.saturating_sub(rect.left)),
+                            f64::from(rect.bottom.saturating_sub(rect.top)),
+                        )
+                    })
+            });
+        let Some((server_width, server_height)) = server else {
+            return (1.0, 1.0);
+        };
+        let Some((css_width, css_height)) = css else {
+            return (1.0, 1.0);
+        };
+        if css_width <= 0.0 || css_height <= 0.0 {
+            return (1.0, 1.0);
+        }
+        let clamp = |value: f64| value.clamp(0.25, 4.0);
+        (
+            clamp(f64::from(server_width) / css_width),
+            clamp(f64::from(server_height) / css_height),
+        )
+    }
+
     unsafe fn handle_raw_mouse(raw: &RawMouse) {
         if CAPTURED_HWND
             .get()
@@ -2379,11 +2430,14 @@ pub(crate) mod win32_renderer_window {
         // Apply the configured mouse sensitivity / acceleration in-process (same
         // formula the renderer uses for the addon and DOM pointer-lock paths) so
         // the sink-native capture feels exactly like the mouse settings instead
-        // of raw unscaled HID counts.
+        // of raw unscaled HID counts — plus the server-width ÷ window-width
+        // normalization (getPointerScale parity), so a mouse sweep across the
+        // window moves the game cursor the full server width like the OS cursor.
         let sensitivity = crate::gstreamer_input::native_mouse_sensitivity();
         let acceleration_percent = crate::gstreamer_input::native_mouse_acceleration_percent();
-        let mut dx_f = f64::from(raw.l_last_x) * sensitivity;
-        let mut dy_f = f64::from(raw.l_last_y) * sensitivity;
+        let (scale_x, scale_y) = mouse_display_scale();
+        let mut dx_f = f64::from(raw.l_last_x) * sensitivity * scale_x;
+        let mut dy_f = f64::from(raw.l_last_y) * sensitivity * scale_y;
         if acceleration_percent > 1.0 {
             let speed = (dx_f * dx_f + dy_f * dy_f).sqrt();
             let strength = (acceleration_percent - 1.0) / 149.0;

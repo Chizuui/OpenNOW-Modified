@@ -818,11 +818,30 @@ export class NativeStreamerManager {
     });
 
     child.once("error", (error) => {
+      // A resume/reconnect can spawn a replacement process before this one's
+      // error/exit lands (the old process was killed asynchronously by
+      // stop()). The exit must only ever be attributed to the process that is
+      // still the tracked child — otherwise the stale exit wipes the new
+      // process's manager state and rejects its in-flight offer, which the
+      // coordinator reads as a native failure and falls back to web (the
+      // "resume shows no video" bug).
+      if (this.child !== child) {
+        console.warn(
+          "[NativeStreamer] Ignoring spawn error from a superseded native streamer process.",
+        );
+        return;
+      }
       this.options.emit({ type: "error", message: `Native streamer failed to start: ${formatError(error)}` });
       this.handleProcessExit(`spawn error: ${formatError(error)}`);
     });
 
     child.once("exit", (code, signal) => {
+      if (this.child !== child) {
+        console.warn(
+          "[NativeStreamer] Ignoring exit from a superseded native streamer process.",
+        );
+        return;
+      }
       const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       this.handleProcessExit(reason);
     });
