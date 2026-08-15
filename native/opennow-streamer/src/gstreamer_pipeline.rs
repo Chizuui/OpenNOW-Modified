@@ -56,13 +56,13 @@ use std::thread;
 // total stream latency. A 2 ms buffer would make RTP frame reordering
 // visible as repeated/back-and-forward frames, so a small playout buffer is
 // kept — but it must stay well below the browser client's usual WebRTC
-// buffer. The liveness watchdog sets it to the BASE (~40 ms) on stable
+// buffer. The liveness watchdog sets it to the BASE (~25 ms) on stable
 // links and raises it toward the MAX (~100 ms, the old fixed default) as
 // the measured receive jitter and packet loss climb (see
 // target_webrtc_latency_ms in gstreamer_liveness), so tight links keep
 // near-minimal input latency while degraded links still absorb jitter
 // bursts and NACK retransmissions.
-pub(crate) const WEBRTC_LATENCY_BASE_MS: u32 = 40;
+pub(crate) const WEBRTC_LATENCY_BASE_MS: u32 = 25;
 /// Mid RTP playout latency (~60 ms): the packet-loss floor (≥0.15%) and the
 /// middle of the jitter/RTT ramp.
 pub(crate) const WEBRTC_LATENCY_MID_MS: u32 = 60;
@@ -100,7 +100,7 @@ pub(crate) const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
 /// Shallow floor of the adaptive compressed-frame jitter buffer (~50 ms at
 /// 60 fps). On stable links (RTT ≤ ~30 ms) the buffer rests here, keeping
 /// drag/input feel tight. Combined with the WEBRTC_LATENCY_BASE_MS RTP
-/// playout buffer, a stable session now holds ~90 ms total instead of the
+/// playout buffer, a stable session now holds ~75 ms total instead of the
 /// ~200 ms the old fixed 100+100 ms configuration added.
 pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 3;
 /// Mid depth (~167 ms at 60 fps) used as the packet-loss floor (≥0.1%) and

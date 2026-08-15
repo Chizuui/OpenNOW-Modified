@@ -132,7 +132,7 @@ fn target_pre_decode_depth(
 
 /// Map the network signals to the webrtcbin RTP playout latency in ms (the
 /// runtime value of the `latency` property on `opennow-webrtcbin`). Stable
-/// links rest at BASE (~40 ms) for tight input feel; degraded networks ramp
+/// links rest at BASE (~25 ms) for tight input feel; degraded networks ramp
 /// it up to MAX (~100 ms, the old fixed default) using the SAME signals as
 /// the pre-decode buffer: a burst hold / heavy loss forces the ceiling,
 /// packet loss floors the depth, and the measured receive jitter + RTT EMA
@@ -1238,7 +1238,7 @@ impl VideoLivenessState {
         (p99 > 0).then_some(p99)
     }
 
-    /// Adaptive webrtcbin RTP playout latency: BASE (~40 ms) on stable
+    /// Adaptive webrtcbin RTP playout latency: BASE (~25 ms) on stable
     /// links, raised toward MAX (~100 ms) as the measured receive jitter,
     /// packet loss and RTT spikes climb — the RTP-side twin of
     /// `adjust_pre_decode_queue_for_network` (that one absorbs bursts
@@ -7163,20 +7163,20 @@ mod tests {
         use crate::gstreamer_pipeline::{
             WEBRTC_LATENCY_BASE_MS, WEBRTC_LATENCY_MAX_MS, WEBRTC_LATENCY_MID_MS,
         };
-        // Stable links: BASE (~40 ms), no jitter/loss/RTT, no burst.
+        // Stable links: BASE (~25 ms), no jitter/loss/RTT, no burst.
         assert_eq!(target_webrtc_latency_ms(None, 0, None, false), WEBRTC_LATENCY_BASE_MS);
         assert_eq!(target_webrtc_latency_ms(Some(5), 0, None, false), WEBRTC_LATENCY_BASE_MS);
         assert_eq!(target_webrtc_latency_ms(None, 30, None, false), WEBRTC_LATENCY_BASE_MS);
         // Continuous jitter ramp: 5 ms → BASE, 40 ms → MAX. 20 ms →
-        // 40 + 60*15/35 = 65.
-        assert_eq!(target_webrtc_latency_ms(Some(20), 0, None, false), 65);
+        // 25 + 75*15/35 = 57.
+        assert_eq!(target_webrtc_latency_ms(Some(20), 0, None, false), 57);
         assert_eq!(
             target_webrtc_latency_ms(Some(40), 0, None, false),
             WEBRTC_LATENCY_MAX_MS
         );
         // Continuous RTT ramp: 30 ms → BASE, 150 ms → MAX. 90 ms →
-        // 40 + 60*60/120 = 70.
-        assert_eq!(target_webrtc_latency_ms(None, 90, None, false), 70);
+        // 25 + 75*60/120 = 62.
+        assert_eq!(target_webrtc_latency_ms(None, 90, None, false), 62);
         assert_eq!(
             target_webrtc_latency_ms(None, 150, None, false),
             WEBRTC_LATENCY_MAX_MS

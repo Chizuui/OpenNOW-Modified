@@ -552,6 +552,42 @@ enum EncodedNativeInputBatch {
 }
 
 #[cfg(target_os = "windows")]
+/// Win32 thread-priority helpers for the native input bridge. The mouse 1:1
+/// path drains a delta the instant WM_INPUT arrives; raising the input thread
+/// to TIME_CRITICAL keeps that drain/encode/send from being starved while the
+/// render thread is busy presenting, and timeBeginPeriod(1) tightens the
+/// process timer resolution so scheduling stays at ~1 ms granularity.
+mod win32_priority {
+    use std::ffi::c_void;
+
+    type Hthread = *mut c_void;
+
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> Hthread;
+        fn SetThreadPriority(thread: Hthread, priority: i32) -> i32;
+    }
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+
+    /// Apply high priority + 1 ms timer resolution on the calling thread.
+    pub unsafe fn apply() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        timeBeginPeriod(1);
+    }
+
+    /// Balance the timeBeginPeriod(1) taken in apply().
+    pub unsafe fn clear() {
+        timeEndPeriod(1);
+    }
+}
+
+#[cfg(target_os = "windows")]
 mod win32_xinput {
     use std::ffi::{c_char, c_void};
 
@@ -725,11 +761,32 @@ impl NativeWindowInputBridge {
         let input_thread_state = input_state.clone();
         let input_thread_channels = input_channels.clone();
         let input_thread = thread::spawn(move || {
+            // 1:1 input: this thread must never be starved by render/present
+            // work, and its blocking recv must wake on ~1 ms scheduling. The
+            // RAII guard restores timer resolution on any exit path.
+            #[cfg(target_os = "windows")]
+            struct InputPriorityGuard;
+            #[cfg(target_os = "windows")]
+            impl InputPriorityGuard {
+                unsafe fn arm() -> Self {
+                    win32_priority::apply();
+                    Self
+                }
+            }
+            #[cfg(target_os = "windows")]
+            impl Drop for InputPriorityGuard {
+                fn drop(&mut self) {
+                    unsafe { win32_priority::clear(); }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            let _priority = unsafe { InputPriorityGuard::arm() };
+
             let mut pending_events = Vec::with_capacity(NATIVE_INPUT_DRAIN_MAX_EVENTS);
             send_log(
                 &thread_sender,
                 "info",
-                "Native DX11 window input capture bridge armed.".to_owned(),
+                "Native DX11 window input capture bridge armed (high-priority input thread, 1 ms timer).".to_owned(),
             );
 
             while !thread_stop.load(Ordering::SeqCst) {

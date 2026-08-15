@@ -66,7 +66,6 @@ import type {
 } from "./webrtc/streamDiagnosticsTypes";
 import { CODEC_MIME_BY_NAME, buildCodecPreferenceList } from "./webrtc/codecPreferences";
 import { classifyStreamLagReason, isRttSpike } from "./webrtc/streamLag";
-import { chooseAdaptiveMouseFlushInterval } from "./webrtc/mouseInput";
 import {
   averageJitterBufferDelayMs,
   codecLabelFromMimeType,
@@ -104,10 +103,8 @@ export {
   type ClassifyStreamLagReasonParams,
 } from "./webrtc/streamLag";
 export {
-  chooseAdaptiveMouseFlushInterval,
   quantizeMouseDeltaWithResidual,
   subsampleCoalescedPointerEvents,
-  type AdaptiveMouseFlushDecisionParams,
 } from "./webrtc/mouseInput";
 export {
   evaluateControllerOverlayShortcutGate,
@@ -377,9 +374,8 @@ export class GfnWebRtcClient {
   private queuedCandidates: RTCIceCandidateInit[] = [];
 
   private static readonly NATIVE_INPUT_PROTOCOL_FALLBACK = 3;
-  private static readonly MOUSE_FLUSH_NORMAL_MS = 8;
-  private static readonly MOUSE_FLUSH_MIN_MS = 2;
-  private static readonly MOUSE_FLUSH_MAX_MS = 20;
+  // Renderer mouse coalesce base — 0 ms on raw paths (immediate flush).
+  private static readonly MOUSE_FLUSH_NORMAL_MS = 0;
   // Official GFN value (a=ri.partialReliableThresholdMs). Only used as a
   // fallback when the offer omits the attribute — the negotiated value (16 ms)
   // always wins. maxPacketLifeTime is the retransmission window, not a send
@@ -567,7 +563,6 @@ export class GfnWebRtcClient {
     mouseFlushIntervalMs: GfnWebRtcClient.MOUSE_FLUSH_NORMAL_MS,
     mousePacketsPerSecond: 0,
     mouseResidualMagnitude: 0,
-    mouseAdaptiveFlushActive: false,
     mousePath: "none",
     mouseHopLatencyMs: undefined,
     nativeInputPath: undefined,
@@ -1216,7 +1211,6 @@ export class GfnWebRtcClient {
       mouseFlushIntervalMs: mouseDiagnostics.flushIntervalMs,
       mousePacketsPerSecond: mouseDiagnostics.packetsPerSecond,
       mouseResidualMagnitude: 0,
-      mouseAdaptiveFlushActive: mouseDiagnostics.adaptiveFlushActive,
       mousePath: "none",
       mouseHopLatencyMs: mouseDiagnostics.hopLatencyMs,
       nativeInputPath: undefined,
@@ -1753,35 +1747,15 @@ export class GfnWebRtcClient {
     this.diagnostics.mouseResidualMagnitude = mouseDiagnostics.residualMagnitude;
     this.diagnostics.mouseHopLatencyMs = mouseDiagnostics.hopLatencyMs;
 
-    // Intentional adaptive coalesce: only when mouse moves ride the reliable
-    // channel (PR mouse keeps the fixed 4/8/16 ms official interval). Skip while
-    // pointerrawupdate forced immediate flush (interval 0).
-    if (mouseDiagnostics.flushIntervalMs <= 0 || mouseDiagnostics.flushBaseIntervalMs <= 0) {
-      this.domInputController.setAdaptiveFlushInterval(mouseDiagnostics.flushIntervalMs, false);
-    } else if (this.canSendInputTypePartiallyReliable(INPUT_MOUSE_REL)) {
-      // Official GFN keeps a fixed coalesce interval for PR mouse.
-      this.domInputController.setAdaptiveFlushInterval(
-        mouseDiagnostics.flushBaseIntervalMs,
-        false,
-      );
-      this.diagnostics.mouseFlushIntervalMs = mouseDiagnostics.flushBaseIntervalMs;
-    } else {
-      const nextInterval = chooseAdaptiveMouseFlushInterval({
-        baseIntervalMs: mouseDiagnostics.flushBaseIntervalMs,
-        currentIntervalMs: mouseDiagnostics.flushIntervalMs,
-        reliableBufferedAmount,
-        schedulingDelayMs: this.inputQueueMaxSchedulingDelayMsWindow,
-        canUsePartiallyReliableMouse: false,
-        backpressureThresholdBytes: GfnWebRtcClient.RELIABLE_MOUSE_BACKPRESSURE_BYTES,
-        minIntervalMs: GfnWebRtcClient.MOUSE_FLUSH_MIN_MS,
-        maxIntervalMs: GfnWebRtcClient.MOUSE_FLUSH_MAX_MS,
-      });
-      const adaptive = nextInterval !== mouseDiagnostics.flushBaseIntervalMs;
-      this.domInputController.setAdaptiveFlushInterval(nextInterval, adaptive);
-      this.diagnostics.mouseFlushIntervalMs = nextInterval;
-    }
-    this.diagnostics.mouseAdaptiveFlushActive =
-      this.domInputController.getMouseDiagnostics().adaptiveFlushActive;
+    // Mouse send cadence is pinned to the base interval — 0 ms on the native
+    // addon / pointerrawupdate paths (immediate flush per delta), a fixed
+    // 4-16 ms coalesce on legacy event paths. It is deliberately NEVER
+    // adaptive: growing the coalesce window when the reliable channel backs
+    // up made input latency track the network — the mouse slowed down exactly
+    // when the stream struggled. Deltas are a few dozen bytes; let SCTP
+    // deliver them in order instead of adding latency.
+    this.domInputController.pinFlushIntervalToBase();
+    this.diagnostics.mouseFlushIntervalMs = mouseDiagnostics.flushBaseIntervalMs;
 
     const lagClassification = classifyStreamLagReason({
       nativeInputActive: this.nativeInputActive,
@@ -1938,7 +1912,6 @@ export class GfnWebRtcClient {
     this.diagnostics.partiallyReliableInputQueuePeakBufferedBytes = 0;
     this.diagnostics.inputQueueDropCount = 0;
     this.diagnostics.inputQueueMaxSchedulingDelayMs = 0;
-    this.diagnostics.mouseAdaptiveFlushActive = false;
     this.diagnostics.mousePacketsPerSecond = 0;
     this.diagnostics.mouseResidualMagnitude = 0;
     this.diagnostics.partiallyReliableInputOpen = true;

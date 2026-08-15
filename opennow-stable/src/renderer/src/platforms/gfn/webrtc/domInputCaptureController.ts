@@ -48,7 +48,6 @@ export interface MouseInputDiagnostics {
   flushIntervalMs: number;
   packetsPerSecond: number;
   residualMagnitude: number;
-  adaptiveFlushActive: boolean;
   /** EMA of the renderer-side event→send hop (ms) for addon / pointer-lock paths. */
   hopLatencyMs: number;
 }
@@ -94,7 +93,6 @@ export class DomInputCaptureController {
   private mouseAccelerationPercent = 1;
   private mouseFlushBaseIntervalMs = MOUSE_FLUSH_NORMAL_MS;
   private mouseFlushIntervalMs = MOUSE_FLUSH_NORMAL_MS;
-  private mouseAdaptiveFlushActive = false;
   private mousePacketsSentInWindow = 0;
   private mousePacketsPerSecond = 0;
   private mousePacketRateWindowStartedAtMs = 0;
@@ -201,7 +199,6 @@ export class DomInputCaptureController {
     this.mouseCoalescedBatchEntries = 0;
     this.mouseFlushBaseIntervalMs = MOUSE_FLUSH_NORMAL_MS;
     this.mouseFlushIntervalMs = MOUSE_FLUSH_NORMAL_MS;
-    this.mouseAdaptiveFlushActive = false;
     this.mousePacketsSentInWindow = 0;
     this.mousePacketsPerSecond = 0;
     this.mousePacketRateWindowStartedAtMs = 0;
@@ -214,22 +211,16 @@ export class DomInputCaptureController {
       flushIntervalMs: this.mouseFlushIntervalMs,
       packetsPerSecond: this.mousePacketsPerSecond,
       residualMagnitude: Math.hypot(this.pendingMouseDxFloat, this.pendingMouseDyFloat),
-      adaptiveFlushActive: this.mouseAdaptiveFlushActive,
       hopLatencyMs: Math.round(this.mouseHopLatencyMs * 100) / 100,
     };
   }
 
-  setAdaptiveFlushInterval(intervalMs: number, active: boolean): void {
-    // Native RawInput mouse is a high-rate, low-jitter source — batching it
-    // (adaptive back-off can raise the interval to 8-20ms under reliable
-    // channel pressure) adds nothing but latency. Pin it to immediate flush.
-    if (this.nativeMouseActive) {
-      this.mouseFlushIntervalMs = 0;
-      this.mouseAdaptiveFlushActive = false;
-      return;
-    }
-    this.mouseFlushIntervalMs = intervalMs;
-    this.mouseAdaptiveFlushActive = active;
+  /** Pin the mouse coalesce window to its base interval. Deliberately never
+   *  adaptive: growing the window under reliable-channel pressure made input
+   *  latency track the network — the mouse slowed down exactly when the
+   *  stream struggled. Native RawInput mouse stays at immediate flush (0 ms). */
+  pinFlushIntervalToBase(): void {
+    this.mouseFlushIntervalMs = this.nativeMouseActive ? 0 : this.mouseFlushBaseIntervalMs;
   }
 
   clearSyntheticEscapeSuppression(): void {
@@ -472,7 +463,6 @@ export class DomInputCaptureController {
       // Raw deltas must reach the encoder on the next task turn, never wait on
       // a coalesce window — 1:1 latency like the official GFN app.
       this.mouseFlushIntervalMs = 0;
-      this.mouseAdaptiveFlushActive = false;
     } else {
       this.flushPendingMovement();
     }
@@ -598,7 +588,6 @@ export class DomInputCaptureController {
         ? MOUSE_FLUSH_NORMAL_MS
         : MOUSE_FLUSH_SAFE_MS;
     this.mouseFlushIntervalMs = this.mouseFlushBaseIntervalMs;
-    this.mouseAdaptiveFlushActive = false;
     const mouseInitNow = performance.now();
     this.mouseFlushLastSendMs = mouseInitNow;
     this.mouseCoalescedBatchEntries = 0;

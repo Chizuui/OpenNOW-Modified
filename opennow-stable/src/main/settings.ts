@@ -191,6 +191,15 @@ export class SettingsManager {
         migrated = true;
       }
 
+      // Native streamer raw input is now the default 1:1 input path (it
+      // bypasses the Electron bridge). Flip the old opt-in OFF that may have
+      // been persisted while the feature was experimental — one-time, so users
+      // upgrading get the low-latency path without touching the toggle.
+      if (parsedSettings.nativeSinkInputCapture === false) {
+        merged.nativeSinkInputCapture = true;
+        migrated = true;
+      }
+
       merged.mouseAcceleration = Math.max(1, Math.min(150, Math.round(merged.mouseAcceleration)));
       const recordingBitrateBefore = merged.recordingBitrateMbps;
       merged.recordingBitrateMbps = normalizeRecordingBitrateMbps(merged.recordingBitrateMbps);

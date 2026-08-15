@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import {
   canUsePartiallyReliableGamepad,
   canUsePartiallyReliableInput,
-  chooseAdaptiveMouseFlushInterval,
   classifyDecoderPressureSample,
   classifyStreamLagReason,
   evaluateControllerOverlayShortcutGate,
@@ -208,60 +207,6 @@ test("quantizeMouseDeltaWithResidual preserves precision across sends", () => {
   const c = quantizeMouseDeltaWithResidual(b.residual + 0.2);
   assert.equal(c.send, 0);
   assert.ok(Math.abs(c.residual) < 1e-9);
-});
-
-test("adaptive flush on reliable mouse tightens toward min under low pressure", () => {
-  const interval = chooseAdaptiveMouseFlushInterval({
-    baseIntervalMs: 8,
-    currentIntervalMs: 4,
-    reliableBufferedAmount: 0,
-    schedulingDelayMs: 0,
-    canUsePartiallyReliableMouse: false,
-    backpressureThresholdBytes: 64 * 1024,
-    minIntervalMs: 2,
-    maxIntervalMs: 20,
-  });
-  assert.equal(interval, 3);
-});
-
-test("adaptive flush keeps base interval when partially-reliable mouse is active", () => {
-  const underPressure = chooseAdaptiveMouseFlushInterval({
-    baseIntervalMs: 8,
-    currentIntervalMs: 20,
-    reliableBufferedAmount: 48 * 1024,
-    schedulingDelayMs: 8,
-    canUsePartiallyReliableMouse: true,
-    backpressureThresholdBytes: 64 * 1024,
-    minIntervalMs: 2,
-    maxIntervalMs: 20,
-  });
-  assert.equal(underPressure, 8);
-});
-
-test("adaptive flush tightens under low pressure and relaxes under pressure on reliable mouse", () => {
-  const lowPressure = chooseAdaptiveMouseFlushInterval({
-    baseIntervalMs: 8,
-    currentIntervalMs: 8,
-    reliableBufferedAmount: 1024,
-    schedulingDelayMs: 0.5,
-    canUsePartiallyReliableMouse: false,
-    backpressureThresholdBytes: 64 * 1024,
-    minIntervalMs: 2,
-    maxIntervalMs: 20,
-  });
-  assert.equal(lowPressure, 7);
-
-  const highPressure = chooseAdaptiveMouseFlushInterval({
-    baseIntervalMs: 8,
-    currentIntervalMs: 7,
-    reliableBufferedAmount: 48 * 1024,
-    schedulingDelayMs: 5,
-    canUsePartiallyReliableMouse: false,
-    backpressureThresholdBytes: 64 * 1024,
-    minIntervalMs: 2,
-    maxIntervalMs: 20,
-  });
-  assert.equal(highPressure, 9);
 });
 
 test("subsampleCoalescedPointerEvents limits large coalesced bursts without dropping movement", () => {

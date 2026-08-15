@@ -74,7 +74,6 @@ export interface StreamDiagnostics {
   mouseFlushIntervalMs: number;
   mousePacketsPerSecond: number;
   mouseResidualMagnitude: number;
-  mouseAdaptiveFlushActive: boolean;
   /**
    * Effective mouse input path this session: sink-native (native streamer
    * captures RawInput on the stacked sink window, in-process), addon (native

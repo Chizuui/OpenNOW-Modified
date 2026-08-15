@@ -295,7 +295,11 @@ export function createDefaultSettings(platform: string): Settings {
     enableGyroscopeControls: false,
     steamControllerCompatibilityMode: false,
     nativeCursorOverlay: true,
-    nativeSinkInputCapture: false,
+    // Default ON: sink-native RawInput (WM_INPUT on the video sink window)
+    // bypasses the Electron renderer bridge entirely — mouse deltas travel
+    // sink wndproc → input thread → data channel with no renderer hops, which
+    // is what makes input feel 1:1 in the native streamer.
+    nativeSinkInputCapture: true,
     mouseSensitivity: 1,
     mouseAcceleration: 1,
     ...shortcuts.bindings,
