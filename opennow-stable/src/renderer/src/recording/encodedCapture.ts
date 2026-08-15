@@ -112,12 +112,85 @@ export interface NalUnit {
   payload: Uint8Array;
 }
 
+export type NalFormat = "annexb" | "length-prefixed-4" | "length-prefixed-2" | "raw-single" | "unknown";
+
 /**
- * Split an Annex-B bitstream (3- or 4-byte start codes) into NAL payloads.
+ * Detect how NAL units are framed inside a receiver-transform frame. The
+ * W3C encoded-transform spec says receiver H.264/H.265 frames are Annex-B
+ * (start codes), but Chromium builds have delivered both that and
+ * length-prefixed samples (AVCC-style, the shape most encoders emit), and a
+ * low-latency single-slice frame can arrive as one raw NAL with no framing
+ * at all. Auto-detecting keeps the recorder working regardless of which
+ * shape the runtime actually sends.
+ */
+export function detectNalFormat(data: Uint8Array): NalFormat {
+  // Annex-B start codes sit at the very beginning of the frame; a valid
+  // Annex-B buffer always carries one within the first few NAL headers.
+  const scanEnd = Math.min(data.length, 64);
+  for (let i = 0; i + 2 < data.length && i < scanEnd; i += 1) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) return "annexb";
+    if (
+      i + 3 < data.length &&
+      data[i] === 0 &&
+      data[i + 1] === 0 &&
+      data[i + 2] === 0 &&
+      data[i + 3] === 1
+    ) {
+      return "annexb";
+    }
+  }
+  // Length-prefixed: walk up to 8 NALs, each bounded by its big-endian size
+  // (4-byte AVCC first, then the 2-byte variant some RTP payload forms use).
+  for (const lengthSize of [4, 2] as const) {
+    let offset = 0;
+    let valid = true;
+    let nals = 0;
+    while (offset < data.length && nals < 8) {
+      if (offset + lengthSize > data.length) {
+        valid = false;
+        break;
+      }
+      let len = 0;
+      for (let b = 0; b < lengthSize; b += 1) len = (len << 8) | data[offset + b];
+      if (len === 0 || offset + lengthSize + len > data.length) {
+        valid = false;
+        break;
+      }
+      offset += lengthSize + len;
+      nals += 1;
+    }
+    if (valid && offset === data.length) {
+      return lengthSize === 4 ? "length-prefixed-4" : "length-prefixed-2";
+    }
+  }
+  return "unknown";
+}
+
+/**
+ * Split a codec frame into NAL payloads, accepting any framing the runtime
+ * may deliver: Annex-B (3/4-byte start codes), length-prefixed (2/4-byte
+ * big-endian sizes — AVCC style), or a single raw NAL with no framing.
  * NAL payloads keep emulation-prevention bytes intact, exactly as decoders
  * and codec-configuration records expect them.
  */
 export function extractNalUnits(data: Uint8Array): NalUnit[] {
+  const format = detectNalFormat(data);
+  if (format === "length-prefixed-4" || format === "length-prefixed-2") {
+    const lengthSize = format === "length-prefixed-4" ? 4 : 2;
+    const nals: NalUnit[] = [];
+    let offset = 0;
+    while (offset + lengthSize <= data.length) {
+      let len = 0;
+      for (let b = 0; b < lengthSize; b += 1) len = (len << 8) | data[offset + b];
+      if (len === 0 || offset + lengthSize + len > data.length) break;
+      if (len > 0) nals.push({ payload: data.slice(offset + lengthSize, offset + lengthSize + len) });
+      offset += lengthSize + len;
+    }
+    return nals;
+  }
+  // Annex-B (or a raw single NAL — the Annex-B scan below degrades to the
+  // whole buffer when no start code exists, which is exactly the single-raw-
+  // NAL shape).
   const nals: NalUnit[] = [];
   let i = 0;
   while (i + 2 < data.length) {
@@ -152,7 +225,49 @@ export function extractNalUnits(data: Uint8Array): NalUnit[] {
     if (end > start) nals.push({ payload: data.slice(start, end) });
     i = end;
   }
+  if (nals.length === 0 && data.length > 0) {
+    // No start codes at all: treat the frame as one raw NAL (the shape of a
+    // low-latency single-slice frame without any framing).
+    nals.push({ payload: data.slice() });
+  }
   return nals;
+}
+
+/** H.264 NAL type helpers (5-bit type in the low bits of the header byte). */
+export function h264NalType(payload: Uint8Array): number {
+  return payload.length > 0 ? payload[0] & 0x1f : -1;
+}
+
+/** H.265 NAL type helpers (6-bit type: header >> 1 & 0x3f). */
+export function h265NalType(payload: Uint8Array): number {
+  return payload.length > 0 ? (payload[0] >> 1) & 0x3f : -1;
+}
+
+/** True when the NAL list carries the H.264 SPS+PPS the avcC record needs. */
+export function hasH264ParameterSets(nals: NalUnit[]): boolean {
+  return nals.some((nal) => h264NalType(nal.payload) === 7) && nals.some((nal) => h264NalType(nal.payload) === 8);
+}
+
+/** True when the NAL list carries the H.265 VPS+SPS+PPS the hvcC needs. */
+export function hasH265ParameterSets(nals: NalUnit[]): boolean {
+  return (
+    nals.some((nal) => h265NalType(nal.payload) === 32) &&
+    nals.some((nal) => h265NalType(nal.payload) === 33) &&
+    nals.some((nal) => h265NalType(nal.payload) === 34)
+  );
+}
+
+/** True when the NAL list contains H.265 IDR/CRA (an intra-coded keyframe). */
+export function hasH265KeyframeNal(nals: NalUnit[]): boolean {
+  return nals.some((nal) => {
+    const type = h265NalType(nal.payload);
+    return type === 19 || type === 20 || type === 21; // IDR_W_RADL, IDR_N_LP, CRA
+  });
+}
+
+/** True when the frame data carries an AV1 sequence-header OBU (keyframe). */
+export function hasAv1SequenceHeader(data: Uint8Array): boolean {
+  return extractAv1SequenceHeader(data) !== null;
 }
 
 /**

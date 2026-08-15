@@ -5917,7 +5917,18 @@ fn configure_rtp_video_chain_element(
             }
         }
         RtpVideoChainRole::Depayloader => {
-            set_property_if_supported(element, "request-keyframe", true);
+            // No in-pipeline keyframe requests: the stock rtph26xdepay pushes
+            // UpstreamForceKeyUnit on every detected sequence gap, which the
+            // rtpbin session turns into RTCP FIRs. On a lossy session start
+            // (sparse first sequence numbers) the gaps never stop, so the
+            // client FIR-storms the server — the field spiral: FIR=429 +
+            // decoded=0 across every decoder + the server never delivers a
+            // decodable stream. That is exactly why gfn_av1_depay's design
+            // never pushes UpstreamForceKeyUnit. The liveness watchdog still
+            // requests keyframes over signaling/RTCP at a rate-limited
+            // cadence, so startup recovery is unaffected; only the depay's
+            // per-gap spam is removed.
+            set_property_if_supported(element, "request-keyframe", false);
             // Hard-waiting after packet loss can freeze the visible frame while RTP is still flowing.
             set_property_if_supported(element, "wait-for-keyframe", false);
         }

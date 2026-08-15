@@ -364,6 +364,11 @@ export function useStreamRecorder({
         } else if (message.type === "done") {
           encodedDoneRef.current?.resolve();
           encodedDoneRef.current = null;
+        } else if (message.type === "diag") {
+          // One-shot worker diagnostics (first frame bytes/format, config
+          // build result) — surface them so a header-only recording pins the
+          // failing stage straight from the exported log.
+          console.info(`[StreamView] ${message.message}`);
         } else if (message.type === "error") {
           const error = new Error(message.message);
           encodedReadyRef.current?.reject(error);

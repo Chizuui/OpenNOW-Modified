@@ -8,9 +8,14 @@ import {
   buildHvcCFromNalus,
   buildOpusHead,
   containerForCodec,
+  detectNalFormat,
   encodedAudioParamsForCodecs,
   encodedCodecFromMime,
   extractNalUnits,
+  hasAv1SequenceHeader,
+  hasH264ParameterSets,
+  hasH265KeyframeNal,
+  hasH265ParameterSets,
   mimeTypeForEncodedCapture,
   mixGameAudioWithMic,
   parseAv1SequenceHeader,
@@ -92,6 +97,59 @@ test("avcC is built from keyframe SPS/PPS (profile/level copied from SPS)", () =
   assert.deepEqual([...config!.subarray(ppsStart)], [...pps]);
   // No SPS/PPS → no config.
   assert.equal(buildAvcCFromNalus(extractNalUnits(annexB(new Uint8Array(0), new Uint8Array([0x65, 0x01])))), null);
+});
+
+test("length-prefixed (AVCC-style) frames are split by 4-byte sizes", () => {
+  const sps = h264Sps();
+  const pps = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+  const slice = new Uint8Array([0x65, 0x88, 0x84, 0x01]);
+  // Same NALs as the Annex-B test, but AVCC-framed (4-byte big-endian sizes).
+  const framed = new Uint8Array([
+    ...new Uint8Array([0, 0, 0, sps.length]),
+    ...sps,
+    ...new Uint8Array([0, 0, 0, pps.length]),
+    ...pps,
+    ...new Uint8Array([0, 0, 0, slice.length]),
+    ...slice,
+  ]);
+  assert.equal(detectNalFormat(framed), "length-prefixed-4");
+  const nals = extractNalUnits(framed);
+  assert.equal(nals.length, 3);
+  assert.deepEqual([...nals[0].payload], [...sps]);
+  assert.deepEqual([...nals[1].payload], [...pps]);
+  assert.deepEqual([...nals[2].payload], [...slice]);
+  // The SPS/PPS are recognized as parameter sets even when not Annex-B, so
+  // the avcC record builds from a length-prefixed keyframe.
+  assert.equal(hasH264ParameterSets(nals), true);
+  assert.ok(buildAvcCFromNalus(nals), "avcC from length-prefixed keyframe");
+});
+
+test("unframed raw NAL frames degrade to a single NAL instead of dropping", () => {
+  const slice = new Uint8Array([0x65, 0x88, 0x84, 0x01]);
+  assert.equal(detectNalFormat(slice), "unknown");
+  const nals = extractNalUnits(slice);
+  assert.equal(nals.length, 1);
+  assert.deepEqual([...nals[0].payload], [...slice]);
+});
+
+test("H.265 keyframe helpers identify parameter sets and IDR/CRA NALs", () => {
+  const vps = new Uint8Array([0x40, 0x01]);
+  const sps = new Uint8Array([0x42, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  const pps = new Uint8Array([0x44, 0x01, 0xc1]);
+  const idr = new Uint8Array([0x26, 0x01, 0xaf]); // type 19 (IDR_W_RADL)
+  const trail = new Uint8Array([0x02, 0x01, 0x65]); // type 1 (TRAIL_R)
+  assert.equal(hasH265ParameterSets(extractNalUnits(annexB(new Uint8Array(0), vps, sps, pps))), true);
+  assert.equal(hasH265ParameterSets(extractNalUnits(annexB(new Uint8Array(0), sps, pps))), false);
+  assert.equal(hasH265KeyframeNal(extractNalUnits(annexB(new Uint8Array(0), idr))), true);
+  assert.equal(hasH265KeyframeNal(extractNalUnits(annexB(new Uint8Array(0), trail))), false);
+});
+
+test("AV1 sequence-header presence is detected from raw OBU bytes", () => {
+  // A valid keyframe OBU stream: sequence header (type 1) OBU first.
+  const obuStream = wrapAv1SequenceHeader(buildAv1SeqHeader());
+  assert.equal(hasAv1SequenceHeader(obuStream), true);
+  // A frame-only stream (no sequence header) is not a config-bearing keyframe.
+  assert.equal(hasAv1SequenceHeader(new Uint8Array([0x34, 0x12, 0x34, 0x56])), false);
 });
 
 test("hvcC is built from keyframe VPS/SPS/PPS with profile_tier_level from SPS", () => {

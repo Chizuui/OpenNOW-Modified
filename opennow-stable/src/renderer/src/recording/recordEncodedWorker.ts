@@ -23,7 +23,13 @@ import {
   buildAvcCFromNalus,
   buildHvcCFromNalus,
   buildOpusHead,
+  detectNalFormat,
   extractNalUnits,
+  hasAv1SequenceHeader,
+  hasH264ParameterSets,
+  hasH265KeyframeNal,
+  hasH265ParameterSets,
+  h264NalType,
   mixGameAudioWithMic,
   patchAv1CInMp4,
   rtpTimestampToMicroseconds,
@@ -35,12 +41,14 @@ import {
   VIDEO_RTP_CLOCK,
   type EncodedCaptureCodec,
   type EncodedCaptureContainer,
+  type NalUnit,
 } from "./encodedCapture";
 
 export type EncodedWorkerOutboundMessage =
   | { type: "ready" }
   | { type: "chunk"; data: ArrayBuffer }
   | { type: "done" }
+  | { type: "diag"; message: string }
   | { type: "error"; message: string };
 
 interface EncodedCaptureInit {
@@ -164,6 +172,13 @@ let lastAudioRtp: number | null = null;
 let lastVideoTsUs: number | null = null;
 let lastAudioTsUs: number | null = null;
 let finalized = false;
+// One-shot diagnostics (bounded, so a session never floods the log): the
+// first video/audio frame (format + first bytes) and config events. They
+// pin down which stage a header-only recording fails at (no frame, no
+// keyframe, or unparseable NALs) from the exported log alone.
+let diagVideoSent = false;
+let diagAudioSent = false;
+let diagKeyNoParamsSent = false;
 const pumpTasks: Promise<void>[] = [];
 // Mic mixing (GFN parity: mic is mixed into the audio track, video untouched).
 let micMixActive = false;
@@ -177,6 +192,14 @@ let mixEncoder: AudioEncoder | null = null;
 
 function post(message: EncodedWorkerOutboundMessage): void {
   self.postMessage(message);
+}
+
+function postDiag(message: string): void {
+  post({ type: "diag", message });
+}
+
+function hexOf(data: Uint8Array, max = 8): string {
+  return Array.from(data.slice(0, max), (byte) => byte.toString(16).padStart(2, "0")).join(" ");
 }
 
 function postError(message: string): void {
@@ -400,15 +423,57 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
   lastVideoTsUs = tsUs;
   const raw = new Uint8Array(frame.data.byteLength);
   raw.set(new Uint8Array(frame.data));
-  const type: "key" | "delta" = frame.type === "key" ? "key" : "delta";
+  const frameType: "key" | "delta" = frame.type === "key" ? "key" : "delta";
+  // Keyframe detection is CONTENT-driven, not frame.type: Chromium has
+  // shipped builds where the receiver-side frame.type is always "delta"
+  // (the type is only reliably set on the sender path), which silently
+  // dropped every keyframe and left the recording header-only. Parameter
+  // sets (VPS/SPS/PPS, SPS/PPS) and the AV1 sequence header only ever
+  // appear in keyframes, so their presence IS the keyframe test — and it is
+  // exactly the content the config record is built from.
+  let contentKey = false;
+  let nals: NalUnit[] | null = null;
+  let nalFormat = "";
+  if (config.codec === "avc" || config.codec === "hevc") {
+    nals = extractNalUnits(raw);
+    nalFormat = detectNalFormat(raw);
+    contentKey =
+      config.codec === "avc"
+        ? hasH264ParameterSets(nals) || nals.some((nal) => h264NalType(nal.payload) === 5)
+        : hasH265ParameterSets(nals) || hasH265KeyframeNal(nals);
+  } else if (config.codec === "av1") {
+    contentKey = hasAv1SequenceHeader(raw);
+  }
+  const type: "key" | "delta" = frameType === "key" || contentKey ? "key" : "delta";
+  if (!diagVideoSent) {
+    diagVideoSent = true;
+    postDiag(
+      `encoded video: first frame len=${raw.length} frame.type=${frameType} contentKey=${contentKey}` +
+        (config.codec === "avc" || config.codec === "hevc"
+          ? ` nals=${nals?.length ?? 0} fmt=${nalFormat} first=[${hexOf(raw)}]`
+          : ` seqHdr=${contentKey} first=[${hexOf(raw)}]`),
+    );
+  }
   if (!videoConfigReady) {
     // Codec config (avcC/hvcC/av1C) lives in the first keyframe's parameter
-    // sets / sequence header; skip until it arrives.
-    if (type !== "key") return;
+    // sets / sequence header; skip until it arrives. Delta frames before it
+    // carry no parameter sets and cannot seed the config record.
+    if (!contentKey) {
+      // A frame Chromium labelled key but which carried no parameter sets
+      // (encoder skipped them mid-stream) is logged once so a recording that
+      // stays header-only is diagnosable from the export.
+      if (frameType === "key" && !diagKeyNoParamsSent) {
+        diagKeyNoParamsSent = true;
+        postDiag(
+          `encoded video: key frame without parameter sets — waiting for the next keyframe (${config.codec})`,
+        );
+      }
+      return;
+    }
     let description: Uint8Array | null = null;
     let codecString = "";
     if (config.codec === "avc" || config.codec === "hevc") {
-      const nalus = extractNalUnits(raw);
+      const nalus = nals ?? extractNalUnits(raw);
       description =
         config.codec === "avc" ? buildAvcCFromNalus(nalus) : buildHvcCFromNalus(nalus);
       codecString = config.codec === "avc" ? "avc1.42001f" : "hvc1.1.6.L93.B0";
@@ -418,6 +483,9 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
     }
     if (!description) return;
     videoConfigReady = true;
+    postDiag(
+      `encoded video: config ready codec=${config.codec} nals=${nals?.length ?? 0} fmt=${nalFormat} len=${raw.length}`,
+    );
     if (config.codec === "av1") {
       // Remember the record for the emitted-stream patch; AV1 samples are
       // passed through unchanged (low-overhead OBU stream, already the
@@ -450,6 +518,12 @@ function convertSample(raw: Uint8Array): Uint8Array {
 
 function captureAudio(frame: RTCEncodedAudioFrame): void {
   if (!config || !handle || !config.hasAudio || finalized) return;
+  if (!diagAudioSent) {
+    diagAudioSent = true;
+    const bytes = new Uint8Array(frame.data.byteLength);
+    bytes.set(new Uint8Array(frame.data));
+    postDiag(`encoded audio: first frame len=${bytes.length} first=[${hexOf(bytes)}]`);
+  }
   const metadata = frame.getMetadata();
   // Audio metadata has only rtpTimestamp in the DOM lib; some runtimes also
   // expose a legacy `timestamp` alias — accept both.
