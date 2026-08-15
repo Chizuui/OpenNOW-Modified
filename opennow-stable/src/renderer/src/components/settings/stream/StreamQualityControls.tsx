@@ -563,6 +563,22 @@ export function StreamQualityControls({
           {t("settings.video.recordingBitrateHint")}
         </span>
       </div>
+
+      <div className="settings-row">
+        <div className="settings-row-top">
+          <label className="settings-label">{t("settings.video.recordingMixMic")}</label>
+          <label className="settings-toggle">
+            <input
+              id="settings-stream-recording-mix-mic"
+              type="checkbox"
+              checked={settings.recordingMixMic}
+              onChange={(e) => handleChange("recordingMixMic", e.target.checked)}
+            />
+            <span className="settings-toggle-track" />
+          </label>
+        </div>
+        <span className="settings-subtle-hint">{t("settings.video.recordingMixMicHint")}</span>
+      </div>
         </>
       )}
 

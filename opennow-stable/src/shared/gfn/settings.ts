@@ -63,6 +63,13 @@ export interface Settings {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  /**
+   * Mix the live microphone into encoded-bitstream recordings (the GFN
+   * parity recorder). The mic is captured as raw PCM and mixed into the
+   * recording's audio track inside the worker — only the audio track is
+   * re-encoded; the video bitstream stays untouched. Requires an active mic.
+   */
+  recordingMixMic: boolean;
   streamClientMode: StreamClientMode;
   nativeStreamerBackend: NativeStreamerBackendPreference;
   nativeVideoBackend: NativeVideoBackendPreference;
@@ -264,6 +271,7 @@ export function createDefaultSettings(platform: string): Settings {
     // resolution/FPS explicitly (settings or in-game Media tab) at their own cost.
     recordingResolution: "720p",
     recordingFps: 30,
+    recordingMixMic: false,
     streamClientMode: "web",
     nativeStreamerBackend: "gstreamer",
     nativeVideoBackend: "auto",

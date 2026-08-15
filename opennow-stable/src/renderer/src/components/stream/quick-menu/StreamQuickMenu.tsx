@@ -64,12 +64,14 @@ interface StreamQuickMenuProps {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  recordingMixMic: boolean;
   nativeRecording: boolean;
   /** Shown after a recording that dropped frames (encoder/queue could not keep up). */
   recordingDropNotice: string | null;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
+  onRecordingMixMicChange: (value: boolean) => void;
   maxBitrateMbps: number;
   onMaxBitrateMbpsChange: (value: number) => void;
 }
@@ -119,11 +121,13 @@ export function StreamQuickMenu({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  recordingMixMic,
   nativeRecording,
   recordingDropNotice,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
+  onRecordingMixMicChange,
   maxBitrateMbps,
   onMaxBitrateMbpsChange,
 }: StreamQuickMenuProps): JSX.Element {
@@ -309,14 +313,17 @@ export function StreamQuickMenu({
                 recordingError={streamRecorder.recordingError}
                 recordingApiAvailable={streamRecorder.recordingApiAvailable}
                 usedMimeType={streamRecorder.usedMimeType}
+                usedStrategy={streamRecorder.usedStrategy}
                 recordingBitrateMbps={recordingBitrateMbps}
                 recordingResolution={recordingResolution}
                 recordingFps={recordingFps}
+                recordingMixMic={recordingMixMic}
                 nativeRecording={nativeRecording}
                 recordingDropNotice={recordingDropNotice}
                 onRecordingResolutionChange={onRecordingResolutionChange}
                 onRecordingFpsChange={onRecordingFpsChange}
                 onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
+                onRecordingMixMicChange={onRecordingMixMicChange}
                 recCarouselRef={streamRecorder.recCarouselRef}
                 onToggleRecording={() => { void streamRecorder.toggleRecording(); }}
                 onDeleteRecording={(id) => { void streamRecorder.deleteRecording(id); }}

@@ -81,9 +81,11 @@ interface StreamViewProps {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  recordingMixMic: boolean;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
+  onRecordingMixMicChange: (value: boolean) => void;
   platformStore?: string;
   onToggleFullscreen: () => void;
   onConfirmExit: () => void;
@@ -145,9 +147,11 @@ export function StreamView({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  recordingMixMic,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
+  onRecordingMixMicChange,
   platformStore,
   onToggleFullscreen,
   onConfirmExit,
@@ -378,6 +382,7 @@ export function StreamView({
     recordingBitrateMbps,
     recordingResolution,
     recordingFps,
+    mixMic: recordingMixMic,
   });
   const releasePointerLockForMenu = useCallback(() => {
     if (document.pointerLockElement) {
@@ -855,11 +860,13 @@ export function StreamView({
         recordingBitrateMbps={recordingBitrateMbps}
         recordingResolution={recordingResolution}
         recordingFps={recordingFps}
+        recordingMixMic={recordingMixMic}
         nativeRecording={nativeRendererActive}
         recordingDropNotice={streamRecorder.recordingDropNotice}
         onRecordingResolutionChange={onRecordingResolutionChange}
         onRecordingFpsChange={onRecordingFpsChange}
         onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
+        onRecordingMixMicChange={onRecordingMixMicChange}
       />
 
       {/* Gradient background when no video */}

@@ -5,26 +5,21 @@ import {
   clampRecordingBitrate,
   computeRecordingFrameShortfall,
   fitThumbnailSize,
+  resolveRecordCap,
   selectRecordingStrategy,
+  type RecordingStrategy,
 } from "../components/stream/streamRuntimeHelpers";
+import { inspectEncodedCapture, type EncodedCaptureInfo } from "../recording/encodedCapture";
 import type { RecordCanvasWorkerOutboundMessage } from "../recording/recordCanvasWorker";
+import type { EncodedWorkerOutboundMessage } from "../recording/recordEncodedWorker";
+import { getActiveWebRtcPeerConnection } from "../platforms/gfn/webrtcClient";
 
 // Web recording uses one of two strategies (see selectRecordingStrategy):
-// "raw-track" hands MediaRecorder the incoming WebRTC track directly (hardware
-// AVC encoder off the decode pipeline — the GFN-native model, ~zero main-thread
-// cost), or "canvas-downscale" bounds the encode cost when only software codecs
-// exist (720p30 by default; cap resolution/FPS are user-selectable via
-// recordingResolution / recordingFps settings).
-const DEFAULT_RECORD_CAP_WIDTH = 1280;
-const DEFAULT_RECORD_CAP_HEIGHT = 720;
-const DEFAULT_RECORD_CAP_FPS = 30;
-
-const RECORD_CAP_BY_RESOLUTION: Record<string, { width: number; height: number }> = {
-  "1440p": { width: 2560, height: 1440 },
-  "1080p": { width: 1920, height: 1080 },
-  "720p": { width: 1280, height: 720 },
-};
-
+// "raw-track" hands MediaRecorder the incoming WebRTC track directly (no
+// canvas/draw loop) and is only taken when the stream already fits the user's
+// recording cap AND a hardware AVC encoder is available; "canvas-downscale"
+// bounds the encode cost to the cap (720p30 by default; resolution/FPS are
+// user-selectable via recordingResolution / recordingFps settings).
 // Resolver that extracts the video track a MediaStreamTrackGenerator exposes
 // for MediaRecorder, regardless of which API shape the runtime ships.
 type GeneratorTrackResolver = (generator: MediaStreamTrackGenerator) => MediaStreamTrack | null;
@@ -104,6 +99,13 @@ interface UseStreamRecorderOptions {
    * chunks are streamed to the main process instead of MediaRecorder.
    */
   nativeRecordingEnabled: boolean;
+  /**
+   * Mix the live microphone into encoded-bitstream recordings. The mic is
+   * captured as raw PCM and mixed into the recording's audio track inside the
+   * worker — only the audio is re-encoded; the video bitstream stays
+   * untouched. Requires an active mic (micTrack live).
+   */
+  mixMic: boolean;
 }
 
 export function useStreamRecorder({
@@ -115,6 +117,7 @@ export function useStreamRecorder({
   recordingResolution,
   recordingFps,
   nativeRecordingEnabled,
+  mixMic,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -126,6 +129,7 @@ export function useStreamRecorder({
   // start — so a choppy recording is explained, not a mystery.
   const [recordingDropNotice, setRecordingDropNotice] = useState<string | null>(null);
   const [usedMimeType, setUsedMimeType] = useState<string | null>(null);
+  const [usedStrategy, setUsedStrategy] = useState<RecordingStrategy | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartTimeRef = useRef(0);
@@ -155,6 +159,21 @@ export function useStreamRecorder({
   // chunk). The chain never rejects (each link catches), so awaiting it is
   // always safe.
   const chunkSendChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Receiver-side encoded capture (GFN parity: the stream's encoded bitstream
+  // is captured pre-decode and muxed in a worker — zero re-encode, so the
+  // recording never competes with the decoder). Non-null while active.
+  const encodedWorkerRef = useRef<Worker | null>(null);
+  const encodedReceiversRef = useRef<{ video: RTCRtpReceiver; audio: RTCRtpReceiver | null } | null>(null);
+  const encodedReadyRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
+  const encodedDoneRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
+  // Live mic PCM capture for the encoded recording's mic mix (GFN parity).
+  // The mic track itself is owned by the app (clientRef.getMicTrack()) — we
+  // only tap it, never stop it.
+  const micCaptureRef = useRef<{
+    context: AudioContext;
+    source: MediaStreamAudioSourceNode;
+    processor: ScriptProcessorNode;
+  } | null>(null);
 
   // Stops the recording's video feed: the generator track (which ends the
   // MediaRecorder's video), the writer (which closes the frame input), and
@@ -222,6 +241,262 @@ export function useStreamRecorder({
     strip.scrollBy({ left: direction === "left" ? -200 : 200, behavior: "smooth" });
   }, []);
 
+  const stopEncodedMicCapture = useCallback((): void => {
+    const capture = micCaptureRef.current;
+    micCaptureRef.current = null;
+    if (!capture) return;
+    try {
+      capture.processor.onaudioprocess = null;
+      capture.processor.disconnect();
+      capture.source.disconnect();
+      void capture.context.close();
+    } catch (error) {
+      console.warn("[StreamView] Failed to stop mic capture:", error);
+    }
+  }, []);
+
+  // Taps the app's live mic track and streams mono 48 kHz PCM to the encoded
+  // worker. Returns false when no usable mic is available (recording proceeds
+  // without the mic, surfaced via a warning).
+  const startEncodedMicCapture = useCallback(
+    (worker: Worker): boolean => {
+      const track = micTrack;
+      if (!track || track.readyState !== "live") {
+        console.warn("[StreamView] Mic mix requested but no live mic available — recording without mic.");
+        return false;
+      }
+      try {
+        const context = new AudioContext({ sampleRate: 48_000 });
+        const source = context.createMediaStreamSource(new MediaStream([track]));
+        // ScriptProcessorNode: deprecated but universal in Chromium and needs
+        // no worklet module to bundle. One mono channel in → one mono out;
+        // the worker re-encodes the mixed track itself.
+        const processor = context.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (event) => {
+          const input = event.inputBuffer.getChannelData(0);
+          const samples = new Float32Array(input.length);
+          samples.set(input);
+          worker.postMessage({ type: "mic-pcm", samples }, [samples.buffer]);
+        };
+        // Keep the graph pulled without routing the mic to the speakers.
+        const mute = context.createGain();
+        mute.gain.value = 0;
+        source.connect(processor);
+        processor.connect(mute);
+        mute.connect(context.destination);
+        micCaptureRef.current = { context, source, processor };
+        console.info("[StreamView] Mic mix active — recording will mix the microphone into the audio track.");
+        return true;
+      } catch (error) {
+        console.warn("[StreamView] Mic capture failed — recording without mic mix.", error);
+        micCaptureRef.current = null;
+        return false;
+      }
+    },
+    [micTrack],
+  );
+
+  const startEncodedRecording = useCallback(
+    async (info: EncodedCaptureInfo, mimeType: string): Promise<void> => {
+      setRecordingError(null);
+      setRecordingDropNotice(null);
+      const pc = getActiveWebRtcPeerConnection();
+      if (!pc) {
+        setRecordingError("Could not start recording.");
+        return;
+      }
+      const videoReceiver = pc.getReceivers().find((receiver) => receiver.track?.kind === "video") ?? null;
+      const audioReceiver = pc.getReceivers().find((receiver) => receiver.track?.kind === "audio") ?? null;
+      if (!videoReceiver) {
+        setRecordingError("Could not start recording.");
+        return;
+      }
+      let recordingId: string;
+      try {
+        const result = await window.openNow.beginRecording({ mimeType });
+        recordingId = result.recordingId;
+      } catch (error) {
+        console.error("[StreamView] Failed to begin encoded recording:", error);
+        const detail = error instanceof Error && error.message ? error.message : "";
+        setRecordingError(detail ? `Could not start recording: ${detail}` : "Could not start recording.");
+        return;
+      }
+      recordingIdRef.current = recordingId;
+      thumbnailDataUrlRef.current = null;
+      recordFallbackCanvasRef.current = null;
+      recordingStartTimeRef.current = Date.now();
+      setRecordingDurationMs(0);
+      const worker = new Worker(
+        new URL("../recording/recordEncodedWorker.ts", import.meta.url),
+        { type: "module" },
+      );
+      encodedWorkerRef.current = worker;
+      encodedReceiversRef.current = { video: videoReceiver, audio: audioReceiver };
+      worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
+        const message = event.data;
+        if (message.type === "chunk") {
+          const id = recordingIdRef.current;
+          if (!id) return;
+          chunkSendChainRef.current = chunkSendChainRef.current
+            .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
+            .catch((error: unknown) => {
+              console.error("[StreamView] Failed to send encoded recording chunk:", error);
+            });
+        } else if (message.type === "ready") {
+          encodedReadyRef.current?.resolve();
+          encodedReadyRef.current = null;
+        } else if (message.type === "done") {
+          encodedDoneRef.current?.resolve();
+          encodedDoneRef.current = null;
+        } else if (message.type === "error") {
+          const error = new Error(message.message);
+          encodedReadyRef.current?.reject(error);
+          encodedReadyRef.current = null;
+          encodedDoneRef.current?.reject(error);
+          encodedDoneRef.current = null;
+          console.error("[StreamView] Encoded recording worker error:", message.message);
+        }
+      };
+      worker.onerror = (event) => {
+        const error = new Error(event.message || "Recording worker crashed");
+        encodedReadyRef.current?.reject(error);
+        encodedReadyRef.current = null;
+        encodedDoneRef.current?.reject(error);
+        encodedDoneRef.current = null;
+        console.error("[StreamView] Encoded recording worker crashed:", event);
+      };
+      try {
+        // Init first; the worker acks 'ready' once the muxer exists, only then
+        // do we attach the transforms — no frame can arrive before the muxer.
+        worker.postMessage({
+          type: "init",
+          codec: info.codec,
+          container: info.container,
+          width: info.width,
+          height: info.height,
+          fps: info.fps,
+          hasAudio: info.hasAudio,
+          audioChannels: info.audioChannels,
+          audioSampleRate: info.audioSampleRate,
+          mixMic,
+        });
+        await new Promise<void>((resolve, reject) => {
+          encodedReadyRef.current = { resolve, reject };
+        });
+        videoReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "video" });
+        if (audioReceiver) {
+          audioReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "audio" });
+        }
+        if (mixMic) {
+          startEncodedMicCapture(worker);
+        }
+      } catch (error) {
+        console.warn("[StreamView] Encoded capture unavailable, aborting:", error);
+        stopEncodedMicCapture();
+        videoReceiver.transform = null;
+        if (audioReceiver) audioReceiver.transform = null;
+        worker.terminate();
+        encodedWorkerRef.current = null;
+        encodedReceiversRef.current = null;
+        encodedReadyRef.current = null;
+        encodedDoneRef.current = null;
+        recordingIdRef.current = null;
+        window.openNow.abortRecording({ recordingId }).catch(() => undefined);
+        setRecordingError("Could not start recording.");
+        return;
+      }
+      setUsedMimeType(mimeType);
+      setIsRecording(true);
+      setIsProcessing(false);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
+      }, 500);
+      console.info(
+        `[StreamView] Encoded capture started: ${info.codec} ${info.width}x${info.height}@${info.fps} → ${mimeType} (zero re-encode${mixMic ? ", mic mix" : ""})`,
+      );
+    },
+    [mixMic, startEncodedMicCapture, stopEncodedMicCapture],
+  );
+
+  const stopEncodedRecording = useCallback(async (): Promise<void> => {
+    setIsRecording(false);
+    setIsProcessing(true);
+    window.clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = undefined;
+    const id = recordingIdRef.current;
+    recordingIdRef.current = null;
+    const worker = encodedWorkerRef.current;
+    const receivers = encodedReceiversRef.current;
+    encodedWorkerRef.current = null;
+    encodedReceiversRef.current = null;
+    if (!worker) {
+      setIsProcessing(false);
+      return;
+    }
+    // Stop the mic tap before detaching the transforms so the worker's final
+    // flush cannot stall waiting on PCM that will never arrive.
+    stopEncodedMicCapture();
+    // Detach the transforms first — frames stop flowing and the worker drains
+    // whatever is still in flight, then finalizes and posts 'done'.
+    if (receivers) {
+      receivers.video.transform = null;
+      if (receivers.audio) receivers.audio.transform = null;
+    }
+    const donePromise = new Promise<void>((resolve, reject) => {
+      encodedDoneRef.current = { resolve, reject };
+    });
+    // A wedged worker must not leave the UI stuck in the PROCESSING pill.
+    const doneWithTimeout = Promise.race([
+      donePromise,
+      new Promise<never>((_, reject) =>
+        window.setTimeout(() => reject(new Error("Encoded recording finalize timed out")), 10_000),
+      ),
+    ]);
+    worker.postMessage({ type: "stop" });
+    let thumbnailDataUrl: string | undefined;
+    const currentVideo = videoRef.current;
+    if (currentVideo && currentVideo.videoWidth > 0 && currentVideo.videoHeight > 0) {
+      const { width: thumbWidth, height: thumbHeight } = fitThumbnailSize(
+        currentVideo.videoWidth,
+        currentVideo.videoHeight,
+      );
+      const canvas = document.createElement("canvas");
+      canvas.width = thumbWidth;
+      canvas.height = thumbHeight;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(currentVideo, 0, 0, thumbWidth, thumbHeight);
+        thumbnailDataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      }
+    }
+    try {
+      await doneWithTimeout;
+      // Chunks arrive strictly before 'done' (worker message ordering), so
+      // draining the send chain here covers every byte of the file.
+      await chunkSendChainRef.current;
+      if (id) {
+        const durationMs = Date.now() - recordingStartTimeRef.current;
+        const entry = await window.openNow.finishRecording({
+          recordingId: id,
+          durationMs,
+          gameTitle,
+          thumbnailDataUrl,
+        });
+        setRecordings((prev) => [entry, ...prev].slice(0, 20));
+      }
+    } catch (error) {
+      console.error("[StreamView] Failed to finalize encoded recording:", error);
+      setRecordingError("Recording could not be saved.");
+      if (id) {
+        window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
+      }
+    } finally {
+      worker.terminate();
+      encodedDoneRef.current = null;
+      setIsProcessing(false);
+    }
+  }, [gameTitle]);
+
   const toggleRecording = useCallback(async () => {
     setRecordingError(null);
 
@@ -279,6 +554,10 @@ export function useStreamRecorder({
         setIsProcessing(false);
         return;
       }
+      if (encodedWorkerRef.current) {
+        void stopEncodedRecording();
+        return;
+      }
       mediaRecorderRef.current?.stop();
       return;
     }
@@ -323,10 +602,30 @@ export function useStreamRecorder({
     }
 
     const stream = video.srcObject as MediaStream;
-    const { strategy, mimeType } = await selectRecordingStrategy(
+    const recordCap = resolveRecordCap(recordingResolution, recordingFps);
+    const streamVideoTrack = stream.getVideoTracks()[0] ?? null;
+    // Receiver-side encoded capture (bitstream pre-decode) wins whenever it is
+    // available: zero re-encode, so the recording cap does not apply.
+    const encodedCapture = inspectEncodedCapture(getActiveWebRtcPeerConnection(), video, stream);
+    const { strategy, mimeType, reason } = await selectRecordingStrategy(
       (candidate) => MediaRecorder.isTypeSupported(candidate),
+      {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        fps: streamVideoTrack?.getSettings().frameRate ?? null,
+      },
+      recordCap,
+      encodedCapture !== null,
     );
-    setUsedMimeType(mimeType);
+    const effectiveMimeType =
+      strategy === "encoded-transform" && encodedCapture ? encodedCapture.mimeType : mimeType;
+    console.info(`[StreamView] Recording strategy: ${strategy} — ${reason}`);
+    setUsedMimeType(effectiveMimeType);
+    setUsedStrategy(strategy);
+    if (strategy === "encoded-transform" && encodedCapture) {
+      await startEncodedRecording(encodedCapture, effectiveMimeType);
+      return;
+    }
 
     // The whole web start path below is guarded: a throw anywhere in the
     // audio/canvas/MediaRecorder setup used to surface as an unhandled
@@ -355,11 +654,10 @@ export function useStreamRecorder({
     // runs the WebRTC decoder. The cap follows the user's
     // recordingResolution/recordingFps settings.
     const rawTrackMode = strategy === "raw-track";
-    const recordCap = RECORD_CAP_BY_RESOLUTION[recordingResolution]
-      ?? { width: DEFAULT_RECORD_CAP_WIDTH, height: DEFAULT_RECORD_CAP_HEIGHT };
-    const recordFps = Number.isFinite(recordingFps) && recordingFps > 0
-      ? Math.min(60, Math.round(recordingFps))
-      : DEFAULT_RECORD_CAP_FPS;
+    // Cap resolved once above — the strategy gate and the canvas draw loop
+    // below share it, so the raw-track path can never outrun the user's
+    // recordingResolution/recordingFps settings.
+    const recordFps = recordCap.fps;
     // Canvas path only: actual draw count vs the target rate is compared at
     // stop (computeRecordingFrameShortfall) so the user is told when the
     // recording was choppier than its nominal fps. The raw-track path has no
@@ -763,11 +1061,16 @@ export function useStreamRecorder({
     gameTitle,
     isRecording,
     micTrack,
+    mixMic,
     nativeRecordingEnabled,
     recordingApiAvailable,
     recordingBitrateMbps,
     recordingFps,
     recordingResolution,
+    startEncodedMicCapture,
+    startEncodedRecording,
+    stopEncodedMicCapture,
+    stopEncodedRecording,
     videoRef,
   ]);
 
@@ -780,6 +1083,18 @@ export function useStreamRecorder({
       }
       recordingFrameCallbackRef.current = undefined;
       stopRecordingVideoTrack();
+      stopEncodedMicCapture();
+      const encodedWorker = encodedWorkerRef.current;
+      if (encodedWorker) {
+        encodedWorkerRef.current = null;
+        const receivers = encodedReceiversRef.current;
+        encodedReceiversRef.current = null;
+        if (receivers) {
+          receivers.video.transform = null;
+          if (receivers.audio) receivers.audio.transform = null;
+        }
+        encodedWorker.terminate();
+      }
       const recorder = mediaRecorderRef.current;
       const id = recordingIdRef.current;
       if (recorder && recorder.state !== "inactive") {
@@ -795,7 +1110,7 @@ export function useStreamRecorder({
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
     };
-  }, [nativeRecordingEnabled]);
+  }, [nativeRecordingEnabled, stopEncodedMicCapture]);
 
   return {
     isRecording,
@@ -805,6 +1120,7 @@ export function useStreamRecorder({
     recordingError,
     recordingDropNotice,
     usedMimeType,
+    usedStrategy,
     recCarouselRef,
     recordingApiAvailable,
     refreshRecordings,

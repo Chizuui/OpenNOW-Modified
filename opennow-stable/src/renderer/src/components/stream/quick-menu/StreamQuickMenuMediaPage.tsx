@@ -37,9 +37,12 @@ interface StreamQuickMenuMediaPageProps {
   recordingError: string | null;
   recordingApiAvailable: boolean;
   usedMimeType: string | null;
+  /** Recording strategy chosen at start (raw-track vs canvas-downscale). */
+  usedStrategy: string | null;
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  recordingMixMic: boolean;
   /**
    * Native streamer mode: the recording happens in the native pipeline at the
    * stream's own resolution/FPS/bitrate — the web-mode encode settings below
@@ -51,6 +54,7 @@ interface StreamQuickMenuMediaPageProps {
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
+  onRecordingMixMicChange: (value: boolean) => void;
   recCarouselRef: RefObject<HTMLDivElement | null>;
   onToggleRecording: () => void;
   onDeleteRecording: (id: string) => void;
@@ -74,14 +78,17 @@ export function StreamQuickMenuMediaPage({
   recordingError,
   recordingApiAvailable,
   usedMimeType,
+  usedStrategy,
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  recordingMixMic,
   nativeRecording,
   recordingDropNotice,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
+  onRecordingMixMicChange,
   recCarouselRef,
   onToggleRecording,
   onDeleteRecording,
@@ -183,6 +190,39 @@ export function StreamQuickMenuMediaPage({
             Recordings are encoded on the CPU. Higher resolution and FPS raise encode load and
             can drop stream FPS on weaker machines.
           </span>
+          <span className="sidebar-hint">
+            Recordings are encoded on the CPU. Higher resolution and FPS raise encode load and
+            can drop stream FPS on weaker machines.
+          </span>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Mix Mic</span>
+            <span className="settings-value-badge">{recordingMixMic ? "On" : "Off"}</span>
+          </div>
+          <div className="sidebar-chip-row">
+            <button
+              type="button"
+              className={`sidebar-chip${recordingMixMic ? " sidebar-chip--active" : ""}`}
+              aria-pressed={recordingMixMic}
+              onClick={() => onRecordingMixMicChange(true)}
+            >
+              <span>On</span>
+            </button>
+            <button
+              type="button"
+              className={`sidebar-chip${!recordingMixMic ? " sidebar-chip--active" : ""}`}
+              aria-pressed={!recordingMixMic}
+              onClick={() => onRecordingMixMicChange(false)}
+            >
+              <span>Off</span>
+            </button>
+          </div>
+          <span className="sidebar-hint">
+            Mixes your microphone into the recording's audio track. Only the audio is
+            re-encoded — the video bitstream is captured as-is, so recording stays
+            zero-cost. Requires an active mic.
+          </span>
         </div>
         </>
         )}
@@ -249,6 +289,16 @@ export function StreamQuickMenuMediaPage({
         </div>
         {usedMimeType && (
           <span className="sidebar-hint sidebar-hint--codec">Codec: {usedMimeType}</span>
+        )}
+        {usedStrategy && (
+          <span className="sidebar-hint sidebar-hint--codec">
+            Mode:{" "}
+            {usedStrategy === "encoded-transform"
+              ? `encoded bitstream (no re-encode${recordingMixMic ? ", mic mix" : ""})`
+              : usedStrategy === "raw-track"
+                ? "raw track (stream res)"
+                : "bounded canvas"}
+          </span>
         )}
         <div className="sidebar-row sidebar-row--aligned">
           <span className="sidebar-label">

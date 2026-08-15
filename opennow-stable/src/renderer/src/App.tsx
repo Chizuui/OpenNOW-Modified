@@ -3306,9 +3306,11 @@ export function App(): JSX.Element {
               recordingBitrateMbps={settings.recordingBitrateMbps}
               recordingResolution={settings.recordingResolution}
               recordingFps={settings.recordingFps}
+              recordingMixMic={settings.recordingMixMic}
               onRecordingResolutionChange={(value) => { void updateSetting("recordingResolution", value); }}
               onRecordingFpsChange={(value) => { void updateSetting("recordingFps", value); }}
               onRecordingBitrateMbpsChange={(value) => { void updateSetting("recordingBitrateMbps", value); }}
+              onRecordingMixMicChange={(value) => { void updateSetting("recordingMixMic", value); }}
               maxBitrateMbps={settings.maxBitrateMbps}
               onMaxBitrateMbpsChange={(value) => { void updateSetting("maxBitrateMbps", value); }}
               gameTitle={streamingGame?.title ?? t("app.labels.game")}

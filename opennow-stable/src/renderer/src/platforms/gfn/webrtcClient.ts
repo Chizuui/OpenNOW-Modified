@@ -319,6 +319,21 @@ function extractVideoBitrateAttributes(sdp: string): {
   return Object.values(result).some((value) => value !== undefined) ? result : null;
 }
 
+// Module-level handle to the live RTCPeerConnection of the active session.
+// The recorder's receiver-side encoded transform attaches to its receivers
+// without threading the connection through the React tree — there is exactly
+// one active session at a time. Cleared when the peer connection is torn down.
+let activeWebRtcPeerConnection: RTCPeerConnection | null = null;
+
+/**
+ * The RTCPeerConnection of the currently active WebRTC session (web mode), or
+ * `null` when none is live. Used by the web recorder to attach receiver-side
+ * encoded transforms (pre-decode bitstream capture).
+ */
+export function getActiveWebRtcPeerConnection(): RTCPeerConnection | null {
+  return activeWebRtcPeerConnection;
+}
+
 export class GfnWebRtcClient {
   private readonly inputEncoder = new InputEncoder();
 
@@ -1852,6 +1867,9 @@ export class GfnWebRtcClient {
       this.pc.onconnectionstatechange = null;
       this.pc.ondatachannel = null;
       this.pc.close();
+      if (activeWebRtcPeerConnection === this.pc) {
+        activeWebRtcPeerConnection = null;
+      }
       this.pc = null;
     }
     this.peerMediaController.clearTracks();
@@ -2672,6 +2690,7 @@ export class GfnWebRtcClient {
 
     const pc = new RTCPeerConnection(rtcConfig);
     this.pc = pc;
+    activeWebRtcPeerConnection = pc;
     this.resetInputState();
     this.resetDiagnostics();
     this.diagnostics.connectionState = pc.connectionState;

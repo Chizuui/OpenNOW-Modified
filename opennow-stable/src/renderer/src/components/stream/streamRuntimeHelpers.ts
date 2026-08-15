@@ -40,13 +40,59 @@ export function selectRecordingMimeType(
   return RECORDING_MIME_TYPES.find(isTypeSupported) ?? "video/webm";
 }
 
-export type RecordingStrategy = "raw-track" | "canvas-downscale";
+export type RecordingStrategy = "encoded-transform" | "raw-track" | "canvas-downscale";
+
+export const DEFAULT_RECORD_CAP_WIDTH = 1280;
+export const DEFAULT_RECORD_CAP_HEIGHT = 720;
+export const DEFAULT_RECORD_CAP_FPS = 30;
+export const MAX_RECORD_CAP_FPS = 60;
+
+export const RECORD_CAP_BY_RESOLUTION: Record<string, { width: number; height: number }> = {
+  "1440p": { width: 2560, height: 1440 },
+  "1080p": { width: 1920, height: 1080 },
+  "720p": { width: 1280, height: 720 },
+};
+
+/** The maximum picture size/rate the user asked the recording to stay within. */
+export interface RecordingCap {
+  width: number;
+  height: number;
+  fps: number;
+}
+
+/** The live stream as the <video> element sees it at record-start time. */
+export interface StreamInfo {
+  width: number;
+  height: number;
+  /** Received frame rate from the track's settings; `null` when unknown. */
+  fps: number | null;
+}
+
+/**
+ * Resolve the user's recordingResolution/recordingFps settings into the cap
+ * every recording path is bounded by. The canvas path draws into a canvas of
+ * at most this size; the raw-track path is only taken when the stream already
+ * fits inside it (see selectRecordingStrategy) — otherwise the user's "720p30"
+ * setting is silently meaningless, which is exactly how a full-resolution
+ * re-encode used to starve the decode pipeline.
+ */
+export function resolveRecordCap(resolution: string, fps: number): RecordingCap {
+  const { width, height } =
+    RECORD_CAP_BY_RESOLUTION[resolution] ?? { width: DEFAULT_RECORD_CAP_WIDTH, height: DEFAULT_RECORD_CAP_HEIGHT };
+  const cappedFps =
+    Number.isFinite(fps) && fps > 0
+      ? Math.min(MAX_RECORD_CAP_FPS, Math.round(fps))
+      : DEFAULT_RECORD_CAP_FPS;
+  return { width, height, fps: cappedFps };
+}
 
 export interface RecordingStrategyChoice {
   strategy: RecordingStrategy;
   mimeType: string;
   /** True when the chosen encoder runs on hardware (power-efficient). */
   hwAccelerated: boolean;
+  /** Short human-readable reason for the choice (logged + surfaced in the UI). */
+  reason: string;
 }
 
 /**
@@ -66,43 +112,115 @@ export type RecordingEncodeProbe = (
 /**
  * Pick the recording path for web mode.
  *
- * "raw-track": the raw WebRTC video track goes straight into MediaRecorder
- * (GFN-native model). "canvas-downscale": a downscaled canvas track bounds
- * the encode cost.
+ * "encoded-transform": the receiver-side encoded transform captures the
+ * stream's bitstream pre-decode and muxes it offline (GFN parity). Zero
+ * re-encode — the recording can never compete with the decoder, so the
+ * user's recording cap does NOT apply ("jangan di cap": the capture is
+ * whatever the stream is). Taken whenever the runtime supports receiver
+ * encoded transforms and the session's negotiated codec is capturable.
  *
- * Raw-track is ONLY chosen when `avc1` is supported AND the encoder is
- * hardware (power-efficient per MediaCapabilities). `isTypeSupported` alone
- * is not enough: on machines without Media Foundation / VideoToolbox / VAAPI
- * hardware AVC encode, Chromium silently falls back to the software OpenH264
- * encoder, and a full-resolution software re-encode of a 1080p60 stream
- * saturates the CPU that also runs the WebRTC decoder — the stream drops to
- * single-digit FPS while recording (the field report). Software encodes
- * instead go through the bounded 720p30 canvas downscale.
+ * "raw-track": the raw WebRTC video track goes straight into MediaRecorder
+ * (no canvas, no draw loop). "canvas-downscale": a downscaled canvas track
+ * bounds the encode cost to the user's recording cap.
+ *
+ * Raw-track is chosen ONLY when ALL of these hold:
+ * 1. an AVC (avc1) container is supported — the format MediaRecorder can
+ *    hardware-encode on Windows/macOS/Linux;
+ * 2. the live stream already fits inside the user's recording cap
+ *    (resolution AND frame rate). A full-resolution re-encode of a 1080p60
+ *    stream competes with the WebRTC decoder for the same GPU/CPU even with a
+ *    hardware encoder (the field report: "recording makes the stream lag" on
+ *    a device that is otherwise fine) — so when the stream exceeds the cap,
+ *    the encode is bounded to the cap instead, honoring the user's
+ *    recordingResolution/recordingFps settings;
+ * 3. the encoder at stream resolution is hardware (power-efficient per
+ *    MediaCapabilities). `isTypeSupported` alone is not enough: on machines
+ *    without Media Foundation / VideoToolbox / VAAPI hardware AVC encode,
+ *    Chromium silently falls back to the software OpenH264 encoder, and a
+ *    full-resolution software re-encode saturates the CPU that also runs the
+ *    WebRTC decoder.
+ *
+ * Everything else goes through the bounded canvas downscale.
  */
 export async function selectRecordingStrategy(
   isTypeSupported: (mimeType: string) => boolean,
+  stream: StreamInfo,
+  cap: RecordingCap,
+  encodedTransformAvailable: boolean,
   encodeProbe: RecordingEncodeProbe = defaultRecordingEncodeProbe,
 ): Promise<RecordingStrategyChoice> {
+  if (encodedTransformAvailable) {
+    // mimeType placeholder — the caller replaces it with the codec-specific
+    // container (video/mp4 or video/webm) derived from the receivers.
+    return {
+      strategy: "encoded-transform",
+      mimeType: "video/mp4",
+      hwAccelerated: true,
+      reason: "receiver encoded transform available — bitstream captured pre-decode, zero re-encode (cap not applied)",
+    };
+  }
   const mimeType = selectRecordingMimeType(isTypeSupported);
   if (!mimeType.includes("avc1")) {
-    return { strategy: "canvas-downscale", mimeType, hwAccelerated: false };
+    return {
+      strategy: "canvas-downscale",
+      mimeType,
+      hwAccelerated: false,
+      reason: "no avc1 container — hardware encode unavailable, bounded canvas used",
+    };
+  }
+  const streamWithinCap =
+    stream.width > 0 &&
+    stream.height > 0 &&
+    stream.width <= cap.width &&
+    stream.height <= cap.height &&
+    // Unknown frame rate is treated as within-cap: the resolution gate above
+    // is the dominant cost factor, and an unknown rate should not force the
+    // downscale path on its own.
+    (stream.fps === null || stream.fps <= cap.fps);
+  if (!streamWithinCap) {
+    const streamLabel =
+      stream.width > 0 && stream.height > 0
+        ? `${stream.width}x${stream.height}@${stream.fps ?? "?"}`
+        : "unknown resolution";
+    return {
+      strategy: "canvas-downscale",
+      mimeType,
+      hwAccelerated: false,
+      reason: `stream ${streamLabel} exceeds recording cap ${cap.width}x${cap.height}@${cap.fps} — encode bounded to cap`,
+    };
   }
   try {
     const info = await encodeProbe({
       contentType: mimeType,
-      width: 1920,
-      height: 1080,
+      width: stream.width,
+      height: stream.height,
       bitrate: 12_000_000,
-      framerate: 60,
+      framerate: stream.fps ?? cap.fps,
     });
     if (info?.powerEfficient) {
-      return { strategy: "raw-track", mimeType, hwAccelerated: true };
+      return {
+        strategy: "raw-track",
+        mimeType,
+        hwAccelerated: true,
+        reason: `hardware AVC encoder and stream ${stream.width}x${stream.height}@${stream.fps ?? cap.fps} within cap ${cap.width}x${cap.height}@${cap.fps}`,
+      };
     }
+    return {
+      strategy: "canvas-downscale",
+      mimeType,
+      hwAccelerated: false,
+      reason: "AVC encoder not power-efficient at stream resolution — bounded canvas used",
+    };
   } catch {
     // Probe unavailable (old runtime / sandbox) — fall through to the safe
     // canvas path rather than risk a software full-res encode.
+    return {
+      strategy: "canvas-downscale",
+      mimeType,
+      hwAccelerated: false,
+      reason: "encoder probe unavailable — bounded canvas used",
+    };
   }
-  return { strategy: "canvas-downscale", mimeType, hwAccelerated: false };
 }
 
 async function defaultRecordingEncodeProbe(
