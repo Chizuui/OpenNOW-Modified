@@ -7934,6 +7934,68 @@ pub(crate) fn build_encoded_record_branch(
     Ok(state)
 }
 
+/// Does an RTP payload begin a complete keyframe access unit? Checks the
+/// NALs at the head of the packet for parameter sets — the start of a fresh
+/// keyframe AU. Handles single-NAL packets and the aggregation forms
+/// (H.264 STAP-A/B, H.265 AP) since some encoders pack SPS/PPS with the
+/// first IDR slices. GFN prefixes every AU with a prefix-SEI, so the sets
+/// may sit in the 2nd+ packet of the AU — the recording-start gate probes
+/// every packet of the AU, not just the first.
+pub(crate) fn payload_starts_keyframe_config(codec: &str, payload: &[u8]) -> bool {
+    let Some(&first) = payload.first() else {
+        return false;
+    };
+    match codec {
+        "H264" => match first & 0x1F {
+            // SPS (7) / PPS (8): a complete keyframe begins with these.
+            7 | 8 => true,
+            // STAP-A (24) / STAP-B (25): 16-bit length-prefixed NALs.
+            24 | 25 => {
+                let mut off = 1usize;
+                while off + 2 <= payload.len() {
+                    let len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
+                    off += 2;
+                    if off + len > payload.len() {
+                        break;
+                    }
+                    if let Some(&b) = payload.get(off) {
+                        if matches!(b & 0x1F, 7 | 8) {
+                            return true;
+                        }
+                    }
+                    off += len;
+                }
+                false
+            }
+            _ => false,
+        },
+        // H265 / HEVC
+        _ => match (first >> 1) & 0x3F {
+            // VPS (32) / SPS (33) / PPS (34).
+            32 | 33 | 34 => true,
+            // AP (48): 16-bit length-prefixed NALs.
+            48 => {
+                let mut off = 1usize;
+                while off + 2 <= payload.len() {
+                    let len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
+                    off += 2;
+                    if off + len > payload.len() {
+                        break;
+                    }
+                    if let Some(&b) = payload.get(off) {
+                        if matches!((b >> 1) & 0x3F, 32 | 33 | 34) {
+                            return true;
+                        }
+                    }
+                    off += len;
+                }
+                false
+            }
+            _ => false,
+        },
+    }
+}
+
 /// Native recording branch — PASS-THROUGH (bitstream remux). Taps the RAW
 /// RTP stream at the source tee (before decode), depayloads and parses it,
 /// and writes the received H.265/H.264/AV1 elementary stream into a temp
@@ -7959,11 +8021,15 @@ pub(crate) fn build_encoded_record_branch(
 /// stream stayed healthy). A filesink always accepts, so the branch cannot
 /// wedge.
 ///
-/// The IDR gate (drop everything until the first sync access unit, so the
-/// file never starts mid-GOP with orphan P-frames) is applied at the OFFLINE
-/// remux, where it cannot stall the live stream. Because the live branch
-/// writes EVERYTHING it receives, a server keyframe that lands late (GFN
-/// H265 GOPs can run ~9 s) no longer black-holes the head of the recording.
+/// The recording-START keyframe gate (drop everything until the first
+/// COMPLETE keyframe AU — the idr_gate probe in the body below) lives at the
+/// RTP tap, NOT the offline remux: the first AU after the valve opens is a
+/// partial keyframe (its head packets arrived before record start) and the
+/// offline remux starts at the first AU that decodes, which IS that partial
+/// keyframe — the flat-gray first frame. The gate opens once at the first
+/// AU carrying parameter sets and never re-arms, so a server keyframe that
+/// lands late (GFN H265 GOPs can run ~9 s) delays the file head but never
+/// black-holes the rest of the recording.
 pub(crate) fn build_pass_through_record_branch(
     pipeline: &gst::Pipeline,
     rtp_tee: &gst::Element,
@@ -7982,9 +8048,7 @@ pub(crate) fn build_pass_through_record_branch(
                 "Pass-through recording: unsupported codec {other} (H264/H265/AV1 expected)."
             ))
         }
-    };
-
-    let valve = make_element("valve")?;
+    };    let valve = make_element("valve")?;
     let queue = make_element("queue")?;
     // as the decode chain — both see the SAME stream. The tap sits at the
     // webrtcbin element's video SRC pad, which is the internal rtpbin session
@@ -8010,24 +8074,36 @@ pub(crate) fn build_pass_through_record_branch(
     let rtp_caps = make_element("capsfilter")?;
     let depay = make_element(depay_factory)?;
     let parse = make_element(parse_factory)?;
-    // The branch must resync itself after a loss hole: rtph26xdepay with
-    // request-keyframe=true pushes a force-key-unit event upstream on seq-gap
-    // detection; it travels through the tee into webrtcbin's rtpbin session,
-    // whose rtpsession turns it into a PLI to the server. wait-for-keyframe
-    // is FALSE (as in the decode chain): waiting for the keyframe before
-    // emitting ANY output was the field truncation bug — a single
-    // NACK-unrecoverable hole mid-recording put the depay into keyframe-wait
-    // mode, and because the server's next periodic keyframe landed after the
-    // recording ended, the branch held everything and the ES stopped growing
-    // (field: 10:30 recording — 10307 RTP packets over 12 s fed the depay
-    // but only 57 AUs reached the parse; 09:50 — 6060 packets over 11 s, 589
-    // AUs). With wait-for-keyframe=false the depay emits the AU with missing
-    // slices, h265parse sheds it, and the ES continues cleanly at the next
-    // keyframe (resync via the request above or the server's own cadence) —
-    // the clip keeps its full duration with a brief jump at the loss point
-    // instead of dying for the rest of the recording. The offline remux's
-    // keyframe gate still guarantees the file starts on a fresh IDR.
-    set_property_if_supported(&depay, "request-keyframe", true);
+    // The branch must resync itself after a loss hole, but NOT by spamming
+    // the server: request-keyframe=false matches the decode chain exactly.
+    // rtph26xdepay with request-keyframe=true pushes a force-key-unit event
+    // upstream on EVERY detected seq gap — and this branch is attached from
+    // session arm time (minutes before a recording), so those events fire
+    // continuously through the shared tap tee into rtpbin, whose rtpsession
+    // turns each one into a PLI to the server. That was the field FIR-storm
+    // spiral the decode chain already disarmed (FIR=429 + decoded=0 across
+    // every decoder — the server floods keyframes and the stream degrades),
+    // and the record branch's per-gap spam also correlates with the track
+    // truncation (15:41 recording: depay emitted 541 AUs over 9.2 s at full
+    // rate, but the parser shed 290 — every AU after the last forced
+    // keyframe came back damaged). The liveness watchdog requests keyframes
+    // over signaling/RTCP at a rate-limited cadence, so startup recovery is
+    // unaffected; only the depay's per-gap spam is removed.
+    //
+    // wait-for-keyframe is FALSE (as in the decode chain): waiting for the
+    // keyframe before emitting ANY output was the field truncation bug — a
+    // single NACK-unrecoverable hole mid-recording put the depay into
+    // keyframe-wait mode, and because the server's next periodic keyframe
+    // landed after the recording ended, the branch held everything and the
+    // ES stopped growing (field: 10:30 recording — 10307 RTP packets over
+    // 12 s fed the depay but only 57 AUs reached the parse; 09:50 — 6060
+    // packets over 11 s, 589 AUs). With wait-for-keyframe=false the depay
+    // emits the AU with missing slices, h265parse sheds it, and the ES
+    // continues cleanly at the next keyframe — the clip keeps its full
+    // duration with a brief jump at the loss point instead of dying for the
+    // rest of the recording. The recording-START keyframe gate (below, the
+    // idr_gate probe) still guarantees the ES begins on a fresh complete IDR.
+    set_property_if_supported(&depay, "request-keyframe", false);
     set_property_if_supported(&depay, "wait-for-keyframe", false);
     // Force the parser to always parse (never passthrough) and re-emit the
     // codec config (SPS/PPS) before every keyframe: the ES file becomes
@@ -8384,13 +8460,79 @@ pub(crate) fn build_pass_through_record_branch(
         });
     }
 
-    // No live IDR gate: the ES file captures EVERYTHING the branch receives,
-    // and the gate (drop-until-first-keyframe) is applied at the OFFLINE
-    // remux where it cannot stall anything. This also means a server keyframe
-    // that lands late (GFN H265 GOP) no longer black-holes the head of the
-    // file — the pre-keyframe data is written and the remux simply starts at
-    // the first keyframe that exists.
+    // Recording-START keyframe gate (H.264/H.265): the ES file must begin at
+    // a COMPLETE keyframe AU. The valve opens mid-stream (record start is not
+    // aligned to the server's GOP), so without a gate the first AU the depay
+    // assembles is a PARTIAL keyframe — its head packets (VPS/SPS/PPS) arrived
+    // before the valve opened and the depay emits the slice tail as a
+    // "keyframe". Decoders render that as a flat gray first frame (the field
+    // glitch at the head of every recording: 15:41 recording frame 0 decoded
+    // to a uniform 128-gray 1080p frame, p1=124/p99=132). The OFFLINE remux
+    // cannot fix it — it starts at the first AU that decodes, which IS the
+    // partial keyframe — so the gate lives HERE at the RTP level, where the
+    // partial AU's head is still distinguishable by its missing parameter
+    // sets. start() arms `idr_gate` (and asks the server for a keyframe over
+    // signaling), the probe drops every packet until the first AU carrying
+    // parameter sets (VPS/SPS/PPS for H.265, SPS/PPS for H.264), then opens
+    // PERMANENTLY: it never re-arms on a later loss hole (that was the
+    // wait-for-keyframe=true truncation bug), so the file starts on a clean
+    // keyframe and keeps its full duration. AV1 is left ungated (the depay
+    // re-frames OBUs itself and GFN AV1 sessions are rare here; the glitch is
+    // cosmetic).
     let idr_gate = Arc::new(AtomicBool::new(true));
+    if matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC") {
+        let gate = idr_gate.clone();
+        let gate_codec = codec_upper.clone();
+        let gate_sender = event_sender.clone();
+        // AU-boundary tracking across the WHOLE tap flow (the probe runs from
+        // branch attach, minutes before a recording, so the state is accurate
+        // when start() re-arms the gate). prev_marker = marker bit of the
+        // previous packet; the packet right after a marker (or the first
+        // packet) begins a new AU and re-opens the scan window.
+        let prev_marker = Arc::new(AtomicBool::new(false));
+        let au_window = Arc::new(AtomicBool::new(true));
+        let gate_sink = valve
+            .static_pad("sink")
+            .ok_or_else(|| "Pass-through gate: valve has no sink pad.".to_owned())?;
+        gate_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            if !gate.load(Ordering::Relaxed) {
+                return gst::PadProbeReturn::Ok;
+            }
+            let Some(buffer) = info.buffer() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let map = buffer.map_readable();
+            let bytes = map.as_deref().unwrap_or(&[]);
+            let marker = bytes.get(1).map(|b| b & 0x80 != 0).unwrap_or(false);
+            // GFN video packets carry the standard 12-byte RTP header.
+            let payload = bytes.get(12..).unwrap_or(&[]);
+            let head = !prev_marker.swap(marker, Ordering::Relaxed);
+            if head {
+                au_window.store(true, Ordering::Relaxed);
+            }
+            // Parameter sets inside this AU = the head of a complete keyframe
+            // (GFN prefixes every AU with a prefix-SEI, so the sets can be the
+            // 2nd+ packet of the AU). Open the gate, keep THIS packet — the
+            // ES then begins [VPS/SPS/PPS, IDR slices...] and decodes clean.
+            if au_window.load(Ordering::Relaxed)
+                && payload_starts_keyframe_config(&gate_codec, payload)
+            {
+                gate.store(false, Ordering::Relaxed);
+                send_log(
+                    &gate_sender,
+                    "info",
+                    format!(
+                        "Native recording ES started at a complete {gate_codec} keyframe (dropped the partial mid-GOP head so the file never opens with a gray frame)."
+                    ),
+                );
+                return gst::PadProbeReturn::Ok;
+            }
+            if marker {
+                au_window.store(false, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Drop
+        });
+    }
 
     // Inactive until the first `start()` (the transcode chunk probe pattern).
     let active = Arc::new(AtomicBool::new(false));
@@ -8661,10 +8803,14 @@ fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
     let children_start = entry.content_offset + 78;
     let entry_children = mp4_box_children(data, children_start, entry.content_offset + entry.size);
     // colr box, 20 bytes: nclx, primaries=transfer=matrix=BT.709 (1),
-    // full_range_flag=1, reserved.
+    // full_range_flag=1, reserved. full_range_flag is the MSB (bit 7) of the
+    // last byte (0x80) — writing the value 1 as 0x01 puts the flag in bit 0
+    // where players read flag=0 (LIMITED) and the full-range recording keeps
+    // rendering too contrasty ("pekat"; verified on a real 15:41 recording:
+    // box payload ended 0x01 instead of 0x80).
     let colr: [u8; 20] = [
         0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
-        0x01, 0x00, 0x01, 0x01, 0x00,
+        0x01, 0x00, 0x01, 0x80, 0x00,
     ];
     // Replace an existing colr box (qtmux's nclc — no full-range flag) so
     // players read FULL-RANGE BT.709. If the existing box is already exactly
@@ -10315,6 +10461,44 @@ mod mic_pipeline_tests {
         }
     }
 
+    /// The recording-start keyframe gate recognizes the head of a COMPLETE
+    /// keyframe AU from the RTP payload alone: H.265 VPS/SPS/PPS (32/33/34)
+    /// and H.264 SPS/PPS (7/8) — single NAL or packed in an aggregation
+    /// packet — while mid-GOP slice NALs and GFN's prefix-SEI AU heads must
+    /// NOT trigger it (a prefix-SEI head is what a PARTIAL keyframe's tail
+    /// looks like; gating on it would reopen the gray-first-frame bug).
+    #[test]
+    fn payload_keyframe_config_detection() {
+        // H.265: VPS/SPS/PPS single-NAL head (GFN keyframe AU start).
+        assert!(payload_starts_keyframe_config("H265", &[0x40, 0x01, 0x0c, 0x01])); // VPS
+        assert!(payload_starts_keyframe_config("H265", &[0x42, 0x01, 0x01, 0x60])); // SPS
+        assert!(payload_starts_keyframe_config("H265", &[0x44, 0x01, 0xc0, 0x93])); // PPS
+        // H.265: prefix-SEI (31) AU head — must NOT open the gate.
+        assert!(!payload_starts_keyframe_config("H265", &[0xbe, 0xde, 0x00, 0x02]));
+        // H.265: IDR slice NAL (19/20) and trailing slices — NOT a config head.
+        assert!(!payload_starts_keyframe_config("H265", &[0x26, 0x01, 0xaf, 0x01]));
+        assert!(!payload_starts_keyframe_config("H265", &[0x28, 0x01, 0xaf, 0x01]));
+        // H.265: AP (48) carrying SPS inside must still open.
+        // AP: [0x60, len_hi, len_lo, SPS(0x42...), ...]
+        assert!(payload_starts_keyframe_config(
+            "H265",
+            &[0x60, 0x00, 0x04, 0x42, 0x01, 0x01, 0x60]
+        ));
+        // H.264: SPS (7) / PPS (8) single NAL.
+        assert!(payload_starts_keyframe_config("H264", &[0x67, 0x42, 0xc0, 0x1e])); // SPS
+        assert!(payload_starts_keyframe_config("H264", &[0x68, 0xce, 0x3c, 0x80])); // PPS
+        // H.264: STAP-A (24) with PPS inside must open.
+        assert!(payload_starts_keyframe_config(
+            "H264",
+            &[0x78, 0x00, 0x03, 0x68, 0xce, 0x3c]
+        ));
+        // H.264: IDR slice (5) and P-slice (1) must NOT open.
+        assert!(!payload_starts_keyframe_config("H264", &[0x65, 0x88, 0x84, 0x21]));
+        assert!(!payload_starts_keyframe_config("H264", &[0x41, 0x9a, 0x24, 0x01]));
+        // Empty payload never opens.
+        assert!(!payload_starts_keyframe_config("H265", &[]));
+    }
+
     /// The hardware encoder must be preferred over software when the runtime
     /// ships it AND it can initialize (a working D3D12 video-encode adapter)
     /// — that is the whole CPU-offload point of the recording branch — and
@@ -10460,6 +10644,21 @@ mod mic_pipeline_tests {
             colour_type == b"nclx" || colour_type == b"nclc",
             "colr box must be an ncl-type colour info box, got {colour_type:?}"
         );
+        // The full_range_flag lives in bit 7 of the byte AFTER the 3x2-byte
+        // primaries/transfer/matrix (0x80). Writing the value 1 as 0x01 puts
+        // it in bit 0 where players read flag=0 (LIMITED) — the field bug that
+        // kept recordings "terlalu pekat": the real 15:41 recording's nclx
+        // payload ended 0x01, so players still expanded full-range data as
+        // limited. Any nclx box the file carries must set the bit.
+        if colour_type == b"nclx" {
+            let flag_byte = bytes[colr_child.content_offset + 10];
+            assert_eq!(
+                flag_byte & 0x80,
+                0x80,
+                "nclx colr must set full_range_flag (bit 7 of the flag byte, \
+                 got 0x{flag_byte:02x})"
+            );
+        }
         let top = mp4_box_children(&bytes, 0, bytes.len());
         let moov = mp4_find_child(&top, b"moov").expect("moov");
         let mdat = mp4_find_child(&top, b"mdat").expect("mdat");
@@ -10536,9 +10735,11 @@ mod mic_pipeline_tests {
         let len_before = mp4.len();
         assert_eq!(inject_mp4_colr_box(&mut mp4), 1);
         assert_eq!(mp4.len(), len_before + 20);
+        // full_range_flag sits in bit 7 (0x80) of the last byte — the value-1
+        // form (0x01) is the bug players read as LIMITED.
         let colr: [u8; 20] = [
             0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x01, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x80, 0x00,
         ];
         assert!(
             mp4.windows(20).any(|w| w == colr),
