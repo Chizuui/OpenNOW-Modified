@@ -160,7 +160,6 @@ let av1C: Uint8Array | null = null;
 let av1CPatched = false;
 let videoConfigReady = false;
 let audioConfigReady = false;
-let lastVideoRtp: number | null = null;
 let lastAudioRtp: number | null = null;
 let lastVideoTsUs: number | null = null;
 let lastAudioTsUs: number | null = null;
@@ -382,13 +381,21 @@ function setup(init: EncodedCaptureInit): void {
 
 function captureVideo(frame: RTCEncodedVideoFrame): void {
   if (!config || !handle || finalized) return;
+  // Video frame metadata carries NO rtpTimestamp — getMetadata() only returns
+  // synchronizationSource/contributingSources/payloadType for video (the RTP
+  // timestamp is audio-only). Reading it here returned undefined for every
+  // frame and silently dropped the whole video track (header-only ~1 KB
+  // recording). The frame's own `timestamp` (µs, derived from the RTP clock)
+  // is the timeline; fall back to the RTP metadata when a runtime lacks it.
   const metadata = frame.getMetadata();
-  const rtp = metadata.rtpTimestamp ?? metadata.timestamp;
-  if (rtp === undefined) return;
-  lastVideoRtp = unwrapRtpTimestamp(rtp, lastVideoRtp);
-  const timestampUs = rtpTimestampToMicroseconds(lastVideoRtp, VIDEO_RTP_CLOCK);
+  let timestampUs = Number.isFinite(frame.timestamp) ? frame.timestamp : NaN;
+  if (!Number.isFinite(timestampUs)) {
+    const rtp = metadata.rtpTimestamp ?? (metadata as { timestamp?: number }).timestamp;
+    if (rtp === undefined) return;
+    timestampUs = rtpTimestampToMicroseconds(rtp, VIDEO_RTP_CLOCK);
+  }
   // Keep the muxer happy: timestamps must be strictly increasing. Guard
-  // against resets that unwrapRtpTimestamp could not reconcile.
+  // against resets (NTP/clock jumps) that could walk the timeline backwards.
   const tsUs = lastVideoTsUs === null ? timestampUs : Math.max(timestampUs, lastVideoTsUs + 1);
   lastVideoTsUs = tsUs;
   const raw = new Uint8Array(frame.data.byteLength);

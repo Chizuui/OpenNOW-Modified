@@ -176,12 +176,20 @@ export async function finishRecording(
   }
   activeRecordings.delete(input.recordingId);
 
-  await new Promise<void>((resolve, reject) => {
-    rec.writeStream.end((err?: Error | null) => {
-      if (err) reject(err);
-      else resolve();
+  // The native handoff (`installRecordingFile`) already ended the (empty)
+  // chunk stream before copying the finalized file into the temp slot; on
+  // the plain chunk path the stream is still open. Calling end() on an
+  // already-finished stream throws ERR_STREAM_ALREADY_FINISHED and kills
+  // the finish handler after the file was renamed — so only end what is
+  // still writable.
+  if (!rec.writeStream.writableEnded) {
+    await new Promise<void>((resolve, reject) => {
+      rec.writeStream.end((err?: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      });
     });
-  });
+  }
 
   const dir = getRecordingsDirectory();
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
