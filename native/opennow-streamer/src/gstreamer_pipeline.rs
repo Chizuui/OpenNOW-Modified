@@ -97,12 +97,16 @@ pub(crate) const DISPLAY_NV12_FULL_RANGE_CAPS: &str =
 /// steady-state latency stays tight and the anti-flicker protection engages
 /// while the network actually needs it.
 pub(crate) const VIDEO_COMPRESSED_QUEUE_MAX_BUFFERS: u32 = 15;
-/// Shallow floor of the adaptive compressed-frame jitter buffer (~50 ms at
+/// Shallow floor of the adaptive compressed-frame jitter buffer (~33 ms at
 /// 60 fps). On stable links (RTT ≤ ~30 ms) the buffer rests here, keeping
-/// drag/input feel tight. Combined with the WEBRTC_LATENCY_BASE_MS RTP
-/// playout buffer, a stable session now holds ~75 ms total instead of the
-/// ~200 ms the old fixed 100+100 ms configuration added.
-pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 3;
+/// drag/input feel tight. The frame count is the 60 fps nominal — the liveness
+/// watchdog converts the ms budget with the ACTUAL stream framerate
+/// (resample-aware), so a 120 fps stream floors at 4 frames (~33 ms) instead
+/// of 2 (16 ms — shorter than one RTT, NACK retransmissions would starve the
+/// decoder). Combined with the WEBRTC_LATENCY_BASE_MS RTP playout buffer, a
+/// stable session now holds ~58 ms total instead of the ~200 ms the old fixed
+/// 100+100 ms configuration added.
+pub(crate) const VIDEO_COMPRESSED_QUEUE_BASE_BUFFERS: u32 = 2;
 /// Mid depth (~167 ms at 60 fps) used as the packet-loss floor (≥0.1%) and
 /// around the middle of the RTT ramp.
 pub(crate) const VIDEO_COMPRESSED_QUEUE_MID_BUFFERS: u32 = 10;
