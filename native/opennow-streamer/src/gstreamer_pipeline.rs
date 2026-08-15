@@ -646,14 +646,16 @@ impl GstreamerVideoTap {
 /// decode) and writes the received bitstream straight to a temp ES file —
 /// zero decode, zero re-encode, zero GPU/CPU, so recording costs NOTHING to
 /// the live stream (the official GeForce Now approach: "just write what we
-/// receive to disk"). Game audio is stored the same way: the raw Opus ES,
-/// no live decoder/encoder. ALL encoding work happens at STOP, offline, in a
+/// receive to disk"). ALL video encode work happens at STOP, offline, in a
 /// throwaway pipeline (`remux_capture_recording`): H.264 video is muxed
 /// directly (still zero re-encode), H.265/AV1 video is decoded and
 /// re-encoded to universal H.264 (slow is fine — nobody is watching the
-/// stream at stop), and Opus audio is decoded + re-encoded to AAC. The
-/// result is a universal H.264/AAC MP4 whose recording phase never touched
-/// the GPU/CPU that the live decoder needs.
+/// stream at stop). Game audio is decoded + re-encoded to AAC in the LIVE
+/// branch as a self-framing ADTS elementary stream (a trivial 48 kHz stereo
+/// opusdec/aacenc — the old raw-Opus ES was unframable by the offline
+/// remux, see `build_audio_branch`). The result is a universal H.264/AAC
+/// MP4 whose recording phase never touched the GPU/CPU that the live
+/// decoder needs.
 ///
 /// `PassThrough` is the same zero-cost raw-RTP capture, but the file keeps
 /// the RECEIVED codec (H265/H264/AV1, exact received quality) and game audio
@@ -694,11 +696,13 @@ impl RecordingMode {
             Ok("passthrough") => RecordingMode::PassThrough,
             Ok("transcode") => RecordingMode::Transcode,
             Ok("encoded") => RecordingMode::Encoded,
-            // Default: zero-cost raw capture (video bitstream + Opus ES in
-            // the live branch) with ALL encode work moved to the offline
+            // Default: zero-cost raw capture (video bitstream in the live
+            // branch) with ALL video encode work moved to the offline
             // stop-time remux, so recording never steals GPU/CPU from the
-            // live decoder (the GFN model). Encoded/transcode stay available
-            // for "record exactly what you see" use cases.
+            // live decoder (the GFN model). Game audio is a trivial live
+            // opusdec → AAC encode (raw Opus ES files are unframable by the
+            // offline remux — the static-audio bug). Encoded/transcode stay
+            // available for "record exactly what you see" use cases.
             _ => RecordingMode::Capture,
         }
     }
@@ -924,7 +928,8 @@ pub(crate) struct GstreamerRecordingState {
     pub(crate) es_caps: Option<gst::Element>,
     /// PASS-THROUGH mode: the filesink writing `video_es_path`.
     pub(crate) video_filesink: Option<gst::Element>,
-    /// PASS-THROUGH mode: the filesink writing `audio_es_path`.
+    /// CAPTURE/PASS-THROUGH/ENCODED: the filesink writing `audio_es_path`
+    /// (the ADTS AAC elementary stream).
     pub(crate) audio_filesink: Option<gst::Element>,
     /// PASS-THROUGH mode: set by an EOS probe on the video filesink sink pad
     /// — once true, the ES file is closed and safe to remux offline.
@@ -1084,20 +1089,26 @@ impl GstreamerRecordingState {
         queue.set_property("max-size-time", 0u64);
 
         // The audio tail depends on the mode:
-        //  - CAPTURE: the depayloader output (raw Opus packets) goes straight
-        //    to its own filesink — NO live decoder/encoder, so recording
-        //    game audio costs ~nothing to the stream (the GFN model). The
-        //    Opus ES is decoded + re-encoded to AAC only at STOP, offline.
-        //  - PASS-THROUGH / ENCODED: decoded + re-encoded to AAC live (the
-        //    historical behavior — universal AAC in the file even before the
-        //    offline remux).
-        //  - TRANSCODE: decoded + re-encoded to AAC live into the shared
-        //    qtmux.
+        //  - CAPTURE / PASS-THROUGH / ENCODED: decoded + re-encoded to AAC
+        //    live and stored as a SELF-FRAMING ADTS elementary stream
+        //    (opusdec → audioconvert → AAC encoder → aacparse → ADTS
+        //    capsfilter → filesink), remuxed into the MP4 OFFLINE at stop.
+        //    ADTS framing is self-describing, so the offline remux
+        //    (`filesrc → aacparse`) can re-frame the file with no external
+        //    caps. The historical raw-Opus alternative was field-broken: a
+        //    bare Opus file carries no packet boundaries, opusparse treats
+        //    each filesrc buffer as one packet, and the offline remux decoded
+        //    mis-framed garbage — the static/white-noise audio in every
+        //    recording. The live opusdec/aacenc cost for one 48 kHz stereo
+        //    stream is trivial, and the leaky queue means the chain can never
+        //    back-pressure the RTP tap.
+        //  - TRANSCODE: the same chain feeds the SHARED live qtmux instead of
+        //    an ES file.
         let mut opusdec: Option<gst::Element> = None;
         let mut audioconvert: Option<gst::Element> = None;
         let mut aac_encoder: Option<gst::Element> = None;
         let mut aac_factory = String::new();
-        if self.mode != RecordingMode::Capture {
+        {
             // The opusdec/aacenc chain must not back-pressure the RTP tap
             // either: the audio queue is already leaky (drops oldest when
             // full), so the chain cannot stall the tap tee.
@@ -1128,24 +1139,12 @@ impl GstreamerRecordingState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
-            // CAPTURE mode: write the RAW Opus elementary stream (depay →
-            // filesink). Raw Opus packets are self-delimiting via their TOC
-            // byte, so the OFFLINE remux (`filesrc → opusparse`) can re-frame
-            // PASS-THROUGH / ENCODED: the raw AAC encoder frames are
-            // re-framed into self-describing ADTS (aacparse + adts
-            // capsfilter) so the offline remux's aacparse can consume the
-            // file with no external caps. CAPTURE: the file is the RAW Opus
-            // ES straight from the depayloader — no extra elements (a bare
-            // Opus file carries no channel/rate info, but the packet TOC
-            // itself signals mono/stereo per frame, so the offline remux's
-            // opusparse → opusdec needs no external caps).
-            let (audio_es_name, audio_caps_decl) = if self.mode == RecordingMode::Capture {
-                ("opus.es", None)
-            } else {
-                ("aac.es", Some("audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"))
-            };
+            // The AAC encoder emits raw AAC frames with no sync word;
+            // aacparse re-frames them into self-describing ADTS so the
+            // OFFLINE remux (`filesrc → aacparse`) can frame the file with
+            // no external caps.
             let audio_es_path = std::env::temp_dir().join(format!(
-                "opennow-rec-{}-{stamp}.{audio_es_name}",
+                "opennow-rec-{}-{stamp}.aac.es",
                 std::process::id()
             ));
             let audio_filesink = make_element("filesink")?;
@@ -1157,22 +1156,19 @@ impl GstreamerRecordingState {
             );
             audio_filesink.set_property("sync", false);
             audio_filesink.set_property("async", false);
-            if self.mode != RecordingMode::Capture {
-                // PASS-THROUGH / ENCODED: aacparse + ADTS capsfilter.
-                let audio_aac_parse = make_element("aacparse")?;
-                let adts_caps = make_element("capsfilter")?;
-                adts_caps.set_property(
-                    "caps",
-                    audio_caps_decl
-                        .expect("non-capture audio caps declaration")
-                        .parse::<gst::Caps>()
-                        .map_err(|error| format!("Invalid pass-through ADTS caps: {error}"))?,
-                );
-                elements.push(audio_aac_parse.clone());
-                elements.push(adts_caps.clone());
-                self.audio_aac_parse = Some(audio_aac_parse);
-                self.audio_adts_caps = Some(adts_caps);
-            }
+            // aacparse + ADTS capsfilter (all non-transcode modes).
+            let audio_aac_parse = make_element("aacparse")?;
+            let adts_caps = make_element("capsfilter")?;
+            adts_caps.set_property(
+                "caps",
+                "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"
+                    .parse::<gst::Caps>()
+                    .map_err(|error| format!("Invalid pass-through ADTS caps: {error}"))?,
+            );
+            elements.push(audio_aac_parse.clone());
+            elements.push(adts_caps.clone());
+            self.audio_aac_parse = Some(audio_aac_parse);
+            self.audio_adts_caps = Some(adts_caps);
             let eos_flag = self.audio_filesink_eos.clone();
             let audio_sink_pad = audio_filesink
                 .static_pad("sink")
@@ -1266,15 +1262,10 @@ impl GstreamerRecordingState {
                 "info",
                 format!("Attached native game-audio transcode branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → qtmux; never touches the audio playback chain)."),
             ),
-            RecordingMode::Capture => send_log(
+            RecordingMode::Capture | RecordingMode::PassThrough | RecordingMode::Encoded => send_log(
                 &self.event_sender,
                 "info",
-                "Attached native game-audio CAPTURE branch (rtp → rtpopusdepay → filesink Opus ES; zero decode/encode live — decoded to AAC only at stop, offline — never touches the audio playback chain).".to_owned(),
-            ),
-            RecordingMode::PassThrough | RecordingMode::Encoded => send_log(
-                &self.event_sender,
-                "info",
-                format!("Attached native game-audio PASS-THROUGH branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → filesink AAC ES; remuxed offline at stop — never touches the audio playback chain)."),
+                format!("Attached native game-audio ADTS branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → aacparse → filesink AAC ES; remuxed offline at stop — never touches the audio playback chain)."),
             ),
         }
         Ok(())
@@ -1645,7 +1636,8 @@ impl GstreamerRecordingState {
         // sheds it (field: parse_in=2197 vs parse_out=1813 on a lossy link,
         // while the queue shed nothing). Report the larger of the two — both
         // mechanisms mean "video lost from the clip", and with
-        // wait-for-keyframe the parse gap is the one that stays observable.
+        // wait-for-keyframe=false (see build_pass_through_record_branch) the
+        // parse gap is the one that stays observable.
         let mut dropped = self
             .queue_input
             .load(Ordering::Relaxed)
@@ -1798,8 +1790,9 @@ impl GstreamerRecordingState {
             ),
             // CAPTURE: the offline stop-time remux — H.264 muxes directly
             // (still zero re-encode), H.265/AV1 video is transcoded to
-            // universal H.264 and the raw Opus ES is decoded + re-encoded to
-            // AAC. Slow is fine: nothing watches the stream at stop.
+            // universal H.264, and the ADTS AAC audio ES (captured live) is
+            // muxed straight through. Slow is fine: nothing watches the
+            // stream at stop.
             RecordingMode::Capture => remux_capture_recording(
                 video_es.as_deref(),
                 audio_es.as_deref(),
@@ -6080,8 +6073,8 @@ fn link_rtp_video_pad(
         if slot.is_none() {
             let built = match recording_mode {
                 // Capture (the default) and PassThrough share the zero-cost
-                // raw-RTP video branch — Capture additionally stores game
-                // audio as a raw Opus ES (no live encoder) and moves ALL
+                // raw-RTP video branch; both store game audio as a live
+                // ADTS AAC ES (see build_audio_branch) and move all video
                 // encode work to the offline stop-time remux.
                 RecordingMode::PassThrough | RecordingMode::Capture => match rtp_tee.as_ref() {
                     Some(tee) => build_pass_through_record_branch(
@@ -8020,17 +8013,22 @@ pub(crate) fn build_pass_through_record_branch(
     // The branch must resync itself after a loss hole: rtph26xdepay with
     // request-keyframe=true pushes a force-key-unit event upstream on seq-gap
     // detection; it travels through the tee into webrtcbin's rtpbin session,
-    // whose rtpsession turns it into a PLI to the server — the same path the
-    // decode chain's depay uses (field-proven: the live path recovers after
-    // PLI floods). wait-for-keyframe=true then holds the ES output until that
-    // keyframe lands, so the file never contains a broken half-GOP: the
-    // recording jumps cleanly from the last good frame to the next keyframe
-    // (frames in the hole are honestly counted by the stop drop counter via
-    // parse_in−parse_out). The decode chain sets wait-for-keyframe=false (it
-    // must keep rendering); a recording has no live viewer and a clean GOP
-    // structure is worth more than the ~300 ms between loss and resync.
+    // whose rtpsession turns it into a PLI to the server. wait-for-keyframe
+    // is FALSE (as in the decode chain): waiting for the keyframe before
+    // emitting ANY output was the field truncation bug — a single
+    // NACK-unrecoverable hole mid-recording put the depay into keyframe-wait
+    // mode, and because the server's next periodic keyframe landed after the
+    // recording ended, the branch held everything and the ES stopped growing
+    // (field: 10:30 recording — 10307 RTP packets over 12 s fed the depay
+    // but only 57 AUs reached the parse; 09:50 — 6060 packets over 11 s, 589
+    // AUs). With wait-for-keyframe=false the depay emits the AU with missing
+    // slices, h265parse sheds it, and the ES continues cleanly at the next
+    // keyframe (resync via the request above or the server's own cadence) —
+    // the clip keeps its full duration with a brief jump at the loss point
+    // instead of dying for the rest of the recording. The offline remux's
+    // keyframe gate still guarantees the file starts on a fresh IDR.
     set_property_if_supported(&depay, "request-keyframe", true);
-    set_property_if_supported(&depay, "wait-for-keyframe", true);
+    set_property_if_supported(&depay, "wait-for-keyframe", false);
     // Force the parser to always parse (never passthrough) and re-emit the
     // codec config (SPS/PPS) before every keyframe: the ES file becomes
     // self-contained — every GOP starts with its own parameter sets, so the
@@ -8587,18 +8585,25 @@ fn bump_mp4_chunk_offsets(data: &mut [u8], info: &Mp4BoxInfo, delta: usize) {
     }
 }
 
-/// Inject a `colr` box (nclx: BT.709 primaries/transfer/matrix,
-/// full_range_flag=1) into the FIRST video sample entry of the MP4 held in
-/// `data`, bumping every affected ancestor size and chunk offset so the file
-/// stays structurally valid. Returns 1 when a box was injected, 0 when the
-/// sample entry already carries a colr box or the structure could not be
-/// parsed (leaves the file untouched).
+/// Ensure the FIRST video sample entry of the MP4 held in `data` carries the
+/// `colr` box (nclx: BT.709 primaries/transfer/matrix, full_range_flag=1),
+/// replacing an existing colr box when present, bumping every affected
+/// ancestor size and chunk offset so the file stays structurally valid.
+/// Returns 1 when a box was injected/replaced, 0 when the sample entry
+/// already carries EXACTLY that tag or the structure could not be parsed
+/// (leaves the file untouched).
 ///
 /// The GFN stream is FULL-RANGE BT.709 PC video (SPS VUI
 /// video_full_range_flag=1); tagging the container the same way lets players
 /// that read colr render the received full-range bitstream with correct
 /// colours — the pass-through recording keeps the exact server bitstream (no
 /// re-encode) and the colour fix is pure metadata.
+///
+/// qtmux writes its OWN colr box from the ES VUI colorimetry — and it is
+/// `nclc` (18 bytes, NO full-range flag), which players interpret as LIMITED
+/// range: the received full-range 0-255 data gets expanded → the recording
+/// renders too contrasty ("pekat"). Replacing that box (instead of skipping
+/// the injection) is what fixes the colour on real recordings.
 fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
     let top = mp4_box_children(data, 0, data.len());
     let Some(moov) = mp4_find_child(&top, b"moov") else {
@@ -8655,17 +8660,48 @@ fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
     // Splicing earlier corrupts width/height (players see 1x256 → black).
     let children_start = entry.content_offset + 78;
     let entry_children = mp4_box_children(data, children_start, entry.content_offset + entry.size);
-    if mp4_find_child(&entry_children, b"colr").is_some() {
-        return 0;
-    }
     // colr box, 20 bytes: nclx, primaries=transfer=matrix=BT.709 (1),
     // full_range_flag=1, reserved.
     let colr: [u8; 20] = [
         0x00, 0x00, 0x00, 0x14, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x', 0x00, 0x01, 0x00,
         0x01, 0x00, 0x01, 0x01, 0x00,
     ];
+    // Replace an existing colr box (qtmux's nclc — no full-range flag) so
+    // players read FULL-RANGE BT.709. If the existing box is already exactly
+    // our nclx tag, no-op. A box larger than ours (unusual) is left alone.
+    let insertion_start = if let Some(existing) = mp4_find_child(&entry_children, b"colr") {
+        let box_start = existing.content_offset - 8; // include the 8-byte header
+        if &data[box_start..box_start + existing.size] == &colr[..] {
+            return 0;
+        }
+        let delta = colr.len() as isize - existing.size as isize;
+        if delta < 0 {
+            // Existing tag carries MORE info than ours — leave it untouched.
+            return 0;
+        }
+        let delta = delta as usize;
+        data.splice(box_start..box_start + existing.size, colr);
+        // All size fields sit BEFORE the insertion point, so the pre-splice
+        // box infos stay valid for the bumps.
+        for info in [entry, stsd, stbl, minf, mdia, trak, moov] {
+            bump_mp4_box_size(data, info, delta);
+        }
+        let mdat_before_moov = mp4_find_child(&top, b"mdat")
+            .map(|mdat| mdat.content_offset < moov.content_offset)
+            .unwrap_or(false);
+        if !mdat_before_moov {
+            for stbl_box in &stbl_children {
+                if stbl_box.fourcc == *b"stco" || stbl_box.fourcc == *b"co64" {
+                    bump_mp4_chunk_offsets(data, stbl_box, delta);
+                }
+            }
+        }
+        return 1;
+    } else {
+        children_start
+    };
     let delta = colr.len();
-    data.splice(children_start..children_start, colr);
+    data.splice(insertion_start..insertion_start, colr);
     // All size fields sit BEFORE the insertion point, so the pre-splice box
     // infos stay valid for the bumps.
     for info in [entry, stsd, stbl, minf, mdia, trak, moov] {
@@ -8762,8 +8798,9 @@ fn finalize_mp4_with_colr_tag(
 /// decoded and re-encoded to universal H.264 HERE, at stop, where the
 /// encoder cannot steal GPU/CPU from the live decoder (nobody is watching
 /// the stream while the recording finalizes; the UI shows a PROCESSING
-/// pill). The Opus ES is decoded + re-encoded to AAC the same way — game
-/// audio never saw a live decoder/encoder either.
+/// pill). Game audio arrives as a live-captured ADTS AAC elementary stream
+/// and is muxed straight through (a raw-Opus ES is unframable by the
+/// offline remux — the static-audio bug, see `build_audio_branch`).
 ///
 /// Returns the output file size in bytes (0 = nothing was written).
 fn remux_capture_recording(
@@ -8917,9 +8954,9 @@ fn remux_capture_recording(
         );
     }
 
-    // Game-audio track: the raw Opus ES (captured live with no decoder) is
-    // decoded + re-encoded to AAC offline — universal playback, zero cost to
-    // the live stream. Only linked when the file actually has data.
+    // Game-audio track: the ADTS AAC elementary stream captured by the live
+    // branch is muxed straight into the MP4 — universal playback, no offline
+    // audio re-encode. Only linked when the file actually has data.
     if let Some(audio_es) = audio_es {
         if audio_es.exists()
             && std::fs::metadata(audio_es)
@@ -8934,36 +8971,23 @@ fn remux_capture_recording(
                     "Capture remux audio ES path is not valid UTF-8.".to_owned()
                 })?,
             );
-            // Raw Opus packets are self-delimiting via their TOC byte;
-            // opusparse re-frames the file. NO capsfilter between opusparse
-            // and opusdec: a bare Opus file carries no channel/rate info, but
-            // the packet TOC signals mono/stereo per frame (mapping family
-            // 0 — GFN game audio is always ≤2ch), so opusdec decodes without
-            // external caps (forcing `channels` broke negotiation
-            // field-verified).
-            let opus_parse = make_element("opusparse")?;
-            let opus_dec = make_element("opusdec")?;
-            let audio_convert = make_element("audioconvert")?;
-            let (_aac_factory, aac_encoder) = pick_aac_encoder()?;
+            // Game-audio track: the ADTS AAC elementary stream captured by
+            // the live branch (opusdec → aacenc → aacparse → ADTS filesink).
+            // ADTS framing is self-describing, so aacparse re-frames the file
+            // with no external caps. (The old raw-Opus ES was unframable —
+            // opusparse treats each filesrc buffer as one packet, so the
+            // remux decoded mis-framed garbage: the static/white-noise audio
+            // in every recording.)
             let aac_parse = make_element("aacparse")?;
-            let audio_chain: Vec<gst::Element> = vec![
-                audio_src.clone(),
-                opus_parse.clone(),
-                opus_dec.clone(),
-                audio_convert.clone(),
-                aac_encoder.clone(),
-                aac_parse.clone(),
-            ];
-            for element in &audio_chain {
-                pipeline.add(element).map_err(|error| {
-                    format!("Failed to add capture remux audio: {error}")
-                })?;
-            }
-            for pair in audio_chain.windows(2) {
-                pair[0]
-                    .link(&pair[1])
-                    .map_err(|error| format!("Failed to link capture remux audio chain: {error:?}"))?;
-            }
+            pipeline
+                .add(&audio_src)
+                .map_err(|error| format!("Failed to add capture remux audio src: {error}"))?;
+            pipeline
+                .add(&aac_parse)
+                .map_err(|error| format!("Failed to add capture remux audio parse: {error}"))?;
+            audio_src
+                .link(&aac_parse)
+                .map_err(|error| format!("Failed to link capture remux audio source: {error:?}"))?;
             // Same timestamp reconstruction for AUDIO: each AAC frame is
             // exactly 1024 samples, so a monotonic PTS ladder at 1024/rate is
             // exact (rate read from the aacparse caps, e.g. 48000).
@@ -10370,30 +10394,43 @@ mod mic_pipeline_tests {
         // idempotent on a second call. If qtmux already wrote a colr box
         // (H.265 VUI colorimetry carries through h265parse caps), the
         // injection is a correct no-op — the file already carries the tag.
-        let len_before = bytes.len();
-        let tail = bytes[bytes.len().saturating_sub(64)..].to_vec();
-        let injected = inject_mp4_colr_box(&mut bytes);
-        assert!(
-            injected == 0 || injected == 1,
-            "colr injection must return 0 (already present) or 1 (injected), got {injected}"
-        );
-        if injected == 1 {
-            assert_eq!(
-                bytes.len(),
-                len_before + 20,
-                "injection adds exactly the 20-byte colr box"
-            );
-        } else {
-            assert_eq!(bytes.len(), len_before, "no-op injection must not grow the file");
-        }
-        // The sample entry's geometry must be intact — the regression that
-        // made native recordings render black (colr spliced into the 78-byte
-        // fixed block turned width/height into 1x256).
         let entry_off = bytes
             .windows(4)
             .position(|w| w == b"hvc1" || w == b"hev1")
             .expect("h265 sample entry");
         let entry_content = entry_off + 4;
+        let len_before = bytes.len();
+        let tail = bytes[bytes.len().saturating_sub(64)..].to_vec();
+        // Expected growth: INSERT path adds exactly the 20-byte nclx box;
+        // REPLACE path swaps qtmux's colr (nclc, 18 bytes) for our 20-byte
+        // nclx (+2), and a larger existing tag makes injection a no-op (0).
+        let children_before = mp4_box_children(
+            &bytes,
+            entry_content + 78,
+            bytes.len().min(entry_content + 78 + 512),
+        );
+        let existing_colr = mp4_find_child(&children_before, b"colr").map(|c| c.size);
+        let expected_growth = match existing_colr {
+            None => 20,
+            Some(size) if size <= 20 => 20 - size,
+            Some(_) => 0,
+        };
+        let injected = inject_mp4_colr_box(&mut bytes);
+        assert!(
+            injected == 0 || injected == 1,
+            "colr injection must return 0 (already present) or 1 (injected), got {injected}"
+        );
+        assert_eq!(
+            bytes.len(),
+            len_before + expected_growth,
+            "colr injection must grow the file by exactly the nclx delta"
+        );
+        if injected == 0 {
+            assert_eq!(expected_growth, 0, "no-op injection must not grow the file");
+        }
+        // The sample entry's geometry must be intact — the regression that
+        // made native recordings render black (colr spliced into the 78-byte
+        // fixed block turned width/height into 1x256).
         assert_eq!(
             u16::from_be_bytes([bytes[entry_content + 24], bytes[entry_content + 25]]),
             1920,
@@ -10656,42 +10693,56 @@ mod mic_pipeline_tests {
         let _ = std::fs::remove_file(&out_path);
     }
 
-    /// CAPTURE-mode game audio: the raw Opus ES (captured live with NO
-    /// decoder/encoder — the whole point of the mode) must be decoded +
-    /// re-encoded to an AAC (mp4a) track OFFLINE. Generates a small Opus ES
-    /// with opusenc in a throwaway pipeline, then remuxes it together with
-    /// the field H.265 ES; skips when opusenc is unavailable.
+    /// CAPTURE-mode game audio: the ADTS AAC elementary stream captured by
+    /// the live branch must mux straight into the MP4 as an AAC (mp4a)
+    /// track at the offline stop-time remux. (The old raw-Opus ES was
+    /// unframable by `opusparse` — every recording's audio decoded to
+    /// static/white noise — so the capture branch now stores ADTS AAC; this
+    /// test feeds the same ADTS ES the branch writes.) Generates a small
+    /// ADTS AAC ES with aacenc + aacparse + ADTS capsfilter in a throwaway
+    /// pipeline, then remuxes it together with the field H.265 ES; skips
+    /// when no AAC encoder is available.
     #[test]
-    fn capture_remux_opus_audio_becomes_aac_track() {
+    fn capture_remux_adts_audio_becomes_aac_track() {
         gst::init().expect("gstreamer init");
-        let Some(opus_enc) = gst::ElementFactory::make("opusenc").build().ok() else {
-            eprintln!("opusenc unavailable — skipping capture audio remux test");
-            return;
+        let (_aac_factory, aac_enc) = match pick_aac_encoder() {
+            Ok(enc) => enc,
+            Err(_) => {
+                eprintln!("no AAC encoder available — skipping capture audio remux test");
+                return;
+            }
         };
-        let opus_path = std::env::temp_dir().join(format!(
-            "opennow-capture-opus-test-{}.opus.es",
+        let aac_path = std::env::temp_dir().join(format!(
+            "opennow-capture-adts-test-{}.aac.es",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&opus_path);
+        let _ = std::fs::remove_file(&aac_path);
         let src_pipeline = gst::Pipeline::new();
         let src = make_element("audiotestsrc").expect("audiotestsrc");
         src.set_property("num-buffers", 240i32);
         let convert = make_element("audioconvert").expect("audioconvert");
         let resample = make_element("audioresample").expect("audioresample");
-        let sink = make_element("filesink").expect("filesink");
-        sink.set_property(
-            "location",
-            opus_path.to_str().expect("opus path utf8"),
+        let aac_parse = make_element("aacparse").expect("aacparse");
+        let adts_caps = make_element("capsfilter").expect("capsfilter");
+        adts_caps.set_property(
+            "caps",
+            "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"
+                .parse::<gst::Caps>()
+                .expect("adts caps"),
         );
+        let sink = make_element("filesink").expect("filesink");
+        sink.set_property("location", aac_path.to_str().expect("aac path utf8"));
         src_pipeline
-            .add_many(&[&src, &convert, &resample, &opus_enc, &sink])
-            .expect("add opus generation chain");
+            .add_many(&[&src, &convert, &resample, &aac_enc, &aac_parse, &adts_caps, &sink])
+            .expect("add aac generation chain");
         src.link(&convert).expect("link src convert");
         convert.link(&resample).expect("link resample");
-        resample.link(&opus_enc).expect("link opusenc");
-        opus_enc.link(&sink).expect("link sink");
+        resample.link(&aac_enc).expect("link aacenc");
+        aac_enc.link(&aac_parse).expect("link aacparse");
+        aac_parse.link(&adts_caps).expect("link adts caps");
+        adts_caps.link(&sink).expect("link sink");
         src_pipeline.set_state(gst::State::Playing).expect("playing");
-        let bus = src_pipeline.bus().expect("opus bus");
+        let bus = src_pipeline.bus().expect("aac bus");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut finished = false;
         while std::time::Instant::now() < deadline {
@@ -10708,16 +10759,16 @@ mod mic_pipeline_tests {
                 }
                 gst::MessageView::Error(error) => {
                     let _ = src_pipeline.set_state(gst::State::Null);
-                    panic!("opus ES generation failed: {}", error.error());
+                    panic!("ADTS AAC ES generation failed: {}", error.error());
                 }
                 _ => {}
             }
         }
         let _ = src_pipeline.set_state(gst::State::Null);
-        assert!(finished, "opus ES generation timed out");
+        assert!(finished, "ADTS AAC ES generation timed out");
         assert!(
-            std::fs::metadata(&opus_path).map(|m| m.len()).unwrap_or(0) > 0,
-            "opus ES must be non-empty"
+            std::fs::metadata(&aac_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "ADTS AAC ES must be non-empty"
         );
         let es_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
@@ -10729,22 +10780,22 @@ mod mic_pipeline_tests {
         let _ = std::fs::remove_file(&out_path);
         let size = remux_capture_recording(
             Some(&es_path),
-            Some(&opus_path),
+            Some(&aac_path),
             &out_path,
             "H265",
             60,
             15_000,
             &None,
         )
-        .expect("capture remux with Opus audio must succeed");
+        .expect("capture remux with ADTS AAC audio must succeed");
         assert!(size > 100_000, "remux output suspiciously small: {size}");
         let bytes = std::fs::read(&out_path).expect("read remux output");
         assert!(
             bytes.windows(4).any(|w| w == b"mp4a"),
-            "Opus ES must become an AAC (mp4a) track in the MP4"
+            "ADTS AAC ES must become an AAC (mp4a) track in the MP4"
         );
         let _ = std::fs::remove_file(&out_path);
-        let _ = std::fs::remove_file(&opus_path);
+        let _ = std::fs::remove_file(&aac_path);
     }
 
     /// The start-time disk guard must demand the reference duration at the
