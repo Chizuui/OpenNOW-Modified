@@ -7934,66 +7934,130 @@ pub(crate) fn build_encoded_record_branch(
     Ok(state)
 }
 
-/// Does an RTP payload begin a complete keyframe access unit? Checks the
-/// NALs at the head of the packet for parameter sets — the start of a fresh
-/// keyframe AU. Handles single-NAL packets and the aggregation forms
-/// (H.264 STAP-A/B, H.265 AP) since some encoders pack SPS/PPS with the
-/// first IDR slices. GFN prefixes every AU with a prefix-SEI, so the sets
-/// may sit in the 2nd+ packet of the AU — the recording-start gate probes
-/// every packet of the AU, not just the first.
-pub(crate) fn payload_starts_keyframe_config(codec: &str, payload: &[u8]) -> bool {
-    let Some(&first) = payload.first() else {
-        return false;
-    };
-    match codec {
-        "H264" => match first & 0x1F {
-            // SPS (7) / PPS (8): a complete keyframe begins with these.
-            7 | 8 => true,
-            // STAP-A (24) / STAP-B (25): 16-bit length-prefixed NALs.
-            24 | 25 => {
-                let mut off = 1usize;
-                while off + 2 <= payload.len() {
-                    let len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
-                    off += 2;
-                    if off + len > payload.len() {
-                        break;
-                    }
-                    if let Some(&b) = payload.get(off) {
-                        if matches!(b & 0x1F, 7 | 8) {
-                            return true;
-                        }
-                    }
-                    off += len;
-                }
-                false
-            }
-            _ => false,
-        },
-        // H265 / HEVC
-        _ => match (first >> 1) & 0x3F {
-            // VPS (32) / SPS (33) / PPS (34).
-            32 | 33 | 34 => true,
-            // AP (48): 16-bit length-prefixed NALs.
-            48 => {
-                let mut off = 1usize;
-                while off + 2 <= payload.len() {
-                    let len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
-                    off += 2;
-                    if off + len > payload.len() {
-                        break;
-                    }
-                    if let Some(&b) = payload.get(off) {
-                        if matches!((b >> 1) & 0x3F, 32 | 33 | 34) {
-                            return true;
-                        }
-                    }
-                    off += len;
-                }
-                false
-            }
-            _ => false,
-        },
+/// Does a depay-output byte-stream buffer (access-unit NALs prefixed with
+/// start codes) carry the parameter sets that begin a COMPLETE keyframe?
+/// H.265: VPS/SPS/PPS (types 32/33/34); H.264: SPS/PPS (7/8). GFN repeats
+/// the sets immediately before every IDR (observed twice in a real 65 s
+/// field capture, gfn_field.h265 offsets 0 and 1357503) and the parser
+/// re-injects them on every keyframe anyway (config-interval=-1 below), so
+/// an AU carrying them is the head of a fresh keyframe and the offline remux
+/// can decode it. This scans the DEPAY OUTPUT (the recording-start gate
+/// probes the parser's src pad) — the only place the sets are reliably
+/// visible: at the RTP level they hide behind GFN's variable-length payload
+/// wrapper + 0xBEDE extension, and the RTP-level gate never matched (the
+/// 0-byte-ES field bug).
+pub(crate) fn byte_stream_au_has_param_sets(codec: &str, bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < bytes.len() {
+        // Start codes: 00 00 01 (3-byte) or 00 00 00 01 (4-byte).
+        if bytes[i] != 0 || bytes[i + 1] != 0 {
+            i += 1;
+            continue;
+        }
+        let nal_off = if bytes.get(i + 2) == Some(&1) {
+            i + 3
+        } else if bytes.get(i + 2) == Some(&0) && bytes.get(i + 3) == Some(&1) {
+            i + 4
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some(&header) = bytes.get(nal_off) else {
+            break;
+        };
+        let is_config = match codec {
+            "H264" => matches!(header & 0x1F, 7 | 8),
+            _ => matches!((header >> 1) & 0x3F, 32 | 33 | 34),
+        };
+        if is_config {
+            return true;
+        }
+        i = nal_off;
     }
+    false
+}
+
+/// Does a depay-output OBU-stream buffer (one AV1 frame in the low-overhead
+/// format the branch's gfnav1depay emits — each OBU a header byte with the
+/// size field forced on, a leb128 size, then the payload) carry a KEY frame?
+/// Walks the OBUs and parses the frame header's first bits per AV1 spec
+/// §5.9.2: show_existing_frame f(1), then frame_type f(2) when not showing
+/// an existing frame. KEY_FRAME=0, so a frame header with
+/// show_existing_frame=0 and frame_type=0 marks the head of a complete
+/// keyframe AU. GFN repeats the sequence header with its keyframes (the AV1
+/// analog of the H.265 VPS/SPS/PPS repetition), so the AU that opens the
+/// gate is self-contained for the offline remux.
+pub(crate) fn obu_stream_au_has_keyframe(bytes: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let Some(&b) = bytes.get(pos) else {
+            break;
+        };
+        // OBU header (AV1 spec §5.3.1): forbidden bit 0, type 1-8 or 15
+        // (TileList). Anything else is not a parseable OBU head.
+        let obu_type = (b >> 3) & 0x0f;
+        if b & 0x80 != 0 || obu_type == 0 || (obu_type >= 9 && obu_type != 15) {
+            break;
+        }
+        let has_extension = (b & 0x04) != 0;
+        let has_size = (b & 0x02) != 0;
+        pos += 1;
+        if has_extension {
+            pos += 1;
+        }
+        if !has_size {
+            // No size field: cannot locate the next OBU — stop scanning.
+            break;
+        }
+        // leb128 size field.
+        let mut size: u64 = 0;
+        let mut shift = 0u32;
+        let mut size_ok = false;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            pos += 1;
+            size |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                size_ok = true;
+                break;
+            }
+            shift += 7;
+            if shift >= 63 {
+                break;
+            }
+        }
+        if !size_ok {
+            break;
+        }
+        let Some(payload_end) = pos.checked_add(size as usize) else {
+            break;
+        };
+        if payload_end > bytes.len() {
+            break;
+        }
+        let payload = &bytes[pos..payload_end];
+        match obu_type {
+            // OBU_FRAME_HEADER (3) / OBU_FRAME (6): the payload opens with
+            // show_existing_frame f(1), then frame_type f(2) (spec §5.9.2).
+            // A frame header is authoritative for this buffer — the AU is a
+            // keyframe only if frame_type == KEY_FRAME (0).
+            3 | 6 => {
+                if let Some(&first) = payload.first() {
+                    let show_existing_frame = first & 0x80 != 0;
+                    let frame_type = if show_existing_frame {
+                        1
+                    } else {
+                        (first >> 5) & 0x03
+                    };
+                    return frame_type == 0;
+                }
+                return false;
+            }
+            _ => {}
+        }
+        pos = payload_end;
+    }
+    false
 }
 
 /// Native recording branch — PASS-THROUGH (bitstream remux). Taps the RAW
@@ -8023,13 +8087,14 @@ pub(crate) fn payload_starts_keyframe_config(codec: &str, payload: &[u8]) -> boo
 ///
 /// The recording-START keyframe gate (drop everything until the first
 /// COMPLETE keyframe AU — the idr_gate probe in the body below) lives at the
-/// RTP tap, NOT the offline remux: the first AU after the valve opens is a
-/// partial keyframe (its head packets arrived before record start) and the
-/// offline remux starts at the first AU that decodes, which IS that partial
-/// keyframe — the flat-gray first frame. The gate opens once at the first
-/// AU carrying parameter sets and never re-arms, so a server keyframe that
-/// lands late (GFN H265 GOPs can run ~9 s) delays the file head but never
-/// black-holes the rest of the recording.
+/// parser's OUTPUT (the depay output after config re-injection), NOT the
+/// offline remux: the first AU after the valve opens is a partial keyframe
+/// (its head packets arrived before record start) and the offline remux
+/// starts at the first AU that decodes, which IS that partial keyframe —
+/// the flat-gray first frame. The gate opens once at the first AU carrying
+/// parameter sets (or an AV1 KEY frame) and never re-arms, so a server
+/// keyframe that lands late (GFN H265 GOPs can run ~9 s) delays the file
+/// head but never black-holes the rest of the recording.
 pub(crate) fn build_pass_through_record_branch(
     pipeline: &gst::Pipeline,
     rtp_tee: &gst::Element,
@@ -8469,32 +8534,41 @@ pub(crate) fn build_pass_through_record_branch(
     // glitch at the head of every recording: 15:41 recording frame 0 decoded
     // to a uniform 128-gray 1080p frame, p1=124/p99=132). The OFFLINE remux
     // cannot fix it — it starts at the first AU that decodes, which IS the
-    // partial keyframe — so the gate lives HERE at the RTP level, where the
-    // partial AU's head is still distinguishable by its missing parameter
-    // sets. start() arms `idr_gate` (and asks the server for a keyframe over
-    // signaling), the probe drops every packet until the first AU carrying
-    // parameter sets (VPS/SPS/PPS for H.265, SPS/PPS for H.264), then opens
-    // PERMANENTLY: it never re-arms on a later loss hole (that was the
-    // wait-for-keyframe=true truncation bug), so the file starts on a clean
-    // keyframe and keeps its full duration. AV1 is left ungated (the depay
-    // re-frames OBUs itself and GFN AV1 sessions are rare here; the glitch is
-    // cosmetic).
+    // partial keyframe — so the gate lives at the parser's OUTPUT (the depay
+    // output after config re-injection), where the partial AU is still
+    // distinguishable by its missing parameter sets. start() arms `idr_gate`
+    // (and asks the server for a keyframe over signaling), the probe drops
+    // every AU until one carries parameter sets (VPS/SPS/PPS for H.265,
+    // SPS/PPS for H.264) or is an AV1 KEY frame, then opens PERMANENTLY: it
+    // never re-arms on a later loss hole (that was the wait-for-keyframe=true
+    // truncation bug), so the file starts on a clean keyframe and keeps its
+    // full duration.
     let idr_gate = Arc::new(AtomicBool::new(true));
-    if matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC") {
+    if matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC" | "AV1") {
         let gate = idr_gate.clone();
         let gate_codec = codec_upper.clone();
         let gate_sender = event_sender.clone();
-        // AU-boundary tracking across the WHOLE tap flow (the probe runs from
-        // branch attach, minutes before a recording, so the state is accurate
-        // when start() re-arms the gate). prev_marker = marker bit of the
-        // previous packet; the packet right after a marker (or the first
-        // packet) begins a new AU and re-opens the scan window.
-        let prev_marker = Arc::new(AtomicBool::new(false));
-        let au_window = Arc::new(AtomicBool::new(true));
-        let gate_sink = valve
-            .static_pad("sink")
-            .ok_or_else(|| "Pass-through gate: valve has no sink pad.".to_owned())?;
-        gate_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        // The gate probes the PARSER's SRC pad — the DEPAY OUTPUT after the
+        // parser re-injected the codec config (config-interval=-1 above
+        // prepends VPS/SPS/PPS before every keyframe). At the RTP level the
+        // parameter sets are invisible behind GFN's variable-length payload
+        // wrapper + 0xBEDE extension (the RTP-level gate never matched and
+        // every recording wrote a 0-byte ES — the 2026-08-16 field sessions),
+        // but by this pad the wrapper is gone: H.264/H.265 buffers are one
+        // complete access unit in byte-stream form (start-code NALs), and AV1
+        // buffers are one frame in low-overhead OBU form. An AU carrying
+        // VPS/SPS/PPS (H.265) or SPS/PPS (H.264) — or an AV1 frame header
+        // whose frame_type is KEY_FRAME — is the head of a complete keyframe
+        // (the parser guarantees the H.26x sets on every IDR, GFN repeats
+        // them itself too, and GFN repeats the AV1 sequence header with its
+        // keyframes), so open the gate and keep the AU. Drop until then; open
+        // PERMANENTLY (never re-arms on a later loss hole — the
+        // wait-for-keyframe=true truncation bug), so the file starts on a
+        // clean keyframe and keeps its full duration.
+        let gate_parse = parse
+            .static_pad("src")
+            .ok_or_else(|| "Pass-through gate: parser has no src pad.".to_owned())?;
+        gate_parse.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
             if !gate.load(Ordering::Relaxed) {
                 return gst::PadProbeReturn::Ok;
             }
@@ -8503,20 +8577,12 @@ pub(crate) fn build_pass_through_record_branch(
             };
             let map = buffer.map_readable();
             let bytes = map.as_deref().unwrap_or(&[]);
-            let marker = bytes.get(1).map(|b| b & 0x80 != 0).unwrap_or(false);
-            // GFN video packets carry the standard 12-byte RTP header.
-            let payload = bytes.get(12..).unwrap_or(&[]);
-            let head = !prev_marker.swap(marker, Ordering::Relaxed);
-            if head {
-                au_window.store(true, Ordering::Relaxed);
-            }
-            // Parameter sets inside this AU = the head of a complete keyframe
-            // (GFN prefixes every AU with a prefix-SEI, so the sets can be the
-            // 2nd+ packet of the AU). Open the gate, keep THIS packet — the
-            // ES then begins [VPS/SPS/PPS, IDR slices...] and decodes clean.
-            if au_window.load(Ordering::Relaxed)
-                && payload_starts_keyframe_config(&gate_codec, payload)
-            {
+            let starts_keyframe = if gate_codec == "AV1" {
+                obu_stream_au_has_keyframe(bytes)
+            } else {
+                byte_stream_au_has_param_sets(&gate_codec, bytes)
+            };
+            if starts_keyframe {
                 gate.store(false, Ordering::Relaxed);
                 send_log(
                     &gate_sender,
@@ -8526,9 +8592,6 @@ pub(crate) fn build_pass_through_record_branch(
                     ),
                 );
                 return gst::PadProbeReturn::Ok;
-            }
-            if marker {
-                au_window.store(false, Ordering::Relaxed);
             }
             gst::PadProbeReturn::Drop
         });
@@ -8961,6 +9024,19 @@ fn remux_capture_recording(
     let Some(video_es) = video_es else {
         return Err("Capture remux: no video elementary stream file.".to_owned());
     };
+    // A 0-byte ES (the recording ended before the keyframe gate could open on
+    // a complete keyframe) decodes to nothing — report it clearly instead of
+    // letting avdec fail with the cryptic "No valid frames decoded before
+    // end of stream".
+    let es_size = std::fs::metadata(video_es)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if es_size == 0 {
+        return Err(
+            "Capture remux: the video elementary stream is empty — the recording captured no video frames (it may have ended before the next keyframe arrived)."
+                .to_owned(),
+        );
+    }
     let codec_upper = codec.to_ascii_uppercase();
     let parse_factory = match codec_upper.as_str() {
         "H264" => "h264parse",
@@ -10462,41 +10538,76 @@ mod mic_pipeline_tests {
     }
 
     /// The recording-start keyframe gate recognizes the head of a COMPLETE
-    /// keyframe AU from the RTP payload alone: H.265 VPS/SPS/PPS (32/33/34)
-    /// and H.264 SPS/PPS (7/8) — single NAL or packed in an aggregation
-    /// packet — while mid-GOP slice NALs and GFN's prefix-SEI AU heads must
-    /// NOT trigger it (a prefix-SEI head is what a PARTIAL keyframe's tail
-    /// looks like; gating on it would reopen the gray-first-frame bug).
+    /// keyframe AU from the depay output — byte-stream NALs prefixed with
+    /// start codes, exactly what the parser's src pad sees: H.265
+    /// VPS/SPS/PPS (32/33/34) and H.264 SPS/PPS (7/8) open the gate, while
+    /// mid-GOP slice NALs must NOT trigger it (a keyframe without its
+    /// parameter sets is what a PARTIAL keyframe's tail looks like; gating
+    /// on it would reopen the gray-first-frame bug).
     #[test]
-    fn payload_keyframe_config_detection() {
-        // H.265: VPS/SPS/PPS single-NAL head (GFN keyframe AU start).
-        assert!(payload_starts_keyframe_config("H265", &[0x40, 0x01, 0x0c, 0x01])); // VPS
-        assert!(payload_starts_keyframe_config("H265", &[0x42, 0x01, 0x01, 0x60])); // SPS
-        assert!(payload_starts_keyframe_config("H265", &[0x44, 0x01, 0xc0, 0x93])); // PPS
-        // H.265: prefix-SEI (31) AU head — must NOT open the gate.
-        assert!(!payload_starts_keyframe_config("H265", &[0xbe, 0xde, 0x00, 0x02]));
-        // H.265: IDR slice NAL (19/20) and trailing slices — NOT a config head.
-        assert!(!payload_starts_keyframe_config("H265", &[0x26, 0x01, 0xaf, 0x01]));
-        assert!(!payload_starts_keyframe_config("H265", &[0x28, 0x01, 0xaf, 0x01]));
-        // H.265: AP (48) carrying SPS inside must still open.
-        // AP: [0x60, len_hi, len_lo, SPS(0x42...), ...]
-        assert!(payload_starts_keyframe_config(
-            "H265",
-            &[0x60, 0x00, 0x04, 0x42, 0x01, 0x01, 0x60]
-        ));
-        // H.264: SPS (7) / PPS (8) single NAL.
-        assert!(payload_starts_keyframe_config("H264", &[0x67, 0x42, 0xc0, 0x1e])); // SPS
-        assert!(payload_starts_keyframe_config("H264", &[0x68, 0xce, 0x3c, 0x80])); // PPS
-        // H.264: STAP-A (24) with PPS inside must open.
-        assert!(payload_starts_keyframe_config(
-            "H264",
-            &[0x78, 0x00, 0x03, 0x68, 0xce, 0x3c]
-        ));
-        // H.264: IDR slice (5) and P-slice (1) must NOT open.
-        assert!(!payload_starts_keyframe_config("H264", &[0x65, 0x88, 0x84, 0x21]));
-        assert!(!payload_starts_keyframe_config("H264", &[0x41, 0x9a, 0x24, 0x01]));
-        // Empty payload never opens.
-        assert!(!payload_starts_keyframe_config("H265", &[]));
+    fn byte_stream_keyframe_au_detection() {
+        // Real GFN H.265 keyframe AU head (gfn_field.h265 offsets 0/28/83):
+        // VPS, SPS, PPS, then the IDR — 4- and 3-byte start codes mixed.
+        let keyframe_au = [
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, // VPS
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, // SPS
+            0x00, 0x00, 0x01, 0x44, 0x01, 0xc1, 0x93, 0x7c, 0x0c, 0xc9, // PPS (3-byte code)
+            0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, 0x0a, 0x60, // IDR_W_RADL
+        ];
+        assert!(byte_stream_au_has_param_sets("H265", &keyframe_au));
+        // A mid-GOP trailing AU (only TRAIL_R slice NALs, type 1) must NOT open.
+        let trailing = [0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0xd0, 0x08, 0xbf];
+        assert!(!byte_stream_au_has_param_sets("H265", &trailing));
+        // H.264: SPS (7) / PPS (8) open; IDR (5) does not.
+        let h264_key = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1e, 0x00, 0x00, 0x00, 0x01, 0x68,
+            0xce, 0x3c, 0x80,
+        ];
+        assert!(byte_stream_au_has_param_sets("H264", &h264_key));
+        let h264_idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21];
+        assert!(!byte_stream_au_has_param_sets("H264", &h264_idr));
+        // Empty data and NALs without a start code never open.
+        assert!(!byte_stream_au_has_param_sets("H265", &[]));
+        assert!(!byte_stream_au_has_param_sets("H265", &[0x40, 0x01, 0x0c, 0x01]));
+    }
+
+    /// The AV1 recording-start gate recognizes a KEY frame from the depay
+    /// output — the low-overhead OBU-stream the branch's gfnav1depay emits
+    /// (header byte with the size field forced on, leb128 size, payload).
+    /// Walks the OBUs and parses the frame header's frame_type per AV1 spec
+    /// §5.9.2: show_existing_frame f(1), then frame_type f(2). Only
+    /// KEY_FRAME (0) opens the gate; inter/intra-only frames and
+    /// show-existing-frame headers must not.
+    #[test]
+    fn obu_stream_keyframe_detection() {
+        // Build OBUs the way gfnav1depay translates them: header = (type<<3)
+        // | 0x02 (has_size_field), then a leb128 size, then the payload.
+        let td = [0x12, 0x00]; // type 2 TemporalDelimiter, empty payload
+        let sh = [0x0a, 0x04, 0x81, 0x82, 0x83, 0x84]; // type 1 SequenceHeader
+        let fh_key = [0x1a, 0x01, 0x00]; // type 3 FrameHeader, frame_type=0 (KEY_FRAME)
+        let fh_inter = [0x1a, 0x01, 0x20]; // type 3, frame_type=1 (INTER_FRAME)
+        let fh_show_existing = [0x1a, 0x01, 0x80]; // show_existing_frame=1
+        let tg = [0x22, 0x02, 0xaa, 0xbb]; // type 4 TileGroup
+        // Keyframe AU: TD, SH, FH(KEY), TG — must open.
+        let mut key_au = Vec::new();
+        key_au.extend_from_slice(&td);
+        key_au.extend_from_slice(&sh);
+        key_au.extend_from_slice(&fh_key);
+        key_au.extend_from_slice(&tg);
+        assert!(obu_stream_au_has_keyframe(&key_au));
+        // A bare OBU_FRAME (type 6, combined header + tiles) must also open.
+        let frame6_key = [0x32, 0x01, 0x00]; // type 6, frame_type=0
+        assert!(obu_stream_au_has_keyframe(&frame6_key));
+        // Inter frame (same AU shape) must NOT open.
+        let mut inter_au = Vec::new();
+        inter_au.extend_from_slice(&td);
+        inter_au.extend_from_slice(&fh_inter);
+        assert!(!obu_stream_au_has_keyframe(&inter_au));
+        // show_existing_frame=1 is not a keyframe.
+        assert!(!obu_stream_au_has_keyframe(&fh_show_existing));
+        // Empty data and an OBU with the forbidden bit set never open.
+        assert!(!obu_stream_au_has_keyframe(&[]));
+        assert!(!obu_stream_au_has_keyframe(&[0xff, 0x00]));
     }
 
     /// The hardware encoder must be preferred over software when the runtime
