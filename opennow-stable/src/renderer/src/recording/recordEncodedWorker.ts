@@ -623,14 +623,34 @@ async function finalize(): Promise<void> {
 // The RTCRtpScriptTransform constructor fires this event at the worker for
 // EACH transform attached (video + audio receivers), carrying the transformer
 // with its readable/writable stream pair + the options passed at construction
-// ({ kind: "video" | "audio" }).
+// ({ kind: "video" | "audio" }). Diag once per delivered transformer so a
+// header-only recording can distinguish "Chromium never invoked the transform"
+// (event absent) from "event fired but no frame ever arrived" (event present,
+// no first-frame diag).
+function handleTransformer(transformer: RtcTransformer): void {
+  const kind = transformer.options?.kind ?? "video";
+  postDiag(
+    `encoded transform delivered kind=${kind} options=${JSON.stringify(transformer.options ?? null)}`,
+  );
+  pumpTasks.push(pump(transformer, kind));
+}
+
 self.onrtctransform = (event: { transformer: RtcTransformer }): void => {
-  const kind = event.transformer.options?.kind ?? "video";
-  pumpTasks.push(pump(event.transformer, kind));
+  handleTransformer(event.transformer);
 };
 
 self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
   const data = event.data;
+  // Legacy transformer delivery (older Chromium/Firefox): the transformer was
+  // posted as a message payload (`event.data.transformer` / `.rtctransform`)
+  // instead of the `rtctransform` event. Accept both so recordings still work
+  // on runtimes that predate the event.
+  const legacyTransformer = (data as { transformer?: unknown }).transformer ??
+    (data as { rtctransform?: unknown }).rtctransform;
+  if (legacyTransformer !== undefined && legacyTransformer !== null) {
+    handleTransformer(legacyTransformer as RtcTransformer);
+    return;
+  }
   if (data.type === "init") {
     setup(data);
   } else if (data.type === "mic-pcm") {

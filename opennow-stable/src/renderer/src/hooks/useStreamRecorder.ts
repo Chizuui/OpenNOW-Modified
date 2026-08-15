@@ -628,6 +628,20 @@ export function useStreamRecorder({
     // Receiver-side encoded capture (bitstream pre-decode) wins whenever it is
     // available: zero re-encode, so the recording cap does not apply.
     const encodedCapture = inspectEncodedCapture(getActiveWebRtcPeerConnection(), video, stream);
+    if (encodedCapture === null) {
+      // Make the HEVC bypass visible from the exported log: Chromium never
+      // delivers receiver-transform frames for H.265 (runtime-verified), so
+      // the recorder silently falls back to the MediaRecorder path here.
+      const pc = getActiveWebRtcPeerConnection();
+      const videoMime =
+        pc?.getReceivers().find((receiver) => receiver.track?.kind === "video")?.getParameters()
+          .codecs[0]?.mimeType ?? "";
+      if (videoMime.toLowerCase().includes("hevc")) {
+        console.info(
+          "[StreamView] HEVC negotiated — Chromium does not deliver receiver encoded transforms for H.265; recording via the MediaRecorder path instead.",
+        );
+      }
+    }
     const { strategy, mimeType, reason } = await selectRecordingStrategy(
       (candidate) => MediaRecorder.isTypeSupported(candidate),
       {

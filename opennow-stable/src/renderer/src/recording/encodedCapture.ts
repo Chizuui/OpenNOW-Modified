@@ -871,6 +871,14 @@ export function inspectEncodedCapture(
   const videoMime = videoReceiver.getParameters().codecs[0]?.mimeType ?? "";
   const codec = encodedCodecFromMime(videoMime);
   if (!codec) return null;
+  // Chromium does not deliver receiver-side encoded transform frames for
+  // H.265/HEVC: the receive path decodes via the platform (hardware) decoder
+  // and the insertable-streams hook is never invoked. Runtime-verified — a
+  // live HEVC session decoded 600 frames at 59 fps while the attached
+  // transform received zero frames and the recording finalized header-only
+  // (~1 KB). Fall back to the MediaRecorder path (decoded-pixel capture) so
+  // web recordings of HEVC sessions actually contain video.
+  if (codec === "hevc") return null;
   const videoTrackSettings = stream.getVideoTracks()[0]?.getSettings() ?? {};
   const width = video.videoWidth || videoTrackSettings.width || 0;
   const height = video.videoHeight || videoTrackSettings.height || 0;
