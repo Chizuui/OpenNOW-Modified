@@ -3104,6 +3104,39 @@ pub(crate) fn watch_rtp_payload_dump(
     video_liveness: VideoLivenessMonitor,
     event_sender: &Option<Sender<Event>>,
 ) {
+    // GFN RTP packets carry an RFC 5285 extension header (0xBEDE).
+    // This helper parses the RTP header and skips to the actual payload.
+    #[inline]
+    fn strip_rtp_header(bytes: &[u8]) -> Option<&[u8]> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let v_pxcc = bytes[0];
+        let version = v_pxcc >> 6;
+        if version != 2 {
+            return None;
+        }
+        let has_extension = (v_pxcc & 0x10) != 0;
+        let csrc_count = (v_pxcc & 0x0f) as usize;
+        let mut offset = 12 + csrc_count * 4;
+        if bytes.len() < offset {
+            return None;
+        }
+        // RFC 3550 §5.3.1: extension header = 4 bytes (profile + 16-bit word-count)
+        // followed by `length` 32-bit words of extension data. Must skip all of it.
+        if has_extension {
+            if bytes.len() < offset + 4 {
+                return None;
+            }
+            let ext_len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            offset = offset.checked_add(4 + ext_len * 4)?;
+            if bytes.len() < offset {
+                return None;
+            }
+        }
+        Some(&bytes[offset..])
+    }
+
     let codec_upper = codec.to_ascii_uppercase();
     if !matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC" | "AV1") {
         return;
@@ -3129,9 +3162,9 @@ pub(crate) fn watch_rtp_payload_dump(
         };
         let map = buffer.map_readable();
         let bytes = map.as_deref().unwrap_or(&[]);
-        // Skip the 12-byte RTP header: payload starts after it (no CSRC/extension
-        // handling here — GFN video packets carry the standard 12-byte header).
-        let payload = bytes.get(12..).unwrap_or(&[]);
+        // GFN video packets carry an RFC 5285 extension header (0xBEDE).
+        // Use the helper to properly skip to the actual payload.
+        let payload = strip_rtp_header(bytes).unwrap_or(&[]);
         let marker = bytes.get(1).map(|b| b & 0x80 != 0).unwrap_or(false);
         let mut seq_bytes = [0u8; 2];
         if let Some(slice) = bytes.get(2..4) {
