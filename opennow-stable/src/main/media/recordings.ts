@@ -2,7 +2,7 @@ import { app } from "electron";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   RecordingAbortRequest,
@@ -12,6 +12,7 @@ import type {
   RecordingDeleteRequest,
   RecordingEntry,
   RecordingFinishRequest,
+  RecordingInstallRequest,
 } from "@shared/gfn";
 import {
   assertSafeMediaId,
@@ -136,6 +137,34 @@ export async function appendRecordingChunk(
       else resolve();
     });
   });
+}
+
+/**
+ * Native streamer handoff: the finalized MP4 already exists as a complete
+ * file (written by the offline remux worker in its temp dir). Close the
+ * (empty) chunk stream, then move the file into this recording's temp slot
+ * so `finishRecording`'s rename to the final name works unchanged. The move
+ * is copy + unlink — the native temp dir and the recordings directory can
+ * live on different volumes, where a plain rename would fail with EXDEV.
+ */
+export async function installRecordingFile(
+  input: RecordingInstallRequest,
+): Promise<void> {
+  const rec = activeRecordings.get(input.recordingId);
+  if (!rec) {
+    throw new Error("Unknown recording id");
+  }
+  // Close the never-written chunk stream so the temp path can be replaced.
+  await new Promise<void>((resolve, reject) => {
+    rec.writeStream.end((err?: Error | null) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+  await copyFile(input.sourcePath, rec.tempPath);
+  // Best-effort: the source lives in the OS temp dir; if the unlink fails
+  // the OS will reap it eventually.
+  await unlink(input.sourcePath).catch(() => undefined);
 }
 
 export async function finishRecording(

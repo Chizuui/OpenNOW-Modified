@@ -298,7 +298,10 @@ export function useStreamRecorder({
         await window.openNow.startNativeRecording(recordingId);
       } catch (error) {
         console.error("[StreamView] Failed to start native recording:", error);
-        setRecordingError("Could not start recording.");
+        // Surface the native streamer's reason (e.g. the disk-space guard
+        // refusing a start) instead of hiding it behind a generic message.
+        const detail = error instanceof Error && error.message ? error.message : "";
+        setRecordingError(detail ? `Could not start recording: ${detail}` : "Could not start recording.");
         return;
       }
       recordingIdRef.current = recordingId;

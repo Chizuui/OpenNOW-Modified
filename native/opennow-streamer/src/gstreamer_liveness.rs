@@ -6436,7 +6436,7 @@ mod stacked_window_dance_diagnostics {
     /// rebuilt the wiring manually and never caught it; this test calls the
     /// REAL production function and asserts the muxer→swallow link exists.
     #[test]
-    fn recording_branch_links_muxer_to_swallow() {
+    fn recording_branch_links_muxer_to_filesink() {
         gst::init().expect("gstreamer init");
         let pipeline = gst::Pipeline::new();
         let rtp_tee = gst::ElementFactory::make("tee").build().expect("tee");
@@ -6452,15 +6452,17 @@ mod stacked_window_dance_diagnostics {
         )
         .expect("build recording branch");
         let muxer = state.muxer.as_ref().expect("transcode muxer");
-        let swallow = state.swallow.as_ref().expect("transcode swallow");
+        let transcode_filesink =
+            state.transcode_filesink.as_ref().expect("transcode filesink");
         let muxer_src = muxer.static_pad("src").expect("muxer src pad");
-        let swallow_sink = swallow.static_pad("sink").expect("swallow sink pad");
-        let linked = muxer_src.peer().is_some_and(|peer| peer == swallow_sink);
-        eprintln!("DIAG muxer->swallow linked: {linked}");
+        let filesink_sink =
+            transcode_filesink.static_pad("sink").expect("transcode filesink sink pad");
+        let linked = muxer_src.peer().is_some_and(|peer| peer == filesink_sink);
+        eprintln!("DIAG muxer->filesink linked: {linked}");
         let _ = pipeline.set_state(gst::State::Null);
         assert!(
             linked,
-            "qtmux src pad must be linked to the swallow sink pad; without it the muxer never aggregates (no chunks) and EOS never finalizes"
+            "qtmux src pad must be linked to the transcode filesink sink pad; without it the muxer never aggregates and EOS never finalizes"
         );
     }
 
@@ -6993,6 +6995,21 @@ mod stacked_window_dance_diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Collect the finalized recording file the offline-remux finalize
+    /// delivered as a `recording-ready` event (a COMPLETE MP4 on disk — the
+    /// base64 chunk pipeline is gone for the pass-through/encoded/capture
+    /// modes). Returns the path; panics when no ready event arrived.
+    fn collect_recording_ready_path(
+        rx: &std::sync::mpsc::Receiver<Event>,
+    ) -> std::path::PathBuf {
+        let mut path: Option<std::path::PathBuf> = None;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RecordingReady { path: ready, .. } = event {
+                path = Some(std::path::PathBuf::from(ready));
+            }
+        }
+        path.expect("recording-ready event with a file path")
+    }
 
     /// The adaptive pre-decode jitter buffer must rest at the shallow depth on
     /// stable links (low drag latency), deepen CONTINUOUSLY as the RTT rises,
@@ -7379,7 +7396,6 @@ mod tests {
     #[test]
     fn transcode_recording_finalizes_into_seekable_mp4() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -7458,25 +7474,16 @@ mod tests {
             eprintln!("DIAG e2e transcode round: queue_in={q0}->{q1} enc_out={e0}->{e1}");
             state.stop(true).expect("finalize recording");
 
-            let mut file_bytes: Vec<u8> = Vec::new();
-            let mut chunk_count = 0usize;
-            while let Ok(event) = rx.try_recv() {
-                if let Event::RecordingChunk { chunk_base64 } = event {
-                    chunk_count += 1;
-                    file_bytes.extend(
-                        BASE64_STANDARD
-                            .decode(chunk_base64)
-                            .expect("valid base64 chunk"),
-                    );
-                }
-            }
-            eprintln!(
-                "DIAG e2e transcode finalize: chunks={chunk_count} file_bytes={}",
-                file_bytes.len()
-            );
+            let ready_path = collect_recording_ready_path(&rx);
             assert!(
-                chunk_count >= 1,
-                "finalized recording produced no chunk at the muxer output"
+                ready_path.exists(),
+                "finalized recording produced no recording-ready file"
+            );
+            let file_bytes = std::fs::read(&ready_path).expect("read finalized recording file");
+            let _ = std::fs::remove_file(&ready_path);
+            eprintln!(
+                "DIAG e2e transcode finalize: file_bytes={}",
+                file_bytes.len()
             );
             assert!(
                 file_bytes.len() > 50_000,
@@ -7555,7 +7562,6 @@ mod tests {
     #[test]
     fn pass_through_recording_remuxes_received_bitstream() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -7610,6 +7616,7 @@ mod tests {
             "H264",
             30,
             Some(tx),
+            crate::gstreamer_pipeline::RecordingMode::PassThrough,
         )
         .expect("build pass-through branch");
 
@@ -7648,24 +7655,17 @@ mod tests {
 
         state.stop(true).expect("finalize recording");
 
-        // The finalized MP4 must arrive as at least one chunk starting with
-        // ftyp and carrying a real mdat payload (the IDR gate opened on the
-        // stream's keyframes, so the file has actual video data).
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        // The finalized MP4 must arrive as a complete `recording-ready` file
+        // starting with ftyp and carrying a real mdat payload (the IDR gate
+        // opened on the stream's keyframes, so the file has actual video
+        // data).
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "pass-through recording produced no muxer chunks"
+            ready_path.exists(),
+            "pass-through recording produced no recording-ready file"
         );
-        let file = chunks.concat();
+        let file = std::fs::read(&ready_path).expect("read finalized recording file");
+        let _ = std::fs::remove_file(&ready_path);
         assert!(
             file.len() >= 8 && &file[4..8] == b"ftyp",
             "pass-through file must be an MP4 (size+ftyp), got {:?}",
@@ -7696,7 +7696,6 @@ mod tests {
     #[test]
     fn pass_through_recording_video_branch_stays_live() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -7754,6 +7753,7 @@ mod tests {
             "H264",
             30,
             Some(tx),
+            crate::gstreamer_pipeline::RecordingMode::PassThrough,
         )
         .expect("build pass-through branch");
 
@@ -7826,23 +7826,14 @@ mod tests {
         );
         state.stop(true).expect("finalize recording");
 
-        // The finalize must deliver the muxed MP4 as a chunk (the swallow's
-        // sticky seeding keeps the EOS buffer from being dropped with
-        // FLOW_ERROR).
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        // The finalize must deliver the complete MP4 file via
+        // `recording-ready`.
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "pass-through finalize lost the MP4 chunk (swallow FLOW_ERROR?)"
+            ready_path.exists(),
+            "pass-through finalize produced no recording-ready file"
         );
+        let _ = std::fs::remove_file(&ready_path);
         let _ = pipeline.set_state(gst::State::Null);
         // 10 s at 30 fps ≈ 300 AUs. A wedge at ~2 s leaves only ~60-80 AUs
         // and a stop_age of ~2000 ms. The recorded field clip showed exactly
@@ -7880,7 +7871,6 @@ mod tests {
     #[ignore = "harness cannot produce H265 RTP (rtph265pay stalls on NONE timestamps from raw ES files)"]
     fn field_repro_pass_through_h265_writes_es() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -7966,6 +7956,7 @@ mod tests {
             "H265",
             60,
             Some(tx),
+            crate::gstreamer_pipeline::RecordingMode::PassThrough,
         )
         .expect("build pass-through branch");
         std::thread::sleep(Duration::from_millis(600));
@@ -8018,24 +8009,18 @@ mod tests {
         );
 
         state.stop(true).expect("finalize recording");
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "pass-through finalize produced no chunk"
+            ready_path.exists(),
+            "pass-through finalize produced no recording-ready file"
         );
         eprintln!(
-            "FIELD-REPRO mp4 chunk: {} bytes",
-            chunks.iter().map(|c| c.len()).sum::<usize>()
+            "FIELD-REPRO mp4 ready file: {} bytes",
+            std::fs::metadata(&ready_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
         );
+        let _ = std::fs::remove_file(&ready_path);
         let _ = pipeline.set_state(gst::State::Null);
     }
 
@@ -8054,7 +8039,6 @@ mod tests {
     #[test]
     fn field_order_pass_through_branch_attached_before_flow_writes_es() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -8117,6 +8101,7 @@ mod tests {
             "H264",
             30,
             Some(tx),
+            crate::gstreamer_pipeline::RecordingMode::PassThrough,
         )
         .expect("build pass-through branch");
 
@@ -8185,20 +8170,12 @@ mod tests {
         );
 
         state.stop(true).expect("finalize recording");
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "field-order pass-through finalize produced no chunk"
+            ready_path.exists(),
+            "field-order pass-through finalize produced no recording-ready file"
         );
+        let _ = std::fs::remove_file(&ready_path);
         let _ = pipeline.set_state(gst::State::Null);
     }
 
@@ -8208,7 +8185,6 @@ mod tests {
     #[test]
     fn pass_through_recording_remuxes_game_audio_with_video() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -8294,6 +8270,7 @@ mod tests {
             "H264",
             30,
             Some(tx),
+            crate::gstreamer_pipeline::RecordingMode::PassThrough,
         )
         .expect("build pass-through branch");
         // Transfer the pipeline-level audio tee into the state, exactly like
@@ -8318,21 +8295,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2_500));
         state.stop(true).expect("finalize recording with audio");
 
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "pass-through recording with audio produced no MP4 chunk"
+            ready_path.exists(),
+            "pass-through recording with audio produced no recording-ready file"
         );
-        let file = chunks.concat();
+        let file = std::fs::read(&ready_path).expect("read finalized recording file");
+        let _ = std::fs::remove_file(&ready_path);
         assert!(
             file.len() >= 8 && &file[4..8] == b"ftyp",
             "pass-through file must be an MP4 (size+ftyp)"
@@ -8365,7 +8334,6 @@ mod tests {
     #[test]
     fn encoded_recording_remuxes_decoded_video_and_audio() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -8464,21 +8432,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2_500));
         state.stop(true).expect("finalize encoded recording");
 
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "encoded recording produced no MP4 chunk"
+            ready_path.exists(),
+            "encoded recording produced no recording-ready file"
         );
-        let file = chunks.concat();
+        let file = std::fs::read(&ready_path).expect("read finalized recording file");
         assert!(
             file.len() >= 8 && &file[4..8] == b"ftyp",
             "encoded file must be an MP4 (size+ftyp)"
@@ -8505,11 +8464,9 @@ mod tests {
         // Demux the output and measure the actual video PTS cadence: it must
         // be ~33 ms per frame (the measured 30 fps), never ~16.7 ms (the
         // negotiated 60) and never ~1000 ms.
-        let tmp_mp4 = std::env::temp_dir().join(format!(
-            "opennow-remux-cadence-{}.mp4",
-            std::process::id()
-        ));
-        std::fs::write(&tmp_mp4, &file).expect("write remux MP4 for cadence check");
+        // The completed MP4 is already on disk (the recording-ready path) —
+        // demux it directly for the cadence check.
+        let tmp_mp4 = ready_path;
         let check_pipeline = gst::Pipeline::new();
         let src = gst::ElementFactory::make("filesrc")
             .build()
@@ -8621,7 +8578,6 @@ mod tests {
     #[ignore = "flaky under load in the harness; run manually for A/V sync verification"]
     fn encoded_recording_audio_video_sync_is_frame_accurate() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
@@ -8716,27 +8672,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(4_000));
         state.stop(true).expect("finalize encoded recording");
 
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
         assert!(
-            !chunks.is_empty(),
-            "sync recording produced no MP4 chunk"
+            ready_path.exists(),
+            "sync recording produced no recording-ready file"
         );
-        eprintln!("[SYNC] chunks={} file_bytes={}", chunks.len(), chunks.iter().map(|c| c.len()).sum::<usize>());
-        let file = chunks.concat();
-        let tmp_mp4 = std::env::temp_dir().join(format!(
-            "opennow-sync-check-{}.mp4",
-            std::process::id()
-        ));
-        std::fs::write(&tmp_mp4, &file).expect("write sync MP4");
+        let file = std::fs::read(&ready_path).expect("read finalized recording file");
+        eprintln!("[SYNC] file_bytes={}", file.len());
+        let tmp_mp4 = ready_path;
 
         // Demux + decode both tracks from the MP4.
         let check_pipeline = gst::Pipeline::new();
@@ -9260,17 +9203,18 @@ mod tests {
         // queue/segment warnings, so the drain+EOS path is part of this
         // regression).
         state.stop(true).expect("finalize recording");
-        let mut chunks = 0usize;
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { .. } = event {
-                chunks += 1;
-            }
-        }
-        eprintln!("DIAG record-start transport: finalized chunks={chunks}");
-        assert!(
-            chunks >= 1,
-            "finalized transcode recording produced no muxer chunks"
+        let ready_path = collect_recording_ready_path(&rx);
+        eprintln!(
+            "DIAG record-start transport: finalized file={} bytes",
+            std::fs::metadata(&ready_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
         );
+        assert!(
+            ready_path.exists(),
+            "finalized transcode recording produced no recording-ready file"
+        );
+        let _ = std::fs::remove_file(&ready_path);
 
         let _ = pipeline.set_state(gst::State::Null);
     }
@@ -9286,7 +9230,6 @@ mod tests {
     #[test]
     fn transcode_branch_real_stream_produces_video_track() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -9378,17 +9321,16 @@ mod tests {
         eprintln!("DIAG transcode branch: encoder src caps = {enc_caps}");
 
         state.stop(true).expect("finalize recording");
-        let mut file_bytes: Vec<u8> = Vec::new();
-        let mut chunks = 0usize;
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks += 1;
-                file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
+        assert!(
+            ready_path.exists(),
+            "finalized transcode recording produced no recording-ready file"
+        );
+        let file_bytes = std::fs::read(&ready_path).expect("read finalized recording file");
+        let _ = std::fs::remove_file(&ready_path);
         let avc1_at = file_bytes.windows(4).position(|w| w == b"avc1");
         eprintln!(
-            "DIAG transcode branch: finalized chunks={chunks} file_bytes={} avc1={avc1_at:?}",
+            "DIAG transcode branch: finalized file_bytes={} avc1={avc1_at:?}",
             file_bytes.len()
         );
         assert!(
@@ -9416,7 +9358,6 @@ mod tests {
     #[test]
     fn transcode_branch_with_audio_produces_video_and_audio_tracks() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -9544,18 +9485,17 @@ mod tests {
         eprintln!("DIAG transcode prod: encoder src caps = {enc_caps}");
 
         state.stop(true).expect("finalize recording");
-        let mut file_bytes: Vec<u8> = Vec::new();
-        let mut chunks = 0usize;
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks += 1;
-                file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
+        assert!(
+            ready_path.exists(),
+            "finalized transcode recording produced no recording-ready file"
+        );
+        let file_bytes = std::fs::read(&ready_path).expect("read finalized recording file");
+        let _ = std::fs::remove_file(&ready_path);
         let avc1_at = file_bytes.windows(4).position(|w| w == b"avc1");
         let mp4a_at = file_bytes.windows(4).position(|w| w == b"mp4a");
         eprintln!(
-            "DIAG transcode prod: finalized chunks={chunks} file_bytes={} avc1={avc1_at:?} mp4a={mp4a_at:?}",
+            "DIAG transcode prod: finalized file_bytes={} avc1={avc1_at:?} mp4a={mp4a_at:?}",
             file_bytes.len()
         );
         assert!(
@@ -9585,7 +9525,6 @@ mod tests {
     #[test]
     fn live_record_window_does_not_inflate_transcode_output() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -9660,16 +9599,15 @@ mod tests {
         );
 
         state.stop(true).expect("finalize recording");
-        let mut file_bytes: Vec<u8> = Vec::new();
-        let mut chunks = 0usize;
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks += 1;
-                file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
-            }
-        }
+        let ready_path = collect_recording_ready_path(&rx);
+        assert!(
+            ready_path.exists(),
+            "finalized transcode recording produced no recording-ready file"
+        );
+        let file_bytes = std::fs::read(&ready_path).expect("read finalized recording file");
+        let _ = std::fs::remove_file(&ready_path);
         eprintln!(
-            "DIAG live: finalized chunks={chunks} file_bytes={} (expected ~{recorded_frames} encoded frames)",
+            "DIAG live: finalized file_bytes={} (expected ~{recorded_frames} encoded frames)",
             file_bytes.len()
         );
         assert!(
@@ -9884,7 +9822,6 @@ mod tests {
     #[test]
     fn record_restart_after_teardown_rebuild_keeps_main_chain_flowing() {
         gst::init().expect("gstreamer init");
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
@@ -10068,15 +10005,13 @@ mod tests {
                 "{round}: stop() took {stop_ms} ms — the EOS-below-valve path failed and the 5 s failsafe had to run (field symptom)"
             );
 
-            let mut file_bytes: Vec<u8> = Vec::new();
-            let mut chunks = 0usize;
-            while let Ok(event) = rx.try_recv() {
-                if let Event::RecordingChunk { chunk_base64 } = event {
-                    chunks += 1;
-                    file_bytes.extend(BASE64_STANDARD.decode(chunk_base64).expect("b64"));
-                }
-            }
-            assert!(chunks >= 1, "{round}: no muxer chunk after stop");
+            let ready_path = collect_recording_ready_path(&rx);
+            assert!(
+                ready_path.exists(),
+                "{round}: no recording-ready file after stop"
+            );
+            let file_bytes = std::fs::read(&ready_path).expect("read finalized recording file");
+            let _ = std::fs::remove_file(&ready_path);
             file_bytes
         };
 

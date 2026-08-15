@@ -767,13 +767,16 @@ pub enum Event {
     Stats { stats: NativeStatsEvent },
     #[serde(rename = "screenshot")]
     Screenshot { screenshot: NativeScreenshotEvent },
-    /// One chunk of the active native recording (base64 bytes). Chunks are
-    /// emitted in file order and must be appended to the recording file in
-    /// arrival order.
-    #[serde(rename = "recording-chunk")]
-    RecordingChunk {
-        #[serde(rename = "chunkBase64")]
-        chunk_base64: String,
+    /// The finalized recording MP4 has been written COMPLETE to `path` by
+    /// the native streamer (the offline remux worker at stop, or the
+    /// transcode live muxer once its EOS flushed; a plain file, no
+    /// base64/IPC round trip). The Electron main process moves it into the
+    /// recordings directory. Emitted strictly BEFORE `recording-finished`.
+    /// `path` is a filesystem path (UTF-8), `size` the file size in bytes.
+    #[serde(rename = "recording-ready")]
+    RecordingReady {
+        path: String,
+        size: u64,
     },
     /// Emitted (via the event channel, so strictly after every chunk of the
     /// finalized recording) once the recording branch has flushed with EOS.
@@ -996,12 +999,14 @@ mod tests {
         assert_eq!(value["screenshot"]["pngBase64"], "aGVsbG8=");
         assert_eq!(value["screenshot"]["width"], 1920);
 
-        let chunk = Event::RecordingChunk {
-            chunk_base64: "Y2h1bms=".to_owned(),
+        let ready = Event::RecordingReady {
+            path: "C:\\temp\\opennow-rec-123.mp4".to_owned(),
+            size: 1_234_567,
         };
-        let value = serde_json::to_value(chunk).expect("serializes");
-        assert_eq!(value["type"], "recording-chunk");
-        assert_eq!(value["chunkBase64"], "Y2h1bms=");
+        let value = serde_json::to_value(ready).expect("serializes");
+        assert_eq!(value["type"], "recording-ready");
+        assert_eq!(value["path"], "C:\\temp\\opennow-rec-123.mp4");
+        assert_eq!(value["size"], 1_234_567);
 
         let finished = serde_json::to_value(Event::RecordingFinished {
             thumbnail_base64: Some("L3RodW1ibmFpbA==".to_owned()),

@@ -128,6 +128,20 @@ const RECORDING_DRAIN_TIMEOUT_MS: u64 = 4_000;
 /// Default recording encoder bitrate (kbps) used until the backend supplies
 /// the session's negotiated maximum (session start always overrides it).
 const RECORD_BITRATE_DEFAULT_KBPS: u32 = 8_000;
+/// Disk-space guard before a recording starts, mirroring gfncapture.dll's
+/// `AllowSave`: it refuses to save a clip unless the free space covers the
+/// clip size PLUS a headroom. A recording's duration is unknowable at start,
+/// so OpenNOW guarantees headroom for a REFERENCE duration at the session's
+/// negotiated bitrate plus a fixed audio allowance, plus the same 300 MB
+/// headroom the NVIDIA client uses — rejecting the start with a clear
+/// message instead of failing mid-recording (filesink ENOSPC → corrupt file
+/// + wedged branch).
+const RECORD_DISK_HEADROOM_BYTES: u64 = 300 * 1024 * 1024;
+/// Reference recording length the start-time check must fit on disk.
+const RECORD_DISK_REFERENCE_DURATION_S: u64 = 600;
+/// Audio allowance added to the video bitrate for the estimate (AAC ~128
+/// kbps after the offline transcode, with margin).
+const RECORD_DISK_AUDIO_ALLOWANCE_KBPS: u64 = 192;
 /// How long to wait after the muxer-direct EOS failsafe before giving up on
 /// finalizing the recording.
 const RECORDING_FAILSAFE_TIMEOUT_MS: u64 = 2_000;
@@ -151,17 +165,6 @@ const RECORDING_REMUX_TIMEOUT_MS: u64 = 45_000;
 /// in the replay order, so its presence proves the whole sequence landed.
 /// Bounded — a genuinely broken branch degrades to a warning, never a hang.
 const RECORDING_STICKY_VERIFY_TIMEOUT_MS: u64 = 250;
-/// The finalized MP4 is handed to Electron as base64 `recording-chunk` events
-/// over a line-delimited stdout protocol, and Electron parses/decodes each
-/// line SYNCHRONOUSLY in its main process. A multi-hundred-MB recording must
-/// therefore never be ONE base64 line: a 70 MB file is ~94 MB of base64, and
-/// `JSON.parse` + `Buffer.from(..., "base64")` on that single line freezes
-/// the Electron UI ("Electron is not responding") and can crash the app
-/// before the tmp file is ever written (the field's 0-byte .tmp). Emit
-/// small fixed-size chunks instead — the protocol already says chunks arrive
-/// in file order and must be appended in arrival order, and Electron does
-/// exactly that through its serialized recordingChunkQueue.
-const RECORDING_CHUNK_BYTES: usize = 1_048_576;
 pub(crate) const VIDEO_QUEUE_MAX_BUFFERS: u32 = DEFAULT_VIDEO_QUEUE_DEPTH;
 const AUDIO_QUEUE_MAX_BUFFERS: u32 = 2;
 
@@ -635,34 +638,34 @@ impl GstreamerVideoTap {
 
 /// How the native recording branch stores the video.
 ///
-/// `Encoded` (the DEFAULT) taps the DECODED video frames (the same reliable
-/// post-decode tee the transcode branch uses) and re-encodes to H.264 — so
-/// the recording captures EXACTLY what the user sees, immune to WAN RTP
-/// jitter/loss and GFN stream restarts that the raw-RTP tap cannot survive,
-/// and the file plays everywhere (universal H.264; no HEVC/AV1 codec needed
-/// on the playback device). The encoded ES is written to a temp file and
-/// muxed OFFLINE at stop (`remux_encoded_recording`) — no live muxer, so the
-/// branch can never wedge. The re-encode costs GPU/CPU while recording (the
-/// encoder competes with the decoder on single-iGPU laptops).
+/// `Capture` (the DEFAULT) taps the RAW RTP stream at the source tee (before
+/// decode) and writes the received bitstream straight to a temp ES file —
+/// zero decode, zero re-encode, zero GPU/CPU, so recording costs NOTHING to
+/// the live stream (the official GeForce Now approach: "just write what we
+/// receive to disk"). Game audio is stored the same way: the raw Opus ES,
+/// no live decoder/encoder. ALL encoding work happens at STOP, offline, in a
+/// throwaway pipeline (`remux_capture_recording`): H.264 video is muxed
+/// directly (still zero re-encode), H.265/AV1 video is decoded and
+/// re-encoded to universal H.264 (slow is fine — nobody is watching the
+/// stream at stop), and Opus audio is decoded + re-encoded to AAC. The
+/// result is a universal H.264/AAC MP4 whose recording phase never touched
+/// the GPU/CPU that the live decoder needs.
 ///
-/// `PassThrough` taps the RAW RTP stream at the source tee (before decode)
-/// and remuxes the received bitstream straight into the MP4 (depay → parse →
-/// qtmux). Zero decode, zero re-encode, zero GPU/CPU — a recording costs
-/// nothing to the live stream, exactly like the official GeForce Now client
-/// ("just write what we receive to disk"). The file is H265/H264/AV1
-/// (whatever the server sent) at the exact received quality, tagged with the
-/// stream's colour metadata (colr nclx BT.709 full-range). Opt-in via
-/// OPENNOW_RECORDING_MODE=passthrough. Two field-proven caveats keep it
-/// opt-in rather than default: (1) the tap sits at the webrtcbin video SRC
-/// pad — the internal rtpbin session output — so NACK/RTX/FEC recovery and
-/// jitter reordering already happened before the branch sees a packet (the
-/// live decode chain, fed from the SAME tee without its own jitter buffer,
-/// renders lossless in the field; the branch sees only the video SSRC). What
-/// remains on a lossy link is a NACK-unrecoverable hole; the branch resyncs
-/// from the next PLI keyframe (request-keyframe + wait-for-keyframe) so the
-/// ES keeps clean GOPs instead of broken ones; (2) the file carries the
-/// stream codec, so H265/AV1 recordings need a player with HEVC/AV1 support
-/// (Windows' default player needs the HEVC extension).
+/// `PassThrough` is the same zero-cost raw-RTP capture, but the file keeps
+/// the RECEIVED codec (H265/H264/AV1, exact received quality) and game audio
+/// is re-encoded to AAC in the LIVE branch. Opt-in via
+/// OPENNOW_RECORDING_MODE=passthrough for purists who want the exact
+/// server bitstream; the file needs a player with HEVC/AV1 support.
+///
+/// `Encoded` taps the DECODED video frames (the same reliable post-decode
+/// tee the transcode branch uses) and re-encodes to H.264 — so the recording
+/// captures EXACTLY what the user sees, immune to WAN RTP jitter/loss and
+/// GFN stream restarts that the raw-RTP tap cannot survive. The encoded ES
+/// is written to a temp file and muxed OFFLINE at stop
+/// (`remux_encoded_recording`) — no live muxer, so the branch can never
+/// wedge. The re-encode costs GPU/CPU while recording (the encoder competes
+/// with the decoder on single-iGPU laptops). Opt-in via
+/// OPENNOW_RECORDING_MODE=encoded.
 ///
 /// `Transcode` taps the DECODED video (post-decode tee), converts to 8-bit
 /// 4:2:0 and re-encodes with H.264 (d3d12h264enc GPU encoder by default)
@@ -674,6 +677,7 @@ impl GstreamerVideoTap {
 /// OPENNOW_RECORDING_MODE=transcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordingMode {
+    Capture,
     PassThrough,
     Encoded,
     Transcode,
@@ -682,14 +686,16 @@ pub(crate) enum RecordingMode {
 impl RecordingMode {
     pub(crate) fn from_env() -> Self {
         match std::env::var("OPENNOW_RECORDING_MODE").as_deref() {
+            Ok("capture") => RecordingMode::Capture,
             Ok("passthrough") => RecordingMode::PassThrough,
             Ok("transcode") => RecordingMode::Transcode,
             Ok("encoded") => RecordingMode::Encoded,
-            // Default: re-encode to universal H.264 from the reliable
-            // post-decode tap. PassThrough (zero cost, but raw-RTP holes on
-            // jitter + H265/AV1 files that need codec support on the player)
-            // stays available via OPENNOW_RECORDING_MODE=passthrough.
-            _ => RecordingMode::Encoded,
+            // Default: zero-cost raw capture (video bitstream + Opus ES in
+            // the live branch) with ALL encode work moved to the offline
+            // stop-time remux, so recording never steals GPU/CPU from the
+            // live decoder (the GFN model). Encoded/transcode stay available
+            // for "record exactly what you see" use cases.
+            _ => RecordingMode::Capture,
         }
     }
 }
@@ -730,10 +736,9 @@ impl RecordingMode {
 /// decode chain is up), and the tee pad stays linked for the session, so
 /// record start/stop is ONLY a valve open/close — the decode/present chain
 /// is never touched and the pipeline cannot re-preroll (the exact failure of
-/// the old post-decode x264 branch with a sink; this branch has NO sink —
-/// the swallow queue tail with DROP probes is the same hot-plug-safe shape
-/// as the old remux branch). The encoder runs only while the valve is open,
-/// so recording costs no CPU when idle.
+/// the old post-decode x264 branch with a sink; this branch has NO sink). The
+/// encoder runs only while the valve is open, so recording costs no CPU when
+/// idle.
 ///
 /// PASS-THROUGH branch flow diagnostics: zero-cost buffer counters at every
 /// hop of the live recording branch, so a field session where the video ES
@@ -892,14 +897,14 @@ pub(crate) struct GstreamerRecordingState {
     /// After a finalized recording it is spent (moov already emitted / EOS
     /// seen), so the whole branch is rebuilt fresh between recordings.
     pub(crate) muxer: Option<gst::Element>,
-    /// Swallow queue at the muxer output. TRANSCODE mode only. The chunk +
-    /// EOS probes live on its sink pad and return DROP, so the muxer's push
-    /// always returns FLOW_OK and its src task keeps running. Deliberately
-    /// NO sink in the branch: a sink that cannot preroll while the valve is
-    /// closed would complete its deferred async transition later and
-    /// re-preroll the whole pipeline (non-sinks transition synchronously, so
-    /// the branch is hot-plug-safe).
-    pub(crate) swallow: Option<gst::Element>,
+    /// TRANSCODE mode: the live muxer's filesink (qtmux → filesink) writing
+    /// the complete seekable MP4 into its temp file. Kept for teardown.
+    pub(crate) transcode_filesink: Option<gst::Element>,
+    /// TRANSCODE mode: the temp MP4 path the live muxer writes into. Handed
+    /// to Electron as a complete file via `recording-ready` at stop (after
+    /// the colr boxes are neutralized in the head) — the base64 chunk
+    /// pipeline is gone.
+    pub(crate) transcode_out_path: Option<std::path::PathBuf>,
     /// PASS-THROUGH mode: the temp elementary-stream file the video branch
     /// (depay → parse → filesink) writes into while recording. Remuxed
     /// offline to MP4 at stop, then deleted. None for transcode mode.
@@ -1074,36 +1079,69 @@ impl GstreamerRecordingState {
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
 
-        let opusdec = make_element("opusdec")?;
-        let audioconvert = make_element("audioconvert")?;
-        let (aac_factory, aac_encoder) = pick_aac_encoder()?;
-        // The opusdec/aacenc chain must not back-pressure the RTP tap either:
-        // the audio queue is already leaky (drops oldest when full), so the
-        // chain cannot stall the tap tee.
+        // The audio tail depends on the mode:
+        //  - CAPTURE: the depayloader output (raw Opus packets) goes straight
+        //    to its own filesink — NO live decoder/encoder, so recording
+        //    game audio costs ~nothing to the stream (the GFN model). The
+        //    Opus ES is decoded + re-encoded to AAC only at STOP, offline.
+        //  - PASS-THROUGH / ENCODED: decoded + re-encoded to AAC live (the
+        //    historical behavior — universal AAC in the file even before the
+        //    offline remux).
+        //  - TRANSCODE: decoded + re-encoded to AAC live into the shared
+        //    qtmux.
+        let mut opusdec: Option<gst::Element> = None;
+        let mut audioconvert: Option<gst::Element> = None;
+        let mut aac_encoder: Option<gst::Element> = None;
+        let mut aac_factory = String::new();
+        if self.mode != RecordingMode::Capture {
+            // The opusdec/aacenc chain must not back-pressure the RTP tap
+            // either: the audio queue is already leaky (drops oldest when
+            // full), so the chain cannot stall the tap tee.
+            opusdec = Some(make_element("opusdec")?);
+            audioconvert = Some(make_element("audioconvert")?);
+            let (factory, encoder) = pick_aac_encoder()?;
+            aac_factory = factory;
+            aac_encoder = Some(encoder);
+        }
 
         let mut elements: Vec<gst::Element> = vec![
             valve.clone(),
             capsfilter.clone(),
             queue.clone(),
             depayloader.clone(),
-            opusdec.clone(),
-            audioconvert.clone(),
-            aac_encoder.clone(),
         ];
-        // PASS-THROUGH / ENCODED modes: the audio branch ends at its own
-        // filesink writing the AAC elementary stream into a temp file
-        // (remuxed OFFLINE at stop, exactly like the video ES — no live
-        // muxer, so the branch cannot wedge). The raw AAC encoder frames are
-        // re-framed into self-describing ADTS (aacparse + adts capsfilter) so
-        // the offline remux's aacparse can consume the file with no external
-        // caps.
+        if let Some(opusdec) = &opusdec {
+            elements.push(opusdec.clone());
+        }
+        if let Some(audioconvert) = &audioconvert {
+            elements.push(audioconvert.clone());
+        }
+        if let Some(aac_encoder) = &aac_encoder {
+            elements.push(aac_encoder.clone());
+        }
         if self.mode != RecordingMode::Transcode {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
+            // CAPTURE mode: write the RAW Opus elementary stream (depay →
+            // filesink). Raw Opus packets are self-delimiting via their TOC
+            // byte, so the OFFLINE remux (`filesrc → opusparse`) can re-frame
+            // PASS-THROUGH / ENCODED: the raw AAC encoder frames are
+            // re-framed into self-describing ADTS (aacparse + adts
+            // capsfilter) so the offline remux's aacparse can consume the
+            // file with no external caps. CAPTURE: the file is the RAW Opus
+            // ES straight from the depayloader — no extra elements (a bare
+            // Opus file carries no channel/rate info, but the packet TOC
+            // itself signals mono/stereo per frame, so the offline remux's
+            // opusparse → opusdec needs no external caps).
+            let (audio_es_name, audio_caps_decl) = if self.mode == RecordingMode::Capture {
+                ("opus.es", None)
+            } else {
+                ("aac.es", Some("audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"))
+            };
             let audio_es_path = std::env::temp_dir().join(format!(
-                "opennow-rec-{}-{stamp}.aac.es",
+                "opennow-rec-{}-{stamp}.{audio_es_name}",
                 std::process::id()
             ));
             let audio_filesink = make_element("filesink")?;
@@ -1115,14 +1153,22 @@ impl GstreamerRecordingState {
             );
             audio_filesink.set_property("sync", false);
             audio_filesink.set_property("async", false);
-            let audio_aac_parse = make_element("aacparse")?;
-            let adts_caps = make_element("capsfilter")?;
-            adts_caps.set_property(
-                "caps",
-                "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts"
-                    .parse::<gst::Caps>()
-                    .map_err(|error| format!("Invalid pass-through ADTS caps: {error}"))?,
-            );
+            if self.mode != RecordingMode::Capture {
+                // PASS-THROUGH / ENCODED: aacparse + ADTS capsfilter.
+                let audio_aac_parse = make_element("aacparse")?;
+                let adts_caps = make_element("capsfilter")?;
+                adts_caps.set_property(
+                    "caps",
+                    audio_caps_decl
+                        .expect("non-capture audio caps declaration")
+                        .parse::<gst::Caps>()
+                        .map_err(|error| format!("Invalid pass-through ADTS caps: {error}"))?,
+                );
+                elements.push(audio_aac_parse.clone());
+                elements.push(adts_caps.clone());
+                self.audio_aac_parse = Some(audio_aac_parse);
+                self.audio_adts_caps = Some(adts_caps);
+            }
             let eos_flag = self.audio_filesink_eos.clone();
             let audio_sink_pad = audio_filesink
                 .static_pad("sink")
@@ -1135,13 +1181,9 @@ impl GstreamerRecordingState {
                 }
                 gst::PadProbeReturn::Ok
             });
-            elements.push(audio_aac_parse.clone());
-            elements.push(adts_caps.clone());
             elements.push(audio_filesink.clone());
             self.audio_es_path = Some(audio_es_path);
             self.audio_filesink = Some(audio_filesink);
-            self.audio_aac_parse = Some(audio_aac_parse);
-            self.audio_adts_caps = Some(adts_caps);
         }
         for element in &elements {
             pipeline.add(element).map_err(|error| {
@@ -1163,6 +1205,9 @@ impl GstreamerRecordingState {
                 .muxer
                 .clone()
                 .ok_or_else(|| "Recording muxer is missing for the transcode audio branch.".to_owned())?;
+            let aac_encoder = aac_encoder
+                .as_ref()
+                .ok_or_else(|| "Recording audio encoder missing for transcode.".to_owned())?;
             let aac_src = aac_encoder
                 .static_pad("src")
                 .ok_or_else(|| "Recording audio encoder has no src pad.".to_owned())?;
@@ -1207,15 +1252,20 @@ impl GstreamerRecordingState {
         self.audio_queue = Some(queue.clone());
         self.audio_capsfilter = Some(capsfilter.clone());
         self.audio_depayloader = Some(depayloader.clone());
-        self.audio_opusdec = Some(opusdec.clone());
-        self.audio_audioconvert = Some(audioconvert.clone());
-        self.audio_aac_encoder = Some(aac_encoder.clone());
+        self.audio_opusdec = opusdec;
+        self.audio_audioconvert = audioconvert;
+        self.audio_aac_encoder = aac_encoder;
         self.audio_branch_built.store(true, Ordering::SeqCst);
         match self.mode {
             RecordingMode::Transcode => send_log(
                 &self.event_sender,
                 "info",
                 format!("Attached native game-audio transcode branch (rtp → rtpopusdepay → opusdec → audioconvert → {aac_factory} → qtmux; never touches the audio playback chain)."),
+            ),
+            RecordingMode::Capture => send_log(
+                &self.event_sender,
+                "info",
+                "Attached native game-audio CAPTURE branch (rtp → rtpopusdepay → filesink Opus ES; zero decode/encode live — decoded to AAC only at stop, offline — never touches the audio playback chain).".to_owned(),
             ),
             RecordingMode::PassThrough | RecordingMode::Encoded => send_log(
                 &self.event_sender,
@@ -1227,6 +1277,13 @@ impl GstreamerRecordingState {
     }
 
     pub(crate) fn start(&self) -> Result<(), String> {
+        // Disk-space guard FIRST — never open the valves into a recording the
+        // disk cannot hold (gfncapture AllowSave parity): a mid-recording
+        // filesink ENOSPC corrupts the file and can wedge the branch. The
+        // check runs before any state/valve mutation, so a refused start
+        // leaves the recording fully idle.
+        let bitrate_kbps = self.record_bitrate_kbps.load(Ordering::SeqCst);
+        check_recording_disk_space(bitrate_kbps)?;
         self.eos_seen.store(false, Ordering::SeqCst);
         // Each recording measures its own PTS cadence window: reset the
         // counters so an aborted + restarted recording (branch kept) never
@@ -1337,16 +1394,14 @@ impl GstreamerRecordingState {
             );
         }
         match self.mode {
-            RecordingMode::PassThrough => {
-                // Re-arm the IDR gate so THIS recording starts at a fresh
-                // keyframe (the probe drops mid-GOP frames until the first
-                // sync access unit, so the file never opens with orphan
-                // P-frames).
+            // Capture and PassThrough both tap the RAW RTP stream — the file
+            // must start at a fresh keyframe, so re-arm the IDR gate (the
+            // probe drops mid-GOP frames until the first sync access unit)
+            // and ask the server for an IDR right now (via the signaling/data
+            // channel — NEVER an in-pipeline GstForceKeyUnit, which kills
+            // the UDP receiver; see the NOTE above).
+            RecordingMode::Capture | RecordingMode::PassThrough => {
                 self.idr_gate.store(true, Ordering::SeqCst);
-                // Ask the server for an IDR right now (via the signaling/data
-                // channel — NEVER an in-pipeline GstForceKeyUnit, which kills
-                // the UDP receiver; see the NOTE above). The IDR lands a
-                // frame later and the gate opens on it: clean file start.
                 if let Some(sender) = &self.event_sender {
                     let _ = sender.send(Event::VideoKeyframeRequest(
                         crate::protocol::VideoKeyframeRequest {
@@ -1370,6 +1425,18 @@ impl GstreamerRecordingState {
         }
         let with_audio = self.audio_branch_built.load(Ordering::SeqCst);
         let started_log = match self.mode {
+            RecordingMode::Capture => {
+                let codec = &self.codec;
+                if with_audio {
+                    format!(
+                        "Native recording started (video + game audio captured from the received {codec} bitstream; zero re-encode live — the MP4 is remuxed/transcoded OFFLINE at stop, so recording costs no GPU/CPU to the stream)."
+                    )
+                } else {
+                    format!(
+                        "Native recording started (video captured from the received {codec} bitstream; zero re-encode live — the MP4 is remuxed/transcoded OFFLINE at stop, so recording costs no GPU/CPU to the stream)."
+                    )
+                }
+            }
             RecordingMode::PassThrough => {
                 let codec = &self.codec;
                 if with_audio {
@@ -1495,7 +1562,7 @@ impl GstreamerRecordingState {
         }
         if !finalize {
             self.active.store(false, Ordering::SeqCst);
-            if self.mode == RecordingMode::PassThrough {
+            if self.mode == RecordingMode::PassThrough || self.mode == RecordingMode::Capture {
                 // A pass-through filesink stays OPEN after an abort and would
                 // APPEND to the same ES file on a later start(), so flush +
                 // close it now with EOS and mark the branch spent — the next
@@ -1506,6 +1573,30 @@ impl GstreamerRecordingState {
                     &self.event_sender,
                     "info",
                     "Native recording aborted; capture valves closed (pass-through ES files flushed; branch rebuilt fresh for the next recording)."
+                        .to_owned(),
+                );
+            } else if self.mode == RecordingMode::Transcode {
+                // Flush + close the live muxer's filesink with EOS so the
+                // partial file is closed (then deleted below), and rebuild
+                // the branch fresh for the next recording — an aborted
+                // transcode must never append stale data to the same temp
+                // file on a later start().
+                self.drain_and_eos(&self.valve, &self.queue)?;
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(RECORDING_FINALIZE_TIMEOUT_MS);
+                while !self.eos_seen.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if let Some(path) = &self.transcode_out_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.spent.store(true, Ordering::SeqCst);
+                send_log(
+                    &self.event_sender,
+                    "info",
+                    "Native recording aborted; transcode muxer flushed and the partial file discarded; branch rebuilt fresh for the next recording."
                         .to_owned(),
                 );
             } else {
@@ -1555,7 +1646,7 @@ impl GstreamerRecordingState {
             .queue_input
             .load(Ordering::Relaxed)
             .saturating_sub(self.queue_output.load(Ordering::Relaxed));
-        if self.mode == RecordingMode::PassThrough {
+        if self.mode == RecordingMode::PassThrough || self.mode == RecordingMode::Capture {
             if let Some(diag) = &self.pass_flow_diag {
                 let parse_dropped = diag
                     .parse_in
@@ -1567,7 +1658,9 @@ impl GstreamerRecordingState {
         self.dropped_frames.store(dropped, Ordering::SeqCst);
 
         match self.mode {
-            RecordingMode::PassThrough | RecordingMode::Encoded => self.stop_pass_through(drain_ms),
+            RecordingMode::PassThrough | RecordingMode::Capture | RecordingMode::Encoded => {
+                self.stop_pass_through(drain_ms)
+            }
             RecordingMode::Transcode => self.stop_transcode(drain_ms),
         }
     }
@@ -1691,7 +1784,7 @@ impl GstreamerRecordingState {
                 self.measured_frame_duration_ns(),
                 &self.event_sender,
             ),
-            _ => remux_pass_through_recording(
+            RecordingMode::PassThrough => remux_pass_through_recording(
                 video_es.as_deref(),
                 audio_es.as_deref(),
                 &remux_out,
@@ -1699,6 +1792,25 @@ impl GstreamerRecordingState {
                 self.fps,
                 &self.event_sender,
             ),
+            // CAPTURE: the offline stop-time remux — H.264 muxes directly
+            // (still zero re-encode), H.265/AV1 video is transcoded to
+            // universal H.264 and the raw Opus ES is decoded + re-encoded to
+            // AAC. Slow is fine: nothing watches the stream at stop.
+            RecordingMode::Capture => remux_capture_recording(
+                video_es.as_deref(),
+                audio_es.as_deref(),
+                &remux_out,
+                &self.codec,
+                self.fps,
+                self.record_bitrate_kbps.load(Ordering::SeqCst),
+                &self.event_sender,
+            ),
+            // TRANSCODE never reaches the offline remux — its live-muxer
+            // finalize (`stop_transcode`) delivers the MP4 directly and
+            // `stop()` dispatches to it instead of `stop_pass_through`.
+            RecordingMode::Transcode => {
+                unreachable!("stop_pass_through is not called for Transcode recordings")
+            }
         };
         let finalize_size = match remux_result {
             Ok(size) => size,
@@ -1738,45 +1850,86 @@ impl GstreamerRecordingState {
                     .to_owned(),
             );
         }
-        // Stream the finalized MP4 to Electron in fixed-size chunks — the
-        // whole file is never read into memory (each helper reads one window
-        // at a time), so a long recording cannot OOM the finalize on a weak
-        // device. PassThrough recordings additionally get their `colr` box
-        // (BT.709 full-range, matching the received bitstream) tagged into
-        // the head while streaming — no re-encode, so the colour fix is pure
-        // metadata.
+        // Hand the finalized MP4 to Electron as a COMPLETE FILE (written by
+        // this offline remux worker), not base64 chunks: the `recording-ready`
+        // event carries the temp path and the main process moves the file
+        // into the recordings directory. No base64 encode/decode, no IPC
+        // byte transfer, no second disk write — a long recording cannot OOM
+        // or freeze the finalize. PassThrough/Capture files additionally get
+        // their `colr` box (BT.709 full-range, matching the received
+        // bitstream) tagged into a colr-tagged copy — no re-encode, so the
+        // colour fix is pure metadata.
+        let mut delivered_path: Option<std::path::PathBuf> = None;
         if let Some(sender) = &self.event_sender {
-            let streamed = if self.mode == RecordingMode::PassThrough {
-                stream_recording_with_colr_tag(sender, &remux_out, &self.event_sender)?
+            let delivered = if self.mode == RecordingMode::PassThrough
+                || self.mode == RecordingMode::Capture
+            {
+                // Capture files are the received full-range bitstream (H.264
+                // muxed directly) or the transcode of it — tag colr nclx
+                // BT.709 full-range like the pass-through path, so players
+                // render correct colours without a data transform.
+                let tagged = remux_out.with_extension("mp4.tag");
+                match finalize_mp4_with_colr_tag(&remux_out, &tagged, &self.event_sender) {
+                    Ok(size) => {
+                        send_log(
+                            &self.event_sender,
+                            "info",
+                            format!("Native recording finalized: {size} bytes remuxed offline into a standard seekable MP4 with colr colour metadata tagged in; handed to Electron as a file (no chunk streaming)."),
+                        );
+                        tagged
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&tagged);
+                        for path in [Some(&remux_out), video_es.as_ref(), audio_es.as_ref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        self.active.store(false, Ordering::SeqCst);
+                        self.spent.store(true, Ordering::SeqCst);
+                        return Err(format!("Finalizing colour-tagged recording failed: {error}"));
+                    }
+                }
             } else {
-                stream_recording_file_as_chunks(sender, &remux_out)?
+                send_log(
+                    &self.event_sender,
+                    "info",
+                    format!("Native recording finalized: {finalize_size} bytes remuxed offline into a standard seekable MP4; handed to Electron as a file (no chunk streaming)."),
+                );
+                remux_out.clone()
             };
-            send_log(
-                &self.event_sender,
-                "info",
-                format!(
-                    "Native recording finalized: {streamed} bytes remuxed offline into a standard seekable MP4, delivered in {} chunk(s).",
-                    (streamed as usize).div_ceil(RECORDING_CHUNK_BYTES),
-                ),
-            );
+            let size = std::fs::metadata(&delivered)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let _ = sender.send(Event::RecordingReady {
+                path: delivered.to_string_lossy().into_owned(),
+                size,
+            });
+            delivered_path = Some(delivered);
         }
-        // Cleanup: delete the temp ES files and the remux output; the branch
-        // is spent (filesinks saw EOS) so the next recording rebuilds fresh.
-        for path in [Some(&remux_out), video_es.as_ref(), audio_es.as_ref()]
+        // Cleanup: delete the temp ES files and the remux output (only when
+        // a colr-tagged copy was made — the DELIVERED file itself is moved by
+        // Electron, so it must survive). The branch is spent (filesinks saw
+        // EOS) so the next recording rebuilds fresh.
+        for path in [video_es.as_ref(), audio_es.as_ref()]
             .into_iter()
             .flatten()
         {
             let _ = std::fs::remove_file(path);
+        }
+        if delivered_path.as_deref() != Some(remux_out.as_path()) {
+            let _ = std::fs::remove_file(&remux_out);
         }
         self.active.store(false, Ordering::SeqCst);
         self.spent.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    /// TRANSCODE finalize: the existing live-muxer path — wait for the muxer
-    /// EOS (the whole faststart MP4 is emitted as one chunk by the swallow
-    /// probe), retry the EOS once, then fall back to sending EOS directly on
-    /// the muxer's sink pads.
+    /// TRANSCODE finalize: wait for the muxer EOS (the live muxer wrote the
+    /// complete faststart MP4 into its temp file), retry the EOS once, then
+    /// fall back to sending EOS directly on the muxer's sink pads. After the
+    /// flush the file is handed to Electron via `recording-ready`.
     fn stop_transcode(&self, drain_ms: u128) -> Result<(), String> {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(RECORDING_FINALIZE_TIMEOUT_MS);
@@ -1848,13 +2001,71 @@ impl GstreamerRecordingState {
             "info",
             format!("Native recording stop: muxer EOS seen (queue drained in {drain_ms} ms)."),
         );
+        // The live muxer wrote the complete seekable MP4 into its temp file.
+        // Neutralize the container's colour-metadata boxes (colr→free — an
+        // in-place fourcc rename, so box sizes and the file size are
+        // unchanged and only the head is touched) so the file carries NO
+        // colour tags, byte-identical to the official GeForce Now
+        // recordings, then hand the file to Electron via `recording-ready` —
+        // the base64 chunk pipeline is gone.
+        if let Some(sender) = &self.event_sender {
+            let path = self.transcode_out_path.as_ref().ok_or_else(|| {
+                "Transcode recording has no output file path.".to_owned()
+            })?;
+            let mut stripped = 0usize;
+            let mut patched_head: Option<Vec<u8>> = None;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let head_len = (metadata.len() as usize).min(MP4_COLR_HEAD_LIMIT);
+                if head_len > 0 {
+                    use std::io::Read;
+                    if let Ok(mut head_file) = std::fs::File::open(path) {
+                        let mut head = vec![0u8; head_len];
+                        if head_file.read_exact(&mut head).is_ok() {
+                            stripped = strip_mp4_colr_boxes(&mut head);
+                            patched_head = Some(head);
+                        }
+                    }
+                }
+            }
+            if let Some(head) = patched_head {
+                if stripped > 0 {
+                    // Write the patched head back. The filesink may still
+                    // be closing the file in its streaming thread, so
+                    // retry briefly before giving up.
+                    use std::io::{Seek, SeekFrom, Write};
+                    for _attempt in 0..50 {
+                        if let Ok(mut out) =
+                            std::fs::OpenOptions::new().write(true).open(path)
+                        {
+                            let _ = out.seek(SeekFrom::Start(0));
+                            let _ = out.write_all(&head);
+                            let _ = out.flush();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+            if stripped > 0 {
+                send_log(
+                    &self.event_sender,
+                    "info",
+                    format!("Recording finalized with {stripped} colour-metadata box(es) neutralized (colr→free); file carries no colour tags, matching the official GeForce Now recordings."),
+                );
+            }
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let _ = sender.send(Event::RecordingReady {
+                path: path.to_string_lossy().into_owned(),
+                size,
+            });
+            send_log(
+                &self.event_sender,
+                "info",
+                format!("Native recording finalized; {size} bytes handed to Electron as a file (no chunk streaming)."),
+            );
+        }
         self.active.store(false, Ordering::SeqCst);
         self.spent.store(true, Ordering::SeqCst);
-        send_log(
-            &self.event_sender,
-            "info",
-            "Native recording finalized; MP4 chunks flushed.".to_owned(),
-        );
         Ok(())
     }
 
@@ -1924,8 +2135,8 @@ impl GstreamerRecordingState {
         if let Some(muxer) = &self.muxer {
             elements.push(muxer.clone());
         }
-        if let Some(swallow) = &self.swallow {
-            elements.push(swallow.clone());
+        if let Some(filesink) = &self.transcode_filesink {
+            elements.push(filesink.clone());
         }
         if let Some(es_caps) = &self.es_caps {
             elements.push(es_caps.clone());
@@ -3253,7 +3464,7 @@ impl GstreamerPipeline {
         old.teardown(&self.pipeline)?;
 
         let mut fresh = match mode {
-            RecordingMode::PassThrough => {
+            RecordingMode::PassThrough | RecordingMode::Capture => {
                 let rtp_tee = rtp_tee.ok_or_else(|| {
                     "Recording rebuild: RTP video tap tee is gone.".to_owned()
                 })?;
@@ -3263,6 +3474,7 @@ impl GstreamerPipeline {
                     &codec,
                     old.fps,
                     self.event_sender.clone(),
+                    mode,
                 )
                 .map_err(|error| format!("Recording rebuild: fresh video branch failed: {error}"))?
             }
@@ -5829,13 +6041,18 @@ fn link_rtp_video_pad(
             .map_err(|_| "Recording state lock poisoned.".to_owned())?;
         if slot.is_none() {
             let built = match recording_mode {
-                RecordingMode::PassThrough => match rtp_tee.as_ref() {
+                // Capture (the default) and PassThrough share the zero-cost
+                // raw-RTP video branch — Capture additionally stores game
+                // audio as a raw Opus ES (no live encoder) and moves ALL
+                // encode work to the offline stop-time remux.
+                RecordingMode::PassThrough | RecordingMode::Capture => match rtp_tee.as_ref() {
                     Some(tee) => build_pass_through_record_branch(
                         pipeline,
                         tee,
                         encoding,
                         requested_fps.unwrap_or(60),
                         event_sender.clone(),
+                        recording_mode,
                     )
                     .map(Some),
                     None => {
@@ -7065,7 +7282,7 @@ fn insert_screenshot_grab_branch(
 /// the luma FULL→LIMITED with a LUT pad probe (videoconvert only clips), and
 /// re-encodes with H.264:
 /// tee → valve → queue → [download] → videoconvert → capsfilter (FULL) →
-/// capsfilter (LIMITED, LUT probe) → encoder → h264parse → qtmux → swallow.
+/// capsfilter (LIMITED, LUT probe) → encoder → h264parse → qtmux → filesink.
 ///
 /// The branch is built at session start (pipeline NULL/READY) and the tee pad
 /// stays linked for the whole session, so record start/stop is ONLY a valve
@@ -7074,11 +7291,12 @@ fn insert_screenshot_grab_branch(
 /// with a sink; this branch has NO sink). The encoder starts a fresh GOP (IDR)
 /// at the first frame it sees, so recording begins instantly with a decodable
 /// file (no mid-GOP orphan frames, no waiting for the next server keyframe).
-/// Chunks are captured by DROP probes on the swallow sink pad (each becomes
-/// one `recording-chunk` event); an EVENT probe records EOS so
-/// `stop(finalize=true)` knows when the branch flushed. The game-audio RTP
-/// stream is Opus and is transcoded to AAC into the same qtmux when available;
-/// the local mic is not part of the server RTP stream.
+/// The live muxer writes the complete seekable MP4 into a temp file; an EVENT
+/// probe on the filesink records EOS so `stop(finalize=true)` knows when the
+/// branch flushed, then the file is handed to Electron via `recording-ready`
+/// (the base64 chunk pipeline is gone). The game-audio RTP stream is Opus
+/// and is transcoded to AAC into the same qtmux when available; the local mic
+/// is not part of the server RTP stream.
 /// Neutralizes the MP4 `colr` colour-information box(es) in the finished
 /// recording so the file carries NO colour metadata at all — primaries,
 /// transfer, matrix and range all "unknown" — byte-identical in spirit to
@@ -7279,15 +7497,6 @@ pub(crate) fn build_transcode_record_branch(
             gst::PadProbeReturn::Ok
         });
     }
-    // Swallow queue: the chunk/EOS probes live on its sink pad and return
-    // DROP, so qtmux's push always returns FLOW_OK and its src task keeps
-    // running with an otherwise-unlinked tail (no NOT_LINKED parking).
-    let swallow = make_element("queue")?;
-    swallow.set_property_from_str("leaky", "downstream");
-    swallow.set_property("max-size-buffers", 1u32);
-    swallow.set_property("max-size-bytes", 0u32);
-    swallow.set_property("max-size-time", 0u64);
-
     // D3D paths with zero-copy produce texture-backed decoded frames;
     // videoconvert/x264 cannot import D3D memory, so download to system
     // memory first (same as the screenshot grab branch).
@@ -7355,6 +7564,29 @@ pub(crate) fn build_transcode_record_branch(
         muxer.set_property("fragment-duration", 0u32);
         muxer.set_property("streamable", false);
     }
+    // TRANSCODE tail: the live muxer writes the complete seekable MP4 into a
+    // temp file (delivered via `recording-ready` at stop — no base64 chunk
+    // pipeline). The branch queue above is leaky=upstream, so a slow disk
+    // cannot back-pressure the live decode path.
+    let mut transcode_out_path: Option<std::path::PathBuf> = None;
+    let transcode_filesink = if es_tail { None } else { Some(make_element("filesink")?) };
+    if let Some(filesink) = transcode_filesink.as_ref() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!("opennow-rec-{}-{stamp}.mp4", std::process::id()));
+        filesink.set_property(
+            "location",
+            path
+                .to_str()
+                .ok_or_else(|| "Transcode output path is not valid UTF-8.".to_owned())?,
+        );
+        filesink.set_property("sync", false);
+        filesink.set_property("async", false);
+        transcode_out_path = Some(path);
+    }
     // ES tail: byte-stream H.264 capsfilter + filesink (self-identifying via
     // 00 00 01 start codes, so the OFFLINE filesrc → h264parse can frame it
     // with no external caps).
@@ -7409,7 +7641,7 @@ pub(crate) fn build_transcode_record_branch(
         elements.push(video_filesink.as_ref().expect("filesink built"));
     } else {
         elements.push(muxer.as_ref().expect("muxer built"));
-        elements.push(&swallow);
+        elements.push(transcode_filesink.as_ref().expect("transcode filesink built"));
     }
     for element in &elements {
         pipeline.add(*element).map_err(|error| {
@@ -7534,61 +7766,24 @@ pub(crate) fn build_transcode_record_branch(
             gst::PadProbeReturn::Ok
         });
     } else {
-        // Chunk capture: every qtmux output buffer becomes one
-        // `recording-chunk` event (with faststart the whole file is emitted
-        // at EOS, so a single final chunk carries the complete seekable MP4).
-        let chunk_sender = event_sender.clone();
-        let chunk_active = active.clone();
-        let probe_sender = event_sender.clone();
-        let swallow_sink_pad = swallow
-            .static_pad("sink")
-            .ok_or_else(|| "Recording swallow queue has no sink pad.".to_owned())?;
-        // DROP swallows each chunk AT the pad: qtmux's push returns FLOW_OK,
-        // so its src task keeps running with an otherwise-unlinked branch
-        // tail.
-        swallow_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            if chunk_active.load(Ordering::SeqCst) {
-                if let Some(buffer) = info.buffer() {
-                    if let Ok(mapped) = buffer.map_readable() {
-                        // Strip the container's colour-metadata box so the
-                        // file carries NO colour tags at all (see
-                        // strip_mp4_colr_boxes for why the player needs it
-                        // byte-identical to the official GeForce Now
-                        // recordings).
-                        let mut bytes = mapped.as_slice().to_vec();
-                        let stripped = strip_mp4_colr_boxes(&mut bytes);
-                        if stripped > 0 {
-                            send_log(
-                                &probe_sender,
-                                "info",
-                                format!(
-                                    "Recording finalized with {stripped} colour-metadata box(es) neutralized (colr→free); file carries no colour tags, matching the official GeForce Now recordings."
-                                ),
-                            );
-                        }
-                        // Send in fixed-size chunks: qtmux with faststart
-                        // emits the ENTIRE seekable file as one final buffer,
-                        // which as a single base64 line can exceed a hundred
-                        // MB and freeze Electron's main process ("not
-                        // responding" + crash with a 0-byte .tmp). Electron
-                        // appends chunks in arrival order.
-                        if let Some(sender) = &chunk_sender {
-                            send_recording_chunks(sender, &bytes);
-                        }
-                    }
-                }
-            }
-            gst::PadProbeReturn::Drop
-        });
-
+        // TRANSCODE: EOS probe on the muxer's filesink. The live muxer
+        // writes the complete seekable MP4 into its temp file; when EOS
+        // reaches the sink, every buffer has been written and stop() hands
+        // the file to Electron via `recording-ready` (after neutralizing the
+        // colr boxes in the head).
         let eos_flag = eos_seen.clone();
-        swallow_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        let transcode_sink_pad = transcode_filesink
+            .as_ref()
+            .expect("transcode filesink built")
+            .static_pad("sink")
+            .ok_or_else(|| "Transcode filesink has no sink pad.".to_owned())?;
+        transcode_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
             if let Some(event) = info.event() {
                 if event.type_() == gst::EventType::Eos {
                     eos_flag.store(true, Ordering::SeqCst);
                 }
             }
-            gst::PadProbeReturn::Drop
+            gst::PadProbeReturn::Ok
         });
     }
 
@@ -7601,7 +7796,7 @@ pub(crate) fn build_transcode_record_branch(
             )
         } else {
             format!(
-                "Attached native TRANSCODE recording branch (decoded → {encoder_factory} (insert-vui=false, bitrate={record_bitrate_kbps} kbps) → qtmux → swallow; FULL→LIMITED Y-plane LUT scaler → limited-range untagged H.264 MP4 matching the official GeForce Now recordings, never touches the decode/present chain)."
+                "Attached native TRANSCODE recording branch (decoded → {encoder_factory} (insert-vui=false, bitrate={record_bitrate_kbps} kbps) → qtmux → filesink; FULL→LIMITED Y-plane LUT scaler → limited-range untagged H.264 MP4 matching the official GeForce Now recordings, never touches the decode/present chain)."
             )
         },
     );
@@ -7619,7 +7814,8 @@ pub(crate) fn build_transcode_record_branch(
         range_convert,
         video_download: download,
         muxer: if es_tail { None } else { Some(muxer.expect("muxer built")) },
-        swallow: if es_tail { None } else { Some(swallow) },
+        transcode_filesink,
+        transcode_out_path,
         video_es_path,
         audio_es_path: None,
         es_caps: es_caps.clone(),
@@ -7743,6 +7939,7 @@ pub(crate) fn build_pass_through_record_branch(
     codec: &str,
     fps: u32,
     event_sender: Option<Sender<Event>>,
+    mode: RecordingMode,
 ) -> Result<GstreamerRecordingState, String> {
     let codec_upper = codec.to_ascii_uppercase();
     let (depay_factory, parse_factory, rtp_encoding) = match codec_upper.as_str() {
@@ -8183,7 +8380,8 @@ pub(crate) fn build_pass_through_record_branch(
         range_convert: rtp_caps.clone(),
         video_download: None,
         muxer: None,
-        swallow: None,
+        transcode_filesink: None,
+        transcode_out_path: None,
         video_es_path: Some(video_es_path),
         audio_es_path: None,
         es_caps: Some(es_caps),
@@ -8199,7 +8397,7 @@ pub(crate) fn build_pass_through_record_branch(
         queue_output,
         dropped_frames: Arc::new(AtomicU64::new(0)),
 
-        mode: RecordingMode::PassThrough,
+        mode,
         codec: rtp_encoding.to_owned(),
         fps,
         record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
@@ -8229,52 +8427,6 @@ pub(crate) fn build_pass_through_record_branch(
 /// (the field wedge) — so all muxing happens here, offline, at stop, where a
 /// stall cannot touch the stream. Returns the output file size in bytes
 /// (0 = nothing was written, e.g. both ES files were empty).
-/// Deliver a finalized recording MP4 to Electron as fixed-size base64
-/// `recording-chunk` events, in file order. The chunking is load-bearing:
-/// Electron parses and base64-decodes each stdout line synchronously in its
-/// main process, so a whole-file single line (a 70 MB recording is ~94 MB of
-/// base64) freezes the UI ("Electron is not responding") and can crash the
-/// app before the .tmp is ever written. Fixed-size chunks keep every line
-/// ~1.4 MB; Electron appends them in arrival order.
-fn send_recording_chunks(sender: &Sender<Event>, bytes: &[u8]) {
-    for chunk in bytes.chunks(RECORDING_CHUNK_BYTES) {
-        let _ = sender.send(Event::RecordingChunk {
-            chunk_base64: BASE64_STANDARD.encode(chunk),
-        });
-    }
-}
-
-/// Stream a finalized MP4 to Electron as fixed-size `recording-chunk` events
-/// WITHOUT loading the whole file into memory (the old finalize read the
-/// entire file with `std::fs::read` — a multi-GB long recording peaked at
-/// ~4× the file size across the Rust base64 + Electron buffers and could OOM
-/// an 8 GB device exactly at the moment the user clicked stop). The file is
-/// opened once and read in RECORDING_CHUNK_BYTES windows, each window encoded
-/// and sent immediately, so peak memory is one chunk + its base64. Returns
-/// the number of bytes streamed.
-fn stream_recording_file_as_chunks(
-    sender: &Sender<Event>,
-    path: &std::path::Path,
-) -> Result<u64, String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).map_err(|error| {
-        format!("Failed to open finalized recording for chunk streaming: {error}")
-    })?;
-    let mut window = vec![0u8; RECORDING_CHUNK_BYTES];
-    let mut total: u64 = 0;
-    loop {
-        let read = file.read(&mut window).map_err(|error| {
-            format!("Failed to read finalized recording for chunk streaming: {error}")
-        })?;
-        if read == 0 {
-            break;
-        }
-        send_recording_chunks(sender, &window[..read]);
-        total += read as u64;
-    }
-    Ok(total)
-}
-
 /// Upper bound on the MP4 head (the moov/faststart index) read for colr
 /// tagging. Even long recordings keep the index at a few KB to a couple MB
 /// (the stco chunk table dominates); if a moov ever exceeds this, the box is
@@ -8363,16 +8515,26 @@ fn bump_mp4_box_size(data: &mut [u8], info: &Mp4BoxInfo, delta: usize) {
 
 /// Bump every chunk offset in an stco/co64 table by `delta` (the insertion
 /// shifted mdat's absolute position).
+///
+/// The stco/co64 box body sits AFTER the colr insertion point, so its content
+/// offset shifted by `delta` too — the pre-splice `Mp4BoxInfo` still points at
+/// the old position. Reading there would pick up garbage (the shifted
+/// neighbouring box) as the entry count and overrun unrelated bytes.
 fn bump_mp4_chunk_offsets(data: &mut [u8], info: &Mp4BoxInfo, delta: usize) {
     let is_co64 = &info.fourcc == b"co64";
     let entry_size = if is_co64 { 8 } else { 4 };
-    let payload = &mut data[info.content_offset..];
-    if payload.len() < 4 {
+    let content_offset = info.content_offset + delta;
+    let payload = &mut data[content_offset..];
+    if payload.len() < 8 {
         return;
     }
-    let count = u32::from_be_bytes(payload[0..4].try_into().expect("entry count")) as usize;
-    let table = &mut payload[4..];
-    let entries = count.min(table.len() / entry_size);
+    // stco/co64 payload: version/flags (4) + entry_count (4) + table.
+    let count = u32::from_be_bytes(payload[4..8].try_into().expect("entry count")) as usize;
+    let table = &mut payload[8..];
+    // Clamp to the table the box actually carries (header 8 + version/flags
+    // 4 + count 4), never to whatever data happens to follow the box.
+    let capacity = info.size.saturating_sub(16) / entry_size;
+    let entries = count.min(capacity);
     for i in 0..entries {
         let at = i * entry_size;
         if is_co64 {
@@ -8483,18 +8645,20 @@ fn inject_mp4_colr_box(data: &mut Vec<u8>) -> usize {
     1
 }
 
-/// Stream a finalized PassThrough recording to Electron as fixed-size
-/// `recording-chunk` events, tagging the colour metadata (colr nclx BT.709
-/// full-range) into the MP4 head on the way. Memory stays bounded: only the
-/// head (the moov index) is held, and the body is streamed window-by-window
-/// from the file — never the whole file in RAM.
-fn stream_recording_with_colr_tag(
-    sender: &Sender<Event>,
-    path: &std::path::Path,
+/// Finalize a PassThrough/Capture recording for DIRECT file handoff: write a
+/// colr-tagged (nclx BT.709 full-range, matching the received bitstream)
+/// copy of the MP4 to `out_path` — the patched head followed by the
+/// untouched body, window-copied so memory stays bounded (only the moov head
+/// is held, never the whole file). The output is the file Electron moves
+/// into the recordings directory; NO base64/IPC round trip. Returns the
+/// output size in bytes.
+fn finalize_mp4_with_colr_tag(
+    src: &std::path::Path,
+    out: &std::path::Path,
     event_sender: &Option<Sender<Event>>,
 ) -> Result<u64, String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|error| {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::File::open(src).map_err(|error| {
         format!("Failed to open finalized recording for colour tagging: {error}")
     })?;
     let file_len = file
@@ -8518,22 +8682,367 @@ fn stream_recording_with_colr_tag(
             "Recording colour metadata: colr already present or moov not fully in the head — the SPS VUI still carries the range info.".to_owned()
         },
     );
-    send_recording_chunks(sender, &head);
-    let mut total = head.len() as u64;
+    let mut out_file = std::fs::File::create(out)
+        .map_err(|error| format!("Failed to create colour-tagged recording: {error}"))?;
+    out_file
+        .write_all(&head)
+        .map_err(|error| format!("Failed to write colour-tagged recording head: {error}"))?;
     file.seek(SeekFrom::Start(head_len as u64))
-        .map_err(|error| format!("Failed to seek finalized recording for streaming: {error}"))?;
-    let mut window = vec![0u8; RECORDING_CHUNK_BYTES];
+        .map_err(|error| format!("Failed to seek finalized recording: {error}"))?;
+    let mut window = vec![0u8; 1024 * 1024];
+    let mut total = head.len() as u64;
     loop {
         let read = file.read(&mut window).map_err(|error| {
-            format!("Failed to read finalized recording for streaming: {error}")
+            format!("Failed to read finalized recording body: {error}")
         })?;
         if read == 0 {
             break;
         }
-        send_recording_chunks(sender, &window[..read]);
+        out_file.write_all(&window[..read]).map_err(|error| {
+            format!("Failed to write finalized recording body: {error}")
+        })?;
         total += read as u64;
     }
+    out_file
+        .flush()
+        .map_err(|error| format!("Failed to flush colour-tagged recording: {error}"))?;
+    drop(out_file);
     Ok(total)
+}
+
+/// Remux a CAPTURE-mode recording at stop, OFFLINE, in a throwaway pipeline
+/// (a stall here can never touch the live stream — the whole point of the
+/// mode): the received video ES (raw bitstream captured live at zero cost)
+/// + the raw Opus game-audio ES into a universal H.264/AAC MP4.
+///
+/// H.264 video is muxed DIRECTLY (still zero re-encode — the exact received
+/// full-range bitstream, colr-tagged at finalize). H.265/AV1 video is
+/// decoded and re-encoded to universal H.264 HERE, at stop, where the
+/// encoder cannot steal GPU/CPU from the live decoder (nobody is watching
+/// the stream while the recording finalizes; the UI shows a PROCESSING
+/// pill). The Opus ES is decoded + re-encoded to AAC the same way — game
+/// audio never saw a live decoder/encoder either.
+///
+/// Returns the output file size in bytes (0 = nothing was written).
+fn remux_capture_recording(
+    video_es: Option<&std::path::Path>,
+    audio_es: Option<&std::path::Path>,
+    out_path: &std::path::Path,
+    codec: &str,
+    fps: u32,
+    record_bitrate_kbps: u32,
+    event_sender: &Option<Sender<Event>>,
+) -> Result<u64, String> {
+    let Some(video_es) = video_es else {
+        return Err("Capture remux: no video elementary stream file.".to_owned());
+    };
+    let codec_upper = codec.to_ascii_uppercase();
+    let parse_factory = match codec_upper.as_str() {
+        "H264" => "h264parse",
+        "H265" | "HEVC" => "h265parse",
+        "AV1" => "av1parse",
+        other => return Err(format!("Capture remux: unsupported codec {other}.")),
+    };
+    // H.264 muxes straight through; H.265/AV1 get an offline decode →
+    // re-encode (universal H.264 output, zero cost to the live stream).
+    let transcodes_video = codec_upper != "H264";
+
+    let pipeline = gst::Pipeline::new();
+    let video_src = make_element("filesrc")?;
+    video_src.set_property(
+        "location",
+        video_es
+            .to_str()
+            .ok_or_else(|| "Capture remux video ES path is not valid UTF-8.".to_owned())?,
+    );
+    let parse = make_element(parse_factory)?;
+    let muxer = make_element("qtmux")?;
+    muxer.set_property("faststart", true);
+    muxer.set_property("fragment-duration", 0u32);
+    muxer.set_property("streamable", false);
+    let out_sink = make_element("filesink")?;
+    out_sink.set_property(
+        "location",
+        out_path
+            .to_str()
+            .ok_or_else(|| "Capture remux output path is not valid UTF-8.".to_owned())?,
+    );
+    out_sink.set_property("sync", false);
+    out_sink.set_property("async", false);
+
+    // Video chain: filesrc → parse → [decoder → videoconvert → encoder →
+    // h264parse when transcoding] → qtmux → filesink.
+    let mut video_chain: Vec<gst::Element> = vec![video_src.clone(), parse.clone()];
+    if transcodes_video {
+        let decoder_factory = match codec_upper.as_str() {
+            "H265" | "HEVC" => "avdec_h265",
+            "AV1" => "dav1ddec",
+            _ => unreachable!("non-H264 codec without an offline decoder"),
+        };
+        let decoder = make_element(decoder_factory)?;
+        // Format bridge (avdec/dav1d output → the encoder's preferred input
+        // format). No colour transform: the decoder caps carry the stream's
+        // full-range BT.709 colorimetry, the encoder inherits it, and the
+        // colr box tagged at finalize tells players.
+        let convert = make_element("videoconvert")?;
+        let (encoder_factory, encoder) = pick_h264_encoder(record_bitrate_kbps)?;
+        // The encoder emits byte-stream H.264; h264parse re-frames it to
+        // avcC for qtmux (same as the live branch).
+        let encode_parse = make_element("h264parse")?;
+        video_chain.extend([decoder, convert, encoder, encode_parse]);
+        send_log(
+            event_sender,
+            "info",
+            format!(
+                "Capture remux: transcoding the received {codec_upper} bitstream to universal H.264 OFFLINE ({encoder_factory}); the live stream is untouched."
+            ),
+        );
+    }
+    for element in &video_chain {
+        pipeline
+            .add(element)
+            .map_err(|error| format!("Failed to add capture remux element: {error}"))?;
+    }
+    pipeline
+        .add(&muxer)
+        .map_err(|error| format!("Failed to add capture remux muxer: {error}"))?;
+    pipeline
+        .add(&out_sink)
+        .map_err(|error| format!("Failed to add capture remux sink: {error}"))?;
+    for pair in video_chain.windows(2) {
+        pair[0]
+            .link(&pair[1])
+            .map_err(|error| format!("Failed to link capture remux video chain: {error:?}"))?;
+    }
+    // qtmux sink pads are REQUEST pads (video_%u / audio_%u) — request and
+    // link explicitly, then link the muxer src to the output filesink.
+    let video_muxer_pad = muxer
+        .request_pad_simple("video_%u")
+        .ok_or_else(|| "Capture remux: qtmux refused a video sink pad.".to_owned())?;
+    let last_video_src = video_chain
+        .last()
+        .ok_or_else(|| "Capture remux: empty video chain.".to_owned())?
+        .static_pad("src")
+        .ok_or_else(|| "Capture remux: last video element has no src pad.".to_owned())?;
+    if let Err(error) = last_video_src.link(&video_muxer_pad) {
+        let _ = muxer.release_request_pad(&video_muxer_pad);
+        return Err(format!("Failed to link capture remux video into qtmux: {error:?}"));
+    }
+    let muxer_out = muxer
+        .static_pad("src")
+        .ok_or_else(|| "Capture remux: qtmux has no src pad.".to_owned())?;
+    let out_sink_sink = out_sink
+        .static_pad("sink")
+        .ok_or_else(|| "Capture remux: output filesink has no sink pad.".to_owned())?;
+    muxer_out
+        .link(&out_sink_sink)
+        .map_err(|error| format!("Failed to link capture remux muxer to output: {error:?}"))?;
+
+    // Reconstruct the VIDEO timestamps the raw ES file cannot carry. H.264
+    // muxes directly: preserve the parser's real PTS when the SPS VUI timing
+    // carries it (the received stream's ground truth), ladder only when
+    // missing. The H.265/AV1 transcode output gets an UNCONDITIONAL
+    // monotonic ladder at the negotiated cadence: decoders can synthesize
+    // degenerate 0 PTS, and GFN's low-latency encoders emit no B-frames, so
+    // decode order == presentation order and the ladder is exact.
+    let frame_duration_ns = (1_000_000_000u64 / (fps.max(1) as u64)).max(1);
+    let video_counter = Arc::new(std::sync::Mutex::new(0u64));
+    {
+        let counter = video_counter.clone();
+        let last_src_pad = video_chain
+            .last()
+            .ok_or_else(|| "Capture remux: empty video chain.".to_owned())?
+            .static_pad("src")
+            .ok_or_else(|| "Capture remux: last video element has no src pad.".to_owned())?;
+        last_src_pad.add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_pad: &gst::Pad, info: &mut gst::PadProbeInfo| {
+                if let Some(buffer) = info.buffer_mut() {
+                    let buffer = buffer.make_mut();
+                    if transcodes_video || buffer.pts().is_none() {
+                        let mut guard =
+                            counter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let pts = gst::ClockTime::from_nseconds(*guard * frame_duration_ns);
+                        *guard += 1;
+                        let duration = gst::ClockTime::from_nseconds(frame_duration_ns);
+                        buffer.set_pts(pts);
+                        buffer.set_dts(pts);
+                        buffer.set_duration(duration);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+
+    // Game-audio track: the raw Opus ES (captured live with no decoder) is
+    // decoded + re-encoded to AAC offline — universal playback, zero cost to
+    // the live stream. Only linked when the file actually has data.
+    if let Some(audio_es) = audio_es {
+        if audio_es.exists()
+            && std::fs::metadata(audio_es)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+                > 0
+        {
+            let audio_src = make_element("filesrc")?;
+            audio_src.set_property(
+                "location",
+                audio_es.to_str().ok_or_else(|| {
+                    "Capture remux audio ES path is not valid UTF-8.".to_owned()
+                })?,
+            );
+            // Raw Opus packets are self-delimiting via their TOC byte;
+            // opusparse re-frames the file. NO capsfilter between opusparse
+            // and opusdec: a bare Opus file carries no channel/rate info, but
+            // the packet TOC signals mono/stereo per frame (mapping family
+            // 0 — GFN game audio is always ≤2ch), so opusdec decodes without
+            // external caps (forcing `channels` broke negotiation
+            // field-verified).
+            let opus_parse = make_element("opusparse")?;
+            let opus_dec = make_element("opusdec")?;
+            let audio_convert = make_element("audioconvert")?;
+            let (_aac_factory, aac_encoder) = pick_aac_encoder()?;
+            let aac_parse = make_element("aacparse")?;
+            let audio_chain: Vec<gst::Element> = vec![
+                audio_src.clone(),
+                opus_parse.clone(),
+                opus_dec.clone(),
+                audio_convert.clone(),
+                aac_encoder.clone(),
+                aac_parse.clone(),
+            ];
+            for element in &audio_chain {
+                pipeline.add(element).map_err(|error| {
+                    format!("Failed to add capture remux audio: {error}")
+                })?;
+            }
+            for pair in audio_chain.windows(2) {
+                pair[0]
+                    .link(&pair[1])
+                    .map_err(|error| format!("Failed to link capture remux audio chain: {error:?}"))?;
+            }
+            // Same timestamp reconstruction for AUDIO: each AAC frame is
+            // exactly 1024 samples, so a monotonic PTS ladder at 1024/rate is
+            // exact (rate read from the aacparse caps, e.g. 48000).
+            let audio_counter = Arc::new(std::sync::Mutex::new(0u64));
+            {
+                let counter = audio_counter.clone();
+                let aac_src_pad = aac_parse
+                    .static_pad("src")
+                    .ok_or_else(|| "Capture remux: aacparse has no src pad.".to_owned())?;
+                aac_src_pad.add_probe(
+                    gst::PadProbeType::BUFFER,
+                    move |pad: &gst::Pad, info: &mut gst::PadProbeInfo| {
+                        if let Some(buffer) = info.buffer_mut() {
+                            let buffer = buffer.make_mut();
+                            if buffer.pts().is_none() {
+                                let rate = match pad.current_caps() {
+                                    Some(caps) => match caps.structure(0) {
+                                        Some(structure) => structure
+                                            .get::<i32>("rate")
+                                            .unwrap_or(48_000)
+                                            .max(1) as u64,
+                                        None => 48_000,
+                                    },
+                                    None => 48_000,
+                                };
+                                let frame_ns = 1_024u64 * 1_000_000_000u64 / rate;
+                                let mut guard = counter
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let pts = gst::ClockTime::from_nseconds(*guard * frame_ns);
+                                *guard += 1;
+                                buffer.set_pts(pts);
+                                buffer.set_dts(pts);
+                                buffer.set_duration(gst::ClockTime::from_nseconds(frame_ns));
+                            }
+                        }
+                        gst::PadProbeReturn::Ok
+                    },
+                );
+            }
+            let audio_muxer_pad = muxer
+                .request_pad_simple("audio_%u")
+                .ok_or_else(|| "Capture remux: qtmux refused an audio sink pad.".to_owned())?;
+            let aac_src = aac_parse
+                .static_pad("src")
+                .ok_or_else(|| "Capture remux: aacparse has no src pad.".to_owned())?;
+            if let Err(error) = aac_src.link(&audio_muxer_pad) {
+                let _ = muxer.release_request_pad(&audio_muxer_pad);
+                return Err(format!("Failed to link capture remux AAC into qtmux: {error:?}"));
+            }
+        }
+    }
+
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(format!("Capture remux failed to start: {error:?}"));
+    }
+    let Some(bus) = pipeline.bus() else {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err("Capture remux pipeline has no bus.".to_owned());
+    };
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(RECORDING_REMUX_TIMEOUT_MS);
+    let mut finished = false;
+    while std::time::Instant::now() < deadline {
+        let Some(message) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(100),
+            &[
+                gst::MessageType::Eos,
+                gst::MessageType::Error,
+                gst::MessageType::Warning,
+            ],
+        ) else {
+            continue;
+        };
+        match message.view() {
+            gst::MessageView::Eos(_) => {
+                finished = true;
+                break;
+            }
+            gst::MessageView::Error(error) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(format!(
+                    "Capture remux failed: {} (debug: {:?})",
+                    error.error(),
+                    error.debug()
+                ));
+            }
+            gst::MessageView::Warning(warning) => send_log(
+                event_sender,
+                "warn",
+                format!(
+                    "Capture remux warning: {} (debug: {:?})",
+                    warning.error(),
+                    warning.debug()
+                ),
+            ),
+            _ => {}
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    if !finished {
+        return Err("Capture remux timed out while muxing the recording.".to_owned());
+    }
+    let size = std::fs::metadata(out_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    send_log(
+        event_sender,
+        "info",
+        if transcodes_video {
+            format!(
+                "Capture remux finished: {size} bytes (received {codec_upper} transcoded to universal H.264 OFFLINE — the live stream was never touched by an encoder)."
+            )
+        } else {
+            format!(
+                "Capture remux finished: {size} bytes (received H.264 muxed directly — zero re-encode, exact received quality)."
+            )
+        },
+    );
+    Ok(size)
 }
 
 fn remux_pass_through_recording(
@@ -8811,6 +9320,106 @@ fn remux_pass_through_recording(
         ),
     );
     Ok(size)
+}
+
+/// Bytes a recording must fit on disk to be allowed to start: the reference
+/// duration at (video + audio) bitrate plus the AllowSave headroom. Pure so
+/// it's unit-testable.
+fn recording_disk_requirement(video_bitrate_kbps: u32) -> u64 {
+    let total_bitrate_kbps = video_bitrate_kbps as u64 + RECORD_DISK_AUDIO_ALLOWANCE_KBPS;
+    total_bitrate_kbps * 1000 / 8 * RECORD_DISK_REFERENCE_DURATION_S + RECORD_DISK_HEADROOM_BYTES
+}
+
+/// Free bytes on the filesystem containing `path`, or `None` when the query
+/// fails (a disk we cannot measure is not a reason to block recording — the
+/// estimate is a heuristic anyway — but a MEASURED shortage is).
+fn free_disk_space_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                free_bytes_available_to_caller: *mut u64,
+                total_number_of_bytes: *mut u64,
+                total_number_of_free_bytes: *mut u64,
+            ) -> i32;
+        }
+        let mut available: u64 = 0;
+        let mut total: u64 = 0;
+        let mut free: u64 = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free)
+        };
+        if ok != 0 {
+            Some(available)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::ffi::CString;
+        #[repr(C)]
+        struct Statvfs {
+            f_bsize: u64,
+            f_frsize: u64,
+            f_blocks: u64,
+            f_bfree: u64,
+            f_bavail: u64,
+            f_files: u64,
+            f_ffree: u64,
+            f_favail: u64,
+            f_fsid: u64,
+            f_flag: u64,
+            f_namemax: u64,
+        }
+        extern "C" {
+            fn statvfs(path: *const i8, buf: *mut Statvfs) -> i32;
+        }
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        let mut buf: Statvfs = unsafe { std::mem::zeroed() };
+        let ok = unsafe { statvfs(c_path.as_ptr(), &mut buf) };
+        if ok == 0 {
+            Some(buf.f_bavail * buf.f_frsize)
+        } else {
+            None
+        }
+    }
+}
+
+/// Refuse to start a recording when the disk cannot hold a reference-length
+/// recording at the current bitrate plus the AllowSave headroom (parity with
+/// gfncapture.dll's `AllowSave`: clip size + 300 MB headroom). Returns the
+/// free bytes on success; `Err` carries a user-facing message.
+fn check_recording_disk_space(video_bitrate_kbps: u32) -> Result<u64, String> {
+    let required = recording_disk_requirement(video_bitrate_kbps);
+    let directory = std::env::temp_dir();
+    let Some(free) = free_disk_space_bytes(&directory) else {
+        // Cannot measure the disk — proceed rather than block recording on a
+        // failed syscall (the estimate itself is a heuristic anyway).
+        return Ok(u64::MAX);
+    };
+    if free < required {
+        let total_bitrate_kbps = video_bitrate_kbps as u64 + RECORD_DISK_AUDIO_ALLOWANCE_KBPS;
+        Err(format!(
+            "Recording start refused: only ~{} MB free on {} but a ~{}-minute recording at ~{:.1} Mbps needs ~{} MB (including {} MB headroom). Free up disk space and try again.",
+            free / (1024 * 1024),
+            directory.display(),
+            RECORD_DISK_REFERENCE_DURATION_S / 60,
+            total_bitrate_kbps as f64 / 1000.0,
+            required / (1024 * 1024),
+            RECORD_DISK_HEADROOM_BYTES / (1024 * 1024),
+        ))
+    } else {
+        Ok(free)
+    }
 }
 
 /// Derive the per-frame PTS interval (ns) the ENCODED-mode remux should use
@@ -9839,45 +10448,6 @@ mod mic_pipeline_tests {
         assert_eq!(inject_mp4_colr_box(&mut mp4), 0);
     }
 
-    /// The finalized MP4 must be delivered to Electron as MULTIPLE
-    /// fixed-size base64 chunks, not one giant line: Electron base64-decodes
-    /// each stdout line synchronously, so a whole-file single line (~94 MB
-    /// base64 for a 70 MB recording) freezes the UI and crashes the app
-    /// before the .tmp is written (the field's 0-byte .tmp + "not
-    /// responding"). Verify a 14 MB payload becomes many chunks and that
-    /// concatenating them reproduces the original bytes exactly.
-    #[test]
-    fn recording_chunks_split_large_files_and_reassemble() {
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-        use std::sync::mpsc;
-
-        let payload: Vec<u8> = (0..(3 * RECORDING_CHUNK_BYTES + 12345))
-            .map(|i| (i % 251) as u8)
-            .collect();
-        let (tx, rx) = mpsc::channel::<Event>();
-        send_recording_chunks(&tx, &payload);
-        let mut chunks = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Event::RecordingChunk { chunk_base64 } = event {
-                chunks.push(
-                    BASE64_STANDARD
-                        .decode(&chunk_base64)
-                        .expect("valid base64 chunk"),
-                );
-            }
-        }
-        assert!(
-            chunks.len() >= 3,
-            "large payload must be split into multiple chunks, got {}",
-            chunks.len()
-        );
-        let reassembled: Vec<u8> = chunks.concat();
-        assert_eq!(
-            reassembled, payload,
-            "concatenated chunks must reproduce the file byte-for-byte"
-        );
-    }
-
     /// The ENCODED-mode remux ladder must follow the MEASURED decoded-frame
     /// cadence of the recording window, not the static negotiated fps: a 60 fps
     /// negotiated stream that delivers 30 unique frames per second (rate
@@ -9936,6 +10506,164 @@ mod mic_pipeline_tests {
         assert_eq!(
             measured_recording_frame_duration_ns(100, 0, 3_333_333_337, 60),
             33_670_033
+        );
+    }
+
+    /// End-to-end CAPTURE-mode offline remux on a REAL field H.265 elementary
+    /// stream (testdata/gfn_field.h265): the capture remux must TRANSCODE the
+    /// received H.265 to universal H.264 (avc1) OFFLINE — the live branch is
+    /// zero-cost passthrough, so all encode work lives here at stop.
+    #[test]
+    fn capture_remux_transcodes_h265_to_universal_h264() {
+        gst::init().expect("gstreamer init");
+        let es_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("gfn_field.h265");
+        assert!(es_path.exists(), "missing testdata/gfn_field.h265");
+        let out_path = std::env::temp_dir().join(format!(
+            "opennow-remux-capture-h265-test-{}.mp4",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&out_path);
+        let size = remux_capture_recording(Some(&es_path), None, &out_path, "H265", 60, 15_000, &None)
+            .expect("capture H.265 ES must remux offline");
+        assert!(size > 100_000, "remux output suspiciously small: {size}");
+        let bytes = std::fs::read(&out_path).expect("read remux output");
+        assert!(bytes.len() >= 8 && &bytes[4..8] == b"ftyp", "must be ftyp MP4");
+        assert!(bytes.windows(4).any(|w| w == b"mdat"), "must contain mdat");
+        let has_h264 = bytes.windows(4).any(|w| w == b"avc1");
+        let has_h265 = bytes.windows(4).any(|w| w == b"hvc1" || w == b"hev1");
+        assert!(
+            has_h264 && !has_h265,
+            "capture remux must transcode H.265 to universal H.264 (avc1={has_h264}, hvc1={has_h265})"
+        );
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// CAPTURE-mode game audio: the raw Opus ES (captured live with NO
+    /// decoder/encoder — the whole point of the mode) must be decoded +
+    /// re-encoded to an AAC (mp4a) track OFFLINE. Generates a small Opus ES
+    /// with opusenc in a throwaway pipeline, then remuxes it together with
+    /// the field H.265 ES; skips when opusenc is unavailable.
+    #[test]
+    fn capture_remux_opus_audio_becomes_aac_track() {
+        gst::init().expect("gstreamer init");
+        let Some(opus_enc) = gst::ElementFactory::make("opusenc").build().ok() else {
+            eprintln!("opusenc unavailable — skipping capture audio remux test");
+            return;
+        };
+        let opus_path = std::env::temp_dir().join(format!(
+            "opennow-capture-opus-test-{}.opus.es",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&opus_path);
+        let src_pipeline = gst::Pipeline::new();
+        let src = make_element("audiotestsrc").expect("audiotestsrc");
+        src.set_property("num-buffers", 240i32);
+        let convert = make_element("audioconvert").expect("audioconvert");
+        let resample = make_element("audioresample").expect("audioresample");
+        let sink = make_element("filesink").expect("filesink");
+        sink.set_property(
+            "location",
+            opus_path.to_str().expect("opus path utf8"),
+        );
+        src_pipeline
+            .add_many(&[&src, &convert, &resample, &opus_enc, &sink])
+            .expect("add opus generation chain");
+        src.link(&convert).expect("link src convert");
+        convert.link(&resample).expect("link resample");
+        resample.link(&opus_enc).expect("link opusenc");
+        opus_enc.link(&sink).expect("link sink");
+        src_pipeline.set_state(gst::State::Playing).expect("playing");
+        let bus = src_pipeline.bus().expect("opus bus");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut finished = false;
+        while std::time::Instant::now() < deadline {
+            let Some(message) = bus.timed_pop_filtered(
+                gst::ClockTime::from_mseconds(100),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            ) else {
+                continue;
+            };
+            match message.view() {
+                gst::MessageView::Eos(_) => {
+                    finished = true;
+                    break;
+                }
+                gst::MessageView::Error(error) => {
+                    let _ = src_pipeline.set_state(gst::State::Null);
+                    panic!("opus ES generation failed: {}", error.error());
+                }
+                _ => {}
+            }
+        }
+        let _ = src_pipeline.set_state(gst::State::Null);
+        assert!(finished, "opus ES generation timed out");
+        assert!(
+            std::fs::metadata(&opus_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "opus ES must be non-empty"
+        );
+        let es_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("gfn_field.h265");
+        let out_path = std::env::temp_dir().join(format!(
+            "opennow-remux-capture-audio-test-{}.mp4",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&out_path);
+        let size = remux_capture_recording(
+            Some(&es_path),
+            Some(&opus_path),
+            &out_path,
+            "H265",
+            60,
+            15_000,
+            &None,
+        )
+        .expect("capture remux with Opus audio must succeed");
+        assert!(size > 100_000, "remux output suspiciously small: {size}");
+        let bytes = std::fs::read(&out_path).expect("read remux output");
+        assert!(
+            bytes.windows(4).any(|w| w == b"mp4a"),
+            "Opus ES must become an AAC (mp4a) track in the MP4"
+        );
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&opus_path);
+    }
+
+    /// The start-time disk guard must demand the reference duration at the
+    /// (video + audio) bitrate PLUS the 300 MB AllowSave headroom, and scale
+    /// with the bitrate.
+    #[test]
+    fn recording_disk_requirement_covers_reference_duration_plus_headroom() {
+        let headroom = 300 * 1024 * 1024;
+        // 8 Mbps video + 192 kbps audio allowance, 600 s reference, +300 MB.
+        let bytes_per_second = (8_000 + 192) * 1000 / 8;
+        assert_eq!(
+            recording_disk_requirement(8_000),
+            bytes_per_second * 600 + headroom
+        );
+        // A higher bitrate demands proportionally more disk.
+        assert!(recording_disk_requirement(16_000) > recording_disk_requirement(8_000));
+        // Zero video bitrate still demands the headroom (and the audio
+        // allowance) — a nearly-full disk is always caught.
+        assert!(recording_disk_requirement(0) >= headroom);
+        // A full 4K60 session (45 Mbps) must fit in a few GB, not tens.
+        let four_k = recording_disk_requirement(45_000);
+        assert!(
+            four_k < 4 * 1024 * 1024 * 1024,
+            "45 Mbps reference estimate is reasonable: {four_k}"
+        );
+    }
+
+    /// The free-space syscall must report the temp filesystem (where the ES
+    /// files and the offline remux output are written).
+    #[test]
+    fn free_disk_space_queries_the_temp_filesystem() {
+        let free = free_disk_space_bytes(&std::env::temp_dir());
+        assert!(
+            free.is_some() && free.unwrap() > 0,
+            "temp dir must report a positive free space"
         );
     }
 }

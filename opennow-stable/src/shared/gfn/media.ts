@@ -49,6 +49,18 @@ export interface RecordingChunkRequest {
   chunk: ArrayBuffer;
 }
 
+/**
+ * Native streamer handoff: the finalized MP4 already exists as a complete
+ * file (written by the offline remux worker). Electron installs it into the
+ * recording's temp slot so `finishRecording`'s rename to the final name
+ * works unchanged — replacing the chunk-append path.
+ */
+export interface RecordingInstallRequest {
+  recordingId: string;
+  /** Absolute path of the completed MP4 in the native streamer's temp dir. */
+  sourcePath: string;
+}
+
 export interface RecordingFinishRequest {
   recordingId: string;
   durationMs: number;

@@ -222,8 +222,15 @@ export type NativeStreamerEvent =
       };
     }
   | {
-      type: "recording-chunk";
-      chunkBase64: string;
+      /**
+       * The finalized MP4 has been written COMPLETE to `path` by the native
+       * streamer (the offline remux worker at stop, or the transcode live
+       * muxer once its EOS flushed). The manager moves it into the
+       * recordings directory — no base64 chunk pipeline.
+       */
+      type: "recording-ready";
+      path: string;
+      size: number;
     }
   | {
       type: "recording-finished";

@@ -36,7 +36,7 @@ import {
   createNativeStreamerStatus,
   formatError,
 } from "./capabilities";
-import { appendRecordingChunk } from "../media/recordings";
+import { installRecordingFile } from "../media/recordings";
 import { resolveNativeStreamerExecutableCandidates } from "./executableDiscovery";
 import {
   isNativeStreamerEvent,
@@ -153,7 +153,12 @@ export class NativeStreamerManager {
     | null = null;
   private pendingRecordingFinishedReject: ((error: Error) => void) | null = null;
   /** Serialize native chunk writes; stdout events can arrive faster than disk writes. */
-  private recordingChunkQueue: Promise<void> = Promise.resolve();
+  /**
+   * Serialized queue for finalizing a native recording file: the
+   * `recording-ready` install (file move) runs before `recording-finished`
+   * resolves, so the two can never race.
+   */
+  private recordingFinalizeQueue: Promise<void> = Promise.resolve();
   private queuedLocalIce: IceCandidatePayload[] = [];
   private queuedRemoteIceSessionId: string | null = null;
   private queuedRemoteIce: IceCandidatePayload[] = [];
@@ -542,15 +547,15 @@ export class NativeStreamerManager {
    * guard, so a plain latest-wins slot is sufficient.
    */
   /**
-   * Start a native recording. Chunks flow back as `recording-chunk` events
-   * and are appended to the recording file (in order) by `handleEvent`.
+   * Start a native recording. The finalized file flows back as a single
+   * `recording-ready` event (complete MP4 path) handled by `handleEvent`.
    */
   async startNativeRecording(recordingId: string): Promise<void> {
     if (!this.child || !this.activeSessionId) {
       throw new Error("Native streamer is not running.");
     }
     this.activeNativeRecordingId = recordingId;
-    this.recordingChunkQueue = Promise.resolve();
+    this.recordingFinalizeQueue = Promise.resolve();
     try {
       await this.request({ type: "start-recording" }, CONTROL_TIMEOUT_MS);
     } catch (error) {
@@ -576,9 +581,10 @@ export class NativeStreamerManager {
 
   /**
    * Finalize the native recording: flush the encoder/muxer with EOS, wait for
-   * the `recording-finished` event (which arrives strictly after every chunk
-   * has been emitted and appended), then resolve with the thumbnail (if the
-   * streamer captured one) and the dropped-frame count.
+   * the `recording-finished` event (which arrives strictly after the file has
+   * been moved into the recordings directory), then resolve with the
+   * thumbnail (if the streamer captured one) and the dropped-frame count.
+   * Rejects when the file could not be saved.
    */
   async stopNativeRecording(): Promise<{ thumbnailBase64?: string; droppedFrames: number }> {
     if (!this.child || !this.activeSessionId) {
@@ -1085,40 +1091,37 @@ export class NativeStreamerManager {
       return;
     }
 
-    if (message.type === "recording-chunk") {
+    if (message.type === "recording-ready") {
       const recordingId = this.activeNativeRecordingId;
       if (recordingId) {
-        const buffer = Buffer.from(message.chunkBase64, "base64");
-        // Keep chunks strictly ordered and do not let recording-finished race
-        // a still-pending disk write. This matters for non-fragmented qtmux:
-        // the final MP4 can be one very large stdout event.
-        this.recordingChunkQueue = this.recordingChunkQueue
+        // Move the complete file into the recording's temp slot, serialized
+        // on a queue so `recording-finished` below cannot race the move. A
+        // failure here rejects the pending stop (via the finished handler's
+        // catch), so a recording that could not be saved is surfaced instead
+        // of silently missing.
+        this.recordingFinalizeQueue = this.recordingFinalizeQueue
           .catch(() => undefined)
-          .then(() => appendRecordingChunk({
-            recordingId,
-            // Buffer's underlying ArrayBuffer spans exactly the decoded bytes.
-            chunk: buffer.buffer.slice(
-              buffer.byteOffset,
-              buffer.byteOffset + buffer.byteLength,
-            ) as ArrayBuffer,
-          }))
-          .catch((error) => {
-            console.warn("[NativeStreamer] Failed to append native recording chunk:", error);
-          });
+          .then(() => installRecordingFile({ recordingId, sourcePath: message.path }));
       }
       return;
     }
 
     if (message.type === "recording-finished") {
       const resolve = this.pendingRecordingFinishedResolve;
+      const reject = this.pendingRecordingFinishedReject;
       this.pendingRecordingFinishedResolve = null;
       this.pendingRecordingFinishedReject = null;
-      void this.recordingChunkQueue.finally(() => {
-        resolve?.({
-          thumbnailBase64: message.thumbnailBase64,
-          droppedFrames: message.droppedFrames ?? 0,
+      void this.recordingFinalizeQueue
+        .then(() => {
+          resolve?.({
+            thumbnailBase64: message.thumbnailBase64,
+            droppedFrames: message.droppedFrames ?? 0,
+          });
+        })
+        .catch((error) => {
+          console.error("[NativeStreamer] Recording file could not be saved:", error);
+          reject?.(error);
         });
-      });
       return;
     }
 
