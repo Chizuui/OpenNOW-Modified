@@ -109,6 +109,15 @@ export interface Settings {
   nativeCursorOverlay: boolean;
   /** Opt-in stacked sink-native RawInput capture (mouse + keyboard bypass the Electron bridge). */
   nativeSinkInputCapture: boolean;
+  /**
+   * GFN DVR pre-roll duration (seconds) shared by BOTH recorders: the native
+   * Capture/PassThrough ring and the web encoded-transform ring keep this
+   * much keyframe-aligned video before record start, so a clip can start up
+   * to N seconds before the record button was pressed. 0 disables the ring
+   * (web recordings then start at record; native falls back to its own
+   * default). Applied at session start (new sessions).
+   */
+  recordingDvrSeconds: number;
   mouseSensitivity: number;
   mouseAcceleration: number;
   shortcutToggleStats: string;
@@ -281,6 +290,7 @@ export function createDefaultSettings(platform: string): Settings {
     nativeD3dFullscreenMode: "auto",
     nativeExternalRenderer: false,
     nativeStackedRenderer: false,
+    recordingDvrSeconds: 30,
     transportMode: "webrtc",
     showNativeStreamerStats: false,
     codec: DEFAULT_STREAM_PREFERENCES.codec,

@@ -28,6 +28,8 @@ export interface NativeStreamerRuntimeEnvironmentOptions {
   stackedRendererEnabled?: boolean;
   cloudGsyncMode: NativeStreamerFeatureMode;
   d3dFullscreenMode: NativeStreamerFeatureMode;
+  /** GFN DVR pre-roll seconds for native recordings (OPENNOW_RECORD_DVR_SECONDS). */
+  dvrPreRollSeconds?: number;
 }
 
 export interface NativeStreamerRuntimeEnvironment {
@@ -238,6 +240,11 @@ export function createNativeStreamerRuntimeEnvironment(
   env.OPENNOW_NATIVE_D3D_FULLSCREEN = nativeStreamerFeatureModeToEnvValue(options.d3dFullscreenMode);
   if (options.backendPreference !== "auto") {
     env.OPENNOW_NATIVE_STREAMER_BACKEND = options.backendPreference;
+  }
+  if (options.dvrPreRollSeconds !== undefined && options.dvrPreRollSeconds > 0) {
+    env.OPENNOW_RECORD_DVR_SECONDS = String(options.dvrPreRollSeconds);
+  } else {
+    delete env.OPENNOW_RECORD_DVR_SECONDS;
   }
 
   return {

@@ -17,6 +17,7 @@ import {
   nativeVideoBackendOptions,
 } from "../settingsFormatters";
 import { MotionSpinner } from "../../MotionSpinner";
+import { SettingRange } from "../SettingRange";
 import { ModalSurface } from "../../ui/ModalSurface";
 
 const nativePlatformHint = `${navigator.platform} ${navigator.userAgent}`;
@@ -69,6 +70,22 @@ export function SettingsNativeStreamerSection({
   const [cacheCleared, setCacheCleared] = useState(false);
   const [nativeStreamerEnablePromptOpen, setNativeStreamerEnablePromptOpen] = useState(false);
   const nativeStreamerEnablePromptConfirmRef = useRef<HTMLButtonElement | null>(null);
+  const [dvrSecondsDraft, setDvrSecondsDraft] = useState(
+    String(settings.recordingDvrSeconds),
+  );
+
+  useEffect(() => {
+    setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+  }, [settings.recordingDvrSeconds]);
+
+  const commitDvrSecondsDraft = useCallback(() => {
+    const parsed = Math.round(Number(dvrSecondsDraft));
+    const clamped = Number.isFinite(parsed)
+      ? Math.max(5, Math.min(300, parsed))
+      : 30;
+    handleChange("recordingDvrSeconds", clamped);
+    setDvrSecondsDraft(String(clamped));
+  }, [dvrSecondsDraft, handleChange]);
   const hostVideoBackends = getHostVideoBackends(nativeStreamerStatus);
   const selectableVideoBackendOptions = nativeVideoBackendOptions.filter(
     (option) => option.value === "auto"
@@ -323,6 +340,53 @@ export function SettingsNativeStreamerSection({
                 </div>
                 <span className="settings-subtle-hint">
                   {t("settings.nativeStreamer.sinkInputCaptureHint")}
+                </span>
+              </div>
+
+              <div className="settings-row settings-row--column">
+                <div className="settings-row-top">
+                  <label
+                    id="settings-native-dvr-seconds-label"
+                    className="settings-label"
+                    htmlFor="settings-native-dvr-seconds-slider"
+                  >
+                    {t("settings.nativeStreamer.recordingDvrSeconds")}
+                  </label>
+                  <span className="settings-value-badge">{settings.recordingDvrSeconds}s</span>
+                </div>
+                <div className="settings-slider-control">
+                  <SettingRange
+                    id="settings-native-dvr-seconds-slider"
+                    className="settings-slider"
+                    min={5}
+                    max={300}
+                    step={5}
+                    value={settings.recordingDvrSeconds}
+                    onPreview={(value) => setDvrSecondsDraft(String(value))}
+                    onCommit={(value) => handleChange("recordingDvrSeconds", value)}
+                  />
+                  <input
+                    id="settings-native-dvr-seconds-number"
+                    type="number"
+                    className="settings-text-input settings-number-input"
+                    aria-labelledby="settings-native-dvr-seconds-label"
+                    min={5}
+                    max={300}
+                    step={5}
+                    value={dvrSecondsDraft}
+                    onChange={(e) => setDvrSecondsDraft(e.target.value)}
+                    onBlur={commitDvrSecondsDraft}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.currentTarget.blur();
+                      } else if (e.key === "Escape") {
+                        setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+                      }
+                    }}
+                  />
+                </div>
+                <span className="settings-subtle-hint">
+                  {t("settings.nativeStreamer.recordingDvrSecondsHint")}
                 </span>
               </div>
 

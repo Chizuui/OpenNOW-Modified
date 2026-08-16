@@ -467,6 +467,8 @@ export class SignalingCoordinator {
         this.deps.settingsManager?.get("nativeExternalRenderer") ?? false,
       getStackedRendererEnabled: () =>
         this.deps.settingsManager?.get("nativeStackedRenderer") ?? false,
+      getDvrPreRollSeconds: () =>
+        this.deps.settingsManager?.get("recordingDvrSeconds") ?? 30,
       emit: (event) => this.emitToRenderer(event),
       sendAnswer: async (payload) => {
         if (!this.signalingClient) {

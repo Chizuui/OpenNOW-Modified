@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, type JSX, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type JSX, type ReactNode } from "react";
 import type {
   CodecPreference,
   ColorQuality,
@@ -74,6 +74,22 @@ export function StreamQualityControls({
   // machines without the Chromium HEVC extension while the native streamer
   // decodes it fine (d3d12h265dec etc.). Falls back to the browser probe when
   // the streamer status is missing/loading.
+  // DVR pre-roll draft (web recordings): synced from the shared setting,
+  // clamped 5..300 on commit (same slider as the Native Streamer section).
+  const [dvrSecondsDraft, setDvrSecondsDraft] = useState(
+    String(settings.recordingDvrSeconds),
+  );
+  useEffect(() => {
+    setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+  }, [settings.recordingDvrSeconds]);
+  const commitDvrSecondsDraft = useCallback(() => {
+    const parsed = Math.round(Number(dvrSecondsDraft));
+    const clamped = Number.isFinite(parsed)
+      ? Math.max(5, Math.min(300, parsed))
+      : 30;
+    handleChange("recordingDvrSeconds", clamped);
+    setDvrSecondsDraft(String(clamped));
+  }, [dvrSecondsDraft, handleChange]);
   const nativeStreamerStatus = useNativeStreamerStatus(settings.streamClientMode === "native");
   const nativeAvailability = useMemo<NativeCodecAvailability | null>(
     () => (settings.streamClientMode === "native"
@@ -578,6 +594,53 @@ export function StreamQualityControls({
           </label>
         </div>
         <span className="settings-subtle-hint">{t("settings.video.recordingMixMicHint")}</span>
+      </div>
+
+      <div className="settings-row settings-row--column">
+        <div className="settings-row-top">
+          <label
+            id="settings-web-dvr-seconds-label"
+            className="settings-label"
+            htmlFor="settings-web-dvr-seconds-slider"
+          >
+            {t("settings.video.recordingDvrSeconds")}
+          </label>
+          <span className="settings-value-badge">{settings.recordingDvrSeconds}s</span>
+        </div>
+        <div className="settings-slider-control">
+          <SettingRange
+            id="settings-web-dvr-seconds-slider"
+            className="settings-slider"
+            min={5}
+            max={300}
+            step={5}
+            value={settings.recordingDvrSeconds}
+            onPreview={(value) => setDvrSecondsDraft(String(value))}
+            onCommit={(value) => handleChange("recordingDvrSeconds", value)}
+          />
+          <input
+            id="settings-web-dvr-seconds-number"
+            type="number"
+            className="settings-text-input settings-number-input"
+            aria-labelledby="settings-web-dvr-seconds-label"
+            min={5}
+            max={300}
+            step={5}
+            value={dvrSecondsDraft}
+            onChange={(e) => setDvrSecondsDraft(e.target.value)}
+            onBlur={commitDvrSecondsDraft}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.currentTarget.blur();
+              } else if (e.key === "Escape") {
+                setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+              }
+            }}
+          />
+        </div>
+        <span className="settings-subtle-hint">
+          {t("settings.video.recordingDvrSecondsHint")}
+        </span>
       </div>
         </>
       )}

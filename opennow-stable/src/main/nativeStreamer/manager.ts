@@ -67,6 +67,8 @@ interface NativeStreamerManagerOptions extends NativeStreamerCallbacks {
   getD3dFullscreenMode(): NativeStreamerFeatureMode;
   getExternalRendererEnabled(): boolean;
   getStackedRendererEnabled(): boolean;
+  /** GFN DVR pre-roll seconds for native recordings (0 = native default). */
+  getDvrPreRollSeconds(): number;
 }
 
 interface PendingRequest {
@@ -791,6 +793,7 @@ export class NativeStreamerManager {
         : false,
       cloudGsyncMode: this.options.getCloudGsyncMode(),
       d3dFullscreenMode: this.options.getD3dFullscreenMode(),
+      dvrPreRollSeconds: this.options.getDvrPreRollSeconds(),
     });
     this.gstreamerRuntime = runtimeStatus;
     if (runtimeStatus.bundled) {

@@ -69,6 +69,26 @@ function normalizeRecordingBitrateMbps(raw: unknown): number | null {
   return Math.max(1, Math.min(200, Math.round(value)));
 }
 
+/**
+ * GFN DVR pre-roll duration (seconds) shared by the native and web recorders:
+ * 5..300, integer. Falls back to 30 (the native streamer's own default) on
+ * garbage.
+ */
+const RECORDING_DVR_SECONDS_MIN = 5;
+const RECORDING_DVR_SECONDS_MAX = 300;
+const RECORDING_DVR_SECONDS_DEFAULT = 30;
+
+function normalizeRecordingDvrSeconds(raw: unknown): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return RECORDING_DVR_SECONDS_DEFAULT;
+  }
+  return Math.max(
+    RECORDING_DVR_SECONDS_MIN,
+    Math.min(RECORDING_DVR_SECONDS_MAX, Math.round(value)),
+  );
+}
+
 
 const ERROR_REPORTING_CONSENTS = new Set<ErrorReportingConsent>(["unset", "granted", "denied"]);
 
@@ -151,10 +171,13 @@ export class SettingsManager {
       const content = readFileSync(this.settingsPath, "utf-8");
       type PersistedSettings = Partial<Settings> & {
         sessionTimeRemainingDisplay?: unknown;
+        /** Renamed to recordingDvrSeconds in v0.6 — migrated on load. */
+        nativeRecordingDvrSeconds?: unknown;
       };
       const parsed = JSON.parse(content) as PersistedSettings;
       const {
         sessionTimeRemainingDisplay: legacySessionTimeDisplay,
+        nativeRecordingDvrSeconds: legacyNativeRecordingDvrSeconds,
         ...parsedSettings
       } = parsed;
 
@@ -188,6 +211,16 @@ export class SettingsManager {
       // Migrate a short-lived prerelease display enum while keeping the old key out of saved settings.
       if (legacySessionTimeDisplay === "stats" || legacySessionTimeDisplay === "both") {
         merged.showSessionTimeRemainingInStatsOverlay = true;
+        migrated = true;
+      }
+
+      // Renamed in v0.6: nativeRecordingDvrSeconds → recordingDvrSeconds (the
+      // DVR pre-roll is now shared by the web and native recorders). Carry the
+      // old persisted value over (normalized) so existing configs keep their
+      // pre-roll preference instead of silently falling back to the default.
+      if (legacyNativeRecordingDvrSeconds !== undefined) {
+        merged.recordingDvrSeconds =
+          normalizeRecordingDvrSeconds(legacyNativeRecordingDvrSeconds);
         migrated = true;
       }
 
@@ -282,6 +315,12 @@ export class SettingsManager {
         "[Settings] Migrating conflicting render mode (Stacked + External) to Stacked.",
       );
       settings.nativeExternalRenderer = false;
+      migrated = true;
+    }
+    const dvrSecondsBefore = settings.recordingDvrSeconds;
+    settings.recordingDvrSeconds =
+      normalizeRecordingDvrSeconds(settings.recordingDvrSeconds);
+    if (settings.recordingDvrSeconds !== dvrSecondsBefore) {
       migrated = true;
     }
     const transportMode = normalizeTransportModeForPlatform(
