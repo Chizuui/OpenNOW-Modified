@@ -842,11 +842,266 @@ impl PassThroughFlowDiag {
     }
 }
 
+/// Duration (seconds) of pre-roll video/audio the always-armed DVR ring
+/// buffers hold before record start. Overridable via
+/// `OPENNOW_RECORD_DVR_SECONDS`. A 1080p60 HEVC/AV1 GFN stream is ~5-15 Mbps,
+/// so 30 s costs roughly 20-60 MB in RAM for video plus ~1 MB for audio.
+const DVR_RING_DEFAULT_SECONDS: u64 = 30;
+
+/// Estimated session video bitrate (kbps) used to size the video DVR ring
+/// when the negotiated bitrate is unknown at branch-build time (the builder
+/// only receives the fps). 15 Mbps ≈ 1080p60 H.265/AV1.
+const DVR_RING_DEFAULT_KBPS: u32 = 15_000;
+
+/// Audio DVR ring budget allowance in bytes per pre-roll second (≈ 256 kbps
+/// stereo AAC — a 30 s pre-roll is ~1 MB).
+const DVR_RING_AUDIO_BYTES_PER_SECOND: u64 = 32_000;
+
+/// Pre-roll duration (seconds) for the DVR rings, from
+/// `OPENNOW_RECORD_DVR_SECONDS` (default [`DVR_RING_DEFAULT_SECONDS`]).
+fn dvr_ring_seconds() -> u64 {
+    std::env::var("OPENNOW_RECORD_DVR_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DVR_RING_DEFAULT_SECONDS)
+}
+
+/// One elementary-stream access unit buffered by [`DvrEsRing`].
+#[derive(Debug, Clone)]
+struct DvrAu {
+    /// Presentation timestamp in ns. Video (parser output, RTP 90 kHz derived)
+    /// and audio (AAC encoder output, RTP 48 kHz derived) both descend from
+    /// the server NTP wall clock, so their inter-clock offset is constant and
+    /// the two streams can be slice-aligned by it. Only used for audio/video
+    /// alignment — the offline remux rebuilds absolute timestamps from 0.
+    pts_ns: u64,
+    keyframe: bool,
+    data: Vec<u8>,
+}
+
+/// Bounded, keyframe-aligned ring of elementary-stream access units with a
+/// disk-backed recording window — the GFN DVR capture model for the native
+/// recorder.
+///
+/// The pass-through recording branch (Capture/PassThrough modes) feeds every
+/// AU the parser emits into this ring from session arm time, so when the user
+/// presses record the ring already holds a complete, keyframe-aligned
+/// pre-roll window. Record start PINs the ring: the pre-roll head is written
+/// straight into the recording's temp ES file and every AU that follows is
+/// appended to that file live — RAM stays bounded to the pre-roll window no
+/// matter how long the recording runs, while the ES file (the "slice", GFN
+/// DVR-style) grows on disk. The recording therefore always begins at a
+/// complete keyframe AU and can never be empty while the stream is delivering
+/// video — the recording-start keyframe gate, its signaling keyframe retry,
+/// and the empty-ES stop guard become unreachable by construction. When idle
+/// the ring trims to its byte budget, always snapping the front to a keyframe
+/// AU (the pre-roll head is therefore always the head of a fresh GOP).
+#[derive(Debug, Clone)]
+pub(crate) struct DvrEsRing {
+    inner: Arc<Mutex<DvrEsRingInner>>,
+}
+
+#[derive(Debug)]
+struct DvrEsRingInner {
+    entries: std::collections::VecDeque<DvrAu>,
+    total_bytes: u64,
+    budget_bytes: u64,
+    /// While pinned (a recording is in flight) the pre-roll head was written
+    /// to `es_file` at pin time and every pushed AU is APPENDED to it — the
+    /// recording body. The in-memory ring stops accumulating (RAM stays
+    /// bounded); the ES file carries the recording.
+    pinned: bool,
+    /// Open handle of the recording's temp ES file (None while idle or after
+    /// unpin). The pre-roll head + live recording body live here.
+    es_file: Option<std::fs::File>,
+    /// Whether idle eviction snaps the ring front to a keyframe AU (video:
+    /// yes — a slice head must open a fresh GOP; audio: no — ADTS has no
+    /// GOP, eviction just drops the oldest AUs).
+    snap_to_keyframe: bool,
+}
+
+impl DvrEsRing {
+    pub(crate) fn new(budget_bytes: u64) -> Self {
+        Self::with_keyframe_snap(budget_bytes, true)
+    }
+
+    /// Create a ring; `snap_to_keyframe` controls whether idle eviction
+    /// snaps the front to a keyframe AU (video yes, audio no).
+    pub(crate) fn with_keyframe_snap(budget_bytes: u64, snap_to_keyframe: bool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DvrEsRingInner {
+                entries: std::collections::VecDeque::new(),
+                total_bytes: 0,
+                budget_bytes,
+                pinned: false,
+                es_file: None,
+                snap_to_keyframe,
+            })),
+        }
+    }
+
+    /// Push one AU. While idle it lands in the bounded ring (pre-roll, front
+    /// snapped to a keyframe); while pinned it is APPENDED to the recording's
+    /// ES file (the live recording body). Empty AUs are ignored.
+    pub(crate) fn push(&self, pts_ns: u64, keyframe: bool, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(file) = inner.es_file.as_mut() {
+            // Recording in flight: append to the ES file. A write error (e.g.
+            // disk full) truncates the tail — the offline remux still yields
+            // a playable file from what was written.
+            use std::io::Write;
+            let _ = file.write_all(&data);
+            return;
+        }
+        inner.total_bytes = inner.total_bytes.saturating_add(data.len() as u64);
+        inner.entries.push_back(DvrAu {
+            pts_ns,
+            keyframe,
+            data,
+        });
+        if !inner.pinned {
+            trim_to_budget(&mut inner);
+        }
+    }
+
+    /// Pin the ring at record start: open `es_path` and write the pre-roll
+    /// head into it (the buffered AUs at or after `from_pts`; `None` = all —
+    /// video pins with None, audio pins at the video head's PTS so both
+    /// tracks' pre-roll starts at the same wall-clock point). Subsequent
+    /// `push`es append to the file. Returns an IO error when the ES file
+    /// cannot be created (the recording is then failed rather than silently
+    /// empty). No-op if already pinned.
+    pub(crate) fn pin(&self, es_path: &std::path::Path, from_pts: Option<u64>) -> Result<(), String> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err("DVR ring lock poisoned at pin.".to_owned());
+        };
+        if inner.pinned || inner.es_file.is_some() {
+            return Ok(());
+        }
+        let mut file = std::fs::File::create(es_path).map_err(|error| {
+            format!("Failed to create DVR ES file {}: {error}", es_path.display())
+        })?;
+        // Write the pre-roll head (keyframe-aligned front, bounded by the
+        // idle eviction policy) — the recording's start. `from_pts` cuts the
+        // audio head to the video head's wall-clock start.
+        use std::io::Write;
+        for au in inner
+            .entries
+            .iter()
+            .filter(|au| from_pts.map(|from| au.pts_ns >= from).unwrap_or(true))
+        {
+            if let Err(error) = file.write_all(&au.data) {
+                return Err(format!(
+                    "Failed to write DVR ES pre-roll head {}: {error}",
+                    es_path.display()
+                ));
+            }
+        }
+        inner.pinned = true;
+        inner.es_file = Some(file);
+        Ok(())
+    }
+
+    /// Unpin at record stop/abort: close the ES file (File drop flushes) and
+    /// reset the ring so a fresh pre-roll window starts for the next
+    /// recording. The ES file is NOT deleted here — the caller owns the
+    /// slice/cleanup lifecycle.
+    pub(crate) fn unpin(&self) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.pinned = false;
+        inner.es_file = None; // drops (and flushes) the handle
+        inner.entries.clear();
+        inner.total_bytes = 0;
+    }
+
+    /// Whether a recording is currently pinned (ES file open). Test-only —
+    /// production code checks the rings' pinned state via the ES-file slice
+    /// lifecycle (pin at start, unpin at stop).
+    #[cfg(test)]
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .map(|inner| inner.pinned || inner.es_file.is_some())
+            .unwrap_or(false)
+    }
+
+    /// PTS of the front AU (the pre-roll head start), None when empty.
+    pub(crate) fn front_pts(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.entries.front().map(|au| au.pts_ns))
+    }
+
+    /// Number of AUs currently buffered (idle pre-roll window only; the
+    /// recording body lives in the ES file, not here).
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .map(|inner| inner.entries.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes currently buffered in RAM (the idle pre-roll window). Test-only
+    /// — the ring's byte budget is exercised by the idle eviction policy.
+    #[cfg(test)]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .ok()
+            .map(|inner| inner.total_bytes)
+            .unwrap_or(0)
+    }
+}
+
+/// Evict from the ring front until the byte budget is met, then keep snapping
+/// the front to a keyframe AU so a slice from the front always opens a fresh
+/// GOP. Never evicts the last remaining AU (a single oversized AU is kept
+/// rather than yielding an empty ring).
+fn trim_to_budget(inner: &mut DvrEsRingInner) {
+    while inner.total_bytes > inner.budget_bytes && inner.entries.len() > 1 {
+        if let Some(front) = inner.entries.pop_front() {
+            inner.total_bytes = inner.total_bytes.saturating_sub(front.data.len() as u64);
+        }
+        // Snap to a keyframe boundary: after popping the front keyframe, keep
+        // popping mid-GOP AUs until the new front is again a keyframe AU
+        // (video only — audio AUs have no keyframe flag and eviction just
+        // drops the oldest).
+        while inner.snap_to_keyframe
+            && inner.entries.len() > 1
+            && !inner
+                .entries
+                .front()
+                .map(|au| au.keyframe)
+                .unwrap_or(false)
+        {
+            if let Some(front) = inner.entries.pop_front() {
+                inner.total_bytes = inner.total_bytes.saturating_sub(front.data.len() as u64);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GstreamerRecordingState {
     /// Video branch valve, FIRST element after the video tap tee. Closed
     /// (drop=true) whenever no recording is in flight; opening it is the
-    /// entire "start recording" operation.
+    /// entire "start recording" operation. For Capture/PassThrough (DVR) the
+    /// valve stays OPEN permanently — the branch feeds the always-armed ring.
     pub(crate) valve: gst::Element,
     /// Leaky decoupling queue (valve → queue → …). It never back-pressures
     /// the live decode path.
@@ -984,11 +1239,17 @@ pub(crate) struct GstreamerRecordingState {
     /// Electron in `recording-finished` so the UI can tell the user why the
     /// clip is choppier than the stream.
     pub(crate) dropped_frames: Arc<AtomicU64>,
-    /// Pass-through IDR gate: while false, buffers are dropped until the
-    /// first sync (IDR) access unit arrives, so the remuxed file never starts
-    /// mid-GOP with orphan P-frames (the old remux glitch). `start()` resets
-    /// it to false so every recording starts at a fresh IDR.
-    pub(crate) idr_gate: Arc<AtomicBool>,
+    /// GFN DVR model (Capture/PassThrough): the always-armed keyframe-aligned
+    /// ring of video elementary-stream AUs. Fed by the pass-through branch
+    /// from session arm time; `start()` pins it and `stop()` slices
+    /// [front..tail] into the temp ES file — so recordings start at a
+    /// complete keyframe (with pre-roll) and can never be empty. None for
+    /// Encoded/Transcode (they tap decoded frames, no ring).
+    pub(crate) dvr_video: Option<DvrEsRing>,
+    /// GFN DVR model: the always-armed ring of ADTS AAC AUs (game audio),
+    /// sliced at stop to the video slice's wall-clock start. None for
+    /// Encoded/Transcode.
+    pub(crate) dvr_audio: Option<DvrEsRing>,
     /// RTP-level tap tee on the game-audio stream (between the webrtcbin
     /// audio src pad and the decode chain). Created when the audio RTP pad
     /// arrives in `wire_incoming_media_sink`; the audio transcode branch
@@ -1147,15 +1408,6 @@ impl GstreamerRecordingState {
                 "opennow-rec-{}-{stamp}.aac.es",
                 std::process::id()
             ));
-            let audio_filesink = make_element("filesink")?;
-            audio_filesink.set_property(
-                "location",
-                audio_es_path
-                    .to_str()
-                    .ok_or_else(|| "Pass-through audio ES path is not valid UTF-8.".to_owned())?,
-            );
-            audio_filesink.set_property("sync", false);
-            audio_filesink.set_property("async", false);
             // aacparse + ADTS capsfilter (all non-transcode modes).
             let audio_aac_parse = make_element("aacparse")?;
             let adts_caps = make_element("capsfilter")?;
@@ -1169,21 +1421,72 @@ impl GstreamerRecordingState {
             elements.push(adts_caps.clone());
             self.audio_aac_parse = Some(audio_aac_parse);
             self.audio_adts_caps = Some(adts_caps);
-            let eos_flag = self.audio_filesink_eos.clone();
-            let audio_sink_pad = audio_filesink
-                .static_pad("sink")
-                .ok_or_else(|| "Pass-through audio filesink has no sink pad.".to_owned())?;
-            audio_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(event) = info.event() {
-                    if event.type_() == gst::EventType::Eos {
-                        eos_flag.store(true, Ordering::SeqCst);
+            if self.mode == RecordingMode::Encoded {
+                // ENCODED: the live ADTS filesink ES tail (audio is written to
+                // the ES file from record start, remuxed offline at stop).
+                let audio_filesink = make_element("filesink")?;
+                audio_filesink.set_property(
+                    "location",
+                    audio_es_path
+                        .to_str()
+                        .ok_or_else(|| "Pass-through audio ES path is not valid UTF-8.".to_owned())?,
+                );
+                audio_filesink.set_property("sync", false);
+                audio_filesink.set_property("async", false);
+                let eos_flag = self.audio_filesink_eos.clone();
+                let audio_sink_pad = audio_filesink
+                    .static_pad("sink")
+                    .ok_or_else(|| "Pass-through audio filesink has no sink pad.".to_owned())?;
+                audio_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                    if let Some(event) = info.event() {
+                        if event.type_() == gst::EventType::Eos {
+                            eos_flag.store(true, Ordering::SeqCst);
+                        }
                     }
-                }
-                gst::PadProbeReturn::Ok
-            });
-            elements.push(audio_filesink.clone());
+                    gst::PadProbeReturn::Ok
+                });
+                elements.push(audio_filesink.clone());
+                self.audio_filesink = Some(audio_filesink);
+            } else {
+                // DVR (Capture/PassThrough): the tail is an appsink feeding
+                // the always-armed ADTS audio ring — the same GFN DVR model as
+                // the video branch. At record start the ring pins: the pre-roll
+                // head (cut to the video head's PTS so both tracks start at the
+                // same wall-clock point) is written into audio_es_path and
+                // every AU that follows is appended live; at stop the file is
+                // closed and remuxed offline. RAM stays bounded to the pre-roll
+                // window — the recording body lives in the ES file.
+                let audio_appsink = make_element("appsink")?;
+                audio_appsink.set_property("drop", true);
+                audio_appsink.set_property("max-buffers", 1u32);
+                audio_appsink.set_property("sync", false);
+                audio_appsink.set_property("async", false);
+                audio_appsink.set_property("emit-signals", false);
+                elements.push(audio_appsink.clone());
+                let audio_ring_budget =
+                    DVR_RING_AUDIO_BYTES_PER_SECOND * dvr_ring_seconds();
+                let dvr_audio =
+                    DvrEsRing::with_keyframe_snap(audio_ring_budget, false);
+                let ring = dvr_audio.clone();
+                let audio_sink_pad = audio_appsink
+                    .static_pad("sink")
+                    .ok_or_else(|| "Recording audio appsink has no sink pad.".to_owned())?;
+                audio_sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    let Some(buffer) = info.buffer() else {
+                        return gst::PadProbeReturn::Ok;
+                    };
+                    let map = buffer.map_readable();
+                    let bytes = map.as_deref().unwrap_or(&[]);
+                    let pts_ns = buffer
+                        .pts()
+                        .map(|pts| pts.nseconds())
+                        .unwrap_or(0);
+                    ring.push(pts_ns, false, bytes.to_vec());
+                    gst::PadProbeReturn::Ok
+                });
+                self.dvr_audio = Some(dvr_audio);
+            }
             self.audio_es_path = Some(audio_es_path);
-            self.audio_filesink = Some(audio_filesink);
         }
         for element in &elements {
             pipeline.add(element).map_err(|error| {
@@ -1389,31 +1692,16 @@ impl GstreamerRecordingState {
             );
         }
         match self.mode {
-            // Capture and PassThrough both tap the RAW RTP stream — the file
-            // must start at a fresh keyframe, so re-arm the IDR gate (the
-            // probe drops mid-GOP frames until the first sync access unit)
-            // and ask the server for an IDR right now (via the signaling/data
-            // channel — NEVER an in-pipeline GstForceKeyUnit, which kills
-            // the UDP receiver; see the NOTE above).
+            // Capture and PassThrough both tap the RAW RTP stream and use the
+            // GFN DVR model: the always-armed pre-roll ring is PINNED — its
+            // keyframe-aligned head becomes the recording's start (pre-roll,
+            // up to the ring budget) and every AU that follows is appended to
+            // the ES file live. No keyframe gate, no signaling keyframe
+            // request, no retry: the clip starts at the last complete keyframe
+            // ALREADY buffered, so it can never be empty and never opens
+            // mid-GOP, whatever the server's GOP cadence.
             RecordingMode::Capture | RecordingMode::PassThrough => {
-                self.idr_gate.store(true, Ordering::SeqCst);
-                if let Some(sender) = &self.event_sender {
-                    let _ = sender.send(Event::VideoKeyframeRequest(
-                        crate::protocol::VideoKeyframeRequest {
-                            reason: "record-start".to_owned(),
-                            attempt: 0,
-                        },
-                    ));
-                }
-                // The gate only opens on a COMPLETE keyframe AU from the
-                // server; if the one-shot request above is dropped or delayed
-                // (signaling is lossy and shares the channel with the liveness
-                // watchdog), the ES file would stay empty for the whole
-                // recording. Re-ask at a modest cadence until the gate opens,
-                // the recording stops, or a bounded number of attempts is
-                // exhausted — same safe signaling path as the watchdog (never
-                // an in-pipeline force-key-unit).
-                self.spawn_idr_gate_keyframe_retry();
+                self.arm_dvr_recording()?;
             }
             // ENCODED taps the DECODED frames, which are always complete —
             // no keyframe gate needed (the encoder starts wherever the live
@@ -1475,41 +1763,36 @@ impl GstreamerRecordingState {
         Ok(())
     }
 
-    /// While the recording-start IDR gate stays closed (no complete keyframe
-    /// AU has arrived yet), keep re-requesting a keyframe over signaling so
-    /// the ES file can actually start. The one-shot `record-start` request
-    /// shares the lossy signaling channel with the liveness watchdog (which
-    /// rate-limits itself to one per 2 s), so it can be dropped or land while
-    /// the server encoder is busy — the gate would then wait for the server's
-    /// next natural GOP, and a short recording could end with an empty ES.
-    /// Retries at a modest cadence until the gate opens (`idr_gate` false),
-    /// the recording stops (`active` false), or a bounded number of attempts
-    /// is exhausted — a genuinely dead keyframe path then degrades to the
-    /// clear empty-ES error at stop instead of spamming the server.
-    fn spawn_idr_gate_keyframe_retry(&self) {
-        const RETRY_INTERVAL_MS: u64 = 700;
-        const MAX_ATTEMPTS: u8 = 8; // ≈ 5.6 s of retries, then give up
-        let gate = self.idr_gate.clone();
-        let active = self.active.clone();
-        let Some(sender) = self.event_sender.clone() else {
-            return;
-        };
-        std::thread::spawn(move || {
-            let mut attempt: u8 = 1;
-            while attempt <= MAX_ATTEMPTS {
-                std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
-                if !active.load(Ordering::SeqCst) || !gate.load(Ordering::SeqCst) {
-                    return;
-                }
-                let _ = sender.send(Event::VideoKeyframeRequest(
-                    crate::protocol::VideoKeyframeRequest {
-                        reason: "record-start-retry".to_owned(),
-                        attempt,
-                    },
-                ));
-                attempt += 1;
-            }
-        });
+    /// GFN DVR arm at record start: pin both pre-roll rings. Each ring writes
+    /// its pre-roll head into the recording's temp ES file and starts
+    /// appending the live body — the recording slice begins at the last
+    /// complete keyframe before record start (keyframe-aligned by the idle
+    /// eviction policy) and is never empty while the stream delivers video.
+    /// The audio head is cut to the video head's PTS so both tracks' pre-roll
+    /// starts at the same wall-clock point.
+    fn arm_dvr_recording(&self) -> Result<(), String> {
+        let video_front_pts = self.dvr_video.as_ref().and_then(|ring| ring.front_pts());
+        if let Some(ring) = &self.dvr_video {
+            let path = self
+                .video_es_path
+                .as_ref()
+                .ok_or_else(|| "DVR recording arm: video ES path is missing.".to_owned())?;
+            ring.pin(path, None)
+                .map_err(|error| format!("DVR recording arm failed (video ES): {error}"))?;
+        }
+        if let (Some(ring), Some(path)) = (&self.dvr_audio, &self.audio_es_path) {
+            ring.pin(path, video_front_pts)
+                .map_err(|error| format!("DVR recording arm failed (audio ES): {error}"))?;
+        }
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Native recording DVR-armed: the slice starts at the last complete keyframe (up to {}s of pre-roll retained; the ES file is written live — no keyframe gate/retry needed).",
+                dvr_ring_seconds()
+            ),
+        );
+        Ok(())
     }
 
     /// Bounded wait for one recording branch queue to show the FULL replayed
@@ -1595,25 +1878,35 @@ impl GstreamerRecordingState {
     }
 
     pub(crate) fn stop(&self, finalize: bool) -> Result<(), String> {
-        // Stop new data entering the branches first; data already inside
-        // (queue → depayloader → parse → …) keeps flowing.
-        self.valve.set_property("drop", true);
-        if let Some(audio_valve) = &self.audio_valve {
-            audio_valve.set_property("drop", true);
+        let dvr = self.mode == RecordingMode::PassThrough || self.mode == RecordingMode::Capture;
+        // DVR (Capture/PassThrough): the branch tail is the always-armed
+        // pre-roll ring — the valves STAY OPEN so the ring keeps rolling a
+        // fresh pre-roll window for the next recording; the recording boundary
+        // is the ring pin/ES-file slice, not the valve. Encoded/Transcode stop
+        // new data at the valve as before (data already inside keeps flowing).
+        if !dvr {
+            self.valve.set_property("drop", true);
+            if let Some(audio_valve) = &self.audio_valve {
+                audio_valve.set_property("drop", true);
+            }
         }
         if !finalize {
             self.active.store(false, Ordering::SeqCst);
-            if self.mode == RecordingMode::PassThrough || self.mode == RecordingMode::Capture {
-                // A pass-through filesink stays OPEN after an abort and would
-                // APPEND to the same ES file on a later start(), so flush +
-                // close it now with EOS and mark the branch spent — the next
-                // recording rebuilds it fresh with a new temp file.
-                self.close_es_files();
-                self.spent.store(true, Ordering::SeqCst);
+            if dvr {
+                // Abort: close + discard the partial ES files and unpin the
+                // rings; the pre-roll window keeps rolling. The branch is NOT
+                // spent — the DVR branch stays armed and is never rebuilt.
+                self.unpin_dvr_rings();
+                for path in [self.video_es_path.as_ref(), self.audio_es_path.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = std::fs::remove_file(path);
+                }
                 send_log(
                     &self.event_sender,
                     "info",
-                    "Native recording aborted; capture valves closed (pass-through ES files flushed; branch rebuilt fresh for the next recording)."
+                    "Native recording aborted; DVR ES files discarded and pre-roll rings unpinned (branch stays armed for the next recording)."
                         .to_owned(),
                 );
             } else if self.mode == RecordingMode::Transcode {
@@ -1651,22 +1944,27 @@ impl GstreamerRecordingState {
             return Ok(());
         }
 
-        // IMPORTANT: the valves are closed (drop=true) BEFORE this point, and
-        // in the bundled GStreamer the valve drops EOS events while closed —
-        // sending EOS into a valve's sink pad never reaches the muxer /
-        // filesink, AND as an upstream event it also propagates back through
-        // the shared RTP tap tee into the live decode chain. Enter EOS BELOW
-        // each valve instead (the next element's sink pad): data already
+        // IMPORTANT (non-DVR only): the valves are closed (drop=true) BEFORE
+        // this point, and in the bundled GStreamer the valve drops EOS events
+        // while closed — sending EOS into a valve's sink pad never reaches the
+        // muxer/filesink, AND as an upstream event it also propagates back
+        // through the shared RTP tap tee into the live decode chain. Enter EOS
+        // BELOW each valve instead (the next element's sink pad): data already
         // buffered in the queue drains first, then EOS, so the tail finalizes
         // normally and the live path is untouched.
         let drain_ms = std::time::Instant::now();
-        // Video branch: the valve sits at the tap (before the queue), so the
-        // queue must drain before EOS — an EOS that overtakes a full queue can
-        // be dropped inside the muxer/filesink (buffers-after-EOS). Drain then
-        // inject EOS below the valve, exactly like the audio branch.
-        self.drain_and_eos(&self.valve, &self.queue)?;
-        if let (Some(audio_valve), Some(audio_queue)) = (&self.audio_valve, &self.audio_queue) {
-            self.drain_and_eos(audio_valve, audio_queue)?;
+        if !dvr {
+            // Video branch: the valve sits at the tap (before the queue), so
+            // the queue must drain before EOS — an EOS that overtakes a full
+            // queue can be dropped inside the muxer/filesink
+            // (buffers-after-EOS). Drain then inject EOS below the valve,
+            // exactly like the audio branch.
+            self.drain_and_eos(&self.valve, &self.queue)?;
+            if let (Some(audio_valve), Some(audio_queue)) =
+                (&self.audio_valve, &self.audio_queue)
+            {
+                self.drain_and_eos(audio_valve, audio_queue)?;
+            }
         }
         let drain_ms = drain_ms.elapsed().as_millis();
 
@@ -1700,10 +1998,23 @@ impl GstreamerRecordingState {
         self.dropped_frames.store(dropped, Ordering::SeqCst);
 
         match self.mode {
-            RecordingMode::PassThrough | RecordingMode::Capture | RecordingMode::Encoded => {
-                self.stop_pass_through(drain_ms)
+            RecordingMode::PassThrough | RecordingMode::Capture => {
+                self.stop_pass_through_dvr(drain_ms)
             }
+            RecordingMode::Encoded => self.stop_pass_through(drain_ms),
             RecordingMode::Transcode => self.stop_transcode(drain_ms),
+        }
+    }
+
+    /// Unpin both DVR rings (closes their ES files; File drop flushes). The
+    /// in-memory rings reset so a fresh pre-roll window starts for the next
+    /// recording. No-op for modes without rings.
+    fn unpin_dvr_rings(&self) {
+        if let Some(ring) = &self.dvr_video {
+            ring.unpin();
+        }
+        if let Some(ring) = &self.dvr_audio {
+            ring.unpin();
         }
     }
 
@@ -1797,6 +2108,64 @@ impl GstreamerRecordingState {
             let _ = filesink.set_state(gst::State::Null);
         }
 
+        // ENCODED remuxes the filesink-written ES files; the branch is spent
+        // (filesinks saw EOS) so the next recording rebuilds fresh.
+        self.finish_pass_through_remux(video_es, audio_es, true)
+    }
+
+    /// DVR (Capture/PassThrough) finalize: the ES files were written LIVE
+    /// (pre-roll head at pin + the recording body), so finalize drains the
+    /// in-flight queue tail into the ring feed, closes the ES files (unpin),
+    /// and remuxes OFFLINE — the same shared remux/deliver tail as the
+    /// Encoded path. The rings are unpinned (a fresh pre-roll window rolls)
+    /// and the branch is NOT spent: the DVR branch stays armed for the next
+    /// recording, so no rebuild and no per-recording EOS/flush lifecycle (the
+    /// old filesink append/spent flakiness is gone by construction).
+    fn stop_pass_through_dvr(&self, drain_ms: u128) -> Result<(), String> {
+        let has_audio = self.audio_branch_built.load(Ordering::SeqCst);
+        let video_es = self.video_es_path.clone();
+        let audio_es = if has_audio {
+            self.audio_es_path.clone()
+        } else {
+            None
+        };
+        // The valves stay open (DVR), so the leaky queue's tail AUs still
+        // drain into the ring feed (and the pinned ES files) — wait for the
+        // queue to empty before closing the files, bounded. A stalled branch
+        // degrades to a shorter tail, never a hang.
+        let drain_deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(RECORDING_DRAIN_TIMEOUT_MS);
+        while read_queue_level(&self.queue) != 0 && std::time::Instant::now() < drain_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.unpin_dvr_rings();
+        if let Some(diag) = &self.pass_flow_diag {
+            diag.log("stop");
+        }
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Native recording stop: DVR ES files written live (video + audio; queue drained in {drain_ms} ms); remuxing the MP4 offline."
+            ),
+        );
+        // DVR branch is never spent — it stays armed for the next recording.
+        self.finish_pass_through_remux(video_es, audio_es, false)
+    }
+
+    /// Shared OFFLINE remux + delivery tail for the pass-through family
+    /// (Encoded ES files or DVR-sliced ES files): remux the temp ES files
+    /// into a standard seekable MP4 (faststart) in a THROWAWAY pipeline,
+    /// tag `colr` colour metadata for Capture/PassThrough, hand the file to
+    /// Electron via `recording-ready`, and clean up the temp files.
+    /// `mark_spent` is true for Encoded (filesink EOS'd → branch rebuilds
+    /// fresh) and false for DVR (branch stays armed).
+    fn finish_pass_through_remux(
+        &self,
+        video_es: Option<std::path::PathBuf>,
+        audio_es: Option<std::path::PathBuf>,
+        mark_spent: bool,
+    ) -> Result<(), String> {
         let remux_out = std::env::temp_dir().join(format!(
             "opennow-rec-{}-{}.mp4",
             std::process::id(),
@@ -1850,9 +2219,14 @@ impl GstreamerRecordingState {
             ),
             // TRANSCODE never reaches the offline remux — its live-muxer
             // finalize (`stop_transcode`) delivers the MP4 directly and
-            // `stop()` dispatches to it instead of `stop_pass_through`.
+            // `stop()` dispatches to it instead of `finish_pass_through_remux`.
             RecordingMode::Transcode => {
-                unreachable!("stop_pass_through is not called for Transcode recordings")
+                unreachable!("finish_pass_through_remux is not called for Transcode recordings")
+            }
+        };
+        let mark_spent = || {
+            if mark_spent {
+                self.spent.store(true, Ordering::SeqCst);
             }
         };
         let finalize_size = match remux_result {
@@ -1866,7 +2240,7 @@ impl GstreamerRecordingState {
                     let _ = std::fs::remove_file(path);
                 }
                 self.active.store(false, Ordering::SeqCst);
-                self.spent.store(true, Ordering::SeqCst);
+                mark_spent();
                 let message = format!("Pass-through remux failed: {error}");
                 send_log(&self.event_sender, "error", message.clone());
                 return Err(message);
@@ -1881,7 +2255,7 @@ impl GstreamerRecordingState {
                 let _ = std::fs::remove_file(path);
             }
             self.active.store(false, Ordering::SeqCst);
-            self.spent.store(true, Ordering::SeqCst);
+            mark_spent();
             send_log(
                 &self.event_sender,
                 "error",
@@ -1930,7 +2304,7 @@ impl GstreamerRecordingState {
                             let _ = std::fs::remove_file(path);
                         }
                         self.active.store(false, Ordering::SeqCst);
-                        self.spent.store(true, Ordering::SeqCst);
+                        mark_spent();
                         return Err(format!("Finalizing colour-tagged recording failed: {error}"));
                     }
                 }
@@ -1953,8 +2327,7 @@ impl GstreamerRecordingState {
         }
         // Cleanup: delete the temp ES files and the remux output (only when
         // a colr-tagged copy was made — the DELIVERED file itself is moved by
-        // Electron, so it must survive). The branch is spent (filesinks saw
-        // EOS) so the next recording rebuilds fresh.
+        // Electron, so it must survive).
         for path in [video_es.as_ref(), audio_es.as_ref()]
             .into_iter()
             .flatten()
@@ -1965,7 +2338,7 @@ impl GstreamerRecordingState {
             let _ = std::fs::remove_file(&remux_out);
         }
         self.active.store(false, Ordering::SeqCst);
-        self.spent.store(true, Ordering::SeqCst);
+        mark_spent();
         Ok(())
     }
 
@@ -2112,27 +2485,6 @@ impl GstreamerRecordingState {
         Ok(())
     }
 
-    /// Abort path for pass-through: send EOS below each valve so the ES
-    /// filesinks flush and CLOSE their temp files (a filesink left open after
-    /// an abort would append stale pre-abort data on a later start()). The
-    /// caller marks the branch spent so the next recording rebuilds it fresh.
-    fn close_es_files(&self) {
-        for valve in [Some(&self.valve), self.audio_valve.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if let Some(src_pad) = valve.static_pad("src") {
-                if let Some(below) = src_pad.peer() {
-                    let _ = below.send_event(gst::event::Eos::new());
-                }
-            }
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while !self.filesink_eos.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
     /// Tear the ENTIRE recording branch (video + audio) out of the pipeline:
     /// release the tee request pads, set every element to NULL and remove it
     /// from the pipeline. Used before REBUILDING the branch fresh for the
@@ -2143,6 +2495,10 @@ impl GstreamerRecordingState {
     /// always succeeds from. The tap tees themselves and the live decode/
     /// present chains are NOT touched.
     pub(crate) fn teardown(&self, pipeline: &gst::Pipeline) -> Result<(), String> {
+        // DVR safety: close any pinned ES file handles so the temp files can
+        // be removed (an open handle makes remove_file fail silently on
+        // Windows). The rings themselves are dropped with the state.
+        self.unpin_dvr_rings();
         // Release the video tap tee's request pad (valve sink pad's peer).
         // gst_pad_unlink() requires the SRC pad first, so unlink from the
         // tee's request pad (src) into the valve's sink pad.
@@ -7916,7 +8272,8 @@ pub(crate) fn build_transcode_record_branch(
         queue_output,
         dropped_frames: Arc::new(AtomicU64::new(0)),
         record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
-        idr_gate: Arc::new(AtomicBool::new(true)),
+        dvr_video: None,
+        dvr_audio: None,
         video_tap_tee: tap_tee.clone(),
         audio_rtp_tee: None,
         audio_valve: None,
@@ -8128,19 +8485,19 @@ pub(crate) fn obu_stream_au_has_keyframe(bytes: &[u8]) -> bool {
 /// qtmux lives in the live pipeline, so a muxer stall can never freeze the
 /// recording branch (the field wedge: a pass-through recording whose video
 /// AND audio branches both froze at the qtmux input ~16 s in while the live
-/// stream stayed healthy). A filesink always accepts, so the branch cannot
-/// wedge.
+/// stream stayed healthy).
 ///
-/// The recording-START keyframe gate (drop everything until the first
-/// COMPLETE keyframe AU — the idr_gate probe in the body below) lives at the
-/// parser's OUTPUT (the depay output after config re-injection), NOT the
-/// offline remux: the first AU after the valve opens is a partial keyframe
-/// (its head packets arrived before record start) and the offline remux
-/// starts at the first AU that decodes, which IS that partial keyframe —
-/// the flat-gray first frame. The gate opens once at the first AU carrying
-/// parameter sets (or an AV1 KEY frame) and never re-arms, so a server
-/// keyframe that lands late (GFN H265 GOPs can run ~9 s) delays the file
-/// head but never black-holes the rest of the recording.
+/// GFN DVR model: the branch tail is an always-armed keyframe-aligned ring
+/// ([`DvrEsRing`]); record start PINs the ring — its pre-roll head (front
+/// snapped to a complete keyframe AU by the idle eviction policy) is written
+/// into the temp ES file and every AU that follows is appended live, so the
+/// recording always begins at a COMPLETE keyframe with pre-roll and can never
+/// be empty while the stream delivers video. The old recording-START keyframe
+/// gate (drop everything until the first complete keyframe AU, so the file
+/// never opened on a partial mid-GOP keyframe — the flat-gray first frame)
+/// and its signaling keyframe retry are gone: a partial keyframe head is
+/// impossible by construction because the slice starts at the last complete
+/// keyframe ALREADY buffered.
 pub(crate) fn build_pass_through_record_branch(
     pipeline: &gst::Pipeline,
     rtp_tee: &gst::Element,
@@ -8212,8 +8569,10 @@ pub(crate) fn build_pass_through_record_branch(
     // emits the AU with missing slices, h265parse sheds it, and the ES
     // continues cleanly at the next keyframe — the clip keeps its full
     // duration with a brief jump at the loss point instead of dying for the
-    // rest of the recording. The recording-START keyframe gate (below, the
-    // idr_gate probe) still guarantees the ES begins on a fresh complete IDR.
+    // rest of the recording. The recording-START keyframe gate is GONE (GFN
+    // DVR model): the always-armed ring's front is keyframe-aligned by its
+    // idle eviction policy, so the recording slice always begins on a fresh
+    // complete IDR — no gate, no request-keyframe spam, no retry.
     set_property_if_supported(&depay, "request-keyframe", false);
     set_property_if_supported(&depay, "wait-for-keyframe", false);
     // Force the parser to always parse (never passthrough) and re-emit the
@@ -8243,10 +8602,13 @@ pub(crate) fn build_pass_through_record_branch(
             .map_err(|error| format!("Invalid pass-through ES caps: {error}"))?,
     );
 
-    valve.set_property("drop", true);
-    // Forward sticky events while buffers are gated, so qtmux never receives
-    // a first buffer before its stream-start/caps/segment (same pattern as
-    // the transcode branch).
+    // GFN DVR model: the valve is ALWAYS OPEN for Capture/PassThrough — the
+    // branch feeds the always-armed pre-roll ring from session arm time, so a
+    // recording window exists before the user presses record. The recording
+    // boundary is the ring pin/ES-file slice, not the valve. (drop-mode kept
+    // for the forward-sticky-events contract so the queue never sees a buffer
+    // before its stream-start/caps/segment during the brief attach window.)
+    valve.set_property("drop", false);
     set_property_from_str_if_supported(&valve, "drop-mode", "forward-sticky-events");
     // Same leaky decoupling as the transcode branch: the branch can NEVER
     // back-pressure the live RTP flow — if the muxer lags, the queue drops
@@ -8330,20 +8692,32 @@ pub(crate) fn build_pass_through_record_branch(
     };
     let video_es_path = std::env::temp_dir()
         .join(format!("opennow-rec-{}-{stamp}.{es_ext}.es", std::process::id()));
-    let video_filesink = make_element("filesink")?;
-    video_filesink.set_property(
-        "location",
-        video_es_path
-            .to_str()
-            .ok_or_else(|| "Pass-through ES path is not valid UTF-8.".to_owned())?,
-    );
-    video_filesink.set_property("sync", false);
-    video_filesink.set_property("async", false);
+    // GFN DVR model: the branch tail is an appsink that feeds the always-armed
+    // keyframe-aligned ring (NOT a filesink — a filesink would have to write
+    // from record start and could never provide pre-roll, and its per-recording
+    // EOS/flush lifecycle was half the stop-time flakiness). The temp ES file
+    // is written from the ring slice at stop, then remuxed offline as before.
+    // The appsink is a drop-everything sink: the ring-feed probe below runs on
+    // its SINK pad BEFORE the element, so every AU is captured; drop=true +
+    // max-buffers=1 just discards them after the probe. sync=false +
+    // async=false keep it a synchronous non-prerolling element like the rest
+    // of the branch (a prerolling sink would re-preroll the whole pipeline).
+    let video_appsink = make_element("appsink")?;
+    video_appsink.set_property("drop", true);
+    video_appsink.set_property("max-buffers", 1u32);
+    video_appsink.set_property("sync", false);
+    video_appsink.set_property("async", false);
+    video_appsink.set_property("emit-signals", false);
+    let dvr_seconds = dvr_ring_seconds();
+    let video_ring_budget =
+        u64::from(DVR_RING_DEFAULT_KBPS) * 1000 / 8 * dvr_seconds;
+    let dvr_video = DvrEsRing::new(video_ring_budget);
 
     // Chain order: valve → queue → capsfilter (RTP caps) → depayloader →
     // parser (normalizes the AUs for the offline remux) → ES-format
-    // capsfilter (byte-stream/OBU) → filesink. NO jitter buffer: the tap is
-    // post-rtpbin (ordered + NACK/RTX/FEC-recovered), see the branch header.
+    // capsfilter (byte-stream/OBU) → appsink (DVR ring). NO jitter buffer:
+    // the tap is post-rtpbin (ordered + NACK/RTX/FEC-recovered), see the
+    // branch header.
     let elements: Vec<&gst::Element> = vec![
         &valve,
         &queue,
@@ -8351,7 +8725,7 @@ pub(crate) fn build_pass_through_record_branch(
         &depay,
         &parse,
         &es_caps,
-        &video_filesink,
+        &video_appsink,
     ];
     for element in &elements {
         pipeline.add(*element).map_err(|error| {
@@ -8372,25 +8746,60 @@ pub(crate) fn build_pass_through_record_branch(
         })?;
     }
 
-    // EOS flag on the filesink: `stop()` waits for it before the offline
-    // remux reads the ES file, so the file is always fully flushed/closed.
-    let filesink_eos = Arc::new(AtomicBool::new(false));
-    let eos_flag = filesink_eos.clone();
-    let filesink_sink_pad = video_filesink
+    // DVR ring feed: every AU the parser emits (byte-stream H.264/H.265 or
+    // OBU-stream AV1, post config re-injection — see the gate comment that
+    // used to live here) is pushed into the always-armed ring. Keyframe
+    // classification reuses the exact scanners the old recording-START gate
+    // used (`byte_stream_au_has_param_sets` / `obu_stream_au_has_keyframe`),
+    // but nothing is DROPPED: the ring's eviction policy keeps the front
+    // snapped to a keyframe AU, so a slice from the front always opens a
+    // fresh GOP with its parameter sets — the partial-mid-GOP gray-frame
+    // head is impossible by construction instead of by gate.
+    let ring = dvr_video.clone();
+    let ring_codec = codec_upper.clone();
+    let ring_sender = event_sender.clone();
+    let appsink_sink = video_appsink
         .static_pad("sink")
-        .ok_or_else(|| "Pass-through filesink has no sink pad.".to_owned())?;
-    filesink_sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-        if let Some(event) = info.event() {
-            if event.type_() == gst::EventType::Eos {
-                eos_flag.store(true, Ordering::SeqCst);
-            }
+        .ok_or_else(|| "Pass-through appsink has no sink pad.".to_owned())?;
+    appsink_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let map = buffer.map_readable();
+        let bytes = map.as_deref().unwrap_or(&[]);
+        let keyframe = if ring_codec == "AV1" {
+            obu_stream_au_has_keyframe(bytes)
+        } else {
+            byte_stream_au_has_param_sets(&ring_codec, bytes)
+        };
+        let pts_ns = buffer
+            .pts()
+            .map(|pts| pts.nseconds())
+            .unwrap_or_else(|| {
+                // No PTS (parsers should set one, but be robust): synthesize a
+                // monotonic ladder so the audio/video slice alignment still
+                // holds. Callers of push() without a real pts use 0; the ring
+                // alignment only needs monotonicity within a stream.
+                0
+            });
+        if ring.is_empty() && ring_sender.is_some() && keyframe {
+            send_log(
+                &ring_sender,
+                "info",
+                format!(
+                    "Native recording DVR ring armed at a complete {ring_codec} keyframe AU (recording-start gate is gone — the ring front always opens a fresh GOP)."
+                ),
+            );
         }
+        ring.push(pts_ns, keyframe, bytes.to_vec());
         gst::PadProbeReturn::Ok
     });
 
-    // Link the branch into the RTP tap tee. The valve starts closed
-    // (drop=true), so the filesink writes nothing until a recording is
-    // active, while the decode/present chain keeps flowing untouched.
+    // Link the branch into the RTP tap tee. The valve is ALWAYS OPEN for
+    // Capture/PassThrough (the DVR branch feeds the ring from session arm
+    // time so a pre-roll window exists before the user presses record); the
+    // recording boundary is the ring pin/slice, not the valve. The live
+    // decode/present chain keeps flowing untouched.
     let first_sink = valve
         .static_pad("sink")
         .ok_or_else(|| "Pass-through recording valve has no sink pad.".to_owned())?;
@@ -8561,85 +8970,16 @@ pub(crate) fn build_pass_through_record_branch(
         });
     }
     {
+        // `file_in` now counts AUs fed into the DVR ring (the branch tail is
+        // an appsink feeding the ring, not a filesink) — the ES bytes written
+        // are the ring head at pin + live appends, visible in the file size.
         let counter = pass_flow_diag.file_in.clone();
-        let filesink_sink = video_filesink
+        let appsink_sink = video_appsink
             .static_pad("sink")
-            .ok_or_else(|| "Pass-through filesink has no sink pad.".to_owned())?;
-        filesink_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            .ok_or_else(|| "Pass-through appsink has no sink pad.".to_owned())?;
+        appsink_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
             counter.fetch_add(1, Ordering::Relaxed);
             gst::PadProbeReturn::Ok
-        });
-    }
-
-    // Recording-START keyframe gate (H.264/H.265): the ES file must begin at
-    // a COMPLETE keyframe AU. The valve opens mid-stream (record start is not
-    // aligned to the server's GOP), so without a gate the first AU the depay
-    // assembles is a PARTIAL keyframe — its head packets (VPS/SPS/PPS) arrived
-    // before the valve opened and the depay emits the slice tail as a
-    // "keyframe". Decoders render that as a flat gray first frame (the field
-    // glitch at the head of every recording: 15:41 recording frame 0 decoded
-    // to a uniform 128-gray 1080p frame, p1=124/p99=132). The OFFLINE remux
-    // cannot fix it — it starts at the first AU that decodes, which IS the
-    // partial keyframe — so the gate lives at the parser's OUTPUT (the depay
-    // output after config re-injection), where the partial AU is still
-    // distinguishable by its missing parameter sets. start() arms `idr_gate`
-    // (and asks the server for a keyframe over signaling), the probe drops
-    // every AU until one carries parameter sets (VPS/SPS/PPS for H.265,
-    // SPS/PPS for H.264) or is an AV1 KEY frame, then opens PERMANENTLY: it
-    // never re-arms on a later loss hole (that was the wait-for-keyframe=true
-    // truncation bug), so the file starts on a clean keyframe and keeps its
-    // full duration.
-    let idr_gate = Arc::new(AtomicBool::new(true));
-    if matches!(codec_upper.as_str(), "H264" | "H265" | "HEVC" | "AV1") {
-        let gate = idr_gate.clone();
-        let gate_codec = codec_upper.clone();
-        let gate_sender = event_sender.clone();
-        // The gate probes the PARSER's SRC pad — the DEPAY OUTPUT after the
-        // parser re-injected the codec config (config-interval=-1 above
-        // prepends VPS/SPS/PPS before every keyframe). At the RTP level the
-        // parameter sets are invisible behind GFN's variable-length payload
-        // wrapper + 0xBEDE extension (the RTP-level gate never matched and
-        // every recording wrote a 0-byte ES — the 2026-08-16 field sessions),
-        // but by this pad the wrapper is gone: H.264/H.265 buffers are one
-        // complete access unit in byte-stream form (start-code NALs), and AV1
-        // buffers are one frame in low-overhead OBU form. An AU carrying
-        // VPS/SPS/PPS (H.265) or SPS/PPS (H.264) — or an AV1 frame header
-        // whose frame_type is KEY_FRAME — is the head of a complete keyframe
-        // (the parser guarantees the H.26x sets on every IDR, GFN repeats
-        // them itself too, and GFN repeats the AV1 sequence header with its
-        // keyframes), so open the gate and keep the AU. Drop until then; open
-        // PERMANENTLY (never re-arms on a later loss hole — the
-        // wait-for-keyframe=true truncation bug), so the file starts on a
-        // clean keyframe and keeps its full duration.
-        let gate_parse = parse
-            .static_pad("src")
-            .ok_or_else(|| "Pass-through gate: parser has no src pad.".to_owned())?;
-        gate_parse.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            if !gate.load(Ordering::Relaxed) {
-                return gst::PadProbeReturn::Ok;
-            }
-            let Some(buffer) = info.buffer() else {
-                return gst::PadProbeReturn::Ok;
-            };
-            let map = buffer.map_readable();
-            let bytes = map.as_deref().unwrap_or(&[]);
-            let starts_keyframe = if gate_codec == "AV1" {
-                obu_stream_au_has_keyframe(bytes)
-            } else {
-                byte_stream_au_has_param_sets(&gate_codec, bytes)
-            };
-            if starts_keyframe {
-                gate.store(false, Ordering::Relaxed);
-                send_log(
-                    &gate_sender,
-                    "info",
-                    format!(
-                        "Native recording ES started at a complete {gate_codec} keyframe (dropped the partial mid-GOP head so the file never opens with a gray frame)."
-                    ),
-                );
-                return gst::PadProbeReturn::Ok;
-            }
-            gst::PadProbeReturn::Drop
         });
     }
 
@@ -8650,7 +8990,7 @@ pub(crate) fn build_pass_through_record_branch(
         &event_sender,
         "info",
         format!(
-            "Attached native PASS-THROUGH recording branch (post-rtpbin recovered RTP → {depay_factory} → {parse_factory} → filesink ES file; zero re-encode — no decode/encode/GPU cost to the live stream; NACK/RTX/FEC recovery inherited from the rtpbin session; file = received {rtp_encoding} bitstream, muxed offline at stop)."
+            "Attached native PASS-THROUGH recording branch (post-rtpbin recovered RTP → {depay_factory} → {parse_factory} → DVR pre-roll ring + ES file; zero re-encode — no decode/encode/GPU cost to the live stream; NACK/RTX/FEC recovery inherited from the rtpbin session; file = received {rtp_encoding} bitstream, muxed offline at stop)."
         ),
     );
 
@@ -8672,8 +9012,9 @@ pub(crate) fn build_pass_through_record_branch(
         video_es_path: Some(video_es_path),
         audio_es_path: None,
         es_caps: Some(es_caps),
-        video_filesink: Some(video_filesink),
-        audio_filesink: None,        filesink_eos,
+        video_filesink: None,
+        audio_filesink: None,
+        filesink_eos: Arc::new(AtomicBool::new(false)),
         audio_filesink_eos: Arc::new(AtomicBool::new(false)),
         eos_seen: Arc::new(AtomicBool::new(false)),
         active,
@@ -8688,7 +9029,8 @@ pub(crate) fn build_pass_through_record_branch(
         codec: rtp_encoding.to_owned(),
         fps,
         record_bitrate_kbps: Arc::new(AtomicU32::new(RECORD_BITRATE_DEFAULT_KBPS)),
-        idr_gate,
+        dvr_video: Some(dvr_video),
+        dvr_audio: None,
         video_tap_tee: rtp_tee.clone(),
         audio_rtp_tee: None,
         audio_valve: None,
@@ -9070,16 +9412,17 @@ fn remux_capture_recording(
     let Some(video_es) = video_es else {
         return Err("Capture remux: no video elementary stream file.".to_owned());
     };
-    // A 0-byte ES (the recording ended before the keyframe gate could open on
-    // a complete keyframe) decodes to nothing — report it clearly instead of
-    // letting avdec fail with the cryptic "No valid frames decoded before
-    // end of stream".
+    // A 0-byte ES (the DVR ring had no video to write: no complete keyframe
+    // AU ever reached the branch — the session may have delivered no video
+    // yet, or the stream was dead before record start) decodes to nothing —
+    // report it clearly instead of letting avdec fail with the cryptic "No
+    // valid frames decoded before end of stream".
     let es_size = std::fs::metadata(video_es)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     if es_size == 0 {
         return Err(
-            "Capture remux: the video elementary stream is empty — the recording captured no video frames (it may have ended before the next keyframe arrived)."
+            "Capture remux: the video elementary stream is empty — the recording captured no video frames (the pre-roll ring had no complete keyframe; check that the stream was delivering video before record start)."
                 .to_owned(),
         );
     }
@@ -11231,5 +11574,150 @@ mod pacing_mode_tests {
         assert!(error.contains("off"));
         assert!(resolve_pacing_mode("").is_err());
         assert!(resolve_pacing_mode("12x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod dvr_ring_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn read_file(path: &std::path::Path) -> Vec<u8> {
+        let mut file = std::fs::File::open(path).expect("open ring ES file");
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).expect("read ring ES file");
+        out
+    }
+
+    /// The idle ring is byte-bounded AND its front snaps to a keyframe AU
+    /// (a slice from the front always opens a fresh GOP).
+    #[test]
+    fn idle_ring_is_bounded_and_keyframe_aligned() {
+        let ring = DvrEsRing::new(100); // tiny budget: 5 × 30-byte AUs
+        // Interleave keyframe (K) and P AUs: K P P K P P …
+        for i in 0..50u64 {
+            ring.push(i * 1_000, i % 3 == 0, vec![0xAA; 30]);
+        }
+        assert!(
+            ring.total_bytes() <= 100,
+            "ring must trim to its byte budget, got {}",
+            ring.total_bytes()
+        );
+        // The front must be a keyframe: the AU at index 0 of every 3 is a
+        // keyframe, and the snap loop stops exactly on one. (A single
+        // oversized AU is kept even when it is a P — the "never empty"
+        // guard — but with mixed K/P content the front must be a K.)
+        let front = ring
+            .inner
+            .lock()
+            .expect("lock")
+            .entries
+            .front()
+            .map(|au| au.keyframe)
+            .unwrap_or(false);
+        assert!(front, "ring front must snap to a keyframe AU");
+        // The ring is non-empty (the last AU is always kept).
+        assert!(!ring.is_empty());
+    }
+
+    /// Pin writes the pre-roll head into the ES file and every later push
+    /// APPENDS to it (the recording body) — while the in-memory ring stops
+    /// accumulating, so RAM stays bounded no matter how long the recording.
+    #[test]
+    fn pin_writes_head_and_appends_body_while_ram_stays_bounded() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+
+        let ring = DvrEsRing::new(1_000_000);
+        // Pre-roll head: K P P K (pts 0..4).
+        for i in 0..4u64 {
+            ring.push(i * 1_000, i % 3 == 0, vec![i as u8; 40]);
+        }
+        let ram_before = ring.total_bytes();
+        assert!(ram_before > 0, "pre-roll must be buffered before pin");
+
+        ring.pin(&es_path, None).expect("pin writes the head");
+        assert!(ring.is_pinned());
+
+        // Recording body: 1000 more AUs pushed while pinned. These must go to
+        // the ES file, NOT the ring.
+        for i in 4..1004u64 {
+            ring.push(i * 1_000, i % 3 == 0, vec![0xBB; 40]);
+        }
+        assert_eq!(
+            ring.total_bytes(),
+            ram_before,
+            "RAM must stay bounded while pinned (the body lives in the ES file)"
+        );
+        assert_eq!(
+            ring.len(),
+            4,
+            "the in-memory ring must freeze at the pre-roll window while pinned"
+        );
+
+        ring.unpin();
+        assert!(!ring.is_pinned());
+        assert_eq!(ring.len(), 0, "unpin resets the ring for a fresh pre-roll");
+
+        // The ES file = head (4 AUs, pts 0-3) + body (1000 AUs).
+        let bytes = read_file(&es_path);
+        assert_eq!(bytes.len(), 1004 * 40, "ES file must hold head + body");
+        assert_eq!(&bytes[0..40], &[0u8; 40], "head starts with AU 0");
+        assert_eq!(&bytes[40 * 4..40 * 5], &[0xBB; 40], "body starts after the head");
+        let _ = std::fs::remove_file(&es_path);
+    }
+
+    /// The audio head is cut to the video head's wall-clock PTS: pin(from_pts)
+    /// writes only AUs at or after `from_pts`, so both tracks' pre-roll starts
+    /// at the same point and stay aligned in the remux.
+    #[test]
+    fn pin_from_pts_cuts_the_audio_head_to_the_video_start() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.aac.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+
+        let ring = DvrEsRing::with_keyframe_snap(1_000_000, false);
+        for i in 0..10u64 {
+            ring.push(i * 20_000, false, vec![0xCC; 16]); // audio AUs, no keyframes
+        }
+        // Video head starts at pts 3 * 20_000 → audio pre-roll must begin at
+        // that AU (and only that AU onward).
+        ring.pin(&es_path, Some(3 * 20_000)).expect("audio pin");
+        let bytes = read_file(&es_path);
+        assert_eq!(bytes.len(), 7 * 16, "audio head = AUs 3..=9 (7 AUs)");
+        ring.unpin();
+        let _ = std::fs::remove_file(&es_path);
+    }
+
+    /// The audio ring (snap_to_keyframe=false) evicts oldest AUs without
+    /// snapping — its front can be a mid-stream AU (ADTS has no GOP).
+    #[test]
+    fn audio_ring_evicts_without_keyframe_snapping() {
+        let ring = DvrEsRing::with_keyframe_snap(80, false); // 5 × 16-byte AUs
+        for i in 0..20u64 {
+            ring.push(i * 20_000, false, vec![0xCC; 16]);
+        }
+        assert!(ring.total_bytes() <= 80);
+        // Front is the oldest surviving AU (index 15 of the 20) — a mid-stream
+        // AU, which is exactly right for ADTS.
+        let front_pts = ring.front_pts().expect("front");
+        assert_eq!(front_pts, 15 * 20_000, "audio ring evicts oldest, no snap");
+    }
+
+    /// Pin on an empty ring (no video ever delivered) is still a no-op file
+    /// creation — the empty-ES guard at remux reports it clearly.
+    #[test]
+    fn pin_on_empty_ring_creates_an_empty_es_file() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.empty.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+        let ring = DvrEsRing::new(1_000_000);
+        ring.pin(&es_path, None).expect("pin on empty ring");
+        assert!(ring.is_pinned());
+        ring.unpin();
+        let bytes = read_file(&es_path);
+        assert!(bytes.is_empty(), "empty ring → empty ES file (guard reports it)");
+        let _ = std::fs::remove_file(&es_path);
     }
 }

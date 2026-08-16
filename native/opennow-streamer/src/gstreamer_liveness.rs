@@ -7912,12 +7912,19 @@ mod tests {
             });
         }
 
-        // Branch armed with the valve closed; live RTP must keep flowing.
+        // GFN DVR model: the branch valve is ALWAYS OPEN — while idle the
+        // AUs feed the bounded pre-roll ring (no ES file is written until
+        // record start pins the ring). Live RTP must keep flowing.
         std::thread::sleep(Duration::from_millis(1_000));
-        assert_eq!(
-            parse_sink_buffers.load(Ordering::SeqCst),
-            0,
-            "no depayloaded AUs may reach the parse while the valve is closed"
+        let idle_aus = parse_sink_buffers.load(Ordering::SeqCst);
+        assert!(
+            idle_aus > 0,
+            "the always-armed DVR branch must feed AUs while idle (pre-roll)"
+        );
+        let es_path = state.video_es_path.clone().expect("es path");
+        assert!(
+            !es_path.exists(),
+            "no ES file may exist before record start (the ring holds pre-roll in RAM)"
         );
 
         // Live-path probe installed BEFORE record start, so we can measure it
@@ -8417,8 +8424,8 @@ mod tests {
             "pass-through audio branch must include aacparse + ADTS capsfilter"
         );
         assert!(
-            state.audio_filesink.is_some() && state.audio_es_path.is_some(),
-            "pass-through audio branch must own an audio ES filesink + path"
+            state.dvr_audio.is_some() && state.audio_es_path.is_some(),
+            "pass-through audio branch must own a DVR audio ring + ES path"
         );
 
         // Let both live streams flow through the closed valves, then record.
