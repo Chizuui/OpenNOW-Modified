@@ -859,11 +859,23 @@ export function mixGameAudioWithMic(
  * bitstream itself — the user's recording cap does NOT apply (capture is
  * zero-cost, so "jangan di cap": the recording is whatever the stream is).
  */
-export function inspectEncodedCapture(
+/**
+ * Codec/audio-only part of `inspectEncodedCapture`: everything derivable
+ * from the peer connection alone (no video element / stream needed). Used to
+ * ARM the DVR worker as soon as the session's peer connection exists — the
+ * pre-roll ring then fills from session start, long before the user presses
+ * record — while the full info (dimensions/fps) is still resolved on demand.
+ */
+export function inspectEncodedCodecOnly(
   pc: RTCPeerConnection | null,
-  video: HTMLVideoElement,
-  stream: MediaStream,
-): EncodedCaptureInfo | null {
+): {
+  codec: EncodedCaptureCodec;
+  container: EncodedCaptureContainer;
+  mimeType: string;
+  hasAudio: boolean;
+  audioChannels: number;
+  audioSampleRate: number;
+} | null {
   if (!pc || typeof RTCRtpScriptTransform === "undefined") return null;
   const receivers = pc.getReceivers();
   const videoReceiver = receivers.find((receiver) => receiver.track?.kind === "video");
@@ -879,14 +891,6 @@ export function inspectEncodedCapture(
   // (~1 KB). Fall back to the MediaRecorder path (decoded-pixel capture) so
   // web recordings of HEVC sessions actually contain video.
   if (codec === "hevc") return null;
-  const videoTrackSettings = stream.getVideoTracks()[0]?.getSettings() ?? {};
-  const width = video.videoWidth || videoTrackSettings.width || 0;
-  const height = video.videoHeight || videoTrackSettings.height || 0;
-  if (width <= 0 || height <= 0) return null;
-  const fps =
-    videoTrackSettings.frameRate && videoTrackSettings.frameRate > 0
-      ? Math.max(1, Math.round(videoTrackSettings.frameRate))
-      : 60;
   const audioReceiver = receivers.find((receiver) => receiver.track?.kind === "audio") ?? null;
   const audioParams = encodedAudioParamsForCodecs(
     (audioReceiver?.getParameters().codecs ?? []).map((codec) => ({
@@ -899,11 +903,223 @@ export function inspectEncodedCapture(
     codec,
     container: containerForCodec(codec),
     mimeType: mimeTypeForEncodedCapture(codec),
-    width,
-    height,
-    fps,
     hasAudio,
     audioChannels: audioParams?.channels ?? 2,
     audioSampleRate: 48_000,
   };
+}
+
+export function inspectEncodedCapture(
+  pc: RTCPeerConnection | null,
+  video: HTMLVideoElement,
+  stream: MediaStream,
+): EncodedCaptureInfo | null {
+  const codecOnly = inspectEncodedCodecOnly(pc);
+  if (!codecOnly) return null;
+  const videoTrackSettings = stream.getVideoTracks()[0]?.getSettings() ?? {};
+  const width = video.videoWidth || videoTrackSettings.width || 0;
+  const height = video.videoHeight || videoTrackSettings.height || 0;
+  if (width <= 0 || height <= 0) return null;
+  const fps =
+    videoTrackSettings.frameRate && videoTrackSettings.frameRate > 0
+      ? Math.max(1, Math.round(videoTrackSettings.frameRate))
+      : 60;
+  return {
+    codec: codecOnly.codec,
+    container: codecOnly.container,
+    mimeType: codecOnly.mimeType,
+    width,
+    height,
+    fps,
+    hasAudio: codecOnly.hasAudio,
+    audioChannels: codecOnly.audioChannels,
+    audioSampleRate: codecOnly.audioSampleRate,
+  };
+}
+
+/**
+ * One buffered encoded frame in the DVR ring: the raw sample bytes, its µs
+ * timestamp and key/delta type. Audio frames are always "key" (every opus
+ * packet is independently decodable).
+ */
+export interface DvrRingFrame {
+  data: Uint8Array;
+  tsUs: number;
+  type: "key" | "delta";
+}
+
+/**
+ * GFN-style DVR pre-roll for the encoded recorder. While the worker is
+ * ARMED (transforms attached, no recording running) every video frame is
+ * pushed here; the ring is bounded by byte budget and its head is always a
+ * keyframe, so slicing at `start` yields a decodable keyframe-aligned head
+ * that is prepended to the recording (the record can never start mid-GOP or
+ * come out empty — the file's first samples are already in the buffer).
+ */
+export class DvrVideoRing {
+  private frames: DvrRingFrame[] = [];
+  private bytes = 0;
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly preRollUs: number,
+  ) {}
+
+  push(frame: DvrRingFrame): void {
+    this.frames.push(frame);
+    this.bytes += frame.data.byteLength;
+    // Eviction is bounded by BOTH the pre-roll window and the byte budget,
+    // with one invariant: the head is always a keyframe, so any slice yields
+    // a decodable head. The window may briefly extend past `preRollUs` until
+    // a new keyframe advances it (the native DVR trade-off), and a session
+    // that never sends a keyframe after the first cannot grow the ring past
+    // the byte cap (the deltas after the head keyframe are dropped).
+    const windowStart = frame.tsUs - this.preRollUs;
+    let head = 0;
+    for (let i = 0; i < this.frames.length - 1; i += 1) {
+      if (this.frames[i].tsUs >= windowStart) break;
+      head = i + 1;
+    }
+    // Find the keyframe that will anchor the head after eviction: the first
+    // keyframe at or after `head`, falling back to the LAST keyframe anywhere
+    // in the ring when the window has advanced past every keyframe (a session
+    // that stopped sending keyframes — keep the most recent one rather than
+    // the whole ring).
+    let anchor = this.frames.findIndex((f, i) => i >= head && f.type === "key");
+    if (anchor === -1) {
+      anchor = -1;
+      for (let i = this.frames.length - 1; i >= 0; i -= 1) {
+        if (this.frames[i].type === "key") {
+          anchor = i;
+          break;
+        }
+      }
+      if (anchor === -1) return;
+    }
+    // Drop deltas before the anchor while over the byte cap. The anchor
+    // keyframe itself is never dropped, so the ring stays decodable even
+    // under a pathological byte squeeze; if the cap still isn't met (a huge
+    // keyframe), drop deltas AFTER the anchor as well.
+    let evict = 0;
+    while (evict < anchor && this.bytes > this.maxBytes) {
+      this.bytes -= this.frames[evict].data.byteLength;
+      evict += 1;
+    }
+    if (this.bytes > this.maxBytes) {
+      // Head keyframe is too large on its own — trim trailing deltas (the
+      // slice keeps only the keyframe, so the recording is a single frame).
+      while (this.frames.length > anchor + 1 && this.bytes > this.maxBytes) {
+        const last = this.frames.pop() as DvrRingFrame;
+        this.bytes -= last.data.byteLength;
+      }
+    }
+    if (evict > 0) this.frames.splice(0, evict);
+  }
+
+  /**
+   * Return the keyframe-aligned head for a recording that starts at
+   * `nowUs`: the latest keyframe at or before `nowUs - preRollUs` and
+   * everything after it. Clears the ring (the buffered frames belong to the
+   * recording now). Returns null when the ring has no frames yet.
+   */
+  sliceHead(nowUs: number): { frames: DvrRingFrame[]; headUs: number; preRollUs: number } | null {
+    const windowStart = nowUs - this.preRollUs;
+    let head = 0;
+    for (let i = 0; i < this.frames.length - 1; i += 1) {
+      if (this.frames[i].tsUs >= windowStart) break;
+      head = i + 1;
+    }
+    // Anchor the slice to the latest keyframe at or before the window start:
+    // when the most recent keyframe predates the window (a long GOP or a
+    // session that stopped sending keyframes), the slice still starts at a
+    // decodable keyframe and picks up everything after it — the pre-roll is
+    // then longer than `preRollUs`, which is exactly the native DVR trade-off.
+    let keyIndex = -1;
+    for (let i = head; i >= 0; i -= 1) {
+      if (this.frames[i].type === "key") {
+        keyIndex = i;
+        break;
+      }
+    }
+    if (keyIndex === -1) {
+      // No keyframe before the window; fall back to the first keyframe in the
+      // ring (the byte-eviction invariant guarantees one exists unless empty).
+      keyIndex = this.frames.findIndex((f) => f.type === "key");
+    }
+    if (keyIndex === -1) return null;
+    const headUs = this.frames[keyIndex].tsUs;
+    const frames = this.frames.slice(keyIndex);
+    this.frames = [];
+    this.bytes = 0;
+    return { frames, headUs, preRollUs: Math.max(0, headUs - windowStart) };
+  }
+
+  clear(): void {
+    this.frames = [];
+    this.bytes = 0;
+  }
+
+  get length(): number {
+    return this.frames.length;
+  }
+}
+
+/**
+ * Audio pre-roll twin: no keyframe concept (opus packets are independent),
+ * so it holds the last `preRollUs` of audio. The slice is trimmed to the
+ * video head timestamp so both tracks start at the same wall-clock moment.
+ */
+export class DvrAudioRing {
+  private frames: DvrRingFrame[] = [];
+  private bytes = 0;
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly preRollUs: number,
+  ) {}
+
+  push(frame: DvrRingFrame): void {
+    this.frames.push(frame);
+    this.bytes += frame.data.byteLength;
+    const windowStart = frame.tsUs - this.preRollUs;
+    let head = 0;
+    for (let i = 0; i < this.frames.length - 1; i += 1) {
+      if (this.frames[i].tsUs >= windowStart) break;
+      head = i + 1;
+    }
+    while (head < this.frames.length && this.bytes > this.maxBytes) {
+      this.bytes -= this.frames[head].data.byteLength;
+      head += 1;
+    }
+    if (head > 0) this.frames.splice(0, head);
+  }
+
+  /**
+   * Trim to frames at or after `fromUs` and return them (clearing the ring).
+   * The head frame is the first whose timestamp is >= the video head, so
+   * A/V stay aligned; a tiny gap (audio leading the video keyframe) is
+   * dropped rather than prepended.
+   */
+  sliceFrom(fromUs: number): DvrRingFrame[] {
+    const frames = this.frames.filter((frame) => frame.tsUs >= fromUs);
+    this.frames = [];
+    this.bytes = 0;
+    return frames;
+  }
+
+  clear(): void {
+    this.frames = [];
+    this.bytes = 0;
+  }
+
+  get length(): number {
+    return this.frames.length;
+  }
+}
+
+/** Default ring budget: ~60 MB of encoded ES (~60s @ 8 Mbps). */
+export const DVR_RING_MAX_BYTES = 60 * 1024 * 1024;
+
+export function dvrPreRollUsForSeconds(seconds: number): number {
+  return Math.max(0, Math.round(seconds * 1_000_000));
 }

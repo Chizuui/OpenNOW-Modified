@@ -9,7 +9,11 @@ import {
   selectRecordingStrategy,
   type RecordingStrategy,
 } from "../components/stream/streamRuntimeHelpers";
-import { inspectEncodedCapture, type EncodedCaptureInfo } from "../recording/encodedCapture";
+import {
+  inspectEncodedCapture,
+  inspectEncodedCodecOnly,
+  type EncodedCaptureInfo,
+} from "../recording/encodedCapture";
 import type { RecordCanvasWorkerOutboundMessage } from "../recording/recordCanvasWorker";
 import type { EncodedWorkerOutboundMessage } from "../recording/recordEncodedWorker";
 import { getActiveWebRtcPeerConnection } from "../platforms/gfn/webrtcClient";
@@ -112,6 +116,25 @@ interface UseStreamRecorderOptions {
    * silently captured without the user's voice.
    */
   onMixMicUnavailable?: () => void;
+  /**
+   * GFN-style DVR pre-roll (seconds) for web (encoded-transform) recordings:
+   * the worker is armed from session start and keeps a keyframe-aligned ring
+   * of the last N seconds, prepended to every recording. 0 disables the ring
+   * (capture starts at record, like the legacy recorder).
+   */
+  recordingDvrSeconds: number;
+  /**
+   * True while a stream session is live. The DVR worker arms on the session
+   * start (once per peer connection) so the ring fills before the first
+   * record; re-arms when a new session begins.
+   */
+  streamActive: boolean;
+  /**
+   * True once the session's <video> element carries frames (dimensions known
+   * — the DVR arm needs them resolvable). Flips true after the session is
+   * up, so the arm effect re-runs exactly when the stream becomes ready.
+   */
+  streamVideoReady: boolean;
 }
 
 export function useStreamRecorder({
@@ -125,6 +148,9 @@ export function useStreamRecorder({
   nativeRecordingEnabled,
   mixMic,
   onMixMicUnavailable,
+  recordingDvrSeconds,
+  streamActive,
+  streamVideoReady,
 }: UseStreamRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -173,6 +199,10 @@ export function useStreamRecorder({
   const encodedReceiversRef = useRef<{ video: RTCRtpReceiver; audio: RTCRtpReceiver | null } | null>(null);
   const encodedReadyRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
   const encodedDoneRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
+  // The peer connection the encoded worker was armed against (session id for
+  // the DVR ring): a new session gets a fresh worker instead of reusing a
+  // stale one.
+  const encodedArmedPeerConnRef = useRef<RTCPeerConnection | null>(null);
   // Live mic PCM capture for the encoded recording's mic mix (GFN parity).
   // The mic track itself is owned by the app (clientRef.getMicTrack()) — we
   // only tap it, never stop it.
@@ -342,53 +372,60 @@ export function useStreamRecorder({
       recordFallbackCanvasRef.current = null;
       recordingStartTimeRef.current = Date.now();
       setRecordingDurationMs(0);
-      const worker = new Worker(
+      // The DVR worker is persistent for the session: created (and armed,
+      // transforms attached, ring filling) at stream start when the DVR
+      // pre-roll setting is on, or on demand here when it is off / the arm
+      // failed. Either way this recording just re-inits (fresh dimensions /
+      // mixMic) and starts the muxer on the EXISTING worker.
+      const worker = encodedWorkerRef.current ?? new Worker(
         new URL("../recording/recordEncodedWorker.ts", import.meta.url),
         { type: "module" },
       );
-      encodedWorkerRef.current = worker;
-      encodedReceiversRef.current = { video: videoReceiver, audio: audioReceiver };
-      worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
-        const message = event.data;
-        if (message.type === "chunk") {
-          const id = recordingIdRef.current;
-          if (!id) return;
-          chunkSendChainRef.current = chunkSendChainRef.current
-            .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
-            .catch((error: unknown) => {
-              console.error("[StreamView] Failed to send encoded recording chunk:", error);
-            });
-        } else if (message.type === "ready") {
-          encodedReadyRef.current?.resolve();
-          encodedReadyRef.current = null;
-        } else if (message.type === "done") {
-          encodedDoneRef.current?.resolve();
-          encodedDoneRef.current = null;
-        } else if (message.type === "diag") {
-          // One-shot worker diagnostics (first frame bytes/format, config
-          // build result) — surface them so a header-only recording pins the
-          // failing stage straight from the exported log.
-          console.info(`[StreamView] ${message.message}`);
-        } else if (message.type === "error") {
-          const error = new Error(message.message);
+      if (!encodedWorkerRef.current) {
+        encodedWorkerRef.current = worker;
+        worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
+          const message = event.data;
+          if (message.type === "chunk") {
+            const id = recordingIdRef.current;
+            if (!id) return;
+            chunkSendChainRef.current = chunkSendChainRef.current
+              .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
+              .catch((error: unknown) => {
+                console.error("[StreamView] Failed to send encoded recording chunk:", error);
+              });
+          } else if (message.type === "ready") {
+            encodedReadyRef.current?.resolve();
+            encodedReadyRef.current = null;
+          } else if (message.type === "done") {
+            encodedDoneRef.current?.resolve();
+            encodedDoneRef.current = null;
+          } else if (message.type === "diag") {
+            // One-shot worker diagnostics (first frame bytes/format, config
+            // build result) — surface them so a header-only recording pins
+            // the failing stage straight from the exported log.
+            console.info(`[StreamView] ${message.message}`);
+          } else if (message.type === "error") {
+            const error = new Error(message.message);
+            encodedReadyRef.current?.reject(error);
+            encodedReadyRef.current = null;
+            encodedDoneRef.current?.reject(error);
+            encodedDoneRef.current = null;
+            console.error("[StreamView] Encoded recording worker error:", message.message);
+          }
+        };
+        worker.onerror = (event) => {
+          const error = new Error(event.message || "Recording worker crashed");
           encodedReadyRef.current?.reject(error);
           encodedReadyRef.current = null;
           encodedDoneRef.current?.reject(error);
           encodedDoneRef.current = null;
-          console.error("[StreamView] Encoded recording worker error:", message.message);
-        }
-      };
-      worker.onerror = (event) => {
-        const error = new Error(event.message || "Recording worker crashed");
-        encodedReadyRef.current?.reject(error);
-        encodedReadyRef.current = null;
-        encodedDoneRef.current?.reject(error);
-        encodedDoneRef.current = null;
-        console.error("[StreamView] Encoded recording worker crashed:", event);
-      };
+          console.error("[StreamView] Encoded recording worker crashed:", event);
+        };
+      }
       try {
-        // Init first; the worker acks 'ready' once the muxer exists, only then
-        // do we attach the transforms — no frame can arrive before the muxer.
+        // Init (the worker acks 'ready'); then start. When the worker was
+        // armed early (DVR), init refreshes params only and start slices the
+        // ring — the transforms are already attached.
         worker.postMessage({
           type: "init",
           codec: info.codec,
@@ -400,25 +437,38 @@ export function useStreamRecorder({
           audioChannels: info.audioChannels,
           audioSampleRate: info.audioSampleRate,
           mixMic,
+          dvrSeconds: recordingDvrSeconds,
         });
         await new Promise<void>((resolve, reject) => {
           encodedReadyRef.current = { resolve, reject };
         });
-        videoReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "video" });
-        if (audioReceiver) {
-          audioReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "audio" });
+        if (!encodedArmedPeerConnRef.current || encodedArmedPeerConnRef.current !== pc) {
+          // Not armed for this session yet (DVR off, or the arm failed):
+          // attach the transforms now. The ring starts filling here, so this
+          // recording has no pre-roll, but the next one will.
+          videoReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "video" });
+          if (audioReceiver) {
+            audioReceiver.transform = new RTCRtpScriptTransform(worker, { kind: "audio" });
+          }
+          encodedArmedPeerConnRef.current = pc;
+          encodedReceiversRef.current = { video: videoReceiver, audio: audioReceiver };
         }
+        worker.postMessage({ type: "start" });
         if (mixMic) {
           startEncodedMicCapture(worker);
         }
       } catch (error) {
         console.warn("[StreamView] Encoded capture unavailable, aborting:", error);
         stopEncodedMicCapture();
+        // Reset unconditionally: a pre-armed worker that failed this start is
+        // not trustworthy for the next recording either, and the armed ref
+        // must not outlive it (the next start would skip re-attaching).
         videoReceiver.transform = null;
         if (audioReceiver) audioReceiver.transform = null;
         worker.terminate();
         encodedWorkerRef.current = null;
         encodedReceiversRef.current = null;
+        encodedArmedPeerConnRef.current = null;
         encodedReadyRef.current = null;
         encodedDoneRef.current = null;
         recordingIdRef.current = null;
@@ -433,10 +483,10 @@ export function useStreamRecorder({
         setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
       }, 500);
       console.info(
-        `[StreamView] Encoded capture started: ${info.codec} ${info.width}x${info.height}@${info.fps} → ${mimeType} (zero re-encode${mixMic ? ", mic mix" : ""})`,
+        `[StreamView] Encoded capture started: ${info.codec} ${info.width}x${info.height}@${info.fps} → ${mimeType} (zero re-encode, DVR pre-roll ${recordingDvrSeconds}s${mixMic ? ", mic mix" : ""})`,
       );
     },
-    [mixMic, startEncodedMicCapture, stopEncodedMicCapture],
+    [mixMic, recordingDvrSeconds, startEncodedMicCapture, stopEncodedMicCapture],
   );
 
   const stopEncodedRecording = useCallback(async (): Promise<void> => {
@@ -447,22 +497,14 @@ export function useStreamRecorder({
     const id = recordingIdRef.current;
     recordingIdRef.current = null;
     const worker = encodedWorkerRef.current;
-    const receivers = encodedReceiversRef.current;
-    encodedWorkerRef.current = null;
-    encodedReceiversRef.current = null;
     if (!worker) {
       setIsProcessing(false);
       return;
     }
-    // Stop the mic tap before detaching the transforms so the worker's final
-    // flush cannot stall waiting on PCM that will never arrive.
+    // Stop the mic tap before the worker finalizes so its mic-chain flush
+    // cannot stall waiting on PCM that will never arrive. The worker itself
+    // stays armed (transforms attached, rings buffering) for the next record.
     stopEncodedMicCapture();
-    // Detach the transforms first — frames stop flowing and the worker drains
-    // whatever is still in flight, then finalizes and posts 'done'.
-    if (receivers) {
-      receivers.video.transform = null;
-      if (receivers.audio) receivers.audio.transform = null;
-    }
     const donePromise = new Promise<void>((resolve, reject) => {
       encodedDoneRef.current = { resolve, reject };
     });
@@ -512,11 +554,147 @@ export function useStreamRecorder({
         window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
       }
     } finally {
-      worker.terminate();
       encodedDoneRef.current = null;
       setIsProcessing(false);
     }
   }, [gameTitle]);
+
+  // Abort the in-flight encoded recording (start failure / session teardown):
+  // tell the worker to drop the recording state and stay armed, close the
+  // mic tap, and abort the main-process file. The worker lives on so a later
+  // recording still gets its pre-roll.
+  const abortEncodedRecording = useCallback(async (): Promise<void> => {
+    setIsRecording(false);
+    setIsProcessing(false);
+    window.clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = undefined;
+    const id = recordingIdRef.current;
+    recordingIdRef.current = null;
+    const worker = encodedWorkerRef.current;
+    stopEncodedMicCapture();
+    if (worker) {
+      worker.postMessage({ type: "stop", abort: true });
+    }
+    if (id) {
+      window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
+    }
+  }, [stopEncodedMicCapture]);
+
+  // Arm the DVR recorder at session start (GFN parity): spawn the encoded
+  // worker, attach the transforms and let its ring buffer the last N seconds
+  // of keyframe-aligned video from the moment the stream is up — long before
+  // the user presses record — so every recording carries a pre-roll. Runs
+  // once per peer connection; the worker then lives for the session.
+  const armEncodedRecorder = useCallback((): void => {
+    const pc = getActiveWebRtcPeerConnection();
+    if (!pc || encodedArmedPeerConnRef.current === pc || !recordingDvrSeconds) return;
+    const codecOnly = inspectEncodedCodecOnly(pc);
+    if (!codecOnly) return; // unsupported codec / no transform support — the
+    // on-demand path falls back to the MediaRecorder recorder at record time.
+    const videoReceiver = pc.getReceivers().find((receiver) => receiver.track?.kind === "video") ?? null;
+    const audioReceiver = pc.getReceivers().find((receiver) => receiver.track?.kind === "audio") ?? null;
+    if (!videoReceiver) return;
+    // Don't re-arm while a recording is in flight (startEncodedRecording
+    // already owns the worker then).
+    if (recordingIdRef.current) return;
+    let worker = encodedWorkerRef.current;
+    if (worker) {
+      // Reuse the worker for a new session: cancel any stale recording state.
+      worker.postMessage({ type: "stop", abort: true });
+      stopEncodedMicCapture();
+    } else {
+      worker = new Worker(
+        new URL("../recording/recordEncodedWorker.ts", import.meta.url),
+        { type: "module" },
+      );
+      encodedWorkerRef.current = worker;
+      worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
+        const message = event.data;
+        if (message.type === "chunk") {
+          const id = recordingIdRef.current;
+          if (!id) return;
+          chunkSendChainRef.current = chunkSendChainRef.current
+            .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
+            .catch((error: unknown) => {
+              console.error("[StreamView] Failed to send encoded recording chunk:", error);
+            });
+        } else if (message.type === "ready") {
+          encodedReadyRef.current?.resolve();
+          encodedReadyRef.current = null;
+        } else if (message.type === "done") {
+          encodedDoneRef.current?.resolve();
+          encodedDoneRef.current = null;
+        } else if (message.type === "diag") {
+          console.info(`[StreamView] ${message.message}`);
+        } else if (message.type === "error") {
+          const error = new Error(message.message);
+          encodedReadyRef.current?.reject(error);
+          encodedReadyRef.current = null;
+          encodedDoneRef.current?.reject(error);
+          encodedDoneRef.current = null;
+          console.error("[StreamView] Encoded recording worker error:", message.message);
+        }
+      };
+      worker.onerror = (event) => {
+        const error = new Error(event.message || "Recording worker crashed");
+        encodedReadyRef.current?.reject(error);
+        encodedReadyRef.current = null;
+        encodedDoneRef.current?.reject(error);
+        encodedDoneRef.current = null;
+        console.error("[StreamView] Encoded recording worker crashed:", event);
+      };
+    }
+    // Codec-only init (dimensions may not be resolvable yet — the muxer is
+    // created per-recording with the full info at `start`, so this is enough
+    // to arm the ring). The worker acks 'ready'; only then do we attach the
+    // transforms so no frame can arrive before the rings exist.
+    worker.postMessage({
+      type: "init",
+      codec: codecOnly.codec,
+      container: codecOnly.container,
+      width: 0,
+      height: 0,
+      fps: 60,
+      hasAudio: codecOnly.hasAudio,
+      audioChannels: codecOnly.audioChannels,
+      audioSampleRate: codecOnly.audioSampleRate,
+      mixMic,
+      dvrSeconds: recordingDvrSeconds,
+    });
+    const ready = new Promise<void>((resolve, reject) => {
+      encodedReadyRef.current = { resolve, reject };
+    });
+    void ready
+      .then(() => {
+        videoReceiver.transform = new RTCRtpScriptTransform(worker as Worker, { kind: "video" });
+        if (audioReceiver) {
+          audioReceiver.transform = new RTCRtpScriptTransform(worker as Worker, { kind: "audio" });
+        }
+        encodedArmedPeerConnRef.current = pc;
+        encodedReceiversRef.current = { video: videoReceiver, audio: audioReceiver };
+        console.info(
+          `[StreamView] Encoded DVR armed: ${codecOnly.codec} pre-roll ${recordingDvrSeconds}s (ring fills from session start)`,
+        );
+      })
+      .catch((error: unknown) => {
+        // Arm failed (e.g. worker crash): fall back to on-demand recording.
+        console.warn("[StreamView] Encoded DVR arm failed — recording will start on demand:", error);
+        worker?.terminate();
+        encodedWorkerRef.current = null;
+        encodedReadyRef.current = null;
+      });
+  }, [mixMic, recordingDvrSeconds, stopEncodedMicCapture]);
+
+  // Arm once the session's stream is up (video element has frames and the
+  // peer connection exists). Re-arms when a NEW session starts (streamActive
+  // flips true again); the guard inside armEncodedRecorder makes it a no-op
+  // while the same peer connection is already armed.
+  useEffect(() => {
+    if (!recordingDvrSeconds || !streamActive || !streamVideoReady) return;
+    const pc = getActiveWebRtcPeerConnection();
+    if (!pc) return;
+    armEncodedRecorder();
+  }, [armEncodedRecorder, recordingDvrSeconds, streamActive, streamVideoReady]);
 
   const toggleRecording = useCallback(async () => {
     setRecordingError(null);
@@ -1092,6 +1270,7 @@ export function useStreamRecorder({
       return;
     }
   }, [
+    abortEncodedRecording,
     audioRef,
     gameTitle,
     isRecording,
@@ -1106,6 +1285,7 @@ export function useStreamRecorder({
     startEncodedRecording,
     stopEncodedMicCapture,
     stopEncodedRecording,
+    streamActive,
     videoRef,
   ]);
 
@@ -1124,6 +1304,7 @@ export function useStreamRecorder({
         encodedWorkerRef.current = null;
         const receivers = encodedReceiversRef.current;
         encodedReceiversRef.current = null;
+        encodedArmedPeerConnRef.current = null;
         if (receivers) {
           receivers.video.transform = null;
           if (receivers.audio) receivers.audio.transform = null;

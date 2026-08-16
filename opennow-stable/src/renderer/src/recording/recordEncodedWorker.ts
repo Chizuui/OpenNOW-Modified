@@ -36,6 +36,10 @@ import {
   unwrapRtpTimestamp,
   AUDIO_RTP_CLOCK,
   DEFAULT_MIC_MIX_GAIN,
+  DvrAudioRing,
+  DvrVideoRing,
+  dvrPreRollUsForSeconds,
+  DVR_RING_MAX_BYTES,
   MicPcmFifo,
   MicSync,
   VIDEO_RTP_CLOCK,
@@ -67,10 +71,26 @@ interface EncodedCaptureInit {
    * video bitstream stays untouched. Requires WebCodecs audio in the worker.
    */
   mixMic: boolean;
+  /**
+   * GFN-style DVR pre-roll: seconds of keyframe-aligned video (and audio)
+   * kept in the ring while the worker is armed, prepended to the recording
+   * when `start` arrives. 0 disables the ring (capture starts at `start`).
+   */
+  dvrSeconds: number;
+}
+
+/** Begin a recording from the armed state: slice the DVR ring and mux live. */
+interface EncodedCaptureStart {
+  type: "start";
 }
 
 interface EncodedCaptureStop {
   type: "stop";
+  /**
+   * True when the recording is being aborted (no finalize, no chunks kept):
+   * the worker clears the recording state and stays armed for the next one.
+   */
+  abort?: boolean;
 }
 
 /** Raw mic PCM captured on the main thread (48 kHz, mono, transferable). */
@@ -96,7 +116,7 @@ interface RtcTransformer {
   writable: WritableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
 }
 
-type WorkerInbound = EncodedCaptureInit | EncodedCaptureStop | EncodedCaptureMicPcm;
+type WorkerInbound = EncodedCaptureInit | EncodedCaptureStart | EncodedCaptureStop | EncodedCaptureMicPcm;
 
 // Minimal worker-global typing: the DOM lib's `self` (Window) is a lie inside
 // a dedicated worker, and pulling lib.webworker into this DOM project would
@@ -172,6 +192,33 @@ let lastAudioRtp: number | null = null;
 let lastVideoTsUs: number | null = null;
 let lastAudioTsUs: number | null = null;
 let finalized = false;
+// DVR ring (GFN-style pre-roll): the worker is armed from the moment the
+// transforms attach (session start) and buffers the last `dvrPreRollUs` of
+// keyframe-aligned video (plus a matching audio window) here. `start` slices
+// the ring and muxes it ahead of the live frames; the ring keeps filling
+// between recordings so every save carries a pre-roll, never starts mid-GOP
+// and can never come out empty.
+let dvrVideoRing: DvrVideoRing | null = null;
+let dvrAudioRing: DvrAudioRing | null = null;
+let dvrPreRollUs = 0;
+// True between `start` and `stop`: live frames feed the muxer (and the ring
+// keeps its pre-roll semantics — `start` already sliced the head).
+let recordingActive = false;
+// True between `start` and the first keyframe: the muxer cannot exist before
+// the codec record is built, so `start` defers it until the first keyframe
+// arrives and begins live capture then (pre-roll head already buffered).
+let recordingPendingMuxer = false;
+// µs added to every muxed audio timestamp while recording: the video pre-roll
+// head lands earlier than the record point, so audio is shifted forward by
+// the pre-roll duration to stay in sync (A/V never drift — both clocks are
+// anchored to the RTP timeline; only the pre-roll video precedes the audio).
+let audioShiftUs = 0;
+// lastVideoTsUs at `start`: the DVR slice window (`nowUs` for sliceHead).
+let recordingStartUs = 0;
+// The codec configuration record (avcC/hvcC/av1C) + codec string, built once
+// from the first keyframe and reused for every recording in this session.
+let codecDescription: Uint8Array | null = null;
+let codecString = "";
 // One-shot diagnostics (bounded, so a session never floods the log): the
 // first video/audio frame (format + first bytes) and config events. They
 // pin down which stage a header-only recording fails at (no frame, no
@@ -271,7 +318,9 @@ function setupMicMix(init: EncodedCaptureInit): void {
       if (!config || !handle) return;
       const bytes = new Uint8Array(chunk.byteLength);
       chunk.copyTo(bytes);
-      const timestampUs = chunk.timestamp;
+      // Shift by the pre-roll duration so the mixed track lands after the
+      // pre-roll video (see audioShiftUs).
+      const timestampUs = chunk.timestamp + audioShiftUs;
       if (!audioConfigReady) {
         audioConfigReady = true;
         handle.audio(bytes, "key", timestampUs, {
@@ -333,77 +382,172 @@ function teardownMicMix(): void {
 
 function setup(init: EncodedCaptureInit): void {
   try {
+    // The worker is armed for the whole session (transforms stay attached).
+    // The main thread re-posts init before each recording (fresh dimensions /
+    // mixMic), so re-init must NOT reset the rings or the codec record — it
+    // only refreshes the muxer params and the mic chain.
+    const firstInit = config === null;
     config = init;
-    if (init.mixMic) setupMicMix(init);
-    writer = new PositionalWriter(postChunk);
-    const onData = (data: Uint8Array, position: number): void => {
-      // mp4-muxer hardcodes a zeroed av1C box for AV1 (it ignores
-      // decoderConfig.description); patch the emitted moov with the real
-      // record built from the first keyframe. The moov is the first section
-      // the muxer emits, so the first match is the box, never sample data.
-      if (!av1CPatched && config?.codec === "av1" && av1C && patchAv1CInMp4(data, av1C)) {
-        av1CPatched = true;
+    if (firstInit) {
+      dvrPreRollUs = dvrPreRollUsForSeconds(init.dvrSeconds);
+      if (dvrPreRollUs > 0) {
+        dvrVideoRing = new DvrVideoRing(DVR_RING_MAX_BYTES, dvrPreRollUs);
+        if (init.hasAudio) dvrAudioRing = new DvrAudioRing(DVR_RING_MAX_BYTES / 8, dvrPreRollUs);
       }
-      writer?.write(data, position);
-    };
-    if (init.container === "mp4") {
-      const muxer = new Mp4Muxer({
-        target: new Mp4StreamTarget({ onData }),
-        video: {
-          codec: init.codec === "avc" ? "avc" : init.codec === "hevc" ? "hevc" : "av1",
-          width: init.width,
-          height: init.height,
-          frameRate: init.fps,
-        },
-        ...(init.hasAudio
-          ? { audio: { codec: "opus", numberOfChannels: init.audioChannels, sampleRate: init.audioSampleRate } }
-          : {}),
-        fastStart: "fragmented",
-        minFragmentDuration: 1,
-        firstTimestampBehavior: "offset",
-      });
-      handle = {
-        video(data, type, timestampUs, meta) {
-          // mp4-muxer refines durations from the next sample, so an estimate is fine.
-          muxer.addVideoChunkRaw(data, type, timestampUs, Math.round(1e6 / Math.max(1, init.fps)), meta);
-        },
-        audio(data, type, timestampUs, meta) {
-          muxer.addAudioChunkRaw(data, type, timestampUs, 20_000, meta);
-        },
-        finalize: () => muxer.finalize(),
-      };
     } else {
-      const muxer = new WebmMuxer({
-        target: new WebmStreamTarget({ onData }),
-        video: {
-          codec: init.codec === "av1" ? "V_AV1" : init.codec === "vp9" ? "V_VP9" : "V_VP8",
-          width: init.width,
-          height: init.height,
-          frameRate: init.fps,
-        },
-        ...(init.hasAudio
-          ? { audio: { codec: "A_OPUS", numberOfChannels: init.audioChannels, sampleRate: init.audioSampleRate } }
-          : {}),
-        firstTimestampBehavior: "offset",
-      });
-      handle = {
-        video(data, type, timestampUs, meta) {
-          muxer.addVideoChunkRaw(data, type, timestampUs, meta);
-        },
-        audio(data, type, timestampUs, meta) {
-          muxer.addAudioChunkRaw(data, type, timestampUs, meta);
-        },
-        finalize: () => muxer.finalize(),
-      };
+      // Re-init: cancel any in-flight recording state and reconcile the mic
+      // chain with the (possibly changed) mixMic flag.
+      handle = null;
+      writer = null;
+      recordingActive = false;
+      recordingPendingMuxer = false;
+      audioConfigReady = false;
+      av1CPatched = false;
+      audioShiftUs = 0;
+      if (init.mixMic && !micMixActive) {
+        setupMicMix(init);
+      } else if (!init.mixMic && micMixActive) {
+        teardownMicMix();
+      }
     }
+    if (init.mixMic && !micMixActive) {
+      setupMicMix(init);
+    }
+    // The muxer is created per-recording by startRecording (it needs the
+    // codec record from the first keyframe); the writer is created once and
+    // reused across recordings.
+    writer = new PositionalWriter(postChunk);
     post({ type: "ready" });
   } catch (error) {
     postError(`Encoded capture init failed: ${String(error)}`);
   }
 }
 
+/**
+ * Create the muxer for a recording and feed it the DVR pre-roll head (video
+ * slice + audio slice trimmed to the video head, timestamps shifted so the
+ * audio lands after the pre-roll video). Called from `start` once the codec
+ * record exists, and from `captureVideo` when the first keyframe arrives for
+ * a recording that started before any keyframe.
+ */
+function beginMuxer(): void {
+  const init = config;
+  if (!init || handle || !videoConfigReady || !codecDescription) return;
+  writer = new PositionalWriter(postChunk);
+  const onData = (data: Uint8Array, position: number): void => {
+    // mp4-muxer hardcodes a zeroed av1C box for AV1 (it ignores
+    // decoderConfig.description); patch the emitted moov with the real
+    // record built from the first keyframe. The moov is the first section
+    // the muxer emits, so the first match is the box, never sample data.
+    if (!av1CPatched && init.codec === "av1" && av1C && patchAv1CInMp4(data, av1C)) {
+      av1CPatched = true;
+    }
+    writer?.write(data, position);
+  };
+  if (init.container === "mp4") {
+    const muxer = new Mp4Muxer({
+      target: new Mp4StreamTarget({ onData }),
+      video: {
+        codec: init.codec === "avc" ? "avc" : init.codec === "hevc" ? "hevc" : "av1",
+        width: init.width,
+        height: init.height,
+        frameRate: init.fps,
+      },
+      ...(init.hasAudio
+        ? { audio: { codec: "opus", numberOfChannels: init.audioChannels, sampleRate: init.audioSampleRate } }
+        : {}),
+      fastStart: "fragmented",
+      minFragmentDuration: 1,
+      firstTimestampBehavior: "offset",
+    });
+    handle = {
+      video(data, type, timestampUs, meta) {
+        // mp4-muxer refines durations from the next sample, so an estimate is fine.
+        muxer.addVideoChunkRaw(data, type, timestampUs, Math.round(1e6 / Math.max(1, init.fps)), meta);
+      },
+      audio(data, type, timestampUs, meta) {
+        muxer.addAudioChunkRaw(data, type, timestampUs, 20_000, meta);
+      },
+      finalize: () => muxer.finalize(),
+    };
+  } else {
+    const muxer = new WebmMuxer({
+      target: new WebmStreamTarget({ onData }),
+      video: {
+        codec: init.codec === "av1" ? "V_AV1" : init.codec === "vp9" ? "V_VP9" : "V_VP8",
+        width: init.width,
+        height: init.height,
+        frameRate: init.fps,
+      },
+      ...(init.hasAudio
+        ? { audio: { codec: "A_OPUS", numberOfChannels: init.audioChannels, sampleRate: init.audioSampleRate } }
+        : {}),
+      firstTimestampBehavior: "offset",
+    });
+    handle = {
+      video(data, type, timestampUs, meta) {
+        muxer.addVideoChunkRaw(data, type, timestampUs, meta);
+      },
+      audio(data, type, timestampUs, meta) {
+        muxer.addAudioChunkRaw(data, type, timestampUs, meta);
+      },
+      finalize: () => muxer.finalize(),
+    };
+  }
+  // Feed the buffered pre-roll head. Video frames were pushed while armed
+  // with their raw bytes; convert here (Annex-B → length-prefixed) exactly
+  // once, then mux. The head is keyframe-aligned by construction.
+  const head = dvrVideoRing?.sliceHead(recordingStartUs) ?? null;
+  if (head) {
+    for (const frame of head.frames) {
+      // Ring frames carry no metadata — the decoderConfig for the first video
+      // sample is supplied by the muxer's video config (codec record).
+      handle.video(convertSample(frame.data), frame.type, frame.tsUs);
+    }
+  }
+  if (init.hasAudio && !micMixActive) {
+    // Trim the audio pre-roll to the video head so both tracks start at the
+    // same wall-clock moment, then shift forward by the pre-roll duration so
+    // the audio lands after the pre-roll video (the muxer's
+    // firstTimestampBehavior offsets the timeline to the first chunk).
+    const audioFrames = dvrAudioRing?.sliceFrom(head ? head.headUs : Number.POSITIVE_INFINITY) ?? [];
+    for (const frame of audioFrames) {
+      // Ring audio frames never carry metadata (opus needs none — the
+      // OpusHead config is supplied by the muxer's audio config).
+      handle.audio(frame.data, "key", frame.tsUs + audioShiftUs);
+    }
+  }
+}
+
+/** Start a recording from the armed state (DVR slice + live mux). */
+function startRecording(): void {
+  if (!config || recordingActive || finalized) return;
+  recordingActive = true;
+  recordingPendingMuxer = !videoConfigReady;
+  recordingStartUs = lastVideoTsUs ?? 0;
+  // The video head lands `preRollUs` before the record point; shift the audio
+  // (pre-roll slice and live) forward by that duration to keep A/V in sync.
+  audioShiftUs = dvrPreRollUs;
+  // New muxer per recording (chunks for the previous one were already
+  // emitted and the recording id closed by the main thread).
+  handle = null;
+  writer = null;
+  av1CPatched = false;
+  audioConfigReady = false;
+  if (videoConfigReady) {
+    beginMuxer();
+    postDiag(
+      `encoded recording: start (DVR pre-roll ${Math.round(audioShiftUs / 1000)}ms, ring=${dvrVideoRing?.length ?? 0} video frames)`,
+    );
+  } else {
+    postDiag(
+      "encoded recording: start before any keyframe — capturing from the next keyframe",
+    );
+  }
+}
+
 function captureVideo(frame: RTCEncodedVideoFrame): void {
-  if (!config || !handle || finalized) return;
+  if (!config || finalized) return;
   // Video frame metadata carries NO rtpTimestamp — getMetadata() only returns
   // synchronizationSource/contributingSources/payloadType for video (the RTP
   // timestamp is audio-only). Reading it here returned undefined for every
@@ -454,6 +598,9 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
           : ` seqHdr=${contentKey} first=[${hexOf(raw)}]`),
     );
   }
+  // Build the codec record from the first keyframe exactly once per session
+  // (while armed — long before any recording), then reuse it for every
+  // recording's muxer.
   if (!videoConfigReady) {
     // Codec config (avcC/hvcC/av1C) lives in the first keyframe's parameter
     // sets / sequence header; skip until it arrives. Delta frames before it
@@ -468,10 +615,14 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
           `encoded video: key frame without parameter sets — waiting for the next keyframe (${config.codec})`,
         );
       }
+      // Keep buffering while armed — the next keyframe (or a recording that
+      // starts now) will slice whatever head exists.
+      if (!recordingActive && dvrVideoRing) {
+        dvrVideoRing.push({ data: raw, tsUs, type });
+      }
       return;
     }
     let description: Uint8Array | null = null;
-    let codecString = "";
     if (config.codec === "avc" || config.codec === "hevc") {
       const nalus = nals ?? extractNalUnits(raw);
       description =
@@ -483,6 +634,7 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
     }
     if (!description) return;
     videoConfigReady = true;
+    codecDescription = description;
     postDiag(
       `encoded video: config ready codec=${config.codec} nals=${nals?.length ?? 0} fmt=${nalFormat} len=${raw.length}`,
     );
@@ -492,12 +644,33 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
       // format MP4 stores).
       av1C = description;
     }
-    handle.video(convertSample(raw), type, tsUs, {
+    if (recordingPendingMuxer) {
+      // The recording started before any keyframe — the muxer could not exist
+      // yet; create it now with the pre-roll head and start live capture.
+      beginMuxer();
+      recordingPendingMuxer = false;
+    } else if (!recordingActive && dvrVideoRing) {
+      dvrVideoRing.push({ data: raw, tsUs, type });
+    }
+    if (!recordingActive) return;
+    handle?.video(convertSample(raw), type, tsUs, {
       decoderConfig: { codec: codecString, description },
     });
     return;
   }
-  handle.video(convertSample(raw), type, tsUs);
+  if (recordingPendingMuxer && handle) {
+    // The muxer became available after the pending start (defensive — the
+    // keyframe path above normally resolves it).
+    recordingPendingMuxer = false;
+  }
+  if (recordingActive && handle) {
+    handle.video(convertSample(raw), type, tsUs);
+    return;
+  }
+  // Armed: buffer into the DVR ring for the next recording's pre-roll.
+  if (dvrVideoRing) {
+    dvrVideoRing.push({ data: raw, tsUs, type });
+  }
 }
 
 /**
@@ -517,7 +690,7 @@ function convertSample(raw: Uint8Array): Uint8Array {
 }
 
 function captureAudio(frame: RTCEncodedAudioFrame): void {
-  if (!config || !handle || !config.hasAudio || finalized) return;
+  if (!config || !config.hasAudio || finalized) return;
   if (!diagAudioSent) {
     diagAudioSent = true;
     const bytes = new Uint8Array(frame.data.byteLength);
@@ -535,10 +708,12 @@ function captureAudio(frame: RTCEncodedAudioFrame): void {
   lastAudioTsUs = tsUs;
   const raw = new Uint8Array(frame.data.byteLength);
   raw.set(new Uint8Array(frame.data));
-  if (micMixActive && gameDecoder) {
-    // Mic mixing: decode the game opus, mix with the mic PCM, re-encode.
-    // Audio chunks are treated as key (every opus packet is independently
-    // decodable; the transform's frames carry no key/delta distinction).
+  if (recordingActive && micMixActive && gameDecoder) {
+    // Mic mixing (live, after the pre-roll head): decode the game opus, mix
+    // with the mic PCM, re-encode. Audio chunks are treated as key (every
+    // opus packet is independently decodable; the transform's frames carry
+    // no key/delta distinction). The encoder output applies audioShiftUs so
+    // the mixed track lands after the pre-roll video.
     gameDecoder.decode(
       new EncodedAudioChunk({
         type: "key",
@@ -548,19 +723,27 @@ function captureAudio(frame: RTCEncodedAudioFrame): void {
     );
     return;
   }
-  if (!audioConfigReady) {
-    audioConfigReady = true;
-    handle.audio(raw, "key", tsUs, {
-      decoderConfig: {
-        codec: "opus",
-        description: buildOpusHead(config.audioChannels),
-        numberOfChannels: config.audioChannels,
-        sampleRate: config.audioSampleRate,
-      },
-    });
+  if (recordingActive && handle) {
+    // Live audio (no mic mix): mux after the pre-roll head, shifted by the
+    // pre-roll duration so A/V stay in sync (the muxer's offset behavior
+    // anchors the timeline to the first chunk, which is the pre-roll video).
+    if (!audioConfigReady) {
+      audioConfigReady = true;
+      handle.audio(raw, "key", tsUs + audioShiftUs, {
+        decoderConfig: {
+          codec: "opus",
+          description: buildOpusHead(config.audioChannels),
+          numberOfChannels: config.audioChannels,
+          sampleRate: config.audioSampleRate,
+        },
+      });
+      return;
+    }
+    handle.audio(raw, "key", tsUs + audioShiftUs);
     return;
   }
-  handle.audio(raw, "key", tsUs);
+  // Armed: buffer into the audio ring for the next recording's pre-roll.
+  dvrAudioRing?.push({ data: raw, tsUs, type: "key" });
 }
 
 async function pump(
@@ -588,16 +771,21 @@ async function pump(
   }
 }
 
+/**
+ * Finalize the current recording. The worker stays ARMED afterwards (the
+ * transforms remain attached, the rings keep buffering) so the next
+ * recording can slice a fresh pre-roll without respawning the worker. The
+ * main thread waits for `done` before starting the next recording, and
+ * terminates the worker at session end.
+ */
 async function finalize(): Promise<void> {
   if (finalized) return;
   finalized = true;
   try {
-    // Drain any frames still in flight after the transforms were detached,
-    // with a timeout so a readable that never closes cannot hang the stop.
-    await Promise.race([
-      Promise.allSettled(pumpTasks),
-      new Promise((resolve) => setTimeout(resolve, 2000)),
-    ]);
+    // The transforms stay attached, so the pump loops never exit on their
+    // own — nothing to drain; the last frame the transform delivered was
+    // already muxed synchronously by captureVideo/captureAudio. What remains
+    // is the mic chain's re-encode tail.
     if (micMixActive && gameDecoder && mixEncoder) {
       // Flush decode → mix → encode so the tail of the recording is not cut
       // off; the encoder output feeds the muxer before finalize. Sequential:
@@ -613,11 +801,32 @@ async function finalize(): Promise<void> {
     }
     handle?.finalize();
     writer?.flushAll();
-    teardownMicMix();
+    // Re-arm for the next recording: clear per-recording state (the codec
+    // record and rings survive).
+    handle = null;
+    writer = null;
+    recordingActive = false;
+    recordingPendingMuxer = false;
+    audioConfigReady = false;
+    av1CPatched = false;
+    audioShiftUs = 0;
+    finalized = false;
     post({ type: "done" });
   } catch (error) {
     postError(`Encoded capture finalize failed: ${String(error)}`);
   }
+}
+
+/** Abort the current recording without finalizing: drop state, stay armed. */
+function abortRecording(): void {
+  handle = null;
+  writer = null;
+  recordingActive = false;
+  recordingPendingMuxer = false;
+  audioConfigReady = false;
+  av1CPatched = false;
+  audioShiftUs = 0;
+  // Keep the rings (pre-roll continues uninterrupted for the next recording).
 }
 
 // The RTCRtpScriptTransform constructor fires this event at the worker for
@@ -653,6 +862,8 @@ self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
   }
   if (data.type === "init") {
     setup(data);
+  } else if (data.type === "start") {
+    startRecording();
   } else if (data.type === "mic-pcm") {
     // Raw mic PCM (48 kHz mono) + the real-clock capture time. The sync
     // measures the mic's actual rate from the tags; the FIFO holds the
@@ -660,6 +871,10 @@ self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
     micSync?.push(data.samples.length, data.capturedAtMs);
     micFifo?.push(data.samples);
   } else if (data.type === "stop") {
-    void finalize();
+    if (data.abort) {
+      abortRecording();
+    } else {
+      void finalize();
+    }
   }
 };

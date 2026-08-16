@@ -82,6 +82,8 @@ interface StreamViewProps {
   recordingResolution: string;
   recordingFps: number;
   recordingMixMic: boolean;
+  /** GFN-style DVR pre-roll (seconds) for web encoded recordings (0 = off). */
+  recordingDvrSeconds: number;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
@@ -148,6 +150,7 @@ export function StreamView({
   recordingResolution,
   recordingFps,
   recordingMixMic,
+  recordingDvrSeconds,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
@@ -383,6 +386,9 @@ export function StreamView({
     recordingResolution,
     recordingFps,
     mixMic: recordingMixMic,
+    recordingDvrSeconds,
+    streamActive: isStreaming,
+    streamVideoReady,
     // Auto-reset the setting when a recording finds no live mic — a silent
     // recording must not leave "Mix Mic" looking active.
     onMixMicUnavailable: () => onRecordingMixMicChange(false),

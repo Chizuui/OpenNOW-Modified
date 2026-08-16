@@ -3330,6 +3330,7 @@ export function App(): JSX.Element {
               recordingResolution={settings.recordingResolution}
               recordingFps={settings.recordingFps}
               recordingMixMic={settings.recordingMixMic}
+              recordingDvrSeconds={settings.recordingDvrSeconds}
               onRecordingResolutionChange={(value) => { void updateSetting("recordingResolution", value); }}
               onRecordingFpsChange={(value) => { void updateSetting("recordingFps", value); }}
               onRecordingBitrateMbpsChange={(value) => { void updateSetting("recordingBitrateMbps", value); }}

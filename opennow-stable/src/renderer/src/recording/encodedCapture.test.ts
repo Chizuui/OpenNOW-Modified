@@ -22,8 +22,12 @@ import {
   patchAv1CInMp4,
   rtpTimestampToMicroseconds,
   unwrapRtpTimestamp,
+  DvrAudioRing,
+  DvrVideoRing,
+  dvrPreRollUsForSeconds,
   MicPcmFifo,
   MicSync,
+  type DvrRingFrame,
 } from "./encodedCapture";
 
 /** Build an Annex-B H.264-style NAL payload with a 4-byte start code. */
@@ -475,4 +479,97 @@ test("patchAv1CInMp4 replaces the av1C box content of an emitted MP4 stream", ()
   // returns false.
   assert.equal(patchAv1CInMp4(stream, av1C), true);
   assert.equal(patchAv1CInMp4(new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70]), av1C), false);
+});
+
+function key(tsUs: number, size = 4): DvrRingFrame {
+  return { data: new Uint8Array(size).fill(1), tsUs, type: "key" };
+}
+
+function delta(tsUs: number, size = 4): DvrRingFrame {
+  return { data: new Uint8Array(size).fill(2), tsUs, type: "delta" };
+}
+
+test("DVR video ring slices a keyframe-aligned head from the pre-roll window", () => {
+  const ring = new DvrVideoRing(1024 * 1024, 1_000_000);
+  // One GOP per second: keyframe at t=0, deltas at 33/66/99 ms, keyframe at 1s.
+  ring.push(key(0));
+  ring.push(delta(33_333));
+  ring.push(delta(66_666));
+  ring.push(delta(99_999));
+  ring.push(key(1_000_000));
+  ring.push(delta(1_033_333));
+  ring.push(delta(1_066_666));
+  // Slice at 1.1s with a 1s pre-roll: the window head is the 1s keyframe.
+  const head = ring.sliceHead(1_100_000);
+  assert.ok(head);
+  assert.equal(head.headUs, 1_000_000);
+  assert.deepEqual(
+    head.frames.map((frame) => frame.tsUs),
+    [1_000_000, 1_033_333, 1_066_666],
+  );
+  // The ring is drained by the slice (the frames belong to the recording).
+  assert.equal(ring.length, 0);
+});
+
+test("DVR video ring always keeps the latest keyframe at the head", () => {
+  const ring = new DvrVideoRing(1024 * 1024, 500_000); // 0.5s pre-roll
+  // Push a full 2s of 30fps frames without any keyframe after t=0 — the head
+  // must stay at t=0 (no keyframe to advance to), even though the window has
+  // long passed, so a slice still yields a decodable head.
+  ring.push(key(0));
+  for (let i = 1; i <= 60; i += 1) ring.push(delta(i * 33_333));
+  const head = ring.sliceHead(2_000_000);
+  assert.ok(head);
+  assert.equal(head.headUs, 0);
+  assert.equal(head.frames.length, 61);
+  // A fresh keyframe advances the window: old deltas before the new keyframe
+  // are evicted.
+  ring.push(key(0));
+  for (let i = 1; i <= 20; i += 1) ring.push(delta(i * 33_333));
+  ring.push(key(1_000_000));
+  ring.push(delta(1_033_333));
+  const head2 = ring.sliceHead(1_500_000);
+  assert.ok(head2);
+  assert.equal(head2.headUs, 1_000_000);
+  assert.deepEqual(
+    head2.frames.map((frame) => frame.tsUs),
+    [1_000_000, 1_033_333],
+  );
+});
+
+test("DVR video ring is byte-bounded even when no keyframe ever advances", () => {
+  const ring = new DvrVideoRing(40, 1_000_000); // 40 bytes, 4-byte frames
+  ring.push(key(0));
+  for (let i = 1; i <= 100; i += 1) ring.push(delta(i * 33_333));
+  // Byte cap forces eviction; the head keyframe (t=0) survives.
+  assert.ok(ring.length < 100);
+  const head = ring.sliceHead(100_000);
+  assert.ok(head);
+  assert.equal(head.headUs, 0);
+  assert.equal(head.frames[0].type, "key");
+  // And the total buffered bytes never exceed the budget.
+  const total = head.frames.reduce((sum, frame) => sum + frame.data.byteLength, 0);
+  assert.ok(total <= 40);
+});
+
+test("DVR audio ring trims to the video head and evicts by time", () => {
+  const ring = new DvrAudioRing(1024 * 1024, 500_000);
+  ring.push({ data: new Uint8Array(1), tsUs: 0, type: "key" });
+  ring.push({ data: new Uint8Array(1), tsUs: 100_000, type: "key" });
+  ring.push({ data: new Uint8Array(1), tsUs: 200_000, type: "key" });
+  ring.push({ data: new Uint8Array(1), tsUs: 400_000, type: "key" });
+  ring.push({ data: new Uint8Array(1), tsUs: 600_000, type: "key" });
+  // 0.5s window at the latest push keeps t >= 100_000.
+  assert.deepEqual(ring.sliceFrom(200_000).map((frame) => frame.tsUs), [200_000, 400_000, 600_000]);
+  // Audio leading the video head is dropped (A/V stay aligned).
+  const ring2 = new DvrAudioRing(1024 * 1024, 1_000_000);
+  ring2.push({ data: new Uint8Array(1), tsUs: 900_000, type: "key" });
+  ring2.push({ data: new Uint8Array(1), tsUs: 950_000, type: "key" });
+  assert.deepEqual(ring2.sliceFrom(1_000_000).map((frame) => frame.tsUs), []);
+});
+
+test("DVR pre-roll seconds converts to µs with clamping", () => {
+  assert.equal(dvrPreRollUsForSeconds(30), 30_000_000);
+  assert.equal(dvrPreRollUsForSeconds(0), 0);
+  assert.equal(dvrPreRollUsForSeconds(-5), 0);
 });
