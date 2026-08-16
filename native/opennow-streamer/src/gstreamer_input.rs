@@ -587,6 +587,192 @@ mod win32_priority {
     }
 }
 
+/// OS mouse acceleration management for native RawInput capture.
+///
+/// While the streamer owns mouse capture (sink-native / internal / external
+/// stacked window), disable Windows "Enhance pointer precision" (mouse
+/// acceleration) so EVERY input source the game could read — raw HID counts
+/// via WM_INPUT, legacy WM_MOUSEMOVE, or GetCursorPos deltas — sees 1:1
+/// unaccelerated counts. The GeForce NOW Windows client does the same
+/// ("Sending alt mouse settings (accel=0)" while streaming): raw-input games
+/// calibrate sensitivity on raw counts, and games that fall back to legacy
+/// input would otherwise get OS-accelerated deltas on top of the 1:1 path.
+///
+/// Idempotent: only the first disable captures the user's original settings;
+/// repeated arms (re-arm on foreground / guard ticks) are no-ops, and restore
+/// is a no-op when we never modified anything — so a session that toggles
+/// capture several times always ends with the exact original values. A
+/// process-exit Drop guard restores the settings even if the streamer is
+/// stopped without a clean release (crash aside, which leaves the user's
+/// pointer without acceleration until re-enabled — the same trade-off GFN
+/// accepts).
+#[cfg(target_os = "windows")]
+mod win32_mouse_acceleration {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    const SPI_GETMOUSE: u32 = 0x0003;
+    const SPI_SETMOUSE: u32 = 0x0004;
+    const SPIF_SENDCHANGE: u32 = 0x0002;
+
+    /// Original OS mouse parameters `[threshold1, threshold2, acceleration]`
+    /// captured the first time capture disabled acceleration. `Some` only while
+    /// we own the modification; `None` means we never disabled (or already
+    /// restored) and restore must not touch the system.
+    static ORIGINAL_MOUSE_PARAMS: OnceLock<Mutex<Option<(u32, u32, u32)>>> = OnceLock::new();
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SystemParametersInfoW(
+            ui_action: u32,
+            ui_param: u32,
+            pv_param: *mut c_void,
+            f_win_ini: u32,
+        ) -> i32;
+    }
+
+    /// Disable OS mouse acceleration, remembering the original settings so
+    /// restore can put them back exactly. No-op when already disabled (or when
+    /// the system read fails). Call on native capture arm.
+    pub unsafe fn disable_for_capture() {
+        let Ok(mut slot) = ORIGINAL_MOUSE_PARAMS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        else {
+            return;
+        };
+        if slot.is_some() {
+            return; // already disabled for the current capture — keep originals
+        }
+        let mut params = [0u32; 3];
+        let read = SystemParametersInfoW(
+            SPI_GETMOUSE,
+            0,
+            params.as_mut_ptr() as *mut c_void,
+            0,
+        );
+        if read == 0 {
+            return;
+        }
+        *slot = Some((params[0], params[1], params[2]));
+        let zero = [0u32; 3];
+        SystemParametersInfoW(
+            SPI_SETMOUSE,
+            0,
+            zero.as_ptr() as *mut c_void,
+            SPIF_SENDCHANGE,
+        );
+    }
+
+    /// Restore the OS mouse settings captured at disable time. No-op when we
+    /// never disabled (or already restored). Call on native capture release.
+    pub unsafe fn restore() {
+        let Ok(mut slot) = ORIGINAL_MOUSE_PARAMS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        else {
+            return;
+        };
+        let Some((threshold1, threshold2, acceleration)) = slot.take() else {
+            return;
+        };
+        let params = [threshold1, threshold2, acceleration];
+        SystemParametersInfoW(
+            SPI_SETMOUSE,
+            0,
+            params.as_ptr() as *mut c_void,
+            SPIF_SENDCHANGE,
+        );
+    }
+
+    /// Process-exit safety net: if the streamer exits without a clean release
+    /// (normal shutdown path aside), restore the OS mouse settings rather than
+    /// leaving the user's desktop without acceleration.
+    struct RestoreOnExit;
+    impl Drop for RestoreOnExit {
+        fn drop(&mut self) {
+            unsafe { restore(); }
+        }
+    }
+    #[allow(dead_code)]
+    static RESTORE_ON_EXIT: RestoreOnExit = RestoreOnExit;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Snapshot the current OS mouse params via SPI_GETMOUSE.
+        fn current_params() -> (u32, u32, u32) {
+            let mut params = [0u32; 3];
+            let ok = unsafe {
+                SystemParametersInfoW(
+                    SPI_GETMOUSE,
+                    0,
+                    params.as_mut_ptr() as *mut c_void,
+                    0,
+                )
+            };
+            assert_ne!(ok, 0, "SPI_GETMOUSE must succeed on Windows");
+            (params[0], params[1], params[2])
+        }
+
+        /// Restore-on-drop guard so a panicking assertion cannot leave the OS
+        /// mouse acceleration disabled for the rest of the test run (stack
+        /// unwinding runs this even on panic).
+        struct RestoreGuard;
+        impl Drop for RestoreGuard {
+            fn drop(&mut self) {
+                unsafe { restore(); }
+            }
+        }
+
+        #[test]
+        fn disable_is_idempotent_and_restore_returns_exact_original() {
+            let _guard = RestoreGuard;
+            let original = current_params();
+
+            unsafe { disable_for_capture(); }
+            unsafe { disable_for_capture(); } // second arm is a no-op
+            assert_eq!(
+                current_params().2,
+                0,
+                "acceleration must be disabled while capture is armed"
+            );
+            let captured_originals = ORIGINAL_MOUSE_PARAMS
+                .get()
+                .and_then(|slot| slot.lock().ok())
+                .is_some_and(|slot| slot.is_some());
+            assert!(
+                captured_originals,
+                "originals must be captured exactly once (idempotent arm)"
+            );
+
+            unsafe { restore(); }
+            assert_eq!(
+                current_params(),
+                original,
+                "restore must return the exact original threshold/accel values"
+            );
+            unsafe { restore(); } // second restore is a no-op
+            assert_eq!(current_params(), original);
+        }
+    }
+}
+
+/// Disable Windows mouse acceleration for the duration of native RawInput
+/// capture (see [`win32_mouse_acceleration`]). Call when capture arms.
+#[cfg(target_os = "windows")]
+pub(crate) unsafe fn disable_os_mouse_acceleration_for_capture() {
+    win32_mouse_acceleration::disable_for_capture();
+}
+
+/// Restore the OS mouse settings captured at disable time. Call when native
+/// capture releases.
+#[cfg(target_os = "windows")]
+pub(crate) unsafe fn restore_os_mouse_acceleration() {
+    win32_mouse_acceleration::restore();
+}
+
 #[cfg(target_os = "windows")]
 mod win32_xinput {
     use std::ffi::{c_char, c_void};

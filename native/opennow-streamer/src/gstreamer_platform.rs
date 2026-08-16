@@ -2087,6 +2087,11 @@ pub(crate) mod win32_renderer_window {
         if let Ok(mut captured) = slot.lock() {
             *captured = Some(hwnd as isize);
         }
+        // Capture owns raw input now: disable Windows "Enhance pointer precision"
+        // so every input source the game might read (raw HID or legacy) sees
+        // 1:1 counts — same as the GeForce NOW client does while streaming.
+        // The original OS settings are restored in release_input_capture.
+        crate::gstreamer_input::disable_os_mouse_acceleration_for_capture();
         sync_lock_keys_state(true);
     }
 
@@ -2164,6 +2169,10 @@ pub(crate) mod win32_renderer_window {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+        // Capture released: restore the OS mouse acceleration disabled at
+        // begin_input_capture so the desktop returns to the user's exact
+        // original pointer settings.
+        crate::gstreamer_input::restore_os_mouse_acceleration();
     }
 
     fn is_input_captured(hwnd: Hwnd) -> bool {
