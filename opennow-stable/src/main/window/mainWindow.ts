@@ -313,6 +313,20 @@ export async function createMainWindow(
   window.webContents.on("before-input-event", (event, input) => {
     try {
       const mainWindow = deps.getMainWindow();
+      // Dev-only: the default application menu (and its F12 / Ctrl+Shift+I /
+      // Cmd+Option+I accelerators) is removed or stripped, so restore devtools
+      // access here. Never in packaged builds — the key belongs to the game
+      // during a stream there.
+      if (!app.isPackaged && input.type === "keyDown" && !deps.getStreamInputActive()) {
+        const isF12 = input.key === "F12";
+        const isCtrlShiftI = input.control && input.shift && input.key.toLowerCase() === "i";
+        const isCmdOptI = process.platform === "darwin" && input.meta && input.alt && input.key.toLowerCase() === "i";
+        if (isF12 || isCtrlShiftI || isCmdOptI) {
+          event.preventDefault();
+          window.webContents.toggleDevTools();
+          return;
+        }
+      }
       if (
         process.platform !== "darwin" &&
         input.type === "keyDown" &&

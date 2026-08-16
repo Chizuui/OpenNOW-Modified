@@ -4,6 +4,7 @@ import {
   clipboard,
   ipcMain,
   dialog,
+  Menu,
   shell,
   systemPreferences,
   session,
@@ -509,6 +510,30 @@ if (!gotSingleInstanceLock) {
 
 if (gotSingleInstanceLock) {
 app.whenReady().then(async () => {
+  // No default application menu: Electron's default menu binds Ctrl+W (and
+  // Cmd+W on macOS) to "Close Window", which would close the app while a game
+  // stream is active (the key is forwarded to the game in both the DOM
+  // pointer-lock path and the native sink RawInput path). Removing the menu
+  // entirely — like the GeForce NOW client, which has no default CEF
+  // accelerators — leaves the close shortcut as a plain game key and keeps the
+  // window open. On Windows/Linux a null menu is enough; macOS still needs a
+  // minimal app menu (its Edit-menu roles are what make Cmd+C/V/X work in the
+  // renderer's text fields, and the app menu owns Quit), so use a stripped
+  // template with appMenu + editMenu and NO Window menu — that leaves Cmd+W
+  // unbound without regressing standard macOS UI. Devtools stay reachable in
+  // dev via the before-input-event F12 / Ctrl+Shift+I / Cmd+Option+I handler
+  // in mainWindow.ts.
+  if (process.platform === "darwin") {
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        { role: "appMenu" },
+        { role: "editMenu" },
+      ]),
+    );
+  } else {
+    Menu.setApplicationMenu(null);
+  }
+
   // Initialize log capture first to capture all console output
   initLogCapture("main");
   initSessionProxyAuth();
