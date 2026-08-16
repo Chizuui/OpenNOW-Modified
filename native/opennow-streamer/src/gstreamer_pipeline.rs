@@ -1405,6 +1405,15 @@ impl GstreamerRecordingState {
                         },
                     ));
                 }
+                // The gate only opens on a COMPLETE keyframe AU from the
+                // server; if the one-shot request above is dropped or delayed
+                // (signaling is lossy and shares the channel with the liveness
+                // watchdog), the ES file would stay empty for the whole
+                // recording. Re-ask at a modest cadence until the gate opens,
+                // the recording stops, or a bounded number of attempts is
+                // exhausted — same safe signaling path as the watchdog (never
+                // an in-pipeline force-key-unit).
+                self.spawn_idr_gate_keyframe_retry();
             }
             // ENCODED taps the DECODED frames, which are always complete —
             // no keyframe gate needed (the encoder starts wherever the live
@@ -1464,6 +1473,43 @@ impl GstreamerRecordingState {
         };
         send_log(&self.event_sender, "info", started_log);
         Ok(())
+    }
+
+    /// While the recording-start IDR gate stays closed (no complete keyframe
+    /// AU has arrived yet), keep re-requesting a keyframe over signaling so
+    /// the ES file can actually start. The one-shot `record-start` request
+    /// shares the lossy signaling channel with the liveness watchdog (which
+    /// rate-limits itself to one per 2 s), so it can be dropped or land while
+    /// the server encoder is busy — the gate would then wait for the server's
+    /// next natural GOP, and a short recording could end with an empty ES.
+    /// Retries at a modest cadence until the gate opens (`idr_gate` false),
+    /// the recording stops (`active` false), or a bounded number of attempts
+    /// is exhausted — a genuinely dead keyframe path then degrades to the
+    /// clear empty-ES error at stop instead of spamming the server.
+    fn spawn_idr_gate_keyframe_retry(&self) {
+        const RETRY_INTERVAL_MS: u64 = 700;
+        const MAX_ATTEMPTS: u8 = 8; // ≈ 5.6 s of retries, then give up
+        let gate = self.idr_gate.clone();
+        let active = self.active.clone();
+        let Some(sender) = self.event_sender.clone() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let mut attempt: u8 = 1;
+            while attempt <= MAX_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
+                if !active.load(Ordering::SeqCst) || !gate.load(Ordering::SeqCst) {
+                    return;
+                }
+                let _ = sender.send(Event::VideoKeyframeRequest(
+                    crate::protocol::VideoKeyframeRequest {
+                        reason: "record-start-retry".to_owned(),
+                        attempt,
+                    },
+                ));
+                attempt += 1;
+            }
+        });
     }
 
     /// Bounded wait for one recording branch queue to show the FULL replayed
