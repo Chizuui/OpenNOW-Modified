@@ -2354,57 +2354,6 @@ pub(crate) mod win32_renderer_window {
         }
     }
 
-    /// Server-stream CSS size ÷ the sink window's CSS size (physical rect /
-    /// device-pixel-ratio) — the same normalization the renderer's
-    /// getPointerScale applies to the addon / DOM pointer-lock paths. A mouse
-    /// sweep across the full window must move the game cursor the full server
-    /// width; raw HID counts alone move it faster than the OS cursor on
-    /// displays larger than the stream (a 1080p stream fullscreen on a 1440p
-    /// monitor needs ×0.75, not ×1.0). Falls back to 1.0 when the server
-    /// resolution or the window geometry is unknown yet.
-    fn mouse_display_scale() -> (f64, f64) {
-        let server = crate::gstreamer_input::native_mouse_server_resolution();
-        let css = STACKED_PENDING_SURFACE
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .ok()
-            .and_then(|pending| {
-                pending.as_ref().and_then(|surface| {
-                    surface.rect.as_ref().map(|rect| {
-                        let dpr = surface.device_scale_factor.max(0.25);
-                        (rect.width as f64 / dpr, rect.height as f64 / dpr)
-                    })
-                })
-            })
-            .or_else(|| {
-                STACKED_TARGET
-                    .get_or_init(|| Mutex::new(None))
-                    .lock()
-                    .ok()
-                    .and_then(|target| target.as_ref().and_then(|target| target.last_rect))
-                    .map(|rect| {
-                        (
-                            f64::from(rect.right.saturating_sub(rect.left)),
-                            f64::from(rect.bottom.saturating_sub(rect.top)),
-                        )
-                    })
-            });
-        let Some((server_width, server_height)) = server else {
-            return (1.0, 1.0);
-        };
-        let Some((css_width, css_height)) = css else {
-            return (1.0, 1.0);
-        };
-        if css_width <= 0.0 || css_height <= 0.0 {
-            return (1.0, 1.0);
-        }
-        let clamp = |value: f64| value.clamp(0.25, 4.0);
-        (
-            clamp(f64::from(server_width) / css_width),
-            clamp(f64::from(server_height) / css_height),
-        )
-    }
-
     unsafe fn handle_raw_mouse(raw: &RawMouse) {
         if CAPTURED_HWND
             .get()
@@ -2429,24 +2378,20 @@ pub(crate) mod win32_renderer_window {
         let timestamp_us = timestamp_us();
         // Apply the configured mouse sensitivity / acceleration in-process (same
         // formula the renderer uses for the addon and DOM pointer-lock paths) so
-        // the sink-native capture feels exactly like the mouse settings instead
-        // of raw unscaled HID counts — plus the server-width ÷ window-width
-        // normalization (getPointerScale parity), so a mouse sweep across the
-        // window moves the game cursor the full server width like the OS cursor.
+        // the sink-native capture feels exactly like the mouse settings. Raw
+        // HID counts are forwarded 1:1 — deliberately no server-width ÷
+        // window-width normalization: raw-input games calibrate their
+        // sensitivity on raw counts, so window-size scaling would make the feel
+        // depend on the window size and break muscle memory (local play has no
+        // such scaling either).
         let sensitivity = crate::gstreamer_input::native_mouse_sensitivity();
         let acceleration_percent = crate::gstreamer_input::native_mouse_acceleration_percent();
-        let (scale_x, scale_y) = mouse_display_scale();
-        let mut dx_f = f64::from(raw.l_last_x) * sensitivity * scale_x;
-        let mut dy_f = f64::from(raw.l_last_y) * sensitivity * scale_y;
-        if acceleration_percent > 1.0 {
-            let speed = (dx_f * dx_f + dy_f * dy_f).sqrt();
-            let strength = (acceleration_percent - 1.0) / 149.0;
-            let accel_factor = 1.0 + (0.6 * strength).min((speed / 50.0) * strength);
-            dx_f *= accel_factor;
-            dy_f *= accel_factor;
-        }
-        let dx = clamp_i32_to_i16(dx_f.round() as i32);
-        let dy = clamp_i32_to_i16(dy_f.round() as i32);
+        let (dx, dy) = apply_native_mouse_delta(
+            raw.l_last_x,
+            raw.l_last_y,
+            sensitivity,
+            acceleration_percent,
+        );
         if dx != 0 || dy != 0 {
             emit_input_event(NativeWindowInputEvent::MouseMove {
                 dx,
@@ -3093,6 +3038,35 @@ pub(crate) mod win32_renderer_window {
         value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
     }
 
+    /// Apply the configured sensitivity / optional software acceleration to one
+    /// raw HID mouse delta pair, then clamp to i16. Raw counts are forwarded
+    /// 1:1 — deliberately NO server-width ÷ window-width normalization here:
+    /// raw-input games calibrate their sensitivity on raw counts, so window-size
+    /// scaling would make the feel depend on the window size and break muscle
+    /// memory (local play has no such scaling either). Pure — callers pass the
+    /// current settings, so the 1:1 and sensitivity/accel behavior is
+    /// unit-testable without a live RawInput device.
+    fn apply_native_mouse_delta(
+        dx: i32,
+        dy: i32,
+        sensitivity: f64,
+        acceleration_percent: f64,
+    ) -> (i16, i16) {
+        let mut dx_f = f64::from(dx) * sensitivity;
+        let mut dy_f = f64::from(dy) * sensitivity;
+        if acceleration_percent > 1.0 {
+            let speed = (dx_f * dx_f + dy_f * dy_f).sqrt();
+            let strength = (acceleration_percent - 1.0) / 149.0;
+            let accel_factor = 1.0 + (0.6 * strength).min((speed / 50.0) * strength);
+            dx_f *= accel_factor;
+            dy_f *= accel_factor;
+        }
+        (
+            clamp_i32_to_i16(dx_f.round() as i32),
+            clamp_i32_to_i16(dy_f.round() as i32),
+        )
+    }
+
     fn timestamp_us() -> u64 {
         // Shared with the input thread so measured capture→send delta latency
         // is exact (a module-local baseline here would offset the subtraction).
@@ -3105,6 +3079,56 @@ pub(crate) mod win32_renderer_window {
 
     unsafe fn show_cursor() {
         while ShowCursor(1) < 0 {}
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::apply_native_mouse_delta;
+
+        #[test]
+        fn raw_delta_is_1_to_1_with_default_settings() {
+            // No server-width ÷ window-width normalization: at sensitivity 1.0
+            // (and no acceleration) the exact HID counts must pass through —
+            // never multiplied by anything derived from the window size.
+            assert_eq!(apply_native_mouse_delta(10, -5, 1.0, 1.0), (10, -5));
+            assert_eq!(apply_native_mouse_delta(-1, 7, 1.0, 1.0), (-1, 7));
+            assert_eq!(apply_native_mouse_delta(0, 0, 1.0, 1.0), (0, 0));
+        }
+
+        #[test]
+        fn sensitivity_scales_raw_counts_linearly() {
+            assert_eq!(apply_native_mouse_delta(10, 0, 1.5, 1.0), (15, 0));
+            assert_eq!(apply_native_mouse_delta(0, 10, 0.5, 1.0), (0, 5));
+            // Fractional results round half away from zero.
+            assert_eq!(apply_native_mouse_delta(3, 0, 1.5, 1.0), (5, 0));
+        }
+
+        #[test]
+        fn acceleration_amplifies_fast_deltas_more_than_slow_ones() {
+            // acceleration_percent = 150 → strength = (150-1)/149 = 1.0.
+            // Slow: factor = 1 + min(0.6, (10/50)*1.0) = 1.2 → 12.
+            assert_eq!(apply_native_mouse_delta(10, 0, 1.0, 150.0), (12, 0));
+            // Fast: factor = 1 + min(0.6, (50/50)*1.0) = 1.6 → 80.
+            assert_eq!(apply_native_mouse_delta(50, 0, 1.0, 150.0), (80, 0));
+            // Diagonal speed uses the Euclidean magnitude: (30, 40) → speed 50.
+            assert_eq!(apply_native_mouse_delta(30, 40, 1.0, 150.0), (48, 64));
+        }
+
+        #[test]
+        fn delta_clamps_to_i16_range() {
+            assert_eq!(
+                apply_native_mouse_delta(40_000, 0, 1.0, 1.0),
+                (i16::MAX, 0)
+            );
+            assert_eq!(
+                apply_native_mouse_delta(-40_000, 0, 1.0, 1.0),
+                (i16::MIN, 0)
+            );
+            assert_eq!(
+                apply_native_mouse_delta(i32::MAX, i32::MIN, 1.0, 1.0),
+                (i16::MAX, i16::MIN)
+            );
+        }
     }
 }
 

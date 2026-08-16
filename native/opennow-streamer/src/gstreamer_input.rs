@@ -232,39 +232,6 @@ pub(crate) fn native_mouse_acceleration_percent() -> f64 {
         .unwrap_or(1.0)
 }
 
-/// Server-side stream resolution (CSS/logical pixels, "WxH") used to
-/// normalize sink-native RawInput deltas to the on-screen cursor. The DOM /
-/// addon path scales deltas by server-width ÷ CSS-window-width
-/// (getPointerScale in the renderer); stacked capture must apply the same
-/// factor or the game cursor runs FASTER than the OS cursor on displays
-/// larger than the stream (e.g. a 1080p stream fullscreen on a 1440p
-/// monitor: raw counts × 1.0 vs the DOM path's × 0.75).
-static NATIVE_MOUSE_SERVER_RESOLUTION: OnceLock<Mutex<Option<(u32, u32)>>> = OnceLock::new();
-
-pub(crate) fn set_native_mouse_server_resolution(resolution: &str) {
-    let mut parts = resolution.splitn(2, ['x', 'X']);
-    let width = parts.next().and_then(|value| value.trim().parse::<u32>().ok());
-    let height = parts.next().and_then(|value| value.trim().parse::<u32>().ok());
-    if let (Some(width), Some(height)) = (width, height) {
-        if width > 0 && height > 0 {
-            if let Ok(mut slot) = NATIVE_MOUSE_SERVER_RESOLUTION
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-            {
-                *slot = Some((width, height));
-            }
-        }
-    }
-}
-
-pub(crate) fn native_mouse_server_resolution() -> Option<(u32, u32)> {
-    NATIVE_MOUSE_SERVER_RESOLUTION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .ok()
-        .and_then(|slot| *slot)
-}
-
 /// Stacked sink-native RawInput capture toggle (settings > native streamer).
 /// Default OFF: stacked mode rides the Electron bridge (addon mouse + DOM
 /// keyboard) like the web path. The sink bypass is opt-in because raw HID
