@@ -42,6 +42,45 @@ export function quantizeMouseDeltaWithResidual(accumulatedDelta: number): { send
   };
 }
 
+export interface RelativeMouseDelta {
+  dxServer: number;
+  dyServer: number;
+  residualX: number;
+  residualY: number;
+}
+
+/**
+ * Convert an accumulated floating-point mouse delta (already sensitivity- and
+ * acceleration-adjusted by the caller) into an integer server delta with the
+ * fractional remainder carried as residual, clamped to the wire format's i16
+ * range. Deliberately NO server-width ÷ window-width normalization: raw-input
+ * games calibrate their sensitivity on raw counts, so window-size scaling
+ * would make the feel depend on the window size and break muscle memory
+ * (local play has no such scaling either). Returns null when there is nothing
+ * to send (both axes below half a count, or both clamp to zero).
+ */
+export function computeRelativeMouseDelta(
+  accumulatedDx: number,
+  accumulatedDy: number,
+): RelativeMouseDelta | null {
+  if (Math.abs(accumulatedDx) < 0.5 && Math.abs(accumulatedDy) < 0.5) {
+    return null;
+  }
+  const dxQuantized = quantizeMouseDeltaWithResidual(accumulatedDx);
+  const dyQuantized = quantizeMouseDeltaWithResidual(accumulatedDy);
+  const dxServer = Math.max(-32768, Math.min(32767, dxQuantized.send));
+  const dyServer = Math.max(-32768, Math.min(32767, dyQuantized.send));
+  if (dxServer === 0 && dyServer === 0) {
+    return null;
+  }
+  return {
+    dxServer,
+    dyServer,
+    residualX: dxQuantized.residual,
+    residualY: dyQuantized.residual,
+  };
+}
+
 /** Filters noisy/outlier relative mouse deltas before they enter the send path. */
 export class MouseDeltaFilter {
   private x = 0;

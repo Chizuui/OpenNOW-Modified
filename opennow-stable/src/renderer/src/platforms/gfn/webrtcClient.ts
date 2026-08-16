@@ -936,6 +936,19 @@ export class GfnWebRtcClient {
   public setNativeStreamerInputOwned(owned: boolean): void {
     if (this.nativeStreamerInputOwned === owned) return;
     this.nativeStreamerInputOwned = owned;
+    if (owned) {
+      // The sink owns OS RawInput now; drop any DOM pointer lock so the two
+      // capture paths never both deliver the same mouse movement (~2× speed).
+      // queueMouseMovement / attemptAutoPointerLock / the retention timer all
+      // gate on the flag too, so the lock does not come back while captured.
+      if (typeof document !== "undefined" && document.pointerLockElement) {
+        try {
+          document.exitPointerLock();
+        } catch {
+          // best effort — the DOM sources are gated on the flag regardless
+        }
+      }
+    }
     this.log(owned
       ? "Native streamer owns RawInput capture (sink window); renderer mouse sources stand down"
       : "Native streamer released RawInput capture; renderer mouse sources re-engaged");

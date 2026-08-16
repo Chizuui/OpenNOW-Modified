@@ -14,8 +14,8 @@ import {
 import { FULLSCREEN_KEYBOARD_LOCK_CODES } from "../keyboardLock";
 import { GfnCursorOverlayController } from "../cursorChannel";
 import {
+  computeRelativeMouseDelta,
   MouseDeltaFilter,
-  quantizeMouseDeltaWithResidual,
   subsampleCoalescedPointerEvents,
 } from "./mouseInput";
 
@@ -691,30 +691,17 @@ export class DomInputCaptureController {
       // is unordered, so a dependent pair must travel on the ordered reliable
       // channel or the relative delta could arrive before the absolute pin
       // and be overwritten by it.
-      let relPart: {
-        dxServer: number;
-        dyServer: number;
-        residualX: number;
-        residualY: number;
-      } | null = null;
-      if (
-        Math.abs(this.pendingMouseDxFloat) >= 0.5
-        || Math.abs(this.pendingMouseDyFloat) >= 0.5
-      ) {
-        const { scaleX, scaleY } = getPointerScale();
-        const dxQuantized = quantizeMouseDeltaWithResidual(this.pendingMouseDxFloat);
-        const dyQuantized = quantizeMouseDeltaWithResidual(this.pendingMouseDyFloat);
-        const dxServer = Math.max(-32768, Math.min(32767, Math.round(dxQuantized.send * scaleX)));
-        const dyServer = Math.max(-32768, Math.min(32767, Math.round(dyQuantized.send * scaleY)));
-        if (dxServer !== 0 || dyServer !== 0) {
-          relPart = {
-            dxServer,
-            dyServer,
-            residualX: dxQuantized.residual,
-            residualY: dyQuantized.residual,
-          };
-        }
-      }
+      // Raw 1:1 deltas for every renderer source (addon + DOM pointer lock):
+      // computeRelativeMouseDelta deliberately applies no server-width ÷
+      // window-width normalization — raw-input games calibrate sensitivity on
+      // raw counts, so window-size scaling would make the feel depend on the
+      // window size and break muscle memory (local play has no such scaling
+      // either). Absolute positioning (pointer-lock entry alignment, cursor
+      // overlay) still uses getPointerScale below.
+      const relPart = computeRelativeMouseDelta(
+        this.pendingMouseDxFloat,
+        this.pendingMouseDyFloat,
+      );
       const mixedBatch = this.pendingMouseAbs !== null && relPart !== null;
 
       if (this.pendingMouseAbs !== null) {
@@ -887,7 +874,14 @@ export class DomInputCaptureController {
         return;
       }
 
-      if (autoLockPending || isPointerLockActive() || this.isNativeMouseActive() || !mouseInStreamView || !this.dependencies.isInputReady()) {
+      if (
+        autoLockPending
+        || isPointerLockActive()
+        || this.isNativeMouseActive()
+        || this.dependencies.isNativeStreamerInputOwned()
+        || !mouseInStreamView
+        || !this.dependencies.isInputReady()
+      ) {
         return;
       }
       autoLockPending = true;
@@ -972,7 +966,15 @@ export class DomInputCaptureController {
     };
 
     const queueMouseMovement = (dx: number, dy: number, eventTimestampMs: number): void => {
-      if (!this.dependencies.isInputReady() || !isPointerLockActive()) {
+      // The native streamer owns RawInput capture on the stacked sink window:
+      // it feeds the data channel directly, so forwarding DOM deltas here too
+      // would double-input the game (mouse runs ~2×). The sink also drops the
+      // DOM pointer lock on arm, but gate on the flag as defense in depth.
+      if (
+        !this.dependencies.isInputReady()
+        || !isPointerLockActive()
+        || this.dependencies.isNativeStreamerInputOwned()
+      ) {
         return;
       }
       this.lastMouseEventArrivalMs = performance.now();
@@ -1317,7 +1319,15 @@ export class DomInputCaptureController {
       this.pointerLockRelockTimer = window.setTimeout(() => {
         this.pointerLockRelockTimer = null;
 
-        if (!this.dependencies.isInputReady() || !this.shouldSendSyntheticEscapeOnPointerLockLoss() || isPointerLockActive()) {
+        // Never re-lock while the native streamer owns RawInput capture on the
+        // sink window — re-acquiring here is what made the two paths fight
+        // (arm → lock-loss → re-lock → overlap → double mouse speed).
+        if (
+          !this.dependencies.isInputReady()
+          || !this.shouldSendSyntheticEscapeOnPointerLockLoss()
+          || isPointerLockActive()
+          || this.dependencies.isNativeStreamerInputOwned()
+        ) {
           return;
         }
 
@@ -1384,6 +1394,14 @@ export class DomInputCaptureController {
 
       // Pointer lock was lost
       if (!this.dependencies.isInputReady()) return;
+
+      // The native streamer owns RawInput capture on the stacked sink window:
+      // the lock was dropped because the sink took over (not by the user). Do
+      // not synthesize Escape and do not re-lock — the sink feeds the game
+      // directly and the retention timer is gated on the same flag.
+      if (this.dependencies.isNativeStreamerInputOwned()) {
+        return;
+      }
 
       if (this.consumeSyntheticEscapeSuppression()) {
         this.releasePressedKeys("pointer lock intentionally released");
