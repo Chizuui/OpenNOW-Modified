@@ -602,12 +602,15 @@ internal fun restampProtocolV3OuterTimestamp(packet: ByteArray, nowUs: Long = ti
 }
 
 /**
- * WebRTC's low-latency AudioTrack path can race teardown and dereference a released AudioTrack.
- * Stable buffering is preferable to a process crash on both handheld and TV devices.
+ * Low-latency AudioTrack is enabled on handheld/tablet devices for minimal audio delay. TV
+ * devices keep the stable buffering path: some Android TV builds expose a low-latency AudioTrack
+ * that does not actually reduce latency, and the aggressive buffer it requests can cause audio
+ * dropouts. The WebRTC low-latency teardown race that previously forced this off for all devices
+ * is now safe because teardown runs strictly ordered on the single-threaded lifecycle executor
+ * (peer connection close, factory dispose, audio device module release), so playout stops before
+ * the module is released.
  */
-internal fun shouldUseLowLatencyStreamAudio(
-    @Suppress("UNUSED_PARAMETER") androidTvProfile: Boolean,
-): Boolean = false
+internal fun shouldUseLowLatencyStreamAudio(androidTvProfile: Boolean): Boolean = !androidTvProfile
 
 internal fun shouldRunControllerMouseLoop(
     controllerMouseAssistActive: Boolean,
