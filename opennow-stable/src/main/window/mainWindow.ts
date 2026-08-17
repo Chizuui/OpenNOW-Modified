@@ -139,6 +139,11 @@ export async function createMainWindow(
     },
   });
   deps.setMainWindow(window);
+  // Electron's BrowserWindow option covers the initial renderer setup, while
+  // this explicit call also protects sessions after focus/visibility changes
+  // (Alt-Tab, window occlusion, or screen sharing). It is platform-neutral and
+  // does not select a decoder or GPU backend.
+  window.webContents.setBackgroundThrottling(false);
 
   const emitMaximizeState = (maximized: boolean): void => {
     if (!window.isDestroyed()) {

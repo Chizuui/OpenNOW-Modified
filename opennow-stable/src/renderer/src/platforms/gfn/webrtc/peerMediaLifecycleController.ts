@@ -9,6 +9,7 @@ export class PeerMediaLifecycleController {
   private readonly videoStream = new MediaStream();
   private readonly audioStream = new MediaStream();
   private outputVolume = 1;
+  private videoPlaybackRecoveryCleanup: (() => void) | null = null;
 
   constructor(private readonly dependencies: PeerMediaLifecycleDependencies) {
     dependencies.videoElement.srcObject = this.videoStream;
@@ -30,6 +31,34 @@ export class PeerMediaLifecycleController {
     if (track.kind === "video") {
       this.replaceTrackInStream(this.videoStream, track);
       const video = this.dependencies.videoElement;
+      this.videoPlaybackRecoveryCleanup?.();
+      const recoverPlayback = (): void => {
+        // Chromium can leave a MediaStream video element paused after an
+        // occlusion/focus transition even though inbound-rtp and decoded-frame
+        // counters continue advancing. Re-assert playback only when the page
+        // is visible/focused; this is safe on Windows, Linux, and macOS and
+        // does not alter codec or decoder selection.
+        if (document.visibilityState === "hidden" || !video.paused) {
+          return;
+        }
+        void video.play().catch(() => {
+          // Autoplay policy may reject until the next user gesture; the next
+          // focus/visibility event will retry without interrupting the stream.
+        });
+      };
+      const onVisibilityChange = (): void => {
+        if (document.visibilityState === "visible") recoverPlayback();
+      };
+      const onFocus = (): void => recoverPlayback();
+      const onPageShow = (): void => recoverPlayback();
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      window.addEventListener("focus", onFocus);
+      window.addEventListener("pageshow", onPageShow);
+      this.videoPlaybackRecoveryCleanup = () => {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        window.removeEventListener("focus", onFocus);
+        window.removeEventListener("pageshow", onPageShow);
+      };
       const frameCallback = () => {
         this.dependencies.onRenderFrame();
         if (this.videoStream.active) {
@@ -111,6 +140,8 @@ export class PeerMediaLifecycleController {
   }
 
   reset(): void {
+    this.videoPlaybackRecoveryCleanup?.();
+    this.videoPlaybackRecoveryCleanup = null;
     this.cleanupAudioRouting();
     this.clearTracks();
   }
@@ -120,6 +151,8 @@ export class PeerMediaLifecycleController {
   }
 
   clearTracks(): void {
+    this.videoPlaybackRecoveryCleanup?.();
+    this.videoPlaybackRecoveryCleanup = null;
     for (const track of this.videoStream.getTracks()) {
       this.videoStream.removeTrack(track);
     }

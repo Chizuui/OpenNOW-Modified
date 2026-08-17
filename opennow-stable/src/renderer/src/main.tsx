@@ -12,7 +12,11 @@ import "./styles.css";
 initLogCapture("renderer");
 void initializeLocale();
 
-if (import.meta.env.DEV) {
+// React Scan instruments every React render and is useful during UI work, but
+// it adds measurable renderer/compositor pressure while a WebRTC stream is
+// being captured by Discord or the window is being occluded. Keep it opt-in so
+// development streaming has the same lightweight render path as production.
+if (import.meta.env.DEV && import.meta.env.VITE_ENABLE_REACT_SCAN === "1") {
   scan();
 }
 
