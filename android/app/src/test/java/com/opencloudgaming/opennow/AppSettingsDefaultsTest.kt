@@ -249,6 +249,17 @@ class AppSettingsDefaultsTest {
     }
 
     @Test
+    fun streamProfileLockIsOptInAndSurvivesSettingsSerialization() {
+        val defaulted = OpenNowJson.decodeFromString<AppSettings>("{}")
+        val optedIn = OpenNowJson.decodeFromString<AppSettings>(
+            """{"lockStreamProfile":true}""",
+        )
+
+        assertFalse(defaulted.lockStreamProfile)
+        assertTrue(optedIn.lockStreamProfile)
+    }
+
+    @Test
     fun phonePresentationKeepsExactGeometryByDefaultAndRunsOnce() {
         val migrated = AppSettings().withCurrentStreamPresentationDefaults()
 

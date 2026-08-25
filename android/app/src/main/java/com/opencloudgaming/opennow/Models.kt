@@ -586,6 +586,15 @@ data class AppSettings(
     val allowEscapeToExitFullscreen: Boolean = false,
     val nativeLowLatencyDecoder: Boolean = false,
     /**
+     * Keeps resolution, FPS, and bitrate exactly as configured for the whole session.
+     *
+     * Off (default) preserves today's behavior: sustained packet loss or decoder overload restarts
+     * the transport once at a stable 30 FPS profile. On, the client never rewrites the stream
+     * profile mid-session — an unstable link shows stutter instead of a silent quality drop. Fatal
+     * decoder recovery (the safe H264 fallback) still applies so a broken codec can still recover.
+     */
+    val lockStreamProfile: Boolean = false,
+    /**
      * Highest [SETUP_FLOW_VERSION] whose first-run setup this install has been through. Versioned
      * rather than a boolean so a later release that adds a step can show the flow again, and so
      * "run setup again" is expressible as resetting the field.

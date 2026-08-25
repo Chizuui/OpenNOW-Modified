@@ -337,6 +337,33 @@ class SdpToolsTest {
         )
     }
 
+    @Test
+    fun nvstSdpKeepsServerFpsAdjustmentOnUnlockedProfiles() {
+        val nvst = buildNvstSdp(StreamSettings(fps = 60))
+
+        assertTrue(nvst.contains("a=vqos.adjustStreamingFpsDuringOutOfFocus:1"))
+        assertFalse(nvst.contains("a=vqos.adjustStreamingFpsDuringOutOfFocus:0"))
+    }
+
+    @Test
+    fun nvstSdpDisablesServerFpsAdjustmentForLockedProfilesOnly() {
+        val unlocked = buildNvstSdp(StreamSettings(fps = 60))
+        val locked = SdpTools.buildNvstSdp(
+            offerSdp = "a=ri.partialReliableThresholdMs:42",
+            settings = StreamSettings(fps = 60),
+            localAnswer = """
+                a=ice-ufrag:testUfrag
+                a=ice-pwd:testPassword
+                a=fingerprint:sha-256 11:22:33
+            """.trimIndent(),
+            lockStreamProfile = true,
+        )
+
+        assertTrue(unlocked.contains("a=vqos.adjustStreamingFpsDuringOutOfFocus:1"))
+        assertTrue(locked.contains("a=vqos.adjustStreamingFpsDuringOutOfFocus:0"))
+    assertFalse(locked.contains("a=vqos.adjustStreamingFpsDuringOutOfFocus:1"))
+    }
+
     private fun buildNvstSdp(settings: StreamSettings): String =
         SdpTools.buildNvstSdp(
             offerSdp = "a=ri.partialReliableThresholdMs:42",

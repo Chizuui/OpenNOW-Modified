@@ -498,6 +498,8 @@
     <string name="settings_fps_desc">Frames per second controls motion smoothness. Higher FPS gives the decoder less time per frame and can cause stutter on slower hardware.</string>
     <string name="settings_bitrate">Bitrate Mbps</string>
     <string name="settings_bitrate_desc">The maximum video data rate. Higher bitrate can improve detail, but only when the connection has enough stable capacity; it does not increase FPS.</string>
+    <string name="settings_lock_stream_profile">Lock stream profile</string>
+    <string name="settings_lock_stream_profile_desc">Keeps this resolution, FPS, and bitrate for the whole session. The stream no longer restarts at 30 FPS when the network or decoder struggles — expect stutter on a bad connection instead of a silent quality drop.</string>
     <string name="settings_codec">Codec</string>
     <string name="settings_codec_desc">H.264 is the most compatible. H.265 uses bandwidth more efficiently and is preferred for high resolution when a verified hardware decoder exists. AV1 is 8-bit here and is used only on devices with a compatible hardware path.</string>
     <string name="settings_color">Color</string>

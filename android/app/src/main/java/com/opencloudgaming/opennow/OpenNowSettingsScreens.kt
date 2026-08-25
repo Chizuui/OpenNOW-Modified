@@ -848,6 +848,13 @@ private fun SettingsContent(
                 ) {
                     viewModel.updateStreamSettings { s -> s.copy(maxBitrateMbps = it.roundToInt()) }
                 }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_lock_stream_profile),
+                    checked = settings.lockStreamProfile,
+                    description = stringResource(R.string.settings_lock_stream_profile_desc),
+                ) { locked ->
+                    viewModel.updateSettings(settings.copy(lockStreamProfile = locked))
+                }
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Stream, searchQuery, stringResource(R.string.settings_section_stream_video), "stream", "video", "codec", "color", "hdr", "sharpening", "native streamer", "low latency", "native decoder", "decoder") {
                 val comingSoonLabel = stringResource(R.string.option_coming_soon)

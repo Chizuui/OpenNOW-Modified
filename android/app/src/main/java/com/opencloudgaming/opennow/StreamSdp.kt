@@ -296,7 +296,12 @@ object SdpTools {
             (partiallyReliableHidMask and inputMask) != 0
     }
 
-    fun buildNvstSdp(offerSdp: String, settings: StreamSettings, localAnswer: String): String {
+    fun buildNvstSdp(
+        offerSdp: String,
+        settings: StreamSettings,
+        localAnswer: String,
+        lockStreamProfile: Boolean = false,
+    ): String {
         val (width, height) = streamResolutionPixels(settings)
         val ufrag = Regex("a=ice-ufrag:([^\\r\\n]+)").find(localAnswer)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pwd = Regex("a=ice-pwd:([^\\r\\n]+)").find(localAnswer)?.groupValues?.getOrNull(1)?.trim().orEmpty()
@@ -410,7 +415,9 @@ object SdpTools {
                 add("a=vqos.rtcPreemptiveIdrSettings.minBurstNackSize:65535")
                 add("a=vqos.rtcPreemptiveIdrSettings.minNackPacketCaptureAgeMs:65535")
             }
-            add("a=vqos.adjustStreamingFpsDuringOutOfFocus:0")
+            // A locked profile also asks the server to keep its capture FPS steady when the
+            // client app loses focus; unlocked sessions keep the provider's power-friendly drop.
+            add("a=vqos.adjustStreamingFpsDuringOutOfFocus:${if (lockStreamProfile) 0 else 1}")
             add("a=vqos.resControl.cpmRtc.ignoreOutOfFocusWindowState:1")
             add("a=vqos.resControl.perfHistory.rtcIgnoreOutOfFocusWindowState:1")
             add("a=vqos.resControl.cpmRtc.featureMask:0")
