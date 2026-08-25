@@ -609,6 +609,7 @@ internal fun StreamScreen(
                         MicrophoneMode.Disabled
                     },
                 ),
+                lockStreamProfile = state.settings.lockStreamProfile,
             )
         }
     }
