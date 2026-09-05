@@ -306,7 +306,6 @@ class NativeStreamClient(
     var liveBitrateLimitKbps: Int? = null
     private var videoSafeFallbackApplied = false
     private var stableMediaStallRestarts = 0
-    private var runtimeQualityFallbackApplied = false
     /**
      * When set, the runtime quality watchdog never rewrites [settings]: sustained packet loss or
      * decoder overload no longer restarts the transport at a 30 FPS profile. Fatal decoder
@@ -3219,50 +3218,6 @@ class NativeStreamClient(
                 restartTransport("Media stalled for ${action.stalledMs / 1000}s", videoFailure = true)
             }
         }
-    }
-
-    private fun requestRuntimeQualityFallback(
-        reason: RuntimeQualityRecoveryReason,
-        stats: StreamRuntimeStats,
-    ): Boolean {
-        if (lockStreamProfile) {
-            recordStreamDiagnostic(
-                "runtime quality recovery skipped lockStreamProfile=true reason=$reason " +
-                    "loss=${stats.packetLossPct} receivedFps=${stats.receivedFps} decodedFps=${stats.decodedFps}",
-            )
-            return false
-        }
-        if (runtimeQualityFallbackApplied) return false
-        runtimeQualityFallbackApplied = true
-        val currentSettings = settings
-        val fallback = currentSettings.runtimeQualityRecoveryProfile(reason)
-        val diagnosticReason = when (reason) {
-            RuntimeQualityRecoveryReason.NetworkDegraded -> "sustained network degradation"
-            RuntimeQualityRecoveryReason.DecoderOverloaded -> "sustained decoder overload"
-        }
-        NativeInputDiagnostics.add(
-            "$diagnosticReason recovery loss=${stats.packetLossPct} ping=${stats.pingMs} " +
-                "receivedFps=${stats.receivedFps} decodedFps=${stats.decodedFps} decodeMs=${stats.decodeMs} " +
-                "codec=${fallback.codec} resolution=${fallback.resolution} fps=${fallback.fps} bitrate=${fallback.maxBitrateMbps}",
-        )
-        if (fallback == currentSettings) {
-            recordStreamDiagnostic("$diagnosticReason already at recovery profile; transport unchanged")
-            return false
-        }
-        if (fallback.codec == VideoCodec.H264) videoSafeFallbackApplied = true
-        liveBitrateLimitKbps = fallback.maxBitrateMbps * 1_000
-        val message = when (reason) {
-            RuntimeQualityRecoveryReason.NetworkDegraded ->
-                "Packet loss stayed high; reconnecting this stream at 30 FPS with a lower bitrate"
-            RuntimeQualityRecoveryReason.DecoderOverloaded ->
-                "The decoder could not keep up with received frames; reconnecting this stream with a 30 FPS H264 profile"
-        }
-        emitVideoTransportFallbackApplied(message, fallback)
-        return restartTransportWithProfile(
-            updatedSettings = fallback,
-            diagnosticReason = diagnosticReason,
-            stateMessage = "Reconnecting stream with stable profile",
-        )
     }
 
     private fun updateTransportRecoveryProgress(progressed: Boolean) {
