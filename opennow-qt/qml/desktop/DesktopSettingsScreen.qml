@@ -800,6 +800,18 @@ FocusScope {
                 DesktopSettingsButton { text: ShellStore.signedIn ? qsTr("Sign out") : qsTr("Sign in"); onClicked: ShellStore.signedIn ? ShellStore.logout() : AppController.navigate("sign-in") }
             }
             DesktopSettingsRow {
+                width: parent.width; paperStyle: true; glyph: "globe"
+                title: qsTr("ChizuiLogin provider")
+                description: qsTr("Use the custom ChizuiLogin OAuth provider")
+                showDivider: false
+                DesktopSettingsField {
+                    width: 280
+                    text: String(ShellStore.settings.chizuiLoginUrl || "https://gfn.chizui.dev")
+                    Accessible.name: qsTr("ChizuiLogin provider URL")
+                    onEditingFinished: ShellStore.setSetting("chizuiLoginUrl", text)
+                }
+            }
+            DesktopSettingsRow {
                 width: parent.width; paperStyle: true; glyph: "crown"; title: root.liveTierBadge() || qsTr("Membership unavailable")
                 description: root.planChips().join(" · "); expandable: true; expanded: root.advancedOpen
                 onExpansionRequested: root.advancedOpen = !root.advancedOpen

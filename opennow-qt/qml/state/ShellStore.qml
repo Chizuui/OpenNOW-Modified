@@ -12,6 +12,7 @@ QtObject {
     property var providers: []
     property var authSession: null
     property var authChallenge: null
+    property var chizuiAttempt: null
     property string authState: "idle"
     property string authMessage: ""
     property var catalogGames: []
@@ -147,6 +148,9 @@ QtObject {
     property string deviceStartRequestId: ""
     property string devicePollRequestId: ""
     property string deviceCompleteRequestId: ""
+    property string chizuiStartRequestId: ""
+    property string chizuiPollRequestId: ""
+    property string chizuiCompleteRequestId: ""
     property string logoutRequestId: ""
     property string logoutAllRequestId: ""
     property string subscriptionRequestId: ""
@@ -255,6 +259,13 @@ QtObject {
         onTriggered: root.pollDeviceLogin()
     }
 
+    property Timer chizuiPollTimer: Timer {
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: root.pollChizuiLogin()
+    }
+
     property Timer streamPollTimer: Timer {
         interval: 1500
         repeat: true
@@ -332,6 +343,27 @@ QtObject {
         if (!ready)
             return
         settingsRequestId = CoreClient.request("settings.get", {})
+    }
+
+    function ensureChizuiProvider() {
+        const current = providers || []
+        for (let index = 0; index < current.length; ++index) {
+            if (current[index].idpId === "chizui") {
+                const updated = current.slice()
+                updated[index] = Object.assign({}, updated[index], {
+                    streamingServiceUrl: String(settings.chizuiLoginUrl || "https://gfn.chizui.dev")
+                })
+                providers = updated
+                return
+            }
+        }
+        providers = current.concat([{
+            idpId: "chizui",
+            code: "CHIZUI",
+            displayName: "ChizuiLogin",
+            streamingServiceUrl: String(settings.chizuiLoginUrl || "https://gfn.chizui.dev"),
+            priority: 999
+        }])
     }
 
     function initializeServices() {
@@ -2071,6 +2103,10 @@ QtObject {
     }
 
     function startDeviceLogin(providerIdpId, staySignedIn) {
+        if (providerIdpId === "chizui") {
+            startChizuiLogin(staySignedIn)
+            return
+        }
         if (!ready || deviceStartRequestId !== "")
             return
         pendingStaySignedIn = staySignedIn !== false
@@ -2080,6 +2116,45 @@ QtObject {
         authState = "starting"
         const params = providerIdpId ? { providerIdpId: providerIdpId } : {}
         deviceStartRequestId = CoreClient.request("auth.device.start", params, 30000)
+    }
+
+    function startChizuiLogin(staySignedIn) {
+        if (!ready || chizuiStartRequestId !== "" || chizuiAttempt)
+            return
+        const serverUrl = String(settings.chizuiLoginUrl || "https://gfn.chizui.dev").trim()
+        if (!serverUrl) {
+            authState = "error"
+            authMessage = qsTr("ChizuiLogin URL is empty")
+            return
+        }
+        pendingStaySignedIn = staySignedIn !== false
+        authMessage = qsTr("Preparing ChizuiLogin…")
+        authState = "starting"
+        chizuiStartRequestId = CoreClient.request("auth.chizui.start", {
+            serverUrl: serverUrl,
+            promptSelectAccount: true
+        }, 30000)
+    }
+
+    function pollChizuiLogin() {
+        if (!ready || !chizuiAttempt || chizuiPollRequestId !== "")
+            return
+        chizuiPollRequestId = CoreClient.request("auth.chizui.poll", {
+            attemptId: chizuiAttempt.attemptId
+        }, 30000)
+    }
+
+    function cancelChizuiLogin() {
+        chizuiPollTimer.stop()
+        if (chizuiPollRequestId !== "") {
+            CoreClient.cancel(chizuiPollRequestId)
+            chizuiPollRequestId = ""
+        }
+        if (chizuiAttempt && ready)
+            CoreClient.request("auth.chizui.cancel", {attemptId: chizuiAttempt.attemptId})
+        chizuiAttempt = null
+        if (!signedIn)
+            authState = "idle"
     }
 
     function pollDeviceLogin() {
@@ -2092,6 +2167,10 @@ QtObject {
     }
 
     function cancelDeviceLogin() {
+        if (chizuiAttempt) {
+            cancelChizuiLogin()
+            return
+        }
         devicePollTimer.stop()
         if (devicePollRequestId !== "") {
             CoreClient.cancel(devicePollRequestId)
@@ -2458,6 +2537,7 @@ QtObject {
                 return
             } else if (requestId === root.settingsRequestId && result.settings) {
                 root.settings = Object.assign({}, result.settings, {microphoneMode: "disabled"})
+                root.ensureChizuiProvider()
                 if (result.settings.microphoneMode !== "disabled")
                     root.setSetting("microphoneMode", "disabled")
                 root.consoleSurfaceConfirmedValue = Boolean(result.settings.launchInConsoleMode)
@@ -2486,6 +2566,7 @@ QtObject {
                 }
             } else if (requestId === root.providersRequestId) {
                 root.providers = result.providers || []
+                root.ensureChizuiProvider()
                 root.providersRequestId = ""
             } else if (requestId === root.authSessionRequestId) {
                 root.authSession = result.session || null
@@ -2521,6 +2602,49 @@ QtObject {
                 else if (result.section === "filters") root.storeFilterGroups = result.items || []
                 root.storePresentationIndex += 1
                 root.requestStorePresentation()
+            } else if (requestId === root.chizuiStartRequestId) {
+                root.chizuiStartRequestId = ""
+                root.chizuiAttempt = result
+                root.authState = "waiting"
+                root.authMessage = qsTr("Finish signing in on the ChizuiLogin page…")
+                if (!AppController.openExternalUrl(result.loginUrl || "")) {
+                    root.cancelChizuiLogin()
+                    root.authState = "error"
+                    root.authMessage = qsTr("Could not open the ChizuiLogin page")
+                } else {
+                    root.chizuiPollTimer.start()
+                }
+            } else if (requestId === root.chizuiPollRequestId) {
+                root.chizuiPollRequestId = ""
+                const status = result.status || "error"
+                if (status === "authorized") {
+                    root.chizuiPollTimer.stop()
+                    root.authState = "completing"
+                    root.authMessage = qsTr("Signed in. Loading your profile…")
+                    root.chizuiCompleteRequestId = CoreClient.request("auth.chizui.complete", {
+                        attemptId: root.chizuiAttempt.attemptId,
+                        staySignedIn: root.pendingStaySignedIn
+                    }, 30000)
+                } else if (status !== "pending") {
+                    root.chizuiPollTimer.stop()
+                    root.chizuiAttempt = null
+                    root.authState = "error"
+                    root.authMessage = result.error || qsTr("ChizuiLogin sign-in failed")
+                }
+            } else if (requestId === root.chizuiCompleteRequestId) {
+                root.chizuiCompleteRequestId = ""
+                root.chizuiAttempt = null
+                root.authSession = result.session || null
+                root.sessionPersistence = result.persistence || "memory-only"
+                root.authState = root.authSession ? "signed-in" : "error"
+                root.authMessage = root.authSession
+                    ? qsTr("Welcome, %1").arg(root.authSession.user.displayName)
+                    : qsTr("ChizuiLogin did not return a session")
+                if (root.authSession) {
+                    root.reloadCatalogForSession()
+                    root.refreshAccountServices()
+                    root.refreshRemoteSessions()
+                }
             } else if (requestId === root.deviceStartRequestId) {
                 root.authChallenge = result
                 root.authState = "waiting"
@@ -2910,6 +3034,16 @@ QtObject {
                 root.authState = root.authSession ? "signed-in" : "idle"
                 if (code !== "cancelled")
                     root.authMessage = message
+            } else if (requestId === root.chizuiStartRequestId
+                       || requestId === root.chizuiPollRequestId
+                       || requestId === root.chizuiCompleteRequestId) {
+                root.chizuiStartRequestId = ""
+                root.chizuiPollRequestId = ""
+                root.chizuiCompleteRequestId = ""
+                root.chizuiPollTimer.stop()
+                root.chizuiAttempt = null
+                root.authState = code === "cancelled" ? "idle" : "error"
+                root.authMessage = code === "cancelled" ? "" : message
             } else if (requestId === root.deviceStartRequestId
                        || requestId === root.devicePollRequestId
                        || requestId === root.deviceCompleteRequestId) {

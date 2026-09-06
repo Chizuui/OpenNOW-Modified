@@ -268,7 +268,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 ));
             }
             Ok((
-                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v5", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
+                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.chizuiLogin", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v5", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
                 None,
             ))
         }
@@ -344,6 +344,26 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "auth.device.cancel" => core
             .gfn
             .cancel_device_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
+        "auth.chizui.start" => core
+            .gfn
+            .start_chizui_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
+        "auth.chizui.poll" => core
+            .gfn
+            .poll_chizui_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
+        "auth.chizui.complete" => core
+            .gfn
+            .complete_chizui_login(params)
+            .map(|value| (value.clone(), Some(("auth.session.changed", value))))
+            .map_err(gfn_error),
+        "auth.chizui.cancel" => core
+            .gfn
+            .cancel_chizui_login(params)
             .map(|value| (value, None))
             .map_err(gfn_error),
         "auth.session.get" => core

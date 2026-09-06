@@ -422,7 +422,8 @@ FocusScope {
                             anchors.verticalCenter: parent.verticalCenter
                             spacing: 7
                             Text {
-                                text: root.challenge ? String(root.challenge.userCode || "").toUpperCase() : qsTr("CREATING SECURE CODE…")
+                                text: root.challenge ? String(root.challenge.userCode || "").toUpperCase()
+                                    : ShellStore.chizuiAttempt ? qsTr("BROWSER SIGN-IN") : qsTr("CREATING SECURE CODE…")
                                 color: DesktopTokens.text
                                 font.family: DesktopTokens.monoFont
                                 font.pixelSize: 20
@@ -430,7 +431,8 @@ FocusScope {
                                 font.letterSpacing: 2
                             }
                             Text {
-                                text: root.challenge ? String(root.challenge.verificationUri || "").replace(/^https?:\/\//, "") : qsTr("Contacting provider")
+                                text: root.challenge ? String(root.challenge.verificationUri || "").replace(/^https?:\/\//, "")
+                                    : ShellStore.chizuiAttempt ? qsTr("ChizuiLogin") : qsTr("Contacting provider")
                                 color: DesktopTokens.focus
                                 font.family: DesktopTokens.monoFont
                                 font.pixelSize: 10
@@ -466,7 +468,12 @@ FocusScope {
                         cornerRadius: 11
                         primary: !root.qrRequested
                         text: root.qrRequested ? qsTr("Open sign-in page") : qsTr("Open provider page")
-                        onClicked: if (root.challenge) Qt.openUrlExternally(root.challenge.verificationUriComplete || root.challenge.verificationUri)
+                        onClicked: {
+                            if (root.challenge)
+                                AppController.openExternalUrl(root.challenge.verificationUriComplete || root.challenge.verificationUri)
+                            else if (ShellStore.chizuiAttempt)
+                                AppController.openExternalUrl(ShellStore.chizuiAttempt.loginUrl || "")
+                        }
                     }
                     DesktopButton {
                         width: parent.width
