@@ -475,9 +475,21 @@ pub fn prepare_owned_nvst(
     let setup = client.request("SETUP", &video_setup, &setup_headers, "")?;
     ensure_rtsp_ok("SETUP", &setup)?;
     let transport = header_value(&setup, "transport").unwrap_or_default();
+    let described_server_transport = sdp_attribute(&describe.body, "general.serverTransport");
+    opennow_streamer_protocol::log::log_line(
+        "INFO",
+        "nvst",
+        &format!(
+            "video peer metadata transport_present={} transport_source_present={} transport_server_port_present={} sdp_server_transport_present={}",
+            !transport.is_empty(),
+            transport_field_present(transport, "source"),
+            transport_field_present(transport, "xgsserverport"),
+            described_server_transport.is_some(),
+        ),
+    );
     let (video_peer_ip, video_peer_port) = parse_video_peer(transport)
         .or_else(|| {
-            sdp_attribute(&describe.body, "general.serverTransport")
+            described_server_transport
                 .as_deref()
                 .and_then(parse_server_transport)
         })
@@ -1062,13 +1074,29 @@ fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
         let Some((name, value)) = part.trim().split_once('=') else {
             continue;
         };
-        if name.eq_ignore_ascii_case("source") {
+        let normalized_name = name
+            .bytes()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if normalized_name == b"source" {
             ip = Some(value.trim().to_owned());
-        } else if name.eq_ignore_ascii_case("X-GS-ServerPort") {
+        } else if normalized_name == b"xgsserverport" {
             port = value.trim().split('-').next()?.parse().ok();
         }
     }
     Some((ip?, port?))
+}
+
+fn transport_field_present(transport: &str, expected: &str) -> bool {
+    transport.split([';', ',']).any(|part| {
+        part.split_once('=').is_some_and(|(name, _)| {
+            name.bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .map(|byte| byte.to_ascii_lowercase())
+                .eq(expected.bytes())
+        })
+    })
 }
 
 fn parse_server_transport(value: &str) -> Option<(String, u16)> {
@@ -1206,6 +1234,18 @@ mod tests {
             parse_server_transport("[2001:db8::20]:5004"),
             Some(("2001:db8::20".to_owned(), 5004))
         );
+    }
+
+    #[test]
+    fn video_peer_parser_accepts_header_name_variants() {
+        assert_eq!(
+            parse_video_peer("unicast;X-GS-Server-Port=5004-5005;source=192.0.2.4"),
+            Some(("192.0.2.4".to_owned(), 5004))
+        );
+        assert!(transport_field_present(
+            "unicast; X-GS-Server-Port=5004",
+            "xgsserverport"
+        ));
     }
 
     #[test]
