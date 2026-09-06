@@ -1142,7 +1142,7 @@ fn set_read_timeout(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, timeout: 
         MaybeTlsStream::Plain(stream) => {
             let _ = stream.set_read_timeout(Some(timeout));
         }
-        MaybeTlsStream::Rustls(stream) => {
+        MaybeTlsStream::NativeTls(stream) => {
             let _ = stream.get_mut().set_read_timeout(Some(timeout));
         }
         _ => {}
