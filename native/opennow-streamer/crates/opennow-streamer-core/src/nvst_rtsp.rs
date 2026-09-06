@@ -73,10 +73,7 @@ impl RtspClient {
         } else {
             host.to_owned()
         };
-        // Bifrost's NVST endpoint expects the WebSocket upgrade on `/`.
-        // `/rtsp` can still return HTTP 101/RTSP 200 responses, but does not
-        // attach the video relay metadata to SETUP on some seats.
-        let wss = format!("wss://{authority_host}:{port}/");
+        let wss = format!("wss://{authority_host}:{port}/rtsp");
         let mut request = wss
             .into_client_request()
             .map_err(|error| NvstRtspError::new("nvst-connect-failed", error.to_string()))?;
