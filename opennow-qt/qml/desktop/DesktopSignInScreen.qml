@@ -7,6 +7,7 @@ import OpenNOW
 FocusScope {
     id: root
     property bool providerOpen: false
+    property var selectedProvider: null
     property bool qrRequested: false
     property bool staySignedIn: true
     property double clockMs: Date.now()
@@ -324,6 +325,7 @@ FocusScope {
                     spacing: 10
                     visible: !root.waiting && !root.failed
                     DesktopButton {
+                        visible: !root.selectedProvider
                         width: parent.width
                         height: 46
                         cornerRadius: 11
@@ -336,6 +338,7 @@ FocusScope {
                         onClicked: ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn)
                     }
                     DesktopButton {
+                        visible: !root.selectedProvider
                         width: parent.width
                         height: 42
                         cornerRadius: 11
@@ -346,6 +349,29 @@ FocusScope {
                         text: qsTr("Sign in with a QR code")
                         enabled: ShellStore.ready
                         onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) }
+                    }
+                    DesktopButton {
+                        visible: !!root.selectedProvider
+                        width: parent.width
+                        height: 46
+                        cornerRadius: 11
+                        primary: true
+                        glyph: "desktop-shield.svg"
+                        glyphSize: 16
+                        font.pixelSize: 14
+                        text: qsTr("Login with ChizuiLogin")
+                        enabled: ShellStore.ready
+                        onClicked: {
+                            ShellStore.startChizuiLogin(root.staySignedIn)
+                        }
+                    }
+                    DesktopButton {
+                        visible: !!root.selectedProvider
+                        width: parent.width
+                        height: 40
+                        cornerRadius: 11
+                        text: qsTr("Change provider")
+                        onClicked: root.selectedProvider = null
                     }
                 }
 
@@ -517,7 +543,13 @@ FocusScope {
                             cornerRadius: 11
                             primary: true
                             text: qsTr("Try again")
-                            onClicked: { ShellStore.authState = "idle"; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) }
+                            onClicked: {
+                                ShellStore.authState = "idle"
+                                if (root.selectedProvider && root.selectedProvider.idpId === "chizui")
+                                    ShellStore.startChizuiLogin(root.staySignedIn)
+                                else
+                                    ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn)
+                            }
                         }
                         DesktopButton {
                             width: 179
@@ -577,7 +609,13 @@ FocusScope {
                             Text { text: modelData.displayName || qsTr("Provider"); color: DesktopTokens.textHigh; font.family: DesktopTokens.bodyFont; font.pixelSize: 12; font.weight: Font.Bold }
                             Text { text: String(modelData.region || "GLOBAL").toUpperCase(); color: DesktopTokens.textFaint; font.family: DesktopTokens.monoFont; font.pixelSize: 9 }
                         }
-                        onClicked: { root.providerOpen = false; ShellStore.startDeviceLogin(modelData.idpId || "", root.staySignedIn) }
+                        onClicked: {
+                            root.providerOpen = false
+                            if (modelData.idpId === "chizui")
+                                root.selectedProvider = modelData
+                            else
+                                ShellStore.startDeviceLogin(modelData.idpId || "", root.staySignedIn)
+                        }
                     }
                 }
                 opacity: providerMotion.progress

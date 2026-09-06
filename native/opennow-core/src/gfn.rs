@@ -241,6 +241,7 @@ pub struct LoginProvider {
     pub code: String,
     pub display_name: String,
     pub streaming_service_url: String,
+    #[serde(default)]
     pub priority: i64,
 }
 
@@ -315,6 +316,7 @@ struct DeviceAttempt {
 struct ChizuiAttempt {
     server_url: String,
     listener: TcpListener,
+    callback_port: u16,
     expires_at: u64,
     code: Option<String>,
     pending_session: Option<AuthSession>,
@@ -736,6 +738,7 @@ impl GfnService {
                 ChizuiAttempt {
                     server_url,
                     listener,
+                    callback_port,
                     expires_at,
                     code: None,
                     pending_session: None,
@@ -812,7 +815,22 @@ impl GfnService {
                 .remove(&attempt_id);
             return Ok(json!({"status":"error", "error":error}));
         }
-        let jwt_token = code.strip_prefix("CHIZUI_").unwrap_or(&code).to_owned();
+        let callback_code = code.strip_prefix("CHIZUI_").unwrap_or(&code);
+        let callback_port = {
+            let state = self.state.lock().expect("GFN state poisoned");
+            state
+                .chizui_attempts
+                .get(&attempt_id)
+                .map(|attempt| attempt.callback_port)
+                .ok_or_else(|| ServiceError::invalid("ChizuiLogin is no longer active"))?
+        };
+        let jwt_token = if let Some(one_time_code) = callback_code.strip_prefix("ctc_") {
+            self.exchange_chizui_code(&server_url, one_time_code, callback_port)?
+        } else {
+            // Compatibility with the pre-exchange server that returned a
+            // directly usable JWT/session token in the callback.
+            callback_code.to_owned()
+        };
         let session = match self.fetch_chizui_session(&server_url, &jwt_token, None) {
             Ok(mut session) => {
                 session.chizui_server_url = Some(server_url);
@@ -1848,6 +1866,36 @@ impl GfnService {
             code: "upstream_error",
             message: "ChizuiLogin response did not contain a valid session".to_owned(),
         })
+    }
+
+    fn exchange_chizui_code(
+        &self,
+        server_url: &str,
+        code: &str,
+        callback_port: u16,
+    ) -> Result<String, ServiceError> {
+        let mut url = url::Url::parse(server_url)
+            .map_err(|_| ServiceError::invalid("ChizuiLogin URL is invalid"))?;
+        url.set_path("/api/auth/exchange");
+        let body = json!({"code": format!("ctc_{code}"), "callbackPort": callback_port});
+        let response = self
+            .client
+            .post(url)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|error| ServiceError::network("ChizuiLogin code exchange failed", error))?;
+        if !response.status().is_success() {
+            return Err(ServiceError::response(
+                "ChizuiLogin code exchange failed",
+                response,
+            ));
+        }
+        let payload = response.json::<Value>().map_err(|error| {
+            ServiceError::network("Invalid ChizuiLogin exchange response", error)
+        })?;
+        required_string(&payload, "token")
     }
 
     fn vpc_id(&self, session: &AuthSession, token: &str) -> String {
