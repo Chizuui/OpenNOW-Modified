@@ -472,9 +472,36 @@ pub fn prepare_owned_nvst(
     setup_headers.push(("Session", rtsp_session.clone()));
     setup_headers.push(("x-nv-ping", described_ping_version.to_string()));
     setup_headers.push(("Transport", String::new()));
-    let setup = client.request("SETUP", &video_setup, &setup_headers, "")?;
+    let mut setup = client.request("SETUP", &video_setup, &setup_headers, "")?;
     ensure_rtsp_ok("SETUP", &setup)?;
-    let transport = header_value(&setup, "transport").unwrap_or_default();
+    let mut transport = header_value(&setup, "transport")
+        .unwrap_or_default()
+        .to_owned();
+    if parse_video_peer(&transport).is_none() {
+        let mut retry_headers = setup_headers.clone();
+        if let Some((_, value)) = retry_headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Transport"))
+        {
+            *value = format!(
+                "unicast;X-GS-ClientPort={}-{}",
+                mjolnir_port,
+                mjolnir_port + 1
+            );
+        }
+        opennow_streamer_protocol::log::log_line(
+            "INFO",
+            "nvst",
+            "video peer absent after empty Transport SETUP; retrying with client UDP port",
+        );
+        let retry = client.request("SETUP", &video_setup, &retry_headers, "")?;
+        if retry.status == 200 {
+            setup = retry;
+            transport = header_value(&setup, "transport")
+                .unwrap_or_default()
+                .to_owned();
+        }
+    }
     let described_server_transport = sdp_attribute(&describe.body, "general.serverTransport");
     opennow_streamer_protocol::log::log_line(
         "INFO",
@@ -482,12 +509,12 @@ pub fn prepare_owned_nvst(
         &format!(
             "video peer metadata transport_present={} transport_source_present={} transport_server_port_present={} sdp_server_transport_present={}",
             !transport.is_empty(),
-            transport_field_present(transport, "source"),
-            transport_field_present(transport, "xgsserverport"),
+            transport_field_present(&transport, "source"),
+            transport_field_present(&transport, "xgsserverport"),
             described_server_transport.is_some(),
         ),
     );
-    let (video_peer_ip, video_peer_port) = parse_video_peer(transport)
+    let (video_peer_ip, video_peer_port) = parse_video_peer(&transport)
         .or_else(|| {
             described_server_transport
                 .as_deref()
