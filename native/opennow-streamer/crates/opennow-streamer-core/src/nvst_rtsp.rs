@@ -475,12 +475,18 @@ pub fn prepare_owned_nvst(
     let setup = client.request("SETUP", &video_setup, &setup_headers, "")?;
     ensure_rtsp_ok("SETUP", &setup)?;
     let transport = header_value(&setup, "transport").unwrap_or_default();
-    let (video_peer_ip, video_peer_port) = parse_video_peer(transport).ok_or_else(|| {
-        NvstRtspError::new(
-            "missing-video-peer",
-            "SETUP did not return the NVST video peer",
-        )
-    })?;
+    let (video_peer_ip, video_peer_port) = parse_video_peer(transport)
+        .or_else(|| {
+            sdp_attribute(&describe.body, "general.serverTransport")
+                .as_deref()
+                .and_then(parse_server_transport)
+        })
+        .ok_or_else(|| {
+            NvstRtspError::new(
+                "missing-video-peer",
+                "SETUP did not return the NVST video peer",
+            )
+        })?;
     let setup_ping_payload = header_value(&setup, "x-nv-ping-payload").map(ToOwned::to_owned);
     let ping_version = header_value(&setup, "x-nv-ping")
         .and_then(|value| value.parse::<u8>().ok())
@@ -1065,6 +1071,11 @@ fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
     Some((ip?, port?))
 }
 
+fn parse_server_transport(value: &str) -> Option<(String, u16)> {
+    let (ip, port) = value.trim().rsplit_once(':')?;
+    Some((ip.trim_matches(['[', ']']).to_owned(), port.parse().ok()?))
+}
+
 fn increment_hex(value: &str) -> Option<String> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -1183,6 +1194,18 @@ mod tests {
     fn installs_a_process_level_tls_crypto_provider() {
         ensure_tls_crypto_provider().expect("TLS provider");
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn server_transport_fallback_parses_sdp_peer() {
+        assert_eq!(
+            parse_server_transport("192.0.2.20:5004"),
+            Some(("192.0.2.20".to_owned(), 5004))
+        );
+        assert_eq!(
+            parse_server_transport("[2001:db8::20]:5004"),
+            Some(("2001:db8::20".to_owned(), 5004))
+        );
     }
 
     #[test]
