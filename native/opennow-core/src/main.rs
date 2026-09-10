@@ -353,6 +353,26 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             .cancel_device_login(params)
             .map(|value| (value, None))
             .map_err(gfn_error),
+        "auth.chizui.start" => core
+            .gfn
+            .start_chizui_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
+        "auth.chizui.poll" => core
+            .gfn
+            .poll_chizui_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
+        "auth.chizui.complete" => core
+            .gfn
+            .complete_chizui_login(params)
+            .map(|value| (value.clone(), Some(("auth.session.changed", value))))
+            .map_err(gfn_error),
+        "auth.chizui.cancel" => core
+            .gfn
+            .cancel_chizui_login(params)
+            .map(|value| (value, None))
+            .map_err(gfn_error),
         "auth.session.get" => core
             .gfn
             .session()

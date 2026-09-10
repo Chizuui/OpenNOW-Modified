@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
- 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -726,15 +725,21 @@ impl GfnService {
                 "ChizuiLogin URL must use HTTP or HTTPS",
             ));
         }
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| ServiceError::network("Could not bind ChizuiLogin callback", error))?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| ServiceError {
+            code: "network_error",
+            message: format!("Could not bind ChizuiLogin callback: {error}"),
+        })?;
         listener.set_nonblocking(true).map_err(|error| {
-            ServiceError::network("Could not prepare ChizuiLogin callback", error)
+            ServiceError {
+                code: "network_error",
+                message: format!("Could not prepare ChizuiLogin callback: {error}"),
+            }
         })?;
         let callback_port = listener
             .local_addr()
-            .map_err(|error| {
-                ServiceError::network("Could not read ChizuiLogin callback port", error)
+            .map_err(|error| ServiceError {
+                code: "network_error",
+                message: format!("Could not read ChizuiLogin callback port: {error}"),
             })?
             .port();
         let mut login_url = parsed;
@@ -2103,7 +2108,10 @@ impl GfnService {
                     }
                     return self.store_refreshed_session(refreshed);
                 }
-                Err(error) => errors.push(format!("chizui: {}", error.message)),
+                Err(error) => errors.push(ServiceError {
+                    code: error.code,
+                    message: format!("chizui: {}", error.message),
+                }),
             }
         }
         if let Some(client_token) = session.tokens.client_token.as_deref() {
