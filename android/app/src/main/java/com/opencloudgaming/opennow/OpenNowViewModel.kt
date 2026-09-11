@@ -1554,13 +1554,6 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                             page = defaultLaunchAppPage(),
                         )
                     }
-                    OpenNowAnalytics.capture(
-                        event = "user_logged_in_chizui",
-                        properties = mapOf(
-                            "provider" to session.provider.code,
-                            "membership_tier" to session.user.membershipTier,
-                        ),
-                    )
                     refreshAfterAuth(session)
                 }
                 .onFailure { error ->
