@@ -178,8 +178,9 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("ensure-windows-media-foundation.ps1", checks)
         cmake = (ROOT / "opennow-qt/cmake/Tests.cmake").read_text()
         targets = re.search(r"set\(OPENNOW_CI_UNIT_TEST_TARGETS\s+(.*?)\)", cmake, re.DOTALL)[1].split()
-        self.assertEqual(len(targets), 27)
-        self.assertEqual(len(set(targets)), 27)
+        self.assertEqual(len(targets), 28)
+        self.assertEqual(len(set(targets)), 28)
+        self.assertIn("opennow-applicationicons-tests", targets)
         self.assertIn("opennow-fsrupscaler-tests", targets)
         self.assertRegex(cmake, r'if\(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"\)\s+'
                          r'set_tests_properties\(opennow-frameinterpolator-tests opennow-fsrupscaler-tests\s+'
@@ -263,8 +264,7 @@ class CIWorkflowTest(unittest.TestCase):
             for runner in runners:
                 with self.subTest(workflow=workflow.name, runner=runner):
                     self.assertTrue(
-                        runner.startswith(("blacksmith-", "${{"))
-                        or runner == "[self-hosted, opennow-release-signer]",
+                        runner.startswith(("blacksmith-", "${{")),
                     )
 
     def test_rust_caches_survive_job_renames_and_later_test_failures(self):

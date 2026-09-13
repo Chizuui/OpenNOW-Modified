@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Numeric signed-candidate version (for example 1.0.0; use qt-ci for unsigned nightlies)
+        description: Numeric update-signed candidate version (for example 1.0.0)
         required: true
         type: string
       source_commit:
@@ -15,6 +15,14 @@ on:
         description: Base64 Ed25519 public key pinned into every build
         required: true
         type: string
+      windows_signing_mode:
+        description: Windows platform signing (Ed25519 update signing is always required)
+        required: true
+        type: choice
+        default: unsigned
+        options:
+          - unsigned
+          - authenticode
 
 concurrency:
   group: qt-release-candidate-${{ inputs.version }}
@@ -41,6 +49,7 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           UPDATE_PUBLIC_KEY: ${{ inputs.update_public_key }}
+          WINDOWS_SIGNING_MODE: ${{ inputs.windows_signing_mode }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -50,6 +59,10 @@ jobs:
             exit 1
           fi
           [[ $(printf '%s' "$UPDATE_PUBLIC_KEY" | base64 --decode | wc -c) -eq 32 ]]
+          case "$WINDOWS_SIGNING_MODE" in
+            unsigned|authenticode) ;;
+            *) echo "Invalid Windows signing mode" >&2; exit 1 ;;
+          esac
 
       - name: Resolve immutable source
         uses: actions/checkout@v4
@@ -391,6 +404,7 @@ jobs:
           cmake --build build/opennow-qt-release --config Release --parallel 8
 
       - name: Authenticode-sign application binaries
+        if: inputs.windows_signing_mode == 'authenticode'
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.OPENNOW_WINDOWS_SIGNING_PFX_BASE64 }}
@@ -398,6 +412,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           . ./opennow-qt/packaging/windows-release.ps1
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PFX_BASE64) -or
+              [string]::IsNullOrEmpty($env:WINDOWS_PFX_PASSWORD)) {
+            throw "Authenticode mode requires the Windows PFX and password secrets"
+          }
           $pfx = Join-Path $env:RUNNER_TEMP "opennow-signing.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
           $files = @(Get-OpenNowReleaseBinaries -Root build/opennow-qt-release/Release)
@@ -406,33 +424,57 @@ jobs:
             Invoke-OpenNowSignTool verify /pa /all $file.FullName
           }
 
-      - name: Create and sign MSI and portable ZIP
+      - name: Create MSI and portable ZIP
         shell: pwsh
-        env:
-          WINDOWS_PFX_BASE64: ${{ secrets.OPENNOW_WINDOWS_SIGNING_PFX_BASE64 }}
-          WINDOWS_PFX_PASSWORD: ${{ secrets.OPENNOW_WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
-          . ./opennow-qt/packaging/windows-release.ps1
           New-Item -ItemType Directory -Force build/release-artifacts | Out-Null
           cpack --config build/opennow-qt-release/CPackConfig.cmake -C Release -G WIX -B build/release-artifacts
           if ($LASTEXITCODE -ne 0) { throw "MSI packaging failed with exit code $LASTEXITCODE" }
           cpack --config build/opennow-qt-release/CPackConfig.cmake -C Release -G ZIP -B build/release-artifacts
           if ($LASTEXITCODE -ne 0) { throw "ZIP packaging failed with exit code $LASTEXITCODE" }
+
+      - name: Authenticode-sign MSI
+        if: inputs.windows_signing_mode == 'authenticode'
+        shell: pwsh
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.OPENNOW_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./opennow-qt/packaging/windows-release.ps1
           $pfx = Join-Path $env:RUNNER_TEMP "opennow-signing.pfx"
           $msi = Get-ChildItem build/release-artifacts -Filter *.msi
           if ($msi.Count -ne 1) { throw "Expected one MSI" }
           Invoke-OpenNowSignTool sign /f $pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
           Invoke-OpenNowSignTool verify /pa /all $msi.FullName
+
+      - name: Verify MSI and portable ZIP payloads
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_MODE: ${{ inputs.windows_signing_mode }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./opennow-qt/packaging/windows-release.ps1
+          if ($env:WINDOWS_SIGNING_MODE -notin @("unsigned", "authenticode")) {
+            throw "Invalid Windows signing mode"
+          }
+          $msi = Get-ChildItem build/release-artifacts -Filter *.msi
+          if ($msi.Count -ne 1) { throw "Expected one MSI" }
           $msiExpanded = Join-Path $env:RUNNER_TEMP "msi-expanded"
           $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/a `"$($msi.FullName)`" /qn TARGETDIR=`"$msiExpanded`""
           if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed" }
-          Assert-OpenNowSignedPackage -Root $msiExpanded -SignedRoot build/opennow-qt-release/Release
+          Assert-OpenNowPackagePayload -Root $msiExpanded -DeploymentRoot build/opennow-qt-release/Release
+          if ($env:WINDOWS_SIGNING_MODE -eq "authenticode") {
+            Assert-OpenNowSignedPackage -Root $msiExpanded -SignedRoot build/opennow-qt-release/Release
+          }
           $zip = Get-ChildItem build/release-artifacts -Filter *.zip
           if ($zip.Count -ne 1) { throw "Expected one portable ZIP" }
           $expanded = Join-Path $env:RUNNER_TEMP "portable"
           Expand-Archive $zip.FullName $expanded
-          Assert-OpenNowSignedPackage -Root $expanded -SignedRoot build/opennow-qt-release/Release
+          Assert-OpenNowPackagePayload -Root $expanded -DeploymentRoot build/opennow-qt-release/Release
+          if ($env:WINDOWS_SIGNING_MODE -eq "authenticode") {
+            Assert-OpenNowSignedPackage -Root $expanded -SignedRoot build/opennow-qt-release/Release
+          }
 
       - name: Record artifact checksums
         shell: pwsh
@@ -443,25 +485,239 @@ jobs:
             Set-Content build/release-artifacts/SHA256SUMS
 
       - name: Remove Windows signing certificate
-        if: always()
+        if: always() && inputs.windows_signing_mode == 'authenticode'
         shell: pwsh
         run: Remove-Item "$env:RUNNER_TEMP/opennow-signing.pfx" -Force -ErrorAction SilentlyContinue
 
       - uses: actions/upload-artifact@v4
         with:
-          name: opennow-qt-${{ inputs.version }}-windows-${{ matrix.arch }}-signed
+          name: opennow-qt-${{ inputs.version }}-windows-${{ matrix.arch }}-${{ inputs.windows_signing_mode }}
           path: |
             build/release-artifacts/*.msi
             build/release-artifacts/*.zip
             build/release-artifacts/SHA256SUMS
           if-no-files-found: error
 
+  macos:
+    name: macos-arm64
+    needs: preflight
+    runs-on: blacksmith-6vcpu-macos-15
+    timeout-minutes: 120
+    environment: qt-production-release
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia qtshadertools
+          cache: true
+          cache-key-prefix: qt-release-macos-arm64
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: qt-release-macos-arm64
+          cache-bin: false
+          workspaces: |
+            native/opennow-core -> target
+            native/opennow-streamer -> target
+            native/opennow-core -> ../../build/opennow-qt-release/rust-target
+            native/opennow-core -> ../../build/opennow-qt-release/update-helper-rust-target
+            native/opennow-streamer -> ../../build/opennow-qt-release/streamer-rust-target
+
+      - name: Cache Qt C++ compilation
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          key: qt-release-macos-arm64
+          max-size: 1G
+
+      - name: Build and cache SDL3
+        uses: ./.github/actions/sdl3
+        with:
+          version: ${{ env.SDL_VERSION }}
+          target-arch: arm64
+          parallel: 3
+
+      - name: Test macOS native and signing contracts
+        shell: bash
+        run: |
+          [[ "$(uname -m)" == arm64 ]]
+          python3 -m unittest discover -s opennow-qt/tests -p 'test_macos_*.py'
+          cargo test --manifest-path native/opennow-core/Cargo.toml --locked
+          cargo test --manifest-path native/opennow-streamer/Cargo.toml --locked \
+            -p opennow-streamer-platform-macos -p opennow-streamer-protocol -p opennow-streamer-ffi
+
+      - name: Configure and build Qt native release
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          UPDATE_PUBLIC_KEY: ${{ inputs.update_public_key }}
+        run: |
+          cmake -S opennow-qt -B build/opennow-qt-release \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DOPENNOW_BUILD_VERSION="$RELEASE_VERSION" \
+            -DOPENNOW_UPDATE_ED25519_PUBLIC_KEY="$UPDATE_PUBLIC_KEY" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/SDL-install"
+          cmake --build build/opennow-qt-release --parallel 3
+
+      - name: Test Qt shell and embedded runtime offscreen
+        shell: bash
+        run: |
+          ctest --test-dir build/opennow-qt-release --output-on-failure --parallel 2 --no-tests=error -LE interactive-desktop \
+            -R '^opennow-.*-tests$|^opennow-acceptance-verifier-help$|^qml-(desktop-route-(home|settings|stream)|fullscreen-.*stats-shortcut|desktop-stream-.*|streamer-event-contract)$'
+
+      - name: Sign and notarize deployed macOS app and final packages
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          OPENNOW_MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.OPENNOW_MACOS_DEVELOPER_ID_P12_BASE64 }}
+          OPENNOW_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.OPENNOW_MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          OPENNOW_MACOS_SIGN_IDENTITY: ${{ secrets.OPENNOW_MACOS_SIGN_IDENTITY }}
+          OPENNOW_APPLE_API_KEY_BASE64: ${{ secrets.OPENNOW_APPLE_API_KEY_BASE64 }}
+          OPENNOW_APPLE_API_KEY_ID: ${{ secrets.OPENNOW_APPLE_API_KEY_ID }}
+          OPENNOW_APPLE_API_ISSUER_ID: ${{ secrets.OPENNOW_APPLE_API_ISSUER_ID }}
+        run: |
+          python3 opennow-qt/packaging/macos_release.py \
+            --build build/opennow-qt-release --output build/release-artifacts --version "$RELEASE_VERSION"
+
+      - name: Test relocated bundle without development libraries
+        shell: bash
+        run: |
+          packages=(build/release-artifacts/OpenNOW-Qt-*-Darwin-arm64.zip)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          ditto -x -k "${packages[0]}" "$RUNNER_TEMP/zip-relocated"
+          zip_app=$(find "$RUNNER_TEMP/zip-relocated" -name OpenNOW.app -type d -print -quit)
+          [[ -n "$zip_app" ]]
+          dmgs=(build/release-artifacts/OpenNOW-Qt-*-Darwin-arm64.dmg)
+          [[ ${#dmgs[@]} -eq 1 && -f "${dmgs[0]}" ]]
+          hdiutil verify "${dmgs[0]}"
+          mount="$RUNNER_TEMP/opennow-dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/dmg-relocated"
+          hdiutil attach "${dmgs[0]}" -readonly -nobrowse -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          test -d "$mount/OpenNOW.app"
+          ditto "$mount/OpenNOW.app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"
+          hdiutil detach "$mount"
+          trap - EXIT
+          for app in "$zip_app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"; do
+            /usr/bin/codesign --verify --deep --strict "$app"
+            [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist") == io.github.opencloudgaming.OpenNOW ]]
+            identity=$(/usr/bin/codesign --display --verbose=4 "$app" 2>&1)
+            printf '%s\n' "$identity" | grep -Fx 'Identifier=io.github.opencloudgaming.OpenNOW'
+            printf '%s\n' "$identity" | grep -F 'Authority=Developer ID Application:'
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=4 "$app"
+            bin="$app/Contents/MacOS"
+            for executable in OpenNOW opennow-core opennow-acceptance-verify opennow-update-helper opennow-streamer; do
+              test -x "$bin/$executable"
+              lipo "$bin/$executable" -verify_arch arm64
+            done
+            test -f "$bin/libopennow_streamer_ffi.dylib"
+            lipo "$bin/libopennow_streamer_ffi.dylib" -verify_arch arm64
+            otool -D "$bin/libopennow_streamer_ffi.dylib" \
+              | grep -Fx '@rpath/libopennow_streamer_ffi.dylib'
+            test -f "$app/Contents/Resources/licenses/THIRD_PARTY_NOTICES"
+            test -f "$app/Contents/PlugIns/imageformats/libqsvg.dylib"
+            restore() {
+              for path in "$PWD/build/opennow-qt-release" "$QT_ROOT_DIR" "$RUNNER_TEMP/SDL-install"; do
+                if [[ -d "$path.unavailable" ]]; then mv "$path.unavailable" "$path"; fi
+              done
+            }
+            trap restore EXIT
+            mv build/opennow-qt-release build/opennow-qt-release.unavailable
+            mv "$QT_ROOT_DIR" "$QT_ROOT_DIR.unavailable"
+            mv "$RUNNER_TEMP/SDL-install" "$RUNNER_TEMP/SDL-install.unavailable"
+            unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH
+            unset DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+            "$bin/opennow-acceptance-verify" --help
+            python3 - "$bin" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import select
+          import subprocess
+          import sys
+          import tempfile
+
+          bin_dir = Path(sys.argv[1])
+          for name in ("OpenNOW", "opennow-core", "opennow-acceptance-verify",
+                       "opennow-update-helper", "opennow-streamer", "libopennow_streamer_ffi.dylib"):
+              dependencies = subprocess.check_output(["otool", "-L", bin_dir / name], text=True)
+              for line in dependencies.splitlines()[1:]:
+                  dependency = line.strip().split(" (", 1)[0]
+                  assert not dependency.startswith("/") or dependency.startswith(
+                      ("/System/Library/", "/usr/lib/")), (name, dependency)
+          probe = subprocess.run(
+              [bin_dir / "opennow-streamer"],
+              input='{"id":"package-probe","type":"hello","protocolVersion":7}\n'
+                    '{"id":"package-shutdown","type":"shutdown"}\n',
+              text=True, capture_output=True, check=True, timeout=30)
+          messages = [json.loads(line) for line in probe.stdout.splitlines()]
+          ready = next(m for m in messages if m.get("id") == "package-probe")
+          assert ready.get("type") == "ready", ready
+          assert any(b.get("backend") == "videotoolbox" for b in ready["capabilities"]["videoBackends"])
+          with tempfile.TemporaryDirectory() as data_dir:
+              core = subprocess.Popen(
+                  [bin_dir / "opennow-core", "--data-dir", data_dir],
+                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+              try:
+                  core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
+                                   '"params":{"protocolVersion":1}}\n')
+                  core.stdin.flush()
+                  assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
+                  response = json.loads(core.stdout.readline())
+                  assert response.get("id") == "package-core" and response.get("ok") is True, response
+              finally:
+                  core.kill()
+                  core.communicate(timeout=5)
+          subprocess.run(
+              [bin_dir / "OpenNOW", "--smoke-test", "--allow-multiple-instances",
+               "--desktop", "--route", "home", "--reduced-motion"],
+              env={**os.environ, "QT_QPA_PLATFORM": "cocoa"}, check=True, timeout=30)
+          PY
+            restore
+            trap - EXIT
+          done
+      - name: Record macOS artifact checksums
+        shell: bash
+        run: (cd build/release-artifacts && shasum -a 256 -- *.dmg *.zip > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opennow-qt-${{ inputs.version }}-macos-arm64-signed
+          path: |
+            build/release-artifacts/*.dmg
+            build/release-artifacts/*.zip
+            build/release-artifacts/SHA256SUMS
+          if-no-files-found: error
+
   inventory:
     name: isolated-update-signing-and-inventory
-    runs-on: [self-hosted, opennow-release-signer]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     environment: qt-update-signing
-    needs: [preflight, linux, windows]
+    needs: [preflight, linux, windows, macos]
+    timeout-minutes: 30
     steps:
+      - name: Verify signing tools
+        run: |
+          python3 -c 'import sys; assert sys.version_info >= (3, 11)'
+          openssl version | grep -E '^OpenSSL 3\.'
+          command -v jq sha256sum >/dev/null
       - uses: actions/download-artifact@v4
         with:
           pattern: opennow-qt-${{ inputs.version }}-*
@@ -471,6 +727,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          WINDOWS_SIGNING_MODE: ${{ inputs.windows_signing_mode }}
           UPDATE_PUBLIC_KEY: ${{ inputs.update_public_key }}
           UPDATE_PRIVATE_KEY: ${{ secrets.OPENNOW_UPDATE_ED25519_PRIVATE_KEY }}
         run: |
@@ -479,14 +736,19 @@ jobs:
             echo "Candidate contains a symbolic link" >&2
             exit 1
           fi
-          [[ $(find candidate -type f -name '*.msi' | wc -l) -eq 2 ]]
-          [[ $(find candidate -type f -name '*.dmg' | wc -l) -eq 0 ]]
-          [[ $(find candidate -type f -name '*.AppImage' | wc -l) -eq 2 ]]
-          [[ $(find candidate -type f -name '*.deb' | wc -l) -eq 2 ]]
-          [[ $(find candidate -type f -name '*.zip' | wc -l) -eq 2 ]]
+          expected=$(for arch in x64 arm64; do
+            printf 'OpenNOW-Qt-%s-Linux-%s.AppImage\nOpenNOW-Qt-%s-Linux-%s.deb\n' \
+              "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch"
+            printf 'OpenNOW-Qt-%s-Windows-%s.msi\nOpenNOW-Qt-%s-Windows-%s.zip\n' \
+              "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch"
+          done
+          printf 'OpenNOW-Qt-%s-Darwin-arm64.dmg\nOpenNOW-Qt-%s-Darwin-arm64.zip\n' \
+            "$RELEASE_VERSION" "$RELEASE_VERSION")
+          actual=$(find candidate -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
+          [[ "$actual" == "$(printf '%s\n' "$expected" | LC_ALL=C sort)" ]]
           assets=$(find candidate -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
             -o -name '*.deb' -o -name '*.zip' \) | wc -l)
-          [[ "$assets" -eq 8 ]]
+          [[ "$assets" -eq 10 ]]
 
           signing_dir=$(mktemp -d "$RUNNER_TEMP/opennow-update-signing.XXXXXX")
           trap 'rm -rf "$signing_dir"' EXIT
@@ -532,6 +794,7 @@ jobs:
             echo "OpenNOW Qt release candidate"
             echo "version=$RELEASE_VERSION"
             echo "sourceCommit=$SOURCE_SHA"
+            echo "windowsSigningMode=$WINDOWS_SIGNING_MODE"
             find candidate -type f -print0 | sort -z | xargs -0 sha256sum
           } > "$inventory"
           mv "$inventory" candidate/RELEASE-CANDIDATE-INVENTORY.txt
