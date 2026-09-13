@@ -715,6 +715,29 @@ fn advisory_lock_distinguishes_live_helper_from_stale_outcomes() {
     assert!(!helper_is_running(&prepared).unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+fn transaction_lock_releases_ownership_with_an_inherited_descriptor_open() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("apply.lock");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let owner = TransactionLock::acquire(file).unwrap();
+    let inherited = owner.0.try_clone().unwrap();
+    let next = OpenOptions::new().write(true).open(&path).unwrap();
+    assert_eq!(
+        next.try_lock_exclusive().unwrap_err().raw_os_error(),
+        fs2::lock_contended_error().raw_os_error()
+    );
+    drop(owner);
+    next.try_lock_exclusive().unwrap();
+    FileExt::unlock(&next).unwrap();
+    drop(inherited);
+}
+
 #[test]
 fn portable_nested_profile_and_extra_root_files_are_preserved() {
     let directory = TempDir::new().unwrap();

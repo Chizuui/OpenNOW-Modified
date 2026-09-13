@@ -16,6 +16,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+struct TransactionLock(File);
+
+impl TransactionLock {
+    fn acquire(file: File) -> std::io::Result<Self> {
+        file.try_lock_exclusive()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for TransactionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum InstallKind {
@@ -405,8 +420,8 @@ pub fn helper_is_running(prepared: &PreparedUpdate) -> Result<bool, String> {
         .write(true)
         .open(path)
         .map_err(|error| error.to_string())?;
-    match lock.try_lock_exclusive() {
-        Ok(()) => Ok(false),
+    match TransactionLock::acquire(lock) {
+        Ok(_lock) => Ok(false),
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Ok(true)
         }
@@ -479,7 +494,7 @@ pub fn run_helper(plan_path: &Path) -> Result<(), String> {
         .write(true)
         .open(directory.join("apply.lock"))
         .map_err(|error| error.to_string())?;
-    lock.try_lock_exclusive()
+    let _lock = TransactionLock::acquire(lock)
         .map_err(|_| "Another helper owns this update transaction")?;
     let plan: Plan = read_json(&plan_path, 64 * 1024)?;
     if read_outcome(&directory.join("outcome.json"))?.is_some_and(|outcome| {
