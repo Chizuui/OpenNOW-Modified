@@ -204,6 +204,7 @@ int AcceptanceSession::startSmokeWorkload()
             });
         });
     } else if (m_smokeTest && (m_arguments.contains(u"--smoke-backend-availability"_s)
+                     || m_arguments.contains(u"--smoke-command-search"_s)
                      || m_arguments.contains(u"--smoke-ownership"_s)
                      || m_arguments.contains(u"--smoke-catalog-sync"_s)
                      || m_arguments.contains(u"--smoke-microphone"_s)
@@ -216,7 +217,9 @@ int AcceptanceSession::startSmokeWorkload()
                      || m_arguments.contains(u"--smoke-idle-mode"_s)
                      || m_arguments.contains(u"--smoke-queue-drops"_s)
                      || m_arguments.contains(u"--smoke-stream-recovery"_s))) {
-        QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-ownership"_s)
+        QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-command-search"_s)
+            ? u"qrc:/acceptance/CommandSearchAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-ownership"_s)
             ? u"qrc:/acceptance/OwnershipAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-catalog-sync"_s)
             ? u"qrc:/acceptance/CatalogSyncAcceptance.qml"_s
@@ -252,6 +255,7 @@ int AcceptanceSession::startSmokeWorkload()
             m_engine.rootContext()->setContextProperty(u"NativeStreamRuntime"_s, runtime);
         }
         if (m_arguments.contains(u"--smoke-stream-recovery"_s)
+            || m_arguments.contains(u"--smoke-command-search"_s)
             || m_arguments.contains(u"--smoke-ownership"_s)
             || m_arguments.contains(u"--smoke-catalog-sync"_s)
             || m_arguments.contains(u"--smoke-recording"_s)
@@ -268,6 +272,34 @@ int AcceptanceSession::startSmokeWorkload()
             QVariant passed;
             const bool ok = window && QMetaObject::invokeMethod(fixture, "run", Q_RETURN_ARG(QVariant, passed),
                 Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) && passed.toBool() && !m_qmlWarningOccurred;
+            if (ok && m_arguments.contains(u"--smoke-command-search"_s)) {
+                auto *timer = new QTimer(this);
+                timer->setInterval(25);
+                connect(timer, &QTimer::timeout, this, [this, fixture, window, timer, deadline = QDeadlineTimer(15000)] {
+                    const auto key = fixture->property("key").toInt();
+                    if (key != 0) {
+                        fixture->setProperty("key", 0);
+                        const auto modifiers = Qt::KeyboardModifiers(fixture->property("modifiers").toInt());
+                        QKeyEvent press(QEvent::KeyPress, key, modifiers);
+                        QKeyEvent release(QEvent::KeyRelease, key, modifiers);
+                        QGuiApplication::sendEvent(window, &press);
+                        QGuiApplication::sendEvent(window, &release);
+                    }
+                    QVariant state;
+                    const bool advanced = QMetaObject::invokeMethod(fixture, "advance", Q_RETURN_ARG(QVariant, state));
+                    if (advanced && state.toInt() == 0 && !m_qmlWarningOccurred && !deadline.hasExpired()) return;
+                    timer->stop();
+                    bool success = advanced && state.toInt() == 1 && !m_qmlWarningOccurred;
+                    const auto shot = m_arguments.indexOf(u"--screenshot"_s);
+                    if (success && shot >= 0)
+                        success = shot + 1 < m_arguments.size() && QFileInfo(m_arguments.at(shot + 1)).isAbsolute()
+                            && window->grabWindow().save(m_arguments.at(shot + 1));
+                    if (!success) qCritical("Command search acceptance failed");
+                    m_application.exit(success ? EXIT_SUCCESS : EXIT_FAILURE);
+                });
+                timer->start();
+                return;
+            }
             if (ok && (m_arguments.contains(u"--smoke-collections"_s)
                        || m_arguments.contains(u"--smoke-ownership"_s)
                        || m_arguments.contains(u"--smoke-catalog-sync"_s)

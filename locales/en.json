@@ -1,4 +1,17 @@
 {
+  "commandSearch": {
+    "signIn": "Sign in to search games.",
+    "reconnecting": "Game search is unavailable while OpenNOW reconnects.",
+    "waiting": "Waiting to search… Press Enter to search now.",
+    "searching": "Searching GeForce NOW…",
+    "hiddenPage": "This result page contains only hidden games. More matches are available; refine your search.",
+    "hiddenAll": "All matching games are hidden.",
+    "more": "More matches are available. Refine your search to narrow the results.",
+    "empty": "No games match “%1”.",
+    "startFailed": "Game search could not start. Press Enter to retry.",
+    "invalidResponse": "Game search returned an invalid or outdated response. Press Enter to retry.",
+    "failed": "Game search failed. Press Enter to retry."
+  },
   "cloudLibrary": {
     "favoriteAdd": "Add to GeForce NOW favorites",
     "favoriteRemove": "Remove from GeForce NOW favorites",

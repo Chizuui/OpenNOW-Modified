@@ -69,7 +69,7 @@ QtObject {
             check(DesktopTokens.storeIconUrl(store).endsWith(".svg"), "missing store icon " + store)
         check(DesktopTokens.storeLabel("UPLAY") === "Ubisoft Connect", "raw provider label")
         check(DesktopTokens.genreLabel("MASSIVELY_MULTIPLAYER") === "Massively Multiplayer", "raw genre label")
-        ShellStore.authSession = {user:{userId:"store-fixture", displayName:"Store Test"}}
+        ShellStore.authSession = {user:{userId:"store-fixture", displayName:"Store Test"}, provider:{idpId:"store-provider", code:"NVIDIA"}}
         ShellStore.reloadStoreForSession()
         const first = ShellStore.storeRequestId
         check(client.requests.find(r => r.id === first).params.limit === 40, "unbounded page requested")
@@ -164,13 +164,16 @@ QtObject {
         palette.query = "fortntie"
         palette.requestGames()
         const paletteFirst = palette.searchRequestId
-        check(client.requests.find(r => r.id === paletteFirst).params.limit === 6, "palette search was unbounded")
+        const paletteRequest = client.requests.find(r => r.id === paletteFirst)
+        check(paletteRequest.method === "catalog.store.list" && paletteRequest.params.limit === 6
+            && paletteRequest.params.revalidate === true, "palette search was not bounded remote search")
         palette.query = "cs2"
         palette.requestGames()
         client.responseReceived(paletteFirst, {games:[ranked]})
-        check(palette.localGames.length === 0, "stale palette search was accepted")
-        client.responseReceived(palette.searchRequestId, {games:[game("cs2")]})
-        check(palette.gameList.length === 1 && palette.gameList[0].id === "cs2", "palette ignored ranked local results")
+        check(palette.remoteGames.length === 0, "stale palette search was accepted")
+        client.responseReceived(palette.searchRequestId, {games:[game("cs2")], scope:ShellStore.catalogOwnerState.authScope,
+            catalogRevision:ShellStore.catalogOwnerState.catalogRevision === null ? 0 : ShellStore.catalogOwnerState.catalogRevision})
+        check(palette.gameList.length === 1 && palette.gameList[0].id === "cs2", "palette ignored ranked remote results")
         palette.query = ""
         palette.scopeFilter = "actions"
         palette.ensureCurrentVisible()

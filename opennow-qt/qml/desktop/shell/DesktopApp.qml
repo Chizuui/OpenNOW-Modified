@@ -184,6 +184,7 @@ FocusScope {
         onVariantSelected: index => ShellStore.selectGameVariant(index)
     }
     DesktopCommandPalette {
+        objectName: "desktopCommandPalette"
         opened: root.commandOpen && root.shellVisible
         z: 120
         onCloseRequested: root.commandOpen = false
