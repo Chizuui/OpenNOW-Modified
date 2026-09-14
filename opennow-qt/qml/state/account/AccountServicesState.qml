@@ -6,7 +6,7 @@ QtObject {
     required property var appController
     required property bool ready
     required property bool signedIn
-    required property var reloadCatalogForSession
+    required property var refreshCatalogAfterAccountChange
     required property var refreshAccountServices
     signal accessibilityAnnounced(string message)
     property var subscription: null
@@ -214,7 +214,7 @@ QtObject {
         } else if (result.phase === "refreshing_library") {
             gameAccountMessage = qsTr("Store sync finished. Refreshing your library…")
             refreshGameAccounts()
-            reloadCatalogForSession()
+            refreshCatalogAfterAccountChange()
         } else {
             syncOperation = null
             syncPollTimer.stop()
@@ -348,7 +348,7 @@ QtObject {
         }
         root.gameAccountMessage = result.message || qsTr("Account updated")
         root.refreshGameAccounts()
-        root.reloadCatalogForSession()
+        root.refreshCatalogAfterAccountChange()
     }
 
     function failGameAccountAction(message) {
@@ -385,7 +385,7 @@ QtObject {
         if (status === "complete") {
             root.gameAccountMessage = qsTr("Account connected")
             root.refreshGameAccounts()
-            root.reloadCatalogForSession()
+            root.refreshCatalogAfterAccountChange()
         } else {
             root.gameAccountMessage = result.message || qsTr("Account linking expired")
         }

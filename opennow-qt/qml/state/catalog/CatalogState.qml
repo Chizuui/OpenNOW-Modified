@@ -15,6 +15,7 @@ QtObject {
     property var selectedGame: null
     property int catalogTotalCount: 0
     property string catalogState: "idle"
+    readonly property bool catalogBusy: catalogState === "loading" || catalogState === "refreshing"
     property string catalogSource: "public"
     property string catalogRequestId: ""
     property bool catalogComplete: false
@@ -129,15 +130,12 @@ QtObject {
     }
     onReadyChanged: {
         if (!ready) {
-            libraryPageTimer.stop()
+            cancelCatalogRequest()
             cancelDetailRequest()
-            const id = catalogRequestId
-            catalogRequestId = ""
-            if (id !== "") coreClient.cancel(id)
             catalogNextCursor = ""
             catalogStaged = []
+            catalogState = catalogGames.length ? "partial" : "idle"
             if (catalogGames.length) {
-                catalogState = "partial"
                 catalogError = qsTr("The core restarted. Refresh the library to confirm its current contents.")
             }
         }
@@ -303,8 +301,12 @@ QtObject {
         storeShelfEpoch++
     }
 
+    function ensureCatalog(searchQuery) {
+        if (catalogState === "idle") refreshCatalog(searchQuery)
+    }
+
     function refreshCatalog(searchQuery) {
-        if (!ready || catalogRequestId !== "")
+        if (!ready || catalogBusy)
             return
         catalogState = catalogGames.length > 0 ? "refreshing" : "loading"
         catalogError = ""
@@ -327,6 +329,7 @@ QtObject {
 
     function requestLibraryPage() {
         if (!ready || !signedIn || catalogRequestId !== "") return
+        libraryPageTimer.stop()
         catalogRequestId = coreClient.request("catalog.library.list", {
             limit: 100, cursor: catalogNextCursor, traversalId: catalogTraversalId,
             catalogRevision: catalogRevision, catalogContext: catalogContext
@@ -335,8 +338,8 @@ QtObject {
     }
 
     function continueCatalog() {
-        if (catalogRequestId !== "") return
-        if (catalogNextCursor === "" || catalogError === "catalog_changed") {
+        if (!ready || catalogBusy) return
+        if (catalogNextCursor === "") {
             refreshCatalog("")
             return
         }
@@ -351,15 +354,24 @@ QtObject {
         detailState = "idle"
         detailError = ""
         selectedGame = null
-        libraryPageTimer.stop()
-        if (catalogRequestId !== "") {
-            const previous = catalogRequestId
-            catalogRequestId = ""
-            coreClient.cancel(previous)
-        }
+        cancelCatalogRequest()
         catalogGames = []
         catalogComplete = false
         catalogLastCompleteAt = 0
+        catalogState = "idle"
+        refreshCatalog("")
+        reloadStoreForSession()
+    }
+
+    function cancelCatalogRequest() {
+        libraryPageTimer.stop()
+        const previous = catalogRequestId
+        catalogRequestId = ""
+        if (previous !== "") coreClient.cancel(previous)
+    }
+
+    function refreshCatalogAfterAccountChange() {
+        cancelCatalogRequest()
         catalogState = "idle"
         refreshCatalog("")
         reloadStoreForSession()

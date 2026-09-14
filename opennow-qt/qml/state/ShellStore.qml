@@ -65,7 +65,7 @@ QtObject {
         appController: AppController
         ready: root.ready
         signedIn: root.signedIn
-        reloadCatalogForSession: function() { catalogOwner.refreshCatalog(""); catalogOwner.reloadStoreForSession() }
+        refreshCatalogAfterAccountChange: catalogOwner.refreshCatalogAfterAccountChange
         refreshAccountServices: root.refreshAccountServices
         acceptsScope: root.matchesAuthScope
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
@@ -1224,8 +1224,7 @@ QtObject {
                 || onboardingSaving || onboardingReplaying || onboardingError !== "")
             return
         if (catalogState !== "ready") {
-            if (ready && catalogRequestId === "")
-                refreshCatalog(pendingDirectLaunch.title)
+            catalogOwner.ensureCatalog(pendingDirectLaunch.title)
             return
         }
         let match = null
