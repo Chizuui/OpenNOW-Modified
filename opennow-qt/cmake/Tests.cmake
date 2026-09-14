@@ -588,6 +588,8 @@ if(BUILD_TESTING)
     )
     target_include_directories(opennow-coreclient-tests PRIVATE src)
     target_link_libraries(opennow-coreclient-tests PRIVATE Qt6::Test Qt6::Core)
+    target_compile_definitions(opennow-coreclient-tests PRIVATE
+        OPENNOW_TEST_CORE_PATH="$<TARGET_FILE_DIR:opennow-qt>/opennow-core${CMAKE_EXECUTABLE_SUFFIX}")
     add_dependencies(opennow-coreclient-tests opennow-fake-core opennow-core)
     add_test(NAME opennow-coreclient-tests COMMAND opennow-coreclient-tests -o -,txt)
 

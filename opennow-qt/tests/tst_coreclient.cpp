@@ -354,10 +354,8 @@ private slots:
         CoreClient client;
         QSignalSpy responses(&client, &CoreClient::responseReceived);
         QSignalSpy failures(&client, &CoreClient::requestFailed);
-        auto program = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("opennow-core"));
-#ifdef Q_OS_WIN
-        program += QStringLiteral(".exe");
-#endif
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
         QVERIFY(client.start(program, {QStringLiteral("--data-dir"), directory.path()}));
         QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
         responses.clear();
