@@ -370,6 +370,7 @@ impl GfnService {
             let fields = STORE_BROWSE_QUERY.split("    items {").nth(1).expect("catalog item selection");
             let fields = fields.strip_suffix("  }\n}").expect("catalog query suffix");
             let fields = fields.replace("id title developerName", "shortDescription computedValues { paymentModels { __typename } } id title developerName")
+                .replace("itemMetadata { campaignIds }", "")
                 .replace("status\n          features", "status\n          supportedLanguages { language ... on GfnLanguageSettings { availableFeatures setMethod } }\n          features");
             let query = format!("query OpenNowGame($vpcId:String!,$locale:String!,$ids:[{ty}]!) {{ apps(vpcId:$vpcId,language:$locale,{kind}:$ids) {{ items {{ {fields} }} }}");
             let payload = self.catalog_document(&client,token,&query,json!({"vpcId":vpc,"locale":"en_US","ids":ids}))?;
