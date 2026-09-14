@@ -32,6 +32,38 @@ Column {
     width: controlsRoot.availableWidth; spacing: 20
     DesktopSettingsPanel {
         width: parent.width; paperStyle: true
+        DesktopSettingsSection { text: qsTr("LANGUAGE & KEYBOARD") }
+        DesktopSettingsChoice {
+            objectName: "gameLanguageChoice"
+            width: parent.width; title: qsTr("Game language")
+            description: ShellStore.settingsOwnerState.gameLanguageDescription
+            items: ShellStore.settingsOwnerState.gameLanguageItems
+            value: controlsRoot.settingsScreen.valueSetting("gameLanguage", "en_US")
+            onSelected: value => controlsRoot.settingsScreen.setChoice("gameLanguage", value)
+        }
+        DesktopSettingsRow {
+            width: parent.width; glyph: "globe"; paperStyle: true
+            title: qsTr("Game language metadata")
+            description: ShellStore.settingsOwnerState.languageStatusText
+            DesktopSettingsButton {
+                objectName: "retryGameLanguages"
+                text: qsTr("Retry")
+                enabled: ShellStore.settingsOwnerState.ready && ShellStore.settingsOwnerState.languageState !== "loading"
+                onClicked: ShellStore.settingsOwnerState.ensureGameLanguages(true)
+            }
+        }
+        DesktopSettingsChoice {
+            objectName: "keyboardLayoutChoice"
+            width: parent.width; title: qsTr("Keyboard layout"); glyph: "keyboard"
+            description: ShellStore.settingsOwnerState.keyboardLayoutDescription
+            items: ShellStore.settingsOwnerState.keyboardLayoutItems
+            value: controlsRoot.settingsScreen.valueSetting("keyboardLayout", "en-US")
+            showDivider: false
+            onSelected: value => controlsRoot.settingsScreen.setChoice("keyboardLayout", value)
+        }
+    }
+    DesktopSettingsPanel {
+        width: parent.width; paperStyle: true
         DesktopSettingsSection { text: qsTr("CONTROLLERS") }
         DesktopSettingsChoice {
             objectName: "controllerSourceChoice"

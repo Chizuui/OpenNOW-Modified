@@ -20,6 +20,7 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <QFont>
 #include <QFontDatabase>
 #include <QQmlApplicationEngine>
@@ -210,6 +211,7 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
         coreClient.setNativeHdrSupported(hdrOutput.supported());
     });
     qmlRegisterType<HdrChromeEffect>("OpenNOW", 1, 0, "HdrChromeEffect");
+    qmlRegisterType<QTimer>("OpenNOW", 1, 0, "NativeTimer");
     qmlRegisterUncreatableType<MacAwdlController>("OpenNOW", 1, 0, "MacAwdlController",
                                                 u"Use the application-owned MacAwdl instance"_s);
     MacAwdlController macAwdl;

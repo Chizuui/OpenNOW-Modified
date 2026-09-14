@@ -324,6 +324,48 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(opennow-streamcolor-tests PROPERTIES TIMEOUT 60)
     qt_add_resources(opennow-qt "region-ping-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml tests/OwnershipAcceptance.qml tests/CommandSearchAcceptance.qml)
+    foreach(search_case compact normal scaled-light)
+        if(search_case STREQUAL "normal")
+            set(search_width 1440)
+            set(search_height 900)
+        else()
+            set(search_width 960)
+            set(search_height 720)
+        endif()
+        add_test(NAME qml-command-search-${search_case} COMMAND opennow-qt
+            --smoke-test --allow-multiple-instances --desktop --route home --smoke-command-search
+            --search-${search_case} --smoke-width ${search_width} --smoke-height ${search_height} --reduced-motion)
+        set_tests_properties(qml-command-search-${search_case} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+    endforeach()
+    foreach(surface desktop console)
+        foreach(width 960 1440)
+            if(width EQUAL 960)
+                set(ownership_height 720)
+            else()
+                set(ownership_height 900)
+            endif()
+            foreach(state confirmation error)
+                add_test(NAME qml-ownership-${surface}-${width}-${state} COMMAND opennow-qt
+                    --smoke-test --allow-multiple-instances --${surface} --route game-detail
+                    --smoke-ownership --ownership-${state} --smoke-width ${width} --smoke-height ${ownership_height} --reduced-motion)
+                set_tests_properties(qml-ownership-${surface}-${width}-${state} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+            endforeach()
+        endforeach()
+    endforeach()
+    foreach(width 960 1440)
+        add_test(NAME qml-catalog-sync-${width} COMMAND opennow-qt
+            --smoke-test --allow-multiple-instances --desktop --route library
+            --smoke-catalog-sync --smoke-width ${width} --smoke-height 900 --reduced-motion)
+        set_tests_properties(qml-catalog-sync-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+        foreach(route settings-account game-detail)
+            add_test(NAME qml-catalog-notice-${route}-${width} COMMAND opennow-qt
+                --smoke-test --allow-multiple-instances --desktop --route ${route}
+                --smoke-catalog-sync --smoke-width ${width} --smoke-height 900 --reduced-motion)
+            set_tests_properties(qml-catalog-notice-${route}-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+        endforeach()
+    endforeach()
+    qt_add_resources(opennow-qt "store-paging-acceptance"
         PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
     add_test(NAME qml-recording
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
@@ -375,6 +417,37 @@ if(BUILD_TESTING)
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-input --smoke-controller-metadata --reduced-motion)
     set_tests_properties(qml-controller-metadata PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+    qt_add_resources(opennow-qt "language-settings-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/LanguageSettingsAcceptance.qml)
+    foreach(surface desktop console)
+        foreach(width 900 1400)
+            add_test(NAME qml-language-settings-${surface}-${width}
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                    --route settings-input --smoke-language-settings --smoke-width ${width} --reduced-motion)
+            set_tests_properties(qml-language-settings-${surface}-${width} PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        endforeach()
+        add_test(NAME qml-language-colors-${surface}
+            COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                --route settings-streaming --smoke-language-settings --language-colors --reduced-motion)
+        set_tests_properties(qml-language-colors-${surface} PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        add_test(NAME qml-language-hdr-invalidation-${surface}
+            COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                --route settings-input --smoke-language-settings --language-hdr-invalidation --reduced-motion)
+        set_tests_properties(qml-language-hdr-invalidation-${surface} PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    endforeach()
+    add_test(NAME qml-language-settings-scaled-light
+        COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+            --route settings-input --smoke-language-settings --smoke-light-theme --smoke-width 1400 --reduced-motion)
+    set_tests_properties(qml-language-settings-scaled-light PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    add_test(NAME qml-language-keyboard-selection
+        COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+            --route settings-input --smoke-language-settings --language-keyboard-selection --reduced-motion)
+    set_tests_properties(qml-language-keyboard-selection PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
     qt_add_resources(opennow-qt "custom-background-acceptance"
         PREFIX "/acceptance" BASE tests FILES tests/CustomBackgroundAcceptance.qml)
     qt_add_resources(opennow-qt "stream-stats-acceptance"
@@ -515,7 +588,9 @@ if(BUILD_TESTING)
     )
     target_include_directories(opennow-coreclient-tests PRIVATE src)
     target_link_libraries(opennow-coreclient-tests PRIVATE Qt6::Test Qt6::Core)
-    add_dependencies(opennow-coreclient-tests opennow-fake-core)
+    target_compile_definitions(opennow-coreclient-tests PRIVATE
+        OPENNOW_TEST_CORE_PATH="$<TARGET_FILE_DIR:opennow-qt>/opennow-core${CMAKE_EXECUTABLE_SUFFIX}")
+    add_dependencies(opennow-coreclient-tests opennow-fake-core opennow-core)
     add_test(NAME opennow-coreclient-tests COMMAND opennow-coreclient-tests -o -,txt)
 
     qt_add_executable(opennow-streamvideo-tests
@@ -883,12 +958,30 @@ if(BUILD_TESTING)
         )
     endforeach()
     foreach(surface desktop console)
-        foreach(resume_state conflict unavailable resuming)
+        foreach(resume_state conflict unavailable resuming finished not-found)
             add_test(NAME "qml-session-resume-${surface}-${resume_state}"
                 COMMAND opennow-qt --smoke-test --allow-multiple-instances
                     --${surface} --route inserting --reduced-motion
                     --smoke-width 960 --smoke-height 640 --smoke-session-resume ${resume_state})
             set_tests_properties("qml-session-resume-${surface}-${resume_state}" PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT ${OPENNOW_QT_SMOKE_TIMEOUT})
+        endforeach()
+    endforeach()
+    foreach(persistence memory-only migration-pending unavailable)
+        add_test(NAME "qml-auth-persistence-${persistence}"
+            COMMAND opennow-qt --smoke-test --allow-multiple-instances
+                --desktop --route sign-in --reduced-motion --smoke-width 960 --smoke-height 640
+                --smoke-auth-persistence ${persistence})
+        set_tests_properties("qml-auth-persistence-${persistence}" PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT ${OPENNOW_QT_SMOKE_TIMEOUT})
+    endforeach()
+    foreach(surface desktop console)
+        foreach(width 960 1440)
+            add_test(NAME "qml-alliance-routing-${surface}-${width}"
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances
+                    --${surface} --route sign-in --reduced-motion --smoke-width ${width} --smoke-height 900
+                    --smoke-alliance-routing)
+            set_tests_properties("qml-alliance-routing-${surface}-${width}" PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT ${OPENNOW_QT_SMOKE_TIMEOUT})
         endforeach()
     endforeach()

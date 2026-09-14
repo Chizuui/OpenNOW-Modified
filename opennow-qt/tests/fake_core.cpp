@@ -34,6 +34,7 @@ int main(int argc, char **argv)
     bool launchInConsoleMode = false;
     int consoleModeWriteCount = 0;
     int startupAcknowledgements = 0;
+    int createReceipts = 0;
     std::unordered_map<std::string, int> busyAttempts;
     if (argc == 3 && std::string(argv[1]) == "--eof-marker") {
         eofMarker = argv[2];
@@ -42,9 +43,18 @@ int main(int argc, char **argv)
     while (std::getline(std::cin, line)) {
         const auto id = field(line, "id");
         const auto method = field(line, "method");
-        if (method == "core.hello") {
+        if (field(line, "type") == "ack") {
+            ++createReceipts;
+        } else if (method == "test.create-receipts") {
             std::cout << "{\"type\":\"response\",\"id\":\"" << id
-                      << "\",\"ok\":true,\"result\":{\"protocolVersion\":1,\"capabilities\":[\"settings\",\"nativeStreamer.v7\",\"nativeStreamer.ownedNvstNegotiation\"]}}\n" << std::flush;
+                      << "\",\"ok\":true,\"result\":{\"receipts\":" << createReceipts << "}}\n" << std::flush;
+        } else if (field(line, "type") == "cancel") {
+            continue;
+        } else if (method == "core.hello") {
+            const auto protocolVersion = std::getenv("OPENNOW_TEST_OLD_CORE") ? 4 : 5;
+            std::cout << "{\"type\":\"response\",\"id\":\"" << id
+                      << "\",\"ok\":true,\"result\":{\"protocolVersion\":" << protocolVersion
+                      << ",\"capabilities\":[\"settings\",\"catalog.libraryPages.v1\",\"catalog.metadata.v1\",\"account.syncObservation.v1\",\"catalog.languages.v1\",\"nativeStreamer.v7\",\"nativeStreamer.ownedNvstNegotiation\"]}}\n" << std::flush;
         } else if (method == "updater.startup.ack") {
             ++startupAcknowledgements;
             std::cout << "{\"type\":\"response\",\"id\":\"" << id
@@ -61,7 +71,9 @@ int main(int argc, char **argv)
                       << ",\"startupAcknowledgements\":" << startupAcknowledgements
                       << ",\"hasUpdateEnvironment\":" << (std::getenv("OPENNOW_UPDATE_PLAN") && std::getenv("OPENNOW_UPDATE_NONCE") ? "true" : "false")
                       << "}}\n" << std::flush;
-        } else if (method == "session.create" || method == "streamer.prepare") {
+        } else if (method == "session.create" || method == "streamer.prepare" || method == "settings.choices.get") {
+            if (line.find("\"delayReceipt\":true") != std::string::npos)
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
             std::cout << "{\"type\":\"response\",\"id\":\"" << id
                       << "\",\"ok\":true,\"result\":" << line << "}\n" << std::flush;
         } else if (method == "settings.get") {
@@ -77,11 +89,11 @@ int main(int argc, char **argv)
                           << "\",\"ok\":false,\"error\":{\"code\":\"settings_write_failed\",\"message\":\"Fixture denied settings persistence\"}}\n" << std::flush;
             } else if (consoleModeWrite) {
                 launchInConsoleMode = line.find("\"value\":true") != std::string::npos;
-                std::cout << "{\"type\":\"response\",\"id\":\"" << id
-                          << "\",\"ok\":true,\"result\":{\"key\":\"launchInConsoleMode\",\"value\":"
+                std::cout << "{\"type\":\"event\",\"name\":\"settings.changed\",\"payload\":{\"key\":\"launchInConsoleMode\",\"value\":"
                           << (launchInConsoleMode ? "true" : "false")
                           << (launchInConsoleMode ? "" : ",\"changes\":{\"switchToConsoleOnPad\":false}") << "}}\n";
-                std::cout << "{\"type\":\"event\",\"name\":\"settings.changed\",\"payload\":{\"key\":\"launchInConsoleMode\",\"value\":"
+                std::cout << "{\"type\":\"response\",\"id\":\"" << id
+                          << "\",\"ok\":true,\"result\":{\"key\":\"launchInConsoleMode\",\"value\":"
                           << (launchInConsoleMode ? "true" : "false")
                           << (launchInConsoleMode ? "" : ",\"changes\":{\"switchToConsoleOnPad\":false}") << "}}\n" << std::flush;
             } else {

@@ -5,6 +5,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QElapsedTimer>
 #include <QRegularExpression>
 #include <QScopeGuard>
@@ -31,6 +33,30 @@ class CoreClientTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void acknowledgesOnlyAcceptedCreateResponses()
+    {
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        responses.clear();
+        const auto accepted = client.request(QStringLiteral("session.create"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == accepted;
+        }), 2'000);
+        const auto cancelled = client.request(QStringLiteral("session.create"), {{QStringLiteral("delayReceipt"), true}});
+        QVERIFY(client.cancel(cancelled));
+        const auto query = client.request(QStringLiteral("test.create-receipts"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == query;
+        }), 2'000);
+        for (const auto &response : responses) {
+            QVERIFY(response.at(0).toString() != cancelled);
+            if (response.at(0).toString() == query)
+                QCOMPARE(response.at(1).toJsonObject().value(QStringLiteral("receipts")).toInt(), 1);
+        }
+    }
+
 #ifdef Q_OS_LINUX
     void passesFlatpakPicturesDirectoryToCore_data()
     {
@@ -260,8 +286,27 @@ private slots:
     {
         CoreClient client;
         QCOMPARE(client.state(), QStringLiteral("stopped"));
-        QCOMPARE(client.protocolVersion(), 1);
+        QCOMPARE(client.protocolVersion(), 5);
         QVERIFY(client.lastError().isEmpty());
+    }
+
+    void rejectsOldCoreBeforeSendingCatalogRequests()
+    {
+        const auto previous = qgetenv("OPENNOW_TEST_OLD_CORE");
+        const auto restore = qScopeGuard([previous] {
+            if (previous.isNull()) qunsetenv("OPENNOW_TEST_OLD_CORE");
+            else qputenv("OPENNOW_TEST_OLD_CORE", previous);
+        });
+        qputenv("OPENNOW_TEST_OLD_CORE", "1");
+        CoreClient client;
+        QStringList errors;
+        connect(&client, &CoreClient::lastErrorChanged, &client, [&] { errors.append(client.lastError()); });
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("failed"), 2'000);
+        QVERIFY(errors.contains(QStringLiteral("Core protocol version is incompatible")));
+        QVERIFY(client.request(QStringLiteral("catalog.library.list")).isEmpty());
+        QVERIFY(responses.isEmpty());
     }
 
     void rejectsInvalidStartAndRequest()
@@ -278,7 +323,8 @@ private slots:
         QSignalSpy responses(&client, &CoreClient::responseReceived);
         QVERIFY(client.start(fakeCorePath()));
         QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
-        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare")}) {
+        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare"),
+                                  QStringLiteral("settings.choices.get")}) {
             for (bool supported : {false, true, false}) {
                 responses.clear();
                 client.setNativeHdrSupported(supported);
@@ -298,6 +344,46 @@ private slots:
                 QCOMPARE(params.value(QStringLiteral("runtimeCapabilities")).toObject(), capabilities);
             }
         }
+        client.stop();
+    }
+
+    void injectedHdrOutputControlsRealCoreColorDescriptors()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), directory.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        QVERIFY(!client.request(QStringLiteral("settings.set"),
+            {{QStringLiteral("key"), QStringLiteral("enableHdr")}, {QStringLiteral("value"), true}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+        for (bool supported : {false, true, false}) {
+            client.setNativeHdrSupported(supported);
+            const auto capabilities = QJsonDocument::fromJson(R"({"protocolVersion":7,
+                "videoBackends":[{"backend":"vaapi","available":true,"codecs":[
+                    {"codec":"h265","available":true,"hdrSupported":true,
+                     "colorQualities":["8bit_420","10bit_420"],"hdrColorQualities":["10bit_420"]}]}]})").object();
+            auto callerCapabilities = capabilities;
+            callerCapabilities.insert(QStringLiteral("nativeHdrSupported"), !supported);
+            responses.clear();
+            QVERIFY(!client.request(QStringLiteral("settings.choices.get"),
+                {{QStringLiteral("runtimeCapabilities"), callerCapabilities}}).isEmpty());
+            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+            const auto choices = responses.first().at(1).toJsonObject().value(QStringLiteral("colorQualities")).toArray();
+            QCOMPARE(choices.size(), 4);
+            for (const auto &entry : choices) {
+                const auto choice = entry.toObject();
+                const auto expected = supported && choice.value(QStringLiteral("value")).toString().endsWith(QStringLiteral("420"));
+                QCOMPARE(choice.value(QStringLiteral("disabled")).toBool(), !expected);
+            }
+            QCOMPARE(callerCapabilities.value(QStringLiteral("nativeHdrSupported")).toBool(), !supported);
+        }
+        QVERIFY(failures.isEmpty());
         client.stop();
     }
 

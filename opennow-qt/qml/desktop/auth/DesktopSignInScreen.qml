@@ -17,6 +17,7 @@ FocusScope {
     readonly property var challenge: ShellStore.authChallenge
     readonly property var providers: ShellStore.providers && ShellStore.providers.length
         ? ShellStore.providers : [{displayName:"NVIDIA · GeForce NOW", idpId:"", region:"GLOBAL"}]
+    readonly property var selectedProvider: ShellStore.selectedProvider || {displayName:qsTr("Select a provider"), idpId:ShellStore.selectedProviderIdpId, region:""}
     readonly property bool waiting: ShellStore.authState === "starting" || ShellStore.authState === "waiting" || ShellStore.authState === "completing"
     readonly property bool failed: ShellStore.authState === "error"
     readonly property bool wideLayout: width >= DesktopTokens.px(1240)
@@ -402,13 +403,26 @@ FocusScope {
                         bottomPadding: DesktopTokens.px(18)
                         visible: !root.waiting && !root.failed
                         MonoText { text: qsTr("PROVIDER") }
+                        BodyText {
+                            objectName: "providerDiscoveryNotice"
+                            width: parent.width
+                            visible: ShellStore.providerDiscoveryDegraded
+                            text: qsTr("Provider discovery is unavailable. Known providers are shown. Refresh to try again.")
+                            color: DesktopTokens.textMuted
+                        }
+                        AuthButton {
+                            width: parent.width
+                            visible: ShellStore.providerDiscoveryDegraded
+                            text: qsTr("Refresh providers")
+                            onClicked: ShellStore.refreshProviders()
+                        }
                         ItemDelegate {
                             id: providerButton
                             focusPolicy: Qt.StrongFocus
                             width: parent.width
                             height: DesktopTokens.px(56)
                             padding: 0
-                            Accessible.name: String(root.providers[0].displayName || "NVIDIA · GeForce NOW")
+                            Accessible.name: String(root.selectedProvider.displayName || "NVIDIA · GeForce NOW")
                             background: Rectangle {
                                 radius: DesktopTokens.px(12)
                                 color: providerButton.hovered || providerButton.activeFocus ? DesktopTokens.raisedStrong : DesktopTokens.raised
@@ -423,15 +437,15 @@ FocusScope {
                                     height: width
                                     radius: DesktopTokens.px(9)
                                     color: "#76B900"
-                                    BodyText { anchors.centerIn: parent; text: "N"; color: "#0B0F1A"; font.pixelSize: DesktopTokens.px(14); font.weight: Font.Black }
+                                    BodyText { anchors.centerIn: parent; text: String(root.selectedProvider.displayName || "").slice(0, 1).toUpperCase(); color: "#0B0F1A"; font.pixelSize: DesktopTokens.px(14); font.weight: Font.Black }
                                 }
                                 Column {
                                     x: DesktopTokens.px(58)
                                     width: parent.width - DesktopTokens.px(100)
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: DesktopTokens.px(2)
-                                    BodyText { objectName: "signInProviderName"; width: parent.width; text: String(root.providers[0].displayName || "NVIDIA · GeForce NOW"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(14); font.weight: Font.ExtraBold; maximumLineCount: 1; elide: Text.ElideRight }
-                                    MonoText { objectName: "signInProviderRegion"; width: parent.width; text: String(root.providers[0].region || "GLOBAL").toUpperCase() + qsTr("  ·  DEFAULT PROVIDER"); font.letterSpacing: 0.8 * DesktopTokens.uiScale; elide: Text.ElideRight }
+                                    BodyText { objectName: "signInProviderName"; width: parent.width; text: String(root.selectedProvider.displayName || "NVIDIA · GeForce NOW"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(14); font.weight: Font.ExtraBold; maximumLineCount: 1; elide: Text.ElideRight }
+                                    MonoText { objectName: "signInProviderRegion"; width: parent.width; text: String(root.selectedProvider.region || "GLOBAL").toUpperCase() + qsTr("  ·  SELECTED PROVIDER"); font.letterSpacing: 0.8 * DesktopTokens.uiScale; elide: Text.ElideRight }
                                 }
                                 DesktopGlyph {
                                     anchors.right: parent.right
@@ -526,9 +540,9 @@ FocusScope {
                             primary: true
                             external: true
                             font.pixelSize: DesktopTokens.px(14)
-                            text: qsTr("Continue with NVIDIA")
-                            enabled: ShellStore.ready
-                            onClicked: ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn)
+                            text: qsTr("Continue with %1").arg(root.selectedProvider.displayName)
+                            enabled: ShellStore.ready && ShellStore.selectedProvider !== null
+                            onClicked: ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn)
                         }
                         AuthButton {
                             width: parent.width
@@ -536,7 +550,7 @@ FocusScope {
                             glyphSize: DesktopTokens.px(14)
                             text: qsTr("Sign in with a QR code")
                             enabled: ShellStore.ready
-                            onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) }
+                            onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn) }
                         }
                     }
 
@@ -706,7 +720,7 @@ FocusScope {
                         Row {
                             width: parent.width
                             spacing: DesktopTokens.px(10)
-                            AuthButton { width: (parent.width - parent.spacing) * 0.55; primary: true; text: qsTr("Try again"); onClicked: { ShellStore.authState = "idle"; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) } }
+                            AuthButton { width: (parent.width - parent.spacing) * 0.55; primary: true; text: qsTr("Try again"); onClicked: { ShellStore.authState = "idle"; ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn) } }
                             AuthButton { width: (parent.width - parent.spacing) * 0.45; text: qsTr("Choose provider"); onClicked: { ShellStore.authState = "idle"; root.providerOpen = true } }
                         }
                         Rectangle {

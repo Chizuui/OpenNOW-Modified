@@ -303,6 +303,21 @@ impl StreamerService {
         ensure_codec_available(&detection["capabilities"], codec)
     }
 
+    pub fn color_quality_choices(settings: &Value, capabilities: &Value) -> Value {
+        json!(
+            ["8bit_420", "8bit_444", "10bit_420", "10bit_444"]
+                .into_iter()
+                .map(|quality| {
+                    let mut candidate = settings.clone();
+                    candidate["colorQuality"] = json!(quality);
+                    let result = Self::embedded_session_settings(&candidate, capabilities);
+                    json!({"value":quality, "disabled":result.is_err(),
+                    "reason":result.err().map(|error| error.message)})
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
     /// The in-process Qt streamer, not a separately installed executable, owns the usable
     /// decode/presentation capabilities. Resolve Auto before asking CloudMatch for a seat.
     pub fn embedded_session_settings(
@@ -512,6 +527,21 @@ impl StreamerService {
         if !matches!(status, 2 | 3) {
             return Err(invalid(
                 "CloudMatch session is not ready for NVST media attachment",
+            ));
+        }
+        let profile = &session["negotiatedStreamProfile"];
+        if profile["enableHdrSource"] == "server" && profile["enableHdr"].as_bool().is_none() {
+            return Err(invalid("CloudMatch returned an unsupported HDR mode"));
+        }
+        if ["bitDepthSource", "chromaFormatSource"].iter().any(|key| {
+            matches!(
+                profile[*key].as_str(),
+                Some("request" | "finalized" | "server")
+            )
+        }) && profile["colorQuality"].as_str().is_none()
+        {
+            return Err(invalid(
+                "CloudMatch returned an incomplete or unsupported color profile",
             ));
         }
         let mut context = streamer_context(session, settings);
@@ -1858,6 +1888,49 @@ mod tests {
     }
 
     #[test]
+    fn color_descriptors_match_final_profile_validation_without_mutation() {
+        for backend in ["d3d11", "vulkan", "videotoolbox", "missing"] {
+            for codec in ["auto", "h264", "h265", "av1"] {
+                for hdr in [false, true] {
+                    for known in [false, true] {
+                        let caps = if known {
+                            json!({"protocolVersion":7,"nativeHdrSupported":true,
+                            "videoBackends":[{"backend":backend,"platform":"macos","available":true,
+                                "codecs":[{"codec":"h264","available":true,"colorQualities":["8bit_420"]},
+                                    {"codec":"h265","available":true,"hdrSupported":true,
+                                        "colorQualities":["8bit_420","8bit_444","10bit_420","10bit_444"],
+                                        "hdrColorQualities":["10bit_420","10bit_444"]},
+                                    {"codec":"av1","available":true,"hdrSupported":true,
+                                        "colorQualities":["8bit_420","10bit_420"]}]}]})
+                        } else {
+                            json!({})
+                        };
+                        let settings = json!({"codec":codec,"enableHdr":hdr,"nativeVideoBackend":backend,
+                            "colorQuality":"8bit_444"});
+                        let original = settings.clone();
+                        let choices = StreamerService::color_quality_choices(&settings, &caps);
+                        assert_eq!(choices.as_array().unwrap().len(), 4);
+                        for choice in choices.as_array().unwrap() {
+                            let mut candidate = settings.clone();
+                            candidate["colorQuality"] = choice["value"].clone();
+                            let result =
+                                StreamerService::embedded_session_settings(&candidate, &caps);
+                            assert_eq!(choice["disabled"], result.is_err());
+                            if let Err(error) = result {
+                                assert_eq!(choice["reason"], error.message);
+                            }
+                            if !known {
+                                assert_eq!(choice["disabled"], true);
+                            }
+                        }
+                        assert_eq!(settings, original);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn embedded_auto_selects_only_supported_codecs_and_preserves_manual_choices() {
         let mut caps = json!({"protocolVersion":7,"videoBackends":[{
             "backend":"d3d11","available":true,"codecs":[
@@ -1994,6 +2067,23 @@ mod tests {
         }
         let av1 = json!({"codec":"av1","colorQuality":"10bit_444","enableHdr":true});
         assert!(StreamerService::embedded_session_settings(&av1, &capabilities).is_err());
+    }
+
+    #[test]
+    fn invalid_accepted_color_never_falls_back_to_local_preferences() {
+        let service = StreamerService::new();
+        for source in ["request", "finalized", "server"] {
+            let params = json!({"session":{"sessionId":"seat","status":2,
+                "negotiatedStreamProfile":{"codec":"H265", "colorQuality":null,
+                    "bitDepthSource":source, "chromaFormat":1}}});
+            let error = service
+                .prepare_embedded(
+                    &params,
+                    &json!({"codec":"h265", "colorQuality":"10bit_444"}),
+                )
+                .unwrap_err();
+            assert!(error.message.contains("color profile"));
+        }
     }
 
     #[test]

@@ -12,9 +12,10 @@ DesktopSettingsPanel {
     DesktopSettingsSection { text: qsTr("INTERFACE") }
     DesktopSettingsChoice {
         objectName: "renewLanguageChoice"
-        width: parent.width; glyph: "globe"; title: qsTr("Language"); description: qsTr("Community translated through Crowdin")
-        items: [{label:qsTr("System"),value:"system"},{label:"Deutsch",value:"de"},{label:"English",value:"en"},{label:"Español",value:"es"},{label:"Français",value:"fr"},{label:qsTr("Japanese"),value:"ja"},{label:qsTr("Korean"),value:"ko"},{label:"Nederlands",value:"nl"},{label:"Polski",value:"pl"},{label:"Română",value:"ro"},{label:"Русский",value:"ru"},{label:"Türkçe",value:"tr"},{label:qsTr("Chinese"),value:"zh"}]
-        value: page.settingsScreen.valueSetting("appLanguage","en")
+        width: parent.width; glyph: "globe"; title: qsTr("Interface language")
+        description: ShellStore.settingsOwnerState.interfaceLanguageDescription
+        items: ShellStore.settingsOwnerState.interfaceLanguageItems
+        value: page.settingsScreen.valueSetting("appLanguage","system")
         onSelected: value => page.settingsScreen.setChoice("appLanguage",value)
     }
     DesktopSettingsRow {

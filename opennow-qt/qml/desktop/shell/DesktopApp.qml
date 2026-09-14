@@ -180,10 +180,11 @@ FocusScope {
         opened: root.shellVisible && root.route === "game-detail"
         z: 100
         onCloseRequested: AppController.goBack()
-        onPlayRequested: ShellStore.launchSelectedGame(false)
+        onPlayRequested: ShellStore.activateSelectedGame()
         onVariantSelected: index => ShellStore.selectGameVariant(index)
     }
     DesktopCommandPalette {
+        objectName: "desktopCommandPalette"
         opened: root.commandOpen && root.shellVisible
         z: 120
         onCloseRequested: root.commandOpen = false

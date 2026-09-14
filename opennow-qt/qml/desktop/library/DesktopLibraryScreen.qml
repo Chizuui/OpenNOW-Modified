@@ -36,12 +36,13 @@ FocusScope {
         return controls.indexOf("gamepad") >= 0 || controls.indexOf("controller") >= 0
     }
     function isReady(game) {
-        return Boolean(game.isInLibrary || game.isAvailable)
+        return game.playabilityState === "PLAYABLE" && (game.variants || []).some(variant =>
+            variant.gfnStatus === "AVAILABLE" && variant.playStatus !== "NOT_PLAYABLE" && !variant.stateDetails)
     }
     function favoriteLabel() {
         if (root.contextGame && ShellStore.isFavorite(root.contextGame))
-            return qsTr("Remove from favourites")
-        return qsTr("Add to favourites")
+            return qsTr("Remove from Home")
+        return qsTr("Pin to Home")
     }
     function hideLabel() {
         if (root.contextGame && ShellStore.isHidden(root.contextGame))
@@ -70,7 +71,7 @@ FocusScope {
     }
     function filteredGames() {
         const query = searchQuery.trim().toLocaleLowerCase()
-        const source = ShellStore.catalogGames || []
+        const source = activeFilter === "cloud-favorites" ? ShellStore.remoteFavorites : ShellStore.catalogGames || []
         const result = []
         for (let index = 0; index < source.length; ++index) {
             const game = source[index]
@@ -169,16 +170,49 @@ FocusScope {
         }
     }
 
+    Rectangle {
+        id: catalogNotice
+        objectName: "libraryCompletenessNotice"
+        x: 24
+        y: collectionToolbar.y + collectionToolbar.height + 14
+        width: parent.width - 48
+        height: visible ? Math.max(58, noticeText.implicitHeight + 24) : 0
+        visible: root.activeFilter === "cloud-favorites" || (ShellStore.catalogSource === "account-library" && ShellStore.catalogState !== "ready")
+        radius: 10
+        color: DesktopTokens.surface
+        border.color: DesktopTokens.seam
+        Text {
+            id: noticeText
+            x: 14; y: 12; width: parent.width - noticeAction.width - 42
+            text: root.activeFilter === "cloud-favorites" ? (ShellStore.remoteFavoritesError || qsTr("GeForce NOW favorites may show only part of your favorites. Refresh to check for updates. Home pins are separate.")) : ShellStore.catalogError || (ShellStore.catalogComplete
+                ? qsTr("Refreshing the library. Your last complete library is still shown.")
+                : qsTr("Loading your library. The games shown so far are only part of it."))
+            wrapMode: Text.WordWrap
+            color: DesktopTokens.textMuted
+            font.family: DesktopTokens.bodyFont
+            font.pixelSize: 13
+        }
+        DesktopButton {
+            id: noticeAction
+            anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+            text: root.activeFilter === "cloud-favorites" ? qsTr("Refresh") : ShellStore.catalogNextCursor ? qsTr("Continue") : qsTr("Retry")
+            visible: root.activeFilter === "cloud-favorites" || (ShellStore.catalogRequestId === "" && ShellStore.catalogError !== "")
+            enabled: root.activeFilter !== "cloud-favorites" || ShellStore.remoteFavoritesState !== "loading"
+            onClicked: root.activeFilter === "cloud-favorites" ? ShellStore.refreshCloudFavorites() : ShellStore.continueCatalog()
+        }
+    }
+
     Flow {
         id: filterRow
         x: 24
-        y: collectionToolbar.y + collectionToolbar.height + 14
+        y: catalogNotice.y + catalogNotice.height + (catalogNotice.visible ? 12 : 0)
         width: parent.width - 48
         spacing: 8
         Repeater {
             model: [
                 {key:"all", label:qsTr("All"), count:root.countWhere(function(game) { return !root.isHiddenGame(game) })},
-                {key:"ready", label:qsTr("Ready to play"), count:root.countWhere(root.isReady)},
+                {key:"cloud-favorites", label:qsTr("GeForce NOW favorites"), count:ShellStore.remoteFavorites.length},
+                {key:"ready", label:qsTr("Available versions"), count:root.countWhere(root.isReady)},
                 {key:"rtx", label:"RTX", count:root.countWhere(root.hasRtx)},
                 {key:"controller", label:qsTr("Controller"), count:root.countWhere(root.hasController)},
                 {key:"steam", label:"Steam", count:root.countStore("steam")},

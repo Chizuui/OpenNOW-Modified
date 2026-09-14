@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const SERVICE_NAME: &str = "app.opennow.auth";
 
@@ -24,6 +25,10 @@ pub struct SavedIdentity {
 struct Metadata {
     active_user_id: Option<String>,
     accounts: Vec<SavedIdentity>,
+    #[serde(default)]
+    suppressed: Vec<String>,
+    #[serde(default)]
+    legacy_discarded: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -37,29 +42,66 @@ struct LegacyAuthState {
 
 pub struct CredentialVault {
     metadata_path: PathBuf,
+    store: Box<dyn SecretStore>,
+    warnings: Mutex<std::collections::BTreeMap<String, String>>,
+    suppressed: Mutex<Vec<String>>,
+}
+
+trait SecretStore: Send + Sync {
+    fn get(&self, user_id: &str) -> Result<Option<String>, String>;
+    fn set(&self, user_id: &str, encoded: &str) -> Result<(), String>;
+    fn delete(&self, user_id: &str) -> Result<(), String>;
+}
+
+struct OsSecretStore;
+
+impl SecretStore for OsSecretStore {
+    fn get(&self, user_id: &str) -> Result<Option<String>, String> {
+        match credential(user_id)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("OS credential store is unavailable or locked".into()),
+        }
+    }
+
+    fn set(&self, user_id: &str, encoded: &str) -> Result<(), String> {
+        credential(user_id)?
+            .set_password(encoded)
+            .map_err(|_| "OS credential store could not save the session".into())
+    }
+
+    fn delete(&self, user_id: &str) -> Result<(), String> {
+        match credential(user_id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("OS credential store could not remove the session".into()),
+        }
+    }
 }
 
 impl CredentialVault {
+    #[cfg(test)]
+    pub(crate) fn memory(data_dir: PathBuf) -> Self {
+        let mut vault = Self::new(data_dir);
+        vault.store = Box::<MemorySecretStore>::default();
+        vault
+    }
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             metadata_path: data_dir.join("accounts.json"),
+            store: Box::new(OsSecretStore),
+            warnings: Mutex::new(std::collections::BTreeMap::new()),
+            suppressed: Mutex::new(Vec::new()),
         }
     }
 
     pub fn save(&self, session: &AuthSession) -> Result<(), String> {
         let encoded = serde_json::to_string(session).map_err(|error| error.to_string())?;
-        self.write_session_file(&session.user.user_id, encoded.as_bytes())?;
-        if let Err(error) = credential(&session.user.user_id).and_then(|entry| {
-            entry
-                .set_password(&encoded)
-                .map_err(|error| format!("OS credential store rejected the session: {error}"))
-        }) {
-            eprintln!(
-                "auth: OS credential store skipped ({error}); session kept in the local store"
-            );
+        let mut metadata = self.read_metadata()?;
+        self.store.set(&session.user.user_id, &encoded)?;
+        if self.store.get(&session.user.user_id)?.as_deref() != Some(&encoded) {
+            return Err("OS credential store verification failed".into());
         }
-
-        let mut metadata = self.read_metadata();
+        metadata.suppressed.retain(|id| id != &session.user.user_id);
         metadata.active_user_id = Some(session.user.user_id.clone());
         let identity = SavedIdentity {
             user_id: session.user.user_id.clone(),
@@ -79,20 +121,59 @@ impl CredentialVault {
             metadata.accounts.push(identity);
         }
         self.write_metadata(&metadata)
-            .map_err(|error| format!("Could not save account metadata: {error}"))
+            .map_err(|error| format!("Could not save account metadata: {error}"))?;
+        self.suppressed
+            .lock()
+            .expect("vault suppression poisoned")
+            .retain(|id| id != &session.user.user_id);
+        if let Err(error) = self.remove_session_file(&session.user.user_id) {
+            self.warn(format!("cleanup:{}", session.user.user_id), error);
+        } else {
+            self.clear_warning(&format!("cleanup:{}", session.user.user_id));
+        }
+        self.clear_warning(&format!("migration:{}", session.user.user_id));
+        Ok(())
     }
 
     pub fn migrate_legacy_electron_sessions(&self) -> Result<usize, String> {
-        if !self.read_metadata().accounts.is_empty() {
-            return Ok(0);
+        let metadata = self.read_metadata()?;
+        let mut imported = 0;
+        let mut failures = Vec::new();
+        for user_id in &metadata.suppressed {
+            if let Err(error) = self.remove(user_id) {
+                failures.push(error);
+            }
+        }
+        for user_id in self.discovered_user_ids()? {
+            match self.load(&user_id) {
+                Ok(Some(session)) if self.durable(&session) => imported += 1,
+                Ok(Some(_)) => failures.push("Legacy credential migration is pending".into()),
+                Ok(None) => {}
+                Err(error) => failures.push(error),
+            }
+        }
+        if self.has_discovery_warning() {
+            failures.push("Some legacy credential sources need recovery".into());
+        }
+        if let Some(active) = metadata.active_user_id.as_deref() {
+            if !metadata.suppressed.iter().any(|id| id == active) {
+                self.set_active(active)?;
+            }
         }
         let Some(parent) = self.metadata_path.parent() else {
             return Ok(0);
         };
         let legacy_path = parent.join("auth-state.json");
-        let bytes = match fs::read(&legacy_path) {
+        let bytes = match read_bounded(&legacy_path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return if failures.is_empty() {
+                    self.clear_warning("migration");
+                    Ok(imported)
+                } else {
+                    Err(failures.join("; "))
+                };
+            }
             Err(error) => {
                 return Err(format!(
                     "Could not read the Electron account state: {error}"
@@ -107,33 +188,49 @@ impl CredentialVault {
             return Ok(0);
         }
 
-        let first_user_id = legacy.sessions[0].user.user_id.clone();
-        let mut imported = 0;
         for session in &legacy.sessions {
-            self.save(session)?;
-            imported += 1;
+            if metadata.suppressed.contains(&session.user.user_id)
+                || metadata.legacy_discarded.contains(&session.user.user_id)
+            {
+                continue;
+            }
+            let result = self.store.get(&session.user.user_id).and_then(|stored| {
+                let selected = match stored {
+                    Some(encoded) => decode_session(&encoded, &session.user.user_id)?,
+                    None => session.clone(),
+                };
+                self.save(&selected)
+            });
+            match result {
+                Ok(()) => imported += 1,
+                Err(error) => failures.push(error),
+            }
         }
-        let active = legacy
-            .active_user_id
-            .as_deref()
-            .filter(|user_id| {
-                legacy
-                    .sessions
-                    .iter()
-                    .any(|item| item.user.user_id == *user_id)
-            })
-            .unwrap_or(&first_user_id);
-        self.set_active(active)?;
+        if !failures.is_empty() {
+            self.warn(
+                "migration".into(),
+                "Legacy credential migration is pending; recoverable source data was retained"
+                    .into(),
+            );
+            return Err(failures.join("; "));
+        }
+        if let Some(active) = metadata.active_user_id.or(legacy.active_user_id) {
+            if !metadata.suppressed.contains(&active) {
+                self.set_active(&active)?;
+            }
+        }
+        fs::remove_file(&legacy_path)
+            .map_err(|_| "Legacy credential cleanup is pending".to_owned())?;
+        self.clear_warning("migration");
         Ok(imported)
     }
 
     pub fn load_active(&self) -> Result<Option<AuthSession>, String> {
-        let metadata = self.read_metadata();
-        let candidates = self.discovered_user_ids();
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        let mut last_error = None;
+        let metadata = self.read_metadata()?;
+        let candidates = self.discovered_user_ids()?;
+        let mut last_error = self
+            .has_discovery_warning()
+            .then(|| "Legacy credential sources need recovery".to_owned());
         for user_id in &candidates {
             match self.load(user_id) {
                 Ok(Some(session)) => {
@@ -157,27 +254,99 @@ impl CredentialVault {
     }
 
     pub fn load(&self, user_id: &str) -> Result<Option<AuthSession>, String> {
-        if let Some(session) = self.load_session_file(user_id)? {
-            return Ok(Some(session));
+        if self
+            .suppressed
+            .lock()
+            .expect("vault suppression poisoned")
+            .iter()
+            .any(|id| id == user_id)
+        {
+            return Ok(None);
         }
-        let encoded = match credential(user_id)?.get_password() {
-            Ok(value) => value,
-            Err(keyring::Error::NoEntry) => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "OS credential store could not restore the session: {error}"
-                ));
+        if self
+            .read_metadata()?
+            .suppressed
+            .iter()
+            .any(|id| id == user_id)
+        {
+            return Ok(None);
+        }
+        match self.store.get(user_id) {
+            Ok(Some(encoded)) => {
+                let session = decode_session(&encoded, user_id)?;
+                if self.session_file(user_id).exists() {
+                    if let Err(error) = self.save(&session) {
+                        self.warn(
+                            format!("cleanup:{user_id}"),
+                            format!("Legacy credential cleanup is pending: {error}"),
+                        );
+                    }
+                }
+                self.clear_warning(&format!("migration:{user_id}"));
+                return Ok(Some(session));
             }
-        };
-        let session = decode_session(&encoded, user_id)?;
-        if let Err(error) = self.write_session_file(user_id, encoded.as_bytes()) {
-            eprintln!("auth: could not mirror keychain session to the local store: {error}");
+            Err(error) => {
+                if let Some(session) = self.load_legacy_session(user_id)? {
+                    self.warn(format!("migration:{user_id}"), "Legacy credential migration is pending; this session is not securely persisted".into());
+                    return Ok(Some(session));
+                }
+                return Err(error);
+            }
+            Ok(None) => {}
         }
-        Ok(Some(session))
+        let session = self.load_legacy_session(user_id)?;
+        if let Some(session) = &session {
+            if let Err(error) = self.save(session) {
+                self.warn(
+                    format!("migration:{user_id}"),
+                    format!("Legacy credential migration is pending: {error}"),
+                );
+            }
+        }
+        Ok(session)
+    }
+
+    pub fn durable(&self, session: &AuthSession) -> bool {
+        self.store
+            .get(&session.user.user_id)
+            .ok()
+            .flatten()
+            .is_some_and(|encoded| serde_json::to_string(session).ok().as_deref() == Some(&encoded))
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings
+            .lock()
+            .expect("vault warnings poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn warn(&self, key: String, warning: String) {
+        let mut warnings = self.warnings.lock().expect("vault warnings poisoned");
+        if warnings.len() < 16 || warnings.contains_key(&key) {
+            warnings.insert(key, warning);
+        }
+    }
+
+    fn clear_warning(&self, key: &str) {
+        self.warnings
+            .lock()
+            .expect("vault warnings poisoned")
+            .remove(key);
+    }
+
+    fn has_discovery_warning(&self) -> bool {
+        self.warnings
+            .lock()
+            .expect("vault warnings poisoned")
+            .keys()
+            .any(|key| key.starts_with("source:"))
     }
 
     pub fn list(&self) -> Result<Vec<Value>, String> {
-        self.read_metadata()
+        self.read_metadata()?
             .accounts
             .into_iter()
             .map(|identity| serde_json::to_value(identity).map_err(|error| error.to_string()))
@@ -185,7 +354,7 @@ impl CredentialVault {
     }
 
     pub fn set_active(&self, user_id: &str) -> Result<(), String> {
-        let mut metadata = self.read_metadata();
+        let mut metadata = self.read_metadata()?;
         if !metadata
             .accounts
             .iter()
@@ -199,36 +368,55 @@ impl CredentialVault {
     }
 
     pub fn remove(&self, user_id: &str) -> Result<(), String> {
-        match credential(user_id)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(error) => {
-                return Err(format!(
-                    "OS credential store could not remove the session: {error}"
-                ));
+        self.suppressed
+            .lock()
+            .expect("vault suppression poisoned")
+            .push(user_id.to_owned());
+        let suppression = self.read_metadata().and_then(|mut metadata| {
+            if !metadata.suppressed.iter().any(|id| id == user_id) {
+                metadata.suppressed.push(user_id.to_owned());
             }
+            if !metadata.legacy_discarded.iter().any(|id| id == user_id) {
+                metadata.legacy_discarded.push(user_id.to_owned());
+            }
+            metadata.accounts.retain(|item| item.user_id != user_id);
+            if metadata.active_user_id.as_deref() == Some(user_id) {
+                metadata.active_user_id =
+                    metadata.accounts.first().map(|item| item.user_id.clone());
+            }
+            self.write_metadata(&metadata)
+                .map_err(|error| error.to_string())
+        });
+        let secret = self.store.delete(user_id);
+        let legacy = self.remove_session_file(user_id);
+        let result = suppression.and(secret).and(legacy);
+        if result.is_err() {
+            self.warn(
+                format!("cleanup:{user_id}"),
+                "Removed account credential cleanup is pending".into(),
+            );
+        } else {
+            self.clear_warning(&format!("cleanup:{user_id}"));
+            self.clear_warning(&format!("migration:{user_id}"));
         }
-        let _ = fs::remove_file(self.session_file(user_id));
-        let mut metadata = self.read_metadata();
-        metadata.accounts.retain(|item| item.user_id != user_id);
-        if metadata.active_user_id.as_deref() == Some(user_id) {
-            metadata.active_user_id = metadata.accounts.first().map(|item| item.user_id.clone());
-        }
-        self.write_metadata(&metadata)
-            .map_err(|error| error.to_string())
+        result
     }
 
     pub fn remove_all(&self) -> Result<(), String> {
-        let user_ids = self
-            .read_metadata()
-            .accounts
-            .into_iter()
-            .map(|identity| identity.user_id)
-            .collect::<Vec<_>>();
+        let metadata = self.read_metadata()?;
+        let mut user_ids = self.discovered_user_ids()?;
+        user_ids.extend(metadata.suppressed);
+        let mut failures = Vec::new();
         for user_id in user_ids {
-            self.remove(&user_id)?;
+            if let Err(error) = self.remove(&user_id) {
+                failures.push(error);
+            }
         }
-        self.write_metadata(&Metadata::default())
-            .map_err(|error| error.to_string())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     fn data_dir(&self) -> &Path {
@@ -246,19 +434,16 @@ impl CredentialVault {
             .join(format!("{}.json", sanitize_user_id(user_id)))
     }
 
-    fn write_session_file(&self, user_id: &str, encoded: &[u8]) -> Result<(), String> {
-        let directory = self.sessions_dir();
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("Could not create the local session store: {error}"))?;
-        let path = self.session_file(user_id);
-        let temporary = path.with_extension("json.tmp");
-        write_private_file(&temporary, encoded)
-            .and_then(|_| fs::rename(&temporary, &path))
-            .map_err(|error| format!("Could not write the local session store: {error}"))
+    fn remove_session_file(&self, user_id: &str) -> Result<(), String> {
+        if self.load_session_file(user_id)?.is_none() {
+            return Ok(());
+        }
+        fs::remove_file(self.session_file(user_id))
+            .map_err(|_| "Legacy credential cleanup is pending".into())
     }
 
     fn load_session_file(&self, user_id: &str) -> Result<Option<AuthSession>, String> {
-        let bytes = match fs::read(self.session_file(user_id)) {
+        let bytes = match read_bounded(&self.session_file(user_id)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -270,37 +455,111 @@ impl CredentialVault {
         Ok(Some(decode_session(&encoded, user_id)?))
     }
 
-    fn discovered_user_ids(&self) -> Vec<String> {
-        let mut ids = candidate_user_ids(&self.read_metadata());
-        let Ok(entries) = fs::read_dir(self.sessions_dir()) else {
-            return ids;
+    fn load_legacy_session(&self, user_id: &str) -> Result<Option<AuthSession>, String> {
+        if self
+            .read_metadata()?
+            .legacy_discarded
+            .iter()
+            .any(|id| id == user_id)
+        {
+            return Ok(None);
+        }
+        if let Some(session) = self.load_session_file(user_id)? {
+            return Ok(Some(session));
+        }
+        match read_bounded(&self.data_dir().join("auth-state.json")) {
+            Ok(bytes) => Ok(parse_legacy_auth_state(&bytes)?
+                .sessions
+                .into_iter()
+                .find(|session| session.user.user_id == user_id)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("Legacy account state could not be read".into()),
+        }
+    }
+
+    fn discovered_user_ids(&self) -> Result<Vec<String>, String> {
+        let metadata = self.read_metadata()?;
+        let mut ids = candidate_user_ids(&metadata);
+        self.warnings
+            .lock()
+            .expect("vault warnings poisoned")
+            .retain(|key, _| !key.starts_with("source:"));
+        match read_bounded(&self.data_dir().join("auth-state.json")) {
+            Ok(bytes) => match parse_legacy_auth_state(&bytes) {
+                Ok(legacy) => {
+                    for session in legacy.sessions {
+                        if !ids.contains(&session.user.user_id) {
+                            ids.push(session.user.user_id);
+                        }
+                    }
+                }
+                Err(error) => self.warn("source:legacy".into(), error),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => self.warn(
+                "source:legacy".into(),
+                "Legacy account state could not be read".into(),
+            ),
+        }
+        ids.retain(|id| !metadata.suppressed.contains(id));
+        let entries = match fs::read_dir(self.sessions_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ids),
+            Err(_) => {
+                self.warn(
+                    "source:directory".into(),
+                    "Legacy session directory could not be read".into(),
+                );
+                return Ok(ids);
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.warn(
+                        "source:directory".into(),
+                        "Legacy session entry could not be read".into(),
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
+            let session = match read_bounded(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<AuthSession>(&bytes).ok())
+            {
+                Some(session) => session,
+                None => {
+                    self.warn(format!("source:{}", path.display()), "A legacy credential file is invalid or unavailable; it was retained for recovery".into());
+                    continue;
+                }
             };
-            let Ok(session) = serde_json::from_slice::<AuthSession>(&bytes) else {
-                continue;
-            };
-            if session.user.user_id.is_empty() {
+            if session.user.user_id.is_empty() || self.session_file(&session.user.user_id) != path {
+                self.warn(
+                    format!("source:{}", path.display()),
+                    "Legacy credential filename does not match its identity".into(),
+                );
                 continue;
             }
             if !ids.iter().any(|id| id == &session.user.user_id) {
                 ids.push(session.user.user_id);
             }
         }
-        ids
+        ids.retain(|id| !metadata.suppressed.contains(id));
+        Ok(ids)
     }
 
-    fn read_metadata(&self) -> Metadata {
-        fs::read_to_string(&self.metadata_path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    fn read_metadata(&self) -> Result<Metadata, String> {
+        match read_bounded(&self.metadata_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| "Account metadata is invalid; recovery is required".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Metadata::default()),
+            Err(_) => Err("Account metadata could not be read; recovery is required".into()),
+        }
     }
 
     fn write_metadata(&self, metadata: &Metadata) -> io::Result<()> {
@@ -312,8 +571,58 @@ impl CredentialVault {
         let temporary = self.metadata_path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(metadata).map_err(io::Error::other)?;
         write_private_file(&temporary, &data)?;
-        fs::rename(temporary, &self.metadata_path)
+        fs::rename(temporary, &self.metadata_path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MemorySecretStore {
+    values: Mutex<std::collections::HashMap<String, String>>,
+    unavailable: bool,
+    fail_user: Option<String>,
+}
+
+#[cfg(test)]
+impl SecretStore for MemorySecretStore {
+    fn get(&self, user_id: &str) -> Result<Option<String>, String> {
+        if self.unavailable || self.fail_user.as_deref() == Some(user_id) {
+            return Err("locked".into());
+        }
+        Ok(self.values.lock().unwrap().get(user_id).cloned())
+    }
+    fn set(&self, user_id: &str, encoded: &str) -> Result<(), String> {
+        if self.unavailable || self.fail_user.as_deref() == Some(user_id) {
+            return Err("locked".into());
+        }
+        self.values
+            .lock()
+            .unwrap()
+            .insert(user_id.into(), encoded.into());
+        Ok(())
+    }
+    fn delete(&self, user_id: &str) -> Result<(), String> {
+        if self.unavailable || self.fail_user.as_deref() == Some(user_id) {
+            return Err("locked".into());
+        }
+        self.values.lock().unwrap().remove(user_id);
+        Ok(())
+    }
+}
+
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(io::Error::other("Account document exceeds size limit"));
+    }
+    Ok(bytes)
 }
 
 fn sanitize_user_id(user_id: &str) -> String {
@@ -330,8 +639,11 @@ fn sanitize_user_id(user_id: &str) -> String {
 }
 
 fn decode_session(encoded: &str, user_id: &str) -> Result<AuthSession, String> {
+    if encoded.len() > 4 * 1024 * 1024 || user_id.trim().is_empty() {
+        return Err("Saved credential exceeds size or identity limits".into());
+    }
     let session = serde_json::from_str::<AuthSession>(encoded)
-        .map_err(|error| format!("Saved session is invalid: {error}"))?;
+        .map_err(|_| "Saved session is invalid".to_owned())?;
     if session.user.user_id != user_id {
         return Err("Saved credential identity does not match account metadata".to_owned());
     }
@@ -360,18 +672,29 @@ fn candidate_user_ids(metadata: &Metadata) -> Vec<String> {
 
 fn parse_legacy_auth_state(bytes: &[u8]) -> Result<LegacyAuthState, String> {
     let mut legacy = serde_json::from_slice::<LegacyAuthState>(bytes)
-        .map_err(|error| format!("Electron account state is invalid: {error}"))?;
-    if legacy.sessions.is_empty() {
-        if let Some(session) = legacy.session.take() {
-            legacy.sessions.push(session);
-        }
+        .map_err(|_| "Legacy account state is invalid".to_owned())?;
+    if let Some(session) = legacy.session.take() {
+        legacy.sessions.push(session);
+    }
+    if legacy
+        .sessions
+        .iter()
+        .any(|session| session.user.user_id.trim().is_empty())
+    {
+        return Err("Legacy account identity is invalid".into());
     }
     legacy
         .sessions
-        .retain(|session| !session.user.user_id.trim().is_empty());
-    legacy
-        .sessions
         .sort_by(|left, right| left.user.user_id.cmp(&right.user.user_id));
+    for pair in legacy.sessions.windows(2) {
+        if pair[0].user.user_id == pair[1].user.user_id
+            && serde_json::to_value(&pair[0]).ok() != serde_json::to_value(&pair[1]).ok()
+        {
+            return Err(
+                "Legacy account state contains conflicting grants; recovery is required".into(),
+            );
+        }
+    }
     legacy
         .sessions
         .dedup_by(|left, right| left.user.user_id == right.user.user_id);
@@ -407,6 +730,214 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn secure_restore_survives_failed_legacy_cleanup_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        let session = sample_session("selected");
+        vault.save(&session).unwrap();
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        let mut legacy = session.clone();
+        legacy.tokens.access_token = "superseded-legacy-grant".into();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(vault.session_file("selected"), &legacy_bytes).unwrap();
+        let blocked_metadata = directory.path().join("accounts.json.tmp");
+        fs::create_dir(&blocked_metadata).unwrap();
+
+        let restored = vault.load_active().unwrap().unwrap();
+        assert_eq!(restored.tokens.access_token, session.tokens.access_token);
+        assert_eq!(
+            fs::read(vault.session_file("selected")).unwrap(),
+            legacy_bytes
+        );
+        assert!(!vault.warnings().is_empty());
+
+        fs::remove_dir(blocked_metadata).unwrap();
+        let restored = vault.load_active().unwrap().unwrap();
+        assert_eq!(restored.tokens.access_token, session.tokens.access_token);
+        assert!(!vault.session_file("selected").exists());
+        assert!(vault.warnings().is_empty());
+    }
+
+    #[test]
+    fn migration_preserves_selection_and_conflicting_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        vault.save(&sample_session("selected")).unwrap();
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        fs::write(
+            vault.session_file("later"),
+            serde_json::to_vec(&sample_session("later")).unwrap(),
+        )
+        .unwrap();
+        vault.migrate_legacy_electron_sessions().unwrap();
+        assert_eq!(
+            vault.load_active().unwrap().unwrap().user.user_id,
+            "selected"
+        );
+        let mut other = sample_session("selected");
+        other.tokens.access_token = "other-grant".into();
+        let bytes =
+            serde_json::to_vec(&json!({"sessions":[sample_session("selected")],"session":other}))
+                .unwrap();
+        let source = directory.path().join("auth-state.json");
+        fs::write(&source, &bytes).unwrap();
+        assert!(vault.migrate_legacy_electron_sessions().is_err());
+        assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn damaged_legacy_sources_do_not_strand_other_restorable_accounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        vault.save(&sample_session("selected")).unwrap();
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        fs::write(vault.session_file("damaged"), "invalid credential").unwrap();
+        fs::write(
+            vault.session_file("recoverable"),
+            serde_json::to_vec(&sample_session("recoverable")).unwrap(),
+        )
+        .unwrap();
+        assert!(vault.migrate_legacy_electron_sessions().is_err());
+        assert_eq!(
+            vault.load_active().unwrap().unwrap().user.user_id,
+            "selected"
+        );
+        assert!(vault.durable(&sample_session("recoverable")));
+        assert!(vault.session_file("damaged").exists());
+        fs::write(
+            directory.path().join("auth-state.json"),
+            "damaged legacy document",
+        )
+        .unwrap();
+        assert_eq!(
+            vault.load_active().unwrap().unwrap().user.user_id,
+            "selected"
+        );
+        assert!(vault.has_discovery_warning());
+    }
+
+    #[test]
+    fn unavailable_store_retains_legacy_data_and_new_saves_write_no_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut vault = CredentialVault::memory(directory.path().into());
+        vault.store = Box::new(MemorySecretStore {
+            unavailable: true,
+            ..Default::default()
+        });
+        let session = sample_session("legacy");
+        let legacy = serde_json::to_vec(&json!({"sessions":[session]})).unwrap();
+        let source = directory.path().join("auth-state.json");
+        fs::write(&source, &legacy).unwrap();
+        assert!(vault.migrate_legacy_electron_sessions().is_err());
+        assert_eq!(vault.load_active().unwrap().unwrap().user.user_id, "legacy");
+        assert_eq!(fs::read(&source).unwrap(), legacy);
+        assert!(vault.save(&sample_session("new")).is_err());
+        assert!(!directory.path().join("sessions").exists());
+        assert!(!directory.path().join("accounts.json").exists());
+        vault.store = Box::<MemorySecretStore>::default();
+        assert!(vault.migrate_legacy_electron_sessions().unwrap() > 0);
+        assert!(!source.exists());
+        assert!(vault.warnings().is_empty());
+        assert_eq!(vault.load_active().unwrap().unwrap().user.user_id, "legacy");
+        assert_eq!(vault.migrate_legacy_electron_sessions().unwrap(), 1);
+    }
+
+    #[test]
+    fn partial_migration_keeps_source_and_does_not_skip_later_accounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut vault = CredentialVault::memory(directory.path().into());
+        vault.store = Box::new(MemorySecretStore {
+            fail_user: Some("b".into()),
+            ..Default::default()
+        });
+        vault.save(&sample_session("existing")).unwrap();
+        let source = directory.path().join("auth-state.json");
+        let bytes = serde_json::to_vec(
+            &json!({"sessions":[sample_session("a"),sample_session("b"),sample_session("c")]}),
+        )
+        .unwrap();
+        fs::write(&source, &bytes).unwrap();
+        assert!(vault.migrate_legacy_electron_sessions().is_err());
+        assert!(vault.durable(&sample_session("a")));
+        assert!(vault.durable(&sample_session("c")));
+        assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn valid_secure_entry_wins_and_metadata_failure_preserves_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        let session = sample_session("user");
+        vault.save(&session).unwrap();
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        let mut stale = session.clone();
+        stale.tokens.access_token = "obsolete".into();
+        let source = vault.session_file("user");
+        fs::write(&source, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(
+            vault.load("user").unwrap().unwrap().tokens.access_token,
+            "access"
+        );
+        assert!(!source.exists());
+        fs::write(&source, serde_json::to_vec(&stale).unwrap()).unwrap();
+        fs::write(directory.path().join("accounts.json"), "corrupt metadata").unwrap();
+        assert!(vault.save(&session).is_err());
+        assert!(vault.list().is_err());
+        assert!(source.exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("accounts.json")).unwrap(),
+            "corrupt metadata"
+        );
+    }
+
+    #[test]
+    fn failed_deletion_is_suppressed_and_old_legacy_grants_never_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut vault = CredentialVault::memory(directory.path().into());
+        let session = sample_session("user");
+        vault.save(&session).unwrap();
+        fs::write(
+            directory.path().join("auth-state.json"),
+            serde_json::to_vec(&json!({"sessions":[session]})).unwrap(),
+        )
+        .unwrap();
+        vault.store = Box::new(MemorySecretStore {
+            unavailable: true,
+            ..Default::default()
+        });
+        assert!(vault.remove("user").is_err());
+        assert!(vault.load_active().unwrap().is_none());
+        assert!(!vault.warnings().is_empty());
+        vault.store = Box::<MemorySecretStore>::default();
+        vault.remove("user").unwrap();
+        assert!(vault.warnings().is_empty());
+        let mut restarted = CredentialVault::memory(directory.path().into());
+        assert!(restarted.load("user").unwrap().is_none());
+        restarted.save(&sample_session("user")).unwrap();
+        restarted.store = Box::new(MemorySecretStore {
+            unavailable: true,
+            ..Default::default()
+        });
+        assert!(restarted.load("user").is_err());
+    }
+
+    #[test]
+    fn mismatched_legacy_identity_is_not_imported_or_deleted() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        let source = vault.session_file("other-user");
+        fs::write(
+            &source,
+            serde_json::to_vec(&sample_session("real-user")).unwrap(),
+        )
+        .unwrap();
+        assert!(vault.migrate_legacy_electron_sessions().is_err());
+        assert!(source.exists());
+        assert!(vault.load("other-user").is_err());
+    }
+
     fn sample_identity(user_id: &str) -> SavedIdentity {
         SavedIdentity {
             user_id: user_id.to_owned(),
@@ -421,7 +952,7 @@ mod tests {
     #[test]
     fn missing_metadata_has_no_active_session() {
         let path = std::env::temp_dir().join(format!("opennow-vault-{}", std::process::id()));
-        let vault = CredentialVault::new(path.clone());
+        let vault = CredentialVault::memory(path.clone());
         assert!(vault.load_active().unwrap().is_none());
         let _ = fs::remove_dir_all(path);
     }
@@ -445,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_roundtrip_uses_local_session_file() {
+    fn save_and_load_roundtrip_uses_secure_store_without_plaintext_mirror() {
         let path = std::env::temp_dir().join(format!(
             "opennow-vault-file-{}-{}",
             std::process::id(),
@@ -455,14 +986,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&path).unwrap();
-        let vault = CredentialVault::new(path.clone());
+        let vault = CredentialVault::memory(path.clone());
         vault.save(&sample_session("user-file")).unwrap();
         let loaded = vault
             .load_active()
             .unwrap()
-            .expect("session file should restore");
+            .expect("secure session should restore");
         assert_eq!(loaded.user.user_id, "user-file");
-        assert!(path.join("sessions").join("user-file.json").exists());
+        assert!(!path.join("sessions").join("user-file.json").exists());
+        assert!(
+            !fs::read_to_string(path.join("accounts.json"))
+                .unwrap()
+                .contains("accessToken")
+        );
         let _ = fs::remove_dir_all(path);
     }
 
@@ -477,14 +1013,16 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&path).unwrap();
-        let vault = CredentialVault::new(path.clone());
+        let vault = CredentialVault::memory(path.clone());
         vault
             .write_metadata(&Metadata {
                 active_user_id: None,
                 accounts: vec![sample_identity("user-a"), sample_identity("user-b")],
+                suppressed: Vec::new(),
+                legacy_discarded: Vec::new(),
             })
             .unwrap();
-        let metadata = vault.read_metadata();
+        let metadata = vault.read_metadata().unwrap();
         assert_eq!(metadata.active_user_id, None);
         assert_eq!(metadata.accounts.len(), 2);
         assert_eq!(

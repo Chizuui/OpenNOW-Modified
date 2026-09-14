@@ -29,7 +29,7 @@ FocusScope {
     }
 
     function regionStatusText() {
-        const selected = String(ShellStore.settings.region || "")
+        const selected = String(ShellStore.selectedRegion || "")
         if (selected === "")
             return qsTr("AUTO REGION")
         const regions = ShellStore.regions || []

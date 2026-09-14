@@ -18,6 +18,22 @@ QtObject {
     property int catalogTotalCount: 1
     property int launchCount: 0
     property int detailsCount: 0
+    property var selectedLaunchDecision: ({status:"ready",message:""})
+    property bool cloudMutationBusy: false
+    property string cloudMutationState: "idle"
+    property string cloudMutationMessage: ""
+    property var ownershipConfirmation: null
+    property var remoteFavorites: []
+    property string remoteFavoritesError: ""
+    function selectedGameActionLabel() { return "Play" }
+    function activateSelectedGame() { launchSelectedGame() }
+    function isCloudFavorite(game) { return false }
+    function toggleCloudFavorite(game) {}
+    function requestOwnershipConfirmation(action) {}
+    function confirmOwnership() {}
+    function selectPreferredVariant() {}
+    function refreshSelectedMetadata() {}
+    function refreshCloudFavorites() {}
 
     function focusIndex(route) { return 0 }
     function rememberFocus(route, index) {}

@@ -8,6 +8,7 @@ FocusScope {
     property int platformIndex: 0
     property int genreIndex: 0
     property int sortIndex: 0
+    property bool cloudFavoritesOnly: false
     readonly property real posterFactor: Math.max(0.75, Math.min(1.5,
         Number(ShellStore.settings.posterSizeScale || 1.05))) / 1.05
     readonly property var platformOptions: {
@@ -44,8 +45,9 @@ FocusScope {
         const platform = root.platformOptions[root.platformIndex].toLowerCase()
         const genre = root.genreOptions[Math.min(root.genreIndex, root.genreOptions.length - 1)]
         const filtered = []
-        for (let index = 0; index < ShellStore.catalogGames.length; ++index) {
-            const game = ShellStore.catalogGames[index]
+        const source = cloudFavoritesOnly ? ShellStore.remoteFavorites : ShellStore.catalogGames
+        for (let index = 0; index < source.length; ++index) {
+            const game = source[index]
             const searchText = String(game.searchText || game.title || "").toLowerCase()
             const stores = (game.availableStores || []).map(store => String(store).toLowerCase())
             const genres = game.genres || []
@@ -126,6 +128,21 @@ FocusScope {
     }
 
     ScreenBackground { tint: "#354016" }
+    Row {
+        x: 150; y: 58; spacing: 12
+        GlassButton {
+            width: 330; height: 42
+            text: root.cloudFavoritesOnly ? qsTr("Show all library games") : qsTr("GeForce NOW favorites")
+            onClicked: { root.cloudFavoritesOnly = !root.cloudFavoritesOnly; if (root.cloudFavoritesOnly) ShellStore.refreshCloudFavorites() }
+        }
+        Text {
+            width: 780; anchors.verticalCenter: parent.verticalCenter
+            visible: root.cloudFavoritesOnly
+            text: ShellStore.remoteFavoritesError || qsTr("Favorites coverage is partial or unknown. Home pins are separate.")
+            color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: 16
+            wrapMode: Text.WordWrap
+        }
+    }
 
     GlassPanel {
         x: 120; y: 108
@@ -306,6 +323,21 @@ FocusScope {
                 onClicked: ShellStore.toggleFavorite(root.selectedGame)
             }
             GlassButton { id: detailsButton; width: parent.width; text: qsTr("Details"); glyph: "X"; enabled: root.selectedGame !== null; onClicked: ShellStore.openGame(root.selectedGame) }
+            Text {
+                width: parent.width
+                visible: ShellStore.catalogSource === "account-library" && ShellStore.catalogState !== "ready"
+                text: ShellStore.catalogError || qsTr("The library refresh is incomplete. Your available games are still shown.")
+                wrapMode: Text.WordWrap
+                color: Theme.textMuted
+                font.family: Theme.bodyFont
+                font.pixelSize: 14
+            }
+            GlassButton {
+                width: parent.width
+                visible: ShellStore.catalogError !== ""
+                text: ShellStore.catalogNextCursor ? qsTr("Continue") : qsTr("Retry")
+                onClicked: ShellStore.continueCatalog()
+            }
         }
     }
 

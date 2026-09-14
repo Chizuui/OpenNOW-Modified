@@ -69,6 +69,13 @@ Replace `conflict` with `unavailable` to check the session-limit retry screen, o
 `--desktop` with `--console`. These fixtures use synthetic sessions and do not connect
 to NVIDIA or prove live resume behavior.
 
+Use `finished` or `not-found` to inject an authoritative terminal response after a
+native error and an exhausted recovery episode. Both fixtures must clear the active
+seat, return to game detail, and leave no claim pending. The recovery protocol tests
+separately verify that authentication errors and transport EOF do not count as a
+normal session end. Capture terminal cases at 960×640 and 1600×900 with the same
+`--smoke-width`, `--smoke-height`, and `--screenshot` options.
+
 With an authorized account, disconnect from a game without ending its cloud session,
 restart OpenNOW, and select Play for the same game. Check that OpenNOW reconnects
 without asking to create another session. Select a different game and verify that

@@ -1,20 +1,22 @@
 use crate::gfn::ServiceError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const FRESHNESS: Duration = Duration::from_secs(5 * 60);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
 struct Entry {
-    scope: [u8; 32],
-    vpc_id: String,
+    result: Result<String, ServiceError>,
     expires: Instant,
 }
 
+type ScopeEntry = Arc<Mutex<Option<Entry>>>;
+
 #[derive(Default)]
-pub struct ServerVpcCache(Mutex<Option<Entry>>);
+pub struct ServerVpcCache(Mutex<HashMap<[u8; 32], ScopeEntry>>);
 
 impl ServerVpcCache {
     pub fn resolve(
@@ -25,32 +27,53 @@ impl ServerVpcCache {
         fetch: impl FnOnce() -> Result<Option<String>, ServiceError>,
     ) -> Result<String, ServiceError> {
         let scope = Sha256::digest(json!([provider, account, token]).to_string().as_bytes()).into();
-        let mut cached = crate::store_requests::lock(&self.0)?;
+        let slot = {
+            let mut entries = crate::store_requests::lock(&self.0)?;
+            if !entries.contains_key(&scope) && entries.len() >= 16 {
+                entries.retain(|_, entry| Arc::strong_count(entry) > 1);
+                if entries.len() >= 16 {
+                    return Err(ServiceError {
+                        code: "routing_busy",
+                        message: "Too many provider lookups are in progress".into(),
+                    });
+                }
+            }
+            entries.entry(scope).or_default().clone()
+        };
+        let mut cached = crate::store_requests::lock(&slot)?;
         if let Some(entry) = cached
             .as_ref()
-            .filter(|entry| entry.scope == scope && entry.expires > Instant::now())
+            .filter(|entry| entry.expires > Instant::now())
         {
-            return Ok(entry.vpc_id.clone());
+            return entry.result.clone();
         }
-        let result = fetch()?;
+        let result = fetch().and_then(|value| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ServiceError {
+                    code: "invalid_upstream_response",
+                    message: "Server info did not include a verified VPC".into(),
+                })
+        });
         crate::requests::check()?;
-        let (vpc_id, freshness) = match result.filter(|value| !value.is_empty()) {
-            Some(value) => (value, FRESHNESS),
-            None => (
-                cached
-                    .as_ref()
-                    .filter(|entry| entry.scope == scope)
-                    .map(|entry| entry.vpc_id.clone())
-                    .unwrap_or_else(|| "GFN-PC".into()),
-                FAILURE_BACKOFF,
-            ),
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.code,
+                "http_unauthorized" | "rate_limited" | "cancelled" | "stale_account"
+            )
+        }) {
+            return result;
+        }
+        let freshness = if result.is_ok() {
+            FRESHNESS
+        } else {
+            FAILURE_BACKOFF
         };
         *cached = Some(Entry {
-            scope,
-            vpc_id: vpc_id.clone(),
+            result: result.clone(),
             expires: Instant::now() + freshness,
         });
-        Ok(vpc_id)
+        result
     }
 }
 
@@ -61,6 +84,37 @@ mod tests {
         Arc, Barrier,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn only_entry(cache: &ServerVpcCache) -> Arc<Mutex<Option<Entry>>> {
+        cache.0.lock().unwrap().values().next().unwrap().clone()
+    }
+
+    #[test]
+    fn unrelated_provider_lookup_does_not_wait_for_an_inflight_scope() {
+        let cache = ServerVpcCache::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let first = threads.spawn(|| {
+                cache.resolve("provider-a", "account-a", "token-a", move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(Some("vpc-a".into()))
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                cache
+                    .resolve("provider-b", "account-b", "token-b", || Ok(Some(
+                        "vpc-b".into()
+                    )))
+                    .unwrap(),
+                "vpc-b"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap().unwrap(), "vpc-a");
+        });
+    }
 
     #[test]
     fn concurrent_lookups_share_one_fetch_and_reuse_it_for_five_minutes() {
@@ -95,7 +149,8 @@ mod tests {
                 .unwrap(),
             "region-a"
         );
-        let mut cached = cache.0.lock().unwrap();
+        let slot = only_entry(&cache);
+        let mut cached = slot.lock().unwrap();
         let entry = cached.as_mut().unwrap();
         assert!(entry.expires >= started + FRESHNESS);
         assert!(entry.expires <= Instant::now() + FRESHNESS);
@@ -136,10 +191,12 @@ mod tests {
     #[test]
     fn failures_preserve_known_metadata_with_a_short_retry_backoff() {
         let cache = ServerVpcCache::default();
-        assert_eq!(cache.resolve("p", "a", "t", || Ok(None)).unwrap(), "GFN-PC");
+        assert_eq!(
+            cache.resolve("p", "a", "t", || Ok(None)).unwrap_err().code,
+            "invalid_upstream_response"
+        );
         assert!(
-            cache
-                .0
+            only_entry(&cache)
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -152,19 +209,27 @@ mod tests {
             .resolve("p", "a", "t", || {
                 panic!("failed lookup retried immediately")
             })
-            .unwrap();
-        cache.0.lock().unwrap().as_mut().unwrap().expires = Instant::now() - Duration::from_secs(1);
+            .unwrap_err();
+        only_entry(&cache).lock().unwrap().as_mut().unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
         assert_eq!(
             cache
                 .resolve("p", "a", "t", || Ok(Some("known".into())))
                 .unwrap(),
             "known"
         );
-        cache.0.lock().unwrap().as_mut().unwrap().expires = Instant::now() - Duration::from_secs(1);
-        assert_eq!(cache.resolve("p", "a", "t", || Ok(None)).unwrap(), "known");
+        only_entry(&cache).lock().unwrap().as_mut().unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
         assert_eq!(
-            cache.resolve("other", "a", "t", || Ok(None)).unwrap(),
-            "GFN-PC"
+            cache.resolve("p", "a", "t", || Ok(None)).unwrap_err().code,
+            "invalid_upstream_response"
+        );
+        assert_eq!(
+            cache
+                .resolve("other", "a", "t", || Ok(None))
+                .unwrap_err()
+                .code,
+            "invalid_upstream_response"
         );
     }
 
@@ -180,7 +245,7 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, "rate_limited");
-        assert!(cache.0.lock().unwrap().is_none());
+        assert!(only_entry(&cache).lock().unwrap().is_none());
         assert_eq!(
             cache
                 .resolve("p", "a", "t", || Ok(Some("recovered".into())))
@@ -206,7 +271,7 @@ mod tests {
                 "cancelled"
             );
             let held = cache.0.lock().unwrap();
-            assert!(held.is_none());
+            assert!(held.values().all(|entry| entry.lock().unwrap().is_none()));
             assert_eq!(
                 cache
                     .resolve("p", "a", "t", || panic!("cancelled fetch started"))

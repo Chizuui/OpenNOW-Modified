@@ -6,6 +6,7 @@ FocusScope {
     id: root
     readonly property var selectedAccount: accountList.currentIndex >= 0 && accountList.currentIndex < ShellStore.gameAccounts.length
         ? ShellStore.gameAccounts[accountList.currentIndex] : null
+    readonly property string primaryAction: ShellStore.gameAccountAction(selectedAccount)
 
     ScreenBackground { tint: "#162237" }
 
@@ -68,26 +69,31 @@ FocusScope {
             Text { width: parent.width; text: ShellStore.gameAccountMessage || (root.selectedAccount && root.selectedAccount.isConnected ? qsTr("Your linked library is managed by NVIDIA.") : qsTr("Connect this store in your browser, then return to OpenNOW.")); color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: 15; wrapMode: Text.WordWrap; lineHeight: 1.2 }
             GlassButton {
                 id: actionButton; width: parent.width; glyph: "A"; primary: true
-                enabled: root.selectedAccount && (root.selectedAccount.supportsLinking || root.selectedAccount.supportsSync)
-                text: root.selectedAccount && root.selectedAccount.isConnected
-                      ? (root.selectedAccount.supportsSync ? qsTr("Sync library") : qsTr("Connected"))
-                      : qsTr("Connect account")
+                enabled: !ShellStore.syncOperation && root.primaryAction !== "none"
+                danger: root.primaryAction === "unlink"
+                text: root.primaryAction === "sync" ? qsTr("Sync library")
+                    : root.primaryAction === "unlink" ? qsTr("Disconnect")
+                    : root.selectedAccount && root.selectedAccount.isConnected ? qsTr("Reconnect") : qsTr("Connect account")
                 onClicked: {
                     if (!root.selectedAccount)
                         return
-                    if (root.selectedAccount.isConnected)
+                    if (root.primaryAction === "sync")
                         ShellStore.syncGameAccount(root.selectedAccount.provider)
-                    else
+                    else if (root.primaryAction === "link")
                         ShellStore.startAccountLink(root.selectedAccount.provider)
+                    else if (root.primaryAction === "unlink")
+                        ShellStore.unlinkGameAccount(root.selectedAccount.provider)
                 }
                 Component.onCompleted: forceActiveFocus()
             }
             GlassButton {
                 width: parent.width; glyph: "X"; danger: true; text: qsTr("Disconnect")
+                visible: root.primaryAction !== "unlink"
                 enabled: root.selectedAccount && root.selectedAccount.isConnected && root.selectedAccount.supportsLinking
                 onClicked: ShellStore.unlinkGameAccount(root.selectedAccount.provider)
             }
             GlassButton { width: parent.width; glyph: "↻"; text: qsTr("Refresh status"); onClicked: ShellStore.refreshGameAccounts() }
+            GlassButton { width: parent.width; visible: ShellStore.syncOperation !== null; text: qsTr("Stop waiting"); onClicked: ShellStore.cancelSyncObservation() }
             GlassButton { width: parent.width; glyph: "B"; text: qsTr("Back to settings"); onClicked: AppController.navigate("settings-account") }
         }
     }

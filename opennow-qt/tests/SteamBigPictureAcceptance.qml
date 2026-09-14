@@ -20,6 +20,12 @@ QtObject {
         function cancel(id) { return true }
     }
     function check(ok, message) { if (!ok) throw new Error("Steam Big Picture: " + message) }
+    function inspect() {
+        const id = ShellStore.launchInspectRequestId
+        check(id !== "", "launch inspection is required")
+        const pending = ShellStore.pendingLaunchParams
+        client.responseReceived(id, {appId:pending.catalogAppId,variantId:pending.variantId,game:ShellStore.selectedGame,decision:{status:"ready"}})
+    }
     function find(item, name) {
         if (item.objectName === name) return item
         for (const child of item.children || []) {
@@ -54,7 +60,7 @@ QtObject {
 
         ShellStore.nativeRuntimeReady = true
         ShellStore.authSession = {accountId:"fixture"}
-        ShellStore.selectedGame = {title:"Fixture", launchAppId:"12345", variants:[]}
+        ShellStore.selectedGame = {id:"fixture-parent",title:"Fixture", launchAppId:"12345", variants:[{id:"12345",store:"STEAM",libraryStatus:"MANUAL",librarySelected:true,inLibrary:true}]}
         for (const enabled of [undefined, false, true, false]) {
             for (const controller of [false, true]) {
                 for (const consoleMode of [false, true]) {
@@ -65,11 +71,13 @@ QtObject {
                             launchInConsoleMode:consoleMode
                         }
                         ShellStore.launchSelectedGame(directConsoleMode)
+                        inspect()
                         const request = client.calls[client.calls.length - 1]
                         check(request.method === "session.remote.list", "launch checks existing sessions first")
                         check(request.params.appLaunchMode === (enabled === true ? "gamepadFriendly" : "default"),
                             "only explicit Big Picture opt-in selects gamepad-friendly mode")
                         client.responseReceived(request.id, {sessions:[]})
+                        inspect()
                         const create = client.calls[client.calls.length - 1]
                         check(create.method === "session.create" && create.params.appLaunchMode === request.params.appLaunchMode,
                             "session creation preserves the selected launch mode")

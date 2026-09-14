@@ -1490,6 +1490,21 @@ fn validate_context(context: &SessionContext, id: &str) -> Result<(), Value> {
         ));
     }
     if let Some(profile) = context.session.extra.get("negotiatedStreamProfile") {
+        let color_reported = ["bitDepthSource", "chromaFormatSource"].iter().any(|key| {
+            matches!(
+                profile[*key].as_str(),
+                Some("request" | "finalized" | "server")
+            )
+        });
+        if (color_reported && profile["colorQuality"].as_str().is_none())
+            || (profile["enableHdrSource"] == "server" && profile["enableHdr"].as_bool().is_none())
+        {
+            return Err(error(
+                Some(id),
+                "invalid-context",
+                "The accepted color or HDR profile is incomplete or unsupported",
+            ));
+        }
         let codec = profile["codec"]
             .as_str()
             .unwrap_or_default()
@@ -2065,10 +2080,14 @@ fn emit_nvst_terminal<R: NvstSessionResources>(
     }
     resources.stop();
     opennow_streamer_protocol::log::log_line("WARN", "transport", &format!("{code}: {message}"));
-    let _ = output.send(event("error", json!({ "code": code, "message": &message })));
+    let termination = json!({"source":"nvst-transport","code":code,"resumable":null});
+    let _ = output.send(event(
+        "error",
+        json!({ "code": code, "message": &message, "termination": &termination }),
+    ));
     let _ = output.send(event(
         "status",
-        json!({ "status": "stopped", "message": message }),
+        json!({ "status": "stopped", "message": message, "termination": termination }),
     ));
     true
 }
@@ -3783,6 +3802,13 @@ mod tests {
         assert!(events.iter().any(|message| {
             message["type"] == "error" && message["code"] == "nvst-recovery-exhausted"
         }));
+        for message in &events {
+            if matches!(message["type"].as_str(), Some("error" | "status")) {
+                assert_eq!(message["termination"]["source"], "nvst-transport");
+                assert_eq!(message["termination"]["code"], "nvst-recovery-exhausted");
+                assert!(message["termination"]["resumable"].is_null());
+            }
+        }
         assert!(
             events
                 .iter()
@@ -3876,6 +3902,34 @@ mod tests {
                 validate_context(&context, "valid-color").is_ok(),
                 "{codec} {color}"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_accepted_color_is_not_replaced_by_local_settings() {
+        let mut value = synthetic_context("invalid-accepted-color", json!([]));
+        value["settings"]["colorQuality"] = json!("10bit_444");
+        value["session"]["negotiatedStreamProfile"] = json!({
+            "codec":"H265", "colorQuality":null, "bitDepthSource":"finalized"
+        });
+        let context: SessionContext = serde_json::from_value(value).unwrap();
+        assert!(validate_context(&context, "color").is_err());
+    }
+
+    #[test]
+    fn accepted_color_maps_to_native_decode_depth_and_chroma() {
+        for (color, expected) in [
+            ("8bit_420", MediaColorQuality::EightBit420),
+            ("10bit_420", MediaColorQuality::TenBit420),
+            ("10bit_444", MediaColorQuality::TenBit444),
+        ] {
+            let mut value = synthetic_context("accepted-color", json!([]));
+            value["settings"]["colorQuality"] = json!("8bit_420");
+            value["session"]["negotiatedStreamProfile"] =
+                json!({"codec":"H265","colorQuality":color});
+            let context: SessionContext = serde_json::from_value(value).unwrap();
+            assert!(validate_context(&context, "color").is_ok());
+            assert_eq!(media_stream_config(&context).color_quality, expected);
         }
     }
 

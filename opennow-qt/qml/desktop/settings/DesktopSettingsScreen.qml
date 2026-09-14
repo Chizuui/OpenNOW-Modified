@@ -54,36 +54,24 @@ FocusScope {
     }
 
     function valueSetting(key, fallbackValue) {
+        if (key === "region") return ShellStore.selectedRegion
         const value = ShellStore.settings[key]
         return value === undefined || value === null || value === "" ? fallbackValue : value
     }
 
     function setSetting(key, value) {
-        ShellStore.applySetting(key, value)
+        if (!ShellStore.settingsOwnerState.ownsConfirmedSetting(key))
+            ShellStore.applySetting(key, value)
         ShellStore.setSetting(key, value)
         if (key === "resolution")
             Qt.callLater(root.clampFpsToEntitlement)
     }
 
     function setChoice(key, value) {
-        const normalized = String(value || "").toLowerCase()
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (key === "colorQuality") {
-            if (codec === "h264" && normalized !== "8bit_420")
-                return
-            if (codec === "av1" && normalized.indexOf("444") >= 0)
-                return
-        }
         const currentQuality = String(root.valueSetting("colorQuality", "8bit_420"))
         root.setSetting(key, value)
         if (key === "colorQuality")
             tenBitWarning.notifySelection(currentQuality, value)
-        if (key === "codec") {
-            if (normalized === "h264" && currentQuality !== "8bit_420")
-                root.setSetting("colorQuality", "8bit_420")
-            else if (normalized === "av1" && currentQuality.indexOf("444") >= 0)
-                root.setSetting("colorQuality", currentQuality.replace("444", "420"))
-        }
     }
 
     function choices(values) {
@@ -91,35 +79,12 @@ FocusScope {
     }
 
     function colorQualityItems() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        const h264 = codec === "h264"
-        const chroma444Unavailable = h264 || codec === "av1"
-        return [
-            {kind:"choice", label:qsTr("8-bit, YUV 4:2:0"), detail:qsTr("All codecs"), value:"8bit_420"},
-            {kind:"choice", label:qsTr("8-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Sharper color"), value:"8bit_444", disabled:chroma444Unavailable},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:2:0"), detail:h264 ? qsTr("H.265 / AV1 required") : qsTr("Smoother gradients"), value:"10bit_420", disabled:h264},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Highest color quality"), value:"10bit_444", disabled:chroma444Unavailable}
-        ]
+        return ShellStore.settingsOwnerState.colorQualityItems
     }
 
     function colorQualityFooter() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (codec === "h264")
-            return qsTr("H.264 supports 8-bit YUV 4:2:0 only")
-        if (codec === "av1")
-            return qsTr("AV1 supports YUV 4:2:0; use H.265 for 4:4:4")
-        return qsTr("4:4:4 profiles use H.265")
-    }
-
-    function colorQualityLabel() {
-        const labels = {
-            "8bit_420": qsTr("8-bit, YUV 4:2:0"),
-            "8bit_444": qsTr("8-bit, YUV 4:4:4"),
-            "10bit_420": qsTr("10-bit, YUV 4:2:0"),
-            "10bit_444": qsTr("10-bit, YUV 4:4:4")
-        }
-        const value = String(root.valueSetting("colorQuality", "8bit_420"))
-        return labels[value] || labels["8bit_420"]
+        const current = colorQualityItems().find(item => item.value === root.valueSetting("colorQuality", "8bit_420"))
+        return current ? current.detail : ShellStore.settingsOwnerState.colorDescription
     }
 
     function liveTierBadge() {
@@ -367,32 +332,43 @@ FocusScope {
     }
 
     function storeStatus(account) {
+        const action = ShellStore.gameAccountAction(account)
         if (account.status === "expired")
             return { text: qsTr("EXPIRED"), color: Theme.yellow, action: qsTr("Reconnect"), connected: false, primary: true }
         if (account.status === "sync_error")
-            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: qsTr("Resync"), connected: true }
+            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: action === "link" ? qsTr("Reconnect") : qsTr("Sync library"), connected: true }
         if (account.isConnected || account.status === "connected")
             return { text: qsTr("LINKED"), color: DesktopTokens.green, action: account.supportsSync ? qsTr("Resync") : qsTr("Unlink"), connected: true }
-        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: qsTr("Link"), connected: false }
+        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: action === "sync" ? qsTr("Sync library") : qsTr("Link"), connected: false }
     }
 
     function storeDescription(account) {
+        if (account.capabilitySource === "fallback" || account.capabilitySource === "stale")
+            return qsTr("Store capabilities could not be refreshed. Retry before changing this connection.")
+        if (account.status === "sync_error") {
+            if (account.provider === "STEAM" && account.syncState === "SYNC_DENIED") return qsTr("Make your store profile and game library public, then sync again.")
+            if (account.syncState === "PROFILE_NOT_CREATED") return qsTr("Create your store profile, then sync again.")
+            if (account.syncState === "SYNC_DENIED") return qsTr("Store authorization was denied. Reconnect this account.")
+            return qsTr("The store reported a sync error: %1").arg(account.syncState || qsTr("Unknown"))
+        }
+        const subscriptions = ShellStore.storeSubscriptionLabels(account)
+        if (subscriptions) return qsTr("Active store subscriptions: %1").arg(subscriptions)
         if (account.displayName)
             return account.displayName
         if (account.isConnected && account.syncedGames !== undefined && account.syncedGames !== null)
-            return qsTr("%1 cloud-ready games synced").arg(account.syncedGames)
+            return qsTr("%1 games reported by the last store sync").arg(account.syncedGames)
         if (account.isConnected)
             return qsTr("Connected through your NVIDIA account")
         return qsTr("Link this store on NVIDIA to add its games to your library")
     }
 
     function runStoreAction(account) {
-        const status = storeStatus(account)
-        if (status.action === qsTr("Resync"))
+        const action = ShellStore.gameAccountAction(account)
+        if (action === "sync")
             ShellStore.syncGameAccount(account.provider)
-        else if (status.connected)
+        else if (action === "unlink")
             ShellStore.unlinkGameAccount(account.provider)
-        else
+        else if (action === "link")
             ShellStore.startAccountLink(account.provider)
     }
 
@@ -516,6 +492,7 @@ FocusScope {
         height: root.height - y - DesktopTokens.px(18)
         Flickable {
             id: contentFlick
+            objectName: "desktopSettingsContent"
             anchors.fill: parent
             contentWidth: width
             contentHeight: pageLoader.height

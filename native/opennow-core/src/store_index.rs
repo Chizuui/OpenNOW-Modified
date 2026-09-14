@@ -268,6 +268,9 @@ impl StoreIndex {
                 json!({"games":&selected[..count],"count":count,"totalCount":matches.len(),"catalogTotalCount":self.entries.len(),
                 "hasNextPage":more,"nextCursor":if more {format!("{prefix}{next}:{}",self.pages)} else {String::new()},
                 "source":"store-local","cacheHit":true,"cacheComplete":self.complete,
+                "localHasNextPage":next < matches.len(),
+                "upstreamCoverage":if self.complete {"complete-traversal"} else {"partial"},
+                "facetsSource":"local-cache",
                 "upstreamCursor":self.next_upstream,
                 "facets":if offset == 0 {facets.clone()} else {Value::Null}}),
             )

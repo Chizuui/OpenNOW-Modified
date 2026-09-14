@@ -233,6 +233,7 @@ qt_add_qml_module(opennow-qt
         qml/components/NavPill.qml
         qml/components/PageEntrance.qml
         qml/components/PlatformPicker.qml
+        qml/components/CloudLibraryActions.qml
         qml/components/PosterTile.qml
         qml/components/ReleaseNotes.qml
         qml/components/RoundedArtwork.qml
@@ -344,6 +345,7 @@ qt_add_qml_module(opennow-qt
         qml/screens/ThemeStoreScreen.qml
         qml/screens/UpdateScreen.qml
         qml/state/ShellStore.qml
+        qml/state/SessionSetupProgress.qml
         qml/state/account/AccountServicesState.qml
         qml/state/catalog/ArtworkState.qml
         qml/state/catalog/CatalogState.qml

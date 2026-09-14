@@ -26,7 +26,7 @@ Item {
     signal routeRequested(string route)
 
     function regionStatus() {
-        const selected = String(ShellStore.settings.region || "")
+        const selected = String(ShellStore.selectedRegion || "")
         const session = ShellStore.activeSession || ({})
         const name = selected || String(session.zone || session.serverLocation || "")
         let ping = null

@@ -26,8 +26,8 @@ TestCase {
         DesktopTokens.uiScale = 1
         ShellStore.settings = {appTheme: "dark"}
         modal.game = {title: "Multi Store Game", isAvailable: true, selectedVariantIndex: 0,
-            variants: [{id: "1001", store: "Steam", inLibrary: false},
-                       {id: "1003", store: "Xbox", inLibrary: true}]}
+            variants: [{id: "1001", store: "Steam", inLibrary: false, libraryStatus:"NOT_OWNED"},
+                       {id: "1003", store: "Xbox", inLibrary: true, libraryStatus:"MANUAL"}]}
         selection.clear()
         launches.clear()
         waitForRendering(modal)
@@ -71,7 +71,7 @@ TestCase {
 
     function test_singleStoreHidesPicker() {
         modal.game = {title: "Xbox Game", isAvailable: true,
-            variants: [{id: "1003", store: "Xbox", inLibrary: true}]}
+            variants: [{id: "1003", store: "Xbox", inLibrary: true, libraryStatus:"MANUAL"}]}
         tryVerify(() => findChild(modal, "desktopStoreVariant1") === null)
         verify(!findChild(modal, "desktopStoreVariant0").visible)
         compare(modal.selectedVariant.id, "1003")

@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonParseError>
 #include <QStandardPaths>
 #include <QProcessEnvironment>
@@ -267,7 +268,8 @@ QString CoreClient::request(const QString &method, const QJsonObject &params, in
     const auto id = QString::number(m_nextRequestId++);
     const auto deadline = QDateTime::currentMSecsSinceEpoch() + qBound(100, timeoutMs, 300'000);
     auto runtimeParams = params;
-    if (method == u"session.create"_s || method == u"streamer.prepare"_s) {
+    if (method == u"session.create"_s || method == u"streamer.prepare"_s
+            || method == u"settings.choices.get"_s) {
         auto capabilities = runtimeParams.value(u"runtimeCapabilities"_s).toObject();
         capabilities.insert(u"nativeHdrSupported"_s, m_nativeHdrSupported);
         runtimeParams.insert(u"runtimeCapabilities"_s, capabilities);
@@ -449,14 +451,28 @@ void CoreClient::processLine(const QByteArray &line)
             pending->retryDelayMs = qMin(pending->retryDelayMs * 2, 1'000);
             return;
         }
+        const auto method = pending->message.value(u"method"_s).toString();
         m_pending.erase(pending);
         if (message.value(u"ok"_s).toBool(false)) {
+            if (method == u"session.create"_s
+                    && !writeMessage(QJsonObject{{u"type"_s, u"ack"_s}, {u"id"_s, id}})) {
+                emit requestFailed(id, u"core_write_failed"_s, u"Could not accept the allocated session"_s);
+                return;
+            }
             const auto result = message.value(u"result"_s).toObject();
             if (id == m_handshakeRequestId) {
                 const auto version = result.value(u"protocolVersion"_s).toInt(-1);
                 if (version != CurrentProtocolVersion) {
                     protocolFailure(u"Core protocol version is incompatible"_s);
                     return;
+                }
+                const auto capabilities = result.value(u"capabilities"_s).toArray();
+                for (const auto &capability : {u"catalog.libraryPages.v1"_s, u"catalog.metadata.v1"_s,
+                                             u"account.syncObservation.v1"_s, u"catalog.languages.v1"_s}) {
+                    if (!capabilities.contains(capability)) {
+                        protocolFailure(u"The packaged core lacks required catalog capabilities"_s);
+                        return;
+                    }
                 }
                 m_restartAttempts = 0;
                 setState(u"ready"_s);
