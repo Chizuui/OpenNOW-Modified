@@ -14,6 +14,10 @@ public:
 
     Q_INVOKABLE QString artworkUrl(const QString &source) const { return source; }
     Q_INVOKABLE bool isFavorite(const QVariant &) const { return false; }
+    Q_INVOKABLE bool isCloudFavorite(const QVariant &) const { return false; }
+    Q_INVOKABLE QString selectedGameActionLabel() const { return QStringLiteral("Play"); }
+    Q_INVOKABLE QString readinessNotice(const QVariant &) const { return {}; }
+    Q_INVOKABLE QString source(const QString &text, int) const { return text; }
     Q_INVOKABLE bool streamOverlayBlocksGameplayInput(const QString &overlay) const { return !overlay.isEmpty(); }
 
 signals:
@@ -41,6 +45,7 @@ public slots:
                                  {"SessionSetupProgress", "state/SessionSetupProgress.qml"},
                                  {"DesktopGameModal", "desktop/components/DesktopGameModal.qml"},
                                  {"MotionProgress", "components/MotionProgress.qml"},
+                                 {"CloudLibraryActions", "components/CloudLibraryActions.qml"},
                                  {"RoundedArtwork", "components/RoundedArtwork.qml"},
                                  {"DesktopButton", "desktop/components/DesktopButton.qml"},
                                  {"DesktopGlyph", "desktop/components/DesktopGlyph.qml"},
@@ -71,12 +76,22 @@ public slots:
         m_shell.insert("launchConflictDetected", false);
         m_shell.insert("streamMessage", QString{});
         m_shell.insert("streamBusy", false);
+        m_shell.insert("ready", true);
+        m_shell.insert("signedIn", true);
+        m_shell.insert("cloudMutationBusy", false);
+        m_shell.insert("cloudMutationState", "idle");
+        m_shell.insert("cloudMutationMessage", QString{});
+        m_shell.insert("launchInspectRequestId", QString{});
+        m_shell.insert("ownershipConfirmation", QVariant::fromValue(static_cast<QObject *>(nullptr)));
+        m_shell.insert("selectedLaunchDecision", QVariantMap{{"status", "ready"}, {"message", ""}});
+        m_shell.insert("revision", 0);
         m_shell.insert("pendingLaunchParams", QVariantMap{});
         m_shell.insert("conflictSession", QVariantMap{});
         m_controller.insert("reducedMotion", true);
         m_controller.insert("route", "inserting");
         m_controller.insert("overlay", QString{});
         engine->rootContext()->setContextProperty("ShellStore", &m_shell);
+        engine->rootContext()->setContextProperty("I18n", &m_shell);
         engine->rootContext()->setContextProperty("AppController", &m_controller);
     }
 

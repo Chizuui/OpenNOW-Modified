@@ -284,7 +284,7 @@ private slots:
     {
         CoreClient client;
         QCOMPARE(client.state(), QStringLiteral("stopped"));
-        QCOMPARE(client.protocolVersion(), 4);
+        QCOMPARE(client.protocolVersion(), 5);
         QVERIFY(client.lastError().isEmpty());
     }
 

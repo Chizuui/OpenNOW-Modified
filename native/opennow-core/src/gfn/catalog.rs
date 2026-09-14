@@ -436,7 +436,7 @@ impl GfnService {
         self.store_cache.invalidate(revision)
     }
 
-    fn catalog_document(
+    pub(super) fn catalog_document(
         &self,
         client: &Client,
         token: &str,
@@ -462,10 +462,15 @@ impl GfnService {
             let revision = self
                 .catalog_revision
                 .load(std::sync::atomic::Ordering::Acquire);
-            let scope = self.store_cache_scope(session, generation, settings)?;
+            let mut scope = self.store_cache_scope(session, generation, settings)?;
+            let refreshed_scope = || {
+                let current =
+                    self.authenticated_snapshot_for(session, generation, TokenPurpose::ServiceId)?;
+                self.store_cache_scope(&current, generation, settings)
+            };
             if params["refresh"] == true {
                 self.store_catalog(&json!({"limit":100,"refresh":true}), settings)?;
-                self.check_scope(session, generation)?;
+                scope = refreshed_scope()?;
             }
             let mut result = match self.store_cache.local_query(&scope, params) {
                 Err(error) if error.code == "store_cache_missing" => {
@@ -473,6 +478,7 @@ impl GfnService {
                         &json!({"limit":100,"cursor":"","searchQuery":""}),
                         settings,
                     )?;
+                    scope = refreshed_scope()?;
                     self.store_cache.local_query(&scope, params)?
                 }
                 result => result?,
@@ -485,6 +491,7 @@ impl GfnService {
                         &json!({"limit":100,"cursor":cursor,"searchQuery":""}),
                         settings,
                     )?;
+                    scope = refreshed_scope()?;
                     result = self.store_cache.local_query(&scope, params)?;
                 }
             }
@@ -925,7 +932,11 @@ pub(super) fn app_to_game(app: &Value) -> Option<Value> {
     }))
 }
 
-fn bounded_id(params: &Value, key: &str, required: bool) -> Result<String, ServiceError> {
+pub(super) fn bounded_id(
+    params: &Value,
+    key: &str,
+    required: bool,
+) -> Result<String, ServiceError> {
     match params.get(key) {
         None if !required => Ok(String::new()),
         Some(Value::String(value))

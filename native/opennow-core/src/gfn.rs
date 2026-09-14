@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod catalog;
+mod catalog_actions;
 use catalog::*;
 
 #[cfg(test)]
@@ -327,6 +328,7 @@ pub struct GfnService {
     persistent_storage: PersistentStorageService,
     store_cache: crate::store_cache::StoreCache,
     catalog_revision: std::sync::atomic::AtomicU64,
+    catalog_mutations: Mutex<std::collections::HashSet<catalog_actions::CatalogActionKey>>,
     server_vpc_cache: crate::server_vpc_cache::ServerVpcCache,
     auth_operation: Mutex<()>,
     discovery_operation: Mutex<()>,
@@ -379,6 +381,7 @@ impl GfnService {
             profiles: ConsoleProfiles::load(&data_dir),
             store_cache,
             catalog_revision: std::sync::atomic::AtomicU64::new(catalog_revision),
+            catalog_mutations: Mutex::new(std::collections::HashSet::new()),
             server_vpc_cache: crate::server_vpc_cache::ServerVpcCache::default(),
             auth_operation: Mutex::new(()),
             discovery_operation: Mutex::new(()),
@@ -1584,17 +1587,65 @@ impl GfnService {
 
     pub fn create_session(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
         let admission = self.cloudmatch.admit_create()?;
+        let app_id = params["catalogAppId"].as_str().unwrap_or_default();
+        let variant_id = params["variantId"].as_str().unwrap_or_default();
+        if params["appId"].as_str() != Some(variant_id) {
+            return Err(ServiceError::invalid(
+                "The launch ID must match the selected variant",
+            ));
+        }
+        self.providers()?;
+        let (intent_session, intent_generation) =
+            self.authenticated_snapshot(TokenPurpose::ServiceId, false)?;
+        if params["scope"] != scoped_result(json!({}), &intent_session, intent_generation)["scope"]
+        {
+            return Err(ServiceError {
+                code: "stale_account",
+                message: "This launch belongs to a different account context.".into(),
+            });
+        }
+        let _catalog_action = self.admit_catalog_action(&intent_session, app_id)?;
+        let inspection =
+            self.catalog_launch_inspect(&json!({"appId":app_id,"variantId":variant_id}), settings)?;
+        if inspection["decision"]["status"] != "ready" {
+            return Err(ServiceError {
+                code: "launch_not_ready",
+                message: inspection["decision"]["message"]
+                    .as_str()
+                    .unwrap_or("The selected store version cannot be launched")
+                    .into(),
+            });
+        }
         self.providers()?;
         let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
         let (session, generation) = self.session_snapshot_locked()?;
+        if inspection["scope"] != params["scope"]
+            || inspection["scope"] != scoped_result(json!({}), &session, generation)["scope"]
+            || inspection["catalogRevision"].as_u64()
+                != Some(
+                    self.catalog_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+        {
+            return Err(ServiceError {
+                code: "stale_account",
+                message: "The launch context changed. Try again.".into(),
+            });
+        }
         if !self.cloudmatch.active()["session"].is_null() {
             return Err(ServiceError {
                 code: "session_update_busy",
                 message: "End the active session before starting another game".into(),
             });
         }
-        let (params, settings) = self.scoped_session_route(params, settings, &session)?;
+        let variant = catalog_actions::selected_variant(&inspection["game"], variant_id)
+            .expect("ready decision validated the exact variant");
+        let (mut params, settings) = self.scoped_session_route(params, settings, &session)?;
+        params["accountLinked"] = variant["inLibrary"].clone();
+        params["supportsInGameSettingsPersistence"] =
+            variant["supportsInGameSettingsPersistence"].clone();
+        params["title"] = inspection["game"]["title"].clone();
         let result = admission
             .create(&params, &settings, &session, &self.device_id)
             .map(|result| scoped_result(result, &session, generation));
@@ -2229,6 +2280,27 @@ impl GfnService {
             });
         }
         Ok(())
+    }
+
+    fn authenticated_snapshot_for(
+        &self,
+        owner: &AuthSession,
+        generation: u64,
+        purpose: TokenPurpose,
+    ) -> Result<AuthSession, ServiceError> {
+        self.check_scope(owner, generation)?;
+        let (current, current_generation) = self.authenticated_snapshot(purpose, false)?;
+        if current_generation != generation
+            || current.user.user_id != owner.user.user_id
+            || current.provider.idp_id != owner.provider.idp_id
+        {
+            return Err(ServiceError {
+                code: "stale_account",
+                message: "The account or provider changed. Retry this request.".into(),
+            });
+        }
+        self.check_scope(owner, generation)?;
+        Ok(current)
     }
 
     fn authenticated_read(

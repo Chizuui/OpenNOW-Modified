@@ -29,21 +29,14 @@ FocusScope {
         const variants = game.variants || []
         if (!variants.length)
             return null
-        const index = Math.max(0, Math.min(variants.length - 1, Number(game.selectedVariantIndex || 0)))
-        return variants[index]
+        const index = Number(game.selectedVariantIndex || 0)
+        return index >= 0 && index < variants.length ? variants[index] : null
     }
     readonly property bool gameAvailable: {
         const game = root.game
         if (!game)
             return false
-        if (game.isAvailable !== undefined && game.isAvailable !== null)
-            return Boolean(game.isAvailable)
-        const state = String(game.playabilityState || "").toUpperCase()
-        if (state === "PLAYABLE" || state === "AVAILABLE")
-            return true
-        if (state.indexOf("UNPLAYABLE") >= 0 || state === "NOT_PLAYABLE" || state === "NOT_AVAILABLE")
-            return false
-        return Boolean(game.isInLibrary)
+        return ShellStore.selectedLaunchDecision.status === "ready"
     }
     readonly property bool hasRtx: {
         const game = root.game
@@ -85,8 +78,7 @@ FocusScope {
         return stores.length ? stores.join(" · ") : qsTr("—")
     }
     readonly property bool isOwned: root.selectedVariant
-        ? Boolean(root.selectedVariant.inLibrary)
-        : Boolean(root.game && root.game.isInLibrary)
+        && ["MANUAL", "PLATFORM_SYNC"].indexOf(root.selectedVariant.libraryStatus) >= 0
     readonly property string ownershipText: {
         const game = root.game
         const variant = root.selectedVariant
@@ -106,8 +98,6 @@ FocusScope {
         const user = ShellStore.authSession && ShellStore.authSession.user
         if (user && user.membershipTier)
             return String(user.membershipTier).toUpperCase()
-        if (root.game && root.game.membershipTierLabel)
-            return String(root.game.membershipTierLabel).toUpperCase()
         return ""
     }
     readonly property string resolutionText: {
@@ -239,7 +229,7 @@ FocusScope {
                 id: detailsColumn
                 width: parent.width
                 Item {
-                    width: parent.width; height: Math.min(360 * DesktopTokens.uiScale, root.dialogHeight * 0.65)
+                    width: parent.width; height: Math.min(360 * DesktopTokens.uiScale, root.dialogHeight * 0.55)
                     RoundedArtwork {
                         anchors.fill: parent; artwork: DesktopTokens.artworkUrl(root.game, true)
                         cornerRadius: 24; scrimStart: 0.1; fallbackColor: Theme.shell
@@ -278,16 +268,17 @@ FocusScope {
                     width: parent.width - DesktopTokens.px(48)
                     spacing: DesktopTokens.px(8)
                     Text {
+                        id: readinessNoticeLabel
                         objectName: "catalogReadinessNotice"
                         width: parent.width
-                        text: ShellStore.readinessNotice(root.game)
+                        text: I18n.source(ShellStore.cloudMutationMessage || ShellStore.selectedLaunchDecision.message || ShellStore.readinessNotice(root.game), I18n.revision)
                         visible: text !== ""
                         wrapMode: Text.WordWrap
-                        color: Theme.textMuted
+                        color: ShellStore.cloudMutationState === "unconfirmed" ? (Theme.lightMode ? Qt.darker(DesktopTokens.danger, 2) : DesktopTokens.danger) : Theme.textMuted
                         font.family: Theme.bodyFont
                         font.pixelSize: DesktopTokens.captionSize
                     }
-                    visible: storeVariants.count > 1 || ShellStore.readinessNotice(root.game) !== ""
+                    visible: storeVariants.count > 1 || readinessNoticeLabel.text !== ""
                     height: visible ? implicitHeight + DesktopTokens.px(16) : 0
                     Text {
                         text: qsTr("PLATFORM")
@@ -319,7 +310,8 @@ FocusScope {
                                 autoExclusive: true
                                 checked: root.game ? index === Number(root.game.selectedVariantIndex || 0) : false
                                 primary: checked
-                                Accessible.description: modelData.inLibrary ? qsTr("Owned") : qsTr("Not owned")
+                                Accessible.description: ["MANUAL", "PLATFORM_SYNC"].indexOf(modelData.libraryStatus) >= 0
+                                    ? qsTr("Owned") : modelData.libraryStatus === "NOT_OWNED" ? qsTr("Not owned") : qsTr("Ownership unconfirmed")
                                 onClicked: root.variantSelected(index)
                                 Keys.onReturnPressed: root.variantSelected(index)
                                 Keys.onEnterPressed: root.variantSelected(index)
@@ -364,16 +356,17 @@ FocusScope {
                             id: primaryAction
                             objectName: "desktopGamePlay"
                             Layout.fillWidth: true; Layout.preferredHeight: 52
-                            primary: true; glyph: "desktop-play.svg"; text: qsTr("Play"); shortcutText: qsTr("ENTER"); shortcutSequence: "Enter"
-                            enabled: root.game !== null && root.gameAvailable
+                            primary: true; glyph: "desktop-play.svg"; text: ShellStore.selectedGameActionLabel(); shortcutText: qsTr("ENTER"); shortcutSequence: "Enter"
+                            enabled: root.game !== null && !ShellStore.cloudMutationBusy && ShellStore.launchInspectRequestId === ""
                             onClicked: root.playRequested()
                         }
                         DesktopButton {
                             Layout.preferredWidth: 52; Layout.preferredHeight: 52
                             themedGlyph: "star"; leftPadding: 0; rightPadding: 0
-                            Accessible.name: root.game && ShellStore.isFavorite(root.game) ? qsTr("Remove favourite") : qsTr("Add favourite")
+                            Accessible.name: root.game && ShellStore.isCloudFavorite(root.game) ? qsTr("Remove from GeForce NOW favorites") : qsTr("Add to GeForce NOW favorites")
                             ToolTip.visible: hovered; ToolTip.text: Accessible.name
-                            onClicked: if (root.game) ShellStore.toggleFavorite(root.game)
+                            enabled: ShellStore.signedIn && !ShellStore.cloudMutationBusy
+                            onClicked: if (root.game) ShellStore.toggleCloudFavorite(root.game)
                         }
                         DesktopButton {
                             Layout.preferredWidth: 52; Layout.preferredHeight: 52
@@ -383,7 +376,7 @@ FocusScope {
                             onClicked: collectionMenu.popup()
                             Menu {
                                 id: collectionMenu
-                                MenuItem { text: qsTr("Favourites"); checkable: true; checked: root.game && ShellStore.isFavorite(root.game); onTriggered: if (root.game) ShellStore.toggleFavorite(root.game) }
+                                MenuItem { text: qsTr("Pin to Home"); checkable: true; checked: root.game && ShellStore.isFavorite(root.game); onTriggered: if (root.game) ShellStore.toggleFavorite(root.game) }
                             }
                         }
                         DesktopButton {
@@ -398,6 +391,13 @@ FocusScope {
                             }
                         }
                     }
+                }
+                CloudLibraryActions {
+                    x: DesktopTokens.px(24)
+                    width: parent.width - DesktopTokens.px(48)
+                    game: root.game
+                    showFavorites: false
+                    showStatus: false
                 }
                 Item {
                     width: parent.width; height: summaryGrid.implicitHeight + 24

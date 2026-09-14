@@ -11,24 +11,78 @@ ambiguous state.
 The first shell request is always:
 
 ```json
-{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":4,"shell":"qt","shellVersion":"0.5.4"}}
+{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":5,"shell":"qt","shellVersion":"0.5.4"}}
 ```
 
-Protocol 4 changes `catalog.library.list` from an aggregate result to one bounded
-page. Protocol-3 shells are rejected with `incompatible_protocol` during
-`core.hello`, before they can interpret a page as their complete library.
-Protocol-4 shells also reject older cores. The native streamer protocol remains 7.
+Protocol 5 requires an exact selected catalog variant and account scope for fresh
+session allocation. It retains the bounded library-page contract introduced in
+protocol 4. Older shells are rejected with `incompatible_protocol` during
+`core.hello`, and protocol-5 shells reject older cores. The native streamer
+protocol remains 7.
 
 The core must return the same protocol version and its capabilities. The shell
 does not send product requests before this succeeds. Version mismatches, a
 five-second handshake deadline, process exit and invalid data all transition the
 transport to `failed` with a credential-free diagnostic.
 
+## Cloud library actions and launch decisions
+
+`catalog.launch.inspect({appId, variantId})` always resolves the exact parent and
+store variant. Its response contains `appId`, `variantId`, `game`, `scope`,
+`catalogRevision`, `fetchedAt`, `freshness`, and `decision: {status, message}`.
+Statuses are `ready`, `ownership_required`, `selection_required`, `link_required`,
+`subscription_required`, `patching`, `maintenance`, `unavailable`, and
+`metadata_unconfirmed`. Only the selected variant's `MANUAL` or `PLATFORM_SYNC`
+library status records ownership. App-wide library flags, Home pins, favorites,
+free-game labels, store subscriptions, and ownership of another variant do not.
+Store-link requirements use the store definitions and fresh account state.
+Recorded store-subscription IDs must match the account's active subscriptions.
+App playability, variant readiness, patch metadata, and membership restrictions
+remain independent checks. Unknown metadata is not a positive authorization.
+
+All five mutation RPCs require a bounded nonempty parent `appId` and the current
+`scope: {generation, userId, providerIdpId}`. Ownership mutations also require the
+exact `variantId`. `catalog.ownership.add` requires
+`confirmedExistingLicense: true`, the user's assertion that they already own the
+selected store license. This operation neither buys nor grants a license.
+`catalog.ownership.select` accepts only an owned variant and does not add ownership.
+
+Favorites map to the GraphQL `AddFavoriteApp` and `RemoveFavoriteApp` operations
+with `appId` and `locale` variables. Ownership maps to `AddOwnedVariant`,
+`RemoveOwnedVariant`, and `SelectOwnedVariant`, with `cmsId` and `locale`
+variables. `cmsId` supplies the `variantId` argument. Every mutation selects
+`app { id }` and checks the returned parent identity. Mutations share catalog
+scheduling and serialize conflicting actions for the same account and parent
+app. Fresh allocation holds that same app admission while checking and creating.
+
+Mutation results distinguish `outcome: acknowledged|unconfirmed` from
+`reconciliation: confirmed|unconfirmed`. A fresh exact read confirms the desired
+current state; acknowledgement alone does not. Results include captured target
+IDs, `operation`, `scope`, `catalogRevision`, nullable refreshed `game`, a visible
+`message`, and sanitized `error.code`, `error.httpStatus`, and `error.graphql`
+code/path details. `reconciliationCode` and `invalidationCode` distinguish read
+or cache-invalidation failures from the mutation outcome.
+Neither ambiguous failures nor HTTP 401 cause mutation replay. Catalog pages are
+invalidated before sending and again after the attempt. Cancellation may prevent
+delivery of the outcome without preventing an already-sent upstream mutation.
+The shell marks that outcome unconfirmed and refreshes metadata without resending.
+
+`catalog.favorites.list` reads the `FAVORITES` panel using `GetGameSection` with
+`panelNames`, `vpcId`, and `locale`; it has no cursor. It preserves all parsed game
+items up to the 1,000-game and 768-KiB response bounds, rather than the Store
+panel's 24-item display limit. The response contains `games`, section identity
+and `seeMoreInfo`, `scope`, `catalogRevision`, and `fetchedAt`. `coverage` is
+`unknown` and `complete` is false because the panel does not establish global
+completeness. No pagination or see-more request is invented. A failed read keeps
+the shell's last usable list, and a specific favorite is reconciled through the
+exact app's `library.favorited` value. Existing `favoriteGameIds` remain local
+Home pins; pinning, collections, hiding, and reordering do not upload favorites.
+
 ## Messages
 
 ### Authentication boundary
 
-Protocol 4 auth responses and `auth.session.changed` events use the same envelope.
+Protocol 5 auth responses and `auth.session.changed` events use the same envelope.
 `session` is either null or an allowlisted object containing `user` and `provider`.
 Credentials and issuing-client details remain private to the core. The envelope
 includes the core-process account `generation`, `persistence`, `refresh`, `warnings`,
@@ -96,7 +150,7 @@ and region measurement loops stop at cooperative checkpoints. An already-running
 blocking HTTP, DNS, or TCP operation is not forcibly interrupted; its existing
 timeout still applies. Other mutating operations already dispatched are not rolled back.
 
-Protocol 4 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
+Protocol 5 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
 response with `{"type":"ack","id":"42"}` before delivering that response to QML.
 Cancelled or timed-out requests do not acknowledge late responses. The create worker
 retains its admission slot for at most ten seconds awaiting acceptance, then the
@@ -262,6 +316,9 @@ and artwork only near the viewport, using the section's local category ID
 - `catalog.public.list`
 - `catalog.library.list` returns one bounded upstream page, not an aggregate library.
 - `catalog.game.get`, `catalog.definitions.get`, `catalog.languages.get`
+- `catalog.launch.inspect`, `catalog.favorites.list`
+- `catalog.favorites.add`, `catalog.favorites.remove`
+- `catalog.ownership.add`, `catalog.ownership.remove`, `catalog.ownership.select`
 - `catalog.store.list`, `catalog.store.local`, `catalog.store.presentation`
 - `network.regions.list`
 - `network.regions.ping`
@@ -362,6 +419,16 @@ once to that provider's base without deleting the saved preference. Provider and
 region bases must be HTTPS NVIDIA-grid names without userinfo or nonstandard ports.
 Arbitrary partner domains require a separate evidenced trust policy.
 
+`session.create` requires `catalogAppId` as the parent LCARS identifier,
+`variantId` as the selected positive GraphQL Int identifier encoded as a string,
+and `appId` equal to that exact variant ID. `scope` must contain the current
+`generation`, `userId`, and `providerIdpId`. The core resolves fresh catalog and
+account metadata and applies the same decision as `catalog.launch.inspect`
+immediately before allocation. Only `ready` admits a fresh allocation. A decision
+from an earlier inspection is not a transferable permission. Missing, foreign,
+or mismatched identifiers do not fall back to another variant or a title.
+Existing validated seat claims remain separate and never write ownership.
+
 `session.create` acquires a single typed CloudMatch admission guard before provider
 discovery, authentication, or route locks. A concurrent create returns
 `session_update_busy` immediately instead of waiting to allocate after the first
@@ -403,7 +470,7 @@ later session events. Foreign ownership or an unknown seat fails with
 `session_not_ready`, and missing RTSPS endpoints with `session_endpoint_missing`.
 The existing negotiated profile checks still run. Preparation does not expose
 OAuth tokens to Qt or alter the native `/rtsp` websocket session-ID authentication.
-These fields are additive to protocol 4; allocation receipts and exact-seat
+These fields are additive to protocol 5; allocation receipts and exact-seat
 compensation remain unchanged.
 
 `session.create` reports an existing-session limit as `session_conflict`, including

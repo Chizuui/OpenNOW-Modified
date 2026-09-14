@@ -55,8 +55,15 @@ fn protocol_three_shells_are_rejected_before_the_paged_library_contract() {
 #[test]
 fn protocol_four_shells_receive_the_paged_library_capabilities() {
     let response = hello(4);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "incompatible_protocol");
+}
+
+#[test]
+fn protocol_five_shells_receive_the_paged_library_capabilities() {
+    let response = hello(5);
     assert_eq!(response["ok"], true);
-    assert_eq!(response["result"]["protocolVersion"], 4);
+    assert_eq!(response["result"]["protocolVersion"], 5);
     let capabilities = response["result"]["capabilities"].as_array().unwrap();
     for capability in [
         "catalog.libraryPages.v1",

@@ -29,14 +29,49 @@ fn expire_discovery(service: &GfnService) {
     state.providers_retry = None;
 }
 
+fn launch_params(id: &str) -> Value {
+    json!({"appId":id,"variantId":id,"catalogAppId":"launch-fixture",
+        "scope":scoped_result(json!({}), &auth_fixture("account-a"), 7)["scope"]})
+}
+
+fn launch_metadata() -> Vec<(u16, Value)> {
+    vec![
+        (200, json!({"requestStatus":{"serverId":"fixture-vpc"}})),
+        (
+            200,
+            json!({"data":{"apps":{"items":[{"id":"launch-fixture","title":"Launch fixture",
+            "gfn":{"playabilityState":"PLAYABLE"},"variants":[{"id":"123","appStore":"STEAM",
+                "gfn":{"status":"AVAILABLE","library":{"status":"MANUAL","selected":true,"playStatus":"PLAYABLE"}}}]}]}}}),
+        ),
+        (
+            200,
+            json!({"data":{"appStoreDefinitions":[{"store":"STEAM","label":"Steam","features":[],"accountLinkingMetadata":{"isRequired":false}}]}}),
+        ),
+        (200, json!({"data":{"genreDefinitions":[]}})),
+        (200, json!({"data":{"subscriptionDefinitions":[]}})),
+        (
+            200,
+            json!({"data":{"userAccount":{"storesData":[],"subscriptions":[]}}}),
+        ),
+    ]
+}
+
 fn reject_concurrent_create_during(discovery: bool) {
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (url, worker) = mock_requests(vec![(503, json!({}))], move |_, request| {
+    let mut responses = if discovery { vec![] } else { launch_metadata() };
+    responses.push((503, json!({})));
+    let (url, worker) = mock_requests(responses, move |index, request| {
+        if !discovery && index < 6 {
+            return;
+        }
         if discovery {
             assert!(request.starts_with("GET /providers "));
         } else {
             assert!(request.starts_with("POST /v2/session?"));
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["sessionRequestData"]["accountLinked"], true);
         }
         entered_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -53,7 +88,7 @@ fn reject_concurrent_create_during(discovery: bool) {
     std::thread::scope(|threads| {
         let first = threads.spawn(|| {
             crate::requests::scope(permit.token.clone(), || {
-                service.create_session(&json!({"appId":"123"}), &json!({}))
+                service.create_session(&launch_params("123"), &json!({}))
             })
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -61,7 +96,7 @@ fn reject_concurrent_create_during(discovery: bool) {
         let service = &service;
         let second = threads.spawn(move || {
             result_tx
-                .send(service.create_session(&json!({"appId":"456"}), &json!({})))
+                .send(service.create_session(&launch_params("456"), &json!({})))
                 .unwrap()
         });
         let rejected = result_rx.recv_timeout(Duration::from_secs(1));
@@ -833,21 +868,17 @@ fn original_identity_regains_each_exact_seat_operation_after_generation_changes(
 
 #[test]
 fn durable_seat_republication_does_not_renew_allocation_receipt_authority() {
-    let (url, worker) = mock_requests(
-        vec![
-            (
-                200,
-                json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"fresh-seat","status":1}}),
-            ),
-            (200, json!({})),
-            (204, json!({})),
-        ],
-        |index, request| {
-            if index == 2 {
-                assert!(request.starts_with("DELETE /v2/session/fresh-seat "));
-            }
-        },
-    );
+    let mut responses = launch_metadata();
+    responses.extend([
+        (200, json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"fresh-seat","status":1}})),
+        (200, json!({})),
+        (204, json!({})),
+    ]);
+    let (url, worker) = mock_requests(responses, |index, request| {
+        if index == 8 {
+            assert!(request.starts_with("DELETE /v2/session/fresh-seat "));
+        }
+    });
     let (mut service, path) = service(&url);
     {
         let mut state = service.state.lock().unwrap();
@@ -858,7 +889,7 @@ fn durable_seat_republication_does_not_renew_allocation_receipt_authority() {
         .cloudmatch
         .set_test_control_base(url::Url::parse(&url).unwrap());
     service
-        .create_session(&json!({"appId":"123"}), &json!({}))
+        .create_session(&launch_params("123"), &json!({}))
         .unwrap();
     service.clear_cache();
     assert_eq!(service.active_session().unwrap()["scope"]["generation"], 8);

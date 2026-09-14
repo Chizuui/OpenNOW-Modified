@@ -25,10 +25,13 @@ QtObject {
         setSetting: root.setSetting
         applySetting: root.applySetting
         acceptsScope: root.matchesAuthScope
+        authScope: ({generation:root.authGeneration, userId:root.authSession && root.authSession.user ? root.authSession.user.userId : "",
+            providerIdpId:root.authSession && root.authSession.provider ? root.authSession.provider.idpId : ""})
         detailVisible: AppController.route === "game-detail"
         definitions: accountServicesOwner.catalogDefinitions
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
         onStoreSessionReset: root.storeSessionReset()
+        onLaunchContextInvalidated: root.invalidateLaunchInspection()
         onLibraryRefreshFinished: (complete, message) => accountServicesOwner.libraryRefreshFinished(complete, message)
     }
 
@@ -321,6 +324,159 @@ QtObject {
     }
     property var remoteSessions: []
     property var pendingLaunchParams: null
+    property string launchInspectRequestId: ""
+    property string launchInspectStage: ""
+    property string launchInspectSeatId: ""
+    property string directLookupRequestId: ""
+    property alias ownershipConfirmation: catalogOwner.ownershipConfirmation
+    property alias selectedLaunchDecision: catalogOwner.selectedLaunchDecision
+    property alias cloudMutationBusy: catalogOwner.mutationBusy
+    property alias cloudMutationState: catalogOwner.mutationState
+    property alias cloudMutationMessage: catalogOwner.mutationMessage
+    property alias remoteFavorites: catalogOwner.remoteFavorites
+    property alias remoteFavoritesState: catalogOwner.favoritesState
+    property alias remoteFavoritesError: catalogOwner.favoritesError
+    function isCloudFavorite(game) { return catalogOwner.isCloudFavorite(game) }
+    function toggleCloudFavorite(game) { catalogOwner.toggleCloudFavorite(game) }
+    function requestOwnershipConfirmation(action) { catalogOwner.requestOwnershipConfirmation(action) }
+    function confirmOwnership() { catalogOwner.confirmOwnership() }
+    function selectPreferredVariant() { catalogOwner.selectPreferredVariant() }
+    function refreshCloudFavorites() { catalogOwner.refreshFavorites() }
+    function selectedGameActionLabel() {
+        if (!signedIn) return qsTr("Sign in")
+        if (cloudMutationBusy || launchInspectRequestId !== "") return qsTr("Checking…")
+        if (selectedLaunchDecision.status === "ownership_required") return qsTr("I own this game")
+        if (selectedLaunchDecision.status === "selection_required") return qsTr("Use this store version")
+        if (selectedLaunchDecision.status === "ready") return qsTr("Play")
+        return qsTr("Check availability")
+    }
+    function activateSelectedGame() {
+        if (selectedLaunchDecision.status === "ownership_required") requestOwnershipConfirmation("add")
+        else if (selectedLaunchDecision.status === "selection_required") selectPreferredVariant()
+        else launchSelectedGame()
+    }
+    function invalidateLaunchInspection() {
+        const id = launchInspectRequestId
+        launchInspectRequestId = ""
+        launchInspectStage = ""
+        launchInspectSeatId = ""
+        if (id !== "") CoreClient.cancel(id)
+    }
+    function launchIntentCurrent() {
+        return ready && signedIn && pendingLaunchParams
+            && pendingLaunchParams.selectionIdentity === catalogOwner.selectedIdentity
+            && pendingLaunchParams.authGeneration === authGeneration
+            && pendingLaunchParams.actionGeneration === catalogOwner.actionGeneration
+            && pendingLaunchParams.requestContextKey === catalogOwner.requestContextKey
+            && !catalogOwner.mutationBusy
+    }
+    function inspectLaunch(stage) {
+        if (launchInspectRequestId !== "") return
+        if (!launchIntentCurrent()) {
+            streamState = "error"
+            streamMessage = qsTr("The selected game or account changed. Choose the store version again.")
+            lastError = streamMessage
+            return
+        }
+        launchInspectStage = stage
+        launchInspectSeatId = stage === "stop" && conflictSession ? String(conflictSession.sessionId) : ""
+        launchInspectRequestId = CoreClient.request("catalog.launch.inspect", {
+            appId:pendingLaunchParams.catalogAppId, variantId:pendingLaunchParams.variantId
+        }, 30000)
+    }
+    property Connections launchInspectionResponses: Connections {
+        target: CoreClient
+        function onResponseReceived(id, result) {
+            if (id !== "" && id === root.directLookupRequestId) {
+                root.directLookupRequestId = ""
+                const requested = root.pendingDirectLaunch
+                if (!requested || !root.matchesAuthScope(result.scope) || !result.game) return
+                const index = (result.game.variants || []).findIndex(variant => String(variant.id) === requested.appId)
+                if (index < 0) {
+                    root.lastError = qsTr("The exact requested store version was not returned.")
+                    root.pendingDirectLaunch = null
+                    return
+                }
+                root.selectedGame = Object.assign({}, result.game, {selectedVariantIndex:index})
+                root.pendingDirectLaunch = null
+                root.launchSelectedGame(true)
+                return
+            }
+            if (id === "" || id !== root.launchInspectRequestId) return
+            const stage = root.launchInspectStage
+            const seatId = root.launchInspectSeatId
+            root.launchInspectRequestId = ""
+            root.launchInspectStage = ""
+            root.launchInspectSeatId = ""
+            if (!root.launchIntentCurrent() || !root.matchesAuthScope(result.scope)
+                    || result.appId !== root.pendingLaunchParams.catalogAppId || result.variantId !== root.pendingLaunchParams.variantId) {
+                root.streamState = "error"
+                root.streamMessage = qsTr("The selected game or account changed. Choose the store version again.")
+                root.lastError = root.streamMessage
+                return
+            }
+            const variant = result.game && result.game.id === root.pendingLaunchParams.catalogAppId
+                ? (result.game.variants || []).find(item => String(item.id) === root.pendingLaunchParams.variantId) : null
+            if (!variant) {
+                root.streamState = "error"
+                root.streamMessage = qsTr("The exact requested store version was not returned.")
+                root.lastError = root.streamMessage
+                return
+            }
+            catalogOwner.adoptGame(result.game)
+            root.pendingLaunchParams = Object.assign({}, root.pendingLaunchParams, {
+                accountLinked:variant.inLibrary === true,
+                supportsInGameSettingsPersistence:variant.supportsInGameSettingsPersistence === true,
+                title:result.game.title
+            })
+            root.selectedLaunchDecision = result.decision || ({status:"metadata_unconfirmed", message:""})
+            if (root.selectedLaunchDecision.status !== "ready") {
+                root.streamState = "error"
+                root.streamMessage = root.selectedLaunchDecision.message || qsTr("Availability could not be confirmed. Refresh and try again.")
+                root.lastError = root.streamMessage
+                root.pendingLaunchParams = null
+                AppController.navigateFromLastPrimary("game-detail")
+                return
+            }
+            if (stage === "discover") {
+                root.streamState = "checking"
+                root.remoteSessionsRequestId = CoreClient.request("session.remote.list", root.pendingLaunchParams, 30000)
+                AppController.navigate("inserting")
+            } else if (stage === "stop") {
+                if (!root.conflictSession || String(root.conflictSession.sessionId) !== seatId) {
+                    root.streamState = "error"
+                    root.streamMessage = qsTr("The running session changed. Check your sessions again before replacing a game.")
+                    root.lastError = root.streamMessage
+                    return
+                }
+                root.forceNewAfterStop = true
+                root.streamState = "stopping"
+                root.streamMessage = qsTr("Closing the previous cloud session…")
+                root.streamStopRequestId = CoreClient.request("session.stop", {
+                    sessionId:root.conflictSession.sessionId, streamingBaseUrl:root.conflictSession.streamingBaseUrl,
+                    serverIp:root.conflictSession.serverIp || ""
+                }, 35000)
+            } else if (stage === "create") {
+                root.streamState = "requesting"
+                root.streamCreateRequestId = CoreClient.request("session.create",
+                    Object.assign({}, root.pendingLaunchParams, {runtimeCapabilities: root.nativeRuntimeCapabilities}), 60000)
+            }
+        }
+        function onRequestFailed(id, code, message) {
+            if (id !== "" && id === root.directLookupRequestId) {
+                root.directLookupRequestId = ""
+                root.pendingDirectLaunch = null
+                root.lastError = message
+            } else if (id !== "" && id === root.launchInspectRequestId) {
+                root.launchInspectRequestId = ""
+                root.launchInspectStage = ""
+                root.launchInspectSeatId = ""
+                root.streamState = "error"
+                root.streamMessage = message
+                root.lastError = message
+            }
+        }
+    }
     property var pendingDirectLaunch: null
     property var conflictSession: null
     property bool conflictSessionNeedsRefresh: false
@@ -489,7 +645,7 @@ QtObject {
         return ""
     }
     readonly property bool streamBusy: streamCreateRequestId !== "" || streamStopRequestId !== ""
-        || remoteSessionsRequestId !== "" || sessionClaimRequestId !== ""
+        || remoteSessionsRequestId !== "" || sessionClaimRequestId !== "" || launchInspectRequestId !== ""
 
     signal fullscreenToggleRequested()
     signal pointerLockToggleRequested()
@@ -649,6 +805,7 @@ QtObject {
         if (!session)
             return ""
         const appId = String(session.appId || "")
+        if (appId === "") return ""
         const games = catalogGames || []
         for (let gameIndex = 0; gameIndex < games.length; ++gameIndex) {
             const game = games[gameIndex]
@@ -666,18 +823,16 @@ QtObject {
     function selectGameForSession(session) {
         if (!session)
             return
-        const title = sessionGameTitle(session)
-        if (!title) {
-            selectedGame = {title: qsTr("Your running game"), launchAppId: String(session.appId || "")}
-            return
-        }
+        const appId = String(session.appId || "")
         const games = catalogGames || []
         for (let index = 0; index < games.length; ++index) {
-            if (String(games[index].title || "") === title) {
-                selectedGame = games[index]
+            const variantIndex = (games[index].variants || []).findIndex(variant => String(variant.id) === appId)
+            if (appId !== "" && variantIndex >= 0) {
+                selectedGame = Object.assign({}, games[index], {selectedVariantIndex:variantIndex})
                 return
             }
         }
+        selectedGame = {title:sessionGameTitle(session) || qsTr("Your running game"), launchAppId:appId, variants:[], selectedVariantIndex:-1}
     }
 
     function resumeActiveSession() {
@@ -1193,6 +1348,9 @@ QtObject {
     }
 
     function acceptDirectLaunch(appId, title) {
+        const previous = directLookupRequestId
+        directLookupRequestId = ""
+        if (previous !== "") CoreClient.cancel(previous)
         pendingDirectLaunch = {
             appId: String(appId || ""),
             title: String(title || "").trim()
@@ -1203,15 +1361,12 @@ QtObject {
     function gameMatchesDirectLaunch(game, request) {
         const requestedId = String(request.appId || "")
         if (requestedId !== "") {
-            if (String(game.launchAppId || "") === requestedId
-                    || String(game.appId || "") === requestedId
-                    || String(game.id || "") === requestedId)
-                return true
             const variants = game.variants || []
             for (let index = 0; index < variants.length; ++index) {
                 if (String(variants[index].id || "") === requestedId)
                     return true
             }
+            return false
         }
         return request.title !== ""
             && String(game.title || "").toLocaleLowerCase() === request.title.toLocaleLowerCase()
@@ -1223,6 +1378,12 @@ QtObject {
         if (Object.keys(settings).length === 0 || onboardingRequired
                 || onboardingSaving || onboardingReplaying || onboardingError !== "")
             return
+        if (/^[0-9]+$/.test(pendingDirectLaunch.appId)) {
+            if (!signedIn) { AppController.navigate("sign-in"); return }
+            if (ready && directLookupRequestId === "")
+                directLookupRequestId = CoreClient.request("catalog.game.get", {variantId:pendingDirectLaunch.appId}, 30000)
+            return
+        }
         if (catalogState !== "ready") {
             catalogOwner.ensureCatalog(pendingDirectLaunch.title)
             return
@@ -1230,8 +1391,13 @@ QtObject {
         let match = null
         for (let index = 0; index < catalogGames.length; ++index) {
             if (gameMatchesDirectLaunch(catalogGames[index], pendingDirectLaunch)) {
+                if (match) {
+                    lastError = qsTr("More than one game matches this title. Choose a game and store version from your library.")
+                    pendingDirectLaunch = null
+                    AppController.navigate("library")
+                    return
+                }
                 match = catalogGames[index]
-                break
             }
         }
         if (!match) {
@@ -1253,26 +1419,10 @@ QtObject {
         if (!selectedGame)
             return ""
         const variants = selectedGame.variants || []
-        const index = Math.max(0, Number(selectedGame.selectedVariantIndex || 0))
-        const variantId = variants.length > index ? String(variants[index].id || "") : ""
-        if (/^\d+$/.test(variantId))
+        const index = Number(selectedGame.selectedVariantIndex || 0)
+        const variantId = index >= 0 && variants.length > index ? String(variants[index].id || "") : ""
+        if (/^\d+$/.test(variantId) && Number(variantId) > 0 && Number(variantId) <= 2147483647)
             return variantId
-        const launchId = String(selectedGame.launchAppId || "")
-        return /^\d+$/.test(launchId) ? launchId : ""
-    }
-
-    function selectedGameMembershipError() {
-        const requiredTier = String(selectedGame.membershipTierLabel || "").trim()
-        if (requiredTier === "" || /^free(?: tier|-tier)?$/i.test(requiredTier))
-            return ""
-        const accountTier = String((subscription && subscription.membershipTier) || "").trim()
-        if (accountTier === "") {
-            if (subscriptionRequestId === "")
-                subscriptionRequestId = CoreClient.request("account.subscription.get", {}, 30000)
-            return qsTr("Membership details unavailable. Please try again.")
-        }
-        if (/^free(?: tier|-tier)?$/i.test(accountTier))
-            return qsTr("This game requires a paid GeForce NOW membership.")
         return ""
     }
 
@@ -1290,14 +1440,6 @@ QtObject {
         }
         if (!ready || streamBusy || onboardingReplaying)
             return
-        const membershipError = selectedGameMembershipError()
-        if (membershipError !== "") {
-            streamState = "error"
-            streamMessage = membershipError
-            lastError = membershipError
-            AppController.navigate("inserting")
-            return
-        }
         streamerRestartAttempts = 0
         streamerRecoveryExhausted = false
         sessionReconnectAttempts = 0
@@ -1310,6 +1452,13 @@ QtObject {
         const selectedVariant = variants.length > selectedVariantIndex ? variants[selectedVariantIndex] : null
         const params = {
             appId: appId,
+            catalogAppId: String(selectedGame.id),
+            scope: catalogOwner.authScope,
+            variantId: appId,
+            selectionIdentity: catalogOwner.selectedIdentity,
+            authGeneration: authGeneration,
+            actionGeneration: catalogOwner.actionGeneration,
+            requestContextKey: catalogOwner.requestContextKey,
             title: selectedGame.title || "GeForce NOW game",
             supportsInGameSettingsPersistence: Boolean(selectedVariant && selectedVariant.supportsInGameSettingsPersistence),
             accountLinked: Boolean(selectedVariant && selectedVariant.inLibrary),
@@ -1332,8 +1481,7 @@ QtObject {
         streamState = "checking"
         streamMessage = qsTr("Looking for your game on GeForce NOW…")
         lastError = qsTr("")
-        remoteSessionsRequestId = CoreClient.request("session.remote.list", params, 30000)
-        AppController.navigate("inserting")
+        inspectLaunch("discover")
     }
 
     function checkLaunchSessions() {
@@ -1342,7 +1490,7 @@ QtObject {
         streamState = "checking"
         streamMessage = qsTr("Looking for your game on GeForce NOW…")
         lastError = qsTr("")
-        remoteSessionsRequestId = CoreClient.request("session.remote.list", pendingLaunchParams, 30000)
+        inspectLaunch("discover")
     }
 
     function retrySessionLaunch() {
@@ -1382,8 +1530,7 @@ QtObject {
             lastError = streamMessage
             return
         }
-        streamCreateRequestId = CoreClient.request("session.create",
-            Object.assign({}, pendingLaunchParams, {runtimeCapabilities: nativeRuntimeCapabilities}), 35000)
+        inspectLaunch("create")
     }
 
     function resolveSessionConflict(choice) {
@@ -1391,6 +1538,7 @@ QtObject {
             return
         AppController.showOverlay("")
         if (choice === "cancel") {
+            invalidateLaunchInspection()
             pendingLaunchParams = null
             conflictSession = null
             conflictSessionNeedsRefresh = false
@@ -1428,14 +1576,7 @@ QtObject {
                 createPendingSession()
                 return
             }
-            forceNewAfterStop = true
-            streamState = "stopping"
-            streamMessage = qsTr("Closing the previous cloud session…")
-            streamStopRequestId = CoreClient.request("session.stop", {
-                sessionId: conflictSession.sessionId,
-                streamingBaseUrl: conflictSession.streamingBaseUrl,
-                serverIp: conflictSession.serverIp || ""
-            }, 35000)
+            inspectLaunch("stop")
         }
     }
 
@@ -2163,6 +2304,7 @@ QtObject {
     }
 
     function stopStreamingSession() {
+        invalidateLaunchInspection()
         const discoveryRequestId = remoteSessionsRequestId
         const createRequestId = streamCreateRequestId
         remoteSessionsRequestId = ""

@@ -41,7 +41,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use streamer::StreamerService;
 
-const PROTOCOL_VERSION: i64 = 4;
+const PROTOCOL_VERSION: i64 = 5;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 
 struct AppCore {
@@ -508,6 +508,31 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
                 .catalog_game(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.launch.inspect" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_launch_inspect(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.favorites.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_favorites(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.favorites.add"
+        | "catalog.favorites.remove"
+        | "catalog.ownership.add"
+        | "catalog.ownership.remove"
+        | "catalog.ownership.select" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_mutate(method, params, &settings)
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }

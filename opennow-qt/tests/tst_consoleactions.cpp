@@ -30,14 +30,20 @@ public slots:
         for (const auto *name : {"AppChrome", "GlassPanel", "GlassButton", "ControllerGlyph",
                  "KeyboardGlyph", "HintBar", "NavPill", "ScreenBackground", "ArtworkSource",
                  "RoundedArtwork", "PlatformPicker", "StoreBadge", "FilterDropdown",
-                 "PosterTile", "VirtualKeyboard"}) {
+                 "PosterTile", "VirtualKeyboard", "CloudLibraryActions"}) {
             qmlRegisterType(QUrl::fromLocalFile(source + "/components/" + name + ".qml"),
+                            "OpenNOW", 1, 0, name);
+        }
+        for (const auto *name : {"DesktopButton", "DesktopGlyph", "DesktopKeyHint"}) {
+            qmlRegisterType(QUrl::fromLocalFile(source + "/desktop/components/" + name + ".qml"),
                             "OpenNOW", 1, 0, name);
         }
         for (const auto *name : {"GameDetailScreen", "LibraryScreen"}) {
             qmlRegisterType(QUrl::fromLocalFile(source + "/screens/" + name + ".qml"),
                             "OpenNOW", 1, 0, name);
         }
+        qmlRegisterType(QUrl::fromLocalFile(source + "/desktop/settings/controls/DesktopSettingsIcon.qml"),
+                        "OpenNOW", 1, 0, "DesktopSettingsIcon");
         QFontDatabase::addApplicationFont(QStringLiteral(":/qt/qml/OpenNOW/res/fonts/Nunito-Variable.ttf"));
         m_app.setReducedMotion(true);
     }

@@ -324,7 +324,22 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(opennow-streamcolor-tests PROPERTIES TIMEOUT 60)
     qt_add_resources(opennow-qt "region-ping-acceptance"
-        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml)
+        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml tests/OwnershipAcceptance.qml)
+    foreach(surface desktop console)
+        foreach(width 960 1440)
+            if(width EQUAL 960)
+                set(ownership_height 720)
+            else()
+                set(ownership_height 900)
+            endif()
+            foreach(state confirmation error)
+                add_test(NAME qml-ownership-${surface}-${width}-${state} COMMAND opennow-qt
+                    --smoke-test --allow-multiple-instances --${surface} --route game-detail
+                    --smoke-ownership --ownership-${state} --smoke-width ${width} --smoke-height ${ownership_height} --reduced-motion)
+                set_tests_properties(qml-ownership-${surface}-${width}-${state} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+            endforeach()
+        endforeach()
+    endforeach()
     foreach(width 960 1440)
         add_test(NAME qml-catalog-sync-${width} COMMAND opennow-qt
             --smoke-test --allow-multiple-instances --desktop --route library

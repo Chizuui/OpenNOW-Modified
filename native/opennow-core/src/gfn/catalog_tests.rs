@@ -239,6 +239,48 @@ fn local_store_refresh_revalidates_a_warm_disk_chain_and_reports_coverage() {
 }
 
 #[test]
+fn local_store_bootstrap_uses_scope_refreshed_during_nested_read() {
+    for params in [json!({}), json!({"refresh":true})] {
+        let renewed_id = super::tests::jwt("fixture-account", now_ms() + 7_200_000);
+        let (url, worker) = mock_requests(
+            vec![
+                (200, json!({"requestStatus":{"serverId":"old-vpc"}})),
+                (401, json!({})),
+                (
+                    200,
+                    json!({"access_token":"renewed-access","id_token":renewed_id,"expires_in":7200}),
+                ),
+                (200, json!({"requestStatus":{"serverId":"new-vpc"}})),
+                (
+                    200,
+                    json!({"data":{"apps":{"items":[app(1)],"pageInfo":{"hasNextPage":false,"totalCount":1}}}}),
+                ),
+            ],
+            |index, request| {
+                if index == 1 {
+                    assert!(request.contains("old-vpc"));
+                }
+                if index == 4 {
+                    assert!(request.contains("new-vpc"));
+                }
+            },
+        );
+        let (service, path) = service(&url);
+        let result = service.store_local_catalog(&params, &json!({}));
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "nested renewal left the local index in the old catalog scope: {:?}",
+            result.err()
+        );
+        let result = result.unwrap();
+        assert_eq!(result["games"][0]["id"], "app-1");
+        assert_eq!(result["scope"]["generation"], 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
 fn optional_definition_failure_does_not_hide_server_disabled_store_actions() {
     let (url, worker) = mock_requests(
         vec![

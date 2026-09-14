@@ -33,12 +33,35 @@ QtObject {
     property int catalogStagedBytes: 0
     property double catalogSliceStarted: 0
     property var acceptsScope: function(scope) { return true }
+    property var authScope: null
     property bool detailVisible: false
     property var definitions: ({})
     property string detailRequestId: ""
     property string detailAppId: ""
     property string detailError: ""
     property string detailState: "idle"
+    property string detailVariantId: ""
+    property var selectedLaunchDecision: ({status: "metadata_unconfirmed", message: ""})
+    readonly property string selectedIdentity: selectedGame ? String(selectedGame.id || "") + ":" + String(((selectedGame.variants || [])[Number(selectedGame.selectedVariantIndex || 0)] || {}).id || "") : ""
+    property int actionGeneration: 0
+    property var ownershipConfirmation: null
+    property string mutationRequestId: ""
+    property var mutationTarget: null
+    property string mutationState: "idle"
+    property string mutationMessage: ""
+    readonly property bool mutationBusy: mutationRequestId !== ""
+    property var remoteFavorites: []
+    property string favoritesRequestId: ""
+    property string favoritesState: "idle"
+    property string favoritesError: ""
+    property var favoritesSections: []
+    signal launchContextInvalidated()
+    onSelectedIdentityChanged: {
+        ownershipConfirmation = null
+        selectedLaunchDecision = ({status: "metadata_unconfirmed", message: ""})
+        cancelDetailRequest()
+        if (detailVisible) Qt.callLater(refreshSelectedMetadata)
+    }
     property Timer detailRefreshTimer: Timer {
         interval: 30000
         repeat: true
@@ -56,11 +79,9 @@ QtObject {
             root.detailRequestId = ""
             if (!root.acceptsScope(result.scope) || !result.game || !root.selectedGame
                     || String(result.game.id) !== root.detailAppId || String(root.selectedGame.id) !== root.detailAppId) return
-            const old = root.selectedGame.variants || []
-            const selected = old[Number(root.selectedGame.selectedVariantIndex || 0)]
-            const variants = result.game.variants || []
-            const index = selected ? variants.findIndex(variant => String(variant.id) === String(selected.id)) : -1
-            root.selectedGame = Object.assign({}, result.game, {selectedVariantIndex: index >= 0 ? index : result.game.selectedVariantIndex})
+            if (result.variantId !== root.detailVariantId) return
+            root.adoptGame(result.game)
+            root.selectedLaunchDecision = result.decision || ({status:"metadata_unconfirmed", message:""})
             root.detailState = "ready"
             root.detailError = ""
         }
@@ -69,6 +90,7 @@ QtObject {
             root.detailRequestId = ""
             root.detailState = "stale"
             root.detailError = message
+            root.selectedLaunchDecision = ({status:"metadata_unconfirmed", message:message})
         }
     }
 
@@ -81,9 +103,133 @@ QtObject {
     function refreshSelectedMetadata() {
         if (!ready || !signedIn || !detailVisible || !selectedGame || detailRequestId !== "") return
         detailAppId = String(selectedGame.id || "")
-        if (!detailAppId) return
+        detailVariantId = String(((selectedGame.variants || [])[Number(selectedGame.selectedVariantIndex || 0)] || {}).id || "")
+        if (!detailAppId || !detailVariantId) return
         detailState = "loading"
-        detailRequestId = coreClient.request("catalog.game.get", {appId: detailAppId}, 30000)
+        detailRequestId = coreClient.request("catalog.launch.inspect", {appId: detailAppId, variantId: detailVariantId}, 30000)
+    }
+
+    function adoptGame(game) {
+        function replace(items) { return items.map(item => String(item.id) === String(game.id) ? game : item) }
+        catalogGames = replace(catalogGames)
+        storeGames = replace(storeGames)
+        remoteFavorites = game.favorited === false
+            ? remoteFavorites.filter(item => String(item.id) !== String(game.id)) : replace(remoteFavorites)
+        if (selectedGame && String(selectedGame.id) === String(game.id)) {
+            const id = String(((selectedGame.variants || [])[Number(selectedGame.selectedVariantIndex || 0)] || {}).id || "")
+            const index = (game.variants || []).findIndex(variant => String(variant.id) === id)
+            selectedGame = Object.assign({}, game, {selectedVariantIndex:index})
+        }
+    }
+
+    function resetCloudActions() {
+        actionGeneration++
+        ownershipConfirmation = null
+        const ids = [mutationRequestId, favoritesRequestId]
+        mutationRequestId = ""
+        favoritesRequestId = ""
+        mutationTarget = null
+        mutationState = "idle"
+        mutationMessage = ""
+        favoritesState = "idle"
+        favoritesError = ""
+        remoteFavorites = []
+        selectedLaunchDecision = ({status:"metadata_unconfirmed", message:""})
+        for (const id of ids) if (id !== "") coreClient.cancel(id)
+        launchContextInvalidated()
+    }
+
+    function refreshFavorites() {
+        if (!ready || !signedIn || favoritesRequestId !== "") return
+        favoritesState = "loading"
+        favoritesError = ""
+        favoritesRequestId = coreClient.request("catalog.favorites.list", {}, 30000)
+    }
+
+    function isCloudFavorite(game) {
+        return game && (game.favorited === true || (game.favorited !== false && remoteFavorites.some(item => String(item.id) === String(game.id))))
+    }
+
+    function requestOwnershipConfirmation(action) {
+        if (!ready || !signedIn || !selectedGame || mutationBusy) return
+        const variant = (selectedGame.variants || [])[Number(selectedGame.selectedVariantIndex || 0)]
+        if (!variant || ["add", "remove"].indexOf(action) < 0) return
+        ownershipConfirmation = {appId:String(selectedGame.id), variantId:String(variant.id), store:String(variant.store || ""), action:action, generation:actionGeneration, identity:selectedIdentity}
+    }
+
+    function confirmOwnership() {
+        const target = ownershipConfirmation
+        ownershipConfirmation = null
+        if (!target || target.generation !== actionGeneration || target.identity !== selectedIdentity) return
+        mutateGame("catalog.ownership." + target.action, target.appId, target.variantId, target.action === "add")
+    }
+
+    function mutateGame(method, appId, variantId, confirmed) {
+        if (!ready || !signedIn || mutationBusy) return
+        mutationTarget = {appId:appId, variantId:variantId, generation:actionGeneration}
+        mutationState = "updating"
+        mutationMessage = qsTr("Updating your GeForce NOW library…")
+        selectedLaunchDecision = ({status:"metadata_unconfirmed", message:mutationMessage})
+        cancelDetailRequest()
+        const favoriteRead = favoritesRequestId
+        favoritesRequestId = ""
+        if (favoriteRead !== "") coreClient.cancel(favoriteRead)
+        launchContextInvalidated()
+        mutationRequestId = coreClient.request(method, {appId:appId, variantId:variantId, confirmedExistingLicense:confirmed === true, scope:authScope}, 60000)
+    }
+
+    function toggleCloudFavorite(game) {
+        if (game) mutateGame(isCloudFavorite(game) ? "catalog.favorites.remove" : "catalog.favorites.add", String(game.id), "", false)
+    }
+
+    function selectPreferredVariant() {
+        const variant = selectedGame && (selectedGame.variants || [])[Number(selectedGame.selectedVariantIndex || 0)]
+        if (variant) mutateGame("catalog.ownership.select", String(selectedGame.id), String(variant.id), false)
+    }
+
+    property Connections cloudActionResponses: Connections {
+        target: root.coreClient
+        function onResponseReceived(id, result) {
+            if (id !== "" && id === root.favoritesRequestId) {
+                root.favoritesRequestId = ""
+                if (!root.acceptsScope(result.scope)) return
+                root.remoteFavorites = result.games || []
+                root.favoritesSections = result.sections || []
+                root.favoritesState = "partial"
+            } else if (id !== "" && id === root.mutationRequestId) {
+                root.mutationRequestId = ""
+                const target = root.mutationTarget
+                root.mutationTarget = null
+                if (!target || target.generation !== root.actionGeneration || !root.acceptsScope(result.scope)) return
+                if (result.appId !== target.appId || result.variantId !== target.variantId) {
+                    root.mutationState = "unconfirmed"
+                    root.mutationMessage = qsTr("The update returned a different game. Refresh this game before trying again.")
+                    root.refreshSelectedMetadata()
+                    return
+                }
+                root.mutationState = result.reconciliation === "confirmed" ? "confirmed" : "unconfirmed"
+                root.mutationMessage = result.message || qsTr("Could not confirm the update. Refresh this game before trying again.")
+                if (result.game && String(result.game.id) === target.appId) root.adoptGame(result.game)
+                root.refreshCatalogAfterAccountChange()
+                root.refreshSelectedMetadata()
+                root.refreshFavorites()
+            }
+        }
+        function onRequestFailed(id, code, message) {
+            if (id !== "" && id === root.favoritesRequestId) {
+                root.favoritesRequestId = ""
+                root.favoritesState = "error"
+                root.favoritesError = message
+            } else if (id !== "" && id === root.mutationRequestId) {
+                root.mutationRequestId = ""
+                root.mutationTarget = null
+                root.mutationState = "unconfirmed"
+                root.mutationMessage = qsTr("Could not confirm the update. Refresh this game before trying again.") + " " + message
+                root.refreshSelectedMetadata()
+                root.refreshCatalogAfterAccountChange()
+                root.refreshFavorites()
+            }
+        }
     }
 
     function genreLabel(genre) {
@@ -130,6 +276,7 @@ QtObject {
     }
     onReadyChanged: {
         if (!ready) {
+            resetCloudActions()
             cancelCatalogRequest()
             cancelDetailRequest()
             catalogNextCursor = ""
@@ -350,6 +497,8 @@ QtObject {
     }
 
     function reloadCatalogForSession() {
+        resetCloudActions()
+        Qt.callLater(refreshFavorites)
         cancelDetailRequest()
         detailState = "idle"
         detailError = ""
@@ -371,10 +520,15 @@ QtObject {
     }
 
     function refreshCatalogAfterAccountChange() {
+        cancelDetailRequest()
+        selectedLaunchDecision = ({status:"metadata_unconfirmed", message:""})
+        ownershipConfirmation = null
+        launchContextInvalidated()
         cancelCatalogRequest()
         catalogState = "idle"
         refreshCatalog("")
         reloadStoreForSession()
+        Qt.callLater(refreshSelectedMetadata)
     }
 
     function ensureStore(searchQuery, filters) {
@@ -569,7 +723,8 @@ QtObject {
         selectedGame = nextGame
         const variant = variants[boundedIndex]
         accessibilityAnnounced(qsTr("%1 platform selected").arg(String(variant.store || qsTr("Unknown")))
-            + (Boolean(variant.inLibrary) ? qsTr(" · owned") : qsTr(" · not owned")))
+            + (["MANUAL", "PLATFORM_SYNC"].indexOf(variant.libraryStatus) >= 0 ? qsTr(" · owned")
+                : variant.libraryStatus === "NOT_OWNED" ? qsTr(" · not owned") : " · " + qsTr("Ownership unconfirmed")))
     }
 
     function gameIdentity(game) {

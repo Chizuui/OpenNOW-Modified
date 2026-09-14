@@ -17,13 +17,21 @@ FocusScope {
     z: popupPresented ? 100 : 0
     readonly property int boundedCurrentIndex: variants.length > 0
         ? Math.max(0, Math.min(variants.length - 1, currentIndex)) : 0
-    readonly property var currentVariant: variants.length > 0
-        ? variants[boundedCurrentIndex] : ({store:qsTr("GeForce NOW"), inLibrary:false})
+    readonly property var currentVariant: currentIndex >= 0 && currentIndex < variants.length
+        ? variants[currentIndex] : ({store:qsTr("Choose platform"), libraryStatus:null})
 
     Accessible.role: Accessible.ComboBox
     Accessible.name: qsTr("Platform")
     Accessible.description: platformName(currentVariant)
-        + (Boolean(currentVariant.inLibrary) ? qsTr(", owned") : qsTr(", not owned"))
+        + ", " + ownershipText(currentVariant)
+
+    function owned(variant) {
+        return ["MANUAL", "PLATFORM_SYNC"].indexOf(variant.libraryStatus) >= 0
+    }
+
+    function ownershipText(variant) {
+        return owned(variant) ? qsTr("Owned") : variant.libraryStatus === "NOT_OWNED" ? qsTr("Not owned") : qsTr("Ownership unconfirmed")
+    }
 
     function platformName(variant) {
         return String(variant && variant.store || qsTr("Unknown platform"))
@@ -133,9 +141,8 @@ FocusScope {
                 font.weight: Font.Black
             }
             Text {
-                text: Boolean(root.currentVariant.inLibrary)
-                    ? qsTr("Owned in your library") : qsTr("Available on GeForce NOW")
-                color: Boolean(root.currentVariant.inLibrary) ? Theme.mint : Theme.textMuted
+                text: root.ownershipText(root.currentVariant)
+                color: root.owned(root.currentVariant) ? Theme.mint : Theme.textMuted
                 font.family: Theme.bodyFont
                 font.pixelSize: 13
                 font.weight: Font.DemiBold
@@ -202,7 +209,7 @@ FocusScope {
                 padding: 0
                 highlighted: index === root.highlightedIndex
                 Accessible.name: root.platformName(modelData)
-                Accessible.description: Boolean(modelData.inLibrary) ? qsTr("Owned") : qsTr("Not owned")
+                Accessible.description: root.ownershipText(modelData)
                 onClicked: root.choose(index)
                 background: Rectangle {
                     radius: 22
@@ -236,16 +243,16 @@ FocusScope {
                         width: ownershipText.implicitWidth + 18
                         height: 30
                         radius: 15
-                        color: Boolean(modelData.inLibrary)
+                        color: root.owned(modelData)
                             ? (platformOption.highlighted ? Qt.rgba(0.04, 0.48, 0.28, 0.18) : Qt.rgba(0.43, 0.91, 0.72, 0.13))
                             : "transparent"
-                        border.color: Boolean(modelData.inLibrary) ? Theme.mint : Theme.seam
+                        border.color: root.owned(modelData) ? Theme.mint : Theme.seam
                         border.width: 1
                         Text {
                             id: ownershipText
                             anchors.centerIn: parent
-                            text: Boolean(modelData.inLibrary) ? qsTr("✓ Owned") : qsTr("Not owned")
-                            color: Boolean(modelData.inLibrary)
+                            text: root.ownershipText(modelData)
+                            color: root.owned(modelData)
                                 ? (platformOption.highlighted ? Theme.faceText : Theme.mint)
                                 : (platformOption.highlighted ? Qt.rgba(0.04, 0.06, 0.10, 0.6) : Theme.textMuted)
                             font.family: Theme.bodyFont

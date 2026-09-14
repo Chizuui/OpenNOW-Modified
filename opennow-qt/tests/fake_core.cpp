@@ -51,7 +51,7 @@ int main(int argc, char **argv)
         } else if (field(line, "type") == "cancel") {
             continue;
         } else if (method == "core.hello") {
-            const auto protocolVersion = std::getenv("OPENNOW_TEST_OLD_CORE") ? 3 : 4;
+            const auto protocolVersion = std::getenv("OPENNOW_TEST_OLD_CORE") ? 4 : 5;
             std::cout << "{\"type\":\"response\",\"id\":\"" << id
                       << "\",\"ok\":true,\"result\":{\"protocolVersion\":" << protocolVersion
                       << ",\"capabilities\":[\"settings\",\"catalog.libraryPages.v1\",\"catalog.metadata.v1\",\"account.syncObservation.v1\",\"catalog.languages.v1\",\"nativeStreamer.v7\",\"nativeStreamer.ownedNvstNegotiation\"]}}\n" << std::flush;
