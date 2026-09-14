@@ -71,7 +71,7 @@ int main(int argc, char **argv)
                       << ",\"startupAcknowledgements\":" << startupAcknowledgements
                       << ",\"hasUpdateEnvironment\":" << (std::getenv("OPENNOW_UPDATE_PLAN") && std::getenv("OPENNOW_UPDATE_NONCE") ? "true" : "false")
                       << "}}\n" << std::flush;
-        } else if (method == "session.create" || method == "streamer.prepare") {
+        } else if (method == "session.create" || method == "streamer.prepare" || method == "settings.choices.get") {
             if (line.find("\"delayReceipt\":true") != std::string::npos)
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
             std::cout << "{\"type\":\"response\",\"id\":\"" << id
@@ -89,11 +89,11 @@ int main(int argc, char **argv)
                           << "\",\"ok\":false,\"error\":{\"code\":\"settings_write_failed\",\"message\":\"Fixture denied settings persistence\"}}\n" << std::flush;
             } else if (consoleModeWrite) {
                 launchInConsoleMode = line.find("\"value\":true") != std::string::npos;
-                std::cout << "{\"type\":\"response\",\"id\":\"" << id
-                          << "\",\"ok\":true,\"result\":{\"key\":\"launchInConsoleMode\",\"value\":"
+                std::cout << "{\"type\":\"event\",\"name\":\"settings.changed\",\"payload\":{\"key\":\"launchInConsoleMode\",\"value\":"
                           << (launchInConsoleMode ? "true" : "false")
                           << (launchInConsoleMode ? "" : ",\"changes\":{\"switchToConsoleOnPad\":false}") << "}}\n";
-                std::cout << "{\"type\":\"event\",\"name\":\"settings.changed\",\"payload\":{\"key\":\"launchInConsoleMode\",\"value\":"
+                std::cout << "{\"type\":\"response\",\"id\":\"" << id
+                          << "\",\"ok\":true,\"result\":{\"key\":\"launchInConsoleMode\",\"value\":"
                           << (launchInConsoleMode ? "true" : "false")
                           << (launchInConsoleMode ? "" : ",\"changes\":{\"switchToConsoleOnPad\":false}") << "}}\n" << std::flush;
             } else {

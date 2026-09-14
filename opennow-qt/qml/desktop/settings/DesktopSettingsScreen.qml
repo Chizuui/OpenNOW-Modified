@@ -60,31 +60,18 @@ FocusScope {
     }
 
     function setSetting(key, value) {
-        ShellStore.applySetting(key, value)
+        if (!ShellStore.settingsOwnerState.ownsConfirmedSetting(key))
+            ShellStore.applySetting(key, value)
         ShellStore.setSetting(key, value)
         if (key === "resolution")
             Qt.callLater(root.clampFpsToEntitlement)
     }
 
     function setChoice(key, value) {
-        const normalized = String(value || "").toLowerCase()
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (key === "colorQuality") {
-            if (codec === "h264" && normalized !== "8bit_420")
-                return
-            if (codec === "av1" && normalized.indexOf("444") >= 0)
-                return
-        }
         const currentQuality = String(root.valueSetting("colorQuality", "8bit_420"))
         root.setSetting(key, value)
         if (key === "colorQuality")
             tenBitWarning.notifySelection(currentQuality, value)
-        if (key === "codec") {
-            if (normalized === "h264" && currentQuality !== "8bit_420")
-                root.setSetting("colorQuality", "8bit_420")
-            else if (normalized === "av1" && currentQuality.indexOf("444") >= 0)
-                root.setSetting("colorQuality", currentQuality.replace("444", "420"))
-        }
     }
 
     function choices(values) {
@@ -92,35 +79,12 @@ FocusScope {
     }
 
     function colorQualityItems() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        const h264 = codec === "h264"
-        const chroma444Unavailable = h264 || codec === "av1"
-        return [
-            {kind:"choice", label:qsTr("8-bit, YUV 4:2:0"), detail:qsTr("All codecs"), value:"8bit_420"},
-            {kind:"choice", label:qsTr("8-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Sharper color"), value:"8bit_444", disabled:chroma444Unavailable},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:2:0"), detail:h264 ? qsTr("H.265 / AV1 required") : qsTr("Smoother gradients"), value:"10bit_420", disabled:h264},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Highest color quality"), value:"10bit_444", disabled:chroma444Unavailable}
-        ]
+        return ShellStore.settingsOwnerState.colorQualityItems
     }
 
     function colorQualityFooter() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (codec === "h264")
-            return qsTr("H.264 supports 8-bit YUV 4:2:0 only")
-        if (codec === "av1")
-            return qsTr("AV1 supports YUV 4:2:0; use H.265 for 4:4:4")
-        return qsTr("4:4:4 profiles use H.265")
-    }
-
-    function colorQualityLabel() {
-        const labels = {
-            "8bit_420": qsTr("8-bit, YUV 4:2:0"),
-            "8bit_444": qsTr("8-bit, YUV 4:4:4"),
-            "10bit_420": qsTr("10-bit, YUV 4:2:0"),
-            "10bit_444": qsTr("10-bit, YUV 4:4:4")
-        }
-        const value = String(root.valueSetting("colorQuality", "8bit_420"))
-        return labels[value] || labels["8bit_420"]
+        const current = colorQualityItems().find(item => item.value === root.valueSetting("colorQuality", "8bit_420"))
+        return current ? current.detail : ShellStore.settingsOwnerState.colorDescription
     }
 
     function liveTierBadge() {
@@ -528,6 +492,7 @@ FocusScope {
         height: root.height - y - DesktopTokens.px(18)
         Flickable {
             id: contentFlick
+            objectName: "desktopSettingsContent"
             anchors.fill: parent
             contentWidth: width
             contentHeight: pageLoader.height

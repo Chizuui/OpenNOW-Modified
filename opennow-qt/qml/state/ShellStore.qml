@@ -48,6 +48,9 @@ QtObject {
         i18n: I18n
         ready: root.ready
         subscription: root.subscription
+        scopeGeneration: root.authGeneration
+        settingsActive: String(AppController.route).indexOf("settings") === 0
+        nativeHdrOutputSupported: HdrOutput.supported
         providerIdpId: root.authSession && root.authSession.provider ? String(root.authSession.provider.idpId || "") : ""
         providerCode: root.authSession && root.authSession.provider ? String(root.authSession.provider.code || "") : ""
         nativeRuntimeReady: root.nativeRuntimeReady
@@ -2896,6 +2899,7 @@ QtObject {
             }
         }
         function onResponseReceived(requestId, result) {
+            if (settingsOwner.acceptResponse(requestId, result)) return
             const ownedTermination = root.ownedSessionTermination(result)
             if (ownedTermination) {
                 root.finishRemoteSession(ownedTermination)
@@ -3294,6 +3298,7 @@ QtObject {
             }
         }
         function onRequestFailed(requestId, code, message) {
+            if (settingsOwner.acceptFailure(requestId, message)) return
             if (onboardingOwner.acceptFailure(requestId, message)) {
                 return
             } else if (requestId === root.storePresentationRequestId && requestId !== "") {

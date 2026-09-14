@@ -399,6 +399,7 @@ private slots:
             var CoreClient = {request:function(method,params){requests.push(method);return 'request-'+requests.length;}};
             var AppController = {navigate:function(){}};
             var onboardingOwner = {acceptFailure:function(){return false;}};
+            var settingsOwner = {acceptFailure:function(){return false;}};
             function finishArtworkRequest(){return false;}
             function selectedLaunchAppId(){return '123';}
             function selectedGameMembershipError(){return '';}

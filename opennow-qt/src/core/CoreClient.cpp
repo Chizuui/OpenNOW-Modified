@@ -268,7 +268,8 @@ QString CoreClient::request(const QString &method, const QJsonObject &params, in
     const auto id = QString::number(m_nextRequestId++);
     const auto deadline = QDateTime::currentMSecsSinceEpoch() + qBound(100, timeoutMs, 300'000);
     auto runtimeParams = params;
-    if (method == u"session.create"_s || method == u"streamer.prepare"_s) {
+    if (method == u"session.create"_s || method == u"streamer.prepare"_s
+            || method == u"settings.choices.get"_s) {
         auto capabilities = runtimeParams.value(u"runtimeCapabilities"_s).toObject();
         capabilities.insert(u"nativeHdrSupported"_s, m_nativeHdrSupported);
         runtimeParams.insert(u"runtimeCapabilities"_s, capabilities);

@@ -78,7 +78,8 @@ int AcceptanceSession::startSmokeWorkload()
         return startStreamExitWorkload();
     if (m_smokeTest && m_arguments.contains(u"--smoke-frame-generation-stats"_s))
         return startFrameGenerationStatsWorkload();
-    if (m_smokeTest && (m_arguments.contains(u"--smoke-frame-generation"_s)
+    if (m_smokeTest && (m_arguments.contains(u"--smoke-language-settings"_s)
+                       || m_arguments.contains(u"--smoke-frame-generation"_s)
                        || m_arguments.contains(u"--smoke-ten-bit-warning"_s)
                        || m_arguments.contains(u"--smoke-onboarding"_s)
                        || m_arguments.contains(u"--smoke-upscaling"_s)
@@ -87,11 +88,14 @@ int AcceptanceSession::startSmokeWorkload()
                        || m_arguments.contains(u"--smoke-controller-metadata"_s)
                        || m_arguments.contains(u"--smoke-custom-background"_s))) {
         const bool controllerMetadata = m_arguments.contains(u"--smoke-controller-metadata"_s);
+        const bool languageSettings = m_arguments.contains(u"--smoke-language-settings"_s);
         const bool onboarding = m_arguments.contains(u"--smoke-onboarding"_s);
         const bool tenBitWarning = m_arguments.contains(u"--smoke-ten-bit-warning"_s);
         const bool customBackground = m_arguments.contains(u"--smoke-custom-background"_s);
         const bool streamStats = m_arguments.contains(u"--smoke-stream-stats"_s);
-        QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-onboarding"_s)
+        QQmlComponent component(&m_engine, QUrl(languageSettings
+            ? u"qrc:/acceptance/LanguageSettingsAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-onboarding"_s)
             ? m_arguments.contains(u"--onboarding-replay-check"_s)
                 ? u"qrc:/acceptance/OnboardingReplayAcceptance.qml"_s
                 : m_arguments.contains(u"--onboarding-ui-check"_s)
@@ -119,6 +123,8 @@ int AcceptanceSession::startSmokeWorkload()
         fixture->setParent(&m_engine);
         if (controllerMetadata)
             m_engine.rootContext()->setContextProperty(u"ControllerInput"_s, fixture->property("input").value<QObject *>());
+        if (languageSettings && m_arguments.contains(u"--language-hdr-invalidation"_s))
+            m_engine.rootContext()->setContextProperty(u"HdrOutput"_s, fixture->property("hdrOutput").value<QObject *>());
         if (customBackground) {
             QFile image(u":/qt/qml/OpenNOW/res/brand/desktop-renew.jpg"_s);
             auto *localImage = new QTemporaryFile(&m_engine);
@@ -128,14 +134,24 @@ int AcceptanceSession::startSmokeWorkload()
             fixture->setProperty("imageUrl", QUrl::fromLocalFile(localImage->fileName()).toString());
             localImage->close();
         }
-        QTimer::singleShot(150, this, [this, fixture, customBackground, onboarding, tenBitWarning] {
+        QTimer::singleShot(150, this, [this, fixture, customBackground, onboarding, tenBitWarning, languageSettings] {
             auto *window = qobject_cast<QQuickWindow *>(m_engine.rootObjects().first());
             QVariant passed;
             const bool ok = window && QMetaObject::invokeMethod(fixture, "run", Q_RETURN_ARG(QVariant, passed),
                 Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) && passed.toBool() && !m_qmlWarningOccurred;
             if (!ok) { m_application.exit(EXIT_FAILURE); return; }
-            const auto finish = [this, window, fixture, customBackground, onboarding, tenBitWarning] {
-                if (customBackground || onboarding || tenBitWarning) {
+            const auto finish = [this, window, fixture, customBackground, onboarding, tenBitWarning, languageSettings] {
+                if (languageSettings) {
+                    const QList<int> keys = m_arguments.contains(u"--language-keyboard-selection"_s)
+                        ? QList<int>{Qt::Key_Tab, Qt::Key_Return} : QList<int>{Qt::Key_Escape};
+                    for (const auto key : keys) {
+                        QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+                        QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+                        QGuiApplication::sendEvent(window, &press);
+                        QGuiApplication::sendEvent(window, &release);
+                    }
+                }
+                if (customBackground || onboarding || tenBitWarning || languageSettings) {
                     QVariant verified;
                     if (!QMetaObject::invokeMethod(fixture, "verify", Q_RETURN_ARG(QVariant, verified))
                         || !verified.toBool() || m_qmlWarningOccurred) {
@@ -143,7 +159,7 @@ int AcceptanceSession::startSmokeWorkload()
                         return;
                     }
                 }
-                QTimer::singleShot(150, this, [this, window] {
+                QTimer::singleShot(languageSettings && m_arguments.contains(u"--language-preview"_s) ? 60000 : 150, this, [this, window] {
                     const auto shot = m_arguments.indexOf(u"--screenshot"_s);
                     const bool saved = shot < 0 || (shot + 1 < m_arguments.size()
                         && window->grabWindow().save(m_arguments.at(shot + 1)));

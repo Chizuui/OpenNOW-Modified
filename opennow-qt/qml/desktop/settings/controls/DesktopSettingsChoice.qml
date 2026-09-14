@@ -114,6 +114,8 @@ Item {
                                 hoverEnabled: true
                                 Accessible.name: String(modelData.label) + " " + String(modelData.detail || "")
                                 onClicked: { root.expanded = false; root.selected(modelData.value) }
+                                Keys.onReturnPressed: event => { tile.clicked(); event.accepted = true }
+                                Keys.onEnterPressed: event => { tile.clicked(); event.accepted = true }
                                 Keys.onEscapePressed: event => { root.expanded = false; event.accepted = true }
                                 background: Rectangle {
                                     radius: 12

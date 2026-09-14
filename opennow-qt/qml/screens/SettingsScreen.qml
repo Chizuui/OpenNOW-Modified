@@ -29,7 +29,7 @@ FocusScope {
         : Math.max(110, Math.min(height - dropdownPanelHeight - 110,
             96 + 33 + (settingsList.currentItem ? settingsList.currentItem.y : 0) + 58))
     readonly property real dropdownPanelHeight: dropdownKey === "resolution"
-        ? 499 : Math.min(499, 89 + dropdownLabels.length * 40)
+        ? 499 : Math.min(499, 91 + dropdownLabels.length * (dropdownDetails.length ? 64 : 40))
     readonly property var sections: [
         {name:"Account", icon:"settings-account.svg", color:Theme.violet},
         {name:"Streaming", icon:"settings-streaming.svg", color:Theme.focus},
@@ -60,6 +60,13 @@ FocusScope {
         const current = key === "controllerInputSource" ? ControllerInput.inputControllerId : ShellStore.settings[key]
         const index = values.indexOf(current)
         return {t:title, d:description, v:index >= 0 ? labels[index] : key === "controllerInputSource" ? qsTr("Selected controller disconnected") : key === "windowsGpuDeviceId" ? qsTr("Automatic") : root.titleCase(current), key:key, values:values, labels:labels, control:control || "dropdown", disabledValues:disabledValues || []}
+    }
+
+    function descriptorChoice(title, description, key, items) {
+        const row = choice(title, description, key, items.map(item => item.value),
+            items.map(item => item.label), "dropdown", items.filter(item => item.disabled).map(item => item.value))
+        row.details = items.map(item => item.detail || "")
+        return row
     }
 
     function toggle(title, description, key, onLabel, offLabel) {
@@ -282,10 +289,6 @@ FocusScope {
         if (root.selectedSection === 1) {
             const codecValues = ShellStore.availableCodecValues()
             const codecLabels = codecValues.map(value => value === "auto" ? "Auto" : value === "h264" ? "H.264" : value === "h265" ? "H.265" : String(value).toUpperCase())
-            const selectedCodec = String(settings.codec || "auto").toLowerCase()
-            const colorDisabled = selectedCodec === "h264"
-                ? ["8bit_444", "10bit_420", "10bit_444"]
-                : selectedCodec === "av1" ? ["8bit_444", "10bit_444"] : []
             const frameGeneration = String(settings.frameGeneration || "off") === "2x"
             const hdrAvailable = HdrOutput.supported && ShellStore.hdrDecoderAvailable()
             const hdrDescription = HdrOutput.supported && !ShellStore.hdrDecoderAvailable()
@@ -293,7 +296,7 @@ FocusScope {
             return [
                 {t:"Codec", d:"Auto prefers AV1, then H.264, then H.265", v:root.titleCase(settings.codec || "auto"), key:"codec", values:codecValues, labels:codecLabels, segmentLabels:["Auto","AV1","H.264","H.265"], control:"segments", selectedIndex:["auto","av1","h264","h265"].indexOf(String(settings.codec || "auto"))},
                 choice("Fallback codec", "Used when the preferred codec isn't offered by the rig", "fallbackCodec", codecValues, codecLabels),
-                choice("Color quality", "10-bit needs H.265 or AV1; 4:4:4 needs H.265", "colorQuality", ["8bit_420","8bit_444","10bit_420","10bit_444"], ["8-bit, YUV 4:2:0","8-bit, YUV 4:4:4","10-bit, YUV 4:2:0","10-bit, YUV 4:4:4"], "segments", colorDisabled),
+                descriptorChoice(qsTr("Color quality"), ShellStore.settingsOwnerState.colorDescription, "colorQuality", ShellStore.settingsOwnerState.colorQualityItems),
                 {t:qsTr("HDR"), d:hdrDescription, v:Boolean(settings.enableHdr) ? qsTr("On") : qsTr("Off"), key:"enableHdr", values:[false,true], labels:[qsTr("Off"),qsTr("On")], control:"segments", selectedIndex:Boolean(settings.enableHdr) ? 1 : 0, disabledValues:hdrAvailable ? [] : [true]},
                 {t:"Max bitrate", d:"Maximum requested stream bitrate", v:Number(settings.maxBitrateMbps || 75) + " Mbps", key:"maxBitrateMbps", values:[25,50,75,100,150,200], labels:["25 Mbps","50 Mbps","75 Mbps","100 Mbps","150 Mbps","200 Mbps"], control:"slider", sliderPercent:Number(settings.maxBitrateMbps || 75) / 106},
                 {t:qsTr("Frame generation (Experimental)"), d:qsTr("Targets 120 displayed FPS from a 60 FPS stream. Requires a fast GPU and 120 Hz display; adds latency and artifacts."), v:frameGeneration ? qsTr("2×") : qsTr("Off"), key:"frameGeneration", values:["off","2x"], labels:[qsTr("Off"),qsTr("2×")], control:"segments", selectedIndex:frameGeneration ? 1 : 0},
@@ -372,10 +375,12 @@ FocusScope {
                     values:values, labels:values.map(value => value + "%"), control:"slider", sliderPercent:value / setting.maximum})
             }
             rows.push({t:"Mouse sensitivity", d:"Acceleration off · raw input", v:Number(settings.mouseSensitivity || 1).toFixed(1) + "×", key:"mouseSensitivity", values:[0.5,0.75,1,1.25,1.5], labels:["0.5×","0.75×","1.0×","1.25×","1.5×"], control:"slider", sliderPercent:Number(settings.mouseSensitivity || 1) / 1.5})
-            rows.push(choice("Keyboard layout", "Physical key mapping requested from GeForce NOW", "keyboardLayout",
-                ["en-US","en-GB","tr-TR","de-DE","fr-FR","es-ES","es-MX","it-IT","pt-PT","pt-BR","pl-PL","da-DK","nb-NO","sv-SE","fi-FI","ru-RU","ja-JP","ko-KR","zh-CN","zh-TW"],
-                ["English (US)","English (UK)","Turkish Q","German","French","Spanish","Spanish (Latin America)","Italian","Portuguese (Portugal)","Portuguese (Brazil)","Polish","Danish","Norwegian","Swedish","Finnish","Russian","Japanese","Korean","Chinese (Simplified)","Chinese (Traditional)"]))
-            rows.push(choice("Game language", "Requested from the game when it supports it", "gameLanguage", ["en_US","en_GB","de_DE","fr_FR","es_ES","it_IT","pt_BR","ja_JP","ko_KR"], ["English (US)","English (UK)","Deutsch","Français","Español","Italiano","Português (BR)","日本語","한국어"]))
+            rows.push(descriptorChoice(qsTr("Game language"), ShellStore.settingsOwnerState.gameLanguageDescription,
+                "gameLanguage", ShellStore.settingsOwnerState.gameLanguageItems))
+            rows.push({t:qsTr("Game language metadata"), d:ShellStore.settingsOwnerState.languageStatusText,
+                v:qsTr("Retry"), action:"retry-languages", info:!ShellStore.settingsOwnerState.ready || ShellStore.settingsOwnerState.languageState === "loading"})
+            rows.push(descriptorChoice(qsTr("Keyboard layout"), ShellStore.settingsOwnerState.keyboardLayoutDescription,
+                "keyboardLayout", ShellStore.settingsOwnerState.keyboardLayoutItems))
             rows.push({t:"Shortcuts", d:"Stats Ctrl+N · Pointer lock F8 · Fullscreen F11 · Screenshot Ctrl+F11", v:"Edit shortcuts", key:"shortcutToggleStats", action:"shortcut-editor"})
             rows.push(choice(qsTr("Microphone"), ShellStore.microphoneCaptureSupported ? ShellStore.microphoneDescription : qsTr("Microphone capture is unavailable in this build."),
                 "microphoneMode", ["disabled", "voice-activity"], [qsTr("Disabled"), qsTr("Open microphone")], "segments",
@@ -419,9 +424,8 @@ FocusScope {
                 toggle("Reduced motion", "Remove decorative motion without delaying actions", "reducedMotion"),
                 toggle("Console mode", "Bigger 10-foot layout, profile picker on start, controller-only navigation", "launchInConsoleMode"),
                 {t:"Theme store", d:"Browse controller-first palettes from the Paper V3 collection", v:root.titleCase(settings.themePack || "default"), route:"theme-store"},
-                choice("Language", "Changes the OpenNOW interface; untranslated text falls back to English", "appLanguage",
-                    ["system","de","en","es","fr","ja","ko","nl","pl","ro","ru","tr","zh"],
-                    ["System","Deutsch","English","Español","Français","日本語","한국어","Nederlands","Polski","Română","Русский","Türkçe","中文"]),
+                descriptorChoice(qsTr("Interface language"), ShellStore.settingsOwnerState.interfaceLanguageDescription,
+                    "appLanguage", ShellStore.settingsOwnerState.interfaceLanguageItems),
                 toggle("Anti-AFK indicator", "Show an in-session badge while anti-AFK pulses are enabled", "showAntiAfkIndicator"),
                 choice("Anti-AFK reminder", "Repeat the activation reminder when the persistent indicator is hidden", "antiAfkReminderEveryMinutes", [0,5,10,15,30,60], ["Off","Every 5 minutes","Every 10 minutes","Every 15 minutes","Every 30 minutes","Every hour"]),
                 choice("Anti-AFK reminder duration", "How long a reminder remains visible", "antiAfkReminderDurationSeconds", [2,3,5,8,10], ["2 seconds","3 seconds","5 seconds","8 seconds","10 seconds"]),
@@ -457,6 +461,8 @@ FocusScope {
         ]
     }
 
+    property var dropdownDetails: []
+
     function openChoices(row) {
         dropdownCloseTimer.stop()
         dropdownTitle = row.t
@@ -464,6 +470,7 @@ FocusScope {
         dropdownLabels = row.labels
         dropdownValues = row.values
         dropdownDisabledValues = row.disabledValues || []
+        dropdownDetails = row.details || []
         if (row.key === "resolution")
             prepareResolutionMenu()
         dropdownPresented = true
@@ -500,13 +507,6 @@ FocusScope {
             ControllerInput.inputControllerId = Number(value)
         else
             ShellStore.setSetting(key, value)
-        if (key === "codec") {
-            const codec = String(value).toLowerCase()
-            if (codec === "h264" && currentQuality !== "8bit_420")
-                ShellStore.setSetting("colorQuality", "8bit_420")
-            else if (codec === "av1" && currentQuality.indexOf("444") >= 0)
-                ShellStore.setSetting("colorQuality", currentQuality.replace("444", "420"))
-        }
         root.closeDropdown()
         if (key === "colorQuality")
             tenBitWarning.notifySelection(currentQuality, value)
@@ -515,7 +515,9 @@ FocusScope {
     function activate(row) {
         if (!row || row.info)
             return
-        if (row.route) {
+        if (row.action === "retry-languages") {
+            ShellStore.settingsOwnerState.ensureGameLanguages(true)
+        } else if (row.route) {
             AppController.navigate(row.route)
         } else if (row.toggle) {
             ShellStore.setSetting(row.key, !Boolean(ShellStore.settings[row.key]))
@@ -668,6 +670,7 @@ FocusScope {
             anchors.fill: parent; anchors.margins: 33
             ListView {
                 id: settingsList
+                objectName: "consoleSettingsList"
                 anchors.fill: parent
                 spacing: 0; clip: true; keyNavigationWraps: false
                 focus: true
@@ -882,7 +885,7 @@ FocusScope {
                     required property string modelData
                     required property int index
                     width: ListView.view.width
-                    height: 38
+                    height: root.dropdownDetails.length ? 64 : 38
                     padding: 0
                     enabled: !root.dropdownChoiceDisabled(index)
                     highlighted: ListView.isCurrentItem && enabled
@@ -908,7 +911,8 @@ FocusScope {
                         Text {
                             x: root.dropdownChoiceSelected(index) ? 38 : 12
                             anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - x - (disabledReason.visible ? disabledReason.width + 18 : 12)
+                            width: parent.width - x - 12
+                            anchors.verticalCenterOffset: root.dropdownDetails.length ? -13 : 0
                             text: I18n.source(modelData, I18n.revision)
                             color: dropdownItem.highlighted ? Theme.faceText : Theme.label
                             font.family: Theme.bodyFont
@@ -918,13 +922,14 @@ FocusScope {
                         }
                         Text {
                             id: disabledReason
-                            visible: root.dropdownChoiceDisabled(index)
-                            anchors.right: parent.right
-                            anchors.rightMargin: 12
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: root.dropdownKey === "windowsGpuDeviceId" ? qsTr("Unavailable")
-                                : String(root.dropdownValues[index]).indexOf("444") >= 0
-                                    ? qsTr("H.265") : qsTr("H.265 / AV1")
+                            visible: text !== ""
+                            x: 12
+                            y: 32
+                            width: parent.width - 24
+                            maximumLineCount: 2
+                            wrapMode: Text.WordWrap
+                            elide: Text.ElideRight
+                            text: root.dropdownDetails[index] || (root.dropdownChoiceDisabled(index) ? qsTr("Unavailable") : "")
                             color: Theme.textMuted
                             font.family: Theme.bodyFont
                             font.pixelSize: 12

@@ -11,6 +11,7 @@ mod device_identity;
 mod diagnostics;
 mod discord;
 mod gfn;
+mod language;
 mod media;
 mod network;
 mod persistent_storage;
@@ -205,8 +206,11 @@ fn run() -> Result<(), String> {
             if !was_cancelled {
                 match result {
                     Ok((value, event)) => {
+                        if let Some(("settings.changed", payload)) = &event {
+                            let _ = worker_output.send(json!({"type":"event", "name":"settings.changed", "payload":payload}));
+                        }
                         let _ = worker_output.send(json!({"type":"response", "id":id, "ok":true, "result":value}));
-                        if let Some((name, payload)) = event {
+                        if let Some((name, payload)) = event && name != "settings.changed" {
                             let _ = worker_output.send(json!({"type":"event", "name":name, "payload":payload}));
                         }
                     }
@@ -361,9 +365,18 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             None,
         )),
         "settings.get" => Ok((
-            json!({"settings":core.settings.lock().expect("settings poisoned").all()}),
+            json!({"settings":core.settings.lock().expect("settings poisoned").all(),
+                "keyboardLayouts":language::keyboard_choices()}),
             None,
         )),
+        "settings.choices.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            Ok((
+                json!({"colorQualities":streamer::StreamerService::color_quality_choices(
+                &settings, &params["runtimeCapabilities"])}),
+                None,
+            ))
+        }
         "settings.set" => {
             let key = params["key"].as_str().ok_or((
                 "invalid_params".to_owned(),

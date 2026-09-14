@@ -148,14 +148,13 @@ Column {
                 onValueChangedByUser: value => page.settingsScreen.setSetting("enableHdr", value)
             }
         }
-        DesktopSettingsRow {
-            width: parent.width; paperStyle: true; glyph: "drop"; title: qsTr("Color depth")
+        DesktopSettingsChoice {
+            objectName: "colorQualityChoice"
+            width: parent.width; glyph: "sun"; title: qsTr("Color quality")
             description: page.settingsScreen.colorQualityFooter(); showDivider: false
-            DesktopSettingsSegmented {
-                options: page.settingsScreen.colorQualityItems().filter(item => item.value !== "8bit_444" || page.settingsScreen.valueSetting("colorQuality","8bit_420") === "8bit_444").map(item => ({label:item.value === "8bit_420" ? "8-bit" : item.value === "10bit_420" ? "10-bit" : item.value === "8bit_444" ? "8-bit 4:4:4" : "10-bit 4:4:4", value:item.value, enabled:!item.disabled}))
-                optionWidth: 85; selectedIndex: options.findIndex(item => item.value === page.settingsScreen.valueSetting("colorQuality","8bit_420"))
-                onSelected: (index,item) => page.settingsScreen.setChoice("colorQuality",item.value)
-            }
+            items: ShellStore.settingsOwnerState.colorQualityItems
+            value: page.settingsScreen.valueSetting("colorQuality", "8bit_420")
+            onSelected: value => page.settingsScreen.setChoice("colorQuality", value)
         }
     }
     DesktopSettingsPanel {

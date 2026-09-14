@@ -299,6 +299,7 @@ and artwork only near the viewport, using the section's local category ID
 - `core.hello`
 - `app.status`
 - `settings.get`
+- `settings.choices.get`
 - `settings.set`
 - `settings.reset`
 - `auth.providers.list`
@@ -791,6 +792,11 @@ Setting `appAccentColor` enables `themeAccentOverride` in the same save. The
 in `changes`; clients can still override appearance or restore the pack accent
 by setting `appTheme` or `themeAccentOverride` independently.
 
+Each successful settings write publishes `settings.changed` before its own
+response. A client that starts its next per-key write from that response has
+already consumed the previous event. Other response/event pairs, including
+`settings.reset`, retain their existing response-first order.
+
 Settings writes use a temporary file plus recoverable backup and normalize
 compatibility-sensitive values. `audioOutputDevice` is an opaque native output identifier
 (at most 1024 UTF-8 bytes, without NUL characters); an empty string follows the
@@ -971,3 +977,51 @@ duplicate IDs are removed without normalization. Invalid or empty metadata does
 not replace a previous good list. Failure with a previous list is explicitly
 stale; failure without one has an empty list and error status. This reference
 data does not select the interface locale, keyboard map, or a game's preferences.
+
+### Independent language preferences and settings choices
+
+`appLanguage` defaults to `system` and selects a bundled Qt interface locale.
+`gameLanguage` defaults to `en_US`; `keyboardLayout` defaults to `en-US`.
+Changing one does not change either of the others. Game language identifiers
+retain exact case, separators, script, and numeric-region subtags. They have an
+ASCII alphabetic first subtag of 2–8 bytes, subsequent alphanumeric subtags of
+1–8 bytes separated by `_` or `-`, and a total limit of 64 bytes. `auto` and
+`system` are rejected, case-insensitively. Safe future IDs need not appear in
+current metadata to remain saved.
+
+`settings.get` returns `keyboardLayouts` beside `settings`, never inside the
+persisted values. Each descriptor has `value`, `label`, and `aliases`. The table
+in `language.rs` is the authority for the supported Windows-rig keyboard subset
+on all Qt platforms. Historical `ja-JP` and `Japanese106` request `ja-106`;
+historical `es-ES` requests `es-ES_tradnl`. Valid saved aliases retain their
+original spelling on disk. This does not select proprietary Mac keyboard IDs.
+New unrecognized keyboard values and malformed game IDs return `invalid_setting`.
+Restored strings remain visible, but a shared request resolver replaces corrupt
+game or keyboard values with the existing respective defaults before create,
+immediate resume, or claim requests. The interface locale never enters these
+query parameters.
+
+`settings.choices.get({runtimeCapabilities})` returns `colorQualities` for the current
+persisted settings and embedded streamer capability snapshot. Each of the four
+descriptors contains `value`, `disabled`, and nullable `reason`. The operation
+calls the same profile validator as final launch, including backend, codec,
+HDR, and chroma restrictions. Missing or incompatible capabilities do not imply
+support. This read does not persist or coerce any setting. Protocol 5 and native
+streamer protocol 7 are unchanged.
+
+CoreClient injects the current native window's `nativeHdrSupported` into
+`runtimeCapabilities`, overriding any caller-supplied flag, just as it does for
+`session.create` and `streamer.prepare`. SettingsState observes
+`HdrOutput.supported` only to cancel and refetch choices when the display changes;
+it does not author the wire capability or expose platform handles.
+
+Qt `SettingsState` owns shared desktop/console choices and the single lazy
+language request. Settings entry loads idle or expired metadata. Explicit retry
+sets `refresh:true`; there is no retry loop. Requests have a 15-second deadline.
+Readiness, account/provider generation, or proxy changes clear request ownership
+before cancellation and discard old metadata, but preserve saved preferences.
+Only a response for the current request and generation is accepted. `cacheHit`,
+stale/error status, saved IDs absent from metadata, and local fallback choices
+remain distinguishable. Language and profile edits serialize per key and become
+selected only after persistence succeeds; older failures cannot roll back a
+newer successful edit. These local settings operations do not restart media.

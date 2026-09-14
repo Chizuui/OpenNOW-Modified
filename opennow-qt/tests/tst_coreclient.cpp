@@ -5,6 +5,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QElapsedTimer>
 #include <QRegularExpression>
 #include <QScopeGuard>
@@ -321,7 +323,8 @@ private slots:
         QSignalSpy responses(&client, &CoreClient::responseReceived);
         QVERIFY(client.start(fakeCorePath()));
         QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
-        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare")}) {
+        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare"),
+                                  QStringLiteral("settings.choices.get")}) {
             for (bool supported : {false, true, false}) {
                 responses.clear();
                 client.setNativeHdrSupported(supported);
@@ -341,6 +344,48 @@ private slots:
                 QCOMPARE(params.value(QStringLiteral("runtimeCapabilities")).toObject(), capabilities);
             }
         }
+        client.stop();
+    }
+
+    void injectedHdrOutputControlsRealCoreColorDescriptors()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        auto program = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("opennow-core"));
+#ifdef Q_OS_WIN
+        program += QStringLiteral(".exe");
+#endif
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), directory.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        QVERIFY(!client.request(QStringLiteral("settings.set"),
+            {{QStringLiteral("key"), QStringLiteral("enableHdr")}, {QStringLiteral("value"), true}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+        for (bool supported : {false, true, false}) {
+            client.setNativeHdrSupported(supported);
+            const auto capabilities = QJsonDocument::fromJson(R"({"protocolVersion":7,
+                "videoBackends":[{"backend":"vaapi","available":true,"codecs":[
+                    {"codec":"h265","available":true,"hdrSupported":true,
+                     "colorQualities":["8bit_420","10bit_420"],"hdrColorQualities":["10bit_420"]}]}]})").object();
+            auto callerCapabilities = capabilities;
+            callerCapabilities.insert(QStringLiteral("nativeHdrSupported"), !supported);
+            responses.clear();
+            QVERIFY(!client.request(QStringLiteral("settings.choices.get"),
+                {{QStringLiteral("runtimeCapabilities"), callerCapabilities}}).isEmpty());
+            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+            const auto choices = responses.first().at(1).toJsonObject().value(QStringLiteral("colorQualities")).toArray();
+            QCOMPARE(choices.size(), 4);
+            for (const auto &entry : choices) {
+                const auto choice = entry.toObject();
+                const auto expected = supported && choice.value(QStringLiteral("value")).toString().endsWith(QStringLiteral("420"));
+                QCOMPARE(choice.value(QStringLiteral("disabled")).toBool(), !expected);
+            }
+            QCOMPARE(callerCapabilities.value(QStringLiteral("nativeHdrSupported")).toBool(), !supported);
+        }
+        QVERIFY(failures.isEmpty());
         client.stop();
     }
 

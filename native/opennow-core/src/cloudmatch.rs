@@ -222,14 +222,10 @@ impl CloudMatchService {
             .expect("CloudMatch conflict state poisoned") = None;
         let token = session_token(auth);
         let body = build_create_body(&app_id, params, settings, device_id);
-        let keyboard_layout = setting_string(settings, "keyboardLayout", "en-US");
-        let language = setting_string(settings, "gameLanguage", "en_US");
         let mut url = base
             .join("v2/session")
             .map_err(|_| invalid("Invalid CloudMatch session URL"))?;
-        url.query_pairs_mut()
-            .append_pair("keyboardLayout", &keyboard_layout)
-            .append_pair("languageCode", &language);
+        crate::language::append_session_preferences(&mut url, settings);
         let response = client
             .post(url)
             .headers(cloudmatch_headers(token, device_id)?)
@@ -281,10 +277,7 @@ impl CloudMatchService {
             let mut resume_url = base
                 .join(&format!("v2/session/{session_id}"))
                 .map_err(|_| invalid("Invalid CloudMatch resume URL"))?;
-            resume_url
-                .query_pairs_mut()
-                .append_pair("keyboardLayout", &keyboard_layout)
-                .append_pair("languageCode", &language);
+            crate::language::append_session_preferences(&mut resume_url, settings);
             let mut resume = json!({
                 "action": 2,
                 "data": "RESUME",
@@ -912,14 +905,10 @@ impl CloudMatchService {
             return Ok(json!({"session":info}));
         }
         if session_requires_resume(initial_status)? {
-            let keyboard_layout = setting_string(settings, "keyboardLayout", "en-US");
-            let language = setting_string(settings, "gameLanguage", "en_US");
             let mut url = control_base
                 .join(&format!("v2/session/{session_id}"))
                 .map_err(|_| invalid("Invalid CloudMatch claim URL"))?;
-            url.query_pairs_mut()
-                .append_pair("keyboardLayout", &keyboard_layout)
-                .append_pair("languageCode", &language);
+            crate::language::append_session_preferences(&mut url, settings);
             let body = build_resume_body(&app_id, session, settings, device_id);
             #[cfg(test)]
             let url = self.fixture_url(url);
@@ -2458,6 +2447,71 @@ mod tests {
             requests
         });
         (base, worker)
+    }
+
+    #[test]
+    fn create_immediate_resume_and_claim_use_exact_independent_language_query_pairs() {
+        for (game, keyboard, expected_game, expected_keyboard) in [
+            ("es_419", "de-DE", "es_419", "de-DE"),
+            ("zh_Hant_TW", "ja-JP", "zh_Hant_TW", "ja-106"),
+            ("system", "es-ES", "en_US", "es-ES_tradnl"),
+        ] {
+            let settings =
+                json!({"appLanguage":"fr", "gameLanguage":game, "keyboardLayout":keyboard});
+            let (base, server) = session_server(
+                vec![
+                    (
+                        200,
+                        json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                    ),
+                    (200, json!({})),
+                    (204, json!({})),
+                    (
+                        200,
+                        json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"B","status":2}}),
+                    ),
+                    (200, json!({"requestStatus":{"statusCode":1}})),
+                ],
+                |_| {},
+            );
+            let client = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let mut service = CloudMatchService::new(client.clone());
+            service
+                .create_at(
+                    &json!({"appId":"123"}),
+                    &settings,
+                    &conflict_auth(),
+                    "device",
+                    || Ok((client, base.clone())),
+                )
+                .unwrap();
+            service.finish_create("A", false).unwrap();
+            service.set_test_control_base(base);
+            service
+                .claim(
+                    &json!({"sessionId":"B"}),
+                    &settings,
+                    &conflict_auth(),
+                    "device",
+                )
+                .unwrap();
+            let received = server.join().unwrap();
+            assert_eq!(received.len(), 5);
+            for index in [0, 1, 4] {
+                let target = received[index].split_whitespace().nth(1).unwrap();
+                let url = Url::parse(&format!("https://fixture.invalid{target}")).unwrap();
+                let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                assert_eq!(pairs["languageCode"], expected_game);
+                assert_eq!(pairs["keyboardLayout"], expected_keyboard);
+                assert_eq!(pairs.len(), 2);
+            }
+            assert!(received[0].starts_with("POST "));
+            assert!(received[1].starts_with("PUT /v2/session/A?"));
+            assert!(received[4].starts_with("PUT /v2/session/B?"));
+        }
     }
 
     #[test]

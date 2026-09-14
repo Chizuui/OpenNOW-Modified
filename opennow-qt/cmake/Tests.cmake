@@ -417,6 +417,37 @@ if(BUILD_TESTING)
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-input --smoke-controller-metadata --reduced-motion)
     set_tests_properties(qml-controller-metadata PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+    qt_add_resources(opennow-qt "language-settings-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/LanguageSettingsAcceptance.qml)
+    foreach(surface desktop console)
+        foreach(width 900 1400)
+            add_test(NAME qml-language-settings-${surface}-${width}
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                    --route settings-input --smoke-language-settings --smoke-width ${width} --reduced-motion)
+            set_tests_properties(qml-language-settings-${surface}-${width} PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        endforeach()
+        add_test(NAME qml-language-colors-${surface}
+            COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                --route settings-streaming --smoke-language-settings --language-colors --reduced-motion)
+        set_tests_properties(qml-language-colors-${surface} PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        add_test(NAME qml-language-hdr-invalidation-${surface}
+            COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                --route settings-input --smoke-language-settings --language-hdr-invalidation --reduced-motion)
+        set_tests_properties(qml-language-hdr-invalidation-${surface} PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    endforeach()
+    add_test(NAME qml-language-settings-scaled-light
+        COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+            --route settings-input --smoke-language-settings --smoke-light-theme --smoke-width 1400 --reduced-motion)
+    set_tests_properties(qml-language-settings-scaled-light PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    add_test(NAME qml-language-keyboard-selection
+        COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+            --route settings-input --smoke-language-settings --language-keyboard-selection --reduced-motion)
+    set_tests_properties(qml-language-keyboard-selection PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
     qt_add_resources(opennow-qt "custom-background-acceptance"
         PREFIX "/acceptance" BASE tests FILES tests/CustomBackgroundAcceptance.qml)
     qt_add_resources(opennow-qt "stream-stats-acceptance"
@@ -557,7 +588,7 @@ if(BUILD_TESTING)
     )
     target_include_directories(opennow-coreclient-tests PRIVATE src)
     target_link_libraries(opennow-coreclient-tests PRIVATE Qt6::Test Qt6::Core)
-    add_dependencies(opennow-coreclient-tests opennow-fake-core)
+    add_dependencies(opennow-coreclient-tests opennow-fake-core opennow-core)
     add_test(NAME opennow-coreclient-tests COMMAND opennow-coreclient-tests -o -,txt)
 
     qt_add_executable(opennow-streamvideo-tests

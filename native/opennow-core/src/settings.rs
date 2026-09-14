@@ -144,6 +144,9 @@ impl SettingsStore {
         if !defaults().contains_key(key) {
             return Err(format!("Unknown setting: {key}"));
         }
+        if matches!(key, "gameLanguage" | "keyboardLayout") {
+            crate::language::validate_setting(key, &value)?;
+        }
         if key == "audioOutputDevice" {
             validate_bounded_string(&value, key, 1024)?;
         }
@@ -951,6 +954,68 @@ fn defaults() -> Map<String, Value> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn language_preferences_are_independent_and_rejected_writes_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        for (key, value) in [
+            ("appLanguage", "ja"),
+            ("gameLanguage", "es_419"),
+            ("keyboardLayout", "ja-JP"),
+        ] {
+            store.set(key, json!(value)).unwrap();
+        }
+        let saved = store.all();
+        for (key, value) in [
+            ("gameLanguage", "auto"),
+            ("gameLanguage", "system"),
+            ("gameLanguage", "en\nUS"),
+            ("keyboardLayout", "en_US"),
+            ("keyboardLayout", "m-us"),
+        ] {
+            assert!(store.set(key, json!(value)).is_err());
+            assert_eq!(store.all(), saved);
+        }
+        assert_eq!(
+            SettingsStore::load(Some(directory.path().to_path_buf()))
+                .unwrap()
+                .all(),
+            saved
+        );
+        store.set("appLanguage", json!("de")).unwrap();
+        assert_eq!(store.all()["gameLanguage"], "es_419");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        store.set("gameLanguage", json!("future_001")).unwrap();
+        assert_eq!(store.all()["appLanguage"], "de");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        std::fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        let saved = store.all();
+        assert!(store.set("gameLanguage", json!("pt_BR")).is_err());
+        assert_eq!(store.all(), saved);
+    }
+
+    #[test]
+    fn restored_language_ids_are_not_rewritten_but_corrupt_values_never_reach_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("settings.json"),
+            json!({
+                "gameLanguage":"auto", "keyboardLayout":"unknown", "appLanguage":"fr",
+                "onboardingCompleted":true, "qtConsoleModePolicyVersion":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = SettingsStore::load(Some(directory.path().to_path_buf()))
+            .unwrap()
+            .all();
+        assert_eq!(settings["gameLanguage"], "auto");
+        assert_eq!(settings["keyboardLayout"], "unknown");
+        let mut url = url::Url::parse("https://fixture.invalid/").unwrap();
+        crate::language::append_session_preferences(&mut url, &settings);
+        assert_eq!(url.query(), Some("keyboardLayout=en-US&languageCode=en_US"));
+    }
 
     #[test]
     fn provider_region_preferences_are_atomic_isolated_and_persisted() {

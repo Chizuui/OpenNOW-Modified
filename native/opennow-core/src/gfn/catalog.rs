@@ -215,8 +215,7 @@ impl GfnService {
                 .filter(|items| !items.is_empty() && items.len() <= 512).ok_or_else(crate::catalog_types::invalid_metadata)?;
             let mut languages = Vec::new();
             for item in items {
-                let language = item["language"].as_str().filter(|value| !value.is_empty() && value.len() <= 64
-                    && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte,b'_' | b'-')))
+                let language = item["language"].as_str().filter(|value| crate::language::valid_game_language(value))
                     .ok_or_else(crate::catalog_types::invalid_metadata)?;
                 if !languages.contains(&language) { languages.push(language); }
             }
@@ -230,6 +229,16 @@ impl GfnService {
         result["source"] = json!("overallGfnSupportedLanguages");
         if !result["languages"].is_array() {
             result["languages"] = json!([]);
+        }
+        if result["languages"].as_array().is_some_and(|languages| {
+            languages.len() > 512
+                || languages.iter().any(|language| {
+                    !language
+                        .as_str()
+                        .is_some_and(crate::language::valid_game_language)
+                })
+        }) {
+            return Err(crate::catalog_types::invalid_metadata());
         }
         Ok(result)
     }

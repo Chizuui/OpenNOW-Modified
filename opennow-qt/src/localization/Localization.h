@@ -28,6 +28,7 @@ public:
                                     int n = -1) const override;
 
     Q_INVOKABLE void setLocale(const QString &locale);
+    Q_INVOKABLE QString localeDisplayName(const QString &locale) const;
     Q_INVOKABLE QString source(const QString &sourceText) const;
     Q_INVOKABLE QString source(const QString &sourceText, quint64 revision) const;
     Q_INVOKABLE QString text(const QString &key, const QVariantMap &values = {}) const;
