@@ -277,16 +277,28 @@ FocusScope {
                     x: DesktopTokens.px(24)
                     width: parent.width - DesktopTokens.px(48)
                     spacing: DesktopTokens.px(8)
-                    visible: storeVariants.count > 1
+                    Text {
+                        objectName: "catalogReadinessNotice"
+                        width: parent.width
+                        text: ShellStore.readinessNotice(root.game)
+                        visible: text !== ""
+                        wrapMode: Text.WordWrap
+                        color: Theme.textMuted
+                        font.family: Theme.bodyFont
+                        font.pixelSize: DesktopTokens.captionSize
+                    }
+                    visible: storeVariants.count > 1 || ShellStore.readinessNotice(root.game) !== ""
                     height: visible ? implicitHeight + DesktopTokens.px(16) : 0
                     Text {
                         text: qsTr("PLATFORM")
+                        visible: storeVariants.count > 1
                         color: Theme.textMuted
                         font.family: Theme.bodyFont
                         font.pixelSize: DesktopTokens.smallSize
                         font.weight: Font.Bold
                     }
                     Flow {
+                        visible: storeVariants.count > 1
                         width: parent.width
                         spacing: DesktopTokens.px(8)
                         Repeater {

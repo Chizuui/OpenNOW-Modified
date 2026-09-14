@@ -99,7 +99,7 @@ FocusScope {
         Text {
             x: 28; y: 28; width: 504; height: 52
             wrapMode: Text.WordWrap; elide: Text.ElideRight; maximumLineCount: 2
-            text: root.game.longDescription || root.game.description || qsTr("Stream this title from your GeForce NOW library with your controller, keyboard, or mouse.")
+            text: ShellStore.readinessNotice(root.game) || root.game.longDescription || root.game.description || qsTr("Stream this title from your GeForce NOW library with your controller, keyboard, or mouse.")
             color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: 18; font.weight: Font.DemiBold
         }
         Row {

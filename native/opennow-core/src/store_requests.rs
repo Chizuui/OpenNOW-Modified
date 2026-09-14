@@ -50,10 +50,21 @@ impl StoreRequests {
             .and_then(|until| until.checked_duration_since(Instant::now()))
         {
             crate::requests::check()?;
+            drop(schedule);
             std::thread::sleep(remaining.min(REQUEST_INTERVAL));
+            schedule = lock(&self.0)?;
+        }
+        if let Some(remaining) = schedule
+            .cooldown
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+        {
+            return Err(rate_limited(remaining));
         }
         crate::requests::check()?;
+        schedule.next_request = Some(Instant::now() + REQUEST_INTERVAL);
+        drop(schedule);
         let response = request.send();
+        let mut schedule = lock(&self.0)?;
         schedule.next_request = Some(Instant::now() + REQUEST_INTERVAL);
         let response = response.map_err(|error| ServiceError::network(context, error))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -88,6 +99,28 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn in_flight_network_does_not_hold_the_scheduler_lock() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (url, worker) =
+            crate::gfn::tests::mock_requests(vec![(200, serde_json::json!({}))], move |_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        let requests = StoreRequests::default();
+        std::thread::scope(|threads| {
+            let pending = threads
+                .spawn(|| requests.send(reqwest::blocking::Client::new().get(url), "fixture"));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let unlocked = requests.0.try_lock().is_ok();
+            release_tx.send(()).unwrap();
+            assert!(unlocked);
+            assert!(pending.join().unwrap().is_ok());
+        });
+        worker.join().unwrap();
+    }
 
     fn server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Instant>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

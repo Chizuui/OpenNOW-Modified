@@ -32,6 +32,8 @@ private slots:
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             var root = this, cancelled = [], mediaOwner = {id:'same-native-runtime'};
             var accountLinkPollTimer = {stop: function() {}}, coreClient = {cancel: function(id) {cancelled.push(id)}};
+            var syncPollTimer = {stop: function() {}}, syncStatusRequestId = 'old-sync-status', syncCancelRequestId = 'old-sync-cancel';
+            var syncOperation = {operationId:'old-sync'}, storeSubscriptions = [{id:'old-subscription'}], catalogDefinitions = {};
             var subscriptionRequestId = 'old-subscription', regionsRequestId = 'old-regions', regionPingRequestId = 'old-ping';
             var gameAccountsRequestId = 'old-accounts', gameAccountActionRequestId = 'old-action', accountLinkStartRequestId = 'old-link';
             var accountLinkPollRequestId = 'old-link-poll', storageLocationsRequestId = 'old-storage', storageResetRequestId = 'old-reset';
@@ -41,7 +43,8 @@ private slots:
             invalidateAccount();
             if (regionsRequestId === 'old-regions') acceptRegions({regions:[{name:'wrong-account'}],vpcId:'wrong-vpc'});
         )JS")).isError());
-        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.length")).toInt(), 9);
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.length")).toInt(), 11);
+        QVERIFY(engine.evaluate(QStringLiteral("syncOperation === null && syncStatusRequestId === '' && syncCancelRequestId === '' && storeSubscriptions.length === 0")).toBool());
         QCOMPARE(engine.evaluate(QStringLiteral("regions.length")).toInt(), 0);
         QCOMPARE(engine.evaluate(QStringLiteral("regionsVpcId")).toString(), QString());
         QCOMPARE(engine.evaluate(QStringLiteral("subscriptionRequestId")).toString(), QString());

@@ -11,8 +11,13 @@ ambiguous state.
 The first shell request is always:
 
 ```json
-{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":3,"shell":"qt","shellVersion":"0.5.4"}}
+{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":4,"shell":"qt","shellVersion":"0.5.4"}}
 ```
+
+Protocol 4 changes `catalog.library.list` from an aggregate result to one bounded
+page. Protocol-3 shells are rejected with `incompatible_protocol` during
+`core.hello`, before they can interpret a page as their complete library.
+Protocol-4 shells also reject older cores. The native streamer protocol remains 7.
 
 The core must return the same protocol version and its capabilities. The shell
 does not send product requests before this succeeds. Version mismatches, a
@@ -23,7 +28,7 @@ transport to `failed` with a credential-free diagnostic.
 
 ### Authentication boundary
 
-Protocol 3 auth responses and `auth.session.changed` events use the same envelope.
+Protocol 4 auth responses and `auth.session.changed` events use the same envelope.
 `session` is either null or an allowlisted object containing `user` and `provider`.
 Credentials and issuing-client details remain private to the core. The envelope
 includes the core-process account `generation`, `persistence`, `refresh`, `warnings`,
@@ -91,7 +96,7 @@ and region measurement loops stop at cooperative checkpoints. An already-running
 blocking HTTP, DNS, or TCP operation is not forcibly interrupted; its existing
 timeout still applies. Other mutating operations already dispatched are not rolled back.
 
-Protocol 3 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
+Protocol 4 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
 response with `{"type":"ack","id":"42"}` before delivering that response to QML.
 Cancelled or timed-out requests do not acknowledge late responses. The create worker
 retains its admission slot for at most ten seconds awaiting acceptance, then the
@@ -160,7 +165,7 @@ string (at most 4096 UTF-8 bytes); search is at most 512 UTF-8 bytes. Response:
 `{ "games":[], "count":0, "totalCount":0, "hasNextPage":false,
 "nextCursor":"", "source":"store-browse", "fetchedAt":0 }`.
 Pass `nextCursor` unchanged to the next call with the same search. A final page
-has `hasNextPage:false`; empty non-final pages may advance past unmappable apps.
+has `hasNextPage:false`; empty non-final pages may advance only when the upstream supplies an advancing cursor. Invalid mapped identities are errors.
 Missing, repeated or oversized continuation cursors are errors, not completion.
 
 Each result is limited to 768 KiB after JSON encoding, leaving room for the
@@ -255,13 +260,16 @@ and artwork only near the viewport, using the section's local category ID
 - `auth.accounts.remove`
 - `auth.pin.status`, `auth.pin.set`, `auth.pin.clear`, `auth.pin.verify`
 - `catalog.public.list`
-- `catalog.library.list`
+- `catalog.library.list` returns one bounded upstream page, not an aggregate library.
+- `catalog.game.get`, `catalog.definitions.get`, `catalog.languages.get`
 - `catalog.store.list`, `catalog.store.local`, `catalog.store.presentation`
 - `network.regions.list`
 - `network.regions.ping`
 - `account.subscription.get`
 - `account.connections.list`, `account.connections.sync`, `account.connections.unlink`
+- `account.connections.sync.status`, `account.connections.sync.cancel`
 - `account.connections.link.start`, `account.connections.link.poll`
+
 - `account.storage.locations`, `account.storage.reset`
 - `session.create`
 - `session.poll`
@@ -395,7 +403,7 @@ later session events. Foreign ownership or an unknown seat fails with
 `session_not_ready`, and missing RTSPS endpoints with `session_endpoint_missing`.
 The existing negotiated profile checks still run. Preparation does not expose
 OAuth tokens to Qt or alter the native `/rtsp` websocket session-ID authentication.
-These fields are additive to protocol 3; allocation receipts and exact-seat
+These fields are additive to protocol 4; allocation receipts and exact-seat
 compensation remain unchanged.
 
 `session.create` reports an existing-session limit as `session_conflict`, including
@@ -792,3 +800,107 @@ in [the machine-readable parity manifest](../native/opennow-core/contracts/legac
 validated against its [JSON schema](../native/opennow-core/contracts/legacy-open-now-api.schema.json)
 and executable golden-fixture tests. A method is not considered ported until its
 owner, wire shape, fixtures and replacement disposition are recorded there.
+
+### Catalog page and metadata capabilities
+
+Protocol 4 requires `catalog.libraryPages.v1`, `catalog.metadata.v1`,
+`account.syncObservation.v1`, and `catalog.languages.v1` in the core handshake.
+The Qt client and both relocated package probes check these capabilities.
+The JSON envelope and native streaming ABI do not change.
+
+`catalog.library.list` accepts `limit` from 1 to 100, an opaque `cursor` up to
+4,096 bytes, and a `traversalId` up to 256 bytes. Continuations must carry the
+`catalogRevision` and opaque `catalogContext` returned by the first page. The context binds the cursor to the provider, account, generation, endpoint, resolved VPC, proxy route and locale. Results contain `games`, `count`,
+nullable `totalCount`, `hasNextPage`, `nextCursor`, `fetchedAt`, `freshness`,
+`traversalId`, `catalogRevision`, `catalogContext`, and the authenticated `scope`. One result is
+at most 768 KiB. Oversized pages are retried at the same cursor with a smaller
+count; a record that cannot fit is an error. Invalid identities or missing
+pagination state are errors, not an empty complete library.
+
+CatalogState stages these pages and detects cursor cycles. A complete library
+means the traversal reached a validated end; it does not imply a transactional
+snapshot of concurrently changing vendor data. Refresh preserves the previous
+complete snapshot until the new traversal ends. The foreground slice is 30
+seconds, with an explicit Continue action. The hard aggregate bounds are 20,000
+games and 32 MiB of conservative serialized-size accounting. Partial/error
+results retain usable data, the failed cursor where safe, and the error text.
+`catalogLastCompleteAt` changes only when the aggregate traversal completes.
+
+`catalog.game.get` accepts exactly one `appId` or `variantId`. The former is a
+parent LCARS string; the latter must fit a positive GraphQL `Int`. The request
+selects library-aware metadata and verifies the returned identity. It always
+revalidates rather than authorizing from cached browse cards. The result has
+`game`, `catalogRevision`, `scope`, `fetchedAt`, and `freshness`.
+
+Game variants retain nullable `librarySelected`, `libraryStatus`, `playStatus`,
+`installed`, `subscription`, `gfnStatus`, `stateDetails`, `paymentModels`,
+`subscriptions`, and `supportedLanguages`. Patch details distinguish automatic
+patches, manual patches, maintenance, and unknown types. Games retain app-level
+`favorited`, `catalogSkuStrings`, `campaignIds`, and fallback `paymentModels`.
+App availability, favorites, payment models, and GFN membership do not establish
+ownership of another variant. Visible detail metadata refreshes every 30 seconds;
+patch duration history is an estimate, not a promised completion time.
+
+`catalog.definitions.get` returns independently fetched `stores`, `genres`, and
+`subscriptions` sections. Each section has `items`, `source`, `status`,
+`freshness`, `fetchedAt`, `expiresAt`, and nullable `error`. Static definitions
+expire after 24 hours. Store definitions retain the feature union and per-variant
+linking metadata. They drive account rows and allowed actions. Unknown stores
+are display-only; unavailable definitions use labelled, action-disabled fallback
+rows. A current server `supported:false` overrides older capability data.
+Store subscription IDs are separate from MES/GFN membership.
+
+`catalog.store.presentation` retains parsed filter expressions and `sortOrders`.
+`catalog.store.list` can receive a `filterId` or `sortId`; the core resolves these
+to the returned server expressions rather than sending an ID as a filter object.
+`revalidate:true` invalidates only the addressed page key; use it for an explicit
+search submission rather than `refresh:true`, which resets a browse chain.
+Local Store facets remain local. `catalog.store.local` returns
+`localHasNextPage`, `cacheComplete`, `upstreamCoverage`, and `facetsSource`
+alongside its existing demand-driven cursor. Local exhaustion does not prove
+upstream coverage. Browse disk pages expire after 15 minutes, and explicit local
+refresh first revalidates the upstream first page before rebuilding the index.
+Confirmed account changes persist an increasing catalog revision, so old pages cannot join
+a new traversal or reappear after a core restart. Failure to persist the revision is an explicit cache-invalidation error, not completion. Cache identities include provider/account, generation,
+endpoint, resolved VPC, proxy route, locale and schema revision.
+
+### Store synchronization observation
+
+`account.connections.sync` sends one ALS POST and accepts only HTTP 202. It
+returns `operationId`, `provider`, and a local `phase`. Repeated starts for the
+same active provider return the existing operation instead of repeating POST.
+There are at most eight account-scoped operations. Mutating requests are never
+automatically replayed after a 401, timeout, cancellation, or ambiguous send.
+
+`account.connections.sync.status` accepts `operationId`. Each poll reads fresh
+`userAccount` at most once. Calls are spaced at two seconds initially and five
+seconds after 20 seconds, with a 120-second observation deadline. The operation
+records the baseline date and state. Only a changed valid RFC3339 `syncDate`
+with `SYNC_SUCCESS` enters `refreshing_library`; unchanged old success, an
+unchanged old failure, and changed counts alone do not prove completion. New
+failure, disconnection, and expiry enter `failed`. Missing completion evidence
+ends as `timed_out`, meaning completion is unconfirmed.
+
+After `refreshing_library`, Qt starts the final library traversal. Only a
+complete traversal displays completion and acknowledges it with
+`sync.status({operationId, libraryRefreshed:true})`. Partial refresh retains a
+separate incomplete notice. `account.connections.sync.cancel` stops observation,
+not accepted remote work. Account/provider generation changes clear pending
+work; late results cannot complete another account's operation. Polls do not
+sleep across their observation lifetime or hold authentication or scheduler
+locks across HTTP. Link callbacks and unlink acknowledgements require a fresh
+account read before claiming the connection changed.
+
+### Overall supported game languages
+
+`catalog.languages.get({refresh:false})` works without sign-in. Its anonymous
+HTTP document is exactly `{ overallGfnSupportedLanguages { language } }`.
+There are no variables and no Authorization header. It returns exact wire IDs
+in `languages`, `status` (`success`, `stale`, or `error`), `source`, cache timing,
+nullable `error`, and `scopeGeneration`. The bounded cache is shared with the
+existing disk-cache owner, keyed separately by public endpoint, provider context,
+and proxy route. Its TTL is 14 days. At most 512 safe IDs of 64 bytes are accepted;
+duplicate IDs are removed without normalization. Invalid or empty metadata does
+not replace a previous good list. Failure with a previous list is explicitly
+stale; failure without one has an empty list and error status. This reference
+data does not select the interface locale, keyboard map, or a game's preferences.

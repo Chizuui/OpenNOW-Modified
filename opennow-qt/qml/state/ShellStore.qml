@@ -24,8 +24,12 @@ QtObject {
         settings: root.settings
         setSetting: root.setSetting
         applySetting: root.applySetting
+        acceptsScope: root.matchesAuthScope
+        detailVisible: AppController.route === "game-detail"
+        definitions: accountServicesOwner.catalogDefinitions
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
         onStoreSessionReset: root.storeSessionReset()
+        onLibraryRefreshFinished: (complete, message) => accountServicesOwner.libraryRefreshFinished(complete, message)
     }
 
     property ArtworkState artworkOwnerState: ArtworkState {
@@ -61,8 +65,9 @@ QtObject {
         appController: AppController
         ready: root.ready
         signedIn: root.signedIn
-        reloadCatalogForSession: root.reloadCatalogForSession
+        reloadCatalogForSession: function() { catalogOwner.refreshCatalog(""); catalogOwner.reloadStoreForSession() }
         refreshAccountServices: root.refreshAccountServices
+        acceptsScope: root.matchesAuthScope
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
     }
 
@@ -186,6 +191,15 @@ QtObject {
     property alias selectedGame: catalogOwner.selectedGame
     property alias catalogTotalCount: catalogOwner.catalogTotalCount
     property alias catalogState: catalogOwner.catalogState
+    property alias catalogComplete: catalogOwner.catalogComplete
+    property alias catalogError: catalogOwner.catalogError
+    property alias catalogNextCursor: catalogOwner.catalogNextCursor
+    property alias catalogLastCompleteAt: catalogOwner.catalogLastCompleteAt
+    function continueCatalog() { catalogOwner.continueCatalog() }
+    function refreshSelectedMetadata() { catalogOwner.refreshSelectedMetadata() }
+    function readinessNotice(game) { return catalogOwner.readinessNotice(game) }
+    function catalogGenreLabel(genre) { return catalogOwner.genreLabel(genre) }
+    property alias detailMetadataError: catalogOwner.detailError
     property alias catalogSource: catalogOwner.catalogSource
     property alias storeGames: catalogOwner.storeGames
     property alias storeFacets: catalogOwner.storeFacets
@@ -236,6 +250,10 @@ QtObject {
     property alias gameAccounts: accountServicesOwner.gameAccounts
     property alias gameAccountsState: accountServicesOwner.gameAccountsState
     property alias gameAccountMessage: accountServicesOwner.gameAccountMessage
+    property alias syncOperation: accountServicesOwner.syncOperation
+    function cancelSyncObservation() { accountServicesOwner.cancelSyncObservation() }
+    function storeSubscriptionLabels(account) { return accountServicesOwner.storeSubscriptionLabels(account) }
+    function gameAccountAction(account) { return accountServicesOwner.gameAccountAction(account) }
     property alias accountLinkAttempt: accountServicesOwner.accountLinkAttempt
     property alias storageLocations: accountServicesOwner.storageLocations
     property alias storageMessage: accountServicesOwner.storageMessage
@@ -3152,7 +3170,7 @@ QtObject {
             if (requestId === root.consoleSurfaceRequestId) {
                 settingsOwner.failConsoleSurface(message)
             } else if (requestId === root.catalogRequestId) {
-                catalogOwner.failCatalog(message)
+                catalogOwner.failCatalog(message, code)
             } else if (requestId === root.storeRequestId) {
                 catalogOwner.failStore(message)
             } else if (requestId === root.providersRequestId) {

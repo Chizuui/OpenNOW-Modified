@@ -169,10 +169,41 @@ FocusScope {
         }
     }
 
+    Rectangle {
+        id: catalogNotice
+        objectName: "libraryCompletenessNotice"
+        x: 24
+        y: collectionToolbar.y + collectionToolbar.height + 14
+        width: parent.width - 48
+        height: visible ? Math.max(58, noticeText.implicitHeight + 24) : 0
+        visible: ShellStore.catalogSource === "account-library" && ShellStore.catalogState !== "ready"
+        radius: 10
+        color: DesktopTokens.surface
+        border.color: DesktopTokens.seam
+        Text {
+            id: noticeText
+            x: 14; y: 12; width: parent.width - noticeAction.width - 42
+            text: ShellStore.catalogError || (ShellStore.catalogComplete
+                ? qsTr("Refreshing the library. Your last complete library is still shown.")
+                : qsTr("Loading your library. The games shown so far are only part of it."))
+            wrapMode: Text.WordWrap
+            color: DesktopTokens.textMuted
+            font.family: DesktopTokens.bodyFont
+            font.pixelSize: 13
+        }
+        DesktopButton {
+            id: noticeAction
+            anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+            text: ShellStore.catalogNextCursor ? qsTr("Continue") : qsTr("Retry")
+            visible: ShellStore.catalogRequestId === "" && ShellStore.catalogError !== ""
+            onClicked: ShellStore.continueCatalog()
+        }
+    }
+
     Flow {
         id: filterRow
         x: 24
-        y: collectionToolbar.y + collectionToolbar.height + 14
+        y: catalogNotice.y + catalogNotice.height + (catalogNotice.visible ? 12 : 0)
         width: parent.width - 48
         spacing: 8
         Repeater {

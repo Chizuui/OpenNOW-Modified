@@ -306,6 +306,21 @@ FocusScope {
                 onClicked: ShellStore.toggleFavorite(root.selectedGame)
             }
             GlassButton { id: detailsButton; width: parent.width; text: qsTr("Details"); glyph: "X"; enabled: root.selectedGame !== null; onClicked: ShellStore.openGame(root.selectedGame) }
+            Text {
+                width: parent.width
+                visible: ShellStore.catalogSource === "account-library" && ShellStore.catalogState !== "ready"
+                text: ShellStore.catalogError || qsTr("The library refresh is incomplete. Your available games are still shown.")
+                wrapMode: Text.WordWrap
+                color: Theme.textMuted
+                font.family: Theme.bodyFont
+                font.pixelSize: 14
+            }
+            GlassButton {
+                width: parent.width
+                visible: ShellStore.catalogError !== ""
+                text: ShellStore.catalogNextCursor ? qsTr("Continue") : qsTr("Retry")
+                onClicked: ShellStore.continueCatalog()
+            }
         }
     }
 

@@ -324,6 +324,20 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(opennow-streamcolor-tests PROPERTIES TIMEOUT 60)
     qt_add_resources(opennow-qt "region-ping-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml)
+    foreach(width 960 1440)
+        add_test(NAME qml-catalog-sync-${width} COMMAND opennow-qt
+            --smoke-test --allow-multiple-instances --desktop --route library
+            --smoke-catalog-sync --smoke-width ${width} --smoke-height 900 --reduced-motion)
+        set_tests_properties(qml-catalog-sync-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+        foreach(route settings-account game-detail)
+            add_test(NAME qml-catalog-notice-${route}-${width} COMMAND opennow-qt
+                --smoke-test --allow-multiple-instances --desktop --route ${route}
+                --smoke-catalog-sync --smoke-width ${width} --smoke-height 900 --reduced-motion)
+            set_tests_properties(qml-catalog-notice-${route}-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+        endforeach()
+    endforeach()
+    qt_add_resources(opennow-qt "store-paging-acceptance"
         PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
     add_test(NAME qml-recording
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop

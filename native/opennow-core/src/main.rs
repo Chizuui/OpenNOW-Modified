@@ -2,6 +2,7 @@
 
 mod account_connections;
 mod artwork_cache;
+mod catalog_types;
 mod cloudmatch;
 mod community;
 mod console_profiles;
@@ -40,7 +41,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use streamer::StreamerService;
 
-const PROTOCOL_VERSION: i64 = 3;
+const PROTOCOL_VERSION: i64 = 4;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 
 struct AppCore {
@@ -341,7 +342,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 ));
             }
             Ok((
-                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v7", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
+                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v7", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
                 None,
             ))
         }
@@ -503,6 +504,27 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
+        "catalog.game.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_game(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.definitions.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_definitions(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.languages.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_languages(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "catalog.store.local" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
@@ -548,31 +570,58 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
-        "account.connections.list" => core
-            .gfn
-            .account_connections()
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.sync" => core
-            .gfn
-            .sync_account_connection(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.unlink" => core
-            .gfn
-            .unlink_account_connection(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.link.start" => core
-            .gfn
-            .start_account_link(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.link.poll" => core
-            .gfn
-            .poll_account_link(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
+        "account.connections.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_connections(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .sync_account_connection(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.unlink" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .unlink_account_connection(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.link.start" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .start_account_link(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.link.poll" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .poll_account_link(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync.status" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_sync_status(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync.cancel" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_sync_status(
+                    &json!({"operationId":params["operationId"],"cancelObservation":true}),
+                    &settings,
+                )
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "account.storage.locations" => core
             .gfn
             .persistent_storage_locations(params)

@@ -17,6 +17,103 @@ QtObject {
     property string catalogState: "idle"
     property string catalogSource: "public"
     property string catalogRequestId: ""
+    property bool catalogComplete: false
+    property string catalogError: ""
+    property string catalogNextCursor: ""
+    property double catalogLastCompleteAt: 0
+    property var catalogRevision: null
+    property string catalogContext: ""
+    readonly property string requestContextKey: JSON.stringify([settings.sessionProxyEnabled,
+        settings.sessionProxyUrl, settings.region, settings.providerRegions])
+    onRequestContextKeyChanged: if (ready && signedIn) reloadCatalogForSession()
+    property string catalogTraversalId: ""
+    property var catalogStaged: []
+    property var catalogSeenCursors: Object.create(null)
+    property int catalogStagedBytes: 0
+    property double catalogSliceStarted: 0
+    property var acceptsScope: function(scope) { return true }
+    property bool detailVisible: false
+    property var definitions: ({})
+    property string detailRequestId: ""
+    property string detailAppId: ""
+    property string detailError: ""
+    property string detailState: "idle"
+    property Timer detailRefreshTimer: Timer {
+        interval: 30000
+        repeat: true
+        running: root.ready && root.signedIn && root.detailVisible
+        onTriggered: root.refreshSelectedMetadata()
+    }
+    onDetailVisibleChanged: {
+        if (detailVisible) refreshSelectedMetadata()
+        else cancelDetailRequest()
+    }
+    property Connections detailResponses: Connections {
+        target: root.coreClient
+        function onResponseReceived(requestId, result) {
+            if (requestId === "" || requestId !== root.detailRequestId) return
+            root.detailRequestId = ""
+            if (!root.acceptsScope(result.scope) || !result.game || !root.selectedGame
+                    || String(result.game.id) !== root.detailAppId || String(root.selectedGame.id) !== root.detailAppId) return
+            const old = root.selectedGame.variants || []
+            const selected = old[Number(root.selectedGame.selectedVariantIndex || 0)]
+            const variants = result.game.variants || []
+            const index = selected ? variants.findIndex(variant => String(variant.id) === String(selected.id)) : -1
+            root.selectedGame = Object.assign({}, result.game, {selectedVariantIndex: index >= 0 ? index : result.game.selectedVariantIndex})
+            root.detailState = "ready"
+            root.detailError = ""
+        }
+        function onRequestFailed(requestId, code, message) {
+            if (requestId === "" || requestId !== root.detailRequestId) return
+            root.detailRequestId = ""
+            root.detailState = "stale"
+            root.detailError = message
+        }
+    }
+
+    function cancelDetailRequest() {
+        const id = detailRequestId
+        detailRequestId = ""
+        if (id !== "") coreClient.cancel(id)
+    }
+
+    function refreshSelectedMetadata() {
+        if (!ready || !signedIn || !detailVisible || !selectedGame || detailRequestId !== "") return
+        detailAppId = String(selectedGame.id || "")
+        if (!detailAppId) return
+        detailState = "loading"
+        detailRequestId = coreClient.request("catalog.game.get", {appId: detailAppId}, 30000)
+    }
+
+    function genreLabel(genre) {
+        const items = definitions.genres && definitions.genres.items || []
+        const definition = items.find(item => item.genre === genre)
+        return definition ? definition.label : ""
+    }
+
+    function readinessNotice(game) {
+        if (!game) return ""
+        const variant = (game.variants || [])[Number(game.selectedVariantIndex || 0)]
+        if (!variant) return ""
+        const patch = variant.stateDetails
+        let notice = ""
+        if (patch && patch.__typename === "VariantGfnMaintenanceMetadata") notice = qsTr("This store version is under maintenance.")
+        else if (patch && (patch.__typename === "VariantGfnAutoPatchingMetadata" || patch.__typename === "VariantGfnManualPatchingMetadata")) {
+            notice = qsTr("This store version is being patched.")
+            if (patch.historicalEtaMins > 0) notice += " " + qsTr("Past patches took about %1 minutes; this is not a completion time.").arg(Math.round(patch.historicalEtaMins))
+        } else if (variant.playStatus === "NOT_PLAYABLE") notice = qsTr("This store version is currently unavailable.")
+        const subscriptions = definitions.subscriptions && definitions.subscriptions.items || []
+        const required = variant.subscriptions || []
+        const labels = subscriptions.filter(item => required.indexOf(item.subscription) >= 0).map(item => item.label)
+        if (labels.length) notice += (notice ? " " : "") + qsTr("Store subscriptions: %1. A subscription does not confirm ownership of this version.").arg(labels.join(", "))
+        if (detailError) notice += (notice ? " " : "") + qsTr("Readiness could not be refreshed: %1").arg(detailError)
+        return notice
+    }
+    signal libraryRefreshFinished(bool complete, string message)
+    property Timer libraryPageTimer: Timer {
+        interval: 1
+        onTriggered: root.requestLibraryPage()
+    }
     readonly property var gameCollections: settings.gameCollections || []
     property string activeCollectionId: ""
     readonly property var activeCollection: collectionById(activeCollectionId)
@@ -31,6 +128,19 @@ QtObject {
             activeCollectionId = ""
     }
     onReadyChanged: {
+        if (!ready) {
+            libraryPageTimer.stop()
+            cancelDetailRequest()
+            const id = catalogRequestId
+            catalogRequestId = ""
+            if (id !== "") coreClient.cancel(id)
+            catalogNextCursor = ""
+            catalogStaged = []
+            if (catalogGames.length) {
+                catalogState = "partial"
+                catalogError = qsTr("The core restarted. Refresh the library to confirm its current contents.")
+            }
+        }
         if (!ready && collectionsBusy) {
             collectionRequestId = ""
             collectionError = qsTr("The collection could not be saved. Reconnect and try again.")
@@ -197,19 +307,59 @@ QtObject {
         if (!ready || catalogRequestId !== "")
             return
         catalogState = catalogGames.length > 0 ? "refreshing" : "loading"
+        catalogError = ""
         catalogSource = signedIn ? "account-library" : "public"
-        catalogRequestId = coreClient.request(signedIn ? "catalog.library.list" : "catalog.public.list", {
-            limit: signedIn ? 1000 : 360,
-            searchQuery: searchQuery || ""
+        if (!signedIn) {
+            catalogRequestId = coreClient.request("catalog.public.list", {limit: 360, searchQuery: searchQuery || ""}, 30000)
+            return
+        }
+        libraryPageTimer.stop()
+        catalogTraversalId = String(Date.now()) + ":" + String(Math.random())
+        catalogStaged = []
+        catalogSeenCursors = Object.create(null)
+        catalogStagedBytes = 0
+        catalogNextCursor = ""
+        catalogRevision = null
+        catalogContext = ""
+        catalogSliceStarted = Date.now()
+        requestLibraryPage()
+    }
+
+    function requestLibraryPage() {
+        if (!ready || !signedIn || catalogRequestId !== "") return
+        catalogRequestId = coreClient.request("catalog.library.list", {
+            limit: 100, cursor: catalogNextCursor, traversalId: catalogTraversalId,
+            catalogRevision: catalogRevision, catalogContext: catalogContext
         }, 30000)
+        if (catalogRequestId === "") failCatalog(qsTr("The library request could not start. Try again."))
+    }
+
+    function continueCatalog() {
+        if (catalogRequestId !== "") return
+        if (catalogNextCursor === "" || catalogError === "catalog_changed") {
+            refreshCatalog("")
+            return
+        }
+        catalogSliceStarted = Date.now()
+        catalogError = ""
+        catalogState = "refreshing"
+        requestLibraryPage()
     }
 
     function reloadCatalogForSession() {
+        cancelDetailRequest()
+        detailState = "idle"
+        detailError = ""
+        selectedGame = null
+        libraryPageTimer.stop()
         if (catalogRequestId !== "") {
-            coreClient.cancel(catalogRequestId)
+            const previous = catalogRequestId
             catalogRequestId = ""
+            coreClient.cancel(previous)
         }
         catalogGames = []
+        catalogComplete = false
+        catalogLastCompleteAt = 0
         catalogState = "idle"
         refreshCatalog("")
         reloadStoreForSession()
@@ -349,6 +499,8 @@ QtObject {
         storeForceRefresh = false
         storeLastPageCached = result.cacheHit === true
         storeUsesLocalIndex = result.source === "store-local"
+        if (storeUsesLocalIndex && result.cacheComplete === false)
+            storeWarning = qsTr("Browsing saved Store pages. These results and filters cover only the catalog loaded so far.")
         storePageCount += 1
         storeTotalCount = Math.max(merged.length, Number(result.totalCount || 0))
         if (result.facets) storeFacets = result.facets
@@ -386,7 +538,10 @@ QtObject {
     }
 
     function openGame(game) {
+        cancelDetailRequest()
+        detailError = ""
         selectedGame = game
+        if (detailVisible) refreshSelectedMetadata()
         appController.navigateFromLastPrimary("game-detail")
     }
 
@@ -522,12 +677,79 @@ QtObject {
     }
 
     function acceptCatalog(result) {
-        root.catalogGames = result.games || []
-        root.catalogTotalCount = Number(result.totalCount || root.catalogGames.length)
-        if (!root.selectedGame && root.catalogGames.length > 0)
-            root.selectedGame = root.catalogGames[0]
-        root.catalogState = "ready"
         root.catalogRequestId = ""
+        if (catalogSource !== "account-library") {
+            catalogGames = result.games || []
+            catalogTotalCount = Number(result.totalCount || catalogGames.length)
+            catalogState = "ready"
+            if (!selectedGame && catalogGames.length) selectedGame = catalogGames[0]
+            return
+        }
+        if (!acceptsScope(result.scope) || result.traversalId !== catalogTraversalId
+                || (catalogRevision !== null && result.catalogRevision !== catalogRevision)
+                || (catalogContext !== "" && result.catalogContext !== catalogContext)) {
+            failCatalog(qsTr("The catalog changed. Restart the library refresh."))
+            catalogNextCursor = ""
+            return
+        }
+        if (!Array.isArray(result.games) || typeof result.hasNextPage !== "boolean"
+                || !Number.isSafeInteger(result.catalogRevision) || result.catalogRevision < 0
+                || typeof result.catalogContext !== "string" || result.catalogContext === ""
+                || (result.hasNextPage && (!result.nextCursor || catalogSeenCursors[String(result.nextCursor)]))) {
+            failCatalog(qsTr("The library returned an invalid or repeated page. Retry the refresh."))
+            catalogNextCursor = ""
+            return
+        }
+        const bytes = JSON.stringify(result.games).length * 3
+        if (catalogStaged.length + result.games.length > 20000 || catalogStagedBytes + bytes > 32 * 1024 * 1024) {
+            failCatalog(qsTr("The library exceeds this device's refresh budget. The saved library has been kept."))
+            catalogNextCursor = ""
+            return
+        }
+        catalogRevision = result.catalogRevision
+        catalogContext = result.catalogContext || ""
+        const next = catalogStaged.slice()
+        const ids = new Map(next.map((game, index) => [String(game.id), index]))
+        for (const game of result.games) {
+            if (!game.id) {
+                failCatalog(qsTr("A library game has no identity. Retry the refresh."))
+                catalogNextCursor = ""
+                return
+            }
+            if (ids.has(String(game.id))) {
+                const index = ids.get(String(game.id))
+                const variants = (next[index].variants || []).slice()
+                const selected = (game.variants || [])[Number(game.selectedVariantIndex || 0)]
+                for (const variant of game.variants || []) {
+                    const at = variants.findIndex(previous => String(previous.id) === String(variant.id))
+                    if (at >= 0) variants[at] = variant
+                    else variants.push(variant)
+                }
+                const selectedIndex = selected ? variants.findIndex(variant => String(variant.id) === String(selected.id)) : 0
+                next[index] = Object.assign({}, game, {variants: variants, selectedVariantIndex: Math.max(0, selectedIndex),
+                    availableStores: variants.map(variant => variant.store), isInLibrary: variants.some(variant => variant.inLibrary === true)})
+            }
+            else { ids.set(String(game.id), next.length); next.push(game) }
+        }
+        catalogStaged = next
+        catalogStagedBytes += bytes
+        catalogNextCursor = result.hasNextPage ? String(result.nextCursor) : ""
+        const seen = Object.assign(Object.create(null), catalogSeenCursors)
+        if (catalogNextCursor) seen[catalogNextCursor] = true
+        catalogSeenCursors = seen
+        catalogTotalCount = result.totalCount === null ? next.length : Number(result.totalCount || next.length)
+        if (!catalogComplete) catalogGames = next
+        if (!result.hasNextPage) {
+            catalogGames = next
+            catalogComplete = true
+            catalogLastCompleteAt = Date.now()
+            catalogState = "ready"
+            catalogError = ""
+            if (!selectedGame && next.length) selectedGame = next[0]
+            libraryRefreshFinished(true, "")
+        } else if (Date.now() - catalogSliceStarted >= 30000) {
+            failCatalog(qsTr("Library refresh paused. Continue to load the remaining games."))
+        } else libraryPageTimer.restart()
     }
 
     function acceptStorePresentation(result) {
@@ -539,9 +761,13 @@ QtObject {
         root.requestStorePresentation()
     }
 
-    function failCatalog(message) {
-        root.catalogState = "error"
+    function failCatalog(message, code) {
+        libraryPageTimer.stop()
+        if (code === "catalog_changed" || code === "stale_account") catalogNextCursor = ""
+        root.catalogState = catalogGames.length ? "partial" : "error"
+        root.catalogError = message
         root.catalogRequestId = ""
+        libraryRefreshFinished(false, message)
     }
 
     function failStore(message) {

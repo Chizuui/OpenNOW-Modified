@@ -368,32 +368,43 @@ FocusScope {
     }
 
     function storeStatus(account) {
+        const action = ShellStore.gameAccountAction(account)
         if (account.status === "expired")
             return { text: qsTr("EXPIRED"), color: Theme.yellow, action: qsTr("Reconnect"), connected: false, primary: true }
         if (account.status === "sync_error")
-            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: qsTr("Resync"), connected: true }
+            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: action === "link" ? qsTr("Reconnect") : qsTr("Sync library"), connected: true }
         if (account.isConnected || account.status === "connected")
             return { text: qsTr("LINKED"), color: DesktopTokens.green, action: account.supportsSync ? qsTr("Resync") : qsTr("Unlink"), connected: true }
-        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: qsTr("Link"), connected: false }
+        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: action === "sync" ? qsTr("Sync library") : qsTr("Link"), connected: false }
     }
 
     function storeDescription(account) {
+        if (account.capabilitySource === "fallback" || account.capabilitySource === "stale")
+            return qsTr("Store capabilities could not be refreshed. Retry before changing this connection.")
+        if (account.status === "sync_error") {
+            if (account.provider === "STEAM" && account.syncState === "SYNC_DENIED") return qsTr("Make your store profile and game library public, then sync again.")
+            if (account.syncState === "PROFILE_NOT_CREATED") return qsTr("Create your store profile, then sync again.")
+            if (account.syncState === "SYNC_DENIED") return qsTr("Store authorization was denied. Reconnect this account.")
+            return qsTr("The store reported a sync error: %1").arg(account.syncState || qsTr("Unknown"))
+        }
+        const subscriptions = ShellStore.storeSubscriptionLabels(account)
+        if (subscriptions) return qsTr("Active store subscriptions: %1").arg(subscriptions)
         if (account.displayName)
             return account.displayName
         if (account.isConnected && account.syncedGames !== undefined && account.syncedGames !== null)
-            return qsTr("%1 cloud-ready games synced").arg(account.syncedGames)
+            return qsTr("%1 games reported by the last store sync").arg(account.syncedGames)
         if (account.isConnected)
             return qsTr("Connected through your NVIDIA account")
         return qsTr("Link this store on NVIDIA to add its games to your library")
     }
 
     function runStoreAction(account) {
-        const status = storeStatus(account)
-        if (status.action === qsTr("Resync"))
+        const action = ShellStore.gameAccountAction(account)
+        if (action === "sync")
             ShellStore.syncGameAccount(account.provider)
-        else if (status.connected)
+        else if (action === "unlink")
             ShellStore.unlinkGameAccount(account.provider)
-        else
+        else if (action === "link")
             ShellStore.startAccountLink(account.provider)
     }
 

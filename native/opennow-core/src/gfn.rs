@@ -20,6 +20,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod catalog;
+use catalog::*;
+
+#[cfg(test)]
+mod catalog_tests;
 #[cfg(test)]
 mod routing_tests;
 
@@ -36,180 +41,6 @@ const LCARS_CLIENT_ID: &str = "ec7e38d4-03af-4b58-b131-cfb0495903ab";
 const GFN_CLIENT_VERSION: &str = "2.0.87.131";
 const GRAPHQL_URL: &str = "https://games.geforce.com/graphql";
 const MES_URL: &str = "https://mes.geforcenow.com/v4/subscriptions";
-const STORE_PANELS_QUERY: &str = r#"query GetStorePanels($vpcId: String!, $locale: String!, $panelNames: [String]!) {
-  panels(vpcId: $vpcId, language: $locale, names: $panelNames) {
-    id
-    name
-    sections {
-      id
-      title
-      items {
-        __typename
-        ... on GameItem {
-          app {
-            id
-            title
-            publisherName
-            images { GAME_BOX_ART KEY_IMAGE KEY_ART HERO_IMAGE TV_BANNER MARQUEE_HERO_IMAGE }
-            itemMetadata { campaignIds }
-            variants {
-              id
-              appStore
-              storeUrl
-              supportedControls
-              gfn {
-                status
-                library { status selected }
-              }
-            }
-            gfn { playType playabilityState minimumMembershipTierLabel }
-          }
-        }
-      }
-    }
-  }
-}"#;
-
-const STORE_MARQUEE_QUERY: &str = r#"query GetStoreMarquee($vpcId: String!, $locale: String!, $panelNames: [String]!) {
-  panels(vpcId: $vpcId, language: $locale, names: $panelNames) {
-    id
-    name
-    sections {
-      id
-      title
-      items {
-        __typename
-        ... on MarketingItem {
-          id
-          title
-          body
-          images { MARQUEE_HERO_IMAGE HERO_IMAGE }
-          action { uri label }
-        }
-        ... on GameItem {
-          app {
-            id
-            title
-            publisherName
-            images { GAME_BOX_ART KEY_IMAGE KEY_ART HERO_IMAGE TV_BANNER MARQUEE_HERO_IMAGE }
-            itemMetadata { campaignIds }
-            variants {
-              id
-              appStore
-              storeUrl
-              supportedControls
-              gfn {
-                status
-                library { status selected }
-              }
-            }
-            gfn { playType playabilityState minimumMembershipTierLabel }
-          }
-        }
-      }
-    }
-  }
-}"#;
-
-const STORE_DEFINITIONS_QUERY: &str = r#"query GetStoreFilterDefinitions($locale: String!) {
-  filterGroupDefinitions(language: $locale) {
-    id
-    label
-    filters {
-      id
-      label
-    }
-  }
-  sortOrderDefinitions(language: $locale) {
-    id
-    label
-    orderBy
-  }
-}"#;
-
-const STORE_MARQUEE_SHA: &str = "dd4bddfdef4707dfe340cc2040d6bb9c4c45f706976fca15b2ef33221c385d7f";
-const STORE_PANELS_SHA: &str = "46ec15f267a056e7d5e46e629efa929529e5e7542a4850faece90b9f8fa5f810";
-
-const STORE_BROWSE_QUERY: &str = r#"query GetStoreBrowseApps(
-  $vpcId: String!, $locale: String!, $sortString: String!,
-  $fetchCount: Int!, $cursor: String!, $filters: AppFilterFields!
-) {
-  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, filters: $filters) {
-    numberReturned numberSupported pageInfo { hasNextPage endCursor totalCount }
-    items {
-      id title developerName publisherName genres supportedControls
-      images { KEY_ART KEY_IMAGE GAME_BOX_ART TV_BANNER HERO_IMAGE MARQUEE_HERO_IMAGE FEATURE_IMAGE GAME_LOGO SCREENSHOTS }
-      variants {
-        id appStore storeUrl supportedControls
-        gfn {
-          status
-          features {
-            __typename
-            ... on GfnSubscriptionFeatureValue { key value }
-            ... on GfnSubscriptionFeatureValueList { key values }
-          }
-          library { status selected lastPlayedDate }
-        }
-      }
-      gfn { playType playabilityState minimumMembershipTierLabel catalogSkuStrings { SKU_BASED_TAG SKU_BASED_PLAYABILITY_TEXT } }
-      itemMetadata { campaignIds }
-    }
-  }
-}"#;
-
-const STORE_SEARCH_QUERY: &str = r#"query GetStoreSearchApps(
-  $vpcId: String!, $locale: String!, $sortString: String!,
-  $fetchCount: Int!, $cursor: String!, $searchString: String!, $filters: AppFilterFields!
-) {
-  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, searchQuery: $searchString, filters: $filters) {
-    numberReturned numberSupported pageInfo { hasNextPage endCursor totalCount }
-    items {
-      id title developerName publisherName genres supportedControls
-      images { KEY_ART KEY_IMAGE GAME_BOX_ART TV_BANNER HERO_IMAGE MARQUEE_HERO_IMAGE FEATURE_IMAGE GAME_LOGO SCREENSHOTS }
-      variants {
-        id appStore storeUrl supportedControls
-        gfn {
-          status
-          features {
-            __typename
-            ... on GfnSubscriptionFeatureValue { key value }
-            ... on GfnSubscriptionFeatureValueList { key values }
-          }
-          library { status selected lastPlayedDate }
-        }
-      }
-      gfn { playType playabilityState minimumMembershipTierLabel catalogSkuStrings { SKU_BASED_TAG SKU_BASED_PLAYABILITY_TEXT } }
-      itemMetadata { campaignIds }
-    }
-  }
-}"#;
-
-const LIBRARY_QUERY: &str = r#"query GetLibraryApps(
-  $vpcId: String!, $locale: String!, $sortString: String!,
-  $fetchCount: Int!, $cursor: String!, $filters: AppFilterFields!
-) {
-  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, filters: $filters) {
-    numberReturned numberSupported pageInfo { hasNextPage endCursor totalCount }
-    items {
-      id title developerName publisherName genres supportedControls
-      images { KEY_ART KEY_IMAGE GAME_BOX_ART TV_BANNER HERO_IMAGE MARQUEE_HERO_IMAGE FEATURE_IMAGE GAME_LOGO SCREENSHOTS }
-      variants {
-        id appStore storeUrl supportedControls
-        gfn {
-          status
-          features {
-            __typename
-            ... on GfnSubscriptionFeatureValue { key value }
-            ... on GfnSubscriptionFeatureValueList { key values }
-          }
-          library { status selected lastPlayedDate }
-        }
-      }
-      gfn { playType playabilityState minimumMembershipTierLabel catalogSkuStrings { SKU_BASED_TAG SKU_BASED_PLAYABILITY_TEXT } }
-      itemMetadata { campaignIds }
-    }
-  }
-}"#;
 
 #[derive(Clone)]
 pub struct Endpoints {
@@ -221,6 +52,8 @@ pub struct Endpoints {
     pub revoke: String,
     pub public_catalog: String,
     pub graphql: String,
+    pub public_graphql: String,
+    pub account_linking: String,
     pub subscription: String,
     #[cfg(test)]
     server_info: Option<String>,
@@ -239,6 +72,8 @@ impl Default for Endpoints {
                 "https://static.nvidiagrid.net/supported-public-game-list/locales/gfnpc-en-US.json"
                     .to_owned(),
             graphql: GRAPHQL_URL.into(),
+            public_graphql: "https://public.games.geforce.com/graphql".into(),
+            account_linking: "https://als.geforcenow.com/v1".into(),
             subscription: MES_URL.into(),
             #[cfg(test)]
             server_info: None,
@@ -491,6 +326,7 @@ pub struct GfnService {
     account_connections: AccountConnectionsService,
     persistent_storage: PersistentStorageService,
     store_cache: crate::store_cache::StoreCache,
+    catalog_revision: std::sync::atomic::AtomicU64,
     server_vpc_cache: crate::server_vpc_cache::ServerVpcCache,
     auth_operation: Mutex<()>,
     discovery_operation: Mutex<()>,
@@ -526,12 +362,14 @@ impl GfnService {
             Ok(_) => {}
             Err(error) => eprintln!("auth: Electron account migration was deferred: {error}"),
         }
+        let store_cache = crate::store_cache::StoreCache::new(data_dir.clone());
+        let catalog_revision = store_cache.catalog_revision();
         Self {
             cloudmatch: CloudMatchService::with_cleanup_path(
                 client.clone(),
                 data_dir.join("pending-session-cleanup.json"),
             ),
-            account_connections: AccountConnectionsService::new(client.clone()),
+            account_connections: AccountConnectionsService::new(),
             persistent_storage: PersistentStorageService::new(client.clone()),
             client,
             endpoints,
@@ -539,7 +377,8 @@ impl GfnService {
             device_identity_error,
             vault,
             profiles: ConsoleProfiles::load(&data_dir),
-            store_cache: crate::store_cache::StoreCache::new(data_dir),
+            store_cache,
+            catalog_revision: std::sync::atomic::AtomicU64::new(catalog_revision),
             server_vpc_cache: crate::server_vpc_cache::ServerVpcCache::default(),
             auth_operation: Mutex::new(()),
             discovery_operation: Mutex::new(()),
@@ -1596,345 +1435,6 @@ impl GfnService {
         )
     }
 
-    pub fn library_catalog(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        self.authenticated_read(|session, generation| {
-        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-        let token = session
-            .tokens
-            .id_token
-            .as_deref()
-            .unwrap_or(&session.tokens.access_token);
-        let vpc_id = self.vpc_id(&client, session, generation, settings, token, None)?;
-        let limit = params["limit"].as_u64().unwrap_or(600).clamp(1, 2000) as usize;
-        let search = params["searchQuery"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        let mut cursor = String::new();
-        let mut games = Vec::new();
-        let mut total_count = 0_u64;
-
-        for _ in 0..25 {
-            self.check_scope(session, generation)?;
-            let variables = json!({
-                "vpcId":vpc_id,
-                "locale":"en_US",
-                "sortString":"variants.gfn.library.lastPlayedDate:DESC,computedValues.libraryAddedDate:DESC,sortName:ASC",
-                "fetchCount":200,
-                "cursor":cursor,
-                "filters":{"variants":{"gfn":{"library":{"status":{"notEquals":"NOT_OWNED"}}}}}
-            });
-            let response = client
-                .post(&self.endpoints.graphql)
-                .headers(graphql_headers(token)?)
-                .json(&json!({"query":LIBRARY_QUERY,"variables":variables}))
-                .send()
-                .map_err(|error| ServiceError::network("GFN library query failed", error))?;
-            if !response.status().is_success() {
-                return Err(ServiceError::response("GFN library query failed", response));
-            }
-            let payload = response
-                .json::<Value>()
-                .map_err(|error| ServiceError::network("Invalid GFN library response", error))?;
-            if let Some(message) = graphql_error_message(&payload) {
-                return Err(ServiceError {
-                    code: "graphql_error",
-                    message,
-                });
-            }
-            let apps = &payload["data"]["apps"];
-            total_count = apps["pageInfo"]["totalCount"]
-                .as_u64()
-                .unwrap_or(total_count);
-            for app in apps["items"].as_array().into_iter().flatten() {
-                if let Some(game) = app_to_game(app) {
-                    if search.is_empty()
-                        || game["searchText"]
-                            .as_str()
-                            .is_some_and(|text| text.contains(&search))
-                    {
-                        games.push(game);
-                    }
-                }
-                if games.len() >= limit {
-                    break;
-                }
-            }
-            if games.len() >= limit || !apps["pageInfo"]["hasNextPage"].as_bool().unwrap_or(false) {
-                break;
-            }
-            let Some(next_cursor) = apps["pageInfo"]["endCursor"].as_str() else {
-                break;
-            };
-            if next_cursor.is_empty() || next_cursor == cursor {
-                break;
-            }
-            cursor = next_cursor.to_owned();
-        }
-        self.check_scope(session, generation)?;
-        Ok(json!({
-            "games":games,
-            "count":games.len(),
-            "totalCount":total_count.max(games.len() as u64),
-            "source":"account-library",
-            "fetchedAt":now_ms()
-        }))
-        })
-    }
-
-    pub fn store_local_catalog(
-        &self,
-        params: &Value,
-        settings: &Value,
-    ) -> Result<Value, ServiceError> {
-        self.authenticated_read(|session, generation| {
-            let scope = self.store_cache_scope(session, generation, settings)?;
-            let mut result = match self.store_cache.local_query(&scope, params) {
-                Err(error) if error.code == "store_cache_missing" => {
-                    self.store_catalog(
-                        &json!({"limit":100,"cursor":"","searchQuery":""}),
-                        settings,
-                    )?;
-                    self.store_cache.local_query(&scope, params)?
-                }
-                result => result?,
-            };
-            // A cold/partial cache grows by at most one upstream page per explicit
-            // demand. Never crawl the entire catalog on startup or a search keypress.
-            if result["count"] == 0 && result["cacheComplete"] == false {
-                if let Some(cursor) = result["upstreamCursor"].as_str().filter(|s| !s.is_empty()) {
-                    self.store_catalog(
-                        &json!({"limit":100,"cursor":cursor,"searchQuery":""}),
-                        settings,
-                    )?;
-                    result = self.store_cache.local_query(&scope, params)?;
-                }
-            }
-            result
-                .as_object_mut()
-                .expect("Local Store response")
-                .remove("upstreamCursor");
-            self.check_scope(session, generation)?;
-            Ok(result)
-        })
-    }
-
-    pub fn store_catalog(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        self.authenticated_read(|session, generation| {
-            self.check_scope(session, generation)?;
-            let page = crate::store_catalog_page::PageRequest::parse(params)?;
-            let client =
-                client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-            let token = session
-                .tokens
-                .id_token
-                .as_deref()
-                .unwrap_or(&session.tokens.access_token);
-            let scope = self.store_cache_scope(session, generation, settings)?;
-            let key = json!(["page", page.limit, page.cursor, page.search]);
-            let refresh = params["refresh"].as_bool() == Some(true) && page.cursor.is_empty();
-            self.store_cache.load_or_fetch(&scope, &key, refresh, || {
-                let vpc_id = self.vpc_id(
-                    &client,
-                    session,
-                    generation,
-                    settings,
-                    token,
-                    Some(&self.store_cache.requests),
-                )?;
-                // Each retry starts at the SAME cursor. Never truncate a fetched page:
-                // doing so would skip games when returning NVIDIA's end cursor.
-                crate::store_catalog_page::fetch_bounded_page(page.limit, |fetch_count| {
-                    let searching = !page.search.is_empty();
-                    let query = if searching {
-                        STORE_SEARCH_QUERY
-                    } else {
-                        STORE_BROWSE_QUERY
-                    };
-                    let mut variables = json!({
-                        "vpcId":vpc_id, "locale":"en_US",
-                        "sortString":"itemMetadata.relevance:DESC,sortName:ASC",
-                        "fetchCount":fetch_count, "cursor":page.cursor, "filters":{}
-                    });
-                    if searching {
-                        variables["searchString"] = Value::String(page.search.clone());
-                    }
-                    let response = self.store_cache.requests.send(
-                        client
-                            .post(&self.endpoints.graphql)
-                            .headers(graphql_headers(token)?)
-                            .json(&json!({"query":query,"variables":variables})),
-                        "GFN store query failed",
-                    )?;
-                    if !response.status().is_success() {
-                        return Err(ServiceError::response("GFN store query failed", response));
-                    }
-                    let payload = response.json::<Value>().map_err(|error| {
-                        ServiceError::network("Invalid GFN store response", error)
-                    })?;
-                    if let Some(message) = graphql_error_message(&payload) {
-                        return Err(ServiceError {
-                            code: "graphql_error",
-                            message,
-                        });
-                    }
-                    let apps = &payload["data"]["apps"];
-                    let items = apps["items"].as_array().ok_or_else(|| ServiceError {
-                        code: "invalid_upstream_response",
-                        message: "Store response has no games array".to_owned(),
-                    })?;
-                    let games: Vec<Value> = items.iter().filter_map(app_to_game).collect();
-                    self.check_scope(session, generation)?;
-                    crate::store_catalog_page::page_result(
-                        &page.cursor,
-                        games,
-                        &apps["pageInfo"],
-                        now_ms(),
-                    )
-                })
-            })
-        })
-    }
-
-    fn store_cache_scope(
-        &self,
-        session: &AuthSession,
-        generation: u64,
-        settings: &Value,
-    ) -> Result<Value, ServiceError> {
-        let proxy = config_from_settings(settings).map_err(ServiceError::invalid)?;
-        Ok(json!([
-            session.user.user_id,
-            session.provider,
-            generation,
-            session.user.membership_tier,
-            proxy
-                .map(|config| config.cache_scope)
-                .unwrap_or_else(|| "direct".into()),
-            "en_US"
-        ]))
-    }
-
-    pub fn store_presentation(
-        &self,
-        params: &Value,
-        settings: &Value,
-    ) -> Result<Value, ServiceError> {
-        self.authenticated_read(|session, generation| {
-            let section = params["section"].as_str().unwrap_or("");
-            if !matches!(section, "marquee" | "panels" | "filters") {
-                return Err(ServiceError::invalid(
-                    "Store presentation requires marquee, panels or filters",
-                ));
-            }
-            let client =
-                client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-            let scope = self.store_cache_scope(session, generation, settings)?;
-            let mut result = self.store_cache.load_or_fetch(
-                &scope,
-                &json!(["presentation", section]),
-                false,
-                || {
-                    let token = session
-                        .tokens
-                        .id_token
-                        .as_deref()
-                        .unwrap_or(&session.tokens.access_token);
-                    let vpc_id = self.vpc_id(
-                        &client,
-                        session,
-                        generation,
-                        settings,
-                        token,
-                        Some(&self.store_cache.requests),
-                    )?;
-                    let (variables, request_type, sha, query) = match section {
-                        "panels" => (
-                            json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MAIN"]}),
-                            "panels/MainV2",
-                            STORE_PANELS_SHA,
-                            STORE_PANELS_QUERY,
-                        ),
-                        "marquee" => (
-                            json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MARQUEE"]}),
-                            "panels/Marquee",
-                            STORE_MARQUEE_SHA,
-                            STORE_MARQUEE_QUERY,
-                        ),
-                        _ => (
-                            json!({"locale":"en_US"}),
-                            "filterGroupAndSortOrderDefinitions",
-                            "ef725de5e93b093de1ac7418fed0ffb4f6ae2b9c14f743ab274a791521488eb9",
-                            STORE_DEFINITIONS_QUERY,
-                        ),
-                    };
-                    let payload = if section == "panels" {
-                        // The persisted MainV2 document only supplies landscape hero art.
-                        // Execute our document so GAME_BOX_ART is actually requested, just
-                        // like Library/browse, rather than silently ignoring these fields.
-                        self.check_scope(session, generation)?;
-                        let response = self.store_cache.requests.send(
-                            client
-                                .post(&self.endpoints.graphql)
-                                .headers(graphql_headers(token)?)
-                                .json(&json!({"query":query,"variables":variables})),
-                            "GFN storefront query failed",
-                        )?;
-                        if !response.status().is_success() {
-                            return Err(ServiceError::response(
-                                "GFN storefront query failed",
-                                response,
-                            ));
-                        }
-                        let payload = response.json::<Value>().map_err(|error| {
-                            ServiceError::network("Invalid GFN storefront response", error)
-                        })?;
-                        if let Some(message) = graphql_error_message(&payload) {
-                            return Err(ServiceError {
-                                code: "graphql_error",
-                                message,
-                            });
-                        }
-                        payload
-                    } else {
-                        fetch_panels_document(
-                            &self.store_cache.requests,
-                            &client,
-                            token,
-                            variables,
-                            request_type,
-                            sha,
-                            query,
-                        )?
-                    };
-                    self.check_scope(session, generation)?;
-                    let empty_index = HashMap::new();
-                    let items = match section {
-                        "panels" => parse_store_panels(&payload, &empty_index),
-                        "marquee" => parse_store_marquee(&payload, &empty_index),
-                        _ => parse_store_definitions(&payload),
-                    };
-                    // Optional chrome must not enlarge the games response or restart the core.
-                    // An oversized/failed section is reported independently by the shell.
-                    crate::store_catalog_page::bounded_result(
-                        json!({"section":section,"items":items}),
-                    )
-                },
-            )?;
-            if section == "panels" && params["metadataOnly"] == true {
-                for panel in result["items"].as_array_mut().into_iter().flatten() {
-                    for section in panel["sections"].as_array_mut().into_iter().flatten() {
-                        let count = section["games"].as_array().map_or(0, Vec::len);
-                        section["totalCount"] = json!(count);
-                        section["games"] = json!([]);
-                    }
-                }
-            }
-            Ok(result)
-        })
-    }
-
     pub fn regions(&self, settings: &Value) -> Result<Value, ServiceError> {
         let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
         self.authenticated_read(|session, generation| {
@@ -2551,41 +2051,119 @@ impl GfnService {
         Ok((params, settings))
     }
 
-    pub fn account_connections(&self) -> Result<Value, ServiceError> {
-        self.authenticated_read(|session, _| self.account_connections.list(session))
+    pub fn account_connections(&self, settings: &Value) -> Result<Value, ServiceError> {
+        self.authenticated_read(|session, generation| {
+            self.with_account_context(session, generation, settings, |context| {
+                self.account_connections.list(context)
+            })
+        })
     }
 
-    pub fn sync_account_connection(&self, params: &Value) -> Result<Value, ServiceError> {
-        let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        let (session, generation) = self.session_snapshot_locked()?;
-        self.account_connections
-            .sync(params, &session)
-            .map(|result| scoped_result(result, &session, generation))
+    fn with_account_context(
+        &self,
+        session: &AuthSession,
+        generation: u64,
+        settings: &Value,
+        operation: impl FnOnce(
+            &crate::account_connections::AccountContext<'_>,
+        ) -> Result<Value, ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        let definitions = self.definitions_for(session, generation, &json!({}), settings)?;
+        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
+        let check = || self.check_scope(session, generation);
+        check()?;
+        operation(&crate::account_connections::AccountContext {
+            client: &client,
+            auth: session,
+            generation,
+            graphql: &self.endpoints.graphql,
+            als: &self.endpoints.account_linking,
+            definitions: &definitions,
+            requests: &self.store_cache.requests,
+            check: &check,
+        })
     }
 
-    pub fn unlink_account_connection(&self, params: &Value) -> Result<Value, ServiceError> {
-        let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        let (session, generation) = self.session_snapshot_locked()?;
-        self.account_connections
-            .unlink(params, &session)
-            .map(|result| scoped_result(result, &session, generation))
+    pub fn sync_account_connection(
+        &self,
+        params: &Value,
+        settings: &Value,
+    ) -> Result<Value, ServiceError> {
+        self.providers()?;
+        let (session, generation) = self.authenticated_snapshot(TokenPurpose::ServiceId, false)?;
+        let result = self.with_account_context(&session, generation, settings, |context| {
+            self.account_connections.sync(params, context)
+        })?;
+        self.check_scope(&session, generation)?;
+        Ok(scoped_result(result, &session, generation))
     }
 
-    pub fn start_account_link(&self, params: &Value) -> Result<Value, ServiceError> {
-        let _operation = self
-            .auth_operation
-            .lock()
-            .expect("GFN auth operation poisoned");
-        crate::requests::check()?;
-        let session = self
-            .resolve_session_locked(TokenPurpose::ServiceId, false)?
-            .0
-            .ok_or_else(|| ServiceError::invalid("Sign in to connect a game account"))?;
-        self.account_connections.start_link(params, &session)
+    pub fn account_sync_status(
+        &self,
+        params: &Value,
+        settings: &Value,
+    ) -> Result<Value, ServiceError> {
+        self.authenticated_read(|session, generation| {
+            let mut result =
+                self.with_account_context(session, generation, settings, |context| {
+                    self.account_connections.sync_status(params, context)
+                })?;
+            if result["phase"] == "refreshing_library" {
+                let id = result["operationId"].as_str().unwrap_or("");
+                self.account_connections
+                    .invalidate_sync(id, || self.invalidate_catalog())?;
+                result["catalogRevision"] = json!(
+                    self.catalog_revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+            }
+            Ok(result)
+        })
     }
 
-    pub fn poll_account_link(&self, params: &Value) -> Result<Value, ServiceError> {
-        self.account_connections.poll_link(params)
+    pub fn unlink_account_connection(
+        &self,
+        params: &Value,
+        settings: &Value,
+    ) -> Result<Value, ServiceError> {
+        self.providers()?;
+        let (session, generation) = self.authenticated_snapshot(TokenPurpose::ServiceId, false)?;
+        let result = self.with_account_context(&session, generation, settings, |context| {
+            self.account_connections.unlink(params, context)
+        })?;
+        self.check_scope(&session, generation)?;
+        self.invalidate_catalog()?;
+        Ok(scoped_result(result, &session, generation))
+    }
+
+    pub fn start_account_link(
+        &self,
+        params: &Value,
+        settings: &Value,
+    ) -> Result<Value, ServiceError> {
+        self.providers()?;
+        let (session, generation) = self.authenticated_snapshot(TokenPurpose::ServiceId, false)?;
+        let result = self.with_account_context(&session, generation, settings, |context| {
+            self.account_connections.start_link(params, context)
+        })?;
+        self.check_scope(&session, generation)?;
+        Ok(scoped_result(result, &session, generation))
+    }
+
+    pub fn poll_account_link(
+        &self,
+        params: &Value,
+        settings: &Value,
+    ) -> Result<Value, ServiceError> {
+        self.authenticated_read(|session, generation| {
+            let result = self.with_account_context(session, generation, settings, |context| {
+                self.account_connections.poll_link(params, context)
+            })?;
+            if result["status"] == "complete" {
+                self.invalidate_catalog()?;
+            }
+            Ok(result)
+        })
     }
 
     pub fn persistent_storage_locations(&self, params: &Value) -> Result<Value, ServiceError> {
@@ -3181,139 +2759,6 @@ fn public_game_to_info(item: &Value) -> Option<Value> {
     }))
 }
 
-fn app_to_game(app: &Value) -> Option<Value> {
-    let id = app["id"].as_str()?.to_owned();
-    let title = app["title"].as_str()?.trim().to_owned();
-    if title.is_empty() {
-        return None;
-    }
-    let variants = app["variants"].as_array().into_iter().flatten().filter_map(|variant| {
-        let variant_id = variant["id"].as_str()?.to_owned();
-        let store = variant["appStore"].as_str().unwrap_or("Unknown").to_owned();
-        let library_status = variant["gfn"]["library"]["status"].as_str().map(ToOwned::to_owned);
-        let in_library = library_status.as_deref().is_some_and(|status| matches!(status, "MANUAL" | "PLATFORM_SYNC" | "IN_LIBRARY"));
-        let supports_persistence = gfn_feature_enabled(
-            &variant["gfn"]["features"],
-            "IN_GAME_SETTINGS_PERSISTENCE_ENABLED",
-        );
-        Some(json!({
-            "id":variant_id,
-            "store":store,
-            "storeUrl":variant["storeUrl"],
-            "supportedControls":variant["supportedControls"].as_array().cloned().unwrap_or_default(),
-            "librarySelected":variant["gfn"]["library"]["selected"].as_bool().unwrap_or(false),
-            "inLibrary":in_library,
-            "libraryStatus":library_status,
-            "lastPlayedDate":variant["gfn"]["library"]["lastPlayedDate"],
-            "gfnStatus":variant["gfn"]["status"],
-            "supportsInGameSettingsPersistence":supports_persistence,
-        }))
-    }).collect::<Vec<_>>();
-    if variants.is_empty() {
-        return None;
-    }
-    let selected_index = variants
-        .iter()
-        .position(|variant| variant["librarySelected"].as_bool() == Some(true))
-        .or_else(|| {
-            variants
-                .iter()
-                .position(|variant| variant["inLibrary"].as_bool() == Some(true))
-        })
-        .unwrap_or(0);
-    let launch_id = variants
-        .get(selected_index)
-        .and_then(|variant| variant["id"].as_str())
-        .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
-        .or_else(|| {
-            variants
-                .iter()
-                .filter_map(|variant| variant["id"].as_str())
-                .find(|value| value.chars().all(|character| character.is_ascii_digit()))
-        })
-        .or_else(|| {
-            id.chars()
-                .all(|character| character.is_ascii_digit())
-                .then_some(id.as_str())
-        })
-        .map(ToOwned::to_owned);
-    let available_stores = variants
-        .iter()
-        .filter_map(|variant| variant["store"].as_str().map(ToOwned::to_owned))
-        .collect::<Vec<_>>();
-    let genres = string_array(&app["genres"]);
-    let controls = string_array(&app["supportedControls"]);
-    let image_url = first_image(
-        &app["images"],
-        &[
-            "GAME_BOX_ART",
-            "KEY_IMAGE",
-            "KEY_ART",
-            "HERO_IMAGE",
-            "TV_BANNER",
-        ],
-        900,
-    );
-    let hero_image_url = first_image(
-        &app["images"],
-        &[
-            "MARQUEE_HERO_IMAGE",
-            "HERO_IMAGE",
-            "TV_BANNER",
-            "FEATURE_IMAGE",
-            "KEY_IMAGE",
-            "KEY_ART",
-        ],
-        1200,
-    );
-    let key_art_url = first_image(&app["images"], &["KEY_ART", "KEY_IMAGE"], 900);
-    let screenshots = image_values(&app["images"]["SCREENSHOTS"], 1200);
-    let publisher = app["publisherName"].as_str().map(ToOwned::to_owned);
-    let developer = app["developerName"].as_str().map(ToOwned::to_owned);
-    let search_text = [
-        vec![title.clone()],
-        publisher.clone().into_iter().collect(),
-        developer.clone().into_iter().collect(),
-        available_stores.clone(),
-        genres.clone(),
-    ]
-    .concat()
-    .join(" ")
-    .to_lowercase();
-    let is_in_library = variants
-        .iter()
-        .any(|variant| variant["inLibrary"].as_bool() == Some(true));
-    let last_played = variants
-        .iter()
-        .filter_map(|variant| variant["lastPlayedDate"].as_str())
-        .next()
-        .map(ToOwned::to_owned);
-    Some(json!({
-        "id":id,
-        "uuid":id,
-        "launchAppId":launch_id,
-        "title":title,
-        "developerName":developer,
-        "publisherName":publisher,
-        "genres":genres,
-        "supportedControls":controls,
-        "imageUrl":image_url,
-        "heroImageUrl":hero_image_url,
-        "keyArtUrl":key_art_url,
-        "screenshotUrl":screenshots.first(),
-        "screenshotUrls":screenshots,
-        "playType":app["gfn"]["playType"],
-        "membershipTierLabel":app["gfn"]["minimumMembershipTierLabel"],
-        "playabilityState":app["gfn"]["playabilityState"],
-        "availableStores":available_stores,
-        "searchText":search_text,
-        "lastPlayed":last_played,
-        "isInLibrary":is_in_library,
-        "selectedVariantIndex":selected_index,
-        "variants":variants,
-    }))
-}
-
 fn gfn_feature_enabled(features: &Value, expected_key: &str) -> bool {
     let matches = |feature: &Value| {
         feature["key"].as_str() == Some(expected_key)
@@ -3601,6 +3046,8 @@ fn parse_store_definitions(payload: &Value) -> Vec<Value> {
                     Some(json!({
                         "id":entry["id"].as_str()?,
                         "label":entry["label"].as_str().unwrap_or(entry["id"].as_str()?),
+                        "filters":entry["filters"],
+                        "expression":crate::catalog_types::filter_expression(&entry["filters"]),
                     }))
                 })
                 .collect::<Vec<_>>();
@@ -3854,7 +3301,7 @@ fn required_string(payload: &Value, key: &str) -> Result<String, ServiceError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn mock_responses(
@@ -3864,7 +3311,7 @@ mod tests {
         mock_requests(responses, move |index, _| before_response(index))
     }
 
-    pub(super) fn mock_requests(
+    pub(crate) fn mock_requests(
         responses: Vec<(u16, Value)>,
         before_response: impl Fn(usize, &str) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -3914,7 +3361,7 @@ mod tests {
         (url, worker)
     }
 
-    pub(super) fn auth_fixture(user: &str) -> AuthSession {
+    pub(crate) fn auth_fixture(user: &str) -> AuthSession {
         serde_json::from_value(json!({
             "provider": LoginProvider::default_nvidia(),
             "tokens": {"accessToken":"test-access", "refreshToken":"test-refresh",

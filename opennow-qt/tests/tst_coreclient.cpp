@@ -284,8 +284,27 @@ private slots:
     {
         CoreClient client;
         QCOMPARE(client.state(), QStringLiteral("stopped"));
-        QCOMPARE(client.protocolVersion(), 3);
+        QCOMPARE(client.protocolVersion(), 4);
         QVERIFY(client.lastError().isEmpty());
+    }
+
+    void rejectsOldCoreBeforeSendingCatalogRequests()
+    {
+        const auto previous = qgetenv("OPENNOW_TEST_OLD_CORE");
+        const auto restore = qScopeGuard([previous] {
+            if (previous.isNull()) qunsetenv("OPENNOW_TEST_OLD_CORE");
+            else qputenv("OPENNOW_TEST_OLD_CORE", previous);
+        });
+        qputenv("OPENNOW_TEST_OLD_CORE", "1");
+        CoreClient client;
+        QStringList errors;
+        connect(&client, &CoreClient::lastErrorChanged, &client, [&] { errors.append(client.lastError()); });
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("failed"), 2'000);
+        QVERIFY(errors.contains(QStringLiteral("Core protocol version is incompatible")));
+        QVERIFY(client.request(QStringLiteral("catalog.library.list")).isEmpty());
+        QVERIFY(responses.isEmpty());
     }
 
     void rejectsInvalidStartAndRequest()

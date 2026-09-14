@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonParseError>
 #include <QStandardPaths>
 #include <QProcessEnvironment>
@@ -463,6 +464,14 @@ void CoreClient::processLine(const QByteArray &line)
                 if (version != CurrentProtocolVersion) {
                     protocolFailure(u"Core protocol version is incompatible"_s);
                     return;
+                }
+                const auto capabilities = result.value(u"capabilities"_s).toArray();
+                for (const auto &capability : {u"catalog.libraryPages.v1"_s, u"catalog.metadata.v1"_s,
+                                             u"account.syncObservation.v1"_s, u"catalog.languages.v1"_s}) {
+                    if (!capabilities.contains(capability)) {
+                        protocolFailure(u"The packaged core lacks required catalog capabilities"_s);
+                        return;
+                    }
                 }
                 m_restartAttempts = 0;
                 setState(u"ready"_s);
