@@ -275,7 +275,12 @@ impl CredentialVault {
             Ok(Some(encoded)) => {
                 let session = decode_session(&encoded, user_id)?;
                 if self.session_file(user_id).exists() {
-                    self.save(&session)?;
+                    if let Err(error) = self.save(&session) {
+                        self.warn(
+                            format!("cleanup:{user_id}"),
+                            format!("Legacy credential cleanup is pending: {error}"),
+                        );
+                    }
                 }
                 self.clear_warning(&format!("migration:{user_id}"));
                 return Ok(Some(session));
@@ -724,6 +729,35 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn secure_restore_survives_failed_legacy_cleanup_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = CredentialVault::memory(directory.path().into());
+        let session = sample_session("selected");
+        vault.save(&session).unwrap();
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        let mut legacy = session.clone();
+        legacy.tokens.access_token = "superseded-legacy-grant".into();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(vault.session_file("selected"), &legacy_bytes).unwrap();
+        let blocked_metadata = directory.path().join("accounts.json.tmp");
+        fs::create_dir(&blocked_metadata).unwrap();
+
+        let restored = vault.load_active().unwrap().unwrap();
+        assert_eq!(restored.tokens.access_token, session.tokens.access_token);
+        assert_eq!(
+            fs::read(vault.session_file("selected")).unwrap(),
+            legacy_bytes
+        );
+        assert!(!vault.warnings().is_empty());
+
+        fs::remove_dir(blocked_metadata).unwrap();
+        let restored = vault.load_active().unwrap().unwrap();
+        assert_eq!(restored.tokens.access_token, session.tokens.access_token);
+        assert!(!vault.session_file("selected").exists());
+        assert!(vault.warnings().is_empty());
+    }
 
     #[test]
     fn migration_preserves_selection_and_conflicting_sources() {
