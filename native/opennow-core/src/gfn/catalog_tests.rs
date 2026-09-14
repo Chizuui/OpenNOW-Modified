@@ -121,6 +121,60 @@ fn exact_game_lookup_preserves_selected_variant_readiness_and_rejects_wrong_iden
 }
 
 #[test]
+fn targeted_game_lookups_omit_campaign_dependencies_and_keep_launch_metadata() {
+    let (url, worker) = mock_requests(
+        vec![
+            (200, json!({"requestStatus":{"serverId":"fixture-vpc"}})),
+            (200, json!({"data":{"apps":{"items":[app(1)]}}})),
+            (200, json!({"data":{"apps":{"items":[app(1)]}}})),
+        ],
+        |index, request| {
+            if index == 0 {
+                return;
+            }
+            let payload: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let query = payload["query"].as_str().unwrap();
+            assert!(!query.contains("itemMetadata"));
+            assert!(!query.contains("campaignIds"));
+            for field in [
+                "favorited",
+                "playStatus",
+                "selected",
+                "installed",
+                "subscription",
+                "stateDetails",
+                "supportedLanguages",
+                "paymentModels",
+                "minimumMembershipTierLabel",
+                "playabilityState",
+            ] {
+                assert!(query.contains(field), "missing {field}");
+            }
+            assert_eq!(payload["variables"]["vpcId"], "fixture-vpc");
+            assert_eq!(payload["variables"]["locale"], "en_US");
+            if index == 1 {
+                assert!(query.contains("appIds:$ids"));
+                assert_eq!(payload["variables"]["ids"], json!(["app-1"]));
+            } else {
+                assert!(query.contains("variantIds:$ids"));
+                assert_eq!(payload["variables"]["ids"], json!([123]));
+            }
+        },
+    );
+    let (service, path) = service(&url);
+    for params in [json!({"appId":"app-1"}), json!({"variantId":"123"})] {
+        let result = service.catalog_game(&params, &json!({})).unwrap();
+        assert_eq!(result["game"]["id"], "app-1");
+        assert_eq!(result["game"]["variants"][0]["libraryStatus"], "MANUAL");
+        assert_eq!(result["game"]["variants"][0]["playStatus"], "NOT_PLAYABLE");
+        assert_eq!(result["game"]["variants"][0]["gfnStatus"], "PATCHING");
+    }
+    worker.join().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn overall_languages_are_anonymous_variable_free_cached_and_truthfully_stale() {
     let (url, worker) = mock_requests(
         vec![
