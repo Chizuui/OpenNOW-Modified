@@ -5,7 +5,9 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +21,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DISCOVERY_REGIONS: usize = 32;
 const DISCOVERY_CONCURRENCY: usize = 4;
+const MAX_CLEANUP_RECORD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct ActiveSession {
@@ -37,11 +40,23 @@ struct SessionConflict {
     sessions: Vec<Value>,
 }
 
+struct FreshAllocation {
+    info: Value,
+    base: Url,
+    client: Client,
+    headers: HeaderMap,
+    owner: (String, String),
+}
+
 pub struct CloudMatchService {
     client: Client,
     active: Mutex<Option<ActiveSession>>,
     discovered: Mutex<HashMap<String, Value>>,
     conflict: Mutex<Option<SessionConflict>>,
+    allocation_admission: Mutex<()>,
+    fresh: Mutex<Option<FreshAllocation>>,
+    cleanup_path: Option<PathBuf>,
+    retained_cleanup: Mutex<Option<Value>>,
 }
 
 impl CloudMatchService {
@@ -51,7 +66,38 @@ impl CloudMatchService {
             active: Mutex::new(None),
             discovered: Mutex::new(HashMap::new()),
             conflict: Mutex::new(None),
+            allocation_admission: Mutex::new(()),
+            fresh: Mutex::new(None),
+            cleanup_path: None,
+            retained_cleanup: Mutex::new(None),
         }
+    }
+
+    pub fn with_cleanup_path(client: Client, path: PathBuf) -> Self {
+        let mut service = Self::new(client);
+        if let Ok(file) = std::fs::File::open(&path)
+            && let Some(record) = read_cleanup_record(file)
+            && record["sessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && record["streamingBaseUrl"]
+                .as_str()
+                .is_some_and(|base| trusted_cloudmatch_base(base).is_ok())
+            && record["owner"].as_array().is_some_and(|owner| {
+                owner.len() == 2
+                    && owner.iter().all(|part| {
+                        part.as_str()
+                            .is_some_and(|value| !value.is_empty() && value.len() <= 256)
+                    })
+            })
+        {
+            *service
+                .retained_cleanup
+                .lock()
+                .expect("CloudMatch cleanup state poisoned") = Some(record);
+        }
+        service.cleanup_path = Some(path);
+        service
     }
 
     pub fn create(
@@ -61,15 +107,60 @@ impl CloudMatchService {
         auth: &AuthSession,
         device_id: &str,
     ) -> Result<Value, ServiceError> {
-        let client = client_for_settings(&self.client, settings).map_err(invalid)?;
+        self.create_at(params, settings, auth, device_id, || {
+            let client = client_for_settings(&self.client, settings).map_err(invalid)?;
+            let requested_base = requested_streaming_base(params, settings, auth)?;
+            let base = self.resolve_create_base(
+                &client,
+                &requested_base,
+                session_token(auth),
+                device_id,
+                true,
+            );
+            Ok((client, base))
+        })
+    }
+
+    fn create_at(
+        &self,
+        params: &Value,
+        settings: &Value,
+        auth: &AuthSession,
+        device_id: &str,
+        connection: impl FnOnce() -> Result<(Client, Url), ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        let _admission = self
+            .allocation_admission
+            .try_lock()
+            .map_err(|_| allocation_in_progress())?;
+        crate::requests::check()?;
+        if self
+            .retained_cleanup
+            .try_lock()
+            .map_err(|_| allocation_in_progress())?
+            .is_some()
+        {
+            return Err(ServiceError {code:"session_cleanup_pending", message:"A cancelled allocation still needs cleanup. End that session before starting another game.".to_owned()});
+        }
+        if let Some(allocation) = self
+            .fresh
+            .try_lock()
+            .map_err(|_| allocation_in_progress())?
+            .as_ref()
+        {
+            return Err(ServiceError {
+                code: if allocation.info["cleanupPending"] == true { "session_cleanup_pending" } else { "session_update_busy" },
+                message: "The previous allocation is awaiting confirmation or cleanup. End that session before starting another game.".to_owned(),
+            });
+        }
+        let (client, base) = connection()?;
+        crate::requests::check()?;
         let app_id = launch_app_id(params)?;
         *self
             .conflict
             .lock()
             .expect("CloudMatch conflict state poisoned") = None;
         let token = session_token(auth);
-        let requested_base = requested_streaming_base(params, settings, auth)?;
-        let base = self.resolve_create_base(&client, &requested_base, token, device_id, true);
         let body = build_create_body(&app_id, params, settings, device_id);
         let keyboard_layout = setting_string(settings, "keyboardLayout", "en-US");
         let language = setting_string(settings, "gameLanguage", "en_US");
@@ -101,14 +192,30 @@ impl CloudMatchService {
             .or_else(|| base.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
         let mut info = session_info(&payload, &base, &zone, &app_id, device_id)?;
+        *self
+            .fresh
+            .lock()
+            .expect("CloudMatch allocation state poisoned") = Some(FreshAllocation {
+            info: info.clone(),
+            base: base.clone(),
+            client: client.clone(),
+            headers: cloudmatch_headers(token, device_id)?,
+            owner: (auth.provider.idp_id.clone(), auth.user.user_id.clone()),
+        });
+        if crate::requests::current().cancelled() {
+            self.finish_create(info["sessionId"].as_str().unwrap_or_default(), false)?;
+            return Err(cancelled_allocation());
+        }
+        let mut request_profile = negotiated_profile(
+            &body["sessionRequestData"]["clientRequestMonitorSettings"][0],
+            &body["sessionRequestData"]["requestedStreamingFeatures"],
+        );
+        request_profile["codecSource"] = json!("request");
         let request_codec = json!({
             "sessionId":info["sessionId"],
-            "negotiatedStreamProfile":{
-                "codec":codec_from_wire(&body["sessionRequestData"]["requestedStreamingFeatures"]["codec"]),
-                "codecSource":"request"
-            }
+            "negotiatedStreamProfile":request_profile
         });
-        preserve_session_codec(&mut info, &request_codec);
+        preserve_session_profile(&mut info, &request_codec);
 
         if let Some(session_id) = info["sessionId"].as_str() {
             let mut resume_url = base
@@ -143,10 +250,117 @@ impl CloudMatchService {
                 .send();
         }
 
+        if crate::requests::current().cancelled() {
+            self.finish_create(info["sessionId"].as_str().unwrap_or_default(), false)?;
+            return Err(cancelled_allocation());
+        }
         self.store_active(&mut info, &base, &zone, &app_id, client)?;
         info["phase"] =
             Value::String(session_phase(info["status"].as_i64().unwrap_or_default()).to_owned());
         Ok(json!({"session":info}))
+    }
+
+    pub fn finish_create(
+        &self,
+        expected_session_id: &str,
+        accepted: bool,
+    ) -> Result<(), ServiceError> {
+        let mut fresh = self
+            .fresh
+            .lock()
+            .expect("CloudMatch allocation state poisoned");
+        let Some(allocation) = fresh.as_mut() else {
+            return Ok(());
+        };
+        let session_id = allocation.info["sessionId"]
+            .as_str()
+            .ok_or_else(|| upstream("Allocated session has no ID"))?
+            .to_owned();
+        if session_id != expected_session_id {
+            return Ok(());
+        }
+        if !accepted {
+            let url = allocation
+                .base
+                .join(&format!("v2/session/{session_id}"))
+                .map_err(|_| invalid("Invalid allocation cleanup URL"))?;
+            let result = delete_session(&allocation.client, url, allocation.headers.clone());
+            self.clear_active(&session_id);
+            if let Err(error) = result {
+                allocation.info["cleanupPending"] = json!(true);
+                allocation.info["cleanupErrorCode"] = json!(error.code);
+                let mut pending = allocation.info.clone();
+                pending["cleanupPending"] = json!(true);
+                self.discovered
+                    .lock()
+                    .expect("CloudMatch discovery state poisoned")
+                    .insert(session_id.to_owned(), pending);
+                let record = json!({"sessionId":session_id,"appId":allocation.info["appId"],
+                    "status":allocation.info["status"],"phase":allocation.info["phase"],
+                    "streamingBaseUrl":allocation.base.origin().ascii_serialization(),
+                    "cleanupPending":true,"cleanupErrorCode":error.code,"owner":allocation.owner});
+                *self
+                    .retained_cleanup
+                    .lock()
+                    .expect("CloudMatch cleanup state poisoned") = Some(record.clone());
+                if let Some(path) = &self.cleanup_path {
+                    let saved = (|| -> std::io::Result<()> {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let temporary = path.with_extension("tmp");
+                        std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
+                        std::fs::rename(temporary, path)
+                    })();
+                    if saved.is_err() {
+                        eprintln!("CloudMatch could not persist pending allocation cleanup");
+                    }
+                }
+                return Err(ServiceError {code:"session_cleanup_pending", message:"The cancelled cloud session could not be closed. End it before starting another game.".to_owned()});
+            }
+            self.discovered
+                .lock()
+                .expect("CloudMatch discovery state poisoned")
+                .remove(&session_id);
+            self.clear_cleanup(&session_id);
+        }
+        *fresh = None;
+        Ok(())
+    }
+
+    fn pending_cleanup(&self, auth: &AuthSession) -> Option<Value> {
+        self.retained_cleanup
+            .lock()
+            .expect("CloudMatch cleanup state poisoned")
+            .as_ref()
+            .filter(|record| record["owner"] == json!([auth.provider.idp_id, auth.user.user_id]))
+            .map(|record| {
+                let mut public = record.clone();
+                if let Some(object) = public.as_object_mut() {
+                    object.remove("owner");
+                }
+                public
+            })
+    }
+
+    fn clear_cleanup(&self, session_id: &str) {
+        let mut retained = self
+            .retained_cleanup
+            .lock()
+            .expect("CloudMatch cleanup state poisoned");
+        if retained
+            .as_ref()
+            .is_some_and(|record| record["sessionId"] == session_id)
+        {
+            if let Some(path) = &self.cleanup_path
+                && let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("CloudMatch could not remove completed allocation cleanup record");
+                return;
+            }
+            *retained = None;
+        }
     }
 
     pub fn poll(
@@ -183,7 +397,17 @@ impl CloudMatchService {
             .map_or_else(|| trusted_cloudmatch_base(&control_base), Ok)?;
         let token = session_token(auth);
         let headers = cloudmatch_headers(token, device_id)?;
-        let payload = self.get_session(&client, &base, &session_id, &headers)?;
+        let payload = match self.get_session(&client, &base, &session_id, &headers) {
+            Ok(payload) => payload,
+            Err(error) if error.code == "session_not_found" => {
+                self.clear_active(&session_id);
+                return Ok(json!({"session":null,"termination":{
+                    "source":"cloudmatch-http","httpStatus":404,
+                    "sessionId":session_id,"resumable":false
+                }}));
+            }
+            Err(error) => return Err(error),
+        };
         let zone = current
             .as_ref()
             .map(|state| state.zone.clone())
@@ -204,7 +428,7 @@ impl CloudMatchService {
             && let Ok(mut direct_info) =
                 session_info(&direct_payload, &direct, &zone, &app_id, device_id)
         {
-            preserve_session_codec(&mut direct_info, &info);
+            preserve_session_profile(&mut direct_info, &info);
             info = direct_info;
         }
 
@@ -284,19 +508,44 @@ impl CloudMatchService {
         let url = base
             .join(&format!("v2/session/{session_id}"))
             .map_err(|_| invalid("Invalid CloudMatch stop URL"))?;
+        self.stop_at(
+            &session_id,
+            &client,
+            url,
+            cloudmatch_headers(session_token(auth), device_id)?,
+        )
+    }
+
+    fn stop_at(
+        &self,
+        session_id: &str,
+        client: &Client,
+        url: Url,
+        headers: HeaderMap,
+    ) -> Result<Value, ServiceError> {
         let response = client
             .delete(url)
-            .headers(cloudmatch_headers(session_token(auth), device_id)?)
+            .headers(headers)
             .send()
             .map_err(|error| network("Session stop failed", error))?;
-        if !response.status().is_success() && response.status().as_u16() != 404 {
-            return Err(response_error("Session stop failed", response));
+        validate_delete_response("Session stop failed", response)?;
+        self.clear_active(session_id);
+        self.clear_cleanup(session_id);
+        let mut fresh = self
+            .fresh
+            .lock()
+            .expect("CloudMatch allocation state poisoned");
+        if fresh
+            .as_ref()
+            .is_some_and(|allocation| allocation.info["sessionId"] == session_id)
+        {
+            *fresh = None;
         }
-        *self.active.lock().expect("CloudMatch state poisoned") = None;
+        drop(fresh);
         self.discovered
             .lock()
             .expect("CloudMatch discovery state poisoned")
-            .remove(&session_id);
+            .remove(session_id);
         if let Some(conflict) = self
             .conflict
             .lock()
@@ -307,7 +556,7 @@ impl CloudMatchService {
                 .sessions
                 .retain(|session| session["sessionId"] != session_id);
         }
-        Ok(json!({"session":null,"stopped":true,"sessionId":session_id}))
+        Ok(json!({"session":self.active()["session"],"stopped":true,"sessionId":session_id}))
     }
 
     pub fn active(&self) -> Value {
@@ -436,7 +685,7 @@ impl CloudMatchService {
         }
         let incomplete = server_info.is_err() || bases.len() > MAX_DISCOVERY_REGIONS;
         bases.truncate(MAX_DISCOVERY_REGIONS);
-        let sessions = discover_sessions(&bases, deadline, incomplete, |base, timeout| {
+        let mut sessions = discover_sessions(&bases, deadline, incomplete, |base, timeout| {
             let url = base
                 .join("v2/session")
                 .map_err(|_| invalid("Invalid active-session URL"))?;
@@ -456,6 +705,13 @@ impl CloudMatchService {
                 .filter_map(|session| remote_session_info(session, base))
                 .collect())
         })?;
+        if let Some(pending) = self.pending_cleanup(auth)
+            && !sessions
+                .iter()
+                .any(|session| session["sessionId"] == pending["sessionId"])
+        {
+            sessions.push(pending);
+        }
         self.store_discovered(&sessions);
         Ok(json!({"sessions":sessions}))
     }
@@ -523,6 +779,11 @@ impl CloudMatchService {
         let app_id = first_string(&session["sessionRequestData"]["appId"])
             .or_else(|| first_string(&params["appId"]))
             .unwrap_or_else(|| "0".to_owned());
+        if initial_status == 7 {
+            self.clear_active(session_id);
+            let info = session_info(&initial_payload, &control_base, "", &app_id, device_id)?;
+            return Ok(json!({"session":info}));
+        }
         if session_requires_resume(initial_status)? {
             let keyboard_layout = setting_string(settings, "keyboardLayout", "en-US");
             let language = setting_string(settings, "gameLanguage", "en_US");
@@ -649,8 +910,17 @@ impl CloudMatchService {
             .ok_or_else(|| upstream("Session result did not include an ID"))?
             .to_owned();
         let mut active = self.active.lock().expect("CloudMatch state poisoned");
+        if info["status"] == 7 {
+            if active
+                .as_ref()
+                .is_some_and(|state| state.session_id == session_id)
+            {
+                *active = None;
+            }
+            return Ok(());
+        }
         if let Some(previous) = active.as_ref() {
-            preserve_session_codec(info, &previous.info);
+            preserve_session_profile(info, &previous.info);
         }
         *active = Some(ActiveSession {
             session_id,
@@ -665,6 +935,16 @@ impl CloudMatchService {
             client,
         });
         Ok(())
+    }
+
+    fn clear_active(&self, session_id: &str) {
+        let mut active = self.active.lock().expect("CloudMatch state poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|state| state.session_id == session_id)
+        {
+            *active = None;
+        }
     }
 
     fn get_session(
@@ -690,6 +970,13 @@ impl CloudMatchService {
                     thread::sleep(Duration::from_millis(if attempt == 0 { 250 } else { 750 }));
                 }
                 Ok(response) => {
+                    if response.status() == reqwest::StatusCode::NOT_FOUND {
+                        return Err(ServiceError {
+                            code: "session_not_found",
+                            message: "The requested GeForce NOW session no longer exists."
+                                .to_owned(),
+                        });
+                    }
                     return read_cloudmatch_response("Session polling failed", response, false);
                 }
                 Err(error) => {
@@ -797,7 +1084,11 @@ fn session_requires_resume(status: i64) -> Result<bool, ServiceError> {
 fn mark_resume_progress(info: &mut Value) {
     if !matches!(info["status"].as_i64(), Some(1..=6)) {
         info["resumePending"] = json!(false);
-        info["phase"] = json!("failed");
+        info["phase"] = json!(if info["status"] == 7 {
+            "finished"
+        } else {
+            "failed"
+        });
         return;
     }
     let ready = matches!(info["status"].as_i64(), Some(2 | 3))
@@ -1085,6 +1376,11 @@ fn session_info(
     let codec_reported =
         session["negotiatedStreamProfile"].get("codec").is_some() || features.contains_key("codec");
     let mut negotiated = negotiated_profile(monitor, &Value::Object(features));
+    for key in ["bitDepth", "chromaFormat"] {
+        if session["finalizedStreamingFeatures"].get(key).is_some() {
+            negotiated[format!("{key}Source")] = json!("finalized");
+        }
+    }
     if let Some(codec) = session["negotiatedStreamProfile"].get("codec") {
         negotiated["codec"] = json!(codec.as_str().and_then(|value| {
             match value.trim().to_ascii_uppercase().as_str() {
@@ -1100,7 +1396,13 @@ fn session_info(
     } else {
         "unreported"
     });
-    negotiated["enableHdr"] = json!(accepted_hdr_mode(session) == Some(1));
+    let hdr = accepted_hdr_mode(session);
+    negotiated["enableHdr"] = json!(hdr.map(|mode| mode == 1));
+    negotiated["enableHdrSource"] = json!(if hdr_mode_value(session).is_some() {
+        "server"
+    } else {
+        "unreported"
+    });
     let ad_state = normalize_ad_state(session);
     Ok(json!({
         "sessionId":session_id,
@@ -1108,6 +1410,7 @@ fn session_info(
         "appId":app_id,
         "status":status,
         "phase":session_phase(status),
+        "termination":if status == 7 { json!({"source":"cloudmatch-session-status","status":7,"sessionId":session_id,"resumable":false}) } else { Value::Null },
         "queuePosition":queue_position,
         "seatSetupStep":seat_setup_step,
         "adState":ad_state,
@@ -1160,32 +1463,67 @@ fn normalize_ad_state(session: &Value) -> Value {
 }
 
 fn accepted_hdr_mode(session: &Value) -> Option<i64> {
-    value_i64(&session["sdrHdrMode"])
-        .or_else(|| {
-            value_i64(
-                &session["sessionRequestData"]["clientRequestMonitorSettings"][0]["sdrHdrMode"],
-            )
-        })
-        .or_else(|| value_i64(&session["sessionRequestData"]["sdrHdrMode"]))
+    hdr_mode_value(session)
+        .and_then(value_i64)
         .map(|mode| i64::from(mode == 1))
 }
 
-fn preserve_session_codec(info: &mut Value, previous: &Value) {
+fn hdr_mode_value(session: &Value) -> Option<&Value> {
+    session
+        .get("sdrHdrMode")
+        .or_else(|| {
+            session["sessionRequestData"]["clientRequestMonitorSettings"][0].get("sdrHdrMode")
+        })
+        .or_else(|| session["sessionRequestData"].get("sdrHdrMode"))
+}
+
+fn preserve_session_profile(info: &mut Value, previous: &Value) {
     let Some(session_id) = info["sessionId"].as_str().filter(|id| !id.is_empty()) else {
         return;
     };
     let profile = &previous["negotiatedStreamProfile"];
-    if previous["sessionId"].as_str() != Some(session_id)
-        || !(info["negotiatedStreamProfile"]["codecSource"] == "unreported"
-            || (info["negotiatedStreamProfile"]["codecSource"] == "request"
-                && profile["codecSource"] == "server"))
-        || !matches!(profile["codec"].as_str(), Some("H264" | "H265" | "AV1"))
-        || !matches!(profile["codecSource"].as_str(), Some("request" | "server"))
-    {
+    if previous["sessionId"].as_str() != Some(session_id) {
         return;
     }
-    info["negotiatedStreamProfile"]["codec"] = profile["codec"].clone();
-    info["negotiatedStreamProfile"]["codecSource"] = profile["codecSource"].clone();
+    if (info["negotiatedStreamProfile"]["codecSource"] == "unreported"
+        || (info["negotiatedStreamProfile"]["codecSource"] == "request"
+            && profile["codecSource"] == "server"))
+        && matches!(profile["codec"].as_str(), Some("H264" | "H265" | "AV1"))
+        && matches!(profile["codecSource"].as_str(), Some("request" | "server"))
+    {
+        info["negotiatedStreamProfile"]["codec"] = profile["codec"].clone();
+        info["negotiatedStreamProfile"]["codecSource"] = profile["codecSource"].clone();
+    }
+    for key in ["bitDepth", "chromaFormat", "enableHdr"] {
+        let source = format!("{key}Source");
+        let current = &info["negotiatedStreamProfile"][&source];
+        if (current == "unreported" || (current == "request" && profile[&source] == "finalized"))
+            && matches!(
+                profile[&source].as_str(),
+                Some("request" | "server" | "finalized")
+            )
+        {
+            info["negotiatedStreamProfile"][key] = profile[key].clone();
+            info["negotiatedStreamProfile"][&source] = profile[&source].clone();
+        }
+    }
+    let updated = &mut info["negotiatedStreamProfile"];
+    if updated.get("bitDepthSource").is_some() || updated.get("chromaFormatSource").is_some() {
+        updated["colorQuality"] = json!(profile_color(
+            &updated["bitDepth"],
+            &updated["chromaFormat"]
+        ));
+    }
+}
+
+fn profile_color(depth: &Value, chroma: &Value) -> Option<&'static str> {
+    match (depth.as_i64(), chroma.as_i64()) {
+        (Some(8), Some(0)) => Some("8bit_420"),
+        (Some(8), Some(1)) => Some("8bit_444"),
+        (Some(10), Some(0)) => Some("10bit_420"),
+        (Some(10), Some(1)) => Some("10bit_444"),
+        _ => None,
+    }
 }
 
 fn codec_from_wire(value: &Value) -> Option<&'static str> {
@@ -1205,8 +1543,8 @@ fn negotiated_profile(monitor: &Value, features: &Value) -> Value {
         .map(|(width, height)| format!("{width}x{height}"));
     let codec = codec_from_wire(&features["codec"]);
     let bit_depth = value_i64(&features["bitDepth"]).and_then(|value| match value {
-        0 | 8 => Some(0),
-        1 | 10 => Some(1),
+        0 | 8 => Some(8),
+        1 | 10 => Some(10),
         _ => None,
     });
     let chroma = value_i64(&features["chromaFormat"]).and_then(|value| match value {
@@ -1214,18 +1552,16 @@ fn negotiated_profile(monitor: &Value, features: &Value) -> Value {
         1 => Some(1),
         _ => None,
     });
-    let color = match (bit_depth, chroma) {
-        (Some(0), Some(0)) => Some("8bit_420"),
-        (Some(0), Some(1)) => Some("8bit_444"),
-        (Some(1), Some(0)) => Some("10bit_420"),
-        (Some(1), Some(1)) => Some("10bit_444"),
-        _ => None,
-    };
+    let color = profile_color(&json!(bit_depth), &json!(chroma));
     json!({
         "resolution":resolution,
         "fps":value_i64(&monitor["framesPerSecond"]),
         "codec":codec,
         "colorQuality":color,
+        "bitDepth":bit_depth,
+        "chromaFormat":chroma,
+        "bitDepthSource":if features.get("bitDepth").is_some() { "request" } else { "unreported" },
+        "chromaFormatSource":if features.get("chromaFormat").is_some() { "request" } else { "unreported" },
         "enableL4S":features["enabledL4S"],
         "enableCloudGsync":features["cloudGsync"],
         "enableReflex":features["reflex"]
@@ -1691,9 +2027,50 @@ fn session_phase(status: i64) -> &'static str {
         3 => "streaming",
         4 | 5 => "paused",
         6 => "resuming",
+        7 => "finished",
         status if status > 3 => "failed",
         _ => "requesting",
     }
+}
+
+fn cancelled_allocation() -> ServiceError {
+    ServiceError {
+        code: "cancelled",
+        message: "Fresh allocation cancelled and cleaned up".to_owned(),
+    }
+}
+
+fn delete_session(client: &Client, url: Url, headers: HeaderMap) -> Result<(), ServiceError> {
+    let response = client
+        .delete(url)
+        .headers(headers)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .map_err(|error| network("Allocation cleanup failed", error))?;
+    validate_delete_response("Allocation cleanup failed", response)
+}
+
+fn validate_delete_response(context: &str, response: Response) -> Result<(), ServiceError> {
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::NO_CONTENT
+    ) {
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err(response_error(context, response));
+    }
+    let bytes = response.bytes().map_err(|error| network(context, error))?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let payload: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| upstream("Invalid session deletion response"))?;
+    if payload.get("requestStatus").is_some() {
+        validate_cloudmatch_response(context, status, Ok(payload), false)?;
+    }
+    Ok(())
 }
 
 fn session_token(auth: &AuthSession) -> &str {
@@ -1846,6 +2223,25 @@ fn random_uuid() -> String {
     )
 }
 
+fn read_cleanup_record(reader: impl Read) -> Option<Value> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_CLEANUP_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_CLEANUP_RECORD_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn allocation_in_progress() -> ServiceError {
+    ServiceError {
+        code: "session_update_busy",
+        message: "A fresh allocation is already in progress. Wait for it to finish before starting another game.".to_owned(),
+    }
+}
+
 fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError {
         code: "invalid_params",
@@ -1870,6 +2266,623 @@ fn network(context: &str, error: impl std::fmt::Display) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_server(
+        replies: Vec<(u16, Value)>,
+        on_request: impl Fn(usize) + Send + 'static,
+    ) -> (Url, thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, (status, body)) in replies.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                requests.push(line.trim().to_owned());
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                on_request(index);
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (base, worker)
+    }
+
+    #[test]
+    fn concurrent_create_is_rejected_before_network_and_cannot_replace_handoff_owner() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                ),
+                (200, json!({})),
+                (204, json!({})),
+            ],
+            move |index| {
+                if index == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            },
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let connection_calls = AtomicUsize::new(0);
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                service.create_at(
+                    &json!({"appId":"123"}),
+                    &json!({}),
+                    &conflict_auth(),
+                    "device",
+                    || {
+                        connection_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok((client.clone(), base.clone()))
+                    },
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(|| {
+                result_tx
+                    .send(service.create_at(
+                        &json!({"appId":"456"}),
+                        &json!({}),
+                        &conflict_auth(),
+                        "device",
+                        || {
+                            connection_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok((client.clone(), base.clone()))
+                        },
+                    ))
+                    .unwrap();
+            });
+            let second = result_rx.recv_timeout(Duration::from_secs(2));
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                second
+                    .expect("another create must not wait for the delayed POST")
+                    .unwrap_err()
+                    .code,
+                "session_update_busy"
+            );
+            assert_eq!(first.join().unwrap().unwrap()["session"]["sessionId"], "A");
+        });
+        assert_eq!(connection_calls.load(Ordering::SeqCst), 1);
+        let second = service.create_at(
+            &json!({"appId":"456"}),
+            &json!({}),
+            &conflict_auth(),
+            "device",
+            || panic!("an unaccepted allocation must keep its reservation"),
+        );
+        assert_eq!(second.unwrap_err().code, "session_update_busy");
+        service.finish_create("B", false).unwrap();
+        assert_eq!(
+            service.fresh.lock().unwrap().as_ref().unwrap().info["sessionId"],
+            "A"
+        );
+        {
+            let _cleanup = service.fresh.lock().unwrap();
+            assert_eq!(
+                service
+                    .create_at(
+                        &json!({"appId":"456"}),
+                        &json!({}),
+                        &conflict_auth(),
+                        "device",
+                        || { panic!("allocation admission must not wait for a cleanup lock") }
+                    )
+                    .unwrap_err()
+                    .code,
+                "session_update_busy"
+            );
+        }
+        service.finish_create("A", false).unwrap();
+        assert!(service.fresh.lock().unwrap().is_none());
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 3);
+        assert!(received[0].starts_with("POST /v2/session?"));
+        assert!(received[1].starts_with("PUT /v2/session/A?"));
+        assert_eq!(received[2], "DELETE /v2/session/A HTTP/1.1");
+    }
+
+    #[test]
+    fn pre_id_failures_release_allocation_admission_for_the_next_attempt() {
+        let (base, server) = session_server(
+            vec![
+                (503, json!({})),
+                (200, json!({"requestStatus":{"statusCode":4}})),
+                (200, json!({"requestStatus":{"statusCode":1},"session":{}})),
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::new();
+        let service = CloudMatchService::new(client.clone());
+        let requests = std::sync::Arc::new(crate::requests::Requests::default());
+        let permit = requests.admit("cancelled", "session.create").unwrap();
+        requests.cancel("cancelled");
+        let cancelled = crate::requests::scope(permit.token.clone(), || {
+            service.create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || panic!("cancelled admission cannot resolve an endpoint"),
+            )
+        });
+        assert_eq!(cancelled.unwrap_err().code, "cancelled");
+        assert!(service.allocation_admission.try_lock().is_ok());
+        let preparing = requests.admit("preparing", "session.create").unwrap();
+        let cancelled = crate::requests::scope(preparing.token.clone(), || {
+            service.create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || {
+                    requests.cancel("preparing");
+                    Ok((client.clone(), base.clone()))
+                },
+            )
+        });
+        assert_eq!(cancelled.unwrap_err().code, "cancelled");
+        assert!(service.allocation_admission.try_lock().is_ok());
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_base =
+            Url::parse(&format!("http://{}/", unavailable.local_addr().unwrap())).unwrap();
+        let timed_client = Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        assert_eq!(
+            service
+                .create_at(
+                    &json!({"appId":"123"}),
+                    &json!({}),
+                    &conflict_auth(),
+                    "device",
+                    || { Ok((timed_client, unavailable_base)) }
+                )
+                .unwrap_err()
+                .code,
+            "network_error"
+        );
+        assert!(service.allocation_admission.try_lock().is_ok());
+        assert!(service.fresh.lock().unwrap().is_none());
+        assert!(
+            service
+                .create_at(
+                    &json!({"appId":"123"}),
+                    &json!({}),
+                    &conflict_auth(),
+                    "device",
+                    || { Err(invalid("fixture connection preparation failure")) }
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .create_at(&json!({}), &json!({}), &conflict_auth(), "device", || {
+                    Ok((client.clone(), base.clone()))
+                })
+                .is_err()
+        );
+        for code in ["upstream_error", "session_error", "upstream_error"] {
+            assert_eq!(
+                service
+                    .create_at(
+                        &json!({"appId":"123"}),
+                        &json!({}),
+                        &conflict_auth(),
+                        "device",
+                        || { Ok((client.clone(), base.clone())) }
+                    )
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            assert!(service.allocation_admission.try_lock().is_ok());
+            assert!(service.fresh.lock().unwrap().is_none());
+        }
+        let result = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client.clone(), base.clone())),
+            )
+            .unwrap();
+        assert_eq!(result["session"]["sessionId"], "A");
+        service.finish_create("A", true).unwrap();
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 5);
+        assert!(
+            received[..4]
+                .iter()
+                .all(|request| request.starts_with("POST /v2/session?"))
+        );
+        assert!(received[4].starts_with("PUT /v2/session/A?"));
+    }
+
+    #[test]
+    fn cleanup_record_reader_bounds_consumption_before_parsing() {
+        struct EndlessReader(usize);
+        impl Read for EndlessReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buffer.len();
+                buffer.fill(b' ');
+                Ok(buffer.len())
+            }
+        }
+        let mut endless = EndlessReader(0);
+        assert!(read_cleanup_record(&mut endless).is_none());
+        assert_eq!(endless.0, MAX_CLEANUP_RECORD_BYTES + 1);
+        let mut boundary = vec![b' '; MAX_CLEANUP_RECORD_BYTES];
+        boundary[..2].copy_from_slice(b"{}");
+        assert_eq!(read_cleanup_record(boundary.as_slice()), Some(json!({})));
+        assert!(read_cleanup_record(b"not JSON".as_slice()).is_none());
+    }
+
+    #[test]
+    fn cancelled_fresh_post_and_compatibility_resume_are_compensated() {
+        for cancel_at in [0, 1] {
+            let requests = std::sync::Arc::new(crate::requests::Requests::default());
+            let permit = requests.admit("create", "session.create").unwrap();
+            let mut replies = vec![(
+                200,
+                json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"fresh-seat","status":1}}),
+            )];
+            if cancel_at == 1 {
+                replies.push((200, json!({})));
+            }
+            replies.push((204, json!({})));
+            let (base, server) = session_server(replies, move |index| {
+                if index == cancel_at {
+                    requests.cancel("create");
+                }
+            });
+            let client = Client::new();
+            let service = CloudMatchService::new(client.clone());
+            let result = crate::requests::scope(permit.token.clone(), || {
+                service.create_at(
+                    &json!({"appId":"123"}),
+                    &json!({}),
+                    &conflict_auth(),
+                    "device",
+                    || Ok((client, base)),
+                )
+            });
+            assert_eq!(result.unwrap_err().code, "cancelled");
+            let received = server.join().unwrap();
+            assert!(received[0].starts_with("POST /v2/session?"));
+            if cancel_at == 1 {
+                assert!(received[1].starts_with("PUT /v2/session/fresh-seat?"));
+            }
+            assert_eq!(
+                received.last().unwrap(),
+                "DELETE /v2/session/fresh-seat HTTP/1.1"
+            );
+            assert!(service.active()["session"].is_null());
+            assert!(service.fresh.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn unaccepted_allocation_retains_failed_cleanup_and_retries_exact_seat() {
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"fresh-seat","status":1}}),
+                ),
+                (200, json!({})),
+                (503, json!({})),
+                (404, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::new();
+        let service = CloudMatchService::new(client.clone());
+        let result = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client.clone(), base.clone())),
+            )
+            .unwrap();
+        assert_eq!(result["session"]["sessionId"], "fresh-seat");
+        assert_eq!(
+            service.finish_create("fresh-seat", false).unwrap_err().code,
+            "session_cleanup_pending"
+        );
+        assert!(service.active()["session"].is_null());
+        assert_eq!(
+            service.discovered.lock().unwrap()["fresh-seat"]["cleanupPending"],
+            true
+        );
+        assert_eq!(
+            service
+                .create_at(
+                    &json!({"appId":"456"}),
+                    &json!({}),
+                    &conflict_auth(),
+                    "device",
+                    || Ok((client, base))
+                )
+                .unwrap_err()
+                .code,
+            "session_cleanup_pending"
+        );
+        service.finish_create("other-seat", false).unwrap();
+        assert!(service.fresh.lock().unwrap().is_some());
+        service.finish_create("fresh-seat", false).unwrap();
+        assert!(service.fresh.lock().unwrap().is_none());
+        assert!(service.discovered.lock().unwrap().is_empty());
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 4);
+        assert_eq!(received[2], received[3]);
+    }
+
+    #[test]
+    fn accepted_allocation_is_not_deleted_and_unrelated_terminal_keeps_active_slot() {
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::new();
+        let service = CloudMatchService::new(client.clone());
+        service
+            .create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client.clone(), base.clone())),
+            )
+            .unwrap();
+        service.finish_create("A", true).unwrap();
+        assert!(service.fresh.lock().unwrap().is_none());
+        assert_eq!(server.join().unwrap().len(), 2);
+        service.clear_active("B");
+        assert_eq!(service.active()["session"]["sessionId"], "A");
+        let mut finished = session_info(
+            &json!({"session":{"sessionId":"B","status":7}}),
+            &base,
+            "",
+            "",
+            "device",
+        )
+        .unwrap();
+        assert_eq!(finished["phase"], "finished");
+        assert_eq!(
+            finished["termination"]["source"],
+            "cloudmatch-session-status"
+        );
+        service
+            .store_active(&mut finished, &base, "", "", client)
+            .unwrap();
+        assert_eq!(service.active()["session"]["sessionId"], "A");
+        service.clear_active("A");
+        assert!(service.active()["session"].is_null());
+    }
+
+    #[test]
+    fn stopping_discovered_b_keeps_active_a_and_other_discovered_sessions() {
+        let (base, server) = session_server(vec![(204, json!({}))], |_| {});
+        let client = Client::new();
+        let service = CloudMatchService::new(client.clone());
+        let mut active = json!({"sessionId":"A","status":3});
+        service
+            .store_active(&mut active, &base, "", "123", client.clone())
+            .unwrap();
+        service.store_discovered(&[json!({"sessionId":"B"}), json!({"sessionId":"C"})]);
+        let result = service
+            .stop_at(
+                "B",
+                &client,
+                base.join("v2/session/B").unwrap(),
+                HeaderMap::new(),
+            )
+            .unwrap();
+        assert_eq!(result["session"]["sessionId"], "A");
+        assert_eq!(service.active()["session"]["sessionId"], "A");
+        assert!(!service.discovered.lock().unwrap().contains_key("B"));
+        assert!(service.discovered.lock().unwrap().contains_key("C"));
+        assert_eq!(server.join().unwrap(), ["DELETE /v2/session/B HTTP/1.1"]);
+    }
+
+    #[test]
+    fn deletion_rejection_does_not_forget_the_active_seat() {
+        let (base, server) = session_server(
+            vec![(200, json!({"requestStatus":{"statusCode":4}}))],
+            |_| {},
+        );
+        let client = Client::new();
+        let service = CloudMatchService::new(client.clone());
+        let mut active = json!({"sessionId":"A","status":3});
+        service
+            .store_active(&mut active, &base, "", "123", client.clone())
+            .unwrap();
+        assert_eq!(
+            service
+                .stop_at(
+                    "A",
+                    &client,
+                    base.join("v2/session/A").unwrap(),
+                    HeaderMap::new()
+                )
+                .unwrap_err()
+                .code,
+            "session_error"
+        );
+        assert_eq!(service.active()["session"]["sessionId"], "A");
+        assert_eq!(server.join().unwrap(), ["DELETE /v2/session/A HTTP/1.1"]);
+    }
+
+    #[test]
+    fn pending_cleanup_survives_restart_and_is_scoped_to_original_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pending-session-cleanup.json");
+        let auth = conflict_auth();
+        let record = json!({"sessionId":"cancelled","appId":"123","status":1,"phase":"preparing",
+            "streamingBaseUrl":DEFAULT_STREAMING_BASE,"cleanupPending":true,
+            "owner":[auth.provider.idp_id,auth.user.user_id]});
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let service = CloudMatchService::with_cleanup_path(Client::new(), path.clone());
+        let pending = service.pending_cleanup(&auth).unwrap();
+        assert_eq!(pending["sessionId"], "cancelled");
+        assert!(pending.get("owner").is_none());
+        let mut other = auth.clone();
+        other.user.user_id = "other".to_owned();
+        assert!(service.pending_cleanup(&other).is_none());
+        assert_eq!(
+            service
+                .create(&json!({"appId":"123"}), &json!({}), &auth, "device")
+                .unwrap_err()
+                .code,
+            "session_cleanup_pending"
+        );
+        service.clear_cleanup("other-seat");
+        assert!(path.exists());
+        service.clear_cleanup("cancelled");
+        assert!(!path.exists());
+        assert!(service.pending_cleanup(&auth).is_none());
+    }
+
+    #[test]
+    fn targeted_not_found_is_distinct_from_authentication_and_invalid_payloads() {
+        for (status, body, code) in [
+            (404, json!({}), "session_not_found"),
+            (401, json!({}), "authentication_required"),
+            (403, json!({}), "authentication_required"),
+            (
+                200,
+                json!({"requestStatus":{"statusCode":32}}),
+                "session_error",
+            ),
+        ] {
+            let (base, server) = session_server(vec![(status, body)], |_| {});
+            let client = Client::new();
+            let service = CloudMatchService::new(client.clone());
+            assert_eq!(
+                service
+                    .get_session(&client, &base, "seat", &HeaderMap::new())
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            assert_eq!(server.join().unwrap(), ["GET /v2/session/seat HTTP/1.1"]);
+        }
+    }
+
+    #[test]
+    fn same_seat_partial_finalized_color_preserves_components_not_preferences() {
+        let base = trusted_cloudmatch_base(DEFAULT_STREAMING_BASE).unwrap();
+        let parse = |session| {
+            session_info(&json!({"session":session}), &base, "", "123", "device").unwrap()
+        };
+        for (color, depth, chroma) in [("8bit_420", 0, 0), ("10bit_420", 1, 0), ("10bit_444", 1, 1)]
+        {
+            let body = build_create_body(
+                "123",
+                &json!({}),
+                &json!({"codec":"h265", "colorQuality":color}),
+                "device",
+            );
+            assert_eq!(
+                body["sessionRequestData"]["requestedStreamingFeatures"]["bitDepth"],
+                depth
+            );
+            assert_eq!(
+                body["sessionRequestData"]["requestedStreamingFeatures"]["chromaFormat"],
+                chroma
+            );
+            let previous = parse(json!({"sessionId":"seat","status":2,"sdrHdrMode":1,
+                "finalizedStreamingFeatures":{"codec":2,"bitDepth":depth,"chromaFormat":chroma}}));
+            let mut partial = parse(json!({"sessionId":"seat","status":2}));
+            preserve_session_profile(&mut partial, &previous);
+            assert_eq!(partial["negotiatedStreamProfile"]["colorQuality"], color);
+            assert_eq!(partial["negotiatedStreamProfile"]["enableHdr"], true);
+            let mut sdr = partial.clone();
+            sdr["negotiatedStreamProfile"]["enableHdr"] = json!(false);
+            let prepared = crate::streamer::StreamerService::new().prepare_embedded(
+                &json!({"session":sdr,"runtimeCapabilities":{"protocolVersion":7,"videoBackends":[{
+                    "backend":"vaapi","platform":"linux","available":true,"codecs":[{
+                        "codec":"h265","available":true,"colorQualities":["8bit_420","10bit_420","10bit_444"]
+                    }]
+                }]}}), &json!({"codec":"h265","colorQuality":"8bit_420"}),
+            ).unwrap();
+            assert_eq!(prepared["context"]["settings"]["colorQuality"], color);
+            assert_eq!(
+                prepared["context"]["session"]["negotiatedStreamProfile"]["colorQuality"],
+                color
+            );
+            let mut downgrade = parse(json!({"sessionId":"seat","status":2,"sdrHdrMode":0,
+                "finalizedStreamingFeatures":{"bitDepth":0}}));
+            preserve_session_profile(&mut downgrade, &previous);
+            assert_eq!(downgrade["negotiatedStreamProfile"]["bitDepth"], 8);
+            assert_eq!(downgrade["negotiatedStreamProfile"]["chromaFormat"], chroma);
+            assert_eq!(downgrade["negotiatedStreamProfile"]["enableHdr"], false);
+            let mut chroma_only = parse(json!({"sessionId":"seat","status":2,
+                "finalizedStreamingFeatures":{"chromaFormat":0}}));
+            preserve_session_profile(&mut chroma_only, &previous);
+            assert_eq!(chroma_only["negotiatedStreamProfile"]["chromaFormat"], 0);
+            assert_eq!(
+                chroma_only["negotiatedStreamProfile"]["bitDepth"],
+                if depth == 1 { 10 } else { 8 }
+            );
+            let mut invalid = parse(json!({"sessionId":"seat","status":2,
+                "finalizedStreamingFeatures":{"bitDepth":99}}));
+            preserve_session_profile(&mut invalid, &previous);
+            assert!(invalid["negotiatedStreamProfile"]["colorQuality"].is_null());
+            let mut other = parse(json!({"sessionId":"other","status":2}));
+            preserve_session_profile(&mut other, &previous);
+            assert!(other["negotiatedStreamProfile"]["colorQuality"].is_null());
+        }
+    }
 
     fn conflict_auth() -> AuthSession {
         serde_json::from_value(json!({
@@ -2397,7 +3410,10 @@ mod tests {
                 "rtspsEndpoints":["rtsps://example.invalid:322"]});
             mark_resume_progress(&mut info);
             assert_eq!(info["resumePending"], false);
-            assert_eq!(info["phase"], "failed");
+            assert_eq!(
+                info["phase"],
+                if status == 7 { "finished" } else { "failed" }
+            );
         }
     }
 
@@ -2916,7 +3932,7 @@ mod tests {
             "codec":codec_from_wire(&body["sessionRequestData"]["requestedStreamingFeatures"]["codec"]),
             "codecSource":"request"
         }});
-        preserve_session_codec(&mut initial, &request);
+        preserve_session_profile(&mut initial, &request);
         assert_eq!(initial["negotiatedStreamProfile"]["codec"], "H265");
         let capabilities = json!({"protocolVersion":7,"nativeHdrSupported":true,"videoBackends":[{
             "backend":"videotoolbox","platform":"macos","available":true,"codecs":[{
@@ -2937,7 +3953,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(ready["negotiatedStreamProfile"]["codec"], Value::Null);
-            preserve_session_codec(&mut ready, &initial);
+            preserve_session_profile(&mut ready, &initial);
             assert_eq!(ready["negotiatedStreamProfile"]["codec"], "H265");
             assert_eq!(ready["negotiatedStreamProfile"]["codecSource"], "request");
             let prepared = crate::streamer::StreamerService::new()
@@ -2967,7 +3983,7 @@ mod tests {
             "device",
         )
         .unwrap();
-        preserve_session_codec(&mut different, &previous);
+        preserve_session_profile(&mut different, &previous);
         assert_eq!(different["negotiatedStreamProfile"]["codec"], Value::Null);
         for reported in [
             Value::Null,
@@ -2986,7 +4002,7 @@ mod tests {
             )
             .unwrap();
             let before = info.clone();
-            preserve_session_codec(&mut info, &previous);
+            preserve_session_profile(&mut info, &previous);
             assert_eq!(info, before);
             assert_eq!(info["negotiatedStreamProfile"]["codecSource"], "server");
         }
@@ -3001,7 +4017,7 @@ mod tests {
                 "device",
             )
             .unwrap();
-            preserve_session_codec(&mut info, &previous);
+            preserve_session_profile(&mut info, &previous);
             assert_eq!(info["negotiatedStreamProfile"]["codec"], Value::Null);
             assert_eq!(info["negotiatedStreamProfile"]["codecSource"], "server");
         }
@@ -3023,12 +4039,12 @@ mod tests {
             "device",
         )
         .unwrap();
-        preserve_session_codec(&mut regional, &request);
+        preserve_session_profile(&mut regional, &request);
         let mut direct = session_info(&json!({"session":{
             "sessionId":"same-seat","status":2,"finalizedStreamingFeatures":{"bitDepth":1,"chromaFormat":0}
         }}), &base, "auto", "123", "device").unwrap();
-        preserve_session_codec(&mut direct, &regional);
-        preserve_session_codec(&mut direct, &request);
+        preserve_session_profile(&mut direct, &regional);
+        preserve_session_profile(&mut direct, &request);
         assert_eq!(direct["negotiatedStreamProfile"]["codec"], "AV1");
         assert_eq!(direct["negotiatedStreamProfile"]["codecSource"], "server");
         assert_eq!(

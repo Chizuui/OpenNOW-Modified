@@ -11,7 +11,7 @@ ambiguous state.
 The first shell request is always:
 
 ```json
-{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":1,"shell":"qt","shellVersion":"0.5.4"}}
+{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":2,"shell":"qt","shellVersion":"0.5.4"}}
 ```
 
 The core must return the same protocol version and its capabilities. The shell
@@ -46,7 +46,48 @@ pending retries. Other errors are delivered to the caller without retrying.
 Cancelled requests suppress their response. Store page retries/cache traversal
 and region measurement loops stop at cooperative checkpoints. An already-running
 blocking HTTP, DNS, or TCP operation is not forcibly interrupted; its existing
-timeout still applies. Mutating operations already dispatched are not rolled back.
+timeout still applies. Other mutating operations already dispatched are not rolled back.
+
+Protocol 2 requires the Qt client to acknowledge an accepted successful `session.create`
+response with `{"type":"ack","id":"42"}` before delivering that response to QML.
+Cancelled or timed-out requests do not acknowledge late responses. The create worker
+retains its admission slot for at most ten seconds awaiting acceptance, then the
+CloudMatch owner deletes an unaccepted fresh allocation with an eight-second HTTP
+deadline. Cancellation before or during the compatibility RESUME uses the same cleanup.
+The receipt does not apply to claims of existing sessions. A create response is not
+also broadcast as `session.changed`, preventing a late event from reviving a cancelled
+launch. Cleanup failure retains the seat and its scoped discovery route for explicit
+retry, blocks another fresh allocation, and reports `session_cleanup_pending`.
+The failed-cleanup record persists only the seat identity, app/status, trusted control
+route, original provider/account identity, and error code in `pending-session-cleanup.json`;
+it contains no tokens or signaling secrets. Discovery surfaces it only to that account.
+Explicit successful DELETE or not-found clears that exact record, never a different seat.
+HTTP-success DELETE responses containing an explicit vendor rejection retain ownership.
+The CloudMatch owner reserves fresh-create admission before endpoint resolution or POST.
+Concurrent creation, pending handoff, and in-progress cleanup lock contention fail promptly with
+`session_update_busy`, not the automatically retried `busy` response. Admission is
+released on every pre-ID error; after allocation the exact seat remains reserved until
+handoff or compensation completes. Cleanup records are read through a 16-KiB limit plus
+one overflow-detection byte before parsing, including for corrupt or oversized files.
+
+Raw CloudMatch status 7 is `phase: "finished"`, with a `termination` object containing
+`source: "cloudmatch-session-status"`, `status: 7`, and `resumable: false`. This proves
+the seat is terminal, not whether the game exited successfully; no vendor reason is
+invented. A targeted GET returning HTTP 404 yields `session: null` and a top-level
+termination with `source: "cloudmatch-http"`, `httpStatus: 404`, `sessionId`, and
+`resumable: false`. Authentication, invalid payloads, other HTTP failures, empty lists,
+and native transport closure are not terminal evidence. Recovery first polls the exact
+seat before claiming it. `session.poll` with `recoveryMode: true` does not broadcast a
+session change while the recovery owner is deciding whether to claim.
+
+Negotiated profiles retain normalized `bitDepth` (8 or 10), CloudMatch `chromaFormat`
+(0 or 1), and per-component `*Source` fields. `request`, `finalized`, `server`, and
+`unreported` distinguish present values from omissions. Same-seat partial updates retain
+previously known components; explicit finalized invalid values are not replaced with
+saved preferences. Incomplete or unsupported accepted color is rejected before native
+attachment. The native ABI and protocol version are unchanged; transport terminal
+events add `termination: {source: "nvst-transport", code, resumable: null}`, preserving
+unknown cloud-session disposition rather than assigning a normal-exit reason to EOF.
 
 ## Implemented core methods
 

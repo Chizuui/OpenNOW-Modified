@@ -1,18 +1,38 @@
-//! Bounded RPC ownership and cooperative cancellation for read-only work.
+//! Bounded RPC ownership, cooperative cancellation, and allocation receipts.
 use crate::gfn::ServiceError;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 const MAX_ACTIVE: usize = 8;
 const MAX_BACKGROUND: usize = 4;
 
+#[derive(Default)]
+struct RequestState {
+    cancelled: AtomicBool,
+    accepted: Mutex<bool>,
+    wake: Condvar,
+}
+
 #[derive(Clone, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
+pub struct Cancellation(Arc<RequestState>);
 impl Cancellation {
     pub fn cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn await_acceptance(&self, timeout: Duration) -> bool {
+        let accepted = self.0.accepted.lock().expect("request receipt poisoned");
+        let (accepted, _) = self
+            .0
+            .wake
+            .wait_timeout_while(accepted, timeout, |accepted| {
+                !*accepted && !self.cancelled()
+            })
+            .expect("request receipt poisoned");
+        *accepted && !self.cancelled()
     }
     pub fn check(&self) -> Result<(), ServiceError> {
         if self.cancelled() {
@@ -50,7 +70,16 @@ impl Requests {
     }
     pub fn cancel(&self, id: &str) {
         if let Some((_, token)) = self.0.lock().expect("request state poisoned").get(id) {
-            token.0.store(true, Ordering::Release);
+            let _accepted = token.0.accepted.lock().expect("request receipt poisoned");
+            token.0.cancelled.store(true, Ordering::Release);
+            token.0.wake.notify_all();
+        }
+    }
+
+    pub fn acknowledge(&self, id: &str) {
+        if let Some((_, token)) = self.0.lock().expect("request state poisoned").get(id) {
+            *token.0.accepted.lock().expect("request receipt poisoned") = true;
+            token.0.wake.notify_all();
         }
     }
 }
@@ -94,6 +123,30 @@ pub fn scope<T>(token: Cancellation, work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn allocation_receipt_requires_acceptance_and_cancellation_wins() {
+        let requests = Arc::new(Requests::default());
+        let permit = requests.admit("create", "session.create").unwrap();
+        assert!(!permit.token.await_acceptance(Duration::ZERO));
+        requests.acknowledge("unknown");
+        assert!(!permit.token.await_acceptance(Duration::ZERO));
+        requests.acknowledge("create");
+        assert!(permit.token.await_acceptance(Duration::ZERO));
+        requests.cancel("create");
+        assert!(!permit.token.await_acceptance(Duration::ZERO));
+    }
+
+    #[test]
+    fn cancellation_wakes_pending_allocation_receipt() {
+        let requests = Arc::new(Requests::default());
+        let permit = requests.admit("create", "session.create").unwrap();
+        std::thread::scope(|scope| {
+            let token = permit.token.clone();
+            let worker = scope.spawn(move || token.await_acceptance(Duration::from_secs(10)));
+            requests.cancel("create");
+            assert!(!worker.join().unwrap());
+        });
+    }
     #[test]
     fn background_load_reserves_control_capacity_until_workers_really_exit() {
         let requests = Arc::new(Requests::default());

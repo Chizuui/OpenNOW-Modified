@@ -39,7 +39,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use streamer::StreamerService;
 
-const PROTOCOL_VERSION: i64 = 1;
+const PROTOCOL_VERSION: i64 = 2;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 
 struct AppCore {
@@ -129,6 +129,12 @@ fn run() -> Result<(), String> {
             }
             continue;
         }
+        if message["type"] == "ack" {
+            if let Some(id) = message["id"].as_str() {
+                requests.acknowledge(id);
+            }
+            continue;
+        }
         if message["type"] != "request" {
             return Err("unknown protocol message".to_owned());
         }
@@ -164,6 +170,30 @@ fn run() -> Result<(), String> {
                 format!("outcome={outcome} durationMs={}", started.elapsed().as_millis()),
             );
             let was_cancelled = permit.token.cancelled();
+            if method == "session.create"
+                && let Err((code, message)) = &result
+                && code == "session_cleanup_pending"
+            {
+                let _ = worker_output.send(json!({"type":"event","name":"session.cleanup.pending",
+                    "payload":{"code":code,"message":message}}));
+            }
+            if method == "session.create"
+                && let Ok((value, _)) = &result
+                && let Some(session_id) = value["session"]["sessionId"].as_str()
+            {
+                let delivered = !was_cancelled && worker_output.send(json!({"type":"response", "id":id, "ok":true, "result":value})).is_ok();
+                let accepted = delivered && permit.token.await_acceptance(std::time::Duration::from_secs(10));
+                let cleanup = worker_core.gfn.finish_session_create(session_id, accepted);
+                worker_core.diagnostics.record("session", "allocation-handoff", format!(
+                    "accepted={accepted} cleanup={}", cleanup.as_ref().map_or_else(|error| error.code, |()| "ok")
+                ));
+                if let Err(error) = cleanup {
+                    let _ = worker_output.send(json!({"type":"event","name":"session.cleanup.pending","payload":{
+                        "sessionId":session_id,"code":error.code,"message":"The cancelled cloud session could not be closed. End it before starting another game."
+                    }}));
+                }
+                return;
+            }
             if matches!(method.as_str(), "updater.check" | "updater.download" | "updater.install") {
                 if let Err((_, message)) = &result {
                     worker_core.updater.request_failed(message);
@@ -567,7 +597,12 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "session.poll" => core
             .gfn
             .poll_session(params)
-            .map(|value| (value.clone(), Some(("session.changed", value))))
+            .map(|value| {
+                (
+                    value.clone(),
+                    (params["recoveryMode"] != true).then_some(("session.changed", value)),
+                )
+            })
             .map_err(gfn_error),
         "session.stop" => core
             .gfn

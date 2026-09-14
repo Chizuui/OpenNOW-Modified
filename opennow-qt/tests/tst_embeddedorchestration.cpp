@@ -831,13 +831,16 @@ private slots:
                 restart: function() { this.running = true; this.restarts++; },
                 stop: function() { this.running = false; }};
             var streamPollTimer = {stop: function() {}, restart: function() {}};
-            var CoreClient = {request: function(type) {
+            var CoreClient = {cancel: function() {}, request: function(type) {
                 if (type === 'streamer.prepare') { prepares++; return 'prepare'; }
                 if (type === 'session.claim') { claims++; return 'claim'; }
-                if (type === 'session.remote.list') { discoveries++; return 'discovery'; }
+                if (type === 'session.poll') { discoveries++; return 'discovery'; }
                 throw new Error('Unexpected request: ' + type);
             }};
-            var AppController = {route: 'stream', overlay: ''};
+            var AppController = {route: 'stream', overlay: '', showOverlay: function(value) {this.overlay = value;},
+                navigateFromLastPrimary: function(value) {this.route = value;}};
+            function resetStreamReplay() {}
+            function stopNativeStreamer() {streamerStopExpected = true;}
             function qsTr(text) { return text; }
             function inspectStreamerOverlayRequest() {}
             function inspectStreamerScreenshotRequest() {}
@@ -857,6 +860,7 @@ private slots:
         for (const auto &name : {"acceptStreamerSnapshot", "recoverStreamingSession",
                                 "scheduleSessionRecovery", "discoverRecoverySession", "acceptRecoverySessions",
                                 "normalizedStreamingSession", "acceptStreamingSession",
+                                "isRemoteSessionTermination", "finishRemoteSession", "cancelSessionRecovery",
                                 "startNativeStreamer", "retryNativeStreamer", "acceptNativeEvent"}) {
             const QRegularExpression function(QStringLiteral(
                 "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
@@ -887,7 +891,7 @@ private slots:
                 if (discoveries !== attempt || !sessionRecoveryPending || prepares !== attempt - 1)
                     throw new Error('Recovery must discover the active session before preparing media');
                 recoveryDiscoveryRequestId = '';
-                acceptRecoverySessions({sessions: [activeSession]});
+                acceptRecoverySessions({session: activeSession});
                 if (claims !== attempt || !sessionClaimIsRecovery)
                     throw new Error('Recovery must claim the discovered seat');
                 // Model a successful claim followed by a ready poll. The polling
@@ -923,6 +927,35 @@ private slots:
             acceptNativeEvent({type: 'status', event: 'first-frame', status: 'streaming', backend: 'D3D11'});
             unchanged && streamerRestartAttempts === 0 && sessionReconnectAttempts === 0
                 && streamerRestartRecoveryCount === 2 && sessionRecoveryCount === 1;
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId: 'seat', status: 3};
+            sessionRecoveryPending = true; recoverySessionId = 'seat';
+            var oldClaims = claims;
+            acceptRecoverySessions({session: {sessionId:'seat', status:7, phase:'finished'}});
+            activeSession === null && claims === oldClaims && streamState === 'idle'
+                && !streamerRestartTimer.running && AppController.route === 'game-detail';
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3};
+            sessionRecoveryPending = true; recoverySessionId = 'seat';
+            acceptRecoverySessions({session:null, termination:{source:'cloudmatch-http', httpStatus:404,
+                sessionId:'seat', resumable:false}});
+            activeSession === null && claims === oldClaims && !streamerRestartTimer.running;
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3}; streamerStopExpected = false;
+            streamer = {status:'error', message:'transport lost'};
+            streamerRestartTimer.restart();
+            acceptStreamerSnapshot({status:'stopped', termination:{source:'cloudmatch-session-status', status:7,
+                sessionId:'seat', resumable:false}});
+            activeSession === null && !streamerRestartTimer.running && streamState === 'idle';
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3}; streamer = {status:'streaming'};
+            streamerStopExpected = false; sessionRecoveryPending = false;
+            acceptStreamerSnapshot({status:'error', message:'EOF', termination:{source:'nvst-transport', resumable:null}});
+            activeSession !== null && streamerRestartTimer.running;
         )JS")));
     }
 

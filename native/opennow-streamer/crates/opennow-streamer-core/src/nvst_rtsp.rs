@@ -1663,6 +1663,21 @@ mod tests {
     }
 
     #[test]
+    fn accepted_hevc_color_preserves_nvst_depth_and_chroma_enum_space() {
+        for (color, format) in [
+            ("8bit_420", (8, 1)),
+            ("10bit_420", (10, 1)),
+            ("10bit_444", (10, 3)),
+        ] {
+            let mut value = context();
+            value.settings["colorQuality"] = json!("8bit_420");
+            value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
+            value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!(color);
+            assert_eq!(negotiated_color_format(&value, "H265"), format);
+        }
+    }
+
+    #[test]
     fn h265_announce_supports_ten_bit_444() {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");

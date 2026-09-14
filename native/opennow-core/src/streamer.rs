@@ -514,6 +514,21 @@ impl StreamerService {
                 "CloudMatch session is not ready for NVST media attachment",
             ));
         }
+        let profile = &session["negotiatedStreamProfile"];
+        if profile["enableHdrSource"] == "server" && profile["enableHdr"].as_bool().is_none() {
+            return Err(invalid("CloudMatch returned an unsupported HDR mode"));
+        }
+        if ["bitDepthSource", "chromaFormatSource"].iter().any(|key| {
+            matches!(
+                profile[*key].as_str(),
+                Some("request" | "finalized" | "server")
+            )
+        }) && profile["colorQuality"].as_str().is_none()
+        {
+            return Err(invalid(
+                "CloudMatch returned an incomplete or unsupported color profile",
+            ));
+        }
         let mut context = streamer_context(session, settings);
         if context["settings"]["enableHdr"].as_bool() == Some(true)
             && !matches!(
@@ -1994,6 +2009,23 @@ mod tests {
         }
         let av1 = json!({"codec":"av1","colorQuality":"10bit_444","enableHdr":true});
         assert!(StreamerService::embedded_session_settings(&av1, &capabilities).is_err());
+    }
+
+    #[test]
+    fn invalid_accepted_color_never_falls_back_to_local_preferences() {
+        let service = StreamerService::new();
+        for source in ["request", "finalized", "server"] {
+            let params = json!({"session":{"sessionId":"seat","status":2,
+                "negotiatedStreamProfile":{"codec":"H265", "colorQuality":null,
+                    "bitDepthSource":source, "chromaFormat":1}}});
+            let error = service
+                .prepare_embedded(
+                    &params,
+                    &json!({"codec":"h265", "colorQuality":"10bit_444"}),
+                )
+                .unwrap_err();
+            assert!(error.message.contains("color profile"));
+        }
     }
 
     #[test]

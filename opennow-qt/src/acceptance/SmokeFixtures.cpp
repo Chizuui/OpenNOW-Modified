@@ -34,7 +34,8 @@ int AcceptanceSession::prepareWindow()
         if (resumeIndex >= 0) {
             if (resumeIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
             const auto mode = m_arguments.at(resumeIndex + 1);
-            if (mode != u"conflict"_s && mode != u"unavailable"_s && mode != u"resuming"_s)
+            if (mode != u"conflict"_s && mode != u"unavailable"_s && mode != u"resuming"_s
+                    && mode != u"finished"_s && mode != u"not-found"_s)
                 return EXIT_FAILURE;
             auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
             if (!store) return EXIT_FAILURE;
@@ -58,6 +59,20 @@ int AcceptanceSession::prepareWindow()
                 store->setProperty("launchConflictDetected", true);
                 const QVariant sessions = QVariantMap{{u"sessions"_s, QVariantList{}}};
                 if (!QMetaObject::invokeMethod(store, "inspectRemoteSessions", Q_ARG(QVariant, sessions)))
+                    return EXIT_FAILURE;
+            } else if (mode == u"finished"_s || mode == u"not-found"_s) {
+                store->setProperty("activeSession", QVariantMap{{u"sessionId"_s, u"terminal-fixture"_s},
+                    {u"status"_s, 3}, {u"appId"_s, u"123"_s}});
+                store->setProperty("streamer", QVariantMap{{u"status"_s, u"error"_s}});
+                store->setProperty("sessionRecoveryPending", true);
+                store->setProperty("recoverySessionId", u"terminal-fixture"_s);
+                store->setProperty("streamerRecoveryExhausted", true);
+                m_controller.navigate(u"stream"_s);
+                const QVariant result = mode == u"finished"_s
+                    ? QVariantMap{{u"session"_s, QVariantMap{{u"sessionId"_s, u"terminal-fixture"_s}, {u"status"_s, 7}}}}
+                    : QVariantMap{{u"termination"_s, QVariantMap{{u"source"_s, u"cloudmatch-http"_s},
+                        {u"httpStatus"_s, 404}, {u"sessionId"_s, u"terminal-fixture"_s}, {u"resumable"_s, false}}}};
+                if (!QMetaObject::invokeMethod(store, "acceptRecoverySessions", Q_ARG(QVariant, result)))
                     return EXIT_FAILURE;
             } else {
                 store->setProperty("streamState", u"resuming"_s);

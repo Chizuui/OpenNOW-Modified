@@ -31,6 +31,30 @@ class CoreClientTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void acknowledgesOnlyAcceptedCreateResponses()
+    {
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        responses.clear();
+        const auto accepted = client.request(QStringLiteral("session.create"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == accepted;
+        }), 2'000);
+        const auto cancelled = client.request(QStringLiteral("session.create"), {{QStringLiteral("delayReceipt"), true}});
+        QVERIFY(client.cancel(cancelled));
+        const auto query = client.request(QStringLiteral("test.create-receipts"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == query;
+        }), 2'000);
+        for (const auto &response : responses) {
+            QVERIFY(response.at(0).toString() != cancelled);
+            if (response.at(0).toString() == query)
+                QCOMPARE(response.at(1).toJsonObject().value(QStringLiteral("receipts")).toInt(), 1);
+        }
+    }
+
 #ifdef Q_OS_LINUX
     void passesFlatpakPicturesDirectoryToCore_data()
     {
@@ -260,7 +284,7 @@ private slots:
     {
         CoreClient client;
         QCOMPARE(client.state(), QStringLiteral("stopped"));
-        QCOMPARE(client.protocolVersion(), 1);
+        QCOMPARE(client.protocolVersion(), 2);
         QVERIFY(client.lastError().isEmpty());
     }
 

@@ -449,8 +449,14 @@ void CoreClient::processLine(const QByteArray &line)
             pending->retryDelayMs = qMin(pending->retryDelayMs * 2, 1'000);
             return;
         }
+        const auto method = pending->message.value(u"method"_s).toString();
         m_pending.erase(pending);
         if (message.value(u"ok"_s).toBool(false)) {
+            if (method == u"session.create"_s
+                    && !writeMessage(QJsonObject{{u"type"_s, u"ack"_s}, {u"id"_s, id}})) {
+                emit requestFailed(id, u"core_write_failed"_s, u"Could not accept the allocated session"_s);
+                return;
+            }
             const auto result = message.value(u"result"_s).toObject();
             if (id == m_handshakeRequestId) {
                 const auto version = result.value(u"protocolVersion"_s).toInt(-1);

@@ -1453,6 +1453,11 @@ QtObject {
     }
 
     function acceptStreamingSession(session) {
+        if (session && Number(session.status) === 7) {
+            finishRemoteSession(session.termination || {source: "cloudmatch-session-status", status: 7, sessionId: session.sessionId,
+                                resumable: false})
+            return
+        }
         const previousSession = activeSession
         activeSession = normalizedStreamingSession(session)
         if (!activeSession || !previousSession || previousSession.sessionId !== activeSession.sessionId) {
@@ -1592,6 +1597,10 @@ QtObject {
     }
 
     function acceptStreamerSnapshot(snapshot) {
+        if (snapshot && isRemoteSessionTermination(snapshot.termination)) {
+            finishRemoteSession(snapshot.termination)
+            return
+        }
         // One failure produces both error and stopped, plus late input replies.
         // Count it once and preserve the original, actionable error message.
         const wasTerminal = streamer && (streamer.status === "error" || streamer.status === "stopped")
@@ -1708,9 +1717,10 @@ QtObject {
     function discoverRecoverySession() {
         if (!sessionRecoveryPending || !activeSession
                 || String(activeSession.sessionId) !== recoverySessionId) return
-        recoveryDiscoveryRequestId = CoreClient.request("session.remote.list", {
+        recoveryDiscoveryRequestId = CoreClient.request("session.poll", {
             sessionId: recoverySessionId,
-            streamingBaseUrl: activeSession.streamingBaseUrl
+            streamingBaseUrl: activeSession.streamingBaseUrl,
+            recoveryMode: true
         }, 30000)
         if (recoveryDiscoveryRequestId === "") scheduleSessionRecovery(qsTr("Waiting for the connection…"))
     }
@@ -1718,8 +1728,16 @@ QtObject {
     function acceptRecoverySessions(result) {
         if (!sessionRecoveryPending || !activeSession
                 || String(activeSession.sessionId) !== recoverySessionId) return
-        const existing = (result.sessions || []).find(session => String(session.sessionId) === recoverySessionId)
-        if (!existing) {
+        if (isRemoteSessionTermination(result.termination)) {
+            finishRemoteSession(result.termination)
+            return
+        }
+        const existing = result.session
+        if (existing && String(existing.sessionId) === recoverySessionId && Number(existing.status) === 7) {
+            acceptStreamingSession(existing)
+            return
+        }
+        if (!existing || String(existing.sessionId) !== recoverySessionId) {
             scheduleSessionRecovery(qsTr("The previous session is not available yet. Retrying…"))
             return
         }
@@ -1745,6 +1763,29 @@ QtObject {
         resumePollDeadlineMs = 0
         for (const id of requestIds)
             if (id !== "") CoreClient.cancel(id)
+    }
+
+    function isRemoteSessionTermination(termination) {
+        return termination && termination.resumable === false
+            && ((termination.source === "cloudmatch-session-status" && Number(termination.status) === 7)
+                || (termination.source === "cloudmatch-http" && Number(termination.httpStatus) === 404))
+    }
+
+    function finishRemoteSession(termination) {
+        if (!isRemoteSessionTermination(termination))
+            return
+        if (termination.sessionId && activeSession
+                && String(termination.sessionId) !== String(activeSession.sessionId))
+            return
+        for (const id of [streamerPrepareRequestId, streamPollRequestId])
+            if (id !== "") CoreClient.cancel(id)
+        streamerPrepareRequestId = ""
+        streamPollRequestId = ""
+        acceptStreamingSession(null)
+        if (AppController.route === "stream" || AppController.route === "inserting") {
+            AppController.showOverlay("")
+            AppController.navigateFromLastPrimary("game-detail")
+        }
     }
 
     function artworkUrl(sourceUrl) {
@@ -2460,10 +2501,12 @@ QtObject {
         if (type === "status") {
             fields.status = event.status === "ready" ? "streaming" : String(event.status || "streaming")
             fields.message = String(event.message || streamMessage)
+            fields.termination = event.termination || null
         } else if (type === "error") {
             fields.status = "error"
             fields.message = String(event.message || qsTr("Native media runtime failed"))
             fields.errorCode = String(event.code || "native_stream_error")
+            fields.termination = event.termination || null
         } else if (type === "input-ready") {
             fields.inputReady = true
             fields.inputUnavailableReason = null
@@ -2871,12 +2914,17 @@ QtObject {
                 root.acceptStreamingSession(result.session || null)
             } else if (requestId === root.streamPollRequestId) {
                 root.streamPollRequestId = ""
-                root.acceptStreamingSession(result.session || null)
+                if (root.isRemoteSessionTermination(result.termination))
+                    root.finishRemoteSession(result.termination)
+                else
+                    root.acceptStreamingSession(result.session || null)
             } else if (requestId === root.streamStopRequestId) {
                 root.streamStopRequestId = ""
                 const wasForceNewAfterStop = root.forceNewAfterStop
                 root.remoteSessions = []
-                root.acceptStreamingSession(null)
+                root.acceptStreamingSession(result.session || null)
+                if (root.activeSession && String(root.activeSession.sessionId) !== String(result.sessionId))
+                    return
                 if (root.forceNewAfterStop) {
                     root.forceNewAfterStop = false
                     root.conflictSession = null
@@ -3076,7 +3124,10 @@ QtObject {
                 root.sessionClaimRequestId = ""
                 root.sessionClaimIsRecovery = false
                 if (recovering) {
-                    root.scheduleSessionRecovery(message)
+                    if (code === "session_not_found")
+                        root.finishRemoteSession({source: "cloudmatch-http", httpStatus: 404, resumable: false})
+                    else
+                        root.scheduleSessionRecovery(message)
                 } else {
                     root.conflictSessionNeedsRefresh = true
                     root.streamState = "conflict"
@@ -3126,9 +3177,16 @@ QtObject {
                     root.refreshRemoteSessions()
                 else
                     root.remoteSessions = []
-            } else if (name === "session.changed")
-                root.acceptStreamingSession(payload.session || null)
-            else if (name === "streamer.changed")
+            } else if (name === "session.cleanup.pending") {
+                root.lastError = String(payload.message || "")
+                root.streamMessage = root.lastError
+                root.refreshRemoteSessions()
+            } else if (name === "session.changed") {
+                if (root.isRemoteSessionTermination(payload.termination))
+                    root.finishRemoteSession(payload.termination)
+                else
+                    root.acceptStreamingSession(payload.session || null)
+            } else if (name === "streamer.changed")
                 root.acceptStreamerSnapshot(payload.streamer || payload || null)
             else if (name === "artwork.ready")
                 root.acceptArtworkResult(payload)

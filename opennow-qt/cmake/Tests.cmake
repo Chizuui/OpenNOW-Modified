@@ -883,7 +883,7 @@ if(BUILD_TESTING)
         )
     endforeach()
     foreach(surface desktop console)
-        foreach(resume_state conflict unavailable resuming)
+        foreach(resume_state conflict unavailable resuming finished not-found)
             add_test(NAME "qml-session-resume-${surface}-${resume_state}"
                 COMMAND opennow-qt --smoke-test --allow-multiple-instances
                     --${surface} --route inserting --reduced-motion

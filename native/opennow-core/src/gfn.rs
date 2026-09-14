@@ -401,7 +401,10 @@ impl GfnService {
             Err(error) => eprintln!("auth: Electron account migration was deferred: {error}"),
         }
         Self {
-            cloudmatch: CloudMatchService::new(client.clone()),
+            cloudmatch: CloudMatchService::with_cleanup_path(
+                client.clone(),
+                data_dir.join("pending-session-cleanup.json"),
+            ),
             account_connections: AccountConnectionsService::new(client.clone()),
             persistent_storage: PersistentStorageService::new(client.clone()),
             client,
@@ -1588,6 +1591,14 @@ impl GfnService {
     pub fn poll_session(&self, params: &Value) -> Result<Value, ServiceError> {
         let session = self.authenticated_session("Sign in to continue the streaming session")?;
         self.cloudmatch.poll(params, &session, &self.device_id)
+    }
+
+    pub fn finish_session_create(
+        &self,
+        session_id: &str,
+        accepted: bool,
+    ) -> Result<(), ServiceError> {
+        self.cloudmatch.finish_create(session_id, accepted)
     }
 
     pub fn stop_session(&self, params: &Value) -> Result<Value, ServiceError> {

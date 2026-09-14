@@ -34,9 +34,13 @@ int AcceptanceSession::startSmokeWorkload()
                 : qobject_cast<QQuickWindow *>(m_engine.rootObjects().first());
             auto *host = window ? window->findChild<QQuickItem *>(u"fallbackOverlayHost"_s) : nullptr;
             auto *dialog = window ? window->findChild<QQuickItem *>(u"sessionConflictDialog"_s) : nullptr;
-            const auto expectedState = mode == u"unavailable"_s ? u"error"_s : mode;
+            const bool terminal = mode == u"finished"_s || mode == u"not-found"_s;
+            const auto expectedState = terminal ? u"idle"_s : mode == u"unavailable"_s ? u"error"_s : mode;
             if (!store || store->property("streamState").toString() != expectedState
-                    || m_controller.route() != u"inserting"_s
+                    || m_controller.route() != (terminal ? u"game-detail"_s : u"inserting"_s)
+                    || (terminal && (!store->property("activeSession").isNull()
+                        || store->property("sessionRecoveryPending").toBool()
+                        || !store->property("sessionClaimRequestId").toString().isEmpty()))
                     || (mode == u"conflict"_s && m_controller.overlay() != u"session-conflict"_s)) {
                 qCritical("Session resume fixture did not reach its expected screen");
                 m_application.exit(EXIT_FAILURE);

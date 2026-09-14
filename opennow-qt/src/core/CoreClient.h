@@ -18,7 +18,7 @@ class CoreClient final : public QObject
     Q_PROPERTY(int protocolVersion READ protocolVersion CONSTANT)
 
 public:
-    static constexpr int CurrentProtocolVersion = 1;
+    static constexpr int CurrentProtocolVersion = 2;
     static constexpr qsizetype MaximumLineBytes = 1024 * 1024;
     static constexpr qsizetype MaximumQueuedEvents = 512;
     static QString graphicsPreference(const QString &program);
