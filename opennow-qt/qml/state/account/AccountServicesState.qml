@@ -38,6 +38,29 @@ QtObject {
     property string storageLocationsRequestId: ""
     property string storageResetRequestId: ""
 
+    function invalidateAccount() {
+        accountLinkPollTimer.stop()
+        for (const key of ["subscriptionRequestId", "regionsRequestId", "regionPingRequestId",
+                "gameAccountsRequestId", "gameAccountActionRequestId", "accountLinkStartRequestId",
+                "accountLinkPollRequestId", "storageLocationsRequestId", "storageResetRequestId"]) {
+            const requestId = root[key]
+            root[key] = ""
+            if (requestId !== "") coreClient.cancel(requestId)
+        }
+        subscription = null
+        regions = []
+        regionsVpcId = ""
+        regionPingPending = false
+        regionPingResults = ({})
+        regionPingMessage = ""
+        gameAccounts = []
+        gameAccountsState = "idle"
+        gameAccountMessage = ""
+        accountLinkAttempt = null
+        storageLocations = []
+        storageMessage = ""
+    }
+
     function refreshRegions() {
         if (!ready || !signedIn || regionsRequestId !== "")
             return

@@ -18,6 +18,17 @@ QtObject {
     signal accessibilityAnnounced(string message)
     signal errorReported(string message)
     property var settings: ({})
+    property string providerIdpId: ""
+    property string providerCode: ""
+    readonly property string selectedRegion: {
+        const saved = settings.providerRegions || {}
+        if (saved[providerIdpId] !== undefined)
+            return String(saved[providerIdpId])
+        if (settings.regionProviderIdpId === providerIdpId
+                || (!settings.regionProviderIdpId && providerCode === "NVIDIA"))
+            return String(settings.region || "")
+        return ""
+    }
     property string previewThemePack: ""
     property string settingsRequestId: ""
     property string consoleSurfaceRequestId: ""
@@ -283,7 +294,7 @@ QtObject {
             errorReported(qsTr("The OpenNOW core is not ready"))
             return ""
         }
-        const requestId = coreClient.request("settings.set", { key: key, value: value })
+        const requestId = coreClient.request("settings.set", { key: key, value: value, providerIdpId: providerIdpId })
         if (key === "identifyAsSteamDeck") {
             // MES serves a different resolution catalog per device identity
             // (Steam Deck unlocks 90 FPS tuples), so re-read entitlements.

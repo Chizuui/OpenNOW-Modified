@@ -20,6 +20,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+mod routing_tests;
+
 const DEFAULT_IDP_ID: &str = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 const DEFAULT_STREAMING_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
 const STEAM_DECK_CLIENT_ID: &str = "q61ddeJrVt7O90Nl-P-N7I36yctih4Ml6FyXLrb6j-U";
@@ -217,6 +220,10 @@ pub struct Endpoints {
     pub userinfo: String,
     pub revoke: String,
     pub public_catalog: String,
+    pub graphql: String,
+    pub subscription: String,
+    #[cfg(test)]
+    server_info: Option<String>,
 }
 
 impl Default for Endpoints {
@@ -231,6 +238,10 @@ impl Default for Endpoints {
             public_catalog:
                 "https://static.nvidiagrid.net/supported-public-game-list/locales/gfnpc-en-US.json"
                     .to_owned(),
+            graphql: GRAPHQL_URL.into(),
+            subscription: MES_URL.into(),
+            #[cfg(test)]
+            server_info: None,
         }
     }
 }
@@ -365,6 +376,10 @@ struct DeviceAttempt {
 #[derive(Default)]
 struct ServiceState {
     providers: Vec<LoginProvider>,
+    providers_expires: Option<Instant>,
+    providers_retry: Option<Instant>,
+    providers_error: Option<String>,
+    providers_default: Option<String>,
     attempts: HashMap<String, DeviceAttempt>,
     session: Option<AuthSession>,
     public_games: Vec<Value>,
@@ -406,7 +421,11 @@ impl ServiceError {
             .filter(|_| matches!(status.as_u16(), 400 | 401))
             .filter(|error| matches!(*error, "invalid_grant" | "invalid_token" | "token_revoked"));
         Self {
-            code: "upstream_error",
+            code: if status.as_u16() == 401 {
+                "http_unauthorized"
+            } else {
+                "upstream_error"
+            },
             message: match detail {
                 Some(detail) => format!("{context} ({status}): {detail}"),
                 None => format!("{context} ({status})"),
@@ -422,6 +441,12 @@ impl ServiceError {
     }
 }
 
+#[derive(Default)]
+struct SessionRouting {
+    active_owner: Option<(AuthSession, u64)>,
+    discovery_owner: Option<(String, String, u64)>,
+}
+
 pub struct GfnService {
     client: Client,
     endpoints: Endpoints,
@@ -435,12 +460,15 @@ pub struct GfnService {
     store_cache: crate::store_cache::StoreCache,
     server_vpc_cache: crate::server_vpc_cache::ServerVpcCache,
     auth_operation: Mutex<()>,
+    discovery_operation: Mutex<()>,
+    session_routing: Mutex<SessionRouting>,
     state: Mutex<ServiceState>,
 }
 
 impl GfnService {
     pub fn new(data_dir: PathBuf) -> Result<Self, String> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
             .pool_idle_timeout(Duration::from_secs(60))
@@ -481,41 +509,135 @@ impl GfnService {
             store_cache: crate::store_cache::StoreCache::new(data_dir),
             server_vpc_cache: crate::server_vpc_cache::ServerVpcCache::default(),
             auth_operation: Mutex::new(()),
+            discovery_operation: Mutex::new(()),
+            session_routing: Mutex::new(SessionRouting::default()),
             state: Mutex::new(ServiceState::default()),
         }
     }
 
     pub fn providers(&self) -> Result<Value, ServiceError> {
-        let cached = self
-            .state
-            .lock()
-            .expect("GFN state poisoned")
-            .providers
-            .clone();
-        if !cached.is_empty() {
-            return Ok(json!({"providers": cached}));
+        let _discovery = crate::store_requests::lock(&self.discovery_operation)?;
+        {
+            let state = self.state.lock().expect("GFN state poisoned");
+            if state
+                .providers_expires
+                .is_some_and(|time| time > Instant::now())
+                || state
+                    .providers_retry
+                    .is_some_and(|time| time > Instant::now())
+            {
+                return Ok(provider_result(&state));
+            }
         }
-
-        let providers = match self
+        let mut retry_delay = Duration::from_secs(30);
+        let result = self
             .client
             .get(&self.endpoints.service_urls)
+            .timeout(Duration::from_secs(5))
             .header(ACCEPT, "application/json")
             .header(USER_AGENT, GFN_USER_AGENT)
             .send()
-        {
-            Ok(response) if response.status().is_success() => {
-                let payload = response.json::<Value>().unwrap_or(Value::Null);
-                parse_providers(&payload)
+            .map_err(|error| ServiceError::network("Provider discovery failed", error))
+            .and_then(|response| {
+                if !response.status().is_success() {
+                    if response.status().as_u16() == 429 {
+                        retry_delay =
+                            response
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| {
+                                    value.parse::<u64>().ok().map(Duration::from_secs).or_else(
+                                        || {
+                                            httpdate::parse_http_date(value).ok().and_then(|time| {
+                                                time.duration_since(SystemTime::now()).ok()
+                                            })
+                                        },
+                                    )
+                                })
+                                .unwrap_or(retry_delay)
+                                .clamp(Duration::from_secs(30), Duration::from_secs(3600));
+                    }
+                    return Err(ServiceError::response(
+                        "Provider discovery failed",
+                        response,
+                    ));
+                }
+                let payload = response
+                    .json::<Value>()
+                    .map_err(|error| ServiceError::network("Invalid provider discovery", error))?;
+                let providers = parse_providers(&payload)
+                    .into_iter()
+                    .filter(|provider| {
+                        trusted_streaming_base(&provider.streaming_service_url).is_ok()
+                    })
+                    .collect::<Vec<_>>();
+                if providers.is_empty() {
+                    return Err(ServiceError::invalid(
+                        "Provider discovery returned no usable providers",
+                    ));
+                }
+                let default = payload["gfnServiceInfo"]["defaultProvider"]
+                    .as_str()
+                    .and_then(|default| {
+                        payload["gfnServiceInfo"]["gfnServiceEndpoints"]
+                            .as_array()?
+                            .iter()
+                            .find(|entry| {
+                                entry["loginProvider"] == default
+                                    || entry["loginProviderCode"] == default
+                            })
+                            .and_then(|entry| entry["idpId"].as_str())
+                            .filter(|id| providers.iter().any(|provider| provider.idp_id == *id))
+                            .map(ToOwned::to_owned)
+                    });
+                Ok((providers, default))
+            });
+        crate::requests::check()?;
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = self
+            .auth_operation
+            .lock()
+            .expect("GFN auth operation poisoned");
+        let mut state = self.state.lock().expect("GFN state poisoned");
+        match result {
+            Ok((providers, default)) => {
+                if let Some(session) = &mut state.session {
+                    match providers
+                        .iter()
+                        .find(|provider| provider.idp_id == session.provider.idp_id)
+                    {
+                        Some(provider)
+                            if session.provider.streaming_service_url
+                                != provider.streaming_service_url =>
+                        {
+                            session.provider = provider.clone();
+                            state.generation += 1;
+                        }
+                        None => state.generation += 1,
+                        _ => {}
+                    }
+                }
+                state.providers = providers;
+                state.providers_default = default;
+                state.providers_expires = Some(Instant::now() + Duration::from_secs(15 * 60));
+                state.providers_retry = None;
+                state.providers_error = None;
+                if let Some((owner, generation)) = &mut routing.active_owner
+                    && state.session.as_ref().is_some_and(|current| {
+                        current.user.user_id == owner.user.user_id
+                            && current.provider.idp_id == owner.provider.idp_id
+                    })
+                {
+                    *generation = state.generation;
+                }
             }
-            _ => Vec::new(),
-        };
-        let providers = if providers.is_empty() {
-            vec![LoginProvider::default_nvidia()]
-        } else {
-            providers
-        };
-        self.state.lock().expect("GFN state poisoned").providers = providers.clone();
-        Ok(json!({"providers": providers}))
+            Err(error) => {
+                state.providers_retry = Some(Instant::now() + retry_delay);
+                state.providers_error = Some(error.message);
+            }
+        }
+        Ok(provider_result(&state))
     }
 
     pub fn start_device_login(&self, params: &Value) -> Result<Value, ServiceError> {
@@ -533,21 +655,24 @@ impl GfnService {
             state.login_generation
         };
         eprintln!("auth: starting device authorization");
-        let providers = self.providers()?["providers"]
+        let discovery = self.providers()?;
+        let providers = discovery["providers"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let provider_id = params["providerIdpId"].as_str();
+        let provider_id = params["providerIdpId"]
+            .as_str()
+            .or_else(|| discovery["defaultProviderIdpId"].as_str());
         let provider = providers
             .iter()
             .filter_map(|value| serde_json::from_value::<LoginProvider>(value.clone()).ok())
             .find(|item| provider_id.is_some_and(|wanted| item.idp_id == wanted))
-            .or_else(|| {
+            .or_else(|| provider_id.is_none().then(|| {
                 providers
                     .first()
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
-            })
-            .unwrap_or_else(LoginProvider::default_nvidia)
+            }).flatten())
+            .ok_or_else(|| ServiceError { code: "provider_unavailable", message: "The selected provider is unavailable. Refresh the provider list and select it again.".into() })?
             .normalize();
 
         let form = [
@@ -1166,11 +1291,37 @@ impl GfnService {
         let provider_entries = state.providers.len();
         state.public_games.clear();
         state.providers.clear();
+        state.providers_expires = None;
+        state.providers_retry = None;
+        state.providers_error = None;
+        state.generation += 1;
         json!({"ok":true,"catalogEntries":catalog_entries,"providerEntries":provider_entries})
     }
 
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    pub fn with_region_provider<T>(
+        &self,
+        provider: &str,
+        write: impl FnOnce() -> Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        if !self
+            .state
+            .lock()
+            .expect("GFN state poisoned")
+            .session
+            .as_ref()
+            .is_some_and(|session| session.provider.idp_id == provider)
+        {
+            return Err(ServiceError {
+                code: "stale_account",
+                message: "The provider changed before saving the region".into(),
+            });
+        }
+        write()
     }
 
     pub fn saved_accounts(&self) -> Result<Value, ServiceError> {
@@ -1422,14 +1573,14 @@ impl GfnService {
     }
 
     pub fn library_catalog(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
+        self.authenticated_read(|session, generation| {
         let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-        let session = self.authenticated_session("Sign in to load your GeForce NOW library")?;
         let token = session
             .tokens
             .id_token
             .as_deref()
             .unwrap_or(&session.tokens.access_token);
-        let vpc_id = self.vpc_id(&session, token, None)?;
+        let vpc_id = self.vpc_id(&client, session, generation, settings, token, None)?;
         let limit = params["limit"].as_u64().unwrap_or(600).clamp(1, 2000) as usize;
         let search = params["searchQuery"]
             .as_str()
@@ -1441,7 +1592,7 @@ impl GfnService {
         let mut total_count = 0_u64;
 
         for _ in 0..25 {
-            crate::requests::check()?;
+            self.check_scope(session, generation)?;
             let variables = json!({
                 "vpcId":vpc_id,
                 "locale":"en_US",
@@ -1451,7 +1602,7 @@ impl GfnService {
                 "filters":{"variants":{"gfn":{"library":{"status":{"notEquals":"NOT_OWNED"}}}}}
             });
             let response = client
-                .post(GRAPHQL_URL)
+                .post(&self.endpoints.graphql)
                 .headers(graphql_headers(token)?)
                 .json(&json!({"query":LIBRARY_QUERY,"variables":variables}))
                 .send()
@@ -1497,6 +1648,7 @@ impl GfnService {
             }
             cursor = next_cursor.to_owned();
         }
+        self.check_scope(session, generation)?;
         Ok(json!({
             "games":games,
             "count":games.len(),
@@ -1504,6 +1656,7 @@ impl GfnService {
             "source":"account-library",
             "fetchedAt":now_ms()
         }))
+        })
     }
 
     pub fn store_local_catalog(
@@ -1511,97 +1664,111 @@ impl GfnService {
         params: &Value,
         settings: &Value,
     ) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to browse saved Store games")?;
-        let scope = self.store_cache_scope(&session, settings)?;
-        let mut result = match self.store_cache.local_query(&scope, params) {
-            Err(error) if error.code == "store_cache_missing" => {
-                self.store_catalog(&json!({"limit":100,"cursor":"","searchQuery":""}), settings)?;
-                self.store_cache.local_query(&scope, params)?
+        self.authenticated_read(|session, generation| {
+            let scope = self.store_cache_scope(session, generation, settings)?;
+            let mut result = match self.store_cache.local_query(&scope, params) {
+                Err(error) if error.code == "store_cache_missing" => {
+                    self.store_catalog(
+                        &json!({"limit":100,"cursor":"","searchQuery":""}),
+                        settings,
+                    )?;
+                    self.store_cache.local_query(&scope, params)?
+                }
+                result => result?,
+            };
+            // A cold/partial cache grows by at most one upstream page per explicit
+            // demand. Never crawl the entire catalog on startup or a search keypress.
+            if result["count"] == 0 && result["cacheComplete"] == false {
+                if let Some(cursor) = result["upstreamCursor"].as_str().filter(|s| !s.is_empty()) {
+                    self.store_catalog(
+                        &json!({"limit":100,"cursor":cursor,"searchQuery":""}),
+                        settings,
+                    )?;
+                    result = self.store_cache.local_query(&scope, params)?;
+                }
             }
-            result => result?,
-        };
-        // A cold/partial cache grows by at most one upstream page per explicit
-        // demand. Never crawl the entire catalog on startup or a search keypress.
-        if result["count"] == 0 && result["cacheComplete"] == false {
-            if let Some(cursor) = result["upstreamCursor"].as_str().filter(|s| !s.is_empty()) {
-                self.store_catalog(
-                    &json!({"limit":100,"cursor":cursor,"searchQuery":""}),
-                    settings,
-                )?;
-                result = self.store_cache.local_query(&scope, params)?;
-            }
-        }
-        result
-            .as_object_mut()
-            .expect("Local Store response")
-            .remove("upstreamCursor");
-        Ok(result)
+            result
+                .as_object_mut()
+                .expect("Local Store response")
+                .remove("upstreamCursor");
+            self.check_scope(session, generation)?;
+            Ok(result)
+        })
     }
 
     pub fn store_catalog(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        crate::requests::check()?;
-        let page = crate::store_catalog_page::PageRequest::parse(params)?;
-        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-        let session =
-            self.authenticated_session("Sign in to browse the GeForce NOW store catalog")?;
-        let token = session
-            .tokens
-            .id_token
-            .as_deref()
-            .unwrap_or(&session.tokens.access_token);
-        let scope = self.store_cache_scope(&session, settings)?;
-        let key = json!(["page", page.limit, page.cursor, page.search]);
-        let refresh = params["refresh"].as_bool() == Some(true) && page.cursor.is_empty();
-        self.store_cache.load_or_fetch(&scope, &key, refresh, || {
-            let vpc_id = self.vpc_id(&session, token, Some(&self.store_cache.requests))?;
-            // Each retry starts at the SAME cursor. Never truncate a fetched page:
-            // doing so would skip games when returning NVIDIA's end cursor.
-            crate::store_catalog_page::fetch_bounded_page(page.limit, |fetch_count| {
-                let searching = !page.search.is_empty();
-                let query = if searching {
-                    STORE_SEARCH_QUERY
-                } else {
-                    STORE_BROWSE_QUERY
-                };
-                let mut variables = json!({
-                    "vpcId":vpc_id, "locale":"en_US",
-                    "sortString":"itemMetadata.relevance:DESC,sortName:ASC",
-                    "fetchCount":fetch_count, "cursor":page.cursor, "filters":{}
-                });
-                if searching {
-                    variables["searchString"] = Value::String(page.search.clone());
-                }
-                let response = self.store_cache.requests.send(
-                    client
-                        .post(GRAPHQL_URL)
-                        .headers(graphql_headers(token)?)
-                        .json(&json!({"query":query,"variables":variables})),
-                    "GFN store query failed",
+        self.authenticated_read(|session, generation| {
+            self.check_scope(session, generation)?;
+            let page = crate::store_catalog_page::PageRequest::parse(params)?;
+            let client =
+                client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
+            let token = session
+                .tokens
+                .id_token
+                .as_deref()
+                .unwrap_or(&session.tokens.access_token);
+            let scope = self.store_cache_scope(session, generation, settings)?;
+            let key = json!(["page", page.limit, page.cursor, page.search]);
+            let refresh = params["refresh"].as_bool() == Some(true) && page.cursor.is_empty();
+            self.store_cache.load_or_fetch(&scope, &key, refresh, || {
+                let vpc_id = self.vpc_id(
+                    &client,
+                    session,
+                    generation,
+                    settings,
+                    token,
+                    Some(&self.store_cache.requests),
                 )?;
-                if !response.status().is_success() {
-                    return Err(ServiceError::response("GFN store query failed", response));
-                }
-                let payload = response
-                    .json::<Value>()
-                    .map_err(|error| ServiceError::network("Invalid GFN store response", error))?;
-                if let Some(message) = graphql_error_message(&payload) {
-                    return Err(ServiceError {
-                        code: "graphql_error",
-                        message,
+                // Each retry starts at the SAME cursor. Never truncate a fetched page:
+                // doing so would skip games when returning NVIDIA's end cursor.
+                crate::store_catalog_page::fetch_bounded_page(page.limit, |fetch_count| {
+                    let searching = !page.search.is_empty();
+                    let query = if searching {
+                        STORE_SEARCH_QUERY
+                    } else {
+                        STORE_BROWSE_QUERY
+                    };
+                    let mut variables = json!({
+                        "vpcId":vpc_id, "locale":"en_US",
+                        "sortString":"itemMetadata.relevance:DESC,sortName:ASC",
+                        "fetchCount":fetch_count, "cursor":page.cursor, "filters":{}
                     });
-                }
-                let apps = &payload["data"]["apps"];
-                let items = apps["items"].as_array().ok_or_else(|| ServiceError {
-                    code: "invalid_upstream_response",
-                    message: "Store response has no games array".to_owned(),
-                })?;
-                let games: Vec<Value> = items.iter().filter_map(app_to_game).collect();
-                crate::store_catalog_page::page_result(
-                    &page.cursor,
-                    games,
-                    &apps["pageInfo"],
-                    now_ms(),
-                )
+                    if searching {
+                        variables["searchString"] = Value::String(page.search.clone());
+                    }
+                    let response = self.store_cache.requests.send(
+                        client
+                            .post(&self.endpoints.graphql)
+                            .headers(graphql_headers(token)?)
+                            .json(&json!({"query":query,"variables":variables})),
+                        "GFN store query failed",
+                    )?;
+                    if !response.status().is_success() {
+                        return Err(ServiceError::response("GFN store query failed", response));
+                    }
+                    let payload = response.json::<Value>().map_err(|error| {
+                        ServiceError::network("Invalid GFN store response", error)
+                    })?;
+                    if let Some(message) = graphql_error_message(&payload) {
+                        return Err(ServiceError {
+                            code: "graphql_error",
+                            message,
+                        });
+                    }
+                    let apps = &payload["data"]["apps"];
+                    let items = apps["items"].as_array().ok_or_else(|| ServiceError {
+                        code: "invalid_upstream_response",
+                        message: "Store response has no games array".to_owned(),
+                    })?;
+                    let games: Vec<Value> = items.iter().filter_map(app_to_game).collect();
+                    self.check_scope(session, generation)?;
+                    crate::store_catalog_page::page_result(
+                        &page.cursor,
+                        games,
+                        &apps["pageInfo"],
+                        now_ms(),
+                    )
+                })
             })
         })
     }
@@ -1609,12 +1776,14 @@ impl GfnService {
     fn store_cache_scope(
         &self,
         session: &AuthSession,
+        generation: u64,
         settings: &Value,
     ) -> Result<Value, ServiceError> {
         let proxy = config_from_settings(settings).map_err(ServiceError::invalid)?;
         Ok(json!([
             session.user.user_id,
             session.provider,
+            generation,
             session.user.membership_tier,
             proxy
                 .map(|config| config.cache_scope)
@@ -1628,122 +1797,141 @@ impl GfnService {
         params: &Value,
         settings: &Value,
     ) -> Result<Value, ServiceError> {
-        let section = params["section"].as_str().unwrap_or("");
-        if !matches!(section, "marquee" | "panels" | "filters") {
-            return Err(ServiceError::invalid(
-                "Store presentation requires marquee, panels or filters",
-            ));
-        }
-        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-        let session = self.authenticated_session("Sign in to load the storefront")?;
-        let scope = self.store_cache_scope(&session, settings)?;
-        let mut result = self.store_cache.load_or_fetch(
-            &scope,
-            &json!(["presentation", section]),
-            false,
-            || {
-                let token = session
-                    .tokens
-                    .id_token
-                    .as_deref()
-                    .unwrap_or(&session.tokens.access_token);
-                let vpc_id = self.vpc_id(&session, token, Some(&self.store_cache.requests))?;
-                let (variables, request_type, sha, query) = match section {
-                    "panels" => (
-                        json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MAIN"]}),
-                        "panels/MainV2",
-                        STORE_PANELS_SHA,
-                        STORE_PANELS_QUERY,
-                    ),
-                    "marquee" => (
-                        json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MARQUEE"]}),
-                        "panels/Marquee",
-                        STORE_MARQUEE_SHA,
-                        STORE_MARQUEE_QUERY,
-                    ),
-                    _ => (
-                        json!({"locale":"en_US"}),
-                        "filterGroupAndSortOrderDefinitions",
-                        "ef725de5e93b093de1ac7418fed0ffb4f6ae2b9c14f743ab274a791521488eb9",
-                        STORE_DEFINITIONS_QUERY,
-                    ),
-                };
-                let payload = if section == "panels" {
-                    // The persisted MainV2 document only supplies landscape hero art.
-                    // Execute our document so GAME_BOX_ART is actually requested, just
-                    // like Library/browse, rather than silently ignoring these fields.
-                    crate::requests::check()?;
-                    let response = self.store_cache.requests.send(
-                        client
-                            .post(GRAPHQL_URL)
-                            .headers(graphql_headers(token)?)
-                            .json(&json!({"query":query,"variables":variables})),
-                        "GFN storefront query failed",
-                    )?;
-                    if !response.status().is_success() {
-                        return Err(ServiceError::response(
-                            "GFN storefront query failed",
-                            response,
-                        ));
-                    }
-                    let payload = response.json::<Value>().map_err(|error| {
-                        ServiceError::network("Invalid GFN storefront response", error)
-                    })?;
-                    if let Some(message) = graphql_error_message(&payload) {
-                        return Err(ServiceError {
-                            code: "graphql_error",
-                            message,
-                        });
-                    }
-                    payload
-                } else {
-                    fetch_panels_document(
-                        &self.store_cache.requests,
+        self.authenticated_read(|session, generation| {
+            let section = params["section"].as_str().unwrap_or("");
+            if !matches!(section, "marquee" | "panels" | "filters") {
+                return Err(ServiceError::invalid(
+                    "Store presentation requires marquee, panels or filters",
+                ));
+            }
+            let client =
+                client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
+            let scope = self.store_cache_scope(session, generation, settings)?;
+            let mut result = self.store_cache.load_or_fetch(
+                &scope,
+                &json!(["presentation", section]),
+                false,
+                || {
+                    let token = session
+                        .tokens
+                        .id_token
+                        .as_deref()
+                        .unwrap_or(&session.tokens.access_token);
+                    let vpc_id = self.vpc_id(
                         &client,
+                        session,
+                        generation,
+                        settings,
                         token,
-                        variables,
-                        request_type,
-                        sha,
-                        query,
-                    )?
-                };
-                crate::requests::check()?;
-                let empty_index = HashMap::new();
-                let items = match section {
-                    "panels" => parse_store_panels(&payload, &empty_index),
-                    "marquee" => parse_store_marquee(&payload, &empty_index),
-                    _ => parse_store_definitions(&payload),
-                };
-                // Optional chrome must not enlarge the games response or restart the core.
-                // An oversized/failed section is reported independently by the shell.
-                crate::store_catalog_page::bounded_result(json!({"section":section,"items":items}))
-            },
-        )?;
-        if section == "panels" && params["metadataOnly"] == true {
-            for panel in result["items"].as_array_mut().into_iter().flatten() {
-                for section in panel["sections"].as_array_mut().into_iter().flatten() {
-                    let count = section["games"].as_array().map_or(0, Vec::len);
-                    section["totalCount"] = json!(count);
-                    section["games"] = json!([]);
+                        Some(&self.store_cache.requests),
+                    )?;
+                    let (variables, request_type, sha, query) = match section {
+                        "panels" => (
+                            json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MAIN"]}),
+                            "panels/MainV2",
+                            STORE_PANELS_SHA,
+                            STORE_PANELS_QUERY,
+                        ),
+                        "marquee" => (
+                            json!({"vpcId":vpc_id,"locale":"en_US","panelNames":["MARQUEE"]}),
+                            "panels/Marquee",
+                            STORE_MARQUEE_SHA,
+                            STORE_MARQUEE_QUERY,
+                        ),
+                        _ => (
+                            json!({"locale":"en_US"}),
+                            "filterGroupAndSortOrderDefinitions",
+                            "ef725de5e93b093de1ac7418fed0ffb4f6ae2b9c14f743ab274a791521488eb9",
+                            STORE_DEFINITIONS_QUERY,
+                        ),
+                    };
+                    let payload = if section == "panels" {
+                        // The persisted MainV2 document only supplies landscape hero art.
+                        // Execute our document so GAME_BOX_ART is actually requested, just
+                        // like Library/browse, rather than silently ignoring these fields.
+                        self.check_scope(session, generation)?;
+                        let response = self.store_cache.requests.send(
+                            client
+                                .post(&self.endpoints.graphql)
+                                .headers(graphql_headers(token)?)
+                                .json(&json!({"query":query,"variables":variables})),
+                            "GFN storefront query failed",
+                        )?;
+                        if !response.status().is_success() {
+                            return Err(ServiceError::response(
+                                "GFN storefront query failed",
+                                response,
+                            ));
+                        }
+                        let payload = response.json::<Value>().map_err(|error| {
+                            ServiceError::network("Invalid GFN storefront response", error)
+                        })?;
+                        if let Some(message) = graphql_error_message(&payload) {
+                            return Err(ServiceError {
+                                code: "graphql_error",
+                                message,
+                            });
+                        }
+                        payload
+                    } else {
+                        fetch_panels_document(
+                            &self.store_cache.requests,
+                            &client,
+                            token,
+                            variables,
+                            request_type,
+                            sha,
+                            query,
+                        )?
+                    };
+                    self.check_scope(session, generation)?;
+                    let empty_index = HashMap::new();
+                    let items = match section {
+                        "panels" => parse_store_panels(&payload, &empty_index),
+                        "marquee" => parse_store_marquee(&payload, &empty_index),
+                        _ => parse_store_definitions(&payload),
+                    };
+                    // Optional chrome must not enlarge the games response or restart the core.
+                    // An oversized/failed section is reported independently by the shell.
+                    crate::store_catalog_page::bounded_result(
+                        json!({"section":section,"items":items}),
+                    )
+                },
+            )?;
+            if section == "panels" && params["metadataOnly"] == true {
+                for panel in result["items"].as_array_mut().into_iter().flatten() {
+                    for section in panel["sections"].as_array_mut().into_iter().flatten() {
+                        let count = section["games"].as_array().map_or(0, Vec::len);
+                        section["totalCount"] = json!(count);
+                        section["games"] = json!([]);
+                    }
                 }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
-    pub fn regions(&self) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to discover streaming regions")?;
+    pub fn regions(&self, settings: &Value) -> Result<Value, ServiceError> {
+        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
+        self.authenticated_read(|session, generation| {
+            self.check_scope(session, generation)?;
+            self.provider_regions(&client, session)
+        })
+    }
+
+    fn provider_regions(
+        &self,
+        client: &Client,
+        session: &AuthSession,
+    ) -> Result<Value, ServiceError> {
         let token = session
             .tokens
             .id_token
             .as_deref()
             .unwrap_or(&session.tokens.access_token);
         let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
-        let url = base
-            .join("v2/serverInfo")
-            .map_err(|_| ServiceError::invalid("Invalid streaming service URL"))?;
-        let response = self
-            .client
+        let url = self.server_info_url(&base)?;
+        let response = client
             .get(url)
             .headers(lcars_headers(token, "BROWSER", "WEBRTC", false)?)
             .send()
@@ -1754,38 +1942,55 @@ impl GfnService {
         let payload = response
             .json::<Value>()
             .map_err(|error| ServiceError::network("Invalid region response", error))?;
-        let mut regions = payload["metaData"].as_array().into_iter().flatten().filter_map(|entry| {
-            let name = entry["key"].as_str()?;
-            let value = entry["value"].as_str()?;
-            if !value.starts_with("https://") || name == "gfn-regions" || name.starts_with("gfn-") { return None }
-            Some(json!({"name":name,"url":if value.ends_with('/') { value.to_owned() } else { format!("{value}/") }}))
-        }).collect::<Vec<_>>();
+        let vpc_id = verified_vpc(&payload)?;
+        if payload["metaData"].as_array().is_none() {
+            return Err(ServiceError {
+                code: "invalid_upstream_response",
+                message: "Provider server info has no regions or verified VPC".into(),
+            });
+        }
+        let mut regions = payload["metaData"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry["key"].as_str()?;
+                let value = entry["value"].as_str()?;
+                if !value.starts_with("https://")
+                    || name == "gfn-regions"
+                    || name.starts_with("gfn-")
+                {
+                    return None;
+                }
+                Some(json!({"name":name,"url":trusted_streaming_base(value).ok()?.as_str()}))
+            })
+            .collect::<Vec<_>>();
         regions.sort_by(|left, right| {
             left["name"]
                 .as_str()
                 .unwrap_or("")
                 .cmp(right["name"].as_str().unwrap_or(""))
         });
-        Ok(json!({"regions":regions,"vpcId":payload["requestStatus"]["serverId"]}))
+        Ok(json!({"regions":regions,"vpcId":vpc_id,"providerIdpId":session.provider.idp_id}))
     }
 
     pub fn subscription(&self, settings: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to load subscription details")?;
+        self.authenticated_read(|session, generation| {
+        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
         let token = session
             .tokens
             .id_token
             .as_deref()
             .unwrap_or(&session.tokens.access_token);
-        let vpc_id = self.vpc_id(&session, token, None)?;
+        let vpc_id = self.vpc_id(&client, session, generation, settings, token, None)?;
         let steam_deck = settings["identifyAsSteamDeck"].as_bool().unwrap_or(false);
-        let mut url = url::Url::parse(MES_URL).expect("MES URL is valid");
+        let mut url = url::Url::parse(&self.endpoints.subscription).expect("MES URL is valid");
         url.query_pairs_mut()
             .append_pair("serviceName", "gfn_pc")
             .append_pair("languageCode", "en_US")
             .append_pair("vpcId", &vpc_id)
             .append_pair("userId", &session.user.user_id);
-        let response = self
-            .client
+        let response = client
             .get(url)
             .headers(lcars_headers(
                 token,
@@ -1838,6 +2043,7 @@ impl GfnService {
                 "regionCode":attribute("STORAGE_METRO_REGION")
             })
         });
+        self.check_scope(session, generation)?;
         Ok(json!({"subscription":{
             "membershipTier":membership,"subscriptionType":data["type"],"subscriptionSubType":data["subType"],
             "allottedHours":allotted/60.0,"purchasedHours":purchased/60.0,"rolledOverHours":rolled/60.0,
@@ -1849,17 +2055,87 @@ impl GfnService {
             "state":data["currentSubscriptionState"]["state"],"isGamePlayAllowed":data["currentSubscriptionState"]["isGamePlayAllowed"],
             "isUnlimited":data["subType"] == "UNLIMITED","entitledResolutions":resolutions,"storageAddon":storage_addon
         }}))
+        })
     }
 
     pub fn create_session(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to start a streaming session")?;
-        self.cloudmatch
-            .create(params, settings, &session, &self.device_id)
+        let admission = self.cloudmatch.admit_create()?;
+        self.providers()?;
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        if !self.cloudmatch.active()["session"].is_null() {
+            return Err(ServiceError {
+                code: "session_update_busy",
+                message: "End the active session before starting another game".into(),
+            });
+        }
+        let (params, settings) = self.scoped_session_route(params, settings, &session)?;
+        let result = admission
+            .create(&params, &settings, &session, &self.device_id)
+            .map(|result| scoped_result(result, &session, generation));
+        if !self.cloudmatch.active()["session"].is_null() {
+            routing.active_owner = Some((session, generation));
+        }
+        result
     }
 
     pub fn poll_session(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to continue the streaming session")?;
-        self.cloudmatch.poll(params, &session, &self.device_id)
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        if let Some((owner, generation)) = &routing.active_owner
+            && !self
+                .state
+                .lock()
+                .expect("GFN state poisoned")
+                .session
+                .as_ref()
+                .is_some_and(|current| {
+                    current.user.user_id == owner.user.user_id
+                        && current.provider.idp_id == owner.provider.idp_id
+                })
+        {
+            if owner.tokens.expiry(TokenPurpose::ServiceId) <= now_ms() {
+                return Err(ServiceError {
+                    code: "session_owner_authentication_required",
+                    message:
+                        "Sign in to the active session's original account to continue managing it"
+                            .into(),
+                });
+            }
+            let active = self.cloudmatch.active()["session"].clone();
+            if params["sessionId"]
+                .as_str()
+                .is_some_and(|id| active["sessionId"] != id)
+                || active.is_null()
+            {
+                return Err(session_owner_error());
+            }
+            let result = self
+                .cloudmatch
+                .poll(&active, owner, &self.device_id)
+                .map(|result| scoped_result(result, owner, *generation))
+                .map_err(|mut error| {
+                    if error.code == "http_unauthorized" {
+                        error.code = "session_owner_authentication_required";
+                    }
+                    error
+                });
+            if self.cloudmatch.active()["session"].is_null() {
+                routing.active_owner = None;
+            }
+            return result;
+        }
+        let result = self.session_read_locked(|session, generation| {
+            let params = self.owned_session_params(params, &routing, session, generation, false)?;
+            self.cloudmatch.poll(&params, session, &self.device_id)
+        });
+        if self.cloudmatch.active()["session"].is_null() {
+            routing.active_owner = None;
+        } else if let Ok((_, session, generation)) = &result {
+            routing.active_owner = Some((session.clone(), *generation));
+        }
+        result.map(|(result, _, _)| result)
     }
 
     pub fn finish_session_create(
@@ -1867,48 +2143,366 @@ impl GfnService {
         session_id: &str,
         accepted: bool,
     ) -> Result<(), ServiceError> {
-        self.cloudmatch.finish_create(session_id, accepted)
+        let mut routing = self
+            .session_routing
+            .lock()
+            .expect("Session routing poisoned");
+        let accepted = accepted
+            && routing
+                .active_owner
+                .as_ref()
+                .is_some_and(|(session, generation)| {
+                    self.check_scope(session, *generation).is_ok()
+                });
+        let result = self.cloudmatch.finish_create(session_id, accepted);
+        if self.cloudmatch.active()["session"].is_null() {
+            routing.active_owner = None;
+        }
+        result
     }
 
-    pub fn stop_session(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to stop the streaming session")?;
-        self.cloudmatch.stop(params, &session, &self.device_id)
+    pub fn stop_session(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let active = self.cloudmatch.active()["session"].clone();
+        let requested = params["sessionId"].as_str().unwrap_or("");
+        if !active.is_null() && (requested.is_empty() || active["sessionId"] == requested) {
+            let (owner, generation) = routing
+                .active_owner
+                .as_ref()
+                .ok_or_else(session_owner_error)?;
+            let selected_owner = self
+                .state
+                .lock()
+                .expect("GFN state poisoned")
+                .session
+                .as_ref()
+                .is_some_and(|current| {
+                    current.provider.idp_id == owner.provider.idp_id
+                        && current.user.user_id == owner.user.user_id
+                });
+            let (session, generation) = if selected_owner {
+                self.session_snapshot_locked()?
+            } else {
+                (owner.clone(), *generation)
+            };
+            if session.tokens.expiry(TokenPurpose::ServiceId) <= now_ms() {
+                return Err(ServiceError {
+                    code: "authentication_required",
+                    message: "Sign in to the session's original account to end it".into(),
+                });
+            }
+            let result = self
+                .cloudmatch
+                .stop(&active, settings, &session, &self.device_id)
+                .map(|result| scoped_result(result, &session, generation));
+            if self.cloudmatch.active()["session"].is_null() {
+                routing.active_owner = None;
+            }
+            return result;
+        }
+        let (session, generation) = self.session_snapshot_locked()?;
+        let params = self.owned_session_params(params, &routing, &session, generation, true)?;
+        self.cloudmatch
+            .stop(&params, settings, &session, &self.device_id)
+            .map(|result| scoped_result(result, &session, generation))
     }
 
     pub fn active_session(&self) -> Result<Value, ServiceError> {
-        Ok(self.cloudmatch.active())
+        let routing = crate::store_requests::lock(&self.session_routing)?;
+        if routing
+            .active_owner
+            .as_ref()
+            .is_none_or(|(session, generation)| self.check_scope(session, *generation).is_err())
+        {
+            return Ok(json!({"session":null}));
+        }
+        let (session, generation) = routing
+            .active_owner
+            .as_ref()
+            .ok_or_else(session_owner_error)?;
+        Ok(scoped_result(
+            self.cloudmatch.active(),
+            session,
+            *generation,
+        ))
     }
 
     pub fn remote_sessions(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to discover active sessions")?;
-        self.cloudmatch
-            .remote_sessions(params, settings, &session, &self.device_id)
+        self.providers()?;
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (result, session, generation) = self.session_read_locked(|session, generation| {
+            let (mut params, settings) = self.scoped_session_route(params, settings, session)?;
+            if routing.active_owner.as_ref().is_none_or(|(owner, scope)| {
+                *scope != generation
+                    || owner.user.user_id != session.user.user_id
+                    || owner.provider.idp_id != session.provider.idp_id
+            }) {
+                if let Some(params) = params.as_object_mut() {
+                    params.remove("sessionId");
+                }
+            }
+            self.cloudmatch
+                .remote_sessions(&params, &settings, session, &self.device_id)
+        })?;
+        routing.discovery_owner = Some((session.provider.idp_id, session.user.user_id, generation));
+        Ok(result)
     }
 
     pub fn claim_session(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to resume the streaming session")?;
-        self.cloudmatch
-            .claim(params, settings, &session, &self.device_id)
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        let params = self.owned_session_params(params, &routing, &session, generation, true)?;
+        let active = self.cloudmatch.active()["session"].clone();
+        if !active.is_null() && active["sessionId"] != params["sessionId"] {
+            return Err(session_owner_error());
+        }
+        let result = scoped_result(
+            self.cloudmatch
+                .claim(&params, settings, &session, &self.device_id)?,
+            &session,
+            generation,
+        );
+        routing.active_owner = Some((session, generation));
+        Ok(result)
     }
 
     pub fn report_session_ad(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to update the streaming session")?;
-        self.cloudmatch.report_ad(params, &session, &self.device_id)
+        let routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        let mut owned = self.owned_session_params(params, &routing, &session, generation, false)?;
+        for key in ["action", "adId"] {
+            if let Some(value) = params.get(key) {
+                owned[key] = value.clone();
+            }
+        }
+        self.cloudmatch
+            .report_ad(&owned, &session, &self.device_id)
+            .map(|result| scoped_result(result, &session, generation))
+    }
+
+    fn session_snapshot_locked(&self) -> Result<(AuthSession, u64), ServiceError> {
+        let session = self
+            .resolve_session_locked(TokenPurpose::ServiceId, false)?
+            .0
+            .ok_or_else(|| ServiceError {
+                code: "authentication_required",
+                message: "Sign in to manage streaming sessions".into(),
+            })?;
+        let state = self.state.lock().expect("GFN state poisoned");
+        let mut session = session;
+        if let Some(provider) = state
+            .providers
+            .iter()
+            .find(|provider| provider.idp_id == session.provider.idp_id)
+        {
+            session.provider = provider.clone();
+        }
+        trusted_streaming_base(&session.provider.streaming_service_url)?;
+        Ok((session, state.generation))
+    }
+
+    fn session_read_locked(
+        &self,
+        mut read: impl FnMut(&AuthSession, u64) -> Result<Value, ServiceError>,
+    ) -> Result<(Value, AuthSession, u64), ServiceError> {
+        let (session, generation) = self.session_snapshot_locked()?;
+        let result = read(&session, generation);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == "http_unauthorized")
+        {
+            let renewed = self
+                .resolve_session_locked(TokenPurpose::ServiceId, true)?
+                .0
+                .ok_or_else(|| ServiceError {
+                    code: "authentication_required",
+                    message: "Sign in to renew the session credential".into(),
+                })?;
+            self.check_scope(&session, generation)?;
+            if renewed.provider.idp_id != session.provider.idp_id
+                || renewed.user.user_id != session.user.user_id
+            {
+                return Err(session_owner_error());
+            }
+            let result = read(&renewed, generation)?;
+            return Ok((
+                scoped_result(result, &renewed, generation),
+                renewed,
+                generation,
+            ));
+        }
+        Ok((
+            scoped_result(result?, &session, generation),
+            session,
+            generation,
+        ))
+    }
+
+    fn owned_session_params(
+        &self,
+        params: &Value,
+        routing: &SessionRouting,
+        session: &AuthSession,
+        generation: u64,
+        allow_discovered: bool,
+    ) -> Result<Value, ServiceError> {
+        let active = self.cloudmatch.active()["session"].clone();
+        let id = params["sessionId"]
+            .as_str()
+            .or_else(|| active["sessionId"].as_str())
+            .ok_or_else(session_owner_error)?;
+        let owns = |owner: &Option<(AuthSession, u64)>| {
+            owner.as_ref().is_some_and(|(owner, scope)| {
+                *scope == generation
+                    && owner.user.user_id == session.user.user_id
+                    && owner.provider.idp_id == session.provider.idp_id
+            })
+        };
+        if active["sessionId"] == id && owns(&routing.active_owner) {
+            return Ok(active);
+        }
+        if allow_discovered
+            && routing
+                .discovery_owner
+                .as_ref()
+                .is_some_and(|(provider, user, scope)| {
+                    provider == &session.provider.idp_id
+                        && user == &session.user.user_id
+                        && *scope == generation
+                })
+            && let Some(discovered) = self.cloudmatch.discovered_session(id)
+        {
+            return Ok(discovered);
+        }
+        if allow_discovered && let Some(cleanup) = self.cloudmatch.cleanup_session(session, id) {
+            return Ok(cleanup);
+        }
+        Err(session_owner_error())
+    }
+
+    pub fn prepare_owned_stream(
+        &self,
+        params: &Value,
+        prepare: impl FnOnce(&Value) -> Result<Value, ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        let routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        let owned =
+            self.owned_session_params(&params["session"], &routing, &session, generation, false)?;
+        if !matches!(owned["status"].as_i64(), Some(2 | 3)) {
+            return Err(ServiceError {
+                code: "session_not_ready",
+                message: "The owned session is not ready for media attachment".into(),
+            });
+        }
+        if !owned["rtspsEndpoints"].as_array().is_some_and(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                endpoint
+                    .as_str()
+                    .is_some_and(|endpoint| endpoint.starts_with("rtsps://"))
+            })
+        }) {
+            return Err(ServiceError {
+                code: "session_endpoint_missing",
+                message: "The owned session has no RTSPS media endpoint".into(),
+            });
+        }
+        let mut params = params.clone();
+        params["session"] = owned;
+        prepare(&params)
+    }
+
+    fn scoped_session_route(
+        &self,
+        params: &Value,
+        settings: &Value,
+        session: &AuthSession,
+    ) -> Result<(Value, Value), ServiceError> {
+        let state = self.state.lock().expect("GFN state poisoned");
+        if state.providers_expires.is_some()
+            && !state
+                .providers
+                .iter()
+                .any(|provider| provider.idp_id == session.provider.idp_id)
+        {
+            return Err(ServiceError {
+                code: "provider_unavailable",
+                message: "The selected provider is unavailable".into(),
+            });
+        }
+        drop(state);
+        let mut params = params.clone();
+        let mut settings = settings.clone();
+        let selected = params["streamingBaseUrl"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                settings["providerRegions"][&session.provider.idp_id]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                (settings["regionProviderIdpId"] == session.provider.idp_id
+                    || (settings["regionProviderIdpId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                        && session.provider.idp_id == DEFAULT_IDP_ID))
+                    .then(|| settings["region"].as_str().unwrap_or("").to_owned())
+            });
+        if let Some(params) = params.as_object_mut() {
+            params.remove("streamingBaseUrl");
+            params.remove("zone");
+        }
+        settings["region"] = json!("");
+        if let Some(selected) = selected.filter(|value| !value.is_empty()) {
+            let client =
+                client_for_settings(&self.client, &settings).map_err(ServiceError::invalid)?;
+            match self.provider_regions(&client, session) {
+                Ok(result) => {
+                    if let Some(region) = result["regions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|region| region["url"] == selected || region["name"] == selected)
+                    {
+                        params["streamingBaseUrl"] = region["url"].clone();
+                        params["zone"] = region["name"].clone();
+                    }
+                }
+                Err(error) if matches!(error.code, "http_unauthorized" | "cancelled") => {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
+        Ok((params, settings))
     }
 
     pub fn account_connections(&self) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to load connected game accounts")?;
-        self.account_connections.list(&session)
+        self.authenticated_read(|session, _| self.account_connections.list(session))
     }
 
     pub fn sync_account_connection(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to sync a game account")?;
-        self.account_connections.sync(params, &session)
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        self.account_connections
+            .sync(params, &session)
+            .map(|result| scoped_result(result, &session, generation))
     }
 
     pub fn unlink_account_connection(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to disconnect a game account")?;
-        self.account_connections.unlink(params, &session)
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        self.account_connections
+            .unlink(params, &session)
+            .map(|result| scoped_result(result, &session, generation))
     }
 
     pub fn start_account_link(&self, params: &Value) -> Result<Value, ServiceError> {
@@ -1929,32 +2523,15 @@ impl GfnService {
     }
 
     pub fn persistent_storage_locations(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to load persistent storage locations")?;
-        self.persistent_storage.locations(params, &session)
+        self.authenticated_read(|session, _| self.persistent_storage.locations(params, session))
     }
 
     pub fn reset_persistent_storage(&self, params: &Value) -> Result<Value, ServiceError> {
-        let session = self.authenticated_session("Sign in to reset persistent storage")?;
-        self.persistent_storage.reset(params, &session)
-    }
-
-    fn authenticated_session(&self, message: &str) -> Result<AuthSession, ServiceError> {
-        self.authenticated_session_for(TokenPurpose::ServiceId, false)
-            .map_err(|mut error| {
-                if error.code == "authentication_required" {
-                    error.message = message.to_owned();
-                }
-                error
-            })
-    }
-
-    pub(crate) fn authenticated_session_for(
-        &self,
-        purpose: TokenPurpose,
-        force: bool,
-    ) -> Result<AuthSession, ServiceError> {
-        self.authenticated_snapshot(purpose, force)
-            .map(|(session, _)| session)
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let (session, generation) = self.session_snapshot_locked()?;
+        self.persistent_storage
+            .reset(params, &session)
+            .map(|result| scoped_result(result, &session, generation))
     }
 
     pub(crate) fn authenticated_snapshot(
@@ -1969,11 +2546,77 @@ impl GfnService {
         crate::requests::check()?;
         let (session, _) = self.resolve_session_locked(purpose, force)?;
         session
-            .map(|session| (session, self.auth_generation()))
+            .map(|mut session| {
+                let state = self.state.lock().expect("GFN state poisoned");
+                if state.providers_expires.is_some() {
+                    let provider = state
+                        .providers
+                        .iter()
+                        .find(|provider| provider.idp_id == session.provider.idp_id)
+                        .ok_or_else(|| ServiceError {
+                            code: "provider_unavailable",
+                            message:
+                                "The signed-in provider is no longer in the provider directory"
+                                    .into(),
+                        })?;
+                    session.provider = provider.clone();
+                }
+                trusted_streaming_base(&session.provider.streaming_service_url)?;
+                Ok((session, state.generation))
+            })
             .ok_or_else(|| ServiceError {
                 code: "authentication_required",
                 message: "Sign in to renew authentication".into(),
+            })?
+    }
+
+    fn check_scope(&self, session: &AuthSession, generation: u64) -> Result<(), ServiceError> {
+        crate::requests::check()?;
+        let state = self.state.lock().expect("GFN state poisoned");
+        if state.generation != generation
+            || !state.session.as_ref().is_some_and(|current| {
+                current.user.user_id == session.user.user_id
+                    && current.provider.idp_id == session.provider.idp_id
             })
+        {
+            return Err(ServiceError {
+                code: "stale_account",
+                message: "The account or provider changed. Retry this request.".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn authenticated_read(
+        &self,
+        mut read: impl FnMut(&AuthSession, u64) -> Result<Value, ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        self.providers()?;
+        let (session, generation) = self.authenticated_snapshot(TokenPurpose::ServiceId, false)?;
+        self.check_scope(&session, generation)?;
+        let result = read(&session, generation);
+        self.check_scope(&session, generation)?;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == "http_unauthorized")
+        {
+            let (renewed, renewed_generation) =
+                self.authenticated_snapshot(TokenPurpose::ServiceId, true)?;
+            self.check_scope(&session, generation)?;
+            if renewed_generation != generation
+                || renewed.provider.idp_id != session.provider.idp_id
+                || renewed.user.user_id != session.user.user_id
+            {
+                return Err(ServiceError {
+                    code: "stale_account",
+                    message: "The account changed during authentication renewal".into(),
+                });
+            }
+            let result = read(&renewed, generation);
+            self.check_scope(&renewed, generation)?;
+            return result.map(|result| scoped_result(result, &renewed, generation));
+        }
+        result.map(|result| scoped_result(result, &session, generation))
     }
 
     pub(crate) fn auth_generation(&self) -> u64 {
@@ -1982,44 +2625,57 @@ impl GfnService {
 
     fn vpc_id(
         &self,
+        client: &Client,
         session: &AuthSession,
+        generation: u64,
+        settings: &Value,
         token: &str,
         requests: Option<&crate::store_requests::StoreRequests>,
     ) -> Result<String, ServiceError> {
-        let Ok(base) = trusted_streaming_base(&session.provider.streaming_service_url) else {
-            return Ok("GFN-PC".to_owned());
-        };
-        let Ok(url) = base.join("v2/serverInfo") else {
-            return Ok("GFN-PC".to_owned());
-        };
-        let Ok(headers) = lcars_headers(token, "NATIVE", "NVIDIA-CLASSIC", false) else {
-            return Ok("GFN-PC".to_owned());
-        };
-        self.server_vpc_cache
-            .resolve(base.as_str(), &session.user.user_id, token, || {
-                let request = self.client.get(url).headers(headers);
+        self.check_scope(session, generation)?;
+        let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
+        let url = self.server_info_url(&base)?;
+        let headers = lcars_headers(token, "NATIVE", "NVIDIA-CLASSIC", false)?;
+        self.server_vpc_cache.resolve(
+            &json!([
+                base.as_str(),
+                generation,
+                config_from_settings(settings)
+                    .map_err(ServiceError::invalid)?
+                    .map(|proxy| proxy.cache_scope)
+            ])
+            .to_string(),
+            &session.user.user_id,
+            token,
+            || {
+                self.check_scope(session, generation)?;
+                let request = client.get(url).headers(headers);
                 let response = match requests {
                     Some(requests) => requests.send(request, "Store server info failed"),
                     None => request
                         .send()
                         .map_err(|error| ServiceError::network("Server info failed", error)),
                 };
-                let response = match response {
-                    Ok(response) => response,
-                    Err(error) if matches!(error.code, "rate_limited" | "cancelled") => {
-                        return Err(error);
-                    }
-                    Err(_) => return Ok(None),
-                };
+                let response = response?;
                 if !response.status().is_success() {
-                    return Ok(None);
+                    return Err(ServiceError::response("Server info failed", response));
                 }
-                Ok(response.json::<Value>().ok().and_then(|payload| {
-                    payload["requestStatus"]["serverId"]
-                        .as_str()
-                        .map(ToOwned::to_owned)
-                }))
-            })
+                let payload = response
+                    .json::<Value>()
+                    .map_err(|error| ServiceError::network("Invalid server info", error))?;
+                self.check_scope(session, generation)?;
+                verified_vpc(&payload).map(Some)
+            },
+        )
+    }
+
+    fn server_info_url(&self, base: &url::Url) -> Result<url::Url, ServiceError> {
+        #[cfg(test)]
+        if let Some(url) = &self.endpoints.server_info {
+            return url::Url::parse(url).map_err(|_| ServiceError::invalid("Invalid fixture URL"));
+        }
+        base.join("v2/serverInfo")
+            .map_err(|_| ServiceError::invalid("Invalid provider URL"))
     }
 
     fn fetch_user_info(&self, tokens: &AuthTokens) -> Result<AuthUser, ServiceError> {
@@ -2368,7 +3024,7 @@ fn is_definitive_auth_revocation(error: &ServiceError) -> bool {
     if error.code == "session_revoked" {
         return true;
     }
-    if error.code != "upstream_error" {
+    if !matches!(error.code, "upstream_error" | "http_unauthorized") {
         return false;
     }
     let message = error.message.to_ascii_lowercase();
@@ -2895,16 +3551,57 @@ fn parse_store_definitions(payload: &Value) -> Vec<Value> {
 }
 
 fn trusted_streaming_base(value: &str) -> Result<url::Url, ServiceError> {
-    let base = url::Url::parse(value)
-        .map_err(|_| ServiceError::invalid("Invalid streaming service URL"))?;
-    let hostname = base.host_str().unwrap_or("").to_lowercase();
-    if base.scheme() != "https"
-        || !(hostname == "prod.cloudmatchbeta.nvidiagrid.net"
-            || hostname.ends_with(".geforcenow.nvidiagrid.net"))
-    {
-        return Err(ServiceError::invalid("Untrusted streaming service URL"));
+    crate::cloudmatch::trusted_cloudmatch_base(value)
+}
+
+fn provider_result(state: &ServiceState) -> Value {
+    let mut providers = state.providers.clone();
+    if providers.is_empty() {
+        if let Some(session) = &state.session {
+            providers.push(session.provider.clone());
+        }
+        if !providers
+            .iter()
+            .any(|provider| provider.idp_id == DEFAULT_IDP_ID)
+        {
+            providers.push(LoginProvider::default_nvidia());
+        }
     }
-    Ok(base)
+    json!({"providers":providers,"defaultProviderIdpId":state.providers_default,"generation":state.generation,"discovery":{
+        "state":if state.providers_error.is_some() {"degraded"} else {"ready"},
+        "message":state.providers_error,
+        "retryAfterMs":state.providers_retry.map(|time| time.saturating_duration_since(Instant::now()).as_millis() as u64).unwrap_or(0)
+    }})
+}
+
+fn session_owner_error() -> ServiceError {
+    ServiceError { code: "session_owner_mismatch", message: "This session is not owned by the current account and provider. Refresh active sessions.".into() }
+}
+
+fn verified_vpc(payload: &Value) -> Result<String, ServiceError> {
+    let status = &payload["requestStatus"];
+    if status.get("statusCode").is_some() && number_value(&status["statusCode"]) != Some(1.0) {
+        return Err(ServiceError {
+            code: "invalid_upstream_response",
+            message: "Provider server info reported an unsuccessful status".into(),
+        });
+    }
+    status["serverId"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ServiceError {
+            code: "invalid_upstream_response",
+            message: "Provider server info did not include a verified VPC".into(),
+        })
+}
+
+fn scoped_result(mut result: Value, session: &AuthSession, generation: u64) -> Value {
+    result["scope"] = json!({"generation":generation,"providerIdpId":session.provider.idp_id,"userId":session.user.user_id});
+    if result["session"].is_object() {
+        result["session"]["ownerScope"] = result["scope"].clone();
+    }
+    result
 }
 
 fn number_value(value: &Value) -> Option<f64> {
@@ -3101,7 +3798,7 @@ mod tests {
         mock_requests(responses, move |index, _| before_response(index))
     }
 
-    fn mock_requests(
+    pub(super) fn mock_requests(
         responses: Vec<(u16, Value)>,
         before_response: impl Fn(usize, &str) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -3151,7 +3848,7 @@ mod tests {
         (url, worker)
     }
 
-    fn auth_fixture(user: &str) -> AuthSession {
+    pub(super) fn auth_fixture(user: &str) -> AuthSession {
         serde_json::from_value(json!({
             "provider": LoginProvider::default_nvidia(),
             "tokens": {"accessToken":"test-access", "refreshToken":"test-refresh",
@@ -3162,7 +3859,7 @@ mod tests {
         .unwrap()
     }
 
-    fn jwt(user: &str, expiry: u64) -> String {
+    pub(super) fn jwt(user: &str, expiry: u64) -> String {
         format!(
             "header.{}.signature",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
@@ -3332,7 +4029,8 @@ mod tests {
         assert_public_auth(&refreshed);
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::ServiceId, false)
+                .authenticated_snapshot(TokenPurpose::ServiceId, false)
+                .map(|(session, _)| session)
                 .is_ok()
         );
         std::fs::remove_dir_all(path).unwrap();
@@ -3375,7 +4073,8 @@ mod tests {
         session.tokens.id_token = Some(jwt("user", 1000));
         service.state.lock().unwrap().session = Some(session);
         let session = service
-            .authenticated_session_for(TokenPurpose::ServiceId, false)
+            .authenticated_snapshot(TokenPurpose::ServiceId, false)
+            .map(|(session, _)| session)
             .unwrap();
         assert_eq!(session.tokens.access_token, "renewed");
         assert!(session.tokens.expiry(TokenPurpose::ServiceId) > now_ms());
@@ -3396,17 +4095,20 @@ mod tests {
         service.state.lock().unwrap().session = Some(session);
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::ServiceId, false)
+                .authenticated_snapshot(TokenPurpose::ServiceId, false)
+                .map(|(session, _)| session)
                 .is_err()
         );
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::ServiceId, false)
+                .authenticated_snapshot(TokenPurpose::ServiceId, false)
+                .map(|(session, _)| session)
                 .is_err()
         );
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::StarfleetAccess, false)
+                .authenticated_snapshot(TokenPurpose::StarfleetAccess, false)
+                .map(|(session, _)| session)
                 .is_ok()
         );
         assert_eq!(
@@ -3442,12 +4144,14 @@ mod tests {
         service.state.lock().unwrap().session = Some(session);
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::StarfleetAccess, false)
+                .authenticated_snapshot(TokenPurpose::StarfleetAccess, false)
+                .map(|(session, _)| session)
                 .is_err()
         );
         assert!(
             service
-                .authenticated_session_for(TokenPurpose::StarfleetAccess, false)
+                .authenticated_snapshot(TokenPurpose::StarfleetAccess, false)
+                .map(|(session, _)| session)
                 .is_err()
         );
         assert!(service.vault.load("user").unwrap().is_some());
@@ -3578,7 +4282,7 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    fn test_service(url: &str) -> (GfnService, PathBuf) {
+    pub(super) fn test_service(url: &str) -> (GfnService, PathBuf) {
         let path =
             std::env::temp_dir().join(format!("opennow-auth-test-{}", rand::random::<u64>()));
         let client = Client::builder()
@@ -3600,6 +4304,8 @@ mod tests {
         );
         service.vault = CredentialVault::memory(path.clone());
         service.state.lock().unwrap().providers = vec![LoginProvider::default_nvidia()];
+        service.state.lock().unwrap().providers_expires =
+            Some(Instant::now() + Duration::from_secs(900));
         (service, path)
     }
 
@@ -3978,6 +4684,8 @@ mod tests {
         let client = Client::builder().build().unwrap();
         let service = GfnService::with_client(client, Endpoints::default(), std::env::temp_dir());
         service.state.lock().unwrap().providers = vec![LoginProvider::default_nvidia()];
+        service.state.lock().unwrap().providers_expires =
+            Some(Instant::now() + Duration::from_secs(900));
         let result = service.providers().unwrap();
         assert_eq!(result["providers"][0]["code"], "NVIDIA");
     }

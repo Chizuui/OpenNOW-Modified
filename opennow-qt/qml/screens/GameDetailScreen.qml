@@ -55,7 +55,7 @@ FocusScope {
     }
 
     function regionLabel() {
-        const selected = String(ShellStore.settings.region || "")
+        const selected = String(ShellStore.selectedRegion || "")
         if (selected.length)
             return selected
         return qsTr("Automatic region")

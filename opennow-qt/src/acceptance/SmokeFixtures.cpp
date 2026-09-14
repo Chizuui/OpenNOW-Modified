@@ -30,6 +30,23 @@ int AcceptanceSession::prepareWindow()
         };
         if (window) window->resize(dimension(u"--smoke-width"_s, 1600),
                                    dimension(u"--smoke-height"_s, 900));
+        if (m_arguments.contains(u"--smoke-alliance-routing"_s)) {
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            const QVariantMap nvidia{{u"idpId"_s, u"nvidia-fixture"_s}, {u"displayName"_s, u"NVIDIA"_s}, {u"code"_s, u"NVIDIA"_s}};
+            const QVariantMap alliance{{u"idpId"_s, u"alliance-fixture"_s}, {u"displayName"_s, u"Alliance fixture"_s}, {u"code"_s, u"ALLIANCE"_s}};
+            store->setProperty("providers", QVariantList{nvidia, alliance});
+            store->setProperty("selectedProviderIdpId", u"alliance-fixture"_s);
+            const auto selected = store->property("selectedProvider").value<QJSValue>();
+            if (selected.property(u"idpId"_s).toString() != u"alliance-fixture"_s) return EXIT_FAILURE;
+            store->setProperty("providers", QVariantList{alliance, nvidia});
+            if (store->property("selectedProvider").value<QJSValue>().property(u"idpId"_s).toString() != u"alliance-fixture"_s) return EXIT_FAILURE;
+            store->setProperty("providerDiscoveryDegraded", true);
+            store->setProperty("authRestorePending", false);
+            store->setProperty("authSession", QVariant());
+            store->setProperty("authState", u"idle"_s);
+            m_controller.navigate(u"sign-in"_s);
+        }
         const auto persistenceIndex = m_arguments.indexOf(u"--smoke-auth-persistence"_s);
         if (persistenceIndex >= 0) {
             if (persistenceIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;

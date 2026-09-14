@@ -41,6 +41,7 @@ FocusScope {
                     wrapMode: Text.WordWrap
                     text: ShellStore.signedIn
                           ? qsTr("Signed in as %1. Your NVIDIA password never passes through OpenNOW.").arg(ShellStore.authSession.user.displayName)
+                          : ShellStore.providerDiscoveryDegraded ? qsTr("Provider discovery is unavailable. Known providers are shown.")
                           : qsTr("OpenNOW connects to your GeForce NOW account without storing your NVIDIA password. Sign in from your phone, then come straight back to the controller.")
                     color: Theme.textMuted
                     font.family: Theme.bodyFont
@@ -64,22 +65,23 @@ FocusScope {
                         else if (root.challenge)
                             Qt.openUrlExternally(root.challenge.verificationUriComplete)
                         else
-                            ShellStore.startDeviceLogin("")
+                            ShellStore.startDeviceLogin(ShellStore.selectedProvider ? ShellStore.selectedProvider.idpId : "")
                     }
                 }
                 GlassButton {
                     width: parent.width
                     visible: !ShellStore.signedIn
-                    text: root.challenge ? qsTr("Cancel this sign-in") : ShellStore.providers.length > 1
-                          ? qsTr("Provider · %1").arg(ShellStore.providers[0].displayName)
-                          : qsTr("Provider · NVIDIA")
+                    text: root.challenge ? qsTr("Cancel this sign-in")
+                          : qsTr("Provider · %1").arg(ShellStore.selectedProvider ? ShellStore.selectedProvider.displayName : qsTr("Select a provider"))
                     glyph: root.challenge ? "B" : "X"
                     enabled: ShellStore.ready
                     onClicked: {
                         if (root.challenge)
                             ShellStore.cancelDeviceLogin()
-                        else
-                            ShellStore.startDeviceLogin(ShellStore.providers.length ? ShellStore.providers[0].idpId : "")
+                        else if (ShellStore.providers.length) {
+                            const index = ShellStore.providers.findIndex(provider => provider.idpId === (ShellStore.selectedProvider ? ShellStore.selectedProvider.idpId : ""))
+                            ShellStore.selectedProviderIdpId = ShellStore.providers[(index + 1) % ShellStore.providers.length].idpId
+                        }
                     }
                 }
                 GlassButton {

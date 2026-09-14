@@ -900,6 +900,16 @@ if(BUILD_TESTING)
         set_tests_properties("qml-auth-persistence-${persistence}" PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT ${OPENNOW_QT_SMOKE_TIMEOUT})
     endforeach()
+    foreach(surface desktop console)
+        foreach(width 960 1440)
+            add_test(NAME "qml-alliance-routing-${surface}-${width}"
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances
+                    --${surface} --route sign-in --reduced-motion --smoke-width ${width} --smoke-height 900
+                    --smoke-alliance-routing)
+            set_tests_properties("qml-alliance-routing-${surface}-${width}" PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT ${OPENNOW_QT_SMOKE_TIMEOUT})
+        endforeach()
+    endforeach()
     foreach(motion_mode normal reduced)
         foreach(motion_window windowed fullscreen)
             set(launch_args --smoke-test --allow-multiple-instances --desktop --route library --smoke-session-launch)

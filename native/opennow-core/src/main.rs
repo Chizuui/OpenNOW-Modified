@@ -372,6 +372,17 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 "invalid_params".to_owned(),
                 "settings.set requires a value".to_owned(),
             ))?;
+            if key == "region" {
+                let provider = params["providerIdpId"].as_str().unwrap_or("");
+                let event = core.gfn.with_region_provider(provider, || {
+                    let mut settings = core.settings.lock().expect("settings poisoned");
+                    let applied = settings.set_provider_region(provider, value).map_err(|message| gfn::ServiceError { code: "invalid_setting", message })?;
+                    Ok(json!({"key":key,"value":applied,"changes":{
+                        "regionProviderIdpId":provider,"providerRegions":settings.all()["providerRegions"]
+                    }}))
+                }).map_err(gfn_error)?;
+                return Ok((event.clone(), Some(("settings.changed", event))));
+            }
             let mut settings = core.settings.lock().expect("settings poisoned");
             let applied = settings
                 .set(key, value)
@@ -520,11 +531,13 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(|message| ("invalid_params".to_owned(), message))
         }
-        "network.regions.list" => core
-            .gfn
-            .regions()
-            .map(|value| (value, None))
-            .map_err(gfn_error),
+        "network.regions.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .regions(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "network.regions.ping" => network::ping_regions(params)
             .map(|value| (value, None))
             .map_err(|message| ("region_ping_failed".to_owned(), message)),
@@ -599,11 +612,13 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 )
             })
             .map_err(gfn_error),
-        "session.stop" => core
-            .gfn
-            .stop_session(params)
-            .map(|value| (value.clone(), Some(("session.changed", value))))
-            .map_err(gfn_error),
+        "session.stop" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .stop_session(params, &settings)
+                .map(|value| (value.clone(), Some(("session.changed", value))))
+                .map_err(gfn_error)
+        }
         "session.active.get" => core
             .gfn
             .active_session()
@@ -644,8 +659,15 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         }
         "streamer.prepare" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
-            core.streamer
-                .prepare_embedded(params, &settings)
+            core.gfn
+                .prepare_owned_stream(params, |owned| {
+                    core.streamer
+                        .prepare_embedded(owned, &settings)
+                        .map_err(|error| gfn::ServiceError {
+                            code: error.code,
+                            message: error.message,
+                        })
+                })
                 .inspect_err(|error| {
                     core.diagnostics.record(
                         "streamer",
@@ -659,7 +681,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                     );
                 })
                 .map(|value| (value, None))
-                .map_err(streamer_error)
+                .map_err(gfn_error)
         }
         "streamer.status.get" => Ok((core.streamer.status(), None)),
         "streamer.stop" => core

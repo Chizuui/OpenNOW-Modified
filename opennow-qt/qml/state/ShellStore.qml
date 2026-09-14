@@ -41,6 +41,8 @@ QtObject {
         i18n: I18n
         ready: root.ready
         subscription: root.subscription
+        providerIdpId: root.authSession && root.authSession.provider ? String(root.authSession.provider.idpId || "") : ""
+        providerCode: root.authSession && root.authSession.provider ? String(root.authSession.provider.code || "") : ""
         nativeRuntimeReady: root.nativeRuntimeReady
         nativeRuntimeCapabilities: root.nativeRuntimeCapabilities
         refreshAccountServices: root.refreshAccountServices
@@ -65,6 +67,7 @@ QtObject {
     }
 
     property alias settings: settingsOwner.settings
+    readonly property string selectedRegion: settingsOwner.selectedRegion
     property var onboardingAwdlController: MacAwdl
     readonly property bool onboardingAwdlReady: !onboardingAwdlController.busy
         && [MacAwdlController.Unsupported, MacAwdlController.Unavailable, MacAwdlController.Disabled]
@@ -139,6 +142,25 @@ QtObject {
     property string lastError: ""
     property var focusPositions: ({})
     property var providers: []
+    property string selectedProviderIdpId: ""
+    readonly property var selectedProvider: selectedProviderIdpId === ""
+        ? (providers.length ? providers[0] : null)
+        : (providers.find(provider => provider.idpId === selectedProviderIdpId) || null)
+    property bool providerDiscoveryDegraded: false
+    property int providerRetryAttempts: 0
+    property Timer providerRetryTimer: Timer {
+        interval: 31000
+        repeat: false
+        onTriggered: {
+            root.providerRetryAttempts += 1
+            root.refreshProviders()
+        }
+    }
+
+    function refreshProviders() {
+        if (ready && providersRequestId === "")
+            providersRequestId = CoreClient.request("auth.providers.list", {}, 10000)
+    }
     property var authSession: null
     property var authChallenge: null
     property string authState: "idle"
@@ -1277,7 +1299,7 @@ QtObject {
             appLaunchMode: settings.steamBigPictureMode === true
                 ? "gamepadFriendly" : "default"
         }
-        const configuredRegion = String(settings.region || "")
+        const configuredRegion = selectedRegion
         for (let index = 0; index < regions.length; ++index) {
             const region = regions[index]
             if (configuredRegion === region.name || configuredRegion === region.url) {
@@ -2189,6 +2211,12 @@ QtObject {
     function startDeviceLogin(providerIdpId, staySignedIn) {
         if (!ready || deviceStartRequestId !== "")
             return
+        if (!providerIdpId || !providers.some(provider => provider.idpId === providerIdpId)) {
+            authState = "error"
+            authMessage = qsTr("Select an available provider before signing in.")
+            return
+        }
+        selectedProviderIdpId = providerIdpId
         pendingStaySignedIn = staySignedIn !== false
         cancelDeviceLogin()
         lastError = qsTr("")
@@ -2245,11 +2273,52 @@ QtObject {
         const generation = payload.generation === undefined ? authGeneration : Number(payload.generation)
         if (generation < authGeneration)
             return false
+        const next = payload.session || null
+        const changed = generation !== authGeneration
+            || String(authSession && authSession.user ? authSession.user.userId : "") !== String(next && next.user ? next.user.userId : "")
+            || String(authSession && authSession.provider ? authSession.provider.idpId : "") !== String(next && next.provider ? next.provider.idpId : "")
+        const keepPreparedOwner = activeSession && activeSession.ownerScope && next
+            && Number(activeSession.ownerScope.generation) === generation
+            && String(activeSession.ownerScope.userId) === String(next.user.userId)
+            && String(activeSession.ownerScope.providerIdpId) === String(next.provider.idpId)
+        if (changed) {
+            accountServicesOwner.invalidateAccount()
+            for (const key of ["remoteSessionsRequestId", "remoteSessionDiscoveryRequestId", "sessionClaimRequestId", "streamCreateRequestId", "streamerPrepareRequestId"]) {
+                if (key === "streamerPrepareRequestId" && keepPreparedOwner) continue
+                const requestId = root[key]
+                root[key] = ""
+                if (requestId !== "") CoreClient.cancel(requestId)
+            }
+            remoteSessions = []
+            pendingLaunchParams = null
+            conflictSession = null
+        }
         authGeneration = generation
         authSession = payload.session || null
         sessionPersistence = payload.persistence || "none"
         authWarnings = payload.warnings || []
+        if (changed) {
+            Qt.callLater(root.reloadCatalogForSession)
+            if (next) Qt.callLater(root.refreshAccountServices)
+        }
         return true
+    }
+
+    function matchesAuthScope(scope) {
+        return !scope || (Number(scope.generation) === authGeneration && authSession
+            && String(scope.userId) === String(authSession.user.userId)
+            && String(scope.providerIdpId) === String(authSession.provider.idpId))
+    }
+
+    function acceptsSessionScope(scope) {
+        if (matchesAuthScope(scope)) return true
+        if (authSession && Number(scope.generation) < authGeneration
+                && String(scope.userId) === String(authSession.user.userId)
+                && String(scope.providerIdpId) === String(authSession.provider.idpId)) return false
+        const owner = activeSession && activeSession.ownerScope
+        return Boolean(owner && Number(owner.generation) === Number(scope.generation)
+            && String(owner.userId) === String(scope.userId)
+            && String(owner.providerIdpId) === String(scope.providerIdpId))
     }
 
     function requestConsoleSurface(enabled) {
@@ -2656,6 +2725,18 @@ QtObject {
             }
         }
         function onResponseReceived(requestId, result) {
+            const newerSameOwner = result.scope && Number(result.scope.generation) > root.authGeneration
+                && root.authSession && String(result.scope.userId) === String(root.authSession.user.userId)
+                && String(result.scope.providerIdpId) === String(root.authSession.provider.idpId)
+            if (newerSameOwner && root.authSessionRequestId === "")
+                root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+            if (result.scope && !newerSameOwner && !root.matchesAuthScope(result.scope)
+                    && !(result.session !== undefined && root.acceptsSessionScope(result.scope))) {
+                if (Number(result.scope.generation) > root.authGeneration && root.authSessionRequestId === "")
+                    root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+                if (requestId === root.streamPollRequestId) root.streamPollRequestId = ""
+                return
+            }
             const authRequests = ["authSessionRequestId", "deviceCompleteRequestId", "logoutRequestId",
                 "logoutAllRequestId", "accountSwitchRequestId", "accountRemoveRequestId"]
             for (let index = 0; index < authRequests.length; ++index) {
@@ -2681,6 +2762,19 @@ QtObject {
             } else if (requestId === root.providersRequestId) {
                 root.providers = result.providers || []
                 root.providersRequestId = ""
+                if (root.selectedProviderIdpId === "" && result.defaultProviderIdpId)
+                    root.selectedProviderIdpId = result.defaultProviderIdpId
+                if (Number(result.generation || 0) > root.authGeneration && root.authSessionRequestId === "")
+                    root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+                root.providerDiscoveryDegraded = Boolean(result.discovery && result.discovery.state === "degraded")
+                if (root.providerDiscoveryDegraded && root.providerRetryAttempts < 3) {
+                    root.providerRetryTimer.interval = Math.max(31000, Number(result.discovery.retryAfterMs || 0) + 1000)
+                    root.providerRetryTimer.restart()
+                }
+                else if (!root.providerDiscoveryDegraded) {
+                    root.providerRetryAttempts = 0
+                    root.providerRetryTimer.stop()
+                }
             } else if (requestId === root.authSessionRequestId) {
                 root.authSession = result.session || null
                 root.sessionPersistence = result.persistence || "none"
@@ -2958,6 +3052,7 @@ QtObject {
                 root.acceptStreamingSession(result.session || null)
             } else if (requestId === root.streamPollRequestId) {
                 root.streamPollRequestId = ""
+                if (!root.acceptsSessionScope(result.scope)) return
                 if (root.isRemoteSessionTermination(result.termination))
                     root.finishRemoteSession(result.termination)
                 else
@@ -3184,6 +3279,12 @@ QtObject {
                 root.handleSessionCreateFailure(code, message)
             } else if (requestId === root.streamPollRequestId) {
                 root.streamPollRequestId = ""
+                if (code === "session_owner_authentication_required") {
+                    root.streamPollTimer.stop()
+                    root.streamMessage = message
+                    root.lastError = message
+                    return
+                }
                 if (root.activeSession && root.activeSession.resumePending) {
                     root.streamMessage = qsTr("Waiting for the resumed session…")
                     root.streamPollTimer.restart()
@@ -3227,6 +3328,7 @@ QtObject {
                 root.streamMessage = root.lastError
                 root.refreshRemoteSessions()
             } else if (name === "session.changed") {
+                if (!root.acceptsSessionScope(payload.scope)) return
                 if (root.isRemoteSessionTermination(payload.termination))
                     root.finishRemoteSession(payload.termination)
                 else

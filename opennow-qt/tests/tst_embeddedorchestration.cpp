@@ -17,6 +17,68 @@ class EmbeddedOrchestrationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void allianceAccountInvalidationRejectsOldRegionsAndKeepsProviderPreferences()
+    {
+        const auto account = source(QStringLiteral("qml/state/account/AccountServicesState.qml"));
+        const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+        QJSEngine engine;
+        for (const auto &name : {"invalidateAccount", "acceptRegions"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(account);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root = this, cancelled = [], mediaOwner = {id:'same-native-runtime'};
+            var accountLinkPollTimer = {stop: function() {}}, coreClient = {cancel: function(id) {cancelled.push(id)}};
+            var subscriptionRequestId = 'old-subscription', regionsRequestId = 'old-regions', regionPingRequestId = 'old-ping';
+            var gameAccountsRequestId = 'old-accounts', gameAccountActionRequestId = 'old-action', accountLinkStartRequestId = 'old-link';
+            var accountLinkPollRequestId = 'old-link-poll', storageLocationsRequestId = 'old-storage', storageResetRequestId = 'old-reset';
+            var subscription = {membershipTier:'old'}, regions = [{name:'old'}], regionsVpcId = 'old-vpc';
+            var regionPingPending = true, regionPingResults = {}, regionPingMessage = '', gameAccounts = [], gameAccountsState = 'loading';
+            var gameAccountMessage = '', accountLinkAttempt = {}, storageLocations = [], storageMessage = '';
+            invalidateAccount();
+            if (regionsRequestId === 'old-regions') acceptRegions({regions:[{name:'wrong-account'}],vpcId:'wrong-vpc'});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.length")).toInt(), 9);
+        QCOMPARE(engine.evaluate(QStringLiteral("regions.length")).toInt(), 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("regionsVpcId")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("subscriptionRequestId")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("mediaOwner.id")).toString(), QStringLiteral("same-native-runtime"));
+        QVERIFY(!engine.evaluate(QStringLiteral("regionsRequestId='new-regions'; if (regionsRequestId==='new-regions') acceptRegions({regions:[{name:'Alliance region'}],vpcId:'alliance-vpc'})")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("regions[0].name")).toString(), QStringLiteral("Alliance region"));
+        QVERIFY(shell.contains(QStringLiteral("requestId === root.regionsRequestId")));
+        const auto settings = source(QStringLiteral("qml/state/settings/SettingsState.qml"));
+        const auto selected = QRegularExpression(QStringLiteral("readonly property string selectedRegion: (\\{.*?\\n    \\})"),
+            QRegularExpression::DotMatchesEverythingOption).match(settings);
+        QVERIFY(selected.hasMatch());
+        QVERIFY(!engine.evaluate(QStringLiteral("function selectedRegion() ") + selected.captured(1)).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var settings = {region:'old-nvidia',regionProviderIdpId:'nvidia',providerRegions:{alliance:'saved-alliance'}};
+            var providerIdpId='alliance', providerCode='ALLIANCE';
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("selectedRegion()")).toString(), QStringLiteral("saved-alliance"));
+        QCOMPARE(engine.evaluate(QStringLiteral("providerIdpId='another'; selectedRegion()")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("providerIdpId='alliance'; regions=[]; selectedRegion()")).toString(), QStringLiteral("saved-alliance"));
+        for (const auto &name : {"matchesAuthScope", "acceptsSessionScope"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(shell);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var authGeneration=2, authSession={user:{userId:'b'},provider:{idpId:'alliance'}};
+            var oldScope={generation:1,userId:'a',providerIdpId:'nvidia'};
+            var activeSession={sessionId:'owned-seat',ownerScope:oldScope};
+        )JS")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("matchesAuthScope(oldScope)")).toBool());
+        QVERIFY(engine.evaluate(QStringLiteral("acceptsSessionScope(oldScope)")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("acceptsSessionScope({generation:1,userId:'different',providerIdpId:'nvidia'})")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("authSession={user:{userId:'a'},provider:{idpId:'nvidia'}}; acceptsSessionScope(oldScope)")).toBool());
+    }
+
     void authenticationEnvelopeRejectsOlderAccountsAndCancelsEveryLoginPhase()
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
@@ -30,6 +92,10 @@ private slots:
         }
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             var authGeneration = 4, authSession = null, sessionPersistence = 'none', authWarnings = [];
+            var root = this, activeSession = null, remoteSessions = [], pendingLaunchParams = null, conflictSession = null;
+            var remoteSessionsRequestId = '', remoteSessionDiscoveryRequestId = '', sessionClaimRequestId = '', streamCreateRequestId = '', streamerPrepareRequestId = '';
+            var accountServicesOwner = {invalidateAccount: function() {}}, Qt = {callLater: function() {}};
+            function reloadCatalogForSession() {} function refreshAccountServices() {}
             var ready = true, signedIn = false, authState = 'waiting', authSessionRequestId = '';
             var deviceStartRequestId = 'start', devicePollRequestId = 'poll', deviceCompleteRequestId = 'complete';
             var authChallenge = {attemptId: 'attempt'}, cancelled = [], requests = [];
@@ -47,6 +113,14 @@ private slots:
         QCOMPARE(engine.evaluate(QStringLiteral("requests[1].method")).toString(), QStringLiteral("auth.device.cancel"));
         QVERIFY(!engine.evaluate(QStringLiteral("authChallenge={attemptId:'new'}; pollDeviceLogin()")).isError());
         QCOMPARE(engine.evaluate(QStringLiteral("Object.keys(requests[2].params).join(',')")).toString(), QStringLiteral("attemptId"));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            activeSession={ownerScope:{generation:6,userId:'new',providerIdpId:'alliance'}};
+            streamerPrepareRequestId='current-owner-prepare';
+            acceptAuthEnvelope({generation:6,session:{user:{userId:'new'},provider:{idpId:'alliance'}}});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QStringLiteral("current-owner-prepare"));
+        QVERIFY(!engine.evaluate(QStringLiteral("acceptAuthEnvelope({generation:7,session:{user:{userId:'other'},provider:{idpId:'alliance'}}})")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QString());
         QVERIFY(!shell.contains(QStringLiteral("deviceCode")));
         const auto timer = shell.section(QStringLiteral("property Timer devicePollTimer:"), 1).section(QStringLiteral("property Timer streamPollTimer:"), 0, 0);
         QVERIFY(timer.contains(QStringLiteral("repeat: false")));
@@ -73,7 +147,7 @@ private slots:
             var selectedGame = {launchAppId: '1001', title: 'Multi Store Game', selectedVariantIndex: 0,
                 variants: [{id: '1001', store: 'Steam', inLibrary: false},
                            {id: '1003', store: 'Xbox', inLibrary: true}]};
-            var settings = {}, regions = [], requests = [], pendingLaunchParams = null;
+            var settings = {}, selectedRegion = '', regions = [], requests = [], pendingLaunchParams = null;
             var CoreClient = {request: function(method, params) {
                 requests.push({method: method, params: params}); return 'request';
             }};
@@ -291,7 +365,7 @@ private slots:
             var streamCreateRequestId = '', streamStopRequestId = '', sessionClaimRequestId = '';
             var subscriptionRequestId = 'subscription', regionsRequestId = 'regions', accountsRequestId = 'accounts';
             var gameAccountsRequestId = 'connections', streamState = 'idle', streamMessage = '', lastError = '';
-            var requests = [], selectedGame = {title:'Game'}, settings = {}, regions = [], onboardingReplaying = false;
+            var requests = [], selectedGame = {title:'Game'}, settings = {}, selectedRegion = '', regions = [], onboardingReplaying = false;
             var CoreClient = {request:function(method,params){requests.push(method);return 'request-'+requests.length;}};
             var AppController = {navigate:function(){}};
             var onboardingOwner = {acceptFailure:function(){return false;}};
@@ -571,7 +645,7 @@ private slots:
             var selectedGame = {launchAppId: "123", title: "Test", membershipTierLabel: requiredTier};
             var authSession = {user: {membershipTier: "FREE"}};
             var subscriptionRequestId = "", streamState = "idle", streamMessage = "", lastError = "";
-            var settings = {}, regions = [], pendingLaunchParams = null;
+            var settings = {}, selectedRegion = '', regions = [], pendingLaunchParams = null;
             var requests = [], routes = [];
             var CoreClient = {request: function(method, params) {
                 requests.push({method: method, params: params}); return "request-" + requests.length;

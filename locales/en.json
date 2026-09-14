@@ -1,4 +1,13 @@
 {
+  "providerRouting": {
+    "unavailable": "Provider discovery is unavailable. Known providers are shown. Refresh to try again.",
+    "knownProviders": "Provider discovery is unavailable. Known providers are shown.",
+    "refresh": "Refresh providers",
+    "continue": "Continue with %1",
+    "select": "Select a provider",
+    "selectBeforeLogin": "Select an available provider before signing in.",
+    "selected": "  ·  SELECTED PROVIDER"
+  },
   "credentialPersistence": {
     "migrationPending": "Secure account migration is pending. Unlock your system credential store and restart OpenNOW.",
     "cleanupPending": "Account credential cleanup is pending. Your saved data has been retained for recovery."

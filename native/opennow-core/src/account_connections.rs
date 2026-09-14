@@ -536,7 +536,9 @@ fn network(context: &str, error: impl std::fmt::Display) -> ServiceError {
 fn response_error(context: &str, response: reqwest::blocking::Response) -> ServiceError {
     let status = response.status();
     ServiceError {
-        code: if matches!(status.as_u16(), 401 | 403) {
+        code: if status.as_u16() == 401 {
+            "http_unauthorized"
+        } else if status.as_u16() == 403 {
             "authentication_required"
         } else {
             "upstream_error"

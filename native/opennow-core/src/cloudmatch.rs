@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -57,6 +57,53 @@ pub struct CloudMatchService {
     fresh: Mutex<Option<FreshAllocation>>,
     cleanup_path: Option<PathBuf>,
     retained_cleanup: Mutex<Option<Value>>,
+    #[cfg(test)]
+    test_control_base: Option<Url>,
+}
+
+pub(crate) struct CreateAdmission<'a> {
+    service: &'a CloudMatchService,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl CreateAdmission<'_> {
+    pub(crate) fn create(
+        self,
+        params: &Value,
+        settings: &Value,
+        auth: &AuthSession,
+        device_id: &str,
+    ) -> Result<Value, ServiceError> {
+        let service = self.service;
+        self.create_at(params, settings, auth, device_id, || {
+            let client = client_for_settings(&service.client, settings).map_err(invalid)?;
+            #[cfg(test)]
+            if let Some(base) = &service.test_control_base {
+                return Ok((client, base.clone()));
+            }
+            let requested_base = requested_streaming_base(params, settings, auth)?;
+            let base = service.resolve_create_base(
+                &client,
+                &requested_base,
+                session_token(auth),
+                device_id,
+                true,
+            )?;
+            Ok((client, base))
+        })
+    }
+
+    fn create_at(
+        self,
+        params: &Value,
+        settings: &Value,
+        auth: &AuthSession,
+        device_id: &str,
+        connection: impl FnOnce() -> Result<(Client, Url), ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        self.service
+            .create_admitted(params, settings, auth, device_id, connection)
+    }
 }
 
 impl CloudMatchService {
@@ -70,6 +117,8 @@ impl CloudMatchService {
             fresh: Mutex::new(None),
             cleanup_path: None,
             retained_cleanup: Mutex::new(None),
+            #[cfg(test)]
+            test_control_base: None,
         }
     }
 
@@ -100,27 +149,19 @@ impl CloudMatchService {
         service
     }
 
-    pub fn create(
+    #[cfg(test)]
+    fn create(
         &self,
         params: &Value,
         settings: &Value,
         auth: &AuthSession,
         device_id: &str,
     ) -> Result<Value, ServiceError> {
-        self.create_at(params, settings, auth, device_id, || {
-            let client = client_for_settings(&self.client, settings).map_err(invalid)?;
-            let requested_base = requested_streaming_base(params, settings, auth)?;
-            let base = self.resolve_create_base(
-                &client,
-                &requested_base,
-                session_token(auth),
-                device_id,
-                true,
-            );
-            Ok((client, base))
-        })
+        self.admit_create()?
+            .create(params, settings, auth, device_id)
     }
 
+    #[cfg(test)]
     fn create_at(
         &self,
         params: &Value,
@@ -129,7 +170,12 @@ impl CloudMatchService {
         device_id: &str,
         connection: impl FnOnce() -> Result<(Client, Url), ServiceError>,
     ) -> Result<Value, ServiceError> {
-        let _admission = self
+        self.admit_create()?
+            .create_at(params, settings, auth, device_id, connection)
+    }
+
+    pub(crate) fn admit_create(&self) -> Result<CreateAdmission<'_>, ServiceError> {
+        let guard = self
             .allocation_admission
             .try_lock()
             .map_err(|_| allocation_in_progress())?;
@@ -153,6 +199,20 @@ impl CloudMatchService {
                 message: "The previous allocation is awaiting confirmation or cleanup. End that session before starting another game.".to_owned(),
             });
         }
+        Ok(CreateAdmission {
+            service: self,
+            _guard: guard,
+        })
+    }
+
+    fn create_admitted(
+        &self,
+        params: &Value,
+        settings: &Value,
+        auth: &AuthSession,
+        device_id: &str,
+        connection: impl FnOnce() -> Result<(Client, Url), ServiceError>,
+    ) -> Result<Value, ServiceError> {
         let (client, base) = connection()?;
         crate::requests::check()?;
         let app_id = launch_app_id(params)?;
@@ -447,6 +507,7 @@ impl CloudMatchService {
     pub fn stop(
         &self,
         params: &Value,
+        settings: &Value,
         auth: &AuthSession,
         device_id: &str,
     ) -> Result<Value, ServiceError> {
@@ -454,11 +515,12 @@ impl CloudMatchService {
             .active
             .lock()
             .expect("CloudMatch state poisoned")
-            .clone();
-        let client = current
-            .as_ref()
-            .map(|state| state.client.clone())
-            .unwrap_or_else(|| self.client.clone());
+            .clone()
+            .filter(|state| {
+                params["sessionId"]
+                    .as_str()
+                    .is_none_or(|id| id == state.session_id)
+            });
         let session_id = params["sessionId"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -467,6 +529,19 @@ impl CloudMatchService {
         let Some(session_id) = session_id else {
             return Ok(json!({"session":null,"stopped":false}));
         };
+        let client = current
+            .as_ref()
+            .map(|state| state.client.clone())
+            .or_else(|| {
+                self.fresh
+                    .lock()
+                    .expect("CloudMatch allocation state poisoned")
+                    .as_ref()
+                    .filter(|allocation| allocation.info["sessionId"] == session_id)
+                    .map(|allocation| allocation.client.clone())
+            })
+            .map(Ok)
+            .unwrap_or_else(|| client_for_settings(&self.client, settings).map_err(invalid))?;
         let discovered = self
             .discovered
             .lock()
@@ -508,6 +583,14 @@ impl CloudMatchService {
         let url = base
             .join(&format!("v2/session/{session_id}"))
             .map_err(|_| invalid("Invalid CloudMatch stop URL"))?;
+        #[cfg(test)]
+        let url = self
+            .test_control_base
+            .as_ref()
+            .map_or(Ok(url), |base| {
+                base.join(&format!("v2/session/{session_id}"))
+            })
+            .map_err(|_| invalid("Invalid test stop URL"))?;
         self.stop_at(
             &session_id,
             &client,
@@ -562,6 +645,31 @@ impl CloudMatchService {
     pub fn active(&self) -> Value {
         let state = self.active.lock().expect("CloudMatch state poisoned");
         json!({"session":state.as_ref().map(|session| session.info.clone())})
+    }
+
+    pub(crate) fn discovered_session(&self, session_id: &str) -> Option<Value> {
+        self.discovered
+            .lock()
+            .expect("CloudMatch discovery state poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    pub(crate) fn cleanup_session(&self, auth: &AuthSession, session_id: &str) -> Option<Value> {
+        self.pending_cleanup(auth)
+            .filter(|session| session["sessionId"] == session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_owned_session(&self, mut info: Value) {
+        let base = trusted_cloudmatch_base(DEFAULT_STREAMING_BASE).unwrap();
+        self.store_active(&mut info, &base, "", "fixture", self.client.clone())
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_control_base(&mut self, base: Url) {
+        self.test_control_base = Some(base);
     }
 
     fn capture_session_conflict(
@@ -672,7 +780,7 @@ impl CloudMatchService {
                 Ok(payload)
             });
         if let Err(error) = &server_info
-            && error.code == "authentication_required"
+            && matches!(error.code, "authentication_required" | "http_unauthorized")
         {
             return Err(error.clone());
         }
@@ -760,7 +868,9 @@ impl CloudMatchService {
         let initial_payload = self
             .get_session(&client, &initial_base, session_id, &headers)
             .or_else(|error| {
-                if initial_base == zone_base || error.code == "authentication_required" {
+                if initial_base == zone_base
+                    || matches!(error.code, "authentication_required" | "http_unauthorized")
+                {
                     Err(error)
                 } else {
                     let payload = self.get_session(&client, &zone_base, session_id, &headers)?;
@@ -1000,32 +1110,33 @@ impl CloudMatchService {
         token: &str,
         device_id: &str,
         prefer_regional: bool,
-    ) -> Url {
+    ) -> Result<Url, ServiceError> {
         let host = requested.host_str().unwrap_or_default();
         if host != "prod.cloudmatchbeta.nvidiagrid.net" {
-            return requested.clone();
+            return Ok(requested.clone());
         }
         let Ok(url) = requested.join("v2/serverInfo") else {
-            return requested.clone();
+            return Ok(requested.clone());
         };
-        let Ok(headers) = cloudmatch_headers(token, device_id) else {
-            return requested.clone();
-        };
+        let headers = cloudmatch_headers(token, device_id)?;
         let Ok(response) = client.get(url).headers(headers).send() else {
-            return requested.clone();
+            return Ok(requested.clone());
         };
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err(response_error("Session region discovery failed", response));
+        }
         if !response.status().is_success() {
-            return requested.clone();
+            return Ok(requested.clone());
         }
         let Ok(payload) = response.json::<Value>() else {
-            return requested.clone();
+            return Ok(requested.clone());
         };
-        regional_bases(&payload)
+        Ok(regional_bases(&payload)
             .into_iter()
             .find(|base| {
                 !prefer_regional || !base.host_str().unwrap_or_default().starts_with("np-")
             })
-            .unwrap_or_else(|| requested.clone())
+            .unwrap_or_else(|| requested.clone()))
     }
 }
 
@@ -1689,7 +1800,9 @@ fn cloudmatch_http_error(
 ) -> ServiceError {
     let detail = payload.and_then(|payload| payload["requestStatus"]["statusDescription"].as_str());
     ServiceError {
-        code: if status.as_u16() == 401 || status.as_u16() == 403 {
+        code: if status.as_u16() == 401 {
+            "http_unauthorized"
+        } else if status.as_u16() == 403 {
             "authentication_required"
         } else {
             "upstream_error"
@@ -1701,7 +1814,7 @@ fn cloudmatch_http_error(
     }
 }
 
-fn trusted_cloudmatch_base(raw: &str) -> Result<Url, ServiceError> {
+pub(crate) fn trusted_cloudmatch_base(raw: &str) -> Result<Url, ServiceError> {
     let mut url = Url::parse(raw.trim()).map_err(|_| invalid("Invalid CloudMatch endpoint"))?;
     let host = url
         .host_str()
@@ -1737,17 +1850,20 @@ fn trusted_learned_server_base(server: &str) -> Result<Url, ServiceError> {
         .trim_end_matches('.')
         .to_lowercase();
     let trusted_hostname = host == "nvidiagrid.net" || host.ends_with(".nvidiagrid.net");
-    let trusted_ip = host.parse::<IpAddr>().is_ok_and(|address| match address {
-        IpAddr::V4(address) => {
-            !address.is_private()
-                && !address.is_loopback()
-                && !address.is_link_local()
-                && !address.is_unspecified()
-        }
-        IpAddr::V6(address) => {
-            !address.is_loopback() && !address.is_unicast_link_local() && !address.is_unspecified()
-        }
-    });
+    let trusted_ip = match url.host() {
+        Some(url::Host::Ipv4(address)) => public_session_ipv4(address),
+        Some(url::Host::Ipv6(address)) => address.to_ipv4_mapped().map_or_else(
+            || {
+                !address.is_loopback()
+                    && !address.is_unicast_link_local()
+                    && !address.is_unspecified()
+                    && !address.is_unique_local()
+                    && !address.is_multicast()
+            },
+            public_session_ipv4,
+        ),
+        _ => false,
+    };
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -1760,6 +1876,19 @@ fn trusted_learned_server_base(server: &str) -> Result<Url, ServiceError> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+fn public_session_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_unspecified()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+        && octets[0] != 0
+        && octets[0] < 240
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
 fn session_server_ip(session: &Value) -> Option<String> {
@@ -1882,7 +2011,9 @@ fn discover_sessions(
                     }
                 }
             }
-            Err(error) if error.code == "authentication_required" => return Err(error),
+            Err(error) if matches!(error.code, "authentication_required" | "http_unauthorized") => {
+                return Err(error);
+            }
             Err(_) => incomplete = true,
         }
     }
@@ -2796,7 +2927,7 @@ mod tests {
     fn targeted_not_found_is_distinct_from_authentication_and_invalid_payloads() {
         for (status, body, code) in [
             (404, json!({}), "session_not_found"),
-            (401, json!({}), "authentication_required"),
+            (401, json!({}), "http_unauthorized"),
             (403, json!({}), "authentication_required"),
             (
                 200,
@@ -3027,7 +3158,7 @@ mod tests {
             );
             let error = validate_cloudmatch_response("create", status, Ok(payload.clone()), false)
                 .unwrap_err();
-            assert_eq!(error.code, "authentication_required");
+            assert_eq!(error.code, "http_unauthorized");
         }
         assert!(!is_session_conflict(
             &json!({"requestStatus":{"statusCode":4,"statusDescription":"INTERNAL_ERROR_STATUS"}})
@@ -3364,7 +3495,14 @@ mod tests {
                 true,
             )
             .unwrap_err();
-            assert_eq!(error.code, "authentication_required");
+            assert_eq!(
+                error.code,
+                if status == 401 {
+                    "http_unauthorized"
+                } else {
+                    "authentication_required"
+                }
+            );
         }
         for (status, body, code) in [
             (
@@ -4225,5 +4363,22 @@ mod tests {
             trusted_cloudmatch_base("https://prod.cloudmatchbeta.nvidiagrid.net.evil.test")
                 .is_err()
         );
+        for address in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(trusted_learned_server_base(address).is_err(), "{address}");
+        }
+        assert!(trusted_learned_server_base("203.0.113.20").is_ok());
+        assert!(trusted_learned_server_base("2001:db8::20").is_ok());
     }
 }

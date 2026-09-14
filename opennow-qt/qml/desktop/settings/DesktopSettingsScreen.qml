@@ -54,6 +54,7 @@ FocusScope {
     }
 
     function valueSetting(key, fallbackValue) {
+        if (key === "region") return ShellStore.selectedRegion
         const value = ShellStore.settings[key]
         return value === undefined || value === null || value === "" ? fallbackValue : value
     }

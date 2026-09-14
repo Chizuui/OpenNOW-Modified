@@ -311,15 +311,80 @@ three-second per-request timeout, a 12-second total budget (including region
 discovery), and at most 32 regional endpoints. If no sessions were found but a
 region failed, returned invalid data, or could not be checked within these bounds,
 the request fails with `session_discovery_failed` rather than returning an empty
-list. Authentication failures remain `authentication_required`. A found session
+list. HTTP 401 remains `http_unauthorized` after at most one safe-read renewal;
+HTTP 403 remains `authentication_required`. A found session
 can be returned even when another region fails; an empty successful list means
 all discovered regions were checked successfully. Callers must not create a new
 session after a discovery failure.
 
+### Provider routing and account scope
+
+`auth.providers.list` returns `providers`, `defaultProviderIdpId`, `generation`, and
+`discovery: {state, message, retryAfterMs}`. Successful discovery is fresh for
+15 minutes. A failed refresh retains the last known providers and reports
+`state: "degraded"`. Without a discovered list, the response includes the restored
+provider, when present, and an explicit NVIDIA fallback. This fallback is not
+authoritative discovery. Retries wait at least 30 seconds; HTTP 429 `Retry-After`
+can extend the wait up to one hour. Qt performs at most three automatic retries.
+An explicit unknown `providerIdpId` fails with `provider_unavailable` rather than
+selecting another provider. Endpoint updates reconcile by exact IDP identity.
+
+Authenticated catalog and account reads include
+`scope: {generation, providerIdpId, userId}`. Core reads capture private ServiceId
+credentials and reject obsolete account/provider generations before publishing.
+HTTP 401 permits one renewal and one replay of a safe read for the same owner.
+HTTP 403 does not trigger renewal. Create, claim, account sync/unlink, and storage
+reset do not replay mutations after an ambiguous response.
+
+Authenticated VPC lookup requires a successful server-info response with a
+nonempty `requestStatus.serverId`. Missing or rejected metadata is an error,
+not a successful `GFN-PC` library. VPC cache entries are scoped by provider route,
+account, credential, generation, and proxy, with coalescing within each scope.
+Library and VPC requests use the same selected proxy. The core does not silently
+retry a selected proxy directly. Authenticated HTTP clients do not follow redirects.
+LCARS retains its configured shared endpoint; an Alliance provider ID does not
+select `GFNPartnerJWT` or invent a GraphQL hostname.
+
+`settings.set` for `region` also requires the current `providerIdpId`. The core
+atomically updates `region`, `regionProviderIdpId`, and the `providerRegions` map.
+The metadata fields cannot be written separately. Existing unscoped preferences
+remain eligible only for NVIDIA. Region overrides must occur in the current
+provider's server-info list. An unavailable or incompatible override falls back
+once to that provider's base without deleting the saved preference. Provider and
+region bases must be HTTPS NVIDIA-grid names without userinfo or nonstandard ports.
+Arbitrary partner domains require a separate evidenced trust policy.
+
+`session.create` acquires a single typed CloudMatch admission guard before provider
+discovery, authentication, or route locks. A concurrent create returns
+`session_update_busy` immediately instead of waiting to allocate after the first
+request fails or is cancelled. Pre-allocation failure releases the guard; after
+an allocation exists, the existing receipt and exact-seat cleanup state continue
+to prevent another allocation.
+
+CloudMatch requests serialize with account changes. An active seat retains its
+original account for polling and exact-seat cleanup after a switch or logout.
+If that retained credential expires, `session_owner_authentication_required`
+asks the user to return to the original account without restarting media.
+New-account credentials never authorize requests to the retained seat. When the
+selected account matches that owner, explicit cleanup renews expired ServiceId
+credentials before issuing DELETE. A rejected DELETE is not automatically replayed.
+Session results include `ownerScope` inside `session`; Qt distinguishes updates
+for its existing native session from unrelated old-account responses.
+
+`streamer.prepare` uses the caller's session ID to resolve the current core-owned
+active seat. Caller-supplied connection endpoints are ignored. Foreign or stale
+ownership fails with `session_owner_mismatch`, a non-ready seat with
+`session_not_ready`, and missing RTSPS endpoints with `session_endpoint_missing`.
+The existing negotiated profile checks still run. Preparation does not expose
+OAuth tokens to Qt or alter the native `/rtsp` websocket session-ID authentication.
+These fields are additive to protocol 3; allocation receipts and exact-seat
+compensation remain unchanged.
+
 `session.create` reports an existing-session limit as `session_conflict`, including
 CloudMatch status `11`, `SESSION_LIMIT` descriptions, and unified error
 `4AF1201E`, including structured session-limit responses with HTTP 403. An
-unrecognized HTTP 403 or an HTTP 401 remains `authentication_required`. The
+unrecognized HTTP 403 remains `authentication_required`; HTTP 401 is
+`http_unauthorized`. Session creation is never automatically replayed. The
 rejected request never becomes an active local session. The shell
 should call `session.remote.list` once and offer to resume or end the existing
 session instead of displaying the raw vendor error or retrying creation. When the
