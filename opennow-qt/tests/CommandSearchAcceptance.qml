@@ -152,6 +152,14 @@ QtObject {
         invalidate(function() { ShellStore.storeSessionReset() }, "catalog reset")
         invalidate(function() { client.state = "starting" }, "readiness loss")
         check(palette.searchStatus.indexOf("reconnects") >= 0, "readiness status is missing")
+        typeQuery("Open Library")
+        const reconnectingCount = searches().length
+        palette.acceptCurrent()
+        check(AppController.route === "library" && !palette.opened && searches().length === reconnectingCount,
+            "reconnecting Enter did not activate the local command without searching")
+        AppController.navigate("home")
+        palette.parent.commandOpen = true
+        typeQuery("settings")
         client.state = "ready"
         check(palette.searchState === "waiting", "restart did not schedule fresh search")
         invalidate(function() { ShellStore.authSession = null }, "logout")
@@ -159,7 +167,10 @@ QtObject {
         check(palette.actionList.length > 0 && palette.searchStatus.indexOf("Sign in") >= 0, "commands hid sign-in status")
         const signedOutCount = searches().length
         palette.acceptCurrent()
-        check(searches().length === signedOutCount, "signed-out Enter issued search")
+        check(searches().length === signedOutCount && !palette.opened && AppController.route === "settings",
+            "signed-out Enter did not activate the local command without searching")
+        AppController.navigate("home")
+        palette.parent.commandOpen = true
         ShellStore.authSession = {user:{userId:"synthetic-user",displayName:"Search fixture"},provider:{idpId:"synthetic-provider",code:"NVIDIA"}}
         invalidate(function() { palette.scopeFilter = "actions" }, "actions-only")
         typeQuery("settings")
@@ -364,6 +375,36 @@ QtObject {
         if (phase === 10) {
             check(AppController.route === "library" && !palette.opened, "actions-only Enter lost local command behavior")
             AppController.navigate("home")
+            phase = 17
+            return 0
+        }
+        if (phase === 17) {
+            palette.parent.commandOpen = true
+            inFlight = submit("settings")
+            key = Qt.Key_Down
+            phase = 15
+            return 0
+        }
+        if (phase === 15) {
+            check(palette.currentIndex === 1 && palette.actionList[1].route === "settings-streaming",
+                "Down did not select the pending local command: "
+                    + JSON.stringify([palette.currentIndex,palette.query,palette.scopeFilter,palette.opened,field.activeFocus,palette.actionList]))
+            client.responseReceived(inFlight, page([game("first-inserted"),game("second-inserted")]))
+            check(palette.currentIndex === palette.gameList.length + 1
+                && palette.actionList[palette.currentIndex - palette.gameList.length].route === "settings-streaming",
+                "arriving games replaced the selected local command")
+            key = Qt.Key_Return
+            phase = 16
+            return 0
+        }
+        if (phase === 16) {
+            check(AppController.route === "settings-streaming" && !palette.opened
+                && ShellStore.selectedGame.id === "keyboard-result" && count("session.create") === 0
+                && !client.requests.some(item => item.method === "catalog.launch.inspect"
+                    && ["first-inserted","second-inserted"].indexOf(item.params.appId) >= 0),
+                "Enter did not activate the preserved local command: "
+                    + JSON.stringify([AppController.route,palette.opened,count("catalog.launch.inspect"),count("session.create"),palette.currentIndex,field.activeFocus]))
+            AppController.navigate("home")
             phase = 11
             return 0
         }
@@ -387,7 +428,7 @@ QtObject {
         if (phase === 12) {
             if (Qt.application.arguments.indexOf("--search-scaled-light") >= 0)
                 check(Theme.lightMode && DesktopTokens.uiScale === 1.4, "scaled-light fixture did not apply its theme and scale")
-            check(palette.currentIndex === 1, "Down key did not move selection: "
+            check(palette.currentIndex === palette.gameList.length + 1, "Down key did not preserve the selected action: "
                 + JSON.stringify([palette.currentIndex,palette.flatCount,field.activeFocus,palette.opened]))
             const panel = find(palette, "commandPalettePanel")
             const status = find(palette, "commandSearchStatus")

@@ -77,7 +77,7 @@ FocusScope {
             && ShellStore.ready && ShellStore.signedIn
     }
     function acceptCurrent() {
-        if (gamesQuery && searchState !== "ready") {
+        if (gamesQuery && ShellStore.ready && ShellStore.signedIn && searchState !== "ready") {
             requestGames()
             return
         }
@@ -107,9 +107,14 @@ FocusScope {
                 root.searchError = qsTr("Game search returned an invalid or outdated response. Press Enter to retry.")
                 return
             }
+            const selectedActionIndex = root.currentIndex - root.gameList.length
+            const preserveAction = selectedActionIndex >= 0 && selectedActionIndex < root.actionList.length
             root.remoteGames = result.games || []
+            if (preserveAction)
+                root.currentIndex = root.gameList.length + selectedActionIndex
             root.searchHasMore = result.hasNextPage === true
             root.searchState = "ready"
+            root.scheduleCurrentVisibility()
         }
         function onRequestFailed(id, code, message) {
             if (!root.acceptsSearch(id)) return
