@@ -289,6 +289,17 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("set_property(TARGET opennow-hdrcolor-tests PROPERTY MSVC_DEBUG_INFORMATION_FORMAT Embedded)", tests)
         self.assertIn("target_compile_options(opennow-hdrcolor-tests PRIVATE /Zi)", tests)
 
+    def test_relocated_core_probe_matches_shell_protocol(self):
+        header = (ROOT / "opennow-qt/src/core/CoreClient.h").read_text()
+        version = int(re.search(r"CurrentProtocolVersion = (\d+);", header).group(1))
+        core = (ROOT / "native/opennow-core/src/main.rs").read_text()
+        self.assertEqual(int(re.search(r"const PROTOCOL_VERSION: i64 = (\d+);", core).group(1)), version)
+        for name in ("qt-build.yml", "qt-release-candidate.yml"):
+            with self.subTest(workflow=name):
+                workflow = (WORKFLOWS / name).read_text()
+                probe = workflow.split('"id":"package-core"', 1)[1].split("core.stdin.flush()", 1)[0]
+                self.assertEqual(int(re.search(r'"protocolVersion":(\d+)', probe).group(1)), version)
+
     def test_publishing_remains_explicitly_opt_in_after_build(self):
         ci = (WORKFLOWS / "qt-ci.yml").read_text()
         self.assertIn("        type: boolean\n        default: false", ci)

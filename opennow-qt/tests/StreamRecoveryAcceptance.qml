@@ -48,15 +48,19 @@ QtObject {
         ShellStore.streamerStartRequestId = ""
         ShellStore.streamerPrepareRequestId = ""
         ShellStore.recoverStreamingSession("connection lost")
-        check(client.calls[client.calls.length - 1].method === "session.remote.list", "discover before resume")
+        const recoveryProbe = client.calls[client.calls.length - 1]
+        check(recoveryProbe.method === "session.poll", "probe the exact seat before resume")
+        check(recoveryProbe.params.sessionId === "fixture" && recoveryProbe.params.recoveryMode === true,
+              "recovery probe retains the original seat identity")
         let id = ShellStore.recoveryDiscoveryRequestId
-        client.responseReceived(id, {sessions:[{sessionId:"unrelated"}]})
+        client.responseReceived(id, {session:{sessionId:"unrelated"}})
         check(ShellStore.sessionClaimRequestId === "", "never resume another game")
         ShellStore.streamerRestartTimer.stop()
         ShellStore.recoverStreamingSession("retry")
         id = ShellStore.recoveryDiscoveryRequestId
-        client.responseReceived(id, {sessions:[{sessionId:"fixture", streamingBaseUrl:"https://example.invalid"}]})
+        client.responseReceived(id, {session:{sessionId:"fixture", streamingBaseUrl:"https://example.invalid"}})
         check(client.calls[client.calls.length - 1].method === "session.claim", "claim the original session")
+        check(client.calls[client.calls.length - 1].params.sessionId === "fixture", "claim only the probed seat")
         id = ShellStore.sessionClaimRequestId
         client.responseReceived(id, {session:{sessionId:"fixture", status:3, phase:"resuming", resumePending:true}})
         check(ShellStore.streamerPrepareRequestId === "", "resume acknowledgement is not readiness")
@@ -84,7 +88,7 @@ QtObject {
         id = ShellStore.recoveryDiscoveryRequestId
         ShellStore.cancelSessionRecovery()
         const callsBeforeLateDiscovery = client.calls.length
-        client.responseReceived(id, {sessions:[{sessionId:"fixture"}]})
+        client.responseReceived(id, {session:{sessionId:"fixture"}})
         check(client.calls.length === callsBeforeLateDiscovery, "cancelled discovery must not resume")
         ShellStore.sessionRecoveryPending = true
         ShellStore.streamerStopRequestId = "fixture-stalled-stop"

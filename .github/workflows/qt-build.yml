@@ -622,7 +622,7 @@ jobs:
                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
               try:
                   core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
-                                   '"params":{"protocolVersion":1}}\n')
+                                   '"params":{"protocolVersion":2}}\n')
                   core.stdin.flush()
                   assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
                   response = json.loads(core.stdout.readline())

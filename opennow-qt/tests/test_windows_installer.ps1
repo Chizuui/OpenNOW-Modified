@@ -87,6 +87,8 @@ try {
     New-Item -ItemType Directory $root | Out-Null
     foreach ($version in @("1.0.0-nightly.255.1", "1.0.0-nightly.256.1", "1.0.0-nightly.256.2", "1.0.0")) {
         $source = New-Item -ItemType Directory "$root/$version"
+        New-Item -ItemType Directory "$source/packaging/icons" -Force | Out-Null
+        Copy-Item "$PSScriptRoot/../packaging/icons/OpenNOW.ico" "$source/packaging/icons/OpenNOW.ico"
         Set-Content "$source/fixture.txt" $version
         @"
 cmake_minimum_required(VERSION 3.24)
