@@ -1,4 +1,4 @@
-use super::tests::{auth_fixture, jwt, mock_requests, test_service};
+use super::tests::{auth_fixture, jwt, mock_requests, pending_attempt, test_service};
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -134,7 +134,9 @@ fn stopping_same_owner_renews_expired_service_id_before_exactly_one_delete() {
         owner.tokens.id_token = Some("expired-service-id".into());
         owner.tokens.id_token_expires_at = Some(now_ms() - 1);
         service.state.lock().unwrap().session = Some(owner.clone());
-        service.session_routing.lock().unwrap().active_owner = Some((owner, 7));
+        service.session_routing.lock().unwrap().active_owner = Some(
+            ActiveSeatOwner::capture(owner, 7, &json!({"sessionId":"owned-seat"}), None).unwrap(),
+        );
         service
             .cloudmatch
             .set_test_control_base(url::Url::parse(&url).unwrap());
@@ -188,7 +190,8 @@ fn stopping_expired_foreign_owner_never_renews_or_deletes_with_selected_credenti
     selected.tokens.access_token = "foreign-access".into();
     service.state.lock().unwrap().session = Some(selected);
     service.state.lock().unwrap().generation = 8;
-    service.session_routing.lock().unwrap().active_owner = Some((owner, 7));
+    service.session_routing.lock().unwrap().active_owner =
+        Some(ActiveSeatOwner::capture(owner, 7, &json!({"sessionId":"owned-seat"}), None).unwrap());
     service
         .cloudmatch
         .set_test_control_base(url::Url::parse(&url).unwrap());
@@ -649,7 +652,9 @@ fn preparation_uses_owned_context_and_rejects_old_generations_or_other_seats() {
     let (service, path) = service("http://127.0.0.1:1");
     let owner = auth_fixture("account-a");
     service.cloudmatch.seed_owned_session(json!({"sessionId":"seat-a","subSessionId":"sub-a","status":3,"rtspsEndpoints":["rtsps://owned.nvidiagrid.net:443"],"connectionInfo":[{"protocol":"RTSPS","host":"owned.nvidiagrid.net","port":443}]}));
-    service.session_routing.lock().unwrap().active_owner = Some((owner, 7));
+    service.session_routing.lock().unwrap().active_owner = Some(
+        ActiveSeatOwner::capture(owner.clone(), 7, &json!({"sessionId":"seat-a"}), None).unwrap(),
+    );
     let params = json!({"session":{"sessionId":"seat-a","status":3,"connectionInfo":[{"host":"evil.invalid"}]}});
     let calls = AtomicUsize::new(0);
     let result = service
@@ -674,12 +679,330 @@ fn preparation_uses_owned_context_and_rejects_old_generations_or_other_seats() {
         "session_owner_mismatch"
     );
     service.state.lock().unwrap().generation += 1;
+    let regained = service
+        .prepare_owned_stream(&params, |params| Ok(params.clone()))
+        .unwrap();
+    assert_eq!(regained["scope"]["generation"], 8);
+    assert_eq!(
+        regained["session"]["connectionInfo"][0]["host"],
+        "owned.nvidiagrid.net"
+    );
+    assert_eq!(
+        service.check_scope(&owner, 7).unwrap_err().code,
+        "stale_account"
+    );
+    service.state.lock().unwrap().session = Some(auth_fixture("account-b"));
     assert_eq!(
         service
-            .prepare_owned_stream(&params, |_| panic!("stale seat prepared"))
+            .prepare_owned_stream(&params, |_| panic!("foreign owner prepared"))
             .unwrap_err()
             .code,
         "session_owner_mismatch"
     );
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn original_identity_regains_each_exact_seat_operation_after_generation_changes() {
+    for transition in ["switch-back", "clear-cache", "relogin"] {
+        for operation in ["get", "poll", "prepare", "claim", "ad", "stop"] {
+            let payload = json!({"requestStatus":{"statusCode":1},"session":{
+                "sessionId":"seat-a","subSessionId":"sub-a","status":2,
+                "connectionInfo":[{"usage":16,"ip":"owned.nvidiagrid.net","port":443}]
+            }});
+            let responses = match operation {
+                "poll" | "ad" => vec![(200, payload.clone())],
+                "claim" => vec![(200, payload.clone()), (200, payload)],
+                "stop" => vec![(204, json!({}))],
+                _ => vec![],
+            };
+            let (url, worker) = mock_requests(responses, |_, request| {
+                assert!(request.contains(" /v2/session/seat-a"));
+                assert!(request.contains("GFNJWT test-access"));
+                assert!(!request.contains("foreign-access"));
+                assert!(!request.contains("forged.nvidiagrid.net"));
+            });
+            let (mut service, path) = service(&url);
+            let owner = auth_fixture("account-a");
+            service.vault.save(&owner).unwrap();
+            let mut foreign = auth_fixture("account-b");
+            foreign.tokens.access_token = "foreign-access".into();
+            service.vault.save(&foreign).unwrap();
+            service
+                .cloudmatch
+                .set_test_control_base(url::Url::parse(&url).unwrap());
+            let seat = json!({"sessionId":"seat-a","subSessionId":"sub-a","status":3,
+                "streamingBaseUrl":"https://owned.nvidiagrid.net/","zone":"owned.nvidiagrid.net",
+                "rtspsEndpoints":["rtsps://owned.nvidiagrid.net:443"],
+                "connectionInfo":[{"protocol":"RTSPS","host":"owned.nvidiagrid.net","port":443}]
+            });
+            service.cloudmatch.seed_owned_session(seat.clone());
+            service.session_routing.lock().unwrap().active_owner =
+                Some(ActiveSeatOwner::capture(owner.clone(), 7, &seat, None).unwrap());
+            match transition {
+                "switch-back" => {
+                    service
+                        .switch_account(&json!({"userId":"account-b"}))
+                        .unwrap();
+                    assert!(service.active_session().unwrap()["session"].is_null());
+                    let params = json!({"sessionId":"seat-a"});
+                    assert_eq!(
+                        service.claim_session(&params, &json!({})).unwrap_err().code,
+                        "session_owner_mismatch"
+                    );
+                    assert_eq!(
+                        service.report_session_ad(&params).unwrap_err().code,
+                        "session_owner_mismatch"
+                    );
+                    assert_eq!(
+                        service
+                            .prepare_owned_stream(&json!({"session":params}), |_| panic!(
+                                "foreign owner prepared"
+                            ))
+                            .unwrap_err()
+                            .code,
+                        "session_owner_mismatch"
+                    );
+                    service
+                        .switch_account(&json!({"userId":"account-a"}))
+                        .unwrap();
+                }
+                "clear-cache" => {
+                    service.clear_cache();
+                }
+                "relogin" => {
+                    service
+                        .state
+                        .lock()
+                        .unwrap()
+                        .attempts
+                        .insert("relogin".into(), pending_attempt(Some(owner.clone())));
+                    service
+                        .complete_device_login(&json!({"attemptId":"relogin"}))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let generation = service.state.lock().unwrap().generation;
+            assert!(generation > 7);
+            assert_eq!(
+                service.check_scope(&owner, 7).unwrap_err().code,
+                "stale_account"
+            );
+            let params = json!({"sessionId":"seat-a","streamingBaseUrl":"https://forged.nvidiagrid.net/","action":"start","adId":"fixture"});
+            let result = match operation {
+                "get" => service.active_session(),
+                "poll" => service.poll_session(&params),
+                "prepare" => service.prepare_owned_stream(&json!({"session":params}), |params| {
+                    assert_eq!(
+                        params["session"]["connectionInfo"][0]["host"],
+                        "owned.nvidiagrid.net"
+                    );
+                    assert_eq!(params["session"]["ownerScope"]["generation"], generation);
+                    Ok(json!({"context":{}}))
+                }),
+                "claim" => service.claim_session(&params, &json!({})),
+                "ad" => service.report_session_ad(&params),
+                "stop" => service.stop_session(&params, &json!({})),
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{transition}/{operation}: {error:?}"));
+            assert_eq!(
+                result["scope"]["generation"], generation,
+                "{transition}/{operation}"
+            );
+            assert_eq!(result["scope"]["userId"], "account-a");
+            if operation != "stop" {
+                assert_eq!(
+                    service
+                        .session_routing
+                        .lock()
+                        .unwrap()
+                        .active_owner
+                        .as_ref()
+                        .unwrap()
+                        .last_published_generation,
+                    generation
+                );
+            }
+            worker.join().unwrap();
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn durable_seat_republication_does_not_renew_allocation_receipt_authority() {
+    let (url, worker) = mock_requests(
+        vec![
+            (
+                200,
+                json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"fresh-seat","status":1}}),
+            ),
+            (200, json!({})),
+            (204, json!({})),
+        ],
+        |index, request| {
+            if index == 2 {
+                assert!(request.starts_with("DELETE /v2/session/fresh-seat "));
+            }
+        },
+    );
+    let (mut service, path) = service(&url);
+    {
+        let mut state = service.state.lock().unwrap();
+        state.providers = vec![auth_fixture("account-a").provider];
+        state.providers_expires = Some(Instant::now() + Duration::from_secs(60));
+    }
+    service
+        .cloudmatch
+        .set_test_control_base(url::Url::parse(&url).unwrap());
+    service
+        .create_session(&json!({"appId":"123"}), &json!({}))
+        .unwrap();
+    service.clear_cache();
+    assert_eq!(service.active_session().unwrap()["scope"]["generation"], 8);
+    assert_eq!(
+        service
+            .session_routing
+            .lock()
+            .unwrap()
+            .active_owner
+            .as_ref()
+            .unwrap()
+            .allocation_generation,
+        Some(7)
+    );
+    service.finish_session_create("fresh-seat", true).unwrap();
+    assert!(service.cloudmatch.active()["session"].is_null());
+    assert!(
+        service
+            .session_routing
+            .lock()
+            .unwrap()
+            .active_owner
+            .is_none()
+    );
+    worker.join().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rediscovery_stays_generation_fenced_and_same_user_other_provider_cannot_manage_seat() {
+    let (service, path) = service("http://127.0.0.1:1");
+    let owner = auth_fixture("account-a");
+    let seat = json!({"sessionId":"seat-a","status":3});
+    service
+        .cloudmatch
+        .seed_discovered_sessions(std::slice::from_ref(&seat));
+    service.session_routing.lock().unwrap().discovery_owner =
+        Some((owner.provider.idp_id.clone(), owner.user.user_id.clone(), 7));
+    service.clear_cache();
+    assert_eq!(
+        service.claim_session(&seat, &json!({})).unwrap_err().code,
+        "session_owner_mismatch"
+    );
+    service.cloudmatch.seed_owned_session(seat.clone());
+    service.session_routing.lock().unwrap().active_owner =
+        Some(ActiveSeatOwner::capture(owner.clone(), 7, &seat, None).unwrap());
+    service
+        .state
+        .lock()
+        .unwrap()
+        .session
+        .as_mut()
+        .unwrap()
+        .provider
+        .idp_id = "other-provider".into();
+    assert!(service.active_session().unwrap()["session"].is_null());
+    assert_eq!(
+        service.claim_session(&seat, &json!({})).unwrap_err().code,
+        "session_owner_mismatch"
+    );
+    assert_eq!(
+        service.report_session_ad(&seat).unwrap_err().code,
+        "session_owner_mismatch"
+    );
+    assert_eq!(
+        service
+            .prepare_owned_stream(&json!({"session":seat}), |_| panic!(
+                "foreign provider prepared"
+            ))
+            .unwrap_err()
+            .code,
+        "session_owner_mismatch"
+    );
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn delayed_poll_fences_ordinary_results_but_preserves_exact_seat_termination() {
+    for foreign_selected in [false, true] {
+        for status in [2, 7, 404] {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let payload = json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"seat-a","status":status}});
+            let (url, worker) = mock_requests(
+                vec![(if status == 404 { 404 } else { 200 }, payload)],
+                move |_, request| {
+                    assert!(request.contains(" /v2/session/seat-a "));
+                    assert!(request.contains("GFNJWT test-access"));
+                    assert!(!request.contains("foreign-access"));
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+            );
+            let (mut service, path) = service(&url);
+            let owner = auth_fixture("account-a");
+            let seat = json!({"sessionId":"seat-a","status":3});
+            service
+                .cloudmatch
+                .set_test_control_base(url::Url::parse(&url).unwrap());
+            service.cloudmatch.seed_owned_session(seat.clone());
+            service.session_routing.lock().unwrap().active_owner =
+                Some(ActiveSeatOwner::capture(owner, 7, &seat, None).unwrap());
+            if foreign_selected {
+                let mut foreign = auth_fixture("account-b");
+                foreign.tokens.access_token = "foreign-access".into();
+                service.vault.save(&foreign).unwrap();
+                service
+                    .switch_account(&json!({"userId":"account-b"}))
+                    .unwrap();
+            }
+            std::thread::scope(|threads| {
+                let poll = threads.spawn(|| service.poll_session(&json!({"sessionId":"seat-a"})));
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                service.clear_cache();
+                release_tx.send(()).unwrap();
+                let result = poll.join().unwrap();
+                if status == 2 && !foreign_selected {
+                    assert_eq!(result.unwrap_err().code, "stale_account");
+                } else {
+                    let result = result.unwrap();
+                    assert_eq!(result["scope"]["generation"], 7);
+                    assert_eq!(result["scope"]["userId"], "account-a");
+                    if status != 2 {
+                        let termination = if status == 7 {
+                            &result["session"]["termination"]
+                        } else {
+                            &result["termination"]
+                        };
+                        assert_eq!(termination["sessionId"], "seat-a");
+                        assert_eq!(termination["resumable"], false);
+                        assert!(service.cloudmatch.active()["session"].is_null());
+                        assert!(
+                            service
+                                .session_routing
+                                .lock()
+                                .unwrap()
+                                .active_owner
+                                .is_none()
+                        );
+                    }
+                }
+            });
+            worker.join().unwrap();
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
 }

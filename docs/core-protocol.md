@@ -361,19 +361,37 @@ request fails or is cancelled. Pre-allocation failure releases the guard; after
 an allocation exists, the existing receipt and exact-seat cleanup state continue
 to prevent another allocation.
 
-CloudMatch requests serialize with account changes. An active seat retains its
-original account for polling and exact-seat cleanup after a switch or logout.
+CloudMatch requests serialize with account changes. An active seat belongs to
+its exact session ID, user ID, and provider IDP, independently of the account
+generation. Returning from account A to B to A, clearing caches, or signing in
+again as A does not revoke A's ownership. New owned-seat operations publish the
+current generation and retain the core-captured control and media endpoints.
+An active seat retains its original account for polling and exact-seat cleanup
+after a switch or logout.
 If that retained credential expires, `session_owner_authentication_required`
 asks the user to return to the original account without restarting media.
 New-account credentials never authorize requests to the retained seat. When the
 selected account matches that owner, explicit cleanup renews expired ServiceId
 credentials before issuing DELETE. A rejected DELETE is not automatically replayed.
 Session results include `ownerScope` inside `session`; Qt distinguishes updates
-for its existing native session from unrelated old-account responses.
+for its existing native session from unrelated old-account responses. Ordinary
+asynchronous results, discovered seats, and catalog results remain generation
+fenced. A new allocation's receipt retains its original generation even when
+the active seat is republished under a newer generation; an obsolete receipt
+still triggers exact-seat compensation.
+
+Qt accepts authoritative terminal status 7 or HTTP 404 for the exact displayed
+session and its user/provider identity even when the result's generation is old.
+This exception applies before ordinary response and `session.changed` scope
+filters. It does not admit stale nonterminal updates, another account/provider,
+another session ID, or a resumable or non-authoritative termination. Duplicate
+terminal delivery cannot end a replacement seat.
 
 `streamer.prepare` uses the caller's session ID to resolve the current core-owned
-active seat. Caller-supplied connection endpoints are ignored. Foreign or stale
-ownership fails with `session_owner_mismatch`, a non-ready seat with
+active seat. Caller-supplied connection endpoints are ignored. The response also
+returns the owned `session` with its current `ownerScope`, which Qt retains for
+later session events. Foreign ownership or an unknown seat fails with
+`session_owner_mismatch`, a non-ready seat with
 `session_not_ready`, and missing RTSPS endpoints with `session_endpoint_missing`.
 The existing negotiated profile checks still run. Preparation does not expose
 OAuth tokens to Qt or alter the native `/rtsp` websocket session-ID authentication.

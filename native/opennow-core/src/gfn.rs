@@ -443,8 +443,41 @@ impl ServiceError {
 
 #[derive(Default)]
 struct SessionRouting {
-    active_owner: Option<(AuthSession, u64)>,
+    active_owner: Option<ActiveSeatOwner>,
     discovery_owner: Option<(String, String, u64)>,
+}
+
+struct ActiveSeatOwner {
+    auth: AuthSession,
+    session_id: String,
+    last_published_generation: u64,
+    allocation_generation: Option<u64>,
+}
+
+impl ActiveSeatOwner {
+    fn capture(
+        auth: AuthSession,
+        generation: u64,
+        session: &Value,
+        allocation_generation: Option<u64>,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            auth,
+            session_id: session["sessionId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(session_owner_error)?
+                .to_owned(),
+            last_published_generation: generation,
+            allocation_generation,
+        })
+    }
+
+    fn matches(&self, auth: &AuthSession, session_id: &str) -> bool {
+        self.session_id == session_id
+            && self.auth.user.user_id == auth.user.user_id
+            && self.auth.provider.idp_id == auth.provider.idp_id
+    }
 }
 
 pub struct GfnService {
@@ -594,7 +627,6 @@ impl GfnService {
                 Ok((providers, default))
             });
         crate::requests::check()?;
-        let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = self
             .auth_operation
             .lock()
@@ -623,14 +655,6 @@ impl GfnService {
                 state.providers_expires = Some(Instant::now() + Duration::from_secs(15 * 60));
                 state.providers_retry = None;
                 state.providers_error = None;
-                if let Some((owner, generation)) = &mut routing.active_owner
-                    && state.session.as_ref().is_some_and(|current| {
-                        current.user.user_id == owner.user.user_id
-                            && current.provider.idp_id == owner.provider.idp_id
-                    })
-                {
-                    *generation = state.generation;
-                }
             }
             Err(error) => {
                 state.providers_retry = Some(Instant::now() + retry_delay);
@@ -2075,7 +2099,12 @@ impl GfnService {
             .create(&params, &settings, &session, &self.device_id)
             .map(|result| scoped_result(result, &session, generation));
         if !self.cloudmatch.active()["session"].is_null() {
-            routing.active_owner = Some((session, generation));
+            routing.active_owner = Some(ActiveSeatOwner::capture(
+                session,
+                generation,
+                &self.cloudmatch.active()["session"],
+                Some(generation),
+            )?);
         }
         result
     }
@@ -2083,19 +2112,16 @@ impl GfnService {
     pub fn poll_session(&self, params: &Value) -> Result<Value, ServiceError> {
         let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        if let Some((owner, generation)) = &routing.active_owner
+        if let Some(owner) = &routing.active_owner
             && !self
                 .state
                 .lock()
                 .expect("GFN state poisoned")
                 .session
                 .as_ref()
-                .is_some_and(|current| {
-                    current.user.user_id == owner.user.user_id
-                        && current.provider.idp_id == owner.provider.idp_id
-                })
+                .is_some_and(|current| owner.matches(current, &owner.session_id))
         {
-            if owner.tokens.expiry(TokenPurpose::ServiceId) <= now_ms() {
+            if owner.auth.tokens.expiry(TokenPurpose::ServiceId) <= now_ms() {
                 return Err(ServiceError {
                     code: "session_owner_authentication_required",
                     message:
@@ -2107,14 +2133,14 @@ impl GfnService {
             if params["sessionId"]
                 .as_str()
                 .is_some_and(|id| active["sessionId"] != id)
-                || active.is_null()
+                || active["sessionId"] != owner.session_id
             {
                 return Err(session_owner_error());
             }
             let result = self
                 .cloudmatch
-                .poll(&active, owner, &self.device_id)
-                .map(|result| scoped_result(result, owner, *generation))
+                .poll(&active, &owner.auth, &self.device_id)
+                .map(|result| scoped_result(result, &owner.auth, owner.last_published_generation))
                 .map_err(|mut error| {
                     if error.code == "http_unauthorized" {
                         error.code = "session_owner_authentication_required";
@@ -2130,12 +2156,9 @@ impl GfnService {
             let params = self.owned_session_params(params, &routing, session, generation, false)?;
             self.cloudmatch.poll(&params, session, &self.device_id)
         });
-        if self.cloudmatch.active()["session"].is_null() {
-            routing.active_owner = None;
-        } else if let Ok((_, session, generation)) = &result {
-            routing.active_owner = Some((session.clone(), *generation));
-        }
-        result.map(|(result, _, _)| result)
+        result.and_then(|(result, session, generation)| {
+            self.publish_active_result(&mut routing, &session, generation, result)
+        })
     }
 
     pub fn finish_session_create(
@@ -2148,15 +2171,20 @@ impl GfnService {
             .lock()
             .expect("Session routing poisoned");
         let accepted = accepted
-            && routing
-                .active_owner
-                .as_ref()
-                .is_some_and(|(session, generation)| {
-                    self.check_scope(session, *generation).is_ok()
-                });
+            && routing.active_owner.as_ref().is_some_and(|owner| {
+                owner.session_id == session_id
+                    && owner
+                        .allocation_generation
+                        .is_some_and(|generation| self.check_scope(&owner.auth, generation).is_ok())
+            });
         let result = self.cloudmatch.finish_create(session_id, accepted);
         if self.cloudmatch.active()["session"].is_null() {
             routing.active_owner = None;
+        } else if result.is_ok()
+            && let Some(owner) = &mut routing.active_owner
+            && owner.session_id == session_id
+        {
+            owner.allocation_generation = None;
         }
         result
     }
@@ -2167,7 +2195,7 @@ impl GfnService {
         let active = self.cloudmatch.active()["session"].clone();
         let requested = params["sessionId"].as_str().unwrap_or("");
         if !active.is_null() && (requested.is_empty() || active["sessionId"] == requested) {
-            let (owner, generation) = routing
+            let owner = routing
                 .active_owner
                 .as_ref()
                 .ok_or_else(session_owner_error)?;
@@ -2177,14 +2205,11 @@ impl GfnService {
                 .expect("GFN state poisoned")
                 .session
                 .as_ref()
-                .is_some_and(|current| {
-                    current.provider.idp_id == owner.provider.idp_id
-                        && current.user.user_id == owner.user.user_id
-                });
+                .is_some_and(|current| owner.matches(current, &owner.session_id));
             let (session, generation) = if selected_owner {
                 self.session_snapshot_locked()?
             } else {
-                (owner.clone(), *generation)
+                (owner.auth.clone(), owner.last_published_generation)
             };
             if session.tokens.expiry(TokenPurpose::ServiceId) <= now_ms() {
                 return Err(ServiceError {
@@ -2192,13 +2217,15 @@ impl GfnService {
                     message: "Sign in to the session's original account to end it".into(),
                 });
             }
+            if active["sessionId"] != owner.session_id {
+                return Err(session_owner_error());
+            }
             let result = self
                 .cloudmatch
                 .stop(&active, settings, &session, &self.device_id)
-                .map(|result| scoped_result(result, &session, generation));
-            if self.cloudmatch.active()["session"].is_null() {
-                routing.active_owner = None;
-            }
+                .and_then(|result| {
+                    self.publish_active_result(&mut routing, &session, generation, result)
+                });
             return result;
         }
         let (session, generation) = self.session_snapshot_locked()?;
@@ -2209,35 +2236,34 @@ impl GfnService {
     }
 
     pub fn active_session(&self) -> Result<Value, ServiceError> {
-        let routing = crate::store_requests::lock(&self.session_routing)?;
-        if routing
-            .active_owner
-            .as_ref()
-            .is_none_or(|(session, generation)| self.check_scope(session, *generation).is_err())
-        {
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
+        let _operation = crate::store_requests::lock(&self.auth_operation)?;
+        let state = self.state.lock().expect("GFN state poisoned");
+        let active = self.cloudmatch.active();
+        let Some(session) = state.session.as_ref().filter(|session| {
+            routing.active_owner.as_ref().is_some_and(|owner| {
+                owner.matches(
+                    session,
+                    active["session"]["sessionId"].as_str().unwrap_or(""),
+                )
+            })
+        }) else {
             return Ok(json!({"session":null}));
-        }
-        let (session, generation) = routing
-            .active_owner
-            .as_ref()
-            .ok_or_else(session_owner_error)?;
-        Ok(scoped_result(
-            self.cloudmatch.active(),
-            session,
-            *generation,
-        ))
+        };
+        let session = session.clone();
+        let generation = state.generation;
+        drop(state);
+        self.publish_active_result(&mut routing, &session, generation, active)
     }
 
     pub fn remote_sessions(&self, params: &Value, settings: &Value) -> Result<Value, ServiceError> {
         self.providers()?;
         let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        let (result, session, generation) = self.session_read_locked(|session, generation| {
+        let (result, session, generation) = self.session_read_locked(|session, _| {
             let (mut params, settings) = self.scoped_session_route(params, settings, session)?;
-            if routing.active_owner.as_ref().is_none_or(|(owner, scope)| {
-                *scope != generation
-                    || owner.user.user_id != session.user.user_id
-                    || owner.provider.idp_id != session.provider.idp_id
+            if routing.active_owner.as_ref().is_none_or(|owner| {
+                !owner.matches(session, params["sessionId"].as_str().unwrap_or(""))
             }) {
                 if let Some(params) = params.as_object_mut() {
                     params.remove("sessionId");
@@ -2265,12 +2291,19 @@ impl GfnService {
             &session,
             generation,
         );
-        routing.active_owner = Some((session, generation));
-        Ok(result)
+        if routing.active_owner.is_none() && !self.cloudmatch.active()["session"].is_null() {
+            routing.active_owner = Some(ActiveSeatOwner::capture(
+                session.clone(),
+                generation,
+                &self.cloudmatch.active()["session"],
+                None,
+            )?);
+        }
+        self.publish_active_result(&mut routing, &session, generation, result)
     }
 
     pub fn report_session_ad(&self, params: &Value) -> Result<Value, ServiceError> {
-        let routing = crate::store_requests::lock(&self.session_routing)?;
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
         let (session, generation) = self.session_snapshot_locked()?;
         let mut owned = self.owned_session_params(params, &routing, &session, generation, false)?;
@@ -2281,7 +2314,37 @@ impl GfnService {
         }
         self.cloudmatch
             .report_ad(&owned, &session, &self.device_id)
-            .map(|result| scoped_result(result, &session, generation))
+            .and_then(|result| {
+                self.publish_active_result(&mut routing, &session, generation, result)
+            })
+    }
+
+    fn publish_active_result(
+        &self,
+        routing: &mut SessionRouting,
+        session: &AuthSession,
+        generation: u64,
+        result: Value,
+    ) -> Result<Value, ServiceError> {
+        let active = self.cloudmatch.active();
+        if active["session"].is_null() {
+            routing.active_owner = None;
+        } else {
+            self.check_scope(session, generation)?;
+            let owner = routing
+                .active_owner
+                .as_mut()
+                .filter(|owner| {
+                    owner.matches(
+                        session,
+                        active["session"]["sessionId"].as_str().unwrap_or(""),
+                    )
+                })
+                .ok_or_else(session_owner_error)?;
+            owner.auth = session.clone();
+            owner.last_published_generation = generation;
+        }
+        Ok(scoped_result(result, session, generation))
     }
 
     fn session_snapshot_locked(&self) -> Result<(AuthSession, u64), ServiceError> {
@@ -2355,15 +2418,15 @@ impl GfnService {
             .as_str()
             .or_else(|| active["sessionId"].as_str())
             .ok_or_else(session_owner_error)?;
-        let owns = |owner: &Option<(AuthSession, u64)>| {
-            owner.as_ref().is_some_and(|(owner, scope)| {
-                *scope == generation
-                    && owner.user.user_id == session.user.user_id
-                    && owner.provider.idp_id == session.provider.idp_id
-            })
-        };
-        if active["sessionId"] == id && owns(&routing.active_owner) {
-            return Ok(active);
+        if active["sessionId"] == id {
+            if routing
+                .active_owner
+                .as_ref()
+                .is_some_and(|owner| owner.matches(session, id))
+            {
+                return Ok(active);
+            }
+            return Err(session_owner_error());
         }
         if allow_discovered
             && routing
@@ -2389,7 +2452,7 @@ impl GfnService {
         params: &Value,
         prepare: impl FnOnce(&Value) -> Result<Value, ServiceError>,
     ) -> Result<Value, ServiceError> {
-        let routing = crate::store_requests::lock(&self.session_routing)?;
+        let mut routing = crate::store_requests::lock(&self.session_routing)?;
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
         let (session, generation) = self.session_snapshot_locked()?;
         let owned =
@@ -2413,8 +2476,11 @@ impl GfnService {
             });
         }
         let mut params = params.clone();
-        params["session"] = owned;
-        prepare(&params)
+        params["session"] =
+            scoped_result(json!({"session":owned}), &session, generation)["session"].clone();
+        let mut result = prepare(&params)?;
+        result["session"] = params["session"].clone();
+        self.publish_active_result(&mut routing, &session, generation, result)
     }
 
     fn scoped_session_route(
@@ -3871,7 +3937,7 @@ mod tests {
         )
     }
 
-    fn pending_attempt(session: Option<AuthSession>) -> DeviceAttempt {
+    pub(super) fn pending_attempt(session: Option<AuthSession>) -> DeviceAttempt {
         DeviceAttempt {
             provider: LoginProvider::default_nvidia(),
             device_code: "private-device-sentinel".into(),

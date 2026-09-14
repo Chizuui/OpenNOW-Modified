@@ -672,6 +672,23 @@ impl CloudMatchService {
         self.test_control_base = Some(base);
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_discovered_sessions(&self, sessions: &[Value]) {
+        self.store_discovered(sessions);
+    }
+
+    #[cfg(test)]
+    fn fixture_url(&self, url: Url) -> Url {
+        self.test_control_base.as_ref().map_or_else(
+            || url.clone(),
+            |base| {
+                let mut fixture = base.join(url.path()).expect("valid fixture URL");
+                fixture.set_query(url.query());
+                fixture
+            },
+        )
+    }
+
     fn capture_session_conflict(
         &self,
         status: reqwest::StatusCode,
@@ -904,6 +921,8 @@ impl CloudMatchService {
                 .append_pair("keyboardLayout", &keyboard_layout)
                 .append_pair("languageCode", &language);
             let body = build_resume_body(&app_id, session, settings, device_id);
+            #[cfg(test)]
+            let url = self.fixture_url(url);
             let response = client
                 .put(url)
                 .headers(headers.clone())
@@ -972,6 +991,8 @@ impl CloudMatchService {
         let url = base
             .join(&format!("v2/session/{session_id}"))
             .map_err(|_| invalid("Invalid session ad update URL"))?;
+        #[cfg(test)]
+        let url = self.fixture_url(url);
         let mut update = json!({
             "adId": ad_id,
             "adAction": action,
@@ -1067,6 +1088,8 @@ impl CloudMatchService {
         let url = base
             .join(&format!("v2/session/{session_id}"))
             .map_err(|_| invalid("Invalid CloudMatch polling URL"))?;
+        #[cfg(test)]
+        let url = self.fixture_url(url);
         let mut last_error = None;
         for attempt in 0..=2 {
             match client.get(url.clone()).headers(headers.clone()).send() {

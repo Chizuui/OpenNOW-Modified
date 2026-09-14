@@ -22,6 +22,62 @@ QtObject {
         function cancel(id) { return true }
     }
     function check(ok, message) { if (!ok) throw new Error("Stream recovery: " + message) }
+    function checkOwnedTerminations() {
+        const owner = {generation:7,userId:"account-a",providerIdpId:"provider-a"}
+        ShellStore.authGeneration = 9
+        ShellStore.authSession = {user:{userId:"account-a",displayName:"Account A"},provider:{idpId:"provider-a"}}
+        ShellStore.streamer = {status:"stopped"}
+        ShellStore.activeSession = {sessionId:"fixture",status:3,ownerScope:owner,marker:"original"}
+        for (const path of ["response", "event"]) {
+            for (const payload of [
+                {scope:owner,session:{sessionId:"fixture",status:1,marker:"stale"}},
+                {scope:owner,session:null,termination:{source:"untrusted",status:7,sessionId:"fixture",resumable:false}},
+                {scope:owner,session:null,termination:{source:"cloudmatch-http",httpStatus:503,sessionId:"fixture",resumable:false}},
+                {scope:owner,session:null,termination:{source:"cloudmatch-http",httpStatus:404,sessionId:"fixture",resumable:true}},
+                {scope:owner,session:null,termination:{source:"cloudmatch-http",httpStatus:404,sessionId:"other-seat",resumable:false}},
+                {scope:{generation:7,userId:"account-b",providerIdpId:"provider-a"},session:null,
+                    termination:{source:"cloudmatch-http",httpStatus:404,sessionId:"fixture",resumable:false}},
+                {scope:{generation:7,userId:"account-a",providerIdpId:"provider-b"},session:null,
+                    termination:{source:"cloudmatch-http",httpStatus:404,sessionId:"fixture",resumable:false}}
+            ]) {
+                ShellStore.streamPollRequestId = "terminal-fixture"
+                if (path === "response") client.responseReceived("terminal-fixture", payload)
+                else client.eventReceived("session.changed", payload)
+                check(ShellStore.activeSession && ShellStore.activeSession.marker === "original",
+                      path + " rejects stale ordinary, foreign-owner, foreign-seat, and non-authoritative terminal results")
+            }
+        }
+        for (const selected of ["account-a", "account-b"]) {
+            ShellStore.authSession = {user:{userId:selected,displayName:selected},provider:{idpId:"provider-a"}}
+            for (const firstPath of ["response", "event"]) {
+                for (const payload of [
+                    {scope:owner,session:{sessionId:"fixture",status:7}},
+                    {scope:owner,session:null,termination:{source:"cloudmatch-session-status",status:7,sessionId:"fixture",resumable:false}},
+                    {scope:owner,session:null,termination:{source:"cloudmatch-http",httpStatus:404,sessionId:"fixture",resumable:false}}
+                ]) {
+                    ShellStore.activeSession = {sessionId:"fixture",status:3,ownerScope:owner}
+                    ShellStore.streamState = "ready"
+                    ShellStore.streamPollRequestId = "terminal-fixture"
+                    ShellStore.streamerPrepareRequestId = "preparing-fixture"
+                    ShellStore.sessionRecoveryPending = true
+                    if (firstPath === "response") client.responseReceived("terminal-fixture", payload)
+                    else client.eventReceived("session.changed", payload)
+                    check(!ShellStore.activeSession && ShellStore.streamState === "idle"
+                          && ShellStore.streamPollRequestId === "" && ShellStore.streamerPrepareRequestId === ""
+                          && !ShellStore.sessionRecoveryPending && !ShellStore.streamPollTimer.running,
+                          firstPath + " authoritatively ends the exact owned seat despite a newer auth generation")
+                    ShellStore.activeSession = {sessionId:"replacement",status:3,
+                        ownerScope:{generation:9,userId:"account-a",providerIdpId:"provider-a"}}
+                    if (firstPath === "response") client.eventReceived("session.changed", payload)
+                    else client.responseReceived("terminal-fixture", payload)
+                    check(ShellStore.activeSession && ShellStore.activeSession.sessionId === "replacement",
+                          "duplicate terminal delivery cannot end a replacement seat")
+                }
+            }
+        }
+        ShellStore.authSession = null
+        ShellStore.authGeneration = 0
+    }
     function run(parent) {
         client.state = "stopped"
         ShellStore.streamerStartRequestId = "fixture-blocked"
@@ -127,6 +183,7 @@ QtObject {
         ShellStore.settings = {statsShowPacketLoss:false}
         check(stats.cards.every(card => card.key !== "PacketLoss"), "honor hidden metrics")
         stats.destroy()
+        checkOwnedTerminations()
         ShellStore.activeSession = null
         ShellStore.streamer = null
         return true

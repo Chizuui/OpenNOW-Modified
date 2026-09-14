@@ -2321,6 +2321,18 @@ QtObject {
             && String(owner.providerIdpId) === String(scope.providerIdpId))
     }
 
+    function ownedSessionTermination(result) {
+        const owner = activeSession && activeSession.ownerScope
+        const scope = result && result.scope
+        if (!owner || !scope || String(owner.userId) !== String(scope.userId)
+                || String(owner.providerIdpId) !== String(scope.providerIdpId)) return null
+        const session = result.session
+        const termination = result.termination || (session && Number(session.status) === 7
+            ? (session.termination || {source:"cloudmatch-session-status",status:7,sessionId:session.sessionId,resumable:false}) : null)
+        return isRemoteSessionTermination(termination) && termination.sessionId
+            && String(termination.sessionId) === String(activeSession.sessionId) ? termination : null
+    }
+
     function requestConsoleSurface(enabled) {
         return settingsOwner.requestConsoleSurface(enabled)
     }
@@ -2725,6 +2737,11 @@ QtObject {
             }
         }
         function onResponseReceived(requestId, result) {
+            const ownedTermination = root.ownedSessionTermination(result)
+            if (ownedTermination) {
+                root.finishRemoteSession(ownedTermination)
+                return
+            }
             const newerSameOwner = result.scope && Number(result.scope.generation) > root.authGeneration
                 && root.authSession && String(result.scope.userId) === String(root.authSession.user.userId)
                 && String(result.scope.providerIdpId) === String(root.authSession.provider.idpId)
@@ -3087,6 +3104,8 @@ QtObject {
                     }))
                     return
                 }
+                if (result.session && root.activeSession && result.session.sessionId === root.activeSession.sessionId)
+                    root.activeSession = result.session
                 const preparedSettings = result.context.settings || ({})
                 const initialMicrophoneEnabled = root.prepareMicrophoneStart(
                     root.activeSession.sessionId, preparedSettings.microphoneMode)
@@ -3328,6 +3347,11 @@ QtObject {
                 root.streamMessage = root.lastError
                 root.refreshRemoteSessions()
             } else if (name === "session.changed") {
+                const ownedTermination = root.ownedSessionTermination(payload)
+                if (ownedTermination) {
+                    root.finishRemoteSession(ownedTermination)
+                    return
+                }
                 if (!root.acceptsSessionScope(payload.scope)) return
                 if (root.isRemoteSessionTermination(payload.termination))
                     root.finishRemoteSession(payload.termination)
