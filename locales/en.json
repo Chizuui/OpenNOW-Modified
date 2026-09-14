@@ -1,4 +1,17 @@
 {
+  "sessionSetupProgress": {
+    "cleanupTitle": "Cleaning up your previous session",
+    "cleanupDetail": "GeForce NOW is releasing resources from your previous session before starting this one.",
+    "storageTitle": "Waiting for cloud storage",
+    "storageDetail": "GeForce NOW is waiting for session storage to become available.",
+    "queueTitle": "Waiting for an available rig",
+    "connectingTitle": "Connecting to GeForce NOW",
+    "connectingDetail": "GeForce NOW is connecting your session to a cloud gaming server.",
+    "configuringTitle": "Configuring your cloud gaming rig",
+    "configuringDetail": "Your rig has been allocated. GeForce NOW is configuring it for your game.",
+    "nativeStarting": "Initializing the native streaming connection.",
+    "waitingForVideo": "Connected. Waiting for the first video frame."
+  },
   "fsrUpscaling": {
     "description": "FSR 1 upscales enlarged SDR video on the GPU. Uses extra GPU time; HDR and unavailable effects use normal scaling.",
     "clarityDescription": "Sharpen details after FSR 1 upscaling. Set to 0 to disable.",

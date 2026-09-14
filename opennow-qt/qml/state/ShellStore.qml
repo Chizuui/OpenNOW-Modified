@@ -289,6 +289,9 @@ QtObject {
     property string streamerDetectionMessage: qsTr("Checking native codec support…")
     property string streamState: "idle"
     property string streamMessage: ""
+    property SessionSetupProgress sessionSetupProgress: SessionSetupProgress {
+        session: root.activeSession
+    }
     property int streamerRestartAttempts: 0
     property bool streamerRecoveryExhausted: false
     property int sessionReconnectAttempts: 0
@@ -1497,12 +1500,9 @@ QtObject {
             streamMessage = qsTr("GeForce NOW could not prepare this session.")
             streamPollTimer.stop()
         } else {
-            const position = Number(activeSession.queuePosition || 0)
             streamMessage = activeSession.resumePending
                 ? qsTr("Reconnecting to your running game. You don't need to start again.")
-                : position > 0
-                ? qsTr("Queue position %1").arg(position)
-                : qsTr("Preparing your cloud gaming seat…")
+                : sessionSetupProgress.title + "\n" + sessionSetupProgress.detail
             streamPollTimer.restart()
         }
         syncDiscordPresence()

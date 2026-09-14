@@ -25,18 +25,21 @@ FocusScope {
         || (connecting && (streamer.status === "error" || streamer.status === "stopped")))
     readonly property bool reconnecting: phase === "reconnecting"
         || ShellStore.streamerRestartAttempts > 0 || ShellStore.sessionReconnectAttempts > 0
-    readonly property int queuePosition: Math.max(0, Number(session.queuePosition || 0))
+    SessionSetupProgress {
+        id: setupProgress
+        session: root.session
+    }
     readonly property string statusText: {
         if (stopping) return qsTr("Closing your session")
         if (failed) return ShellStore.launchConflictDetected
             ? qsTr("Your game is still running") : qsTr("Session could not start")
         if (reconnecting) return qsTr("Reconnecting to your session")
         if (connecting) return qsTr("Connecting to your game")
-        if (queuePosition > 0) return qsTr("Queue position %1").arg(queuePosition)
+        if (setupProgress.queued) return setupProgress.title
         if (phase === "checking") return qsTr("Checking session availability")
         if (phase === "requesting") return qsTr("Requesting your session")
         if (phase === "resuming") return qsTr("Reconnecting to your game")
-        return qsTr("Preparing your game")
+        return setupProgress.title
     }
     readonly property string detailText: {
         if (stopping) return qsTr("Waiting for your session to close.")
@@ -45,9 +48,12 @@ FocusScope {
         if (reconnecting) return qsTr("Your stream will return when the connection is restored.")
         if (phase === "resuming" || phase === "checking" || phase === "conflict")
             return ShellStore.streamMessage
-        if (connecting) return qsTr("Your game will appear here as soon as the video is ready.")
-        if (queuePosition > 0) return qsTr("Waiting for an available rig. Your session will start automatically.")
-        return qsTr("Your session will start automatically when it is ready.")
+        if (connecting) {
+            if (streamer.status === "starting") return qsTr("Initializing the native streaming connection.")
+            if (streamer.status === "streaming") return qsTr("Connected. Waiting for the first video frame.")
+            return qsTr("Your game will appear here as soon as the video is ready.")
+        }
+        return setupProgress.detail
     }
 
     function restoreFocus() {
