@@ -11,7 +11,7 @@ ambiguous state.
 The first shell request is always:
 
 ```json
-{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":2,"shell":"qt","shellVersion":"0.5.4"}}
+{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":3,"shell":"qt","shellVersion":"0.5.4"}}
 ```
 
 The core must return the same protocol version and its capabilities. The shell
@@ -20,6 +20,49 @@ five-second handshake deadline, process exit and invalid data all transition the
 transport to `failed` with a credential-free diagnostic.
 
 ## Messages
+
+### Authentication boundary
+
+Protocol 3 auth responses and `auth.session.changed` events use the same envelope.
+`session` is either null or an allowlisted object containing `user` and `provider`.
+Credentials and issuing-client details remain private to the core. The envelope
+includes the core-process account `generation`, `persistence`, `refresh`, `warnings`,
+and `deviceIdentity`. Consumers reject older generations and reset their generation
+when a new core process completes its handshake. A token refresh does not change
+account generation.
+
+`auth.device.start` returns `attemptId`, `userCode`, verification URLs, `qrRows`,
+`expiresAt`, and `intervalSeconds`. Poll, complete, and cancel use `attemptId` only.
+The core retains the device grant and enforces the deadline, one in-flight poll,
+and cumulative five-second `slow_down` increments. Pending poll replies include
+`retryAfterMs`; the shell schedules one subsequent poll from that reply.
+Cancellation before the completion commit fence prevents persistence and publication.
+Once the fence is entered, completion is committed under auth ownership; cancelling
+its response does not undo that login. The shell reconciles such cancellation with
+`auth.session.get`. Logout or account replacement invalidates pending login/link work.
+
+Persistence intent is independent of outcome. `secure-store` means the session was
+written to and verified in the OS credential store and its nonsecret index committed.
+`memory-only` never writes a plaintext credential fallback. `migration-pending` means
+a recoverable legacy source remains because secure migration could not finish.
+`unavailable` means restoration failed; warnings identify deferred cleanup without
+containing credentials. An explicitly temporary login suppresses automatic restoration
+of older saved grants for that identity. Legacy sources are removed only after verified
+secure persistence and metadata commit, or explicit account removal. This is file
+cleanup, not guaranteed secure erasure of backups or snapshots.
+
+Logout always ends local auth ownership and reports `remoteRevoke` separately from
+`localCleanup`. Revocation is best-effort DELETE of the selected client grant with an
+access bearer; all-account revocation has a five-second total network budget. Failed
+local deletion remains suppressed in the nonsecret account index and is retried on
+startup. A metadata write failure reports pending cleanup and cannot guarantee that
+suppression survives restart. Logout still selects the next saved account when available.
+
+The core persists one versioned 64-hex device identity. Upgrades freeze the previously
+derived identity using the current environment; if that environment changed before the
+first upgraded launch, the former hash cannot be recovered. Corrupt or unwritable identity
+storage is not replaced, new login is blocked, and restoration reports unavailable device
+identity rather than claiming durable compatibility.
 
 ```json
 {"type":"request","id":"42","method":"settings.get","params":{}}
@@ -48,7 +91,7 @@ and region measurement loops stop at cooperative checkpoints. An already-running
 blocking HTTP, DNS, or TCP operation is not forcibly interrupted; its existing
 timeout still applies. Other mutating operations already dispatched are not rolled back.
 
-Protocol 2 requires the Qt client to acknowledge an accepted successful `session.create`
+Protocol 3 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
 response with `{"type":"ack","id":"42"}` before delivering that response to QML.
 Cancelled or timed-out requests do not acknowledge late responses. The create worker
 retains its admission slot for at most ten seconds awaiting acceptance, then the

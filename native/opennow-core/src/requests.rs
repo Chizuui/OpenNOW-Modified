@@ -19,6 +19,14 @@ struct RequestState {
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<RequestState>);
 impl Cancellation {
+    pub fn commit<T>(
+        &self,
+        work: impl FnOnce() -> Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        let _commit = self.0.accepted.lock().expect("request commit poisoned");
+        self.check()?;
+        work()
+    }
     pub fn cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
@@ -123,6 +131,37 @@ pub fn scope<T>(token: Cancellation, work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auth_commit_fence_rejects_prior_cancellation_and_finishes_entered_commit() {
+        let requests = Arc::new(Requests::default());
+        let permit = requests.admit("login", "auth.device.complete").unwrap();
+        requests.cancel("login");
+        assert!(
+            permit
+                .token
+                .commit(|| -> Result<(), ServiceError> { panic!("cancelled commit ran") })
+                .is_err()
+        );
+        let permit = requests.admit("second", "auth.device.complete").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let token = permit.token.clone();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                token.commit(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok("committed")
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancellation = scope.spawn(|| requests.cancel("second"));
+            release_tx.send(()).unwrap();
+            assert_eq!(worker.join().unwrap().unwrap(), "committed");
+            cancellation.join().unwrap();
+        });
+        assert!(permit.token.cancelled());
+    }
     #[test]
     fn allocation_receipt_requires_acceptance_and_cancellation_wins() {
         let requests = Arc::new(Requests::default());

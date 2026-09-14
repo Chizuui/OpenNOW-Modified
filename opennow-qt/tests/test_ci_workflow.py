@@ -17,6 +17,16 @@ def jobs(workflow):
 
 
 class CIWorkflowTest(unittest.TestCase):
+    def test_stack_base_branches_run_pr_checks_without_new_push_or_publication_triggers(self):
+        ci = (WORKFLOWS / "qt-ci.yml").read_text()
+        pull = ci.split("  pull_request:\n", 1)[1].split("  push:\n", 1)[0]
+        push = ci.split("  push:\n", 1)[1].split("\nconcurrency:", 1)[0]
+        for branch in ("capy/explain-cloud-session-setup", "capy/gfn-correctness/**"):
+            self.assertIn(f"      - {branch}\n", pull)
+            self.assertNotIn(branch, push)
+        self.assertNotIn("pull_request_target:", ci)
+        self.assertIn("github.event_name == 'workflow_dispatch'", jobs(ci)["publish-nightly"])
+
     def test_linux_appimages_deploy_wayland_platform_and_shell_plugins(self):
         for name in ("qt-build.yml", "qt-release-candidate.yml"):
             with self.subTest(workflow=name):

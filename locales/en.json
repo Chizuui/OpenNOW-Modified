@@ -1,4 +1,8 @@
 {
+  "credentialPersistence": {
+    "migrationPending": "Secure account migration is pending. Unlock your system credential store and restart OpenNOW.",
+    "cleanupPending": "Account credential cleanup is pending. Your saved data has been retained for recovery."
+  },
   "sessionSetupProgress": {
     "cleanupTitle": "Cleaning up your previous session",
     "cleanupDetail": "GeForce NOW is releasing resources from your previous session before starting this one.",
@@ -2882,7 +2886,7 @@
       "s_qt_runtime_49": "%1 · NVIDIA account linked",
       "s_qt_runtime_50": ". Active",
       "s_qt_runtime_51": ". Press to apply",
-      "s_qt_runtime_52": "A saved NVIDIA session could not be opened. Sign in once more to store it on this PC.",
+      "s_qt_runtime_52": "Your system credential store is unavailable. Unlock it and restart OpenNOW, or sign in for a memory-only session.",
       "s_qt_runtime_53": "ACTIVE THEME",
       "s_qt_runtime_54": "ASIA PACIFIC",
       "s_qt_runtime_55": "AUTO REGION",

@@ -17,6 +17,41 @@ class EmbeddedOrchestrationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void authenticationEnvelopeRejectsOlderAccountsAndCancelsEveryLoginPhase()
+    {
+        const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+        QJSEngine engine;
+        for (const auto &name : {"acceptAuthEnvelope", "cancelDeviceLogin", "pollDeviceLogin"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(shell);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var authGeneration = 4, authSession = null, sessionPersistence = 'none', authWarnings = [];
+            var ready = true, signedIn = false, authState = 'waiting', authSessionRequestId = '';
+            var deviceStartRequestId = 'start', devicePollRequestId = 'poll', deviceCompleteRequestId = 'complete';
+            var authChallenge = {attemptId: 'attempt'}, cancelled = [], requests = [];
+            var devicePollTimer = {stop: function() {}};
+            var CoreClient = {cancel: function(id) { cancelled.push(id) }, request: function(method, params) {
+                requests.push({method: method, params: params}); return 'reconcile';
+            }};
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("acceptAuthEnvelope({generation:5,session:{user:{userId:'new'},provider:{code:'NVIDIA'}},persistence:'secure-store'})")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("acceptAuthEnvelope({generation:4,session:null})")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("authSession.user.userId")).toString(), QStringLiteral("new"));
+        QVERIFY(!engine.evaluate(QStringLiteral("cancelDeviceLogin()")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.join(',')")).toString(), QStringLiteral("start,complete,poll"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("auth.session.get"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[1].method")).toString(), QStringLiteral("auth.device.cancel"));
+        QVERIFY(!engine.evaluate(QStringLiteral("authChallenge={attemptId:'new'}; pollDeviceLogin()")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("Object.keys(requests[2].params).join(',')")).toString(), QStringLiteral("attemptId"));
+        QVERIFY(!shell.contains(QStringLiteral("deviceCode")));
+        const auto timer = shell.section(QStringLiteral("property Timer devicePollTimer:"), 1).section(QStringLiteral("property Timer streamPollTimer:"), 0, 0);
+        QVERIFY(timer.contains(QStringLiteral("repeat: false")));
+    }
+
     void desktopStoreSelectionUsesTheSelectedLaunchVariant()
     {
         const auto desktop = source(QStringLiteral("qml/desktop/shell/DesktopApp.qml"));

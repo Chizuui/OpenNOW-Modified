@@ -6,6 +6,7 @@ mod cloudmatch;
 mod community;
 mod console_profiles;
 mod credential_vault;
+mod device_identity;
 mod diagnostics;
 mod discord;
 mod gfn;
@@ -39,7 +40,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use streamer::StreamerService;
 
-const PROTOCOL_VERSION: i64 = 2;
+const PROTOCOL_VERSION: i64 = 3;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 
 struct AppCore {
@@ -436,17 +437,11 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             .map_err(gfn_error),
         "auth.logout" => {
             let value = core.gfn.logout().map_err(gfn_error)?;
-            Ok((
-                value.clone(),
-                Some(("auth.session.changed", json!({"session":value["session"]}))),
-            ))
+            Ok((value.clone(), Some(("auth.session.changed", value))))
         }
         "auth.accounts.logoutAll" => {
             let value = core.gfn.logout_all().map_err(gfn_error)?;
-            Ok((
-                value,
-                Some(("auth.session.changed", json!({"session":null}))),
-            ))
+            Ok((value.clone(), Some(("auth.session.changed", value))))
         }
         "auth.accounts.list" => core
             .gfn
@@ -461,7 +456,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "auth.accounts.remove" => core
             .gfn
             .remove_account(params)
-            .map(|value| (value, None))
+            .map(|value| (value.clone(), Some(("auth.session.changed", value))))
             .map_err(gfn_error),
         "auth.pin.status" => core
             .gfn

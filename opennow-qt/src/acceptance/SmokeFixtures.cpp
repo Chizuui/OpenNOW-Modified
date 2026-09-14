@@ -30,6 +30,20 @@ int AcceptanceSession::prepareWindow()
         };
         if (window) window->resize(dimension(u"--smoke-width"_s, 1600),
                                    dimension(u"--smoke-height"_s, 900));
+        const auto persistenceIndex = m_arguments.indexOf(u"--smoke-auth-persistence"_s);
+        if (persistenceIndex >= 0) {
+            if (persistenceIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            const auto persistence = m_arguments.at(persistenceIndex + 1);
+            if (persistence != u"memory-only"_s && persistence != u"migration-pending"_s
+                    && persistence != u"unavailable"_s) return EXIT_FAILURE;
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            store->setProperty("authRestorePending", false);
+            store->setProperty("authSession", QVariant());
+            store->setProperty("sessionPersistence", persistence);
+            m_controller.navigate(u"sign-in"_s);
+            if (store->property("sessionPersistenceMessage").toString().isEmpty()) return EXIT_FAILURE;
+        }
         const auto resumeIndex = m_arguments.indexOf(u"--smoke-session-resume"_s);
         if (resumeIndex >= 0) {
             if (resumeIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;

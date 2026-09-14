@@ -192,6 +192,8 @@ QtObject {
     property alias storePanels: catalogOwner.storePanels
     property alias storeFilterGroups: catalogOwner.storeFilterGroups
     property string sessionPersistence: "none"
+    property double authGeneration: 0
+    property var authWarnings: []
     property bool authRestorePending: true
     property bool pendingStaySignedIn: true
     signal consoleSurfaceRequested(bool enabled)
@@ -437,9 +439,13 @@ QtObject {
         + Number(streamer && streamer.deviceRecoveryCount || 0)
     readonly property string sessionPersistenceMessage: {
         if (sessionPersistence === "unavailable")
-            return qsTr("A saved NVIDIA session could not be opened. Sign in once more to store it on this PC.")
+            return qsTr("Your system credential store is unavailable. Unlock it and restart OpenNOW, or sign in for a memory-only session.")
         if (sessionPersistence === "memory-only")
             return qsTr("This session is memory-only and will not last after you quit.")
+        if (sessionPersistence === "migration-pending")
+            return qsTr("Secure account migration is pending. Unlock your system credential store and restart OpenNOW.")
+        if (authWarnings.length > 0)
+            return qsTr("Account credential cleanup is pending. Your saved data has been retained for recovery.")
         return ""
     }
     readonly property bool streamBusy: streamCreateRequestId !== "" || streamStopRequestId !== ""
@@ -493,8 +499,8 @@ QtObject {
         : qsTr("Uses the system default microphone. Open microphone sends audio continuously during supported sessions. Changes apply to the next session.")
 
     property Timer devicePollTimer: Timer {
-        interval: root.authChallenge ? Math.max(1000, Number(root.authChallenge.intervalSeconds || 5) * 1000) : 5000
-        repeat: true
+        interval: 5000
+        repeat: false
         running: false
         onTriggered: root.pollDeviceLogin()
     }
@@ -1058,6 +1064,7 @@ QtObject {
     }
 
     function switchAccount(userId, pin) {
+        cancelDeviceLogin()
         if (ready && accountSwitchRequestId === "")
             accountSwitchRequestId = CoreClient.request("auth.accounts.switch", {
                 userId: userId,
@@ -2195,13 +2202,22 @@ QtObject {
         if (!ready || !authChallenge || devicePollRequestId !== "")
             return
         devicePollRequestId = CoreClient.request("auth.device.poll", {
-            attemptId: authChallenge.attemptId,
-            deviceCode: authChallenge.deviceCode
+            attemptId: authChallenge.attemptId
         }, 30000)
     }
 
     function cancelDeviceLogin() {
         devicePollTimer.stop()
+        if (deviceStartRequestId !== "") {
+            CoreClient.cancel(deviceStartRequestId)
+            deviceStartRequestId = ""
+        }
+        if (deviceCompleteRequestId !== "") {
+            CoreClient.cancel(deviceCompleteRequestId)
+            deviceCompleteRequestId = ""
+            if (ready)
+                authSessionRequestId = CoreClient.request("auth.session.get", {})
+        }
         if (devicePollRequestId !== "") {
             CoreClient.cancel(devicePollRequestId)
             devicePollRequestId = ""
@@ -2214,13 +2230,26 @@ QtObject {
     }
 
     function logout() {
+        cancelDeviceLogin()
         if (ready && logoutRequestId === "")
             logoutRequestId = CoreClient.request("auth.logout", {})
     }
 
     function logoutAll() {
+        cancelDeviceLogin()
         if (ready && logoutAllRequestId === "")
             logoutAllRequestId = CoreClient.request("auth.accounts.logoutAll", {})
+    }
+
+    function acceptAuthEnvelope(payload) {
+        const generation = payload.generation === undefined ? authGeneration : Number(payload.generation)
+        if (generation < authGeneration)
+            return false
+        authGeneration = generation
+        authSession = payload.session || null
+        sessionPersistence = payload.persistence || "none"
+        authWarnings = payload.warnings || []
+        return true
     }
 
     function requestConsoleSurface(enabled) {
@@ -2617,14 +2646,26 @@ QtObject {
     property Connections coreConnections: Connections {
         target: CoreClient
         function onStateChanged() {
-            if (CoreClient.state === "ready")
+            if (CoreClient.state === "ready") {
+                root.authGeneration = 0
                 root.initializeServices()
+            }
             else if (CoreClient.state === "failed") {
                 root.lastError = CoreClient.lastError
                 root.authRestorePending = false
             }
         }
         function onResponseReceived(requestId, result) {
+            const authRequests = ["authSessionRequestId", "deviceCompleteRequestId", "logoutRequestId",
+                "logoutAllRequestId", "accountSwitchRequestId", "accountRemoveRequestId"]
+            for (let index = 0; index < authRequests.length; ++index) {
+                const propertyName = authRequests[index]
+                if (requestId === root[propertyName] && result.session !== undefined
+                        && !root.acceptAuthEnvelope(result)) {
+                    root[propertyName] = ""
+                    return
+                }
+            }
             if (onboardingOwner.acceptResponse(requestId, result)) {
                 return
             } else if (root.finishArtworkRequest(requestId, result, false)) {
@@ -2669,6 +2710,7 @@ QtObject {
                 root.authState = "waiting"
                 root.authMessage = qsTr("Scan the QR code or enter %1").arg(result.userCode)
                 root.deviceStartRequestId = ""
+                root.devicePollTimer.interval = Math.max(1000, Number(result.intervalSeconds || 5) * 1000)
                 root.devicePollTimer.restart()
             } else if (requestId === root.devicePollRequestId) {
                 root.devicePollRequestId = ""
@@ -2683,8 +2725,10 @@ QtObject {
                     }, 30000)
                 } else if (status === "pending") {
                     root.authState = "waiting"
+                    root.devicePollTimer.interval = Math.max(1000, Number(result.retryAfterMs || Number(result.intervalSeconds || 5) * 1000))
+                    root.devicePollTimer.restart()
                 } else if (status === "slow_down") {
-                    root.authChallenge.intervalSeconds = Number(result.intervalSeconds || 10)
+                    root.devicePollTimer.interval = Math.max(1000, Number(result.retryAfterMs || Number(result.intervalSeconds || 5) * 1000))
                     root.devicePollTimer.restart()
                 } else {
                     root.devicePollTimer.stop()
@@ -3171,7 +3215,8 @@ QtObject {
             } else if (name === "settings.reset")
                 root.refreshSettings()
             else if (name === "auth.session.changed") {
-                root.authSession = payload.session || null
+                if (!root.acceptAuthEnvelope(payload))
+                    return
                 root.authState = root.authSession ? "signed-in" : "idle"
                 if (root.authSession)
                     root.refreshRemoteSessions()

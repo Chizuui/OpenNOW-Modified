@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -27,6 +28,13 @@ struct LinkAttempt {
     provider: String,
     receiver: mpsc::Receiver<Result<Value, String>>,
     expires: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for LinkAttempt {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 pub struct AccountConnectionsService {
@@ -35,6 +43,12 @@ pub struct AccountConnectionsService {
 }
 
 impl AccountConnectionsService {
+    pub fn cancel_pending(&self) {
+        self.attempts
+            .lock()
+            .expect("account-link state poisoned")
+            .clear();
+    }
     pub fn new(client: Client) -> Self {
         Self {
             client,
@@ -147,13 +161,16 @@ impl AccountConnectionsService {
             .ok()
             .and_then(|payload| payload["login_url"].as_str().map(ToOwned::to_owned))
             .ok_or_else(|| upstream("Account-linking URL response was incomplete"))?;
+        crate::requests::check()?;
         let attempt_id = random_id();
         let (sender, receiver) = mpsc::channel();
         let worker_provider = provider.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
         thread::Builder::new()
             .name(format!("opennow-account-link-{attempt_id}"))
             .spawn(move || {
-                let result = wait_for_callback(listener, &worker_provider);
+                let result = wait_for_callback(listener, &worker_provider, &worker_cancelled);
                 let _ = sender.send(result);
             })
             .map_err(|error| network("Could not start account-link callback", error))?;
@@ -166,6 +183,7 @@ impl AccountConnectionsService {
                     provider: provider.clone(),
                     receiver,
                     expires: Instant::now() + Duration::from_secs(300),
+                    cancelled,
                 },
             );
         Ok(
@@ -206,12 +224,16 @@ impl AccountConnectionsService {
     }
 }
 
-fn wait_for_callback(listener: TcpListener, provider: &str) -> Result<Value, String> {
+fn wait_for_callback(
+    listener: TcpListener,
+    provider: &str,
+    cancelled: &AtomicBool,
+) -> Result<Value, String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(300);
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
