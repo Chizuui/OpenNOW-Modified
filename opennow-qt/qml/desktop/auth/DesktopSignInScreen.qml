@@ -243,96 +243,14 @@ FocusScope {
 
         Item {
             id: body
-            x: root.wideLayout ? DesktopTokens.px(80) : (viewport.width - width) / 2
-            y: Math.max(DesktopTokens.px(24), (viewport.height - height) / 2)
-            width: root.wideLayout ? viewport.width - DesktopTokens.px(176) : Math.max(0, Math.min(DesktopTokens.px(440), viewport.width - DesktopTokens.px(48)))
-            height: Math.max(card.height, root.wideLayout ? hero.implicitHeight : 0)
-
-            Column {
-                id: hero
-                visible: root.wideLayout
-                width: DesktopTokens.px(560)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: DesktopTokens.px(24)
-                Rectangle {
-                    width: DesktopTokens.px(72)
-                    height: DesktopTokens.px(72)
-                    radius: DesktopTokens.px(20)
-                    color: Theme.lightMode ? Theme.shell : "#0B0F1A"
-                    border.width: 1
-                    border.color: root.cardSeam
-                    layer.enabled: true
-                    layer.effect: MultiEffect {
-                        shadowEnabled: true
-                        shadowColor: "#186EE7B7"
-                        shadowBlur: 1
-                        shadowVerticalOffset: 0
-                        shadowHorizontalOffset: 0
-                    }
-                    DesktopOnboardingMark { anchors.centerIn: parent; width: DesktopTokens.px(40); height: DesktopTokens.px(26) }
-                }
-                Column {
-                    width: parent.width
-                    spacing: DesktopTokens.px(14)
-                    BodyText {
-                        width: parent.width
-                        text: qsTr("Your GeForce NOW,\nwithout the browser.")
-                        color: DesktopTokens.text
-                        font.family: DesktopTokens.displayFont
-                        font.pixelSize: DesktopTokens.px(56)
-                        font.weight: Font.Black
-                        font.letterSpacing: -1.68 * DesktopTokens.uiScale
-                        lineHeight: DesktopTokens.px(60)
-                        topPadding: -DesktopTokens.px(9)
-                    }
-                    BodyText {
-                        width: DesktopTokens.px(500)
-                        text: qsTr("OpenNOW is a native client for GeForce NOW and its alliance partners. Sign in with your provider to access your library, browse the stores and connect with friends.")
-                        font.pixelSize: DesktopTokens.px(16)
-                        lineHeight: DesktopTokens.px(25)
-                    }
-                }
-                Row {
-                    width: parent.width
-                    spacing: DesktopTokens.px(36)
-                    topPadding: DesktopTokens.px(8)
-                    Column {
-                        width: DesktopTokens.px(130)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("Native Qt"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Native Qt shell, no Chromium"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                    Rectangle { width: 1; height: DesktopTokens.px(44); color: root.cardSeam }
-                    Column {
-                        width: DesktopTokens.px(108)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("Library"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Your games, in one place"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                    Rectangle { width: 1; height: DesktopTokens.px(44); color: root.cardSeam }
-                    Column {
-                        width: DesktopTokens.px(176)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("0 passwords"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Sign-in happens on your provider's page"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                }
-                Row {
-                    width: parent.width
-                    spacing: DesktopTokens.px(10)
-                    topPadding: DesktopTokens.px(4)
-                    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: DesktopTokens.px(8); height: width; radius: width / 2; color: DesktopTokens.amber }
-                    BodyText {
-                        width: parent.width - DesktopTokens.px(18)
-                        text: qsTr("%1 is a beta. We will say more about that right after you sign in.").arg(Qt.application.version || qsTr("OpenNOW"))
-                        color: root.mutedInk
-                    }
-                }
-            }
+            x: (viewport.width - width) / 2
+            y: height <= viewport.height ? (viewport.height - height) / 2 : DesktopTokens.px(24)
+            width: Math.max(0, Math.min(DesktopTokens.px(440), viewport.width - DesktopTokens.px(48)))
+            height: card.height
 
             Rectangle {
                 id: card
-                x: parent.width - width
+                anchors.horizontalCenter: parent.horizontalCenter
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.min(DesktopTokens.px(440), parent.width)
                 height: cardColumn.implicitHeight + 2
