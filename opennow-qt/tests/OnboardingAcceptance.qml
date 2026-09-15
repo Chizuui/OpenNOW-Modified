@@ -72,6 +72,18 @@ QtObject {
         check(bitrate, "bitrate control missing")
         bitrate.moved(85)
         check(ShellStore.onboardingSettings.maxBitrateMbps === 85, "bitrate did not update its real key")
+        check(ShellStore.settingsOwnerState.capabilitiesActive === true,
+            "the onboarding route activates the frame-rate choices lifecycle")
+        const frameRate = find(screen, "onboardingFps")
+        check(frameRate, "frame-rate control missing")
+        const canonical = ShellStore.canonicalFpsValues()
+        check(canonical.indexOf(360) >= 0, "the shared canonical rates expose the documented top tier")
+        for (const value of canonical)
+            check(frameRate.options.some(option => frameRate.optionValue(option) === value),
+                "the onboarding selector offers the shared rate " + value)
+        const fasterIndex = frameRate.options.findIndex(option => frameRate.optionValue(option) === 120)
+        frameRate.selected(fasterIndex, frameRate.options[fasterIndex])
+        check(ShellStore.onboardingSettings.fps === 120, "frame rate did not stage its real key")
         screen.goToStep(3)
         const generation = find(screen, "onboardingFrameGeneration")
         check(generation && generation.selectedIndex === 0, "frame generation did not default off")

@@ -467,6 +467,22 @@ if(BUILD_TESTING)
             --route settings-input --smoke-language-settings --language-keyboard-selection --reduced-motion)
     set_tests_properties(qml-language-keyboard-selection PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    qt_add_resources(opennow-qt "frame-rate-settings-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/FrameRateSettingsAcceptance.qml)
+    foreach(surface desktop console)
+        if(surface STREQUAL "desktop")
+            set(frame_rate_route settings-streaming)
+        else()
+            set(frame_rate_route settings-video)
+        endif()
+        foreach(width 900 1400)
+            add_test(NAME qml-frame-rate-settings-${surface}-${width}
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances --${surface}
+                    --route ${frame_rate_route} --smoke-frame-rate-settings --smoke-width ${width} --reduced-motion)
+            set_tests_properties(qml-frame-rate-settings-${surface}-${width} PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        endforeach()
+    endforeach()
     qt_add_resources(opennow-qt "custom-background-acceptance"
         PREFIX "/acceptance" BASE tests FILES tests/CustomBackgroundAcceptance.qml)
     qt_add_resources(opennow-qt "stream-stats-acceptance"

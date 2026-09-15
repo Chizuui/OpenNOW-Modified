@@ -285,6 +285,10 @@ FocusScope {
         return ShellStore.unentitledFpsValues(root.currentResolutionValue())
     }
 
+    function lockedFpsValues() {
+        return ShellStore.lockedFpsValues(root.currentResolutionValue())
+    }
+
     function fpsEntitlementNote() {
         if (!root.fpsEntitlementKnown())
             return ShellStore.signedIn
@@ -294,12 +298,22 @@ FocusScope {
         const tier = root.liveTierBadge() || qsTr("Membership")
         if (entitled.length === 0)
             return qsTr("%1 · no exact entitlement for this resolution").arg(tier)
-        const max = entitled[entitled.length - 1]
+        const selectable = ShellStore.selectableFpsValues(root.currentResolutionValue())
+        const max = selectable.length ? selectable[selectable.length - 1] : entitled[entitled.length - 1]
         return qsTr("%1 · up to %2 FPS at %3").arg(tier).arg(max)
             .arg(root.currentResolutionValue().replace("x", "×"))
     }
 
     function fpsLockedHint() {
+        if (!root.unentitledFpsValues().length) {
+            const reason = ShellStore.lockedFpsReason()
+            if (reason !== "")
+                return reason
+        } else if (root.lockedFpsValues().length > root.unentitledFpsValues().length) {
+            const reason = ShellStore.lockedFpsReason()
+            if (reason !== "")
+                return reason
+        }
         const tier = root.liveTierBadge()
         return tier
             ? qsTr("Not entitled on %1 — upgrade on NVIDIA to unlock").arg(tier)

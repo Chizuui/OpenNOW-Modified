@@ -81,6 +81,7 @@ enum State {
 const ENCODED_MEDIA_QUEUE_CAPACITY: usize = 8;
 const NVST_RECOVERY_ATTEMPT_LIMIT: usize = 1;
 const NATIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_micros(250);
+const MAX_STREAM_FPS: u32 = 360;
 
 trait NvstSessionResources {
     fn take_rumble(&self) -> ([Option<NvstControllerRumble>; 4], usize) {
@@ -2517,7 +2518,7 @@ fn media_stream_config(context: &SessionContext) -> MediaStreamConfig {
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(60)
-        .clamp(1, 240);
+        .clamp(1, MAX_STREAM_FPS);
     let bitrate_mbps = context
         .settings
         .get("maxBitrateMbps")
@@ -4153,16 +4154,27 @@ mod tests {
         });
         high_fps["session"]["negotiatedStreamProfile"] = json!({
             "codec": "AV1",
-            "fps": 300,
+            "fps": 400,
             "colorQuality": "10bit_444"
         });
         let high_fps: SessionContext = serde_json::from_value(high_fps).expect("context");
         assert_eq!(media_stream_config(&high_fps).codec, MediaVideoCodec::Av1);
-        assert_eq!(media_stream_config(&high_fps).fps, 240);
+        assert_eq!(media_stream_config(&high_fps).fps, 360);
         assert_eq!(
             media_stream_config(&high_fps).color_quality,
             MediaColorQuality::TenBit420
         );
+
+        let mut top_tier = synthetic_context("top-tier-config", json!([]));
+        top_tier["settings"] = json!({
+            "codec": "H265",
+            "resolution": "1920x1080",
+            "fps": 360,
+            "maxBitrateMbps": 100
+        });
+        top_tier["session"]["negotiatedStreamProfile"] = json!({"fps": 360});
+        let top_tier: SessionContext = serde_json::from_value(top_tier).expect("context");
+        assert_eq!(media_stream_config(&top_tier).fps, 360);
 
         let mut rejected_vrr = synthetic_context("rejected-vrr-config", json!([]));
         rejected_vrr["settings"] = json!({ "enableCloudGsync": true });

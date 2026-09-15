@@ -189,13 +189,17 @@ Column {
                     description: qsTr("Rates follow your membership and resolution.")
                     Segments {
                         objectName: "onboardingFps"
+                        readonly property var canonical: root.store.canonicalFpsValues()
                         readonly property int current: Number(root.settings.fps ?? 60)
-                        options: [60,90,120,144,240].indexOf(current) >= 0 ? [60,90,120,144,240]
-                            : [{label: current === 0 ? qsTr("Auto") : String(current), value: current},60,90,120,144,240]
+                        options: canonical.indexOf(current) >= 0 ? canonical
+                            : [{label: current === 0 ? qsTr("Auto") : String(current), value: current}].concat(canonical)
                         optionWidth: 46
                         selectedIndex: options.findIndex(item => Number(optionValue(item)) === current)
-                        disabledValues: root.store.unentitledFpsValues(root.resolution)
-                        disabledHint: qsTr("Not available on your current membership")
+                        disabledValues: root.store.lockedFpsValues(root.resolution)
+                        disabledHint: root.store.unentitledFpsValues(root.resolution).length
+                            ? qsTr("Not available on your current membership")
+                            : root.store.lockedFpsReason()
+                                || qsTr("Not available on your current membership")
                         onSelected: (index, item) => root.store.setOnboardingSetting("fps", Number(optionValue(item)))
                     }
                 }

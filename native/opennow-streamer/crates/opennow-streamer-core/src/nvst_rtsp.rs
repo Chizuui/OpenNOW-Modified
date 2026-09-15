@@ -1026,7 +1026,7 @@ fn negotiated_fps(context: &SessionContext) -> u64 {
         .and_then(Value::as_u64)
         .or_else(|| context.settings.get("fps").and_then(Value::as_u64))
         .unwrap_or(60)
-        .clamp(30, 240)
+        .clamp(30, u64::from(super::MAX_STREAM_FPS))
 }
 
 fn negotiated_codec(context: &SessionContext) -> String {
@@ -1484,6 +1484,51 @@ mod tests {
     fn installs_a_process_level_tls_crypto_provider() {
         ensure_tls_crypto_provider().expect("TLS provider");
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn announce_carries_the_documented_top_tier_frame_rate() {
+        let mut value = context();
+        value.session.extra["negotiatedStreamProfile"] = json!({"codec":"AV1", "fps":360});
+        let sdp = build_announce(
+            &value,
+            AnnounceParams {
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: 1280,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
+        assert!(sdp.contains("a=x-nv-packetPacing.maxDelayUs:4000"));
+
+        let mut runaway = context();
+        runaway.session.extra["negotiatedStreamProfile"] = json!({"codec":"AV1", "fps":600});
+        let sdp = build_announce(
+            &runaway,
+            AnnounceParams {
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: 1280,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
+        assert!(!sdp.contains("a=x-nv-video[0].maxFPS:600"));
     }
 
     #[test]

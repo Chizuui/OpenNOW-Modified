@@ -1038,7 +1038,7 @@ fn probe_capabilities(executable: &Path, settings: &Value) -> Result<Value, Stre
     Ok(capabilities)
 }
 
-fn requested_embedded_backend(settings: &Value) -> String {
+pub(crate) fn requested_embedded_backend(settings: &Value) -> String {
     let requested = settings["nativeVideoBackend"]
         .as_str()
         .unwrap_or("auto")
