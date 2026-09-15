@@ -52,19 +52,17 @@ void ThumbnailGeneratorTest::regenerationScopingFollowsPicturesOverride()
     });
     qputenv("OPENNOW_PICTURES_DIR", overrideRoot.path().toUtf8());
 
-    QDir overrideRecordings(
-        QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW/Recordings")));
-    QVERIFY(overrideRecordings.mkpath(QStringLiteral(".")));
-    const auto insideOverride = overrideRecordings.filePath(QStringLiteral("override-clip.mkv"));
+    QDir root(overrideRoot.path());
+    QVERIFY(root.mkpath(QStringLiteral("OpenNOW/Recordings")));
+    const auto insideOverride = root.filePath(QStringLiteral("OpenNOW/Recordings/override-clip.mkv"));
     QFile inside(insideOverride);
     QVERIFY(inside.open(QIODevice::WriteOnly));
     QCOMPARE(inside.write("fixture"), 7);
     inside.close();
 
-    QDir defaultRecordings(QDir(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation))
-                               .filePath(QStringLiteral("OpenNOW/Recordings")));
-    QVERIFY(defaultRecordings.mkpath(QStringLiteral(".")));
-    const auto outsideOverride = defaultRecordings.filePath(QStringLiteral("default-clip.mkv"));
+    QDir defaultRoot(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));
+    QVERIFY(defaultRoot.mkpath(QStringLiteral("OpenNOW/Recordings")));
+    const auto outsideOverride = defaultRoot.filePath(QStringLiteral("OpenNOW/Recordings/default-clip.mkv"));
     QFile outside(outsideOverride);
     QVERIFY(outside.open(QIODevice::WriteOnly));
     QCOMPARE(outside.write("fixture"), 7);
@@ -85,11 +83,12 @@ void ThumbnailGeneratorTest::regenerationRefusesUnavailablePicturesRoot()
         else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
     });
     qputenv("OPENNOW_PICTURES_DIR", "");
+    if (!qEnvironmentVariableIsSet("OPENNOW_PICTURES_DIR"))
+        QSKIP("This platform cannot set an empty environment variable in-process");
 
-    QDir recordings(QDir(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation))
-                        .filePath(QStringLiteral("OpenNOW/Recordings")));
-    QVERIFY(recordings.mkpath(QStringLiteral(".")));
-    const auto source = recordings.filePath(QStringLiteral("unavailable-clip.mkv"));
+    QDir root(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));
+    QVERIFY(root.mkpath(QStringLiteral("OpenNOW/Recordings")));
+    const auto source = root.filePath(QStringLiteral("OpenNOW/Recordings/unavailable-clip.mkv"));
     QFile file(source);
     QVERIFY(file.open(QIODevice::WriteOnly));
     QCOMPARE(file.write("fixture"), 7);

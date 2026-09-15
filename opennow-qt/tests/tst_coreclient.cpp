@@ -173,36 +173,51 @@ private slots:
         QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
 
         qputenv("OPENNOW_PICTURES_DIR", overrideRoot.path().toUtf8());
-        {
-            CoreClient client;
-            QSignalSpy responses(&client, &CoreClient::responseReceived);
-            QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
-            QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
-            responses.clear();
-            client.request(QStringLiteral("media.root.get"));
-            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
-            const auto root = qvariant_cast<QJsonObject>(responses.first().at(1))
-                                  .value(QStringLiteral("path")).toString();
-            QCOMPARE(root, QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW")));
-            QCOMPARE(mediaRecordingsDirectory(), QDir(root).filePath(QStringLiteral("Recordings")));
-            QCOMPARE(mediaScreenshotsDirectory(), QDir(root).filePath(QStringLiteral("Screenshots")));
-            client.stop();
-        }
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        client.request(QStringLiteral("media.root.get"));
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+        const auto root = qvariant_cast<QJsonObject>(responses.first().at(1))
+                              .value(QStringLiteral("path")).toString();
+        QCOMPARE(QDir::cleanPath(root),
+                 QDir::cleanPath(QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW"))));
+        QCOMPARE(QDir::cleanPath(mediaRecordingsDirectory()),
+                 QDir::cleanPath(QDir(root).filePath(QStringLiteral("Recordings"))));
+        QCOMPARE(QDir::cleanPath(mediaScreenshotsDirectory()),
+                 QDir::cleanPath(QDir(root).filePath(QStringLiteral("Screenshots"))));
+        client.stop();
+    }
+
+    void realCoreTreatsAnEmptyPicturesMarkerAsUnavailable()
+    {
+        QTemporaryDir dataDir;
+        QVERIFY(dataDir.isValid());
+        const auto previousPictures = qgetenv("OPENNOW_PICTURES_DIR");
+        const auto restoreEnvironment = qScopeGuard([&] {
+            if (previousPictures.isNull()) qunsetenv("OPENNOW_PICTURES_DIR");
+            else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
+        });
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
 
         qputenv("OPENNOW_PICTURES_DIR", "");
-        {
-            CoreClient client;
-            QSignalSpy responses(&client, &CoreClient::responseReceived);
-            QSignalSpy failures(&client, &CoreClient::requestFailed);
-            QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
-            QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
-            responses.clear();
-            client.request(QStringLiteral("media.list"));
-            QTRY_VERIFY_WITH_TIMEOUT(!failures.isEmpty(), 5'000);
-            QCOMPARE(failures.last().at(1).toString(), QStringLiteral("media_list_failed"));
-            QVERIFY(responses.isEmpty());
-            client.stop();
-        }
+        if (!qEnvironmentVariableIsSet("OPENNOW_PICTURES_DIR"))
+            QSKIP("This platform cannot set an empty environment variable in-process");
+
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        client.request(QStringLiteral("media.list"));
+        QTRY_VERIFY_WITH_TIMEOUT(!failures.isEmpty(), 5'000);
+        QCOMPARE(failures.last().at(1).toString(), QStringLiteral("media_list_failed"));
+        QVERIFY(responses.isEmpty());
+        client.stop();
     }
 
     void readsGraphicsPreferencesBeforeStartingTheCore()

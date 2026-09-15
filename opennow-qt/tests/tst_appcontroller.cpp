@@ -295,10 +295,10 @@ void AppControllerTest::screenshotExportHonorsPicturesOverride()
     qputenv("OPENNOW_PICTURES_DIR", overrideRoot.path().toUtf8());
 
     AppController controller;
-    QDir directory(QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW/Screenshots")));
-    QVERIFY(directory.mkpath(QStringLiteral(".")));
-    const auto source = directory.filePath(QStringLiteral("override-test.png"));
-    const auto target = QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW/override-export.png"));
+    QDir root(overrideRoot.path());
+    QVERIFY(root.mkpath(QStringLiteral("OpenNOW/Screenshots")));
+    const auto source = root.filePath(QStringLiteral("OpenNOW/Screenshots/override-test.png"));
+    const auto target = root.filePath(QStringLiteral("OpenNOW/override-export.png"));
     QFile file(source);
     QVERIFY(file.open(QIODevice::WriteOnly));
     QCOMPARE(file.write("fixture"), 7);
@@ -315,13 +315,14 @@ void AppControllerTest::screenshotExportRefusesUnavailablePicturesRoot()
         else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
     });
     qputenv("OPENNOW_PICTURES_DIR", "");
+    if (!qEnvironmentVariableIsSet("OPENNOW_PICTURES_DIR"))
+        QSKIP("This platform cannot set an empty environment variable in-process");
 
     AppController controller;
-    const auto pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    QDir directory(pictures);
-    QVERIFY(directory.mkpath(QStringLiteral("OpenNOW/Screenshots")));
-    const auto source = directory.filePath(QStringLiteral("OpenNOW/Screenshots/unavailable-test.png"));
-    const auto target = directory.filePath(QStringLiteral("OpenNOW/unavailable-export.png"));
+    QDir root(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));
+    QVERIFY(root.mkpath(QStringLiteral("OpenNOW/Screenshots")));
+    const auto source = root.filePath(QStringLiteral("OpenNOW/Screenshots/unavailable-test.png"));
+    const auto target = root.filePath(QStringLiteral("OpenNOW/unavailable-export.png"));
     QFile file(source);
     QVERIFY(file.open(QIODevice::WriteOnly));
     QCOMPARE(file.write("fixture"), 7);
