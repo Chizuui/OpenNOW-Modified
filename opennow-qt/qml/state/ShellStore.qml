@@ -422,6 +422,13 @@ QtObject {
         storeLaunchDecision = {status:"metadata_unconfirmed", message:""}
         if (id !== "") CoreClient.cancel(id)
     }
+    function failStoreLaunch(decision) {
+        storeLaunchTarget = null
+        storeLaunchFailed = true
+        storeLaunchDecision = decision
+        if (AppController.route !== "persistent-storage")
+            AppController.navigate("persistent-storage")
+    }
     function inspectStoreLaunch() {
         if (!ready || !signedIn || storeLaunchRequestId !== "")
             return
@@ -485,11 +492,17 @@ QtObject {
             root.launchInspectRequestId = ""
             root.launchInspectStage = ""
             root.launchInspectSeatId = ""
+            const storeOriginated = root.pendingLaunchParams
+                && root.pendingLaunchParams.storeLaunch === true
             if (!root.launchIntentCurrent() || !root.matchesAuthScope(result.scope)
                     || result.appId !== root.pendingLaunchParams.catalogAppId || result.variantId !== root.pendingLaunchParams.variantId) {
                 root.streamState = "error"
                 root.streamMessage = qsTr("The selected game or account changed. Choose the store version again.")
                 root.lastError = root.streamMessage
+                if (storeOriginated) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:root.streamMessage})
+                }
                 return
             }
             const variant = result.game && result.game.id === root.pendingLaunchParams.catalogAppId
@@ -498,6 +511,10 @@ QtObject {
                 root.streamState = "error"
                 root.streamMessage = qsTr("The exact requested store version was not returned.")
                 root.lastError = root.streamMessage
+                if (storeOriginated) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:root.streamMessage})
+                }
                 return
             }
             catalogOwner.adoptGame(result.game)
@@ -512,7 +529,10 @@ QtObject {
                 root.streamMessage = root.selectedLaunchDecision.message || qsTr("Availability could not be confirmed. Refresh and try again.")
                 root.lastError = root.streamMessage
                 root.pendingLaunchParams = null
-                AppController.navigateFromLastPrimary("game-detail")
+                if (storeOriginated)
+                    root.failStoreLaunch(root.selectedLaunchDecision)
+                else
+                    AppController.navigateFromLastPrimary("game-detail")
                 return
             }
             if (stage === "discover") {
@@ -552,6 +572,10 @@ QtObject {
                 root.streamState = "error"
                 root.streamMessage = message
                 root.lastError = message
+                if (root.pendingLaunchParams && root.pendingLaunchParams.storeLaunch === true) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:message})
+                }
             } else if (id !== "" && id === root.storeLaunchRequestId) {
                 root.storeLaunchRequestId = ""
                 root.storeLaunchTarget = null

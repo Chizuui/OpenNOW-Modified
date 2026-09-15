@@ -8,6 +8,8 @@ FocusScope {
     readonly property var selectedLocation: locationList.currentIndex >= 0 && locationList.currentIndex < ShellStore.storageLocations.length
         ? ShellStore.storageLocations[locationList.currentIndex] : null
     readonly property bool storeLaunchReady: ShellStore.storeLaunchTarget !== null
+    readonly property bool storeLaunchBusy: ShellStore.pendingLaunchParams !== null
+        && ShellStore.pendingLaunchParams.storeLaunch === true && ShellStore.streamBusy
 
     ScreenBackground { tint: "#1B2338" }
 
@@ -83,7 +85,8 @@ FocusScope {
                 glyph: ShellStore.storeLaunchFailed ? "↻" : ""
                 text: ShellStore.storeLaunchFailed ? qsTr("Retry") : qsTr("Launch Steam")
                 enabled: ShellStore.storeLaunchFailed
-                    || (root.storeLaunchReady && ShellStore.storeLaunchRequestId === "")
+                    || (root.storeLaunchReady && ShellStore.storeLaunchRequestId === ""
+                        && !root.storeLaunchBusy)
                 onClicked: {
                     root.confirmReset = false
                     if (ShellStore.storeLaunchFailed) ShellStore.inspectStoreLaunch()
@@ -95,9 +98,11 @@ FocusScope {
                 width: parent.width
                 text: ShellStore.storeLaunchRequestId !== ""
                     ? qsTr("Checking the Steam store launch…")
-                    : root.storeLaunchReady
-                        ? qsTr("Opens the %1 store with your persistent storage.").arg(ShellStore.storeLaunchTarget.title)
-                        : ShellStore.storeLaunchDecision.message
+                    : root.storeLaunchBusy
+                        ? qsTr("Starting the Steam store session…")
+                        : root.storeLaunchReady
+                            ? qsTr("Opens the %1 store with your persistent storage.").arg(ShellStore.storeLaunchTarget.title)
+                            : ShellStore.storeLaunchDecision.message
                 wrapMode: Text.WordWrap
                 color: root.storeLaunchReady ? Theme.textMuted : Theme.coral
                 font.family: Theme.bodyFont; font.pixelSize: 14; lineHeight: 1.2
@@ -125,7 +130,8 @@ FocusScope {
 
     Component.onCompleted: {
         ShellStore.refreshStorageLocations()
-        ShellStore.inspectStoreLaunch()
+        if (!ShellStore.storeLaunchFailed)
+            ShellStore.inspectStoreLaunch()
     }
     AppChrome { anchors.fill: parent; title: qsTr("Persistent storage"); currentRoute: "settings"; onRouteRequested: route => AppController.navigate(route) }
 }
