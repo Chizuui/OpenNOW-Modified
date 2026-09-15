@@ -173,6 +173,9 @@ fn select_embedded_fallback(
     stream: crate::MediaStreamConfig,
     backends: &[VideoBackendCapability],
 ) -> LinuxVideoSelection {
+    if matches!(requested, "software" | "ffmpeg") {
+        return select_embedded_software(stream, backends);
+    }
     if !stream.color_quality.is_444() {
         let color = if stream.color_quality.bit_depth() == 10 {
             "10bit_420"
@@ -231,6 +234,47 @@ fn select_embedded_fallback(
             "No compatible embedded {requested} decoder supports the negotiated {} color profile",
             stream.codec.label(),
         )),
+    }
+}
+
+fn select_embedded_software(
+    stream: crate::MediaStreamConfig,
+    backends: &[VideoBackendCapability],
+) -> LinuxVideoSelection {
+    let software = backends.iter().find(|backend| {
+        backend.backend == "ffmpeg"
+            && backend.available
+            && backend.codecs.iter().any(|codec| {
+                codec.codec == stream.codec.label()
+                    && codec.available
+                    && codec
+                        .color_qualities
+                        .as_ref()
+                        .is_none_or(|qualities| qualities.contains(&"8bit_420"))
+            })
+    });
+    let reason = if stream.hdr || stream.color_quality != crate::MediaColorQuality::EightBit420 {
+        format!(
+            "Software decoding presents 8-bit 4:2:0 SDR only; the negotiated {} {} profile cannot be preserved",
+            stream.codec.label(),
+            stream.color_quality.protocol_name(),
+        )
+    } else if software.is_none() {
+        format!(
+            "The FFmpeg software decoder is unavailable for the negotiated {} stream. Select Auto in Stream settings or export diagnostics for backend probe failures.",
+            stream.codec.label(),
+        )
+    } else {
+        return LinuxVideoSelection {
+            path: LinuxVideoPath::Hardware(DecoderPreference::SoftwareOnly),
+            use_vulkan_output: true,
+            fallback_reason: None,
+        };
+    };
+    LinuxVideoSelection {
+        path: LinuxVideoPath::Software,
+        use_vulkan_output: false,
+        fallback_reason: Some(reason),
     }
 }
 
@@ -676,6 +720,122 @@ mod tests {
                 )
                 .path,
                 LinuxVideoPath::Software,
+            );
+        }
+    }
+
+    fn software_backend(
+        codec: &'static str,
+        color_qualities: Vec<&'static str>,
+    ) -> VideoBackendCapability {
+        VideoBackendCapability {
+            backend: "ffmpeg",
+            platform: "linux",
+            codecs: vec![CodecCapability {
+                codec,
+                available: true,
+                hdr_color_qualities: None,
+                color_qualities: Some(color_qualities),
+                hdr_supported: Some(false),
+                reason: None,
+            }],
+            zero_copy_modes: vec![],
+            available: true,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn explicit_software_request_selects_the_bounded_cpu_decoder() {
+        for requested in ["software", "ffmpeg"] {
+            let selected = select_embedded_fallback(
+                requested,
+                crate::MediaStreamConfig::default(),
+                &[software_backend("h264", vec!["8bit_420"])],
+            );
+            assert_eq!(
+                selected.path,
+                LinuxVideoPath::Hardware(DecoderPreference::SoftwareOnly)
+            );
+            assert!(selected.use_vulkan_output);
+            assert!(selected.fallback_reason.is_none());
+        }
+        for codec in ["h264", "h265", "av1"] {
+            let stream = crate::MediaStreamConfig {
+                codec: match codec {
+                    "h265" => crate::MediaVideoCodec::H265,
+                    "av1" => crate::MediaVideoCodec::Av1,
+                    _ => crate::MediaVideoCodec::H264,
+                },
+                ..crate::MediaStreamConfig::default()
+            };
+            assert_eq!(
+                select_embedded_fallback(
+                    "software",
+                    stream,
+                    &[software_backend(codec, vec!["8bit_420"])]
+                )
+                .path,
+                LinuxVideoPath::Hardware(DecoderPreference::SoftwareOnly),
+                "{codec}"
+            );
+        }
+        let stream = crate::MediaStreamConfig {
+            codec: crate::MediaVideoCodec::Av1,
+            ..crate::MediaStreamConfig::default()
+        };
+        for qualities in [vec![], vec!["10bit_420"]] {
+            let selected =
+                select_embedded_fallback("software", stream, &[software_backend("av1", qualities)]);
+            assert_eq!(selected.path, LinuxVideoPath::Software);
+            assert!(
+                selected
+                    .fallback_reason
+                    .unwrap()
+                    .contains("FFmpeg software decoder is unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_software_request_refuses_profiles_the_cpu_path_cannot_preserve() {
+        let backends = [software_backend("h265", vec!["8bit_420"])];
+        for (color_quality, hdr) in [
+            (crate::MediaColorQuality::EightBit420, true),
+            (crate::MediaColorQuality::TenBit420, false),
+            (crate::MediaColorQuality::EightBit444, false),
+            (crate::MediaColorQuality::TenBit444, false),
+        ] {
+            let stream = crate::MediaStreamConfig {
+                codec: crate::MediaVideoCodec::H265,
+                color_quality,
+                hdr,
+                ..crate::MediaStreamConfig::default()
+            };
+            let selected = select_embedded_fallback("software", stream, &backends);
+            assert_eq!(selected.path, LinuxVideoPath::Software);
+            assert!(!selected.use_vulkan_output);
+            let reason = selected.fallback_reason.unwrap();
+            assert!(
+                reason.contains("Software decoding presents 8-bit 4:2:0 SDR only"),
+                "{color_quality:?} hdr={hdr}: {reason}"
+            );
+            assert!(reason.contains(color_quality.protocol_name()));
+        }
+    }
+
+    #[test]
+    fn automatic_selection_never_substitutes_software_for_hardware() {
+        let backends = [software_backend("h264", vec!["8bit_420"])];
+        for requested in ["auto", "hardware"] {
+            let selected =
+                select_embedded_fallback(requested, crate::MediaStreamConfig::default(), &backends);
+            assert_eq!(selected.path, LinuxVideoPath::Software, "{requested}");
+            assert!(
+                selected
+                    .fallback_reason
+                    .unwrap()
+                    .contains("No compatible embedded")
             );
         }
     }

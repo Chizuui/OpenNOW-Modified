@@ -341,6 +341,7 @@ int AcceptanceSession::startSmokeWorkload()
                        || m_arguments.contains(u"--smoke-ownership"_s)
                        || m_arguments.contains(u"--smoke-catalog-sync"_s)
                        || m_arguments.contains(u"--smoke-color-format"_s)
+                       || m_arguments.contains(u"--smoke-backend-availability"_s)
                        || m_arguments.contains(u"--smoke-queue-drops"_s))) {
                 QTimer::singleShot(250, this, [this, window, fixture] {
                     if (m_arguments.contains(u"--smoke-ownership"_s)

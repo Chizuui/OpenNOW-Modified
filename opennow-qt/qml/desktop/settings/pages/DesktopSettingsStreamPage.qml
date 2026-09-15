@@ -165,7 +165,7 @@ Column {
             width: parent.width; glyph: "chip"; title: qsTr("Video backend")
             description: Qt.platform.os === "windows"
                 ? qsTr("Auto uses DX11 hardware decoding. DX12 and Vulkan texture sharing are not supported by the Windows stream view yet. Applies to the next stream.")
-                : qsTr("Choose a supported native backend. Applies to the next stream.")
+                : qsTr("Choose a supported decoder. Auto never falls back to software. Applies to the next stream.")
             items: ShellStore.videoBackendItems()
             value: page.settingsScreen.valueSetting("nativeVideoBackend", "auto")
             onSelected: value => page.settingsScreen.setSetting("nativeVideoBackend", value)
