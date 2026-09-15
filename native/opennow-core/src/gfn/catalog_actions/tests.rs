@@ -80,6 +80,59 @@ fn selected_store_link_and_subscription_requirements_use_current_account_metadat
 }
 
 #[test]
+fn nullable_variant_scope_preserves_required_account_linking() {
+    let game = app_to_game(&app("PLATFORM_SYNC", true, false)).unwrap();
+    for required in [false, true] {
+        let definition: crate::catalog_types::StoreDefinition = serde_json::from_value(json!({
+            "store":"STEAM","label":"Steam","features":[],
+            "accountLinkingMetadata":{"supportedVariantIds":null,"isRequired":required}
+        }))
+        .unwrap();
+        let mut account = access();
+        account["accounts"][0] = definition.connection_definition();
+        assert_eq!(
+            super::launch_decision(&game, "parent-app", "123", &Value::Null, &account).status,
+            if required {
+                LaunchStatus::LinkRequired
+            } else {
+                LaunchStatus::Ready
+            }
+        );
+    }
+}
+
+#[test]
+fn no_subscription_sentinel_is_normalized_without_bypassing_real_subscriptions() {
+    for subscription in [
+        Value::Null,
+        json!("NONE"),
+        json!("STORE_PASS"),
+        json!("UNKNOWN_PASS"),
+    ] {
+        let mut metadata = app("PLATFORM_SYNC", true, false);
+        metadata["variants"][0]["gfn"]["library"]["subscription"] = subscription.clone();
+        let game = app_to_game(&metadata).unwrap();
+        let requires_subscription = subscription.is_string() && subscription != "NONE";
+        assert_eq!(
+            game["variants"][0]["subscription"],
+            if requires_subscription {
+                subscription
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            decision(&game, "parent-app", "123", &Value::Null).status,
+            if requires_subscription {
+                LaunchStatus::SubscriptionRequired
+            } else {
+                LaunchStatus::Ready
+            }
+        );
+    }
+}
+
+#[test]
 fn exact_selected_variant_policy_never_infers_ownership_from_aggregate_or_labels() {
     let mut game = app_to_game(&app("MANUAL", true, true)).unwrap();
     for key in ["isInLibrary", "accountLinked", "favorited"] {
