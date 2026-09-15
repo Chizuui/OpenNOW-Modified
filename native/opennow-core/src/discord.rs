@@ -961,8 +961,7 @@ impl IpcStream {
         } else {
             self.pending_write.take()
         };
-        pending
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no pending Discord IPC operation"))
+        pending.ok_or_else(|| io::Error::other("no pending Discord IPC operation"))
     }
 
     fn restore_pending(&mut self, read: bool, pending: PendingIo) {
