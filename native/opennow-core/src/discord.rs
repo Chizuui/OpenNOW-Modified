@@ -1,8 +1,8 @@
 use rand::RngCore;
 use serde_json::{Value, json};
+use std::io;
 #[cfg(unix)]
 use std::io::Write;
-use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
@@ -587,7 +587,8 @@ impl Connection {
     }
 
     fn send(&mut self, opcode: u32, value: &Value) -> Result<(), Failure> {
-        let body = serde_json::to_vec(value).map_err(|error| Failure::Corrupt(error.to_string()))?;
+        let body =
+            serde_json::to_vec(value).map_err(|error| Failure::Corrupt(error.to_string()))?;
         if body.len() > MAX_FRAME_BYTES {
             return Err(Failure::Corrupt(
                 "Discord RPC frame is too large".to_owned(),
@@ -650,9 +651,11 @@ fn take_frame(buffered: &mut Vec<u8>) -> Result<Option<(u32, Value)>, Failure> {
             .try_into()
             .expect("four-byte Discord RPC opcode"),
     );
-    let length =
-        u32::from_le_bytes(buffered[4..8].try_into().expect("four-byte Discord RPC length"))
-            as usize;
+    let length = u32::from_le_bytes(
+        buffered[4..8]
+            .try_into()
+            .expect("four-byte Discord RPC length"),
+    ) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(Failure::Corrupt(
             "Discord RPC response is too large".to_owned(),
@@ -828,6 +831,41 @@ fn abandon_pending(pending: PendingIo) {
     std::mem::forget(pending);
 }
 
+#[cfg(windows)]
+fn finish_overlapped(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pending: &PendingIo,
+) -> (bool, u32, Option<i32>) {
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+
+    let mut transferred = 0_u32;
+    let success =
+        unsafe { GetOverlappedResult(handle, &*pending.overlapped, &mut transferred, 0) } != 0;
+    let raw_error = if success {
+        None
+    } else {
+        io::Error::last_os_error().raw_os_error()
+    };
+    (success, transferred, raw_error)
+}
+
+#[cfg(windows)]
+fn reap_cancelled(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pending: PendingIo,
+) -> Result<OverlappedStatus, PendingIo> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let milliseconds = CANCEL_REAP_TIMEOUT.as_millis().min(u32::MAX as u128) as u32;
+    if unsafe { WaitForSingleObject(pending.event, milliseconds) } != WAIT_OBJECT_0 {
+        return Err(pending);
+    }
+    let (success, transferred, raw_error) = finish_overlapped(handle, &pending);
+    close_pending(pending);
+    Ok(classify_overlapped(success, transferred, raw_error))
+}
+
 #[cfg(any(windows, test))]
 const ERROR_OPERATION_ABORTED_CODE: i32 = 995;
 
@@ -923,9 +961,8 @@ impl IpcStream {
         } else {
             self.pending_write.take()
         };
-        pending.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "no pending Discord IPC operation")
-        })
+        pending
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no pending Discord IPC operation"))
     }
 
     fn restore_pending(&mut self, read: bool, pending: PendingIo) {
@@ -934,21 +971,6 @@ impl IpcStream {
         } else {
             self.pending_write = Some(pending);
         }
-    }
-
-    fn reap(&self, pending: &PendingIo) -> (bool, u32, Option<i32>) {
-        use windows_sys::Win32::System::IO::GetOverlappedResult;
-
-        let mut transferred = 0_u32;
-        let success = unsafe {
-            GetOverlappedResult(self.handle, &*pending.overlapped, &mut transferred, 0)
-        } != 0;
-        let raw_error = if success {
-            None
-        } else {
-            io::Error::last_os_error().raw_os_error()
-        };
-        (success, transferred, raw_error)
     }
 
     fn poll_pending(
@@ -966,7 +988,7 @@ impl IpcStream {
             self.restore_pending(read, pending);
             return Ok(None);
         }
-        let (success, transferred, raw_error) = self.reap(&pending);
+        let (success, transferred, raw_error) = finish_overlapped(self.handle, &pending);
         match classify_overlapped(success, transferred, raw_error) {
             OverlappedStatus::Completed(count) => Ok(Some((close_pending(pending), count))),
             OverlappedStatus::Aborted => {
@@ -983,47 +1005,37 @@ impl IpcStream {
         }
     }
 
-    fn cancel_pending(&mut self, read: bool, deadline: Instant) -> io::Result<OverlappedStatus> {
-        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    fn cancel_pending(&mut self, read: bool) -> io::Result<OverlappedStatus> {
         use windows_sys::Win32::System::IO::CancelIoEx;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         let pending = self.take_pending(read)?;
         unsafe { CancelIoEx(self.handle, &*pending.overlapped) };
-        let bound = deadline
-            .min(Instant::now() + CANCEL_REAP_TIMEOUT)
-            .saturating_duration_since(Instant::now());
-        let milliseconds = bound.as_millis().min(u32::MAX as u128) as u32;
-        if unsafe { WaitForSingleObject(pending.event, milliseconds) } != WAIT_OBJECT_0 {
-            self.abandoned.store(true, Ordering::SeqCst);
-            abandon_pending(pending);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Discord IPC operation could not be cancelled",
-            ));
+        match reap_cancelled(self.handle, pending) {
+            Ok(status) => Ok(status),
+            Err(pending) => {
+                self.abandoned.store(true, Ordering::SeqCst);
+                abandon_pending(pending);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Discord IPC operation could not be cancelled",
+                ))
+            }
         }
-        let (success, transferred, raw_error) = self.reap(&pending);
-        close_pending(pending);
-        Ok(classify_overlapped(success, transferred, raw_error))
     }
 }
 
 #[cfg(windows)]
 impl Drop for IpcStream {
     fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::IO::CancelIoEx;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         for pending in [self.pending_read.take(), self.pending_write.take()]
             .into_iter()
             .flatten()
         {
             unsafe { CancelIoEx(self.handle, &*pending.overlapped) };
-            let milliseconds = CANCEL_REAP_TIMEOUT.as_millis().min(u32::MAX as u128) as u32;
-            if unsafe { WaitForSingleObject(pending.event, milliseconds) } == WAIT_OBJECT_0 {
-                close_pending(pending);
-            } else {
+            if let Err(pending) = reap_cancelled(self.handle, pending) {
                 self.abandoned.store(true, Ordering::SeqCst);
                 abandon_pending(pending);
             }
@@ -1067,11 +1079,7 @@ fn connect(_directories: &[PathBuf], abandoned: &Arc<AtomicBool>) -> io::Result<
 }
 
 #[cfg(windows)]
-fn deliver_read(
-    scratch: &mut Vec<u8>,
-    buffer: Vec<u8>,
-    count: usize,
-) -> io::Result<ReadOutcome> {
+fn deliver_read(scratch: &mut Vec<u8>, buffer: Vec<u8>, count: usize) -> io::Result<ReadOutcome> {
     if count == 0 {
         return Ok(ReadOutcome::Eof);
     }
@@ -1100,9 +1108,7 @@ fn read_some(
         Ok(Some((buffer, count))) => deliver_read(scratch, buffer, count),
         Ok(None) => Ok(ReadOutcome::TimedOut),
         Err(error) => match error.raw_os_error() {
-            Some(code)
-                if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_NO_DATA as i32 =>
-            {
+            Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_NO_DATA as i32 => {
                 Ok(ReadOutcome::Eof)
             }
             _ => Err(error),
@@ -1143,7 +1149,7 @@ fn write_frame(stream: &mut IpcStream, frame: &[u8], deadline: Instant) -> io::R
                 }
                 written += count;
             }
-            None => match stream.cancel_pending(false, deadline)? {
+            None => match stream.cancel_pending(false)? {
                 OverlappedStatus::Completed(count) => {
                     written += count;
                 }
@@ -1210,7 +1216,10 @@ mod tests {
     #[test]
     fn discord_frames_are_little_endian_and_bounded() {
         let frame = frame_bytes(OPCODE_FRAME, &json!({"evt":"READY"}));
-        assert_eq!(u32::from_le_bytes(frame[..4].try_into().unwrap()), OPCODE_FRAME);
+        assert_eq!(
+            u32::from_le_bytes(frame[..4].try_into().unwrap()),
+            OPCODE_FRAME
+        );
         let body = serde_json::to_vec(&json!({"evt":"READY"})).unwrap();
         assert_eq!(
             u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize,
@@ -1252,7 +1261,10 @@ mod tests {
         let mut buffered = Vec::new();
         buffered.extend_from_slice(&OPCODE_FRAME.to_le_bytes());
         buffered.extend_from_slice(&((MAX_FRAME_BYTES + 1) as u32).to_le_bytes());
-        assert!(matches!(take_frame(&mut buffered), Err(Failure::Corrupt(_))));
+        assert!(matches!(
+            take_frame(&mut buffered),
+            Err(Failure::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -1443,7 +1455,11 @@ mod tests {
                 let (reject, split, delay_ready) = {
                     let mut state = state.lock().unwrap();
                     state.handshakes += 1;
-                    (state.reject_handshake, state.split_replies, state.delay_ready)
+                    (
+                        state.reject_handshake,
+                        state.split_replies,
+                        state.delay_ready,
+                    )
                 };
                 if reject {
                     let _ = write_frame(
@@ -1555,7 +1571,8 @@ mod tests {
                                 }
                                 OPCODE_PING => {
                                     let split = state.lock().unwrap().split_replies;
-                                    let _ = write_frame(&mut stream, OPCODE_PONG, &json!({}), split);
+                                    let _ =
+                                        write_frame(&mut stream, OPCODE_PONG, &json!({}), split);
                                 }
                                 OPCODE_PONG => state.lock().unwrap().pongs += 1,
                                 OPCODE_CLOSE => break,
@@ -1877,9 +1894,7 @@ mod tests {
 
             service.abandoned.store(true, Ordering::SeqCst);
             let observed = {
-                let before = service
-                    .iterations
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                let before = service.iterations.load(std::sync::atomic::Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(300));
                 service
                     .iterations
@@ -1906,9 +1921,7 @@ mod tests {
 
             service.abandoned.store(true, Ordering::SeqCst);
             let observed = {
-                let before = service
-                    .iterations
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                let before = service.iterations.load(std::sync::atomic::Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(300));
                 service
                     .iterations
