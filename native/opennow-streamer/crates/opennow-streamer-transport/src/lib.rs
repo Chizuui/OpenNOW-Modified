@@ -67,6 +67,7 @@ pub struct EncodedMediaFrame {
     pub received_at_us: u64,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 pub type MediaConsumer = SyncSender<EncodedMediaFrame>;
@@ -101,6 +102,7 @@ mod tests {
             received_at_us: 2_500,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         }
     }
 

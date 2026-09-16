@@ -2832,6 +2832,7 @@ fn consume_encoded_media(
             clock_rate_hz: frame.clock_rate_hz,
             keyframe: frame.keyframe,
             contiguous: frame.contiguous,
+            ssrc: frame.ssrc,
         }) {
             PushOutcome::Unsupported => {
                 dropped += 1;
@@ -2916,6 +2917,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             });
             let path = directory.join(format!("{id}.mkv"));
             let (responses, _) = engine.handle(command(
