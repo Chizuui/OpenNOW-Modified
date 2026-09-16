@@ -531,6 +531,13 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
+        "catalog.launch.store.inspect" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .store_launch_inspect(params, None, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "catalog.favorites.list" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
@@ -884,7 +891,11 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(|error| ("acceptance_export_failed".to_owned(), error.to_string()))
         }
-        "media.root.get" => Ok((core.media.root(), None)),
+        "media.root.get" => core
+            .media
+            .root()
+            .map(|value| (value, None))
+            .map_err(|message| ("media_unavailable".to_owned(), message)),
         "media.recording.target" => core
             .media
             .recording_target(params)
