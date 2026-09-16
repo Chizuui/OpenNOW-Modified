@@ -257,6 +257,10 @@ if(BUILD_TESTING)
     target_include_directories(opennow-framepacer-tests PRIVATE src)
     target_link_libraries(opennow-framepacer-tests PRIVATE Qt6::Test)
     add_test(NAME opennow-framepacer-tests COMMAND opennow-framepacer-tests -o -,txt)
+    qt_add_executable(opennow-streampresenttimings-tests tests/tst_streampresenttimings.cpp)
+    target_include_directories(opennow-streampresenttimings-tests PRIVATE src)
+    target_link_libraries(opennow-streampresenttimings-tests PRIVATE Qt6::Test)
+    add_test(NAME opennow-streampresenttimings-tests COMMAND opennow-streampresenttimings-tests -o -,txt)
     qt_add_executable(opennow-fsrupscaler-tests tests/tst_fsrupscaler.cpp)
     target_include_directories(opennow-fsrupscaler-tests PRIVATE src)
     target_link_libraries(opennow-fsrupscaler-tests PRIVATE Qt6::Test Qt6::Gui Qt6::GuiPrivate)
@@ -324,7 +328,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(opennow-streamcolor-tests PROPERTIES TIMEOUT 60)
     qt_add_resources(opennow-qt "region-ping-acceptance"
-        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml tests/OwnershipAcceptance.qml tests/CommandSearchAcceptance.qml tests/GameDetailsLayoutAcceptance.qml)
+        PREFIX "/acceptance" BASE tests FILES tests/CatalogSyncAcceptance.qml tests/OwnershipAcceptance.qml tests/CommandSearchAcceptance.qml tests/GameDetailsLayoutAcceptance.qml tests/PushInvalidationAcceptance.qml)
     foreach(details_size normal short)
         if(details_size STREQUAL "normal")
             set(details_width 1440)
@@ -383,9 +387,13 @@ if(BUILD_TESTING)
                 --smoke-catalog-sync --smoke-width ${width} --smoke-height 900 --reduced-motion)
             set_tests_properties(qml-catalog-notice-${route}-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
         endforeach()
+        add_test(NAME qml-push-invalidation-${width} COMMAND opennow-qt
+            --smoke-test --allow-multiple-instances --desktop --route library
+            --smoke-push-invalidation --smoke-width ${width} --smoke-height 900 --reduced-motion)
+        set_tests_properties(qml-push-invalidation-${width} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
     endforeach()
     qt_add_resources(opennow-qt "store-paging-acceptance"
-        PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
+        PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/StoreLaunchAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
     add_test(NAME qml-recording
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings --smoke-recording --reduced-motion)
@@ -518,6 +526,20 @@ if(BUILD_TESTING)
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-streaming --smoke-persistent-in-game-settings --reduced-motion)
     set_tests_properties(qml-persistent-in-game-settings PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+    foreach(width 960 1600)
+        foreach(mode windowed fullscreen)
+            set(store_launch_args)
+            if(mode STREQUAL "fullscreen")
+                list(APPEND store_launch_args --smoke-store-launch-fullscreen)
+            endif()
+            add_test(NAME qml-store-launch-${width}-${mode}
+                COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+                    --route settings-account --smoke-store-launch --smoke-width ${width}
+                    --reduced-motion ${store_launch_args})
+            set_tests_properties(qml-store-launch-${width}-${mode} PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+        endforeach()
+    endforeach()
     add_test(NAME qml-frame-generation
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-streaming --smoke-frame-generation --reduced-motion)
@@ -901,6 +923,7 @@ if(BUILD_TESTING)
         opennow-hdrcolor-tests
         opennow-theme-tests
         opennow-framepacer-tests
+        opennow-streampresenttimings-tests
         opennow-frameinterpolator-tests
         opennow-fsrupscaler-tests
         opennow-streamcolor-tests
