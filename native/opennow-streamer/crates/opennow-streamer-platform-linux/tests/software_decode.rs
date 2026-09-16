@@ -12,6 +12,7 @@ const BITSTREAM: &[u8] = include_bytes!("fixtures/software_decode_64x64.h264");
 const EXPECTED_FRAMES: usize = 30;
 const SECOND_KEYFRAME: usize = 15;
 const FRAME_INTERVAL_US: u64 = 33_333;
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn access_units(stream: &[u8]) -> Vec<(Vec<u8>, bool)> {
     let mut starts = Vec::new();
@@ -68,7 +69,7 @@ fn software_only_decodes_cpu_nv12_sdr_frames_for_embedded_presentation() {
     assert_eq!(units.len(), EXPECTED_FRAMES);
     let mut frames = Vec::new();
     let mut timestamp_us = 0;
-    for (data, keyframe) in units.iter() {
+    for (index, (data, keyframe)) in units.iter().enumerate() {
         assert!(matches!(
             session
                 .submit_video(
@@ -80,12 +81,22 @@ fn software_only_decodes_cpu_nv12_sdr_frames_for_embedded_presentation() {
                     .unwrap()
                 )
                 .expect("access unit is admitted"),
-            PushOutcome::Queued | PushOutcome::DroppedOldest
+            PushOutcome::Queued
         ));
+        let admitted = Instant::now() + ADMISSION_TIMEOUT;
+        while session.decode_timings().submissions_total < index as u64 + 1 {
+            while let Some(frame) = session.try_recv_frame() {
+                frames.push(frame);
+            }
+            assert!(
+                Instant::now() < admitted,
+                "software decoder never admitted access unit {index}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         while let Some(frame) = session.try_recv_frame() {
             frames.push(frame);
         }
-        thread::sleep(Duration::from_millis(1));
         timestamp_us += FRAME_INTERVAL_US;
     }
     drain_until_silent(&session, &mut frames, Duration::from_millis(500));
