@@ -69,6 +69,7 @@ fn protocol_five_shells_receive_the_paged_library_capabilities() {
         "catalog.libraryPages.v1",
         "catalog.metadata.v1",
         "account.syncObservation.v1",
+        "account.pushInvalidation.v1",
         "catalog.languages.v1",
     ] {
         assert!(capabilities.contains(&json!(capability)));
