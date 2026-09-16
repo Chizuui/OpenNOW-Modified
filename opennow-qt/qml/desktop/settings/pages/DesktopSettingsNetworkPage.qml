@@ -77,8 +77,15 @@ Column {
             DesktopSettingsSection { text: qsTr("TRANSPORT") }
             DesktopSettingsRow {
                 width: parent.width; paperStyle: true; glyph: "bolt"; title: qsTr("L4S")
-                description: qsTr("Request scalable low-latency transport for the next session"); showDivider: false
+                description: qsTr("Request scalable low-latency transport for the next session")
                 DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("enableL4S",false); onValueChangedByUser: value => page.settingsScreen.setSetting("enableL4S",value) }
+            }
+            DesktopSettingsRow {
+                objectName: "renewNetworkTest"
+                width: parent.width; paperStyle: true; glyph: "speed"; title: qsTr("Network test")
+                showDivider: false
+                description: qsTr("Measure this zone's UDP payload reachability before streaming · selected zones only")
+                DesktopSettingsToggle { objectName: "renewNetworkTestToggle"; checked: page.settingsScreen.boolSetting("networkTest",false); onValueChangedByUser: value => page.settingsScreen.setSetting("networkTest",value) }
             }
         }
     }

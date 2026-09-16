@@ -1266,6 +1266,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fs2",
+ "hmac",
  "httpdate",
  "keyring",
  "libc",

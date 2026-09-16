@@ -2446,6 +2446,8 @@
       "s_0740d167": "Keyboard & mouse",
       "s_0649e577": "Kraft",
       "s_9a7f4d8e": "L4S",
+      "s_network_test": "Network test",
+      "s_network_test_hint": "Measure this zone's UDP payload reachability before streaming · selected zones only",
       "s_4ddabc2b": "LB",
       "s_e75f32f3": "LOU",
       "s_b2fab4ce": "Launching the native media runtime…",

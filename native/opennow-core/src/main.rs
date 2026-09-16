@@ -15,6 +15,7 @@ mod gfn;
 mod language;
 mod media;
 mod network;
+mod network_test;
 mod persistent_storage;
 mod proxy;
 mod requests;

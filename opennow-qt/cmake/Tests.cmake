@@ -385,7 +385,7 @@ if(BUILD_TESTING)
         endforeach()
     endforeach()
     qt_add_resources(opennow-qt "store-paging-acceptance"
-        PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
+        PREFIX "/acceptance" BASE tests FILES tests/RegionPingAcceptance.qml tests/RegionChoicesAcceptance.qml tests/StorePagingAcceptance.qml tests/BackendAvailabilityAcceptance.qml tests/StreamRecoveryAcceptance.qml tests/IdleModeAcceptance.qml tests/FrameGenerationAcceptance.qml tests/AudioOutputAcceptance.qml tests/CollectionsAcceptance.qml tests/SteamBigPictureAcceptance.qml tests/PersistentInGameSettingsAcceptance.qml tests/NetworkTestAcceptance.qml tests/ControllerMetadataAcceptance.qml tests/MicrophoneAcceptance.qml tests/RecordingAcceptance.qml)
     add_test(NAME qml-recording
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings --smoke-recording --reduced-motion)
@@ -518,6 +518,10 @@ if(BUILD_TESTING)
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-streaming --smoke-persistent-in-game-settings --reduced-motion)
     set_tests_properties(qml-persistent-in-game-settings PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+    add_test(NAME qml-network-test
+        COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
+            --route settings-network --smoke-network-test --reduced-motion)
+    set_tests_properties(qml-network-test PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
     add_test(NAME qml-frame-generation
         COMMAND opennow-qt --smoke-test --allow-multiple-instances --desktop
             --route settings-streaming --smoke-frame-generation --reduced-motion)

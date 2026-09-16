@@ -190,6 +190,7 @@ const NVST_FEC_RTP_HEADER_ALLOWANCE: usize = 16;
 const DEFAULT_NVST_VIDEO_PACKET_SIZE: usize = 1_280;
 const MIN_NVST_VIDEO_PACKET_SIZE: usize = 256;
 const MAX_NVST_VIDEO_PACKET_SIZE: usize = 65_519;
+const UDP_HEADER_BYTES: usize = 8;
 // Match the official client's bounded NACK/dejitter envelope: it keeps up to
 // 1,024 RTP packets available for late or retransmitted packets and permits a
 // 2,048-entry NACK queue. A 32-packet window is only a few milliseconds at
@@ -4440,18 +4441,25 @@ pub fn nvst_video_packet_size(peer: IpAddr) -> std::io::Result<usize> {
     Ok(packet_size)
 }
 
+fn wire_overhead_bytes(peer: IpAddr) -> usize {
+    let ip_header_bytes = if peer.is_ipv4() { 20 } else { 40 };
+    ip_header_bytes + UDP_HEADER_BYTES + NVST_FEC_RTP_HEADER_ALLOWANCE + SRTP_AEAD_AES_GCM_TAG_LEN
+}
+
+pub fn measured_video_packet_size(datagram_size: usize, peer: IpAddr) -> Option<usize> {
+    let ip_header_bytes = if peer.is_ipv4() { 20 } else { 40 };
+    let route_mtu = datagram_size
+        .checked_add(UDP_HEADER_BYTES)?
+        .checked_add(ip_header_bytes)?;
+    video_packet_size_for_vpn_mtu(peer, Some(route_mtu)).ok()
+}
+
 fn video_packet_size_for_vpn_mtu(peer: IpAddr, route_mtu: Option<usize>) -> std::io::Result<usize> {
     let Some(route_mtu) = route_mtu else {
         return Ok(DEFAULT_NVST_VIDEO_PACKET_SIZE);
     };
-    let ip_header_bytes = if peer.is_ipv4() { 20 } else { 40 };
-    let udp_header_bytes = 8;
-    let overhead = ip_header_bytes
-        + udp_header_bytes
-        + NVST_FEC_RTP_HEADER_ALLOWANCE
-        + SRTP_AEAD_AES_GCM_TAG_LEN;
     let packet_size = route_mtu
-        .saturating_sub(overhead)
+        .saturating_sub(wire_overhead_bytes(peer))
         .min(DEFAULT_NVST_VIDEO_PACKET_SIZE)
         / 16
         * 16;
@@ -7766,6 +7774,45 @@ mod tests {
             assert!(
                 video_packet_size_for_vpn_mtu("192.0.2.1".parse().unwrap(), Some(mtu)).is_err()
             );
+        }
+    }
+
+    #[test]
+    fn measured_datagram_sizes_map_to_wire_budget_packet_sizes() {
+        for (address, datagram_size, expected) in [
+            ("192.0.2.1", 1_340_usize, Some(1_280)),
+            ("192.0.2.1", 1_300, Some(1_264)),
+            ("192.0.2.1", 1_216, Some(1_184)),
+            ("2001:db8::1", 1_340, Some(1_280)),
+            ("2001:db8::1", 1_300, Some(1_264)),
+            ("192.0.2.1", 300, Some(256)),
+            ("192.0.2.1", 65_535, Some(1_280)),
+            ("192.0.2.1", 0, None),
+            ("2001:db8::1", 0, None),
+        ] {
+            let peer: IpAddr = address.parse().unwrap();
+            assert_eq!(
+                measured_video_packet_size(datagram_size, peer),
+                expected,
+                "{address} {datagram_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_datagrams_never_exceed_the_route_derived_packet_size() {
+        for peer in ["192.0.2.1", "2001:db8::1"] {
+            let peer: IpAddr = peer.parse().unwrap();
+            let route_derived = video_packet_size_for_vpn_mtu(peer, Some(1_500)).unwrap();
+            for datagram_size in [320_usize, 700, 1_000, 1_216, 1_300, 1_340, 1_400] {
+                let measured = measured_video_packet_size(datagram_size, peer);
+                assert_eq!(
+                    measured,
+                    Some(((datagram_size - 32) / 16 * 16).min(1_280)),
+                    "{peer} {datagram_size}"
+                );
+                assert!(measured.unwrap() <= route_derived);
+            }
         }
     }
 

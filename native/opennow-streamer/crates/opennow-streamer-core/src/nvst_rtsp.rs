@@ -648,10 +648,15 @@ pub fn prepare_owned_nvst(
                 format!("Could not select the local route to the NVST media peer: {error}"),
             )
         })?;
-    let video_packet_size = nvst_video_packet_size(video_peer_ip.parse().map_err(|_| {
+    let video_peer_ip_parsed = video_peer_ip.parse().map_err(|_| {
         NvstRtspError::new("invalid-media-peer", "NVST video peer is not an IP address")
-    })?)
-    .map_err(|error| NvstRtspError::new("nvst-video-mtu-invalid", error.to_string()))?;
+    })?;
+    let video_packet_size = nvst_video_packet_size(video_peer_ip_parsed)
+        .map_err(|error| NvstRtspError::new("nvst-video-mtu-invalid", error.to_string()))?;
+    let video_packet_size = measured_path_packet_size(context, video_peer_ip_parsed)
+        .map_or(video_packet_size, |measured| {
+            video_packet_size.min(measured)
+        });
     opennow_streamer_protocol::log::log_line(
         "INFO",
         "transport",
@@ -1027,6 +1032,16 @@ fn negotiated_fps(context: &SessionContext) -> u64 {
         .or_else(|| context.settings.get("fps").and_then(Value::as_u64))
         .unwrap_or(60)
         .clamp(30, u64::from(super::MAX_STREAM_FPS))
+}
+
+fn measured_path_packet_size(context: &SessionContext, peer: IpAddr) -> Option<usize> {
+    let datagram = context
+        .session
+        .extra
+        .get("networkTest")?
+        .get("measuredDatagramBytes")?
+        .as_u64()?;
+    opennow_streamer_transport::measured_video_packet_size(usize::try_from(datagram).ok()?, peer)
 }
 
 fn negotiated_codec(context: &SessionContext) -> String {
@@ -1583,6 +1598,60 @@ mod tests {
             assert_eq!(
                 sdp_attribute(&sdp, "video[0].packetSize"),
                 Some(video_packet_size.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn announce_uses_the_measured_authenticated_path_when_it_is_tighter() {
+        let mut context = context();
+        context.session.extra.insert(
+            "networkTest".to_owned(),
+            json!({"sessionId":"nt-1", "measuredDatagramBytes":1_200}),
+        );
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let packet_size = measured_path_packet_size(&context, peer).expect("measured packet size");
+        assert_eq!(packet_size, 1_168);
+        assert!(packet_size < nvst_video_packet_size(peer).unwrap());
+
+        let sdp = build_announce(
+            &context,
+            AnnounceParams {
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: packet_size,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert_eq!(
+            sdp_attribute(&sdp, "video[0].packetSize"),
+            Some(packet_size.to_string())
+        );
+    }
+
+    #[test]
+    fn announce_ignores_an_absent_or_unusable_measurement() {
+        let base = context();
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(measured_path_packet_size(&base, peer), None);
+
+        for measured in [0_u64, 1, 12] {
+            let mut context = context();
+            context.session.extra.insert(
+                "networkTest".to_owned(),
+                json!({"measuredDatagramBytes":measured}),
+            );
+            assert_eq!(
+                measured_path_packet_size(&context, peer),
+                None,
+                "{measured}"
             );
         }
     }
