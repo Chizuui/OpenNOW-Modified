@@ -723,6 +723,15 @@ pub enum MediaFeedback {
         codec: &'static str,
         message: String,
     },
+    AudioDecoderError {
+        message: String,
+        consecutive: u32,
+    },
+    AudioUnavailable {
+        backend: &'static str,
+        reason: String,
+        rejected: u64,
+    },
     QueueDropped {
         media: &'static str,
         count: usize,
@@ -2922,6 +2931,9 @@ fn run_linux_video(shared: Arc<SharedPipeline>, host_commands: Sender<HostComman
                 }
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(reason) => trigger_linux_fallback(
                 &shared,
                 &host_commands,
@@ -2980,6 +2992,9 @@ fn run_embedded_linux_video(shared: Arc<SharedPipeline>) {
                 request_linux_keyframe(&shared, "embedded Linux decoder queue overflow");
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: shared.linux_codec.label(),
@@ -3050,7 +3065,8 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
                 });
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Queued)
-            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused)
+            | Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {}
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "opus",
@@ -3203,6 +3219,34 @@ fn run_embedded_linux_monitor(
                     stop_linux_session(&shared);
                     return;
                 }
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
                 opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
                     report_linux_color_format_change(&shared, &mut reported_color, format);
                 }
@@ -3298,6 +3342,34 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                     &host_commands,
                     "Linux hardware media session failed".to_owned(),
                 ),
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
                 opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
                     report_linux_color_format_change(&shared, &mut reported_color, format);
                 }
@@ -3394,6 +3466,46 @@ const fn linux_decoder_name(
         opennow_streamer_platform_linux::DecoderBackend::V4l2 => "V4L2/Vulkan",
         opennow_streamer_platform_linux::DecoderBackend::Ffmpeg => "FFmpeg software/Vulkan",
     }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_audio_backend_name(
+    backend: opennow_streamer_platform_linux::AudioBackend,
+) -> &'static str {
+    match backend {
+        opennow_streamer_platform_linux::AudioBackend::PipeWire => "PipeWire",
+        opennow_streamer_platform_linux::AudioBackend::Alsa => "ALSA",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_loss(
+    shared: &SharedPipeline,
+    backend: opennow_streamer_platform_linux::AudioBackend,
+    message: String,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(backend),
+        recovered: false,
+        message: Some(message),
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_recovery(
+    shared: &SharedPipeline,
+    from: opennow_streamer_platform_linux::AudioBackend,
+    to: opennow_streamer_platform_linux::AudioBackend,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(from),
+        recovered: true,
+        message: Some(format!(
+            "{} accepted audio output after the {} sink failed",
+            linux_audio_backend_name(to),
+            linux_audio_backend_name(from)
+        )),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -4294,6 +4406,83 @@ mod tests {
             );
             assert!(result.err().is_some_and(|error| error.contains(expected)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn device_lost_feedback(
+        receiver: &Receiver<MediaFeedback>,
+    ) -> (&'static str, bool, Option<String>) {
+        match receiver
+            .try_recv()
+            .expect("a device state feedback for every audio output event")
+        {
+            MediaFeedback::DeviceLost {
+                subsystem,
+                recovered,
+                message,
+            } => (subsystem, recovered, message),
+            other => panic!("expected a device state feedback, saw {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_feedback_pairs_loss_and_recovery_without_touching_video() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::PipeWire, "Broken pipe".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::PipeWire, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        assert_eq!(loss.0, "PipeWire");
+        assert!(!loss.1);
+        assert_eq!(loss.2.as_deref(), Some("Broken pipe"));
+
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(
+            recovery.0, "PipeWire",
+            "recovery must clear the audio subsystem that lost output"
+        );
+        assert!(recovery.1);
+        assert!(
+            recovery
+                .2
+                .as_deref()
+                .is_some_and(|message| message.contains("ALSA") && message.contains("PipeWire")),
+            "recovery must name the sink that accepted output, saw {:?}",
+            recovery.2
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "one loss and one recovery only"
+        );
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.video_desynced.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_recovery_pairs_a_backend_that_recovered_itself() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::Alsa, "Device lost".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::Alsa, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(loss, ("ALSA", false, Some("Device lost".to_owned())));
+        assert_eq!(
+            recovery.0, loss.0,
+            "a backend that accepted output again clears its own loss"
+        );
+        assert!(recovery.1);
+        assert!(receiver.try_recv().is_err());
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
     }
 
     #[cfg(target_os = "windows")]
