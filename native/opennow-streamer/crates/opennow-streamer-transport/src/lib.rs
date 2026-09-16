@@ -19,6 +19,7 @@ pub use nvst_haptics::{NvstControllerRumble, NvstHaptics};
 
 pub use nvst::{
     BoundedFrameQueue, EncodedVideoAccessUnit, NvstBundleIdentity, NvstConfigError, NvstDropReason,
+    NvstFrameProgress, NvstFrameProgressEvent, NvstFrameProgressPolicy, NvstFrameProgressStage,
     NvstReceiveEvent, NvstReceiverState, NvstRecovery, NvstSrtpProfile, NvstUdpReceiverControl,
     NvstUdpReceiverError, NvstUdpReceiverSession, NvstUnsupportedFeature, NvstVideoCodec,
     NvstVideoConfig, NvstVideoReceiver, ReservedNvstBundle, SharedNvstFeedback,

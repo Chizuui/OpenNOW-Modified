@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use decode_progress::{
+    DecodeProgressEvent, DecodeProgressPolicy, DecodeProgressStage, DecodeProgressWatchdog,
+};
 use opennow_streamer_platform::{
     CapturedInput, CapturedInputQueue, CapturedInputSample, DecodeStageTimings,
     DecodeTimingsReport, EncodedFrame, MediaCodec, MediaColorQuality, MediaControl, MediaFeedback,
@@ -26,6 +29,7 @@ use opennow_streamer_transport::{
 };
 use serde_json::{Value, json};
 
+mod decode_progress;
 mod microphone;
 mod nvst_rtsp;
 mod queue_drops;
@@ -94,6 +98,12 @@ trait NvstSessionResources {
     }
     fn frame_stage_timings(&self) -> Option<FrameStageTimings> {
         None
+    }
+    fn decode_progress_policy(&self) -> DecodeProgressPolicy {
+        DecodeProgressPolicy {
+            stall: Duration::from_millis(nvst_rtsp::VIDEO_TIMEOUT_MS),
+            keyframe_grace: Duration::from_millis(nvst_rtsp::VIDEO_TIMEOUT_MS),
+        }
     }
     fn request_keyframe(&self);
     fn acknowledge_video_frame(&self, frame_index: u32, bytes: u32);
@@ -1667,6 +1677,7 @@ fn forward_nvst_session_events<R: NvstSessionResources>(
         transport: resources,
     } = event_resources;
     let mut feedback_state = NvstMediaFeedbackState::new(false);
+    feedback_state.start_id = start_id.clone();
     if let Some(queue) = captured_input.as_ref() {
         queue.set_text_ready(generation, false);
     }
@@ -1790,6 +1801,16 @@ fn forward_nvst_session_events<R: NvstSessionResources>(
                     }
                     _ => {}
                 }
+                match nvst_event {
+                    NvstReceiveEvent::FrameProgressStall { .. }
+                    | NvstReceiveEvent::RecoveryNeeded(NvstRecovery::FrameProgress { .. }) => {
+                        feedback_state.transport_frame_progress_stalled = true;
+                    }
+                    NvstReceiveEvent::FrameProgressResumed => {
+                        feedback_state.transport_frame_progress_stalled = false;
+                    }
+                    _ => {}
+                }
                 let terminal = forward_nvst_event(
                     output,
                     lifecycle,
@@ -1814,6 +1835,51 @@ fn forward_nvst_session_events<R: NvstSessionResources>(
                     "NVST receiver event channel closed unexpectedly".to_owned(),
                 );
                 break;
+            }
+        }
+        if let Some(timings) = feedback_state.decode_timings {
+            let decode_event = feedback_state.decode_progress.poll(
+                &timings,
+                feedback_state.transport_frame_progress_stalled,
+                Instant::now(),
+                resources.decode_progress_policy(),
+            );
+            if let Some(decode_event) = decode_event {
+                match decode_event {
+                    DecodeProgressEvent::KeyframeRequested {
+                        idle_for,
+                        in_flight,
+                    } => {
+                        resources.request_keyframe();
+                        let _ = output.send(event(
+                            "log",
+                            json!({
+                                "level": "warn",
+                                "message": format!(
+                                    "Decoder produced no frame for {idle_for:?} with {in_flight} frame(s) outstanding; requested a keyframe"
+                                )
+                            }),
+                        ));
+                    }
+                    DecodeProgressEvent::RecoveryNeeded {
+                        idle_for,
+                        in_flight,
+                    } => {
+                        let reason = format!(
+                            "decoder stall: no output for {idle_for:?} with {in_flight} frame(s) outstanding"
+                        );
+                        if attempt_nvst_recovery(
+                            output,
+                            lifecycle,
+                            generation,
+                            &resources,
+                            &mut feedback_state.recovery_attempts,
+                            reason,
+                        ) {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1899,6 +1965,25 @@ fn forward_nvst_event<R: NvstSessionResources>(
     match nvst_event {
         NvstReceiveEvent::MicrophoneError(message) => {
             opennow_streamer_protocol::log::log_line("WARN", "microphone", &message);
+            false
+        }
+        NvstReceiveEvent::FrameProgressStall {
+            idle_for,
+            recovery_required: false,
+            ..
+        } => {
+            let _ = output.send(event(
+                "log",
+                json!({
+                    "level": "warn",
+                    "message": format!(
+                        "Produced-frame stall for {idle_for:?}; requested a fresh keyframe"
+                    )
+                }),
+            ));
+            false
+        }
+        NvstReceiveEvent::FrameProgressStall { .. } | NvstReceiveEvent::FrameProgressResumed => {
             false
         }
         NvstReceiveEvent::RecoveryNeeded(NvstRecovery::PacketGap {
@@ -2127,6 +2212,14 @@ fn frame_stage_timings_event(timings: Option<FrameStageTimings>) -> Value {
     })
 }
 
+fn decode_progress_stage_name(stage: DecodeProgressStage) -> &'static str {
+    match stage {
+        DecodeProgressStage::Tracking => "tracking",
+        DecodeProgressStage::KeyframePending => "keyframe-pending",
+        DecodeProgressStage::RecoveryRequired => "recovery-required",
+    }
+}
+
 fn decode_timings_event(timings: Option<DecodeTimingsReport>) -> Value {
     let Some(timings) = timings else {
         return Value::Null;
@@ -2164,6 +2257,9 @@ struct NvstMediaFeedbackState {
     telemetry_bytes: u64,
     peak_bitrate_mbps: f64,
     decode_timings: Option<DecodeTimingsReport>,
+    decode_progress: DecodeProgressWatchdog,
+    transport_frame_progress_stalled: bool,
+    start_id: String,
 }
 
 impl NvstMediaFeedbackState {
@@ -2178,6 +2274,9 @@ impl NvstMediaFeedbackState {
             telemetry_bytes: 0,
             peak_bitrate_mbps: 0.0,
             decode_timings: None,
+            decode_progress: DecodeProgressWatchdog::default(),
+            transport_frame_progress_stalled: false,
+            start_id: String::new(),
         }
     }
 }
@@ -2211,6 +2310,9 @@ fn flush_nvst_telemetry<R: NvstSessionResources>(
             "decoderResidenceMs": state.decode_timings.and_then(|timings| timings.residence)
                 .map(|stage| stage.p50_us as f64 / 1_000.0),
             "decodeTimings": decode_timings_event(state.decode_timings),
+            "decodeProgressStage": decode_progress_stage_name(state.decode_progress.stage()),
+            "transportFrameProgressStalled": state.transport_frame_progress_stalled,
+            "startId": state.start_id,
         }),
     ));
     state.telemetry_window_started = Instant::now();
@@ -2240,6 +2342,7 @@ fn forward_nvst_media_feedback<R: NvstSessionResources>(
             keyframe,
             ..
         } => {
+            state.transport_frame_progress_stalled = false;
             if let Some(frame_index) = frame_index {
                 resources.acknowledge_video_frame(frame_index, bytes);
             }
@@ -2999,10 +3102,11 @@ mod tests {
         rumble: Arc<Mutex<[Option<NvstControllerRumble>; 4]>>,
         ping_ms: Option<f64>,
         frame_stage_timings: Option<FrameStageTimings>,
-        keyframe_requests: AtomicUsize,
+        decode_progress_policy: Option<DecodeProgressPolicy>,
+        keyframe_requests: Arc<AtomicUsize>,
         acknowledged_frames: AtomicUsize,
         acknowledged_frame_data: Mutex<Vec<(u32, u32)>>,
-        recoveries: AtomicUsize,
+        recoveries: Arc<AtomicUsize>,
         stops: AtomicUsize,
         captured_inputs: Mutex<Vec<Vec<u8>>>,
     }
@@ -3017,6 +3121,14 @@ mod tests {
 
         fn frame_stage_timings(&self) -> Option<FrameStageTimings> {
             self.frame_stage_timings
+        }
+
+        fn decode_progress_policy(&self) -> DecodeProgressPolicy {
+            self.decode_progress_policy
+                .unwrap_or_else(|| DecodeProgressPolicy {
+                    stall: Duration::from_millis(nvst_rtsp::VIDEO_TIMEOUT_MS),
+                    keyframe_grace: Duration::from_millis(nvst_rtsp::VIDEO_TIMEOUT_MS),
+                })
         }
 
         fn request_keyframe(&self) {
@@ -4004,6 +4116,544 @@ mod tests {
         worker.join().unwrap();
         assert!(receiver.try_recv().is_err());
         drop(transport_sender);
+    }
+
+    #[test]
+    fn decode_stall_escalates_from_keyframe_to_bounded_recovery() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = EventSender::unbounded(sender);
+        let lifecycle = Arc::new(connected_lifecycle());
+        let (feedback_sender, feedback) = std::sync::mpsc::channel();
+        let (transport_sender, nvst_events) = std::sync::mpsc::channel();
+        let stalled_at = Instant::now() - Duration::from_secs(5);
+        let resources = TestNvstResources {
+            decode_progress_policy: Some(DecodeProgressPolicy {
+                stall: Duration::from_millis(200),
+                keyframe_grace: Duration::from_millis(200),
+            }),
+            frame_stage_timings: Some(FrameStageTimings {
+                last_assembled_at: Some(stalled_at),
+                assembled_frames_total: 12,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keyframe_requests = Arc::clone(&resources.keyframe_requests);
+        let recoveries = Arc::clone(&resources.recoveries);
+        let report = DecodeTimingsReport {
+            call: None,
+            residence: None,
+            call_window_samples: 0,
+            residence_window_samples: 0,
+            submissions_total: 12,
+            outputs_total: 11,
+            output_calls_total: 11,
+            last_submission_at: Some(stalled_at),
+            last_output_at: Some(stalled_at),
+            in_flight: 1,
+            oldest_in_flight_at: Some(stalled_at),
+            epoch: 3,
+            epoch_started_at: Some(stalled_at),
+            unmatched_outputs: 0,
+            unmatched_submissions: 0,
+        };
+        feedback_sender
+            .send(MediaFeedback::DecodeTimings(report))
+            .unwrap();
+        let feeder = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                if feedback_sender
+                    .send(MediaFeedback::DecodeTimings(report))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let worker_lifecycle = lifecycle.clone();
+        let worker = thread::spawn(move || {
+            forward_nvst_session_events(
+                &sender,
+                &worker_lifecycle,
+                7,
+                NvstSessionEventResources {
+                    start_id: "decode-stall".to_owned(),
+                    nvst_events,
+                    media_feedback: Some(feedback),
+                    captured_input: None,
+                    shortcut_runtime: None,
+                    transport: resources,
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut messages = Vec::new();
+        let mut saw_stage = false;
+        while Instant::now() < deadline {
+            if let Ok(message) = receiver.recv_timeout(Duration::from_millis(200)) {
+                if message["type"] == "telemetry"
+                    && message["decodeProgressStage"] == "recovery-required"
+                {
+                    saw_stage = true;
+                }
+                messages.push(message);
+                if recoveries.load(Ordering::Relaxed) > 0 && saw_stage {
+                    break;
+                }
+            }
+        }
+        lock_lifecycle(&lifecycle).generation += 1;
+        worker.join().unwrap();
+        drop(transport_sender);
+        let _ = feeder.join();
+
+        assert_eq!(
+            recoveries.load(Ordering::Relaxed),
+            1,
+            "the decode stall must reach the bounded same-session recovery"
+        );
+        assert_eq!(
+            keyframe_requests.load(Ordering::Relaxed),
+            2,
+            "one keyframe from the stall stage and one from the recovery attempt"
+        );
+        assert!(
+            messages.iter().any(|message| message["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("Decoder produced no frame"))),
+            "the stall stage must be observable: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("Attempting bounded NVST recovery"))),
+            "the recovery stage must be observable: {messages:?}"
+        );
+        assert!(
+            saw_stage,
+            "telemetry must publish the recovery-required decode stage: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn transport_frame_progress_stall_owns_escalation_over_the_decode_stage() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = EventSender::unbounded(sender);
+        let lifecycle = Arc::new(connected_lifecycle());
+        let (feedback_sender, feedback) = std::sync::mpsc::channel();
+        let (transport_sender, nvst_events) = std::sync::mpsc::channel();
+        let resources = TestNvstResources {
+            decode_progress_policy: Some(DecodeProgressPolicy {
+                stall: Duration::from_millis(200),
+                keyframe_grace: Duration::from_millis(200),
+            }),
+            ..Default::default()
+        };
+        let keyframe_requests = Arc::clone(&resources.keyframe_requests);
+        let recoveries = Arc::clone(&resources.recoveries);
+        let stalled_at = Instant::now() - Duration::from_secs(5);
+        let report = DecodeTimingsReport {
+            call: None,
+            residence: None,
+            call_window_samples: 0,
+            residence_window_samples: 0,
+            submissions_total: 1,
+            outputs_total: 0,
+            output_calls_total: 0,
+            last_submission_at: Some(stalled_at),
+            last_output_at: None,
+            in_flight: 1,
+            oldest_in_flight_at: Some(stalled_at),
+            epoch: 1,
+            epoch_started_at: Some(stalled_at),
+            unmatched_outputs: 0,
+            unmatched_submissions: 0,
+        };
+        feedback_sender
+            .send(MediaFeedback::DecodeTimings(report))
+            .unwrap();
+        let feeder = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                if feedback_sender
+                    .send(MediaFeedback::DecodeTimings(report))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let worker_lifecycle = lifecycle.clone();
+        let worker = thread::spawn(move || {
+            forward_nvst_session_events(
+                &sender,
+                &worker_lifecycle,
+                7,
+                NvstSessionEventResources {
+                    start_id: "decode-owned".to_owned(),
+                    nvst_events,
+                    media_feedback: Some(feedback),
+                    captured_input: None,
+                    shortcut_runtime: None,
+                    transport: resources,
+                },
+            )
+        });
+
+        transport_sender
+            .send(NvstReceiveEvent::RecoveryNeeded(
+                NvstRecovery::FrameProgress {
+                    idle_for: Duration::from_secs(8),
+                    last_assembled_frame_index: None,
+                },
+            ))
+            .unwrap();
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            recoveries.load(Ordering::Relaxed),
+            1,
+            "the transport stall owns the single recovery attempt"
+        );
+        assert_eq!(
+            keyframe_requests.load(Ordering::Relaxed),
+            1,
+            "only the transport recovery may request a keyframe, not the decode stage"
+        );
+        let mut messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            messages.push(message);
+        }
+        assert!(
+            !messages.iter().any(|message| message["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("Decoder produced no frame"))),
+            "downstream stall must stay silent while the transport owns it: {messages:?}"
+        );
+        lock_lifecycle(&lifecycle).generation += 1;
+        let _ = transport_sender.send(NvstReceiveEvent::InputUnavailable(String::new()));
+        worker.join().unwrap();
+        let _ = feeder.join();
+    }
+
+    #[test]
+    fn transport_stall_ownership_reaches_telemetry_in_both_phases() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = EventSender::unbounded(sender);
+        let lifecycle = Arc::new(connected_lifecycle());
+        let (feedback_sender, feedback) = std::sync::mpsc::channel();
+        let (transport_sender, nvst_events) = std::sync::mpsc::channel();
+        let resources = TestNvstResources {
+            decode_progress_policy: Some(DecodeProgressPolicy {
+                stall: Duration::from_millis(200),
+                keyframe_grace: Duration::from_millis(200),
+            }),
+            ..Default::default()
+        };
+        let worker_lifecycle = lifecycle.clone();
+        let worker = thread::spawn(move || {
+            forward_nvst_session_events(
+                &sender,
+                &worker_lifecycle,
+                7,
+                NvstSessionEventResources {
+                    start_id: "stall-ownership".to_owned(),
+                    nvst_events,
+                    media_feedback: Some(feedback),
+                    captured_input: None,
+                    shortcut_runtime: None,
+                    transport: resources,
+                },
+            )
+        });
+
+        transport_sender
+            .send(NvstReceiveEvent::FrameProgressStall {
+                idle_for: Duration::from_millis(800),
+                last_assembled_frame_index: Some(9),
+                recovery_required: false,
+            })
+            .unwrap();
+        let idle_at = Instant::now();
+        let decode_report = DecodeTimingsReport {
+            call: None,
+            residence: None,
+            call_window_samples: 0,
+            residence_window_samples: 0,
+            submissions_total: 9,
+            outputs_total: 9,
+            output_calls_total: 9,
+            last_submission_at: Some(idle_at),
+            last_output_at: Some(idle_at),
+            in_flight: 0,
+            oldest_in_flight_at: None,
+            epoch: 1,
+            epoch_started_at: Some(idle_at),
+            unmatched_outputs: 0,
+            unmatched_submissions: 0,
+        };
+        feedback_sender
+            .send(MediaFeedback::DecodeTimings(decode_report))
+            .unwrap();
+        let feeder = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                if feedback_sender
+                    .send(MediaFeedback::DecodeTimings(decode_report))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut stalled = None;
+        let mut logged_stall = false;
+        while Instant::now() < deadline && stalled.is_none() {
+            if let Ok(message) = receiver.recv_timeout(Duration::from_millis(200)) {
+                if message["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Produced-frame stall"))
+                {
+                    logged_stall = true;
+                }
+                if message["type"] == "telemetry"
+                    && message["transportFrameProgressStalled"]
+                        .as_bool()
+                        .unwrap_or(false)
+                {
+                    stalled = Some(true);
+                }
+            }
+        }
+        assert!(
+            logged_stall,
+            "the keyframe-pending phase must be observable"
+        );
+        assert_eq!(
+            stalled,
+            Some(true),
+            "the keyframe-pending phase must reach the consumer boundary"
+        );
+
+        transport_sender
+            .send(NvstReceiveEvent::RecoveryNeeded(
+                NvstRecovery::FrameProgress {
+                    idle_for: Duration::from_secs(2),
+                    last_assembled_frame_index: Some(9),
+                },
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut recovery_owned = false;
+        while Instant::now() < deadline && !recovery_owned {
+            if let Ok(message) = receiver.recv_timeout(Duration::from_millis(200))
+                && message["type"] == "telemetry"
+                && message["transportFrameProgressStalled"]
+                    .as_bool()
+                    .unwrap_or(false)
+            {
+                recovery_owned = true;
+            }
+        }
+        assert!(
+            recovery_owned,
+            "the recovery phase must keep ownership visible to the consumer"
+        );
+
+        lock_lifecycle(&lifecycle).generation += 1;
+        worker.join().unwrap();
+        let _ = feeder.join();
+        drop(transport_sender);
+    }
+
+    #[test]
+    fn assembly_resumption_returns_ownership_to_the_decode_stage() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = EventSender::unbounded(sender);
+        let lifecycle = Arc::new(connected_lifecycle());
+        let (feedback_sender, feedback) = std::sync::mpsc::channel();
+        let (transport_sender, nvst_events) = std::sync::mpsc::channel();
+        let resources = TestNvstResources {
+            decode_progress_policy: Some(DecodeProgressPolicy {
+                stall: Duration::from_millis(200),
+                keyframe_grace: Duration::from_millis(200),
+            }),
+            ..Default::default()
+        };
+        let keyframe_requests = Arc::clone(&resources.keyframe_requests);
+        let recoveries = Arc::clone(&resources.recoveries);
+        let stalled_at = Instant::now() - Duration::from_secs(5);
+        let report = DecodeTimingsReport {
+            call: None,
+            residence: None,
+            call_window_samples: 0,
+            residence_window_samples: 0,
+            submissions_total: 7,
+            outputs_total: 6,
+            output_calls_total: 6,
+            last_submission_at: Some(stalled_at),
+            last_output_at: Some(stalled_at),
+            in_flight: 1,
+            oldest_in_flight_at: Some(stalled_at),
+            epoch: 2,
+            epoch_started_at: Some(stalled_at),
+            unmatched_outputs: 0,
+            unmatched_submissions: 0,
+        };
+        let worker_lifecycle = lifecycle.clone();
+        let worker = thread::spawn(move || {
+            forward_nvst_session_events(
+                &sender,
+                &worker_lifecycle,
+                7,
+                NvstSessionEventResources {
+                    start_id: "assembly-resumed".to_owned(),
+                    nvst_events,
+                    media_feedback: Some(feedback),
+                    captured_input: None,
+                    shortcut_runtime: None,
+                    transport: resources,
+                },
+            )
+        });
+
+        transport_sender
+            .send(NvstReceiveEvent::FrameProgressStall {
+                idle_for: Duration::from_secs(8),
+                last_assembled_frame_index: None,
+                recovery_required: false,
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            recoveries.load(Ordering::Relaxed),
+            0,
+            "the transport owns the stall while it is unresolved"
+        );
+
+        transport_sender
+            .send(NvstReceiveEvent::FrameProgressResumed)
+            .unwrap();
+        feedback_sender
+            .send(MediaFeedback::DecodeTimings(report))
+            .unwrap();
+        let feeder = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                if feedback_sender
+                    .send(MediaFeedback::DecodeTimings(report))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && recoveries.load(Ordering::Relaxed) == 0 {
+            let _ = receiver.recv_timeout(Duration::from_millis(100));
+        }
+        assert_eq!(
+            recoveries.load(Ordering::Relaxed),
+            1,
+            "with assembly resumed and the decoder still outstanding, the decode stage \
+             must regain ownership and recover"
+        );
+        assert!(
+            keyframe_requests.load(Ordering::Relaxed) >= 1,
+            "the decode stall must request a fresh keyframe"
+        );
+
+        lock_lifecycle(&lifecycle).generation += 1;
+        worker.join().unwrap();
+        let _ = feeder.join();
+        drop(transport_sender);
+    }
+
+    #[test]
+    fn idle_decoder_without_outstanding_work_never_escalates() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = EventSender::unbounded(sender);
+        let lifecycle = Arc::new(connected_lifecycle());
+        let (feedback_sender, feedback) = std::sync::mpsc::channel();
+        let (transport_sender, nvst_events) = std::sync::mpsc::channel();
+        let resources = TestNvstResources {
+            decode_progress_policy: Some(DecodeProgressPolicy {
+                stall: Duration::from_millis(100),
+                keyframe_grace: Duration::from_millis(100),
+            }),
+            ..Default::default()
+        };
+        let keyframe_requests = Arc::clone(&resources.keyframe_requests);
+        let recoveries = Arc::clone(&resources.recoveries);
+        let idle_at = Instant::now() - Duration::from_secs(30);
+        let report = DecodeTimingsReport {
+            call: None,
+            residence: None,
+            call_window_samples: 0,
+            residence_window_samples: 0,
+            submissions_total: 4,
+            outputs_total: 4,
+            output_calls_total: 4,
+            last_submission_at: Some(idle_at),
+            last_output_at: Some(idle_at),
+            in_flight: 0,
+            oldest_in_flight_at: None,
+            epoch: 1,
+            epoch_started_at: Some(idle_at),
+            unmatched_outputs: 0,
+            unmatched_submissions: 0,
+        };
+        feedback_sender
+            .send(MediaFeedback::DecodeTimings(report))
+            .unwrap();
+        let feeder = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                if feedback_sender
+                    .send(MediaFeedback::DecodeTimings(report))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let worker_lifecycle = lifecycle.clone();
+        let worker = thread::spawn(move || {
+            forward_nvst_session_events(
+                &sender,
+                &worker_lifecycle,
+                7,
+                NvstSessionEventResources {
+                    start_id: "idle-decoder".to_owned(),
+                    nvst_events,
+                    media_feedback: Some(feedback),
+                    captured_input: None,
+                    shortcut_runtime: None,
+                    transport: resources,
+                },
+            )
+        });
+        let mut saw_tracking = false;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline && !saw_tracking {
+            if let Ok(message) = receiver.recv_timeout(Duration::from_millis(200))
+                && message["type"] == "telemetry"
+            {
+                assert_eq!(message["decodeProgressStage"], "tracking");
+                saw_tracking = true;
+            }
+        }
+        lock_lifecycle(&lifecycle).generation += 1;
+        worker.join().unwrap();
+        drop(transport_sender);
+        let _ = feeder.join();
+        assert_eq!(keyframe_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(recoveries.load(Ordering::Relaxed), 0);
+        assert!(saw_tracking, "idle decoder must still publish its stage");
     }
 
     #[test]

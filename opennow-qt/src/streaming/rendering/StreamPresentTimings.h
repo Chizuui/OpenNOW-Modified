@@ -26,6 +26,7 @@ public:
         std::uint64_t swappedFramesTotal = 0;
         bool hasLastSwap = false;
         std::int64_t lastSwapNs = 0;
+        bool hasPendingSubmit = false;
         std::uint64_t epoch = 0;
     };
 
@@ -59,6 +60,7 @@ public:
         result.swappedFramesTotal = m_swappedFramesTotal;
         result.hasLastSwap = m_hasLastSwap;
         result.lastSwapNs = m_lastSwapNs;
+        result.hasPendingSubmit = m_hasPendingSubmit;
         result.epoch = m_epoch;
         if (m_windowSamples == 0) return result;
         std::vector<std::int64_t> sorted(m_samples.begin(), m_samples.begin() + m_windowSamples);

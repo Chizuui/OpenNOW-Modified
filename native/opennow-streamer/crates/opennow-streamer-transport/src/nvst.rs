@@ -738,6 +738,13 @@ impl NvstFeedbackState {
         });
     }
 
+    pub fn last_assembled_frame_at(&self) -> Option<Instant> {
+        self.frame_stage_timings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_assembled_at()
+    }
+
     pub fn frame_stage_timings(&self) -> crate::FrameStageTimings {
         self.frame_stage_timings
             .lock()
@@ -1740,6 +1747,10 @@ pub enum NvstRecovery {
     Timeout {
         idle_for: Duration,
     },
+    FrameProgress {
+        idle_for: Duration,
+        last_assembled_frame_index: Option<u32>,
+    },
 }
 
 /// All receive decisions are explicit so callers can collect operational metrics without
@@ -1755,7 +1766,75 @@ pub enum NvstReceiveEvent {
     CursorCapture(bool),
     Dropped(NvstDropReason),
     RecoveryNeeded(NvstRecovery),
+    FrameProgressStall {
+        idle_for: Duration,
+        last_assembled_frame_index: Option<u32>,
+        recovery_required: bool,
+    },
+    FrameProgressResumed,
     Lifecycle(NvstReceiverState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvstFrameProgressPolicy {
+    pub stall: Duration,
+    pub keyframe_grace: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NvstFrameProgressStage {
+    #[default]
+    Tracking,
+    KeyframePending,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvstFrameProgress {
+    pub authenticated_packets: u64,
+    pub last_authenticated_packet: Option<Instant>,
+    pub assembled_frames_total: u64,
+    pub last_assembled_frame_index: Option<u32>,
+    pub last_assembled_at: Option<Instant>,
+    pub stage: NvstFrameProgressStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvstFrameProgressEvent {
+    KeyframeRequested {
+        idle_for: Duration,
+        last_assembled_frame_index: Option<u32>,
+    },
+    RecoveryNeeded {
+        idle_for: Duration,
+        last_assembled_frame_index: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FrameProgressWatchdog {
+    first_authenticated_at: Option<Instant>,
+    last_assembled_frame_index: Option<u32>,
+    stage: NvstFrameProgressStage,
+    keyframe_requested_at: Option<Instant>,
+}
+
+impl FrameProgressWatchdog {
+    fn authenticated(&mut self, now: Instant) {
+        self.first_authenticated_at.get_or_insert(now);
+    }
+
+    fn assembled(&mut self, frame_index: u32) -> bool {
+        let closed_episode = self.stage != NvstFrameProgressStage::Tracking;
+        self.last_assembled_frame_index = Some(frame_index);
+        self.stage = NvstFrameProgressStage::Tracking;
+        self.keyframe_requested_at = None;
+        closed_episode
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3642,6 +3721,7 @@ pub struct NvstVideoReceiver {
     timeout_origin: Instant,
     last_authenticated_packet: Option<Instant>,
     initial_timeout_pending: bool,
+    frame_progress: FrameProgressWatchdog,
 }
 
 impl NvstVideoReceiver {
@@ -3676,6 +3756,7 @@ impl NvstVideoReceiver {
             timeout_origin: Instant::now(),
             last_authenticated_packet: None,
             initial_timeout_pending: true,
+            frame_progress: FrameProgressWatchdog::default(),
         }
     }
 
@@ -3750,6 +3831,63 @@ impl NvstVideoReceiver {
         }))
     }
 
+    pub fn frame_progress(&self) -> NvstFrameProgress {
+        let stage = self.config.feedback().frame_stage_timings();
+        NvstFrameProgress {
+            authenticated_packets: self.authenticated_packets,
+            last_authenticated_packet: self.last_authenticated_packet,
+            assembled_frames_total: stage.assembled_frames_total,
+            last_assembled_frame_index: self.frame_progress.last_assembled_frame_index,
+            last_assembled_at: stage.last_assembled_at,
+            stage: self.frame_progress.stage,
+        }
+    }
+
+    pub fn poll_frame_progress(
+        &mut self,
+        now: Instant,
+        policy: NvstFrameProgressPolicy,
+    ) -> Option<NvstFrameProgressEvent> {
+        if self.state != NvstReceiverState::Running {
+            return None;
+        }
+        let assembled_at = self.config.feedback().last_assembled_frame_at();
+        let epoch_at = self.frame_progress.first_authenticated_at;
+        let base = match (assembled_at, epoch_at) {
+            (Some(assembled), Some(epoch)) => assembled.max(epoch),
+            (Some(assembled), None) => assembled,
+            (None, epoch) => epoch?,
+        };
+        let idle_for = now.saturating_duration_since(base);
+        match self.frame_progress.stage {
+            NvstFrameProgressStage::Tracking => {
+                if idle_for < policy.stall {
+                    return None;
+                }
+                self.frame_progress.stage = NvstFrameProgressStage::KeyframePending;
+                self.frame_progress.keyframe_requested_at = Some(now);
+                self.config.feedback.request_keyframe();
+                Some(NvstFrameProgressEvent::KeyframeRequested {
+                    idle_for,
+                    last_assembled_frame_index: self.frame_progress.last_assembled_frame_index,
+                })
+            }
+            NvstFrameProgressStage::KeyframePending => {
+                let grace_started = self.frame_progress.keyframe_requested_at.unwrap_or(now);
+                if now.saturating_duration_since(grace_started) < policy.keyframe_grace {
+                    return None;
+                }
+                self.frame_progress.stage = NvstFrameProgressStage::RecoveryRequired;
+                self.state = NvstReceiverState::RecoveryRequired;
+                Some(NvstFrameProgressEvent::RecoveryNeeded {
+                    idle_for,
+                    last_assembled_frame_index: self.frame_progress.last_assembled_frame_index,
+                })
+            }
+            NvstFrameProgressStage::RecoveryRequired => None,
+        }
+    }
+
     pub fn process_datagram(
         &mut self,
         source: SocketAddr,
@@ -3807,6 +3945,7 @@ impl NvstVideoReceiver {
         self.bound_ssrc.get_or_insert(packet.header.ssrc);
         self.last_authenticated_packet = Some(now);
         self.initial_timeout_pending = false;
+        self.frame_progress.authenticated(now);
         self.authenticated_packets += 1;
         let sequence = u32::try_from(packet.index & 0xffff_ffff).unwrap_or(u32::MAX);
         self.highest_sequence_received = self.highest_sequence_received.max(sequence);
@@ -3921,6 +4060,9 @@ impl NvstVideoReceiver {
                     frame.contiguous = self.next_frame_contiguous;
                     self.next_frame_contiguous = true;
                     self.frames_emitted += 1;
+                    if self.frame_progress.assembled(frame.frame_index) {
+                        events.push(NvstReceiveEvent::FrameProgressResumed);
+                    }
                     self.config.feedback.publish_completed_frame(&frame);
                     events.push(NvstReceiveEvent::Frame(frame));
                 }
@@ -4007,6 +4149,7 @@ impl NvstVideoReceiver {
         self.last_stream_packet_index = None;
         self.next_frame_contiguous = false;
         self.config.feedback().reset_frame_stage_epoch();
+        self.frame_progress.reset();
     }
 }
 
@@ -6121,17 +6264,19 @@ fn run_nvst_webrtc_bundle(
                                 }
                             }
                         } else {
+                            let received_at = Instant::now();
                             for event in receiver.process_mjolnir_payload(
                                 *packet.header.ssrc,
                                 packet.header.timestamp,
                                 &packet.payload,
-                                Instant::now(),
+                                received_at,
                             ) {
                                 if !forward_receive_event(
                                     &media_consumer,
                                     &event_sender,
                                     &feedback,
                                     transport_origin,
+                                    received_at,
                                     &mut video_delivery_gap,
                                     event,
                                 ) {
@@ -6450,13 +6595,15 @@ fn run_nvst_udp_receiver(
                         StunDatagram::NotStun => non_stun += 1,
                     }
                 }
-                let events = receiver.process_datagram(source, &datagram[..length], Instant::now());
+                let received_at = Instant::now();
+                let events = receiver.process_datagram(source, &datagram[..length], received_at);
                 for event in events {
                     if !forward_receive_event(
                         &media_consumer,
                         &event_sender,
                         &feedback,
                         transport_origin,
+                        received_at,
                         &mut video_delivery_gap,
                         event,
                     ) {
@@ -6520,7 +6667,54 @@ fn run_nvst_udp_receiver(
                 );
             }
         }
+        let packets_stalled = timeout.is_some();
         forward_optional(&event_sender, timeout);
+        if !packets_stalled
+            && let Some(event) = receiver.poll_frame_progress(
+                now,
+                NvstFrameProgressPolicy {
+                    stall: receiver.config.timeout,
+                    keyframe_grace: receiver.config.timeout,
+                },
+            )
+        {
+            match event {
+                NvstFrameProgressEvent::KeyframeRequested {
+                    idle_for,
+                    last_assembled_frame_index,
+                } => {
+                    opennow_streamer_protocol::log::log_async(
+                        "WARN",
+                        "nvst-video",
+                        &format!(
+                            "produced-frame stall idle_for={idle_for:?}; requested a keyframe local_port={local_port} {}",
+                            receiver.stats_line(stats_origin)
+                        ),
+                    );
+                    let _ = event_sender.send(NvstReceiveEvent::FrameProgressStall {
+                        idle_for,
+                        last_assembled_frame_index,
+                        recovery_required: false,
+                    });
+                }
+                NvstFrameProgressEvent::RecoveryNeeded {
+                    idle_for,
+                    last_assembled_frame_index,
+                } => {
+                    let _ = event_sender.send(NvstReceiveEvent::FrameProgressStall {
+                        idle_for,
+                        last_assembled_frame_index,
+                        recovery_required: true,
+                    });
+                    let _ = event_sender.send(NvstReceiveEvent::RecoveryNeeded(
+                        NvstRecovery::FrameProgress {
+                            idle_for,
+                            last_assembled_frame_index,
+                        },
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -6535,11 +6729,11 @@ fn forward_receive_event(
     event_sender: &Sender<NvstReceiveEvent>,
     feedback: &SharedNvstFeedback,
     transport_origin: Instant,
+    delivered_at: Instant,
     delivery_gap: &mut bool,
     event: NvstReceiveEvent,
 ) -> bool {
     if let NvstReceiveEvent::Frame(frame) = event {
-        let delivered_at = Instant::now();
         let media_frame = EncodedMediaFrame {
             mid: "nvst-video-0".to_owned(),
             codec: frame.codec.label().to_owned(),
@@ -6650,6 +6844,9 @@ mod tests {
     }
     mod recovery_tests {
         include!("nvst_recovery_tests.rs");
+    }
+    mod progress_tests {
+        include!("nvst_progress_tests.rs");
     }
     mod qos_tests {
         include!("nvst_qos_tests.rs");
@@ -7190,6 +7387,7 @@ mod tests {
             &event_sender,
             &feedback,
             Instant::now(),
+            Instant::now(),
             &mut false,
             NvstReceiveEvent::Frame(EncodedVideoAccessUnit {
                 codec: NvstVideoCodec::Av1,
@@ -7231,6 +7429,7 @@ mod tests {
                     &media_consumer,
                     &event_sender,
                     &feedback,
+                    Instant::now(),
                     Instant::now(),
                     &mut delivery_gap,
                     NvstReceiveEvent::Frame(EncodedVideoAccessUnit {
@@ -7281,6 +7480,7 @@ mod tests {
             &event_sender,
             &feedback,
             Instant::now(),
+            Instant::now(),
             &mut delivery_gap,
             frame(1),
         ));
@@ -7288,6 +7488,7 @@ mod tests {
             &media_consumer,
             &event_sender,
             &feedback,
+            Instant::now(),
             Instant::now(),
             &mut delivery_gap,
             frame(2),
@@ -7313,6 +7514,7 @@ mod tests {
             &event_sender,
             &feedback,
             Instant::now(),
+            Instant::now(),
             &mut delivery_gap,
             frame(3),
         ));
@@ -7322,6 +7524,7 @@ mod tests {
             &media_consumer,
             &event_sender,
             &feedback,
+            Instant::now(),
             Instant::now(),
             &mut delivery_gap,
             frame(4),

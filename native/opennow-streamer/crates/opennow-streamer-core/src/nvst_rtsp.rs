@@ -27,7 +27,7 @@ const MAX_STREAM_BITRATE_MBPS: u64 = 200;
 // video[0].sendFrameTimeoutMs=7000. Waiting sixty seconds left a dead Mjolnir media leg on screen
 // while audio/control remained alive; use the official receiver timeout so the existing bounded
 // transport recovery runs promptly.
-const VIDEO_TIMEOUT_MS: u64 = 8_000;
+pub(crate) const VIDEO_TIMEOUT_MS: u64 = 8_000;
 const VIDEO_STARTUP_TIMEOUT_MS: u64 = if cfg!(windows) {
     60_000
 } else {
