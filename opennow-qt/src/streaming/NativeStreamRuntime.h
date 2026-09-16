@@ -92,6 +92,14 @@ public:
     [[nodiscard]] QString lastError() const;
     [[nodiscard]] quint64 presentationGeneration() const;
     [[nodiscard]] bool presentationAllowed() const;
+    struct UpstreamProgress
+    {
+        bool stalled = false;
+        bool hasDecodeTimings = false;
+        quint64 decodeEpoch = 0;
+        quint64 decodedOutputsTotal = 0;
+    };
+    [[nodiscard]] UpstreamProgress upstreamProgress() const;
     [[nodiscard]] bool inputAllowed() const;
     [[nodiscard]] bool serverCursorComposited() const;
     [[nodiscard]] const OpenNowStreamerVulkanDevice *vulkanDevice() const;

@@ -156,6 +156,13 @@
     "title": "Persistent in-game settings",
     "description": "Keep your in-game graphics settings between sessions for supported games and memberships. Applies to new sessions."
   },
+  "storeLaunch": {
+    "checking": "Checking the Steam store launch…",
+    "readyDescription": "Opens the %1 store with your persistent storage.",
+    "launch": "Launch Steam",
+    "starting": "Starting the Steam store session…",
+    "staleAccount": "The account changed. Refresh the store launch and try again."
+  },
   "saveBandwidth": {
     "title": "Save bandwidth",
     "description": "Lets the server trade resolution and image quality for a steadier frame rate when your connection cannot sustain the selected profile. Off requests no dynamic adjustment. Applies to new sessions."
@@ -494,6 +501,11 @@
     "total": "total",
     "packetLoss": "PACKET LOSS",
     "decode": "DECODE",
+    "decoderResidence": "DECODER RESIDENCE",
+    "qtSubmitToSwap": "QT SUBMIT TO SWAP",
+    "swapGate": "SWAP GATE",
+    "windowMinimized": "Window minimized",
+    "windowHidden": "Window hidden",
     "session": "Session: ",
     "streamStats": "Stream stats:",
     "more": "more",
