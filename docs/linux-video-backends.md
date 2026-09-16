@@ -1,9 +1,15 @@
 # Troubleshoot unavailable Linux video backends
 
-The Qt stream view requires a hardware decoder. On Intel systems, VA-API decoding can
+The Qt stream view prefers a hardware decoder. On Intel systems, VA-API decoding can
 work without Vulkan Video decoding support. The stream view still uses Vulkan for
-presentation; OpenGL is not an embedded streaming backend. Enabling software decoding
-in a standalone streamer does not enable it in the Qt stream view.
+presentation; OpenGL is not an embedded streaming backend.
+
+Auto never switches to software decoding on its own, including after a failed
+hardware start. When no hardware decoder is available, choose **Software (CPU)** in
+Stream settings to decode with the bundled FFmpeg software decoder. That path accepts
+8-bit 4:2:0 SDR only: HDR, 10-bit, and 4:4:4 are refused before CloudMatch instead of
+being downgraded, and frames are copied through a bounded CPU NV12 upload. Expect
+higher CPU load and lower frame rates than hardware decoding.
 
 ## Check the host driver first
 

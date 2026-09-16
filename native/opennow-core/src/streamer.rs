@@ -335,22 +335,41 @@ impl StreamerService {
                 "HDR requires an active HDR-capable window output. Disable HDR or select a supported display.",
             ));
         }
-        if hdr && settings["decoderPreference"].as_str() == Some("software") {
+        let requested_backend = requested_embedded_backend(settings);
+        let software_requested = matches!(requested_backend.as_str(), "software" | "ffmpeg");
+        if hdr && software_requested {
             return Err(invalid(
                 "HDR requires a 10-bit hardware decoder; software decoding is not supported",
             ));
         }
-        let requested_backend = settings["nativeVideoBackend"].as_str().unwrap_or("auto");
+        let requested_color = settings["colorQuality"].as_str().unwrap_or("8bit_420");
+        if software_requested && requested_color != "8bit_420" {
+            return Err(invalid(
+                "Software decoding presents 8-bit 4:2:0 SDR only. Select 8-bit 4:2:0 in Stream settings or a hardware backend.",
+            ));
+        }
+        let software_available = capabilities["videoBackends"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|backend| {
+                matches!(backend["backend"].as_str(), Some("software" | "ffmpeg"))
+                    && backend["available"].as_bool() == Some(true)
+            });
         let mut selected = capabilities.clone();
         let backends = selected["videoBackends"]
             .as_array_mut()
             .ok_or_else(|| invalid("Embedded streamer did not report video backends"))?;
         for backend in backends.iter_mut() {
             let name = backend["backend"].as_str().unwrap_or("");
-            let matches = !matches!(name, "software" | "ffmpeg")
-                && (requested_backend == "auto"
-                    || requested_backend == name
-                    || (requested_backend == "nvdec" && name == "cuda"));
+            let matches = if software_requested {
+                matches!(name, "software" | "ffmpeg")
+            } else {
+                !matches!(name, "software" | "ffmpeg")
+                    && (requested_backend == "auto"
+                        || requested_backend == name
+                        || (requested_backend == "nvdec" && name == "cuda"))
+            };
             if !matches {
                 backend["available"] = json!(false);
             }
@@ -359,12 +378,14 @@ impl StreamerService {
             .iter()
             .any(|backend| backend["available"].as_bool() == Some(true))
         {
-            let message = if requested_backend == "auto" {
-                "No hardware video backend is available for embedded streaming on this device. Check the hardware drivers and export diagnostics for backend probe failures.".to_owned()
-            } else {
+            let message = if software_requested {
+                format!(
+                    "The FFmpeg software decoder is unavailable for the requested {requested_color} profile. Select Auto in Stream settings, or export diagnostics for backend probe failures."
+                )
+            } else if requested_backend != "auto" {
                 let mut message = format!(
                     "The {} backend is unavailable for embedded streaming on this device. Select Auto in Stream settings.",
-                    crate::diagnostics::runtime_failure_reason(requested_backend)
+                    crate::diagnostics::runtime_failure_reason(&requested_backend)
                 );
                 let evidence = crate::diagnostics::native_runtime_evidence(capabilities);
                 if let Some(reason) = evidence["videoBackends"]
@@ -381,6 +402,10 @@ impl StreamerService {
                     message.push_str(&format!(" {reason}"));
                 }
                 message
+            } else if software_available {
+                "No hardware video backend is available for embedded streaming on this device. Select Software (CPU) to decode on the CPU, or export diagnostics for probe failures.".to_owned()
+            } else {
+                "No hardware video backend is available for embedded streaming on this device. Check the hardware drivers and export diagnostics for backend probe failures.".to_owned()
             };
             return Err(StreamerError {
                 code: "streamer_backend_unavailable",
@@ -495,7 +520,7 @@ impl StreamerService {
             };
             candidates.iter().find(|codec| codec_available(&selected, codec)).copied()
                 .ok_or_else(|| StreamerError { code: "streamer_codec_unavailable",
-                    message: "No available hardware codec supports the requested color mode. Try 8-bit 4:2:0 in Stream settings.".to_owned() })?
+                    message: "No available codec supports the requested color mode. Try 8-bit 4:2:0 in Stream settings.".to_owned() })?
         } else {
             let codec =
                 normalize_codec_name(&requested).ok_or_else(|| invalid("Unknown video codec"))?;
@@ -1011,6 +1036,27 @@ fn probe_capabilities(executable: &Path, settings: &Value) -> Result<Value, Stre
     let _ = reader.join();
     let _ = stderr_reader.join();
     Ok(capabilities)
+}
+
+fn requested_embedded_backend(settings: &Value) -> String {
+    let requested = settings["nativeVideoBackend"]
+        .as_str()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    if !requested.is_empty() && requested != "auto" {
+        return requested;
+    }
+    match settings["decoderPreference"]
+        .as_str()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "software" => "software".to_owned(),
+        _ => "auto".to_owned(),
+    }
 }
 
 fn normalize_codec_name(value: &str) -> Option<&'static str> {
@@ -2350,6 +2396,71 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.message.contains("Select Auto"));
+    }
+
+    #[test]
+    fn embedded_software_resolution_honors_the_explicit_cpu_policy() {
+        let software_caps = json!({"protocolVersion":STREAMER_PROTOCOL_VERSION,"videoBackends":[
+            {"backend":"vulkan", "platform":"linux", "available":true, "codecs":[
+                {"codec":"h264", "available":true, "colorQualities":["8bit_420"]},
+                {"codec":"h265", "available":true, "colorQualities":["8bit_420"]}]},
+            {"backend":"ffmpeg", "platform":"linux", "available":true, "codecs":[
+                {"codec":"h264", "available":true, "colorQualities":["8bit_420"]}]}
+        ]});
+        for settings in [
+            json!({"nativeVideoBackend":"software", "codec":"h264"}),
+            json!({"nativeVideoBackend":"ffmpeg", "codec":"h264"}),
+            json!({"decoderPreference":"software", "codec":"h264"}),
+        ] {
+            let resolved =
+                StreamerService::embedded_session_settings(&settings, &software_caps).unwrap();
+            assert_eq!(resolved["codec"], "h264", "{settings}");
+        }
+        let error = StreamerService::embedded_session_settings(
+            &json!({"nativeVideoBackend":"software", "codec":"h265"}),
+            &software_caps,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "streamer_codec_unavailable");
+        assert!(
+            !error.message.contains("hardware"),
+            "software requests must not borrow hardware codecs: {}",
+            error.message
+        );
+        let error = StreamerService::embedded_session_settings(
+            &json!({"nativeVideoBackend":"software", "colorQuality":"10bit_420"}),
+            &software_caps,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("Software decoding presents 8-bit 4:2:0 SDR only"),
+            "{}",
+            error.message
+        );
+        let hardware_only = json!({"protocolVersion":STREAMER_PROTOCOL_VERSION,"videoBackends":[
+            {"backend":"vulkan", "platform":"linux", "available":true, "codecs":[
+                {"codec":"h264", "available":true, "colorQualities":["8bit_420"]}]}
+        ]});
+        let error = StreamerService::embedded_session_settings(
+            &json!({"nativeVideoBackend":"software"}),
+            &hardware_only,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("FFmpeg software decoder is unavailable"),
+            "{}",
+            error.message
+        );
+        let resolved = StreamerService::embedded_session_settings(
+            &json!({"nativeVideoBackend":"auto", "codec":"auto"}),
+            &software_caps,
+        )
+        .unwrap();
+        assert_eq!(resolved["codec"], "h265");
     }
 
     #[test]

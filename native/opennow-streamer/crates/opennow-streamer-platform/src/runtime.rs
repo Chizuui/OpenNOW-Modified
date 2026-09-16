@@ -213,12 +213,13 @@ impl MediaRuntime {
         let supported = matches!(requested, "auto" | "videotoolbox");
         #[cfg(target_os = "linux")]
         let supported = requested == "auto"
-            || (matches!(requested, "vulkan" | "cuda" | "nvdec" | "vaapi" | "v4l2")
-                && self.video_backends().iter().any(|backend| {
-                    backend.available
-                        && (backend.backend == requested
-                            || (requested == "nvdec" && backend.backend == "cuda"))
-                }));
+            || self.video_backends().iter().any(|backend| {
+                backend.available
+                    && (backend.backend == requested
+                        || (requested == "nvdec" && backend.backend == "cuda")
+                        || (matches!(requested, "software" | "ffmpeg")
+                            && backend.backend == "ffmpeg"))
+            });
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         let supported = requested == "auto";
         if supported {
@@ -1983,6 +1984,31 @@ mod tests {
         assert!(vulkan.codecs.iter().all(|codec| !codec.available));
         assert!(runtime.validate_backend("vulkan").is_err());
         assert!(runtime.validate_backend("auto").is_ok());
+        runtime.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_runtime_accepts_software_only_when_the_cpu_decoder_is_available() {
+        let (_graphics, frames) = crate::RenderThreadGraphics::new(|| {});
+        let runtime = super::create_embedded_runtime(frames);
+        let software_available = runtime
+            .video_backends()
+            .iter()
+            .any(|backend| backend.backend == "ffmpeg" && backend.available);
+        for requested in ["software", "ffmpeg"] {
+            assert_eq!(
+                runtime.validate_backend(requested).is_ok(),
+                software_available,
+                "{requested}"
+            );
+        }
+        for unsupported in ["hardware", "d3d12", "videotoolbox", "invalid"] {
+            assert!(
+                runtime.validate_backend(unsupported).is_err(),
+                "{unsupported}"
+            );
+        }
         runtime.shutdown();
     }
 

@@ -58,6 +58,13 @@ QtObject {
     readonly property string keyboardLayoutDescription: qsTr("Physical key mapping requested from GeForce NOW. Applies to the next session.")
     readonly property string interfaceLanguageDescription: qsTr("OpenNOW interface only. Community translated through Crowdin.")
     readonly property string colorDescription: qsTr("Availability follows the current backend, codec and HDR output. Saved unsupported choices are preserved; launch validates the profile.")
+    readonly property bool softwareDecodeRequested: {
+        const backend = String(settings.nativeVideoBackend || "auto")
+        if (["auto", ""].indexOf(backend) < 0)
+            return ["software", "ffmpeg"].indexOf(backend) >= 0
+        return settings.decoderPreference === "software"
+    }
+
     readonly property string languageStatusText: {
         if (languageState === "loading") return qsTr("Loading game languages… Saved preferences are unchanged.")
         if (languageState === "stale") return qsTr("Using stale cached game languages. %1").arg(languageError)
@@ -246,11 +253,13 @@ QtObject {
         const result = []
         const backends = capabilities && capabilities.videoBackends
             ? capabilities.videoBackends : []
+        const requested = String(settings.nativeVideoBackend || "auto")
+        const softwareRequested = softwareDecodeRequested
         for (let backendIndex = 0; backendIndex < backends.length; ++backendIndex) {
             const backend = backends[backendIndex]
-            const requested = String(settings.nativeVideoBackend || "auto")
-            if (!backend.available || ["software", "ffmpeg"].indexOf(backend.backend) >= 0
-                    || (requested !== "auto" && requested !== backend.backend
+            const software = ["software", "ffmpeg"].indexOf(backend.backend) >= 0
+            if (!backend.available || (softwareRequested ? !software : software)
+                    || (!softwareRequested && requested !== "auto" && requested !== backend.backend
                     && !(requested === "nvdec" && backend.backend === "cuda")))
                 continue
             const codecs = backend.codecs || []
@@ -433,15 +442,19 @@ QtObject {
                 ? [{label:"Metal / VideoToolbox", value:"videotoolbox"}]
                 : backends.filter(backend => ["vulkan", "cuda", "vaapi", "v4l2"].indexOf(backend.backend) >= 0)
                     .map(backend => ({label:String(backend.backend).toUpperCase(), value:backend.backend}))
+        if (Qt.platform.os !== "windows" && Qt.platform.os !== "osx")
+            choices.push({label: qsTr("Software (CPU)"), value: "software"})
         for (const choice of choices) {
-            const backend = backends.find(backend => backend.backend === choice.value)
-            result.push(Object.assign({}, choice, {
+            const backend = backends.find(backend => backend.backend
+                === (choice.value === "software" ? "ffmpeg" : choice.value))
+            result.push({label: choice.label, value: choice.value,
                 disabled: !nativeRuntimeReady || !backend || !backend.available,
                 detail: !nativeRuntimeReady ? qsTr("Checking hardware…")
                     : !backend ? qsTr("Not supported by this stream view")
-                    : backend.available ? qsTr("Hardware decoding")
+                    : backend.available ? (choice.value === "software"
+                        ? qsTr("CPU decoding; 8-bit 4:2:0 SDR only") : qsTr("Hardware decoding"))
                     : String(backend.reason || qsTr("Unavailable on this device"))
-            }))
+            })
         }
         return result
     }

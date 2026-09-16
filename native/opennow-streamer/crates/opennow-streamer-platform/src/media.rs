@@ -1229,6 +1229,13 @@ impl MediaSession {
                 "embedded Linux output requires a native NV12 decoder".to_owned()
             }));
         };
+        if decoder_preference == opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly
+            && (stream.hdr || stream.color_quality != crate::MediaColorQuality::EightBit420)
+        {
+            return Err(
+                "Software decoding presents 8-bit 4:2:0 SDR only. Select 8-bit 4:2:0, or disable HDR, or select a hardware backend.".to_owned(),
+            );
+        }
         let format = opennow_streamer_platform_linux::StreamFormat::video_default(
             stream.width,
             stream.height,
@@ -1329,10 +1336,12 @@ impl MediaSession {
         let producer = crate::LinuxGpuFrameProducer::new(8).map_err(|error| error.to_string())?;
         let embedded_frames = frames.clone();
         let monitor_shared = Arc::clone(&shared);
+        let monitor_label = linux_embedded_backend_label(decoder_preference);
         let linux_monitor = match thread::Builder::new()
             .name("opennow-embedded-linux-frame-publisher".to_owned())
-            .spawn(move || run_embedded_linux_monitor(monitor_shared, frames, producer))
-        {
+            .spawn(move || {
+                run_embedded_linux_monitor(monitor_shared, frames, producer, monitor_label)
+            }) {
             Ok(worker) => worker,
             Err(error) => {
                 shared.video.close();
@@ -3082,6 +3091,7 @@ fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
     producer: crate::LinuxGpuFrameProducer,
+    backend_label: &'static str,
 ) {
     use std::time::Duration;
 
@@ -3156,7 +3166,7 @@ fn run_embedded_linux_monitor(
                     Ok(_) if !playback_started => {
                         playback_started = true;
                         let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
-                            backend: "Linux decoder/embedded Vulkan",
+                            backend: backend_label,
                         });
                     }
                     Ok(_) => {}
@@ -3465,6 +3475,18 @@ const fn linux_decoder_name(
         opennow_streamer_platform_linux::DecoderBackend::VaApi => "VA-API/Vulkan",
         opennow_streamer_platform_linux::DecoderBackend::V4l2 => "V4L2/Vulkan",
         opennow_streamer_platform_linux::DecoderBackend::Ffmpeg => "FFmpeg software/Vulkan",
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_embedded_backend_label(
+    preference: opennow_streamer_platform_linux::DecoderPreference,
+) -> &'static str {
+    match preference {
+        opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly => {
+            linux_decoder_name(opennow_streamer_platform_linux::DecoderBackend::Ffmpeg)
+        }
+        _ => "Linux decoder/embedded Vulkan",
     }
 }
 
@@ -4380,6 +4402,21 @@ mod tests {
                 MediaColorQuality::TenBit420,
                 DecoderPreference::VulkanOnly,
                 "attached shared device",
+            ),
+            (
+                MediaColorQuality::TenBit420,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::EightBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::TenBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
             ),
         ] {
             let (feedback, _feedback_receiver) = std::sync::mpsc::channel();
