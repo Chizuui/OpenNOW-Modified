@@ -48,6 +48,7 @@ class StreamVideoItem : public QQuickItem
                    NOTIFY upscalingDenoiseChanged)
     Q_PROPERTY(QVariantMap frameGenerationStats READ frameGenerationStats
                    NOTIFY frameGenerationStatsChanged)
+    Q_PROPERTY(QVariantMap swapStats READ swapStats NOTIFY swapStatsChanged)
 
 public:
     struct RemoteCursorMetadata {
@@ -88,6 +89,7 @@ public:
     int upscalingDenoise() const;
     void setUpscalingDenoise(int value);
     QVariantMap frameGenerationStats() const;
+    QVariantMap swapStats() const;
 
     static void setNativeStreamRuntime(NativeStreamRuntime *runtime);
     [[nodiscard]] static NativeStreamRuntime *nativeStreamRuntime();
@@ -132,6 +134,7 @@ signals:
     void upscalingSharpnessChanged();
     void upscalingDenoiseChanged();
     void frameGenerationStatsChanged();
+    void swapStatsChanged();
     void localShortcutRequested(const QString &action);
 
 protected:
@@ -167,6 +170,10 @@ private:
     void releaseInput();
     void releaseQtMouseButtons();
     void updateCursorConfinement();
+    void updateSwapGate();
+    void syncSwapGate();
+    [[nodiscard]] QString currentSwapGateSource() const;
+    void pushSwapGate();
     [[nodiscard]] static QRect cursorConfinementRect(const QRect &viewport, bool rawRelative);
     void releaseCursorConfinement();
     void submitAbsoluteMouse(const QPointF &position);
@@ -194,6 +201,8 @@ private:
     int m_upscalingSharpness = 10;
     int m_upscalingDenoise = 0;
     QTimer m_frameStatsTimer;
+    QTimer m_swapStatsTimer;
+    QString m_swapGateSource;
     QMetaObject::Connection m_frameSwapConnection;
     QMetaObject::Connection m_frameUpdateConnection;
     bool m_captureActive = false;
