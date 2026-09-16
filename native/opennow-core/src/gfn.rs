@@ -22,12 +22,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod catalog;
 mod catalog_actions;
+mod store_launch;
 use catalog::*;
 
 #[cfg(test)]
 mod catalog_tests;
 #[cfg(test)]
 mod routing_tests;
+#[cfg(test)]
+mod store_launch_tests;
 
 const DEFAULT_IDP_ID: &str = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 const DEFAULT_STREAMING_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
@@ -178,6 +181,10 @@ pub(crate) enum TokenPurpose {
 }
 
 impl AuthTokens {
+    fn service_token(&self) -> &str {
+        self.id_token.as_deref().unwrap_or(&self.access_token)
+    }
+
     fn expiry(&self, purpose: TokenPurpose) -> u64 {
         match purpose {
             TokenPurpose::StarfleetAccess => self.expires_at,
@@ -1451,11 +1458,7 @@ impl GfnService {
         client: &Client,
         session: &AuthSession,
     ) -> Result<Value, ServiceError> {
-        let token = session
-            .tokens
-            .id_token
-            .as_deref()
-            .unwrap_or(&session.tokens.access_token);
+        let token = session.tokens.service_token();
         let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
         let url = self.server_info_url(&base)?;
         let response = client
@@ -1504,11 +1507,7 @@ impl GfnService {
     pub fn subscription(&self, settings: &Value) -> Result<Value, ServiceError> {
         self.authenticated_read(|session, generation| {
         let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
-        let token = session
-            .tokens
-            .id_token
-            .as_deref()
-            .unwrap_or(&session.tokens.access_token);
+        let token = session.tokens.service_token();
         let vpc_id = self.vpc_id(&client, session, generation, settings, token, None)?;
         let steam_deck = settings["identifyAsSteamDeck"].as_bool().unwrap_or(false);
         let mut url = url::Url::parse(&self.endpoints.subscription).expect("MES URL is valid");
@@ -1605,8 +1604,11 @@ impl GfnService {
             });
         }
         let _catalog_action = self.admit_catalog_action(&intent_session, app_id)?;
-        let inspection =
-            self.catalog_launch_inspect(&json!({"appId":app_id,"variantId":variant_id}), settings)?;
+        let store_launch = store_launch::store_launch_intent(params)?;
+        let inspection = self.catalog_launch_inspect(
+            &json!({"appId":app_id,"variantId":variant_id,"storeLaunch":store_launch}),
+            settings,
+        )?;
         if inspection["decision"]["status"] != "ready" {
             return Err(ServiceError {
                 code: "launch_not_ready",
@@ -2337,6 +2339,32 @@ impl GfnService {
 
     pub(crate) fn auth_generation(&self) -> u64 {
         self.state.lock().expect("GFN state poisoned").generation
+    }
+
+    pub(crate) fn push_scope(&self) -> Option<opennow_core::push::PushScope> {
+        let state = self.state.lock().expect("GFN state poisoned");
+        let session = state.session.as_ref()?;
+        Some(opennow_core::push::PushScope {
+            user_id: session.user.user_id.clone(),
+            provider_id: session.provider.idp_id.clone(),
+            generation: state.generation,
+        })
+    }
+
+    pub(crate) fn push_token_for_scope(
+        &self,
+        expected: &opennow_core::push::PushScope,
+    ) -> Option<String> {
+        let (session, generation) = self
+            .authenticated_snapshot(TokenPurpose::ServiceId, false)
+            .ok()?;
+        if session.user.user_id != expected.user_id
+            || session.provider.idp_id != expected.provider_id
+            || generation != expected.generation
+        {
+            return None;
+        }
+        Some(session.tokens.service_token().to_owned())
     }
 
     fn vpc_id(
@@ -3375,6 +3403,26 @@ fn required_string(payload: &Value, key: &str) -> Result<String, ServiceError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn tokens(id_token: Option<&str>) -> AuthTokens {
+        AuthTokens {
+            access_token: "access-token".to_owned(),
+            refresh_token: None,
+            id_token: id_token.map(str::to_owned),
+            id_token_expires_at: None,
+            expires_at: 0,
+            auth_client_id: "client".to_owned(),
+            client_token: None,
+            client_token_expires_at: None,
+            client_token_lifetime_ms: None,
+        }
+    }
+
+    #[test]
+    fn the_service_token_prefers_the_id_token_and_falls_back_to_access() {
+        assert_eq!(tokens(Some("id-token")).service_token(), "id-token");
+        assert_eq!(tokens(None).service_token(), "access-token");
+    }
 
     fn mock_responses(
         responses: Vec<(u16, Value)>,

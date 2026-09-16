@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <utility>
@@ -99,6 +100,55 @@ QString statusText(OpenNowStreamerStatus status)
     return u"The embedded streamer returned an unknown status (%1)."_s
         .arg(static_cast<int>(status));
 }
+
+std::optional<quint64> decodedCounterFromJson(const QJsonValue &value)
+{
+    if (!value.isDouble()) return std::nullopt;
+    const double number = value.toDouble();
+    constexpr double MaxExactJsonInteger = 9'007'199'254'740'991.0;
+    if (!std::isfinite(number) || number < 0.0 || number > MaxExactJsonInteger)
+        return std::nullopt;
+    if (std::trunc(number) != number) return std::nullopt;
+    return static_cast<quint64>(number);
+}
+
+class UpstreamProgressSnapshot
+{
+public:
+    void publish(bool stalled, bool hasDecodeTimings, quint64 epoch, quint64 outputs)
+    {
+        m_sequence.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        m_epoch.store(epoch, std::memory_order_relaxed);
+        m_outputs.store(outputs, std::memory_order_relaxed);
+        m_stalled.store(stalled, std::memory_order_relaxed);
+        m_hasDecodeTimings.store(hasDecodeTimings, std::memory_order_relaxed);
+        m_sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    [[nodiscard]] NativeStreamRuntime::UpstreamProgress read() const
+    {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const quint64 before = m_sequence.load(std::memory_order_acquire);
+            if (before & 1u) continue;
+            NativeStreamRuntime::UpstreamProgress progress;
+            progress.decodeEpoch = m_epoch.load(std::memory_order_relaxed);
+            progress.decodedOutputsTotal = m_outputs.load(std::memory_order_relaxed);
+            progress.stalled = m_stalled.load(std::memory_order_relaxed);
+            progress.hasDecodeTimings = m_hasDecodeTimings.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (m_sequence.load(std::memory_order_relaxed) == before) return progress;
+        }
+        return {};
+    }
+
+private:
+    std::atomic<quint64> m_sequence{0};
+    std::atomic<quint64> m_epoch{0};
+    std::atomic<quint64> m_outputs{0};
+    std::atomic<bool> m_stalled{false};
+    std::atomic<bool> m_hasDecodeTimings{false};
+};
 }
 
 struct NativeStreamRuntime::CallbackState final
@@ -143,11 +193,13 @@ struct NativeStreamRuntime::Private {
     bool firstNotification = false;
     std::atomic<quint64> presentationGeneration{0};
     std::atomic_bool presentationAllowed{false};
+    UpstreamProgressSnapshot upstreamProgressSamples;
     std::atomic_bool inputAllowed{false};
     bool inputAuthorizationPending = false;
     bool serverCursorComposited = true;
     QString cursorStartId;
     QString presentationStartId;
+    QString acceptedSessionStartId;
     QString rumbleStartId;
     quint64 rumbleStartEpoch = 0;
 };
@@ -228,6 +280,11 @@ quint64 NativeStreamRuntime::presentationGeneration() const
     return d->presentationGeneration.load(std::memory_order_acquire);
 }
 
+NativeStreamRuntime::UpstreamProgress NativeStreamRuntime::upstreamProgress() const
+{
+    return d->upstreamProgressSamples.read();
+}
+
 bool NativeStreamRuntime::presentationAllowed() const
 {
     return d->presentationAllowed.load(std::memory_order_acquire);
@@ -243,8 +300,10 @@ void NativeStreamRuntime::invalidatePresentation()
     d->presentationAllowed.store(false, std::memory_order_release);
     d->presentationGeneration.fetch_add(1, std::memory_order_acq_rel);
     d->presentationStartId.clear();
+    d->acceptedSessionStartId.clear();
     d->rumbleStartId.clear();
     d->cursorStartId.clear();
+    d->upstreamProgressSamples.publish(false, false, 0, 0);
     emit controllerRumbleStopped();
     emit frameAvailable(); // Repaint even when the dead transport sends no more frames.
 }
@@ -796,6 +855,23 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
             continue;
         }
         const auto kind = document.object().value(u"type"_s).toString();
+        if (message.event && kind == u"telemetry"_s) {
+            const auto object = document.object();
+            const auto startId = object.value(u"startId"_s).toString();
+            if (presentationAllowed() && !startId.isEmpty()
+                && startId == d->acceptedSessionStartId) {
+                const auto stage = object.value(u"decodeProgressStage"_s).toString();
+                const bool stalled =
+                    object.value(u"transportFrameProgressStalled"_s).toBool()
+                    || stage == u"keyframe-pending"_s
+                    || stage == u"recovery-required"_s;
+                const auto decodeTimings = object.value(u"decodeTimings"_s).toObject();
+                const auto epoch = decodedCounterFromJson(decodeTimings.value(u"epoch"_s));
+                const auto outputs = decodedCounterFromJson(decodeTimings.value(u"outputsTotal"_s));
+                d->upstreamProgressSamples.publish(stalled, epoch.has_value() && outputs.has_value(),
+                                                   epoch.value_or(0), outputs.value_or(0));
+            }
+        }
         const auto status = document.object().value(u"status"_s).toString();
         if (message.event && kind == u"cursor-capture"_s) {
             if (d->cursorStartId.isEmpty()
@@ -835,7 +911,9 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
             if (!current()) return;
         } else if (!message.event && !d->presentationStartId.isEmpty()
                 && document.object().value(u"id"_s).toString() == d->presentationStartId) {
+            d->acceptedSessionStartId = d->presentationStartId;
             d->presentationStartId.clear();
+            d->upstreamProgressSamples.publish(false, false, 0, 0);
             d->presentationAllowed.store(kind == u"ok"_s, std::memory_order_release);
             const bool allowed = std::exchange(d->inputAuthorizationPending, false) && kind == u"ok"_s;
             if (d->inputAllowed.exchange(allowed, std::memory_order_acq_rel) != allowed) {
