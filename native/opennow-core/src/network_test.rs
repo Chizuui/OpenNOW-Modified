@@ -664,7 +664,7 @@ fn confirm_datagram(
     if socket.send_to(&message.encode(), peer).is_err() {
         return false;
     }
-    let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES.min(size as usize + 4)];
+    let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES];
     while std::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait = remaining
