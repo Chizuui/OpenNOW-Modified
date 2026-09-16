@@ -156,6 +156,10 @@
     "title": "Persistent in-game settings",
     "description": "Keep your in-game graphics settings between sessions for supported games and memberships. Applies to new sessions."
   },
+  "saveBandwidth": {
+    "title": "Save bandwidth",
+    "description": "Lets the server trade resolution and image quality for a steadier frame rate when your connection cannot sustain the selected profile. Off requests no dynamic adjustment. Applies to new sessions."
+  },
   "graphicsProcessor": {
     "title": "Graphics processor",
     "restartHint": "Uses the same GPU for decoding and display. Changes apply after restarting OpenNOW.",
