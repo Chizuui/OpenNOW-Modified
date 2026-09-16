@@ -118,6 +118,18 @@ impl PushStateStore for MemoryStore {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HeartbeatPing {
+    last_received: Instant,
+    sent: Instant,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HeartbeatTiming {
+    last_received: Option<Instant>,
+    ping: Option<HeartbeatPing>,
+}
+
 struct ScriptedFactory {
     connections: Mutex<Vec<Vec<Vec<u8>>>>,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -126,6 +138,7 @@ struct ScriptedFactory {
     active: Arc<AtomicUsize>,
     maximum_active: Arc<AtomicUsize>,
     spacing_millis: Arc<AtomicUsize>,
+    heartbeat: Arc<Mutex<HeartbeatTiming>>,
 }
 
 struct TrackedTransport {
@@ -133,10 +146,22 @@ struct TrackedTransport {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
     active: Arc<AtomicUsize>,
     spacing_millis: Arc<AtomicUsize>,
+    heartbeat: Arc<Mutex<HeartbeatTiming>>,
 }
 
 impl PushTransport for TrackedTransport {
     fn send(&mut self, frame: &[u8], _timeout: Duration) -> Result<(), PushError> {
+        if frame.first() == Some(&TAG_HEARTBEAT_PING) {
+            let mut heartbeat = self.heartbeat.lock().unwrap();
+            if heartbeat.ping.is_none()
+                && let Some(last_received) = heartbeat.last_received
+            {
+                heartbeat.ping = Some(HeartbeatPing {
+                    last_received,
+                    sent: Instant::now(),
+                });
+            }
+        }
         self.sent.lock().unwrap().push(frame.to_vec());
         Ok(())
     }
@@ -150,7 +175,11 @@ impl PushTransport for TrackedTransport {
         if spacing > 0 {
             std::thread::sleep(Duration::from_millis(spacing as u64));
         }
-        Ok(self.chunks.remove(0))
+        let chunk = self.chunks.remove(0);
+        if !chunk.is_empty() {
+            self.heartbeat.lock().unwrap().last_received = Some(Instant::now());
+        }
+        Ok(chunk)
     }
 
     fn close(&mut self) {}
@@ -191,6 +220,7 @@ impl PushTransportFactory for ScriptedFactory {
             sent: Arc::clone(&self.sent),
             active: Arc::clone(&self.active),
             spacing_millis: Arc::clone(&self.spacing_millis),
+            heartbeat: Arc::clone(&self.heartbeat),
         }))
     }
 }
@@ -249,6 +279,7 @@ impl PushTransportFactory for BlockingFactory {
             sent: Arc::clone(&self.sent),
             active: Arc::clone(&self.active),
             spacing_millis: Arc::new(AtomicUsize::new(0)),
+            heartbeat: Arc::new(Mutex::new(HeartbeatTiming::default())),
         }))
     }
 }
@@ -601,6 +632,7 @@ fn tuned_owner_harness(
         active: Arc::clone(&active),
         maximum_active: Arc::clone(&maximum_active),
         spacing_millis: Arc::clone(&spacing_millis),
+        heartbeat: Arc::new(Mutex::new(HeartbeatTiming::default())),
     });
     let desired = Arc::new(Mutex::new(initial));
     let scope_source = Arc::clone(&desired);
@@ -2606,11 +2638,6 @@ fn the_negotiated_heartbeat_interval_is_clamped_and_honored() {
         Some(existing),
     );
     harness.owner.start().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while harness.owner.active_scope().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let started = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(3);
     while !harness
         .factory
@@ -2623,13 +2650,17 @@ fn the_negotiated_heartbeat_interval_is_clamped_and_honored() {
     {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let elapsed = started.elapsed();
     let sent = harness.factory.sent.lock().unwrap().clone();
     assert!(
         sent.iter()
             .any(|frame| frame.first() == Some(&TAG_HEARTBEAT_PING)),
         "the negotiated interval must still produce a keep-alive"
     );
+    let heartbeat = *harness.factory.heartbeat.lock().unwrap();
+    let ping = heartbeat
+        .ping
+        .expect("the keep-alive must be observed with its preceding receive");
+    let elapsed = ping.sent.saturating_duration_since(ping.last_received);
     assert!(
         elapsed >= Duration::from_millis(100),
         "an out-of-range negotiated interval must be clamped to the configured bound: {elapsed:?}"
@@ -2687,6 +2718,7 @@ fn heartbeat_ping_triggers_an_acknowledgement() {
         active,
         maximum_active,
         spacing_millis: Arc::new(AtomicUsize::new(0)),
+        heartbeat: Arc::new(Mutex::new(HeartbeatTiming::default())),
     });
     let store = MemoryStore::new(Some(existing));
     let desired = Arc::new(Mutex::new(Some(scope())));

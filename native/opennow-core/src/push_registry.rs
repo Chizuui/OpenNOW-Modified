@@ -153,6 +153,8 @@ mod tests {
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    const HOLD_DEADLINE: Duration = Duration::from_secs(30);
+
     fn scope() -> PushScope {
         PushScope {
             user_id: "user-1".into(),
@@ -235,6 +237,7 @@ mod tests {
     struct Blocking {
         released: Mutex<bool>,
         wake: Condvar,
+        abandoned: AtomicBool,
     }
 
     impl Blocking {
@@ -242,6 +245,7 @@ mod tests {
             Arc::new(Self {
                 released: Mutex::new(false),
                 wake: Condvar::new(),
+                abandoned: AtomicBool::new(false),
             })
         }
 
@@ -250,17 +254,38 @@ mod tests {
             self.wake.notify_all();
         }
 
+        fn abandoned(&self) -> bool {
+            self.abandoned.load(Ordering::SeqCst)
+        }
+
         fn wait(&self) {
             let mut released = self.released.lock().unwrap();
-            while !*released {
-                let (state, timeout) = self
-                    .wake
-                    .wait_timeout(released, Duration::from_millis(20))
-                    .unwrap();
-                released = state;
-                if timeout.timed_out() {
+            let deadline = Instant::now() + HOLD_DEADLINE;
+            loop {
+                if *released {
                     return;
                 }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    drop(released);
+                    self.abandoned.store(true, Ordering::SeqCst);
+                    panic!("the blocked fixture hold was not released within {HOLD_DEADLINE:?}");
+                }
+                let (state, _) = self.wake.wait_timeout(released, remaining).unwrap();
+                released = state;
+            }
+        }
+
+        fn wait_bounded(&self, timeout: Duration) {
+            let mut released = self.released.lock().unwrap();
+            let deadline = Instant::now() + timeout;
+            while !*released {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                let (state, _) = self.wake.wait_timeout(released, remaining).unwrap();
+                released = state;
             }
         }
     }
@@ -344,7 +369,7 @@ mod tests {
             _timeout: Duration,
         ) -> Result<Box<dyn PushTransport>, PushError> {
             self.connects.fetch_add(1, Ordering::SeqCst);
-            self.connection.wait();
+            self.connection.wait_bounded(Duration::from_millis(20));
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum.fetch_max(active, Ordering::SeqCst);
             Ok(Box::new(BlockingTransport {
@@ -363,6 +388,18 @@ mod tests {
         maximum: Arc<AtomicUsize>,
         factories: Arc<AtomicUsize>,
         http_calls: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.connect.release();
+            if !std::thread::panicking() {
+                assert!(
+                    !self.connect.abandoned(),
+                    "the blocked fixture hold must be released before its safety deadline"
+                );
+            }
+        }
     }
 
     fn workers(harness: &Harness) -> usize {
@@ -789,20 +826,44 @@ mod tests {
         let dir = config_dir("switch");
         let mut harness = harness(dir.clone(), true);
         harness.registry.reconcile().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while harness.tokens.lock().unwrap().is_empty() && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.connects.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            !harness.tokens.lock().unwrap().is_empty(),
+            harness.connects.load(Ordering::SeqCst) >= 1,
+            "the nvidia session connects only after its registration finishes"
+        );
+        assert_eq!(
+            harness.tokens.lock().unwrap().as_slice(),
+            &[scope()],
             "the nvidia account registers"
         );
         let http_before = harness.http_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            http_before, 5,
+            "a completed nvidia registration runs every registration request"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness.registry.owner.as_ref().unwrap().is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            harness.registry.owner.as_ref().unwrap().is_running(),
+            "the nvidia session is live before the provider switches"
+        );
         let mut switched = scope();
         switched.provider_id = "alliance".into();
         switched.generation = 4;
         *harness.scope.lock().unwrap() = Some(switched.clone());
-        std::thread::sleep(Duration::from_millis(400));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.registry.owner.as_ref().unwrap().is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !harness.registry.owner.as_ref().unwrap().is_running(),
+            "the retired scope must end the nvidia session"
+        );
         assert!(
             !harness
                 .tokens
