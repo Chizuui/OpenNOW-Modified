@@ -418,7 +418,14 @@ fn udp_receive_loop_reports_frame_progress_recovery_while_partial_packets_contin
     let (media_sender, _media_receiver) = std::sync::mpsc::sync_channel(64);
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
     let session =
-        spawn_nvst_udp_receiver_with_socket(config, media_sender, event_sender, Some(socket), None)
+        spawn_nvst_udp_receiver_with_socket(
+            config,
+            media_sender,
+            event_sender,
+            Some(socket),
+            None,
+            Arc::new(HidRuntime::new()),
+        )
             .expect("receiver spawns");
 
     let destination = format!("127.0.0.1:{receiver_port}");

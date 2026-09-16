@@ -424,6 +424,133 @@ private slots:
         QCOMPARE(authorization.size(), 8);
     }
 
+    void realAbiBoundaryAdmitsClaimsAndGatesUnboundSonySnapshots()
+    {
+        NativeStreamRuntime runtime;
+        QVERIFY2(runtime.start(), qUtf8Printable(runtime.lastError()));
+        QList<SdlDeviceClaim> claims;
+        claims.append(SdlDeviceClaim{1, 41, 0x054c, 0x05c4});
+        QCOMPARE(runtime.replaceSdlDeviceClaims(claims), OPENNOW_STREAMER_OK);
+        OpenNowSonySnapshot snapshot{};
+        snapshot.version = OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION;
+        snapshot.struct_size = sizeof(OpenNowSonySnapshot);
+        snapshot.slot = 1;
+        snapshot.incarnation = 41;
+        snapshot.buttons = 0x1000;
+        snapshot.observed_at_us = 1'000;
+        QCOMPARE(runtime.submitSonySnapshot(snapshot), OPENNOW_STREAMER_CLOSED);
+        snapshot.incarnation = 99;
+        QCOMPARE(runtime.submitSonySnapshot(snapshot), OPENNOW_STREAMER_CLOSED);
+    }
+
+    void sonyWrappersForwardTypedPayloadsAndGatedRumble()
+    {
+        static QList<SdlDeviceClaim> receivedClaims;
+        static OpenNowSonySnapshot receivedSnapshot{};
+        static int claimCalls = 0;
+        static int snapshotCalls = 0;
+        receivedClaims.clear();
+        claimCalls = 0;
+        snapshotCalls = 0;
+        auto api = fakeApi();
+        api.replaceSdlDeviceClaims = [](const OpenNowStreamer *,
+                                         const OpenNowSdlDeviceClaim *claims,
+                                         std::size_t count) {
+            claimCalls += 1;
+            receivedClaims.clear();
+            for (std::size_t index = 0; index < count; ++index) {
+                receivedClaims.append(SdlDeviceClaim{
+                    claims[index].slot, claims[index].incarnation, claims[index].vendor,
+                    claims[index].product});
+            }
+            return OPENNOW_STREAMER_OK;
+        };
+        api.submitSonySnapshot = [](const OpenNowStreamer *, const OpenNowSonySnapshot *snapshot) {
+            snapshotCalls += 1;
+            if (snapshot) receivedSnapshot = *snapshot;
+            return OPENNOW_STREAMER_OK;
+        };
+        NativeStreamRuntime runtime(api);
+        QVERIFY(runtime.start());
+
+        const QList<SdlDeviceClaim> claims{
+            {0, 41, 0x054c, 0x05c4}, {2, 42, 0x045e, 0x02ea}};
+        QCOMPARE(runtime.replaceSdlDeviceClaims(claims), OPENNOW_STREAMER_OK);
+        QCOMPARE(claimCalls, 1);
+        QCOMPARE(receivedClaims.size(), 2);
+        QCOMPARE(receivedClaims.at(0).incarnation, quint64(41));
+        QCOMPARE(receivedClaims.at(1).vendor, quint16(0x045e));
+        QList<SdlDeviceClaim> oversized;
+        for (int index = 0; index < 5; ++index)
+            oversized.append({static_cast<quint8>(index), static_cast<quint64>(index + 1), 1, 1});
+        QCOMPARE(runtime.replaceSdlDeviceClaims(oversized), OPENNOW_STREAMER_INVALID_CONFIG);
+        QCOMPARE(claimCalls, 1);
+        QVERIFY(receivedClaims.at(0).incarnation != 0);
+
+        OpenNowSonySnapshot snapshot{};
+        snapshot.version = OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION;
+        snapshot.struct_size = sizeof(OpenNowSonySnapshot);
+        snapshot.slot = 1;
+        snapshot.incarnation = 77;
+        snapshot.buttons = 0x1000;
+        snapshot.left_trigger = 9;
+        snapshot.right_trigger = 8;
+        snapshot.left_stick_x = -100;
+        snapshot.left_stick_y = 200;
+        snapshot.right_stick_x = -300;
+        snapshot.right_stick_y = 400;
+        snapshot.touchpad_click = 1;
+        snapshot.contact_active[0] = 1;
+        snapshot.contact_x[0] = 0.5f;
+        snapshot.contact_y[0] = 0.25f;
+        snapshot.observed_at_us = 1234;
+        QCOMPARE(runtime.submitSonySnapshot(snapshot), OPENNOW_STREAMER_OK);
+        QCOMPARE(snapshotCalls, 1);
+        QCOMPARE(receivedSnapshot.slot, quint8(1));
+        QCOMPARE(receivedSnapshot.incarnation, quint64(77));
+        QCOMPARE(receivedSnapshot.buttons, quint16(0x1000));
+        QCOMPARE(receivedSnapshot.left_stick_x, qint16(-100));
+        QCOMPARE(receivedSnapshot.right_stick_y, qint16(400));
+        QCOMPARE(receivedSnapshot.touchpad_click, quint8(1));
+        QCOMPARE(receivedSnapshot.contact_active[0], quint8(1));
+        QCOMPARE(receivedSnapshot.contact_x[0], 0.5f);
+        QCOMPARE(receivedSnapshot.observed_at_us, quint64(1234));
+        QVERIFY(runtime.shutdown());
+    }
+
+    void controllerRumbleCarriesTheSourceIncarnation()
+    {
+        auto api = fakeApi();
+        static OpenNowStreamerConfig callbackConfig;
+        api.create = [](const OpenNowStreamerConfig *config, OpenNowStreamer **output) {
+            callbackConfig = *config;
+            return fakeCreate(config, output);
+        };
+        NativeStreamRuntime runtime(api);
+        QVERIFY(runtime.start());
+        QSignalSpy rumble(&runtime, &NativeStreamRuntime::controllerRumbleRequested);
+        const auto startId = QStringLiteral("start-42");
+        QVERIFY(runtime.send({{QStringLiteral("type"), QStringLiteral("start")},
+                              {QStringLiteral("id"), startId}}));
+        QTRY_VERIFY_WITH_TIMEOUT(runtime.inputAllowed(), 2'000);
+        const auto publish = [&](const QByteArray &event) {
+            static OpenNowStreamerConfig config;
+            config = callbackConfig;
+            config.event_callback(reinterpret_cast<const std::uint8_t *>(event.constData()),
+                                  event.size(), config.user_data);
+        };
+        publish(QByteArrayLiteral(
+            R"({"type":"controller-rumble","startId":"start-42","controllerId":1,"lowFrequency":4096,"highFrequency":8192,"durationMs":0,"sourceIncarnation":91})"));
+        QTRY_COMPARE_WITH_TIMEOUT(rumble.size(), 1, 2'000);
+        QCOMPARE(rumble.at(0).at(0).toUInt(), 1u);
+        QCOMPARE(rumble.at(0).at(4).toULongLong(), quint64(91));
+        publish(QByteArrayLiteral(
+            R"({"type":"controller-rumble","startId":"start-42","controllerId":1,"lowFrequency":1,"highFrequency":2,"durationMs":100})"));
+        QTRY_COMPARE_WITH_TIMEOUT(rumble.size(), 2, 2'000);
+        QCOMPARE(rumble.at(1).at(4).toULongLong(), quint64(0));
+        QVERIFY(runtime.shutdown());
+    }
+
     void sessionTransitionsCloseInputBeforeSendingOrDestroying()
     {
         static QStringList calls;

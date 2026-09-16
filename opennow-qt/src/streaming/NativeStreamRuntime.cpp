@@ -1,4 +1,5 @@
 #include "streaming/NativeStreamRuntime.h"
+
 #include "diagnostics/DiagnosticsPaths.h"
 
 #include <QCoreApplication>
@@ -14,6 +15,7 @@
 #include <QStandardPaths>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -223,6 +225,8 @@ NativeStreamRuntime::NativeStreamRuntime(QObject *parent,
                               &opennow_streamer_submit_gamepad,
                               &opennow_streamer_submit_local_action,
                               &opennow_streamer_set_capture_active,
+                              &opennow_streamer_replace_sdl_device_claims,
+                              &opennow_streamer_submit_sony_snapshot,
                               &opennow_streamer_set_log_file,
                               &opennow_streamer_submit_text}, parent, vulkanDevice, windowsAdapterLuid)
 {
@@ -675,6 +679,30 @@ OpenNowStreamerStatus NativeStreamRuntime::setCaptureActive(
                                   rawInputActive)
         : OPENNOW_STREAMER_CLOSED;
 }
+OpenNowStreamerStatus NativeStreamRuntime::replaceSdlDeviceClaims(
+    const QList<SdlDeviceClaim> &claims)
+{
+    const std::shared_lock lock(d->handleMutex);
+    if (!d->handle || !d->api.replaceSdlDeviceClaims) return OPENNOW_STREAMER_CLOSED;
+    if (claims.size() > maxSdlSources)
+        return OPENNOW_STREAMER_INVALID_CONFIG;
+    std::array<OpenNowSdlDeviceClaim, maxSdlSources> converted{};
+    for (qsizetype index = 0; index < claims.size(); ++index) {
+        const auto &claim = claims.at(index);
+        converted[static_cast<std::size_t>(index)] = OpenNowSdlDeviceClaim{
+            claim.slot, {0, 0, 0, 0, 0, 0, 0}, claim.incarnation, claim.vendor, claim.product};
+    }
+    return d->api.replaceSdlDeviceClaims(d->handle, converted.data(),
+                                         static_cast<std::size_t>(claims.size()));
+}
+
+OpenNowStreamerStatus NativeStreamRuntime::submitSonySnapshot(
+    const OpenNowSonySnapshot &snapshot)
+{
+    const std::shared_lock lock(d->handleMutex);
+    if (!d->handle || !d->api.submitSonySnapshot) return OPENNOW_STREAMER_CLOSED;
+    return d->api.submitSonySnapshot(d->handle, &snapshot);
+}
 
 void NativeStreamRuntime::responseCallback(const std::uint8_t *bytes, std::size_t length,
                                            void *userData)
@@ -893,14 +921,17 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
             const auto low = object.value(u"lowFrequency"_s).toDouble(-1);
             const auto high = object.value(u"highFrequency"_s).toDouble(-1);
             const auto duration = object.value(u"durationMs"_s).toDouble(-1);
+            const auto incarnation = object.value(u"sourceIncarnation"_s).toDouble(0);
             const auto valid = [](double value, double maximum) {
                 return value >= 0 && value <= maximum && std::floor(value) == value;
             };
             if (valid(controller, 3) && valid(low, 65535) && valid(high, 65535)
-                && valid(duration, 65535) && duration > 0) {
+                && valid(incarnation, 9'007'199'254'740'991.0)
+                && valid(duration, 65535)) {
                 emit controllerRumbleRequested(static_cast<quint8>(controller),
                     static_cast<quint16>(low), static_cast<quint16>(high),
-                    static_cast<quint32>(duration));
+                    static_cast<quint32>(duration),
+                    static_cast<quint64>(incarnation));
             }
             continue;
         }

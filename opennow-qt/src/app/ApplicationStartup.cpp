@@ -6,6 +6,7 @@
 #include "input/ControllerInput.h"
 #include "core/CoreClient.h"
 #include "input/InputModeTracker.h"
+#include "input/SonySnapshotWire.h"
 #include "localization/Localization.h"
 #include "streaming/rendering/LinuxVulkanGraphics.h"
 #include "streaming/rendering/HdrOutput.h"
@@ -184,6 +185,16 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
                      &nativeStreamRuntime, [&nativeStreamRuntime](quint32 action) {
                          nativeStreamRuntime.submitLocalAction(action);
                      });
+    QObject::connect(&controllerInput, &ControllerInput::deviceClaimsChanged,
+                     &nativeStreamRuntime, [&controllerInput, &nativeStreamRuntime] {
+                         nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
+                     });
+    QObject::connect(
+        &controllerInput, &ControllerInput::sonySnapshot, &nativeStreamRuntime,
+        [&nativeStreamRuntime](const ControllerInput::SonySnapshot &snapshot) {
+            nativeStreamRuntime.submitSonySnapshot(openNowWireSonySnapshot(snapshot));
+        });
+    nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
 #endif
     InputModeTracker inputModeTracker(&controller);
     application.installEventFilter(&inputModeTracker);
