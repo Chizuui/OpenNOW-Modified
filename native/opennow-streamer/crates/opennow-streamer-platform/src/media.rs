@@ -356,6 +356,20 @@ impl MediaColorQuality {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_linux_pixel_format(
+        format: opennow_streamer_platform_linux::PixelFormat,
+    ) -> Option<Self> {
+        use opennow_streamer_platform_linux::PixelFormat;
+        match format {
+            PixelFormat::Nv12 | PixelFormat::I420 => Some(Self::EightBit420),
+            PixelFormat::Nv24 => Some(Self::EightBit444),
+            PixelFormat::P010 => Some(Self::TenBit420),
+            PixelFormat::P410 => Some(Self::TenBit444),
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => None,
+        }
+    }
+
     #[cfg(target_os = "macos")]
     const fn macos_bit_depth(self) -> opennow_streamer_platform_macos::VideoBitDepth {
         use opennow_streamer_platform_macos::VideoBitDepth;
@@ -453,6 +467,7 @@ pub struct EncodedFrame {
     pub clock_rate_hz: u32,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2958,9 +2973,27 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
         let MediaCodec::Opus { .. } = frame.codec else {
             continue;
         };
+        let Some(ssrc) = frame.ssrc else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries no sender source identifier"
+                    .to_owned(),
+            });
+            continue;
+        };
+        let Ok(rtp_timestamp) = u32::try_from(frame.timestamp) else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries an out-of-range RTP timestamp"
+                    .to_owned(),
+            });
+            continue;
+        };
         let packet = match opennow_streamer_platform_linux::AudioPacket::new(
             Arc::clone(&frame.data),
-            media_timestamp_us(frame.timestamp, frame.clock_rate_hz),
+            rtp_timestamp,
+            frame.clock_rate_hz,
+            ssrc,
         ) {
             Ok(packet) => packet,
             Err(error) => {
@@ -3010,6 +3043,7 @@ fn run_embedded_linux_monitor(
     use std::time::Duration;
 
     let mut playback_started = false;
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         let (frames, events) = {
             let session = shared
@@ -3108,10 +3142,12 @@ fn run_embedded_linux_monitor(
                     stop_linux_session(&shared);
                     return;
                 }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3123,6 +3159,7 @@ fn run_embedded_linux_monitor(
 fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostCommand>) {
     use std::time::Duration;
 
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         if shared.linux_software_fallback.load(Ordering::Acquire) {
             request_linux_keyframe(&shared, "Linux decoder fallback requires a fresh keyframe");
@@ -3200,10 +3237,12 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                     &host_commands,
                     "Linux hardware media session failed".to_owned(),
                 ),
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3262,6 +3301,25 @@ fn stop_linux_session(shared: &SharedPipeline) {
     {
         let _ = session.stop();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn report_linux_color_format_change(
+    shared: &SharedPipeline,
+    reported: &mut Option<MediaColorQuality>,
+    format: opennow_streamer_platform_linux::StreamFormat,
+) {
+    let Some(actual) = MediaColorQuality::from_linux_pixel_format(format.pixel_format) else {
+        return;
+    };
+    if *reported == Some(actual) {
+        return;
+    }
+    *reported = Some(actual);
+    let _ = shared.feedback.send(MediaFeedback::ColorFormatChanged {
+        requested: shared.stream.color_quality,
+        actual,
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -4032,7 +4090,92 @@ mod tests {
             (MediaColorQuality::TenBit444, PixelFormat::P410),
         ] {
             assert_eq!(color.linux_pixel_format(), format);
+            assert_eq!(
+                MediaColorQuality::from_linux_pixel_format(format),
+                Some(color)
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decoded_formats_without_a_color_class_are_not_guessed() {
+        use opennow_streamer_platform_linux::PixelFormat;
+        assert_eq!(
+            MediaColorQuality::from_linux_pixel_format(PixelFormat::I420),
+            Some(MediaColorQuality::EightBit420)
+        );
+        for format in [PixelFormat::Bgra8, PixelFormat::Rgba8] {
+            assert_eq!(MediaColorQuality::from_linux_pixel_format(format), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_format_change_reports_the_decoded_color_class_once_per_change() {
+        use opennow_streamer_platform_linux::{ColorTransfer, PixelFormat, StreamFormat};
+
+        let (feedback, receiver) = std::sync::mpsc::channel();
+        let stream = MediaStreamConfig {
+            codec: MediaVideoCodec::H265,
+            color_quality: MediaColorQuality::TenBit420,
+            ..MediaStreamConfig::default()
+        };
+        let shared = SharedPipeline {
+            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
+            output: Arc::new(OutputBuffers::new()),
+            feedback,
+            paused: AtomicBool::new(false),
+            video_desynced: AtomicBool::new(false),
+            keyframe_requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            recording_tap: RecordingTap::default(),
+            replay_tap: crate::replay::ReplayTap::default(),
+            stream,
+            linux_session: Mutex::new(None),
+            linux_software_fallback: Arc::new(AtomicBool::new(false)),
+            linux_video_mid: Mutex::new(String::new()),
+            linux_codec: stream.codec,
+        };
+        let format = |pixel_format| StreamFormat {
+            pixel_format,
+            color_transfer: ColorTransfer::Sdr,
+            ..StreamFormat::video_default(1920, 1080).expect("valid default format")
+        };
+
+        let mut reported = None;
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert_eq!(
+            receiver.try_recv().expect("downgrade report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::EightBit420,
+            }
+        );
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(
+            &shared,
+            &mut reported,
+            StreamFormat {
+                width: 1280,
+                height: 720,
+                ..format(PixelFormat::Nv12)
+            },
+        );
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::P010));
+        assert_eq!(
+            receiver.try_recv().expect("restored format report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::TenBit420,
+            }
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -4340,6 +4483,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         recording.publish(&frame);
         replay.publish(&frame);
@@ -4394,6 +4538,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         for _ in 0..=RECORDING_TAP_QUEUE_CAPACITY {
             tap.publish(&frame);
@@ -4566,6 +4711,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("decoded pending frame");
@@ -4606,6 +4752,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("recovered IDR");
@@ -4651,6 +4798,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         assert!(shared.video_desynced.load(Ordering::Acquire));
@@ -4738,6 +4886,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Paused
         );
@@ -4752,6 +4901,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Closed
         );
@@ -4789,6 +4939,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::DroppedOldest
         );
