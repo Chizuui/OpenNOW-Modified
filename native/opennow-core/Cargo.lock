@@ -1395,6 +1395,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "hkdf",
+ "hmac",
  "httpdate",
  "keyring",
  "libc",

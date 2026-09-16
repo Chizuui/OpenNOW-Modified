@@ -6,7 +6,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
@@ -19,6 +19,8 @@ const DEFAULT_STREAMING_BASE: &str = "https://prod.cloudmatchbeta.nvidiagrid.net
 const DEFAULT_STUN_SERVER: &str = "stun:s1.stun.gamestream.nvidia.com:19308";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const NETWORK_TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const MAXIMUM_NETWORK_TEST_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DISCOVERY_REGIONS: usize = 32;
 const DISCOVERY_CONCURRENCY: usize = 4;
 const MAX_CLEANUP_RECORD_BYTES: usize = 16 * 1024;
@@ -221,7 +223,30 @@ impl CloudMatchService {
             .lock()
             .expect("CloudMatch conflict state poisoned") = None;
         let token = session_token(auth);
-        let body = build_create_body(&app_id, params, settings, device_id);
+        let mut session_params = params.clone();
+        let network_test = if requests_network_test(params, settings) {
+            acquire_network_test_session(&client, &base, token, device_id, params, settings)
+        } else {
+            json!({"status":"not_requested"})
+        };
+        match network_test["status"].as_str() {
+            Some("measured") => eprintln!(
+                "Network test measured path datagram {} bytes in {} probes",
+                network_test["measuredDatagramBytes"], network_test["probes"]
+            ),
+            Some("unmeasured") => eprintln!(
+                "Network test confirmed no probe datagram in {} probes",
+                network_test["probes"]
+            ),
+            Some("unavailable") => eprintln!(
+                "Network test session unavailable: {}",
+                network_test["error"].as_str().unwrap_or_default()
+            ),
+            _ => {}
+        }
+        crate::requests::check()?;
+        session_params["networkTestSessionId"] = json!(network_test["sessionId"].as_str());
+        let body = build_create_body(&app_id, &session_params, settings, device_id);
         let mut url = base
             .join("v2/session")
             .map_err(|_| invalid("Invalid CloudMatch session URL"))?;
@@ -248,6 +273,10 @@ impl CloudMatchService {
             .or_else(|| base.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
         let mut info = session_info(&payload, &base, &zone, &app_id, device_id)?;
+        if let Some(session_id) = network_test["sessionId"].as_str() {
+            info["networkTestSessionId"] = json!(session_id);
+        }
+        info["networkTest"] = network_test;
         *self
             .fresh
             .lock()
@@ -1375,7 +1404,7 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
         "internalTitle":params["title"].as_str(),
         "availableSupportedControllers":[2],
         "preferredController":2,
-        "networkTestSessionId":null,
+        "networkTestSessionId":params["networkTestSessionId"].as_str(),
         "parentSessionId":null,
         "clientIdentification":"GFN-PC",
         "deviceHashId":device_id,
@@ -2232,6 +2261,173 @@ fn validate_delete_response(context: &str, response: Response) -> Result<(), Ser
         validate_cloudmatch_response(context, status, Ok(payload), false)?;
     }
     Ok(())
+}
+
+fn requests_network_test(params: &Value, settings: &Value) -> bool {
+    params["networkTest"]
+        .as_bool()
+        .or_else(|| settings["networkTest"].as_bool())
+        .unwrap_or(false)
+}
+
+fn network_test_key_unavailable() -> ServiceError {
+    ServiceError {
+        code: "network-test-key-unavailable",
+        message: "The session did not provision a network test HMAC key; refusing to probe without verified key material".to_owned(),
+    }
+}
+
+fn acquire_network_test_session(
+    client: &Client,
+    base: &Url,
+    token: &str,
+    device_id: &str,
+    params: &Value,
+    settings: &Value,
+) -> Value {
+    match try_network_test_session(client, base, token, device_id, params, settings) {
+        Ok(value) => value,
+        Err(error) => json!({
+            "status":"unavailable",
+            "code":error.code,
+            "error":error.message,
+        }),
+    }
+}
+
+fn network_test_display_profile(
+    settings: &Value,
+    params: &Value,
+) -> crate::network_test::DisplayProfile {
+    let (width, height) = parse_resolution(&setting_string(settings, "resolution", "1920x1080"));
+    crate::network_test::DisplayProfile {
+        width: u32::try_from(width).unwrap_or(1920),
+        height: u32::try_from(height).unwrap_or(1080),
+        fps: u32::try_from(crate::frame_rate::request_frame_rate(
+            settings, params, width, height,
+        ))
+        .unwrap_or(60),
+    }
+}
+
+fn try_network_test_session(
+    client: &Client,
+    base: &Url,
+    token: &str,
+    device_id: &str,
+    params: &Value,
+    settings: &Value,
+) -> Result<Value, ServiceError> {
+    let profile = network_test_display_profile(settings, params);
+    let url = crate::network_test::nettest_url(base)?;
+    let body = crate::network_test::allocation_body("GFN-PC", profile);
+    let mut headers = cloudmatch_headers(token, device_id)?;
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    crate::requests::check()?;
+    let response = client
+        .post(url)
+        .headers(headers)
+        .timeout(NETWORK_TEST_REQUEST_TIMEOUT)
+        .json(&body)
+        .send()
+        .map_err(|error| network("Network test session failed", error))?;
+    let status = response.status();
+    if response.content_length().unwrap_or(0) > MAXIMUM_NETWORK_TEST_RESPONSE_BYTES {
+        return Err(ServiceError {
+            code: "network-test-rejected",
+            message: "Network test session response exceeded the size limit".to_owned(),
+        });
+    }
+    let mut response = response;
+    let mut body_bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAXIMUM_NETWORK_TEST_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body_bytes)
+        .map_err(|error| network("Network test session failed", error))?;
+    if body_bytes.len() as u64 > MAXIMUM_NETWORK_TEST_RESPONSE_BYTES {
+        return Err(ServiceError {
+            code: "network-test-rejected",
+            message: "Network test session response exceeded the size limit".to_owned(),
+        });
+    }
+    let payload = serde_json::from_slice::<Value>(&body_bytes);
+    if !status.is_success() {
+        let detail = payload
+            .ok()
+            .and_then(|payload| {
+                payload["requestStatus"]["statusDescription"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_default();
+        return Err(ServiceError {
+            code: if matches!(status.as_u16(), 401 | 403) {
+                "network-test-unauthorized"
+            } else {
+                "network-test-rejected"
+            },
+            message: format!(
+                "Network test session returned HTTP {} {detail}",
+                status.as_u16()
+            ),
+        });
+    }
+    let payload = payload.map_err(|_| invalid("Network test session returned invalid JSON"))?;
+    let session = crate::network_test::parse_allocation(&payload)?;
+    let Some(key) = session.hmac_key.as_deref() else {
+        return Err(network_test_key_unavailable());
+    };
+    crate::requests::check()?;
+    let outcome = probe_network_test_path(&session, key)?;
+    crate::requests::check()?;
+    let Some(measured_datagram_bytes) = outcome.measured_datagram_bytes else {
+        return Ok(json!({
+            "status":"unmeasured",
+            "probes":outcome.probes,
+            "error":"No probe datagram was confirmed on the measured path",
+        }));
+    };
+    Ok(json!({
+        "status":"measured",
+        "sessionId":session.session_id,
+        "serverId":session.server_id,
+        "zone":base.host_str().unwrap_or_default(),
+        "address":session.address,
+        "port":session.port,
+        "secure":session.secure,
+        "measuredDatagramBytes":measured_datagram_bytes,
+        "probes":outcome.probes,
+        "thresholds":{
+            "bandwidthRecommendedMbps":session.thresholds.bandwidth_recommended_mbps,
+            "bandwidthLimitMbps":session.thresholds.bandwidth_limit_mbps,
+            "latencyRecommendedMs":session.thresholds.latency_recommended_ms,
+            "latencyLimitMs":session.thresholds.latency_limit_ms,
+            "packetLossRecommendedPct":session.thresholds.packet_loss_recommended_pct,
+            "packetLossLimitPct":session.thresholds.packet_loss_limit_pct,
+        },
+    }))
+}
+
+fn probe_network_test_path(
+    session: &crate::network_test::NetworkTestSession,
+    key: &[u8],
+) -> Result<crate::network_test::ProbeOutcome, ServiceError> {
+    let peer = std::net::SocketAddr::new(session.address, session.port);
+    let socket = UdpSocket::bind(if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .map_err(|_| invalid("Network test probe could not bind a UDP socket"))?;
+    crate::network_test::probe_mtu(
+        &socket,
+        peer,
+        key,
+        session.session_id.as_bytes(),
+        crate::network_test::PROBE_FLOOR_BYTES,
+        crate::network_test::PROBE_CEILING_BYTES,
+    )
 }
 
 fn session_token(auth: &AuthSession) -> &str {
@@ -4266,6 +4462,39 @@ mod tests {
     }
 
     #[test]
+    fn the_network_test_profile_matches_the_session_profile() {
+        let hardware = json!({"protocolVersion":7, "videoBackends":[{"backend":"vaapi",
+            "available":true, "codecs":[{"codec":"h265", "available":true,
+                "colorQualities":["8bit_420"]}]}]});
+        let software = json!({"protocolVersion":7, "videoBackends":[{"backend":"software",
+            "available":true, "codecs":[{"codec":"h265", "available":true,
+                "colorQualities":["8bit_420"]}]}]});
+        let settings = json!({"resolution":"1920x1080", "fps":360, "codec":"h265"});
+        for (capabilities, entitled, expected) in [
+            (&hardware, 360_i64, 360_i64),
+            (&software, 360, 240),
+            (&json!({}), 360, 240),
+            (&hardware, 0, 240),
+            (&hardware, 120, 120),
+        ] {
+            let params = json!({"runtimeCapabilities":capabilities, "maxEntitledFps":entitled});
+            let session = build_create_body("12345", &params, &settings, "device-id");
+            let session_fps =
+                session["sessionRequestData"]["clientRequestMonitorSettings"][0]["framesPerSecond"]
+                    .clone();
+            let profile = network_test_display_profile(&settings, &params);
+            let allocation = crate::network_test::allocation_body("GFN-PC", profile);
+            assert_eq!(profile.width, 1920);
+            assert_eq!(profile.height, 1080);
+            assert_eq!(
+                allocation["netTestRequestData"]["netTestProfile"]["framesPerSecond"], session_fps,
+                "the allocation profile must match the session profile for {capabilities}"
+            );
+            assert_eq!(session_fps, json!(expected), "{capabilities}");
+        }
+    }
+
+    #[test]
     fn manual_av1_uses_native_nvst_even_with_a_legacy_transport_value() {
         let body = build_create_body(
             "12345",
@@ -4764,5 +4993,591 @@ mod tests {
         }
         assert!(trusted_learned_server_base("203.0.113.20").is_ok());
         assert!(trusted_learned_server_base("2001:db8::20").is_ok());
+    }
+
+    fn network_test_udp_server(
+        cap: u32,
+        key: &[u8],
+        session_id: &str,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<usize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        let key = key.to_vec();
+        let session_id = session_id.as_bytes().to_vec();
+        let worker = thread::spawn(move || {
+            let mut served = 0_usize;
+            let mut buffer = vec![0_u8; 4096];
+            while let Ok((length, peer)) = socket.recv_from(&mut buffer) {
+                let Ok(request) =
+                    crate::network_test::NetworkTestMessage::decode(&buffer[..length])
+                else {
+                    continue;
+                };
+                let Some(size) = request.payload_size() else {
+                    continue;
+                };
+                if !request.verify(&key).unwrap_or(false) || size > cap {
+                    continue;
+                }
+                let mut reply = crate::network_test::NetworkTestMessage::default();
+                reply.set_message_type(crate::network_test::MESSAGE_TYPE_MTU_RESPONSE);
+                reply.set_session_id(session_id.clone());
+                reply.set_payload_size(size);
+                let datagram = reply.encode_response(size as usize);
+                let _ = socket.send_to(&datagram, peer);
+                served += 1;
+            }
+            served
+        });
+        (address, worker)
+    }
+
+    #[test]
+    fn measured_network_test_session_reaches_allocation_and_the_session_context() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let key: [u8; 32] = [0x7e; 32];
+        let (udp_address, udp_server) = network_test_udp_server(1_200, &key, "nt-1");
+
+        let allocation = json!({
+            "requestStatus":{"requestId":"req-1","serverId":"zone-1","statusCode":0},
+            "netTestSession":{
+                "sessionId":"nt-1",
+                "serverId":"zone-1",
+                "hmacKey":"~".repeat(32),
+                "connectionInfo":[{
+                    "ip":udp_address.ip().to_string(),
+                    "port":udp_address.port(),
+                    "appLevelProtocol":5
+                }],
+                "netTestThresholds":{
+                    "recommendedBandwidthMBPS":50.0,
+                    "requiredBandwidthMBPS":25.0,
+                    "recommendedLatencyMS":40.0,
+                    "requiredLatencyMS":80.0,
+                    "recommendedPacketLossPct":1.0,
+                    "requiredPacketLossPct":3.0
+                }
+            }
+        });
+        let create_reply = json!({
+            "requestStatus":{"statusCode":1},
+            "session":{
+                "sessionId":"seat-1",
+                "status":2,
+                "connectionInfo":[{
+                    "ip":"127.0.0.1","port":49_100,"usage":14,"resourcePath":"/nvst/"
+                }]
+            }
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let recorded: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_records = Arc::clone(&recorded);
+        let server = thread::spawn(move || {
+            for (status, body) in [
+                (200_u16, allocation.to_string()),
+                (200, create_reply.to_string()),
+                (200, String::new()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut length = 0_usize;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut payload = vec![0_u8; length];
+                reader.read_exact(&mut payload).unwrap();
+                server_records.lock().unwrap().push((
+                    request_line.trim().to_owned(),
+                    String::from_utf8_lossy(&payload).into_owned(),
+                ));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let created = service
+            .create_at(
+                &json!({"appId":"123", "networkTest":true}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+
+        let info = &created["session"];
+        assert_eq!(info["sessionId"], "seat-1");
+        assert_eq!(info["networkTest"]["sessionId"], "nt-1");
+        assert_eq!(info["networkTest"]["status"], "measured");
+        assert_eq!(info["networkTestSessionId"], "nt-1");
+        assert_eq!(info["networkTest"]["zone"], "127.0.0.1");
+        let measured = info["networkTest"]["measuredDatagramBytes"]
+            .as_u64()
+            .expect("measured datagram size");
+        assert!(measured <= 1_200, "measured {measured}");
+        assert!(measured + 32 >= 1_200, "measured {measured}");
+        assert!(info["networkTest"]["probes"].as_u64().unwrap_or_default() > 0);
+
+        server.join().unwrap();
+        let received = recorded.lock().unwrap().clone();
+        assert_eq!(received.len(), 3);
+        assert!(received[0].0.starts_with("POST /v2/nettestsession"));
+        assert!(received[0].1.contains("\"clientPlatformName\""));
+        assert!(received[1].0.starts_with("POST /v2/session"));
+        assert!(
+            received[1].1.contains("\"networkTestSessionId\":\"nt-1\""),
+            "allocation body carries the measured session: {}",
+            received[1].1
+        );
+        assert!(received[2].0.starts_with("PUT /v2/session/seat-1"));
+
+        assert!(
+            udp_server.join().unwrap() > 0,
+            "the probe never reached the authenticated server"
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_response_key_refuses_to_probe() {
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"netTestSession":{
+                        "sessionId":"nt-nokey",
+                        "connectionInfo":[{
+                            "ip":"127.0.0.1","port":49_100,"appLevelProtocol":5
+                        }],
+                        "netTestThresholds":{
+                            "recommendedBandwidthMBPS":50.0,"requiredBandwidthMBPS":25.0,
+                            "recommendedLatencyMS":40.0,"requiredLatencyMS":80.0,
+                            "recommendedPacketLossPct":1.0,"requiredPacketLossPct":3.0
+                        }
+                    }}),
+                ),
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"B","status":2}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let created = service
+            .create_at(
+                &json!({"appId":"123", "networkTest":true}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+        assert_eq!(created["session"]["networkTest"]["status"], "unavailable");
+        assert_eq!(
+            created["session"]["networkTest"]["code"],
+            "network-test-key-unavailable"
+        );
+        assert!(
+            created["session"]["networkTestSessionId"].is_null(),
+            "no session is advertised without a verified measurement"
+        );
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 3);
+        assert!(
+            received[0].starts_with("POST /v2/nettestsession"),
+            "{}",
+            received[0]
+        );
+        assert!(received[1].starts_with("POST /v2/session"));
+        assert!(received[2].starts_with("PUT /v2/session/B"));
+    }
+
+    #[test]
+    fn a_stalled_network_test_allocation_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(12));
+            drop(stream);
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error =
+            try_network_test_session(&client, &base, "token", "device", &json!({}), &json!({}))
+                .unwrap_err();
+        assert_eq!(error.code, "network_error");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_request_never_reaches_the_network_test_allocation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let requests = std::sync::Arc::new(crate::requests::Requests::default());
+        let permit = requests.admit("nettest", "session.create").unwrap();
+        requests.cancel("nettest");
+        let result = crate::requests::scope(permit.token.clone(), || {
+            try_network_test_session(&client, &base, "token", "device", &json!({}), &json!({}))
+        });
+        assert_eq!(result.unwrap_err().code, "cancelled");
+        assert!(
+            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a cancelled request must not open a connection"
+        );
+    }
+
+    #[test]
+    fn the_network_test_setting_enables_the_probe() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        let key: [u8; 32] = [0x7e; 32];
+        let (udp_address, udp_server) = network_test_udp_server(1_200, &key, "nt-1");
+        let allocation = json!({
+            "netTestSession":{
+                "sessionId":"nt-1",
+                "serverId":"zone-1",
+                "hmacKey":"~".repeat(32),
+                "connectionInfo":[{
+                    "ip":udp_address.ip().to_string(),
+                    "port":udp_address.port(),
+                    "appLevelProtocol":5
+                }],
+                "netTestThresholds":{
+                    "recommendedBandwidthMBPS":50.0,"requiredBandwidthMBPS":25.0,
+                    "recommendedLatencyMS":40.0,"requiredLatencyMS":80.0,
+                    "recommendedPacketLossPct":1.0,"requiredPacketLossPct":3.0
+                }
+            }
+        });
+        let create_reply = json!({
+            "requestStatus":{"statusCode":1},
+            "session":{"sessionId":"seat-1","status":2}
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_records = Arc::clone(&recorded);
+        let server = thread::spawn(move || {
+            for (status, body) in [
+                (200_u16, allocation.to_string()),
+                (200, create_reply.to_string()),
+                (200, String::new()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut request_line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+                let mut length = 0_usize;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                server_records
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_owned());
+                let mut payload = vec![0_u8; length];
+                std::io::Read::read_exact(&mut reader, &mut payload).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let created = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &json!({"networkTest":true}),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+        assert_eq!(created["session"]["networkTest"]["status"], "measured");
+        assert_eq!(created["session"]["networkTestSessionId"], "nt-1");
+        server.join().unwrap();
+        let received = recorded.lock().unwrap().clone();
+        assert_eq!(received.len(), 3);
+        assert!(
+            received[0].starts_with("POST /v2/nettestsession"),
+            "{}",
+            received[0]
+        );
+        assert!(udp_server.join().unwrap() > 0, "the setting never probed");
+    }
+
+    #[test]
+    fn a_zone_without_network_test_keeps_the_previous_allocation_body() {
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let created = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+        assert_eq!(created["session"]["networkTest"]["status"], "not_requested");
+        assert!(created["session"]["networkTestSessionId"].is_null());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_oversized_chunked_allocation_response_is_rejected() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 Fixture\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut written = 0_usize;
+            while written <= MAXIMUM_NETWORK_TEST_RESPONSE_BYTES as usize {
+                let _ = stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes());
+                let _ = stream.write_all(&chunk);
+                let _ = stream.write_all(b"\r\n");
+                written += chunk.len();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let error =
+            try_network_test_session(&client, &base, "token", "device", &json!({}), &json!({}))
+                .unwrap_err();
+        assert_eq!(error.code, "network-test-rejected", "{}", error.message);
+        assert!(error.message.contains("size limit"), "{}", error.message);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn the_persisted_network_test_setting_reaches_session_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store =
+            crate::settings::SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        assert_eq!(store.all()["networkTest"], false, "the setting ships off");
+
+        let key: [u8; 32] = [0x7e; 32];
+        let (udp_address, udp_server) = network_test_udp_server(1_200, &key, "nt-1");
+        let allocation = json!({
+            "netTestSession":{
+                "sessionId":"nt-1",
+                "serverId":"zone-1",
+                "hmacKey":"~".repeat(32),
+                "connectionInfo":[{
+                    "ip":udp_address.ip().to_string(),
+                    "port":udp_address.port(),
+                    "appLevelProtocol":5
+                }],
+                "netTestThresholds":{
+                    "recommendedBandwidthMBPS":50.0,"requiredBandwidthMBPS":25.0,
+                    "recommendedLatencyMS":40.0,"requiredLatencyMS":80.0,
+                    "recommendedPacketLossPct":1.0,"requiredPacketLossPct":3.0
+                }
+            }
+        });
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":1}}),
+                ),
+                (200, json!({})),
+                (200, json!({})),
+                (200, allocation),
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"B","status":2}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+
+        let created = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &store.all(),
+                &conflict_auth(),
+                "device",
+                || Ok((client.clone(), base.clone())),
+            )
+            .unwrap();
+        assert_eq!(created["session"]["networkTest"]["status"], "not_requested");
+        service.finish_create("A", false).unwrap();
+
+        store.set("networkTest", json!(true)).unwrap();
+        let restored =
+            crate::settings::SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        assert_eq!(restored.all()["networkTest"], true, "the setting persists");
+
+        let created = service
+            .create_at(
+                &json!({"appId":"123"}),
+                &restored.all(),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+        assert_eq!(created["session"]["networkTest"]["status"], "measured");
+        assert_eq!(created["session"]["networkTestSessionId"], "nt-1");
+
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 6, "{received:?}");
+        assert!(received[0].starts_with("POST /v2/session"), "{received:?}");
+        let probe = received
+            .iter()
+            .position(|line| line.starts_with("POST /v2/nettestsession"))
+            .expect("the opt-in probe runs");
+        assert_eq!(
+            probe, 3,
+            "the default-off create must not probe: {received:?}"
+        );
+        assert!(udp_server.join().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_path_without_a_confirmed_datagram_is_reported_unmeasured() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let silent_address = silent.local_addr().unwrap();
+        let (base, server) = session_server(
+            vec![
+                (
+                    200,
+                    json!({"netTestSession":{
+                        "sessionId":"nt-silent",
+                        "serverId":"zone-1",
+                        "hmacKey":"~".repeat(32),
+                        "connectionInfo":[{
+                            "ip":silent_address.ip().to_string(),
+                            "port":silent_address.port(),
+                            "appLevelProtocol":5
+                        }],
+                        "netTestThresholds":{
+                            "recommendedBandwidthMBPS":50.0,"requiredBandwidthMBPS":25.0,
+                            "recommendedLatencyMS":40.0,"requiredLatencyMS":80.0,
+                            "recommendedPacketLossPct":1.0,"requiredPacketLossPct":3.0
+                        }
+                    }}),
+                ),
+                (
+                    200,
+                    json!({"requestStatus":{"statusCode":1},"session":{"sessionId":"A","status":2}}),
+                ),
+                (200, json!({})),
+            ],
+            |_| {},
+        );
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let service = CloudMatchService::new(client.clone());
+        let created = service
+            .create_at(
+                &json!({"appId":"123", "networkTest":true}),
+                &json!({}),
+                &conflict_auth(),
+                "device",
+                || Ok((client, base)),
+            )
+            .unwrap();
+        let measured = &created["session"]["networkTest"];
+        assert_eq!(measured["status"], "unmeasured");
+        assert!(measured["measuredDatagramBytes"].is_null());
+        assert!(measured["probes"].as_u64().unwrap_or_default() > 0);
+        assert!(
+            created["session"]["networkTestSessionId"].is_null(),
+            "an unconfirmed path must not advertise an unmeasured session"
+        );
+        assert_eq!(created["session"]["sessionId"], "A");
+        server.join().unwrap();
     }
 }

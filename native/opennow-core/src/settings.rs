@@ -903,7 +903,7 @@ fn defaults() -> Map<String, Value> {
         "codec":"auto", "fallbackCodec":"auto", "decoderPreference":"auto",
         "encoderPreference":"auto", "colorQuality":"8bit_420", "enableHdr":false, "region":"", "regionProviderIdpId":"", "providerRegions":{},
         "suppressTenBitWarning":false,
-        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false,
+        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false, "networkTest":false,
         "enableGyroscopeControls":false, "steamControllerCompatibilityMode":false,
         "nativeCursorOverlay":true, "mouseSensitivity":1, "mouseAcceleration":1,
         "shortcutToggleStats":"Ctrl+N", "shortcutTogglePointerLock":"F8",

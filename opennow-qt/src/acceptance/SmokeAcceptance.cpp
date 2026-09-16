@@ -238,6 +238,7 @@ int AcceptanceSession::startSmokeWorkload()
                      || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
                      || m_arguments.contains(u"--smoke-save-bandwidth"_s)
                      || m_arguments.contains(u"--smoke-store-launch"_s)
+                     || m_arguments.contains(u"--smoke-network-test"_s)
                      || m_arguments.contains(u"--smoke-idle-mode"_s)
                      || m_arguments.contains(u"--smoke-queue-drops"_s)
                      || m_arguments.contains(u"--smoke-color-format"_s)
@@ -274,6 +275,8 @@ int AcceptanceSession::startSmokeWorkload()
             ? u"qrc:/acceptance/SaveBandwidthAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-store-launch"_s)
             ? u"qrc:/acceptance/StoreLaunchAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-network-test"_s)
+            ? u"qrc:/acceptance/NetworkTestAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-idle-mode"_s)
             ? u"qrc:/acceptance/IdleModeAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-stream-recovery"_s)
@@ -301,7 +304,8 @@ int AcceptanceSession::startSmokeWorkload()
             || m_arguments.contains(u"--smoke-steam-big-picture"_s)
             || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
             || m_arguments.contains(u"--smoke-save-bandwidth"_s)
-            || m_arguments.contains(u"--smoke-store-launch"_s)) {
+            || m_arguments.contains(u"--smoke-store-launch"_s)
+            || m_arguments.contains(u"--smoke-network-test"_s)) {
             auto *client = fixture->property("client").value<QObject *>();
             if (!client) return EXIT_FAILURE;
             m_engine.rootContext()->setContextProperty(u"CoreClient"_s, client);
@@ -380,7 +384,12 @@ int AcceptanceSession::startSmokeWorkload()
                     m_application.exit(saved && !m_qmlWarningOccurred ? EXIT_SUCCESS : EXIT_FAILURE);
                 });
             } else {
-                m_application.exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+                const auto shot = m_arguments.indexOf(u"--screenshot"_s);
+                const bool saved = shot < 0
+                    || (shot + 1 < m_arguments.size()
+                        && QFileInfo(m_arguments.at(shot + 1)).isAbsolute()
+                        && window->grabWindow().save(m_arguments.at(shot + 1)));
+                m_application.exit(ok && saved ? EXIT_SUCCESS : EXIT_FAILURE);
             }
         });
     } else if (m_smokeTest && (m_arguments.contains(u"--smoke-region-ping"_s) || m_arguments.contains(u"--smoke-store-paging"_s))) {
