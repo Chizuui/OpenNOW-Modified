@@ -1154,6 +1154,30 @@ QtObject {
         refreshRemoteSessions()
     }
 
+    function acceptPushInvalidation(payload) {
+        if (!ready || !signedIn)
+            return
+        if (Number(payload.generation || 0) !== Number(authGeneration))
+            return
+        switch (String(payload.kind || "")) {
+        case "library":
+            catalogOwner.refreshCatalog("")
+            break
+        case "favorites":
+            catalogOwner.refreshFavorites()
+            break
+        case "subscription":
+        case "linked-account":
+            refreshAccountServices()
+            break
+        case "platform-sync":
+            accountServicesOwner.pollSync()
+            break
+        default:
+            break
+        }
+    }
+
     function refreshRegions() {
         return accountServicesOwner.refreshRegions()
     }
@@ -3680,7 +3704,9 @@ QtObject {
                     root.finishRemoteSession(payload.termination)
                 else
                     root.acceptStreamingSession(payload.session || null)
-            } else if (name === "streamer.changed")
+            } else if (name === "account.push.changed")
+                root.acceptPushInvalidation(payload)
+            else if (name === "streamer.changed")
                 root.acceptStreamerSnapshot(payload.streamer || payload || null)
             else if (name === "artwork.ready")
                 root.acceptArtworkResult(payload)
