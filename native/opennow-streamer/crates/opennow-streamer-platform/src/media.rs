@@ -356,6 +356,20 @@ impl MediaColorQuality {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_linux_pixel_format(
+        format: opennow_streamer_platform_linux::PixelFormat,
+    ) -> Option<Self> {
+        use opennow_streamer_platform_linux::PixelFormat;
+        match format {
+            PixelFormat::Nv12 | PixelFormat::I420 => Some(Self::EightBit420),
+            PixelFormat::Nv24 => Some(Self::EightBit444),
+            PixelFormat::P010 => Some(Self::TenBit420),
+            PixelFormat::P410 => Some(Self::TenBit444),
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => None,
+        }
+    }
+
     #[cfg(target_os = "macos")]
     const fn macos_bit_depth(self) -> opennow_streamer_platform_macos::VideoBitDepth {
         use opennow_streamer_platform_macos::VideoBitDepth;
@@ -3045,6 +3059,7 @@ fn run_embedded_linux_monitor(
     use std::time::Duration;
 
     let mut playback_started = false;
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         let (frames, events) = {
             let session = shared
@@ -3155,13 +3170,11 @@ fn run_embedded_linux_monitor(
                 opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
                     backend,
                     message,
-                } => {
-                    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
-                        subsystem: linux_audio_backend_name(backend),
-                        recovered: false,
-                        message: Some(message),
-                    });
-                }
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
                 opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
                     backend,
                     reason,
@@ -3173,10 +3186,12 @@ fn run_embedded_linux_monitor(
                         rejected,
                     });
                 }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3188,6 +3203,7 @@ fn run_embedded_linux_monitor(
 fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostCommand>) {
     use std::time::Duration;
 
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         if shared.linux_software_fallback.load(Ordering::Acquire) {
             request_linux_keyframe(&shared, "Linux decoder fallback requires a fresh keyframe");
@@ -3277,13 +3293,11 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                 opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
                     backend,
                     message,
-                } => {
-                    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
-                        subsystem: linux_audio_backend_name(backend),
-                        recovered: false,
-                        message: Some(message),
-                    });
-                }
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
                 opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
                     backend,
                     reason,
@@ -3295,10 +3309,12 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                         rejected,
                     });
                 }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3360,6 +3376,25 @@ fn stop_linux_session(shared: &SharedPipeline) {
 }
 
 #[cfg(target_os = "linux")]
+fn report_linux_color_format_change(
+    shared: &SharedPipeline,
+    reported: &mut Option<MediaColorQuality>,
+    format: opennow_streamer_platform_linux::StreamFormat,
+) {
+    let Some(actual) = MediaColorQuality::from_linux_pixel_format(format.pixel_format) else {
+        return;
+    };
+    if *reported == Some(actual) {
+        return;
+    }
+    *reported = Some(actual);
+    let _ = shared.feedback.send(MediaFeedback::ColorFormatChanged {
+        requested: shared.stream.color_quality,
+        actual,
+    });
+}
+
+#[cfg(target_os = "linux")]
 const fn linux_decoder_name(
     backend: opennow_streamer_platform_linux::DecoderBackend,
 ) -> &'static str {
@@ -3380,6 +3415,36 @@ const fn linux_audio_backend_name(
         opennow_streamer_platform_linux::AudioBackend::PipeWire => "PipeWire",
         opennow_streamer_platform_linux::AudioBackend::Alsa => "ALSA",
     }
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_loss(
+    shared: &SharedPipeline,
+    backend: opennow_streamer_platform_linux::AudioBackend,
+    message: String,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(backend),
+        recovered: false,
+        message: Some(message),
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_recovery(
+    shared: &SharedPipeline,
+    from: opennow_streamer_platform_linux::AudioBackend,
+    to: opennow_streamer_platform_linux::AudioBackend,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(from),
+        recovered: true,
+        message: Some(format!(
+            "{} accepted audio output after the {} sink failed",
+            linux_audio_backend_name(to),
+            linux_audio_backend_name(from)
+        )),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -4137,7 +4202,92 @@ mod tests {
             (MediaColorQuality::TenBit444, PixelFormat::P410),
         ] {
             assert_eq!(color.linux_pixel_format(), format);
+            assert_eq!(
+                MediaColorQuality::from_linux_pixel_format(format),
+                Some(color)
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decoded_formats_without_a_color_class_are_not_guessed() {
+        use opennow_streamer_platform_linux::PixelFormat;
+        assert_eq!(
+            MediaColorQuality::from_linux_pixel_format(PixelFormat::I420),
+            Some(MediaColorQuality::EightBit420)
+        );
+        for format in [PixelFormat::Bgra8, PixelFormat::Rgba8] {
+            assert_eq!(MediaColorQuality::from_linux_pixel_format(format), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_format_change_reports_the_decoded_color_class_once_per_change() {
+        use opennow_streamer_platform_linux::{ColorTransfer, PixelFormat, StreamFormat};
+
+        let (feedback, receiver) = std::sync::mpsc::channel();
+        let stream = MediaStreamConfig {
+            codec: MediaVideoCodec::H265,
+            color_quality: MediaColorQuality::TenBit420,
+            ..MediaStreamConfig::default()
+        };
+        let shared = SharedPipeline {
+            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
+            output: Arc::new(OutputBuffers::new()),
+            feedback,
+            paused: AtomicBool::new(false),
+            video_desynced: AtomicBool::new(false),
+            keyframe_requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            recording_tap: RecordingTap::default(),
+            replay_tap: crate::replay::ReplayTap::default(),
+            stream,
+            linux_session: Mutex::new(None),
+            linux_software_fallback: Arc::new(AtomicBool::new(false)),
+            linux_video_mid: Mutex::new(String::new()),
+            linux_codec: stream.codec,
+        };
+        let format = |pixel_format| StreamFormat {
+            pixel_format,
+            color_transfer: ColorTransfer::Sdr,
+            ..StreamFormat::video_default(1920, 1080).expect("valid default format")
+        };
+
+        let mut reported = None;
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert_eq!(
+            receiver.try_recv().expect("downgrade report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::EightBit420,
+            }
+        );
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(
+            &shared,
+            &mut reported,
+            StreamFormat {
+                width: 1280,
+                height: 720,
+                ..format(PixelFormat::Nv12)
+            },
+        );
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::P010));
+        assert_eq!(
+            receiver.try_recv().expect("restored format report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::TenBit420,
+            }
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -4195,6 +4345,83 @@ mod tests {
             );
             assert!(result.err().is_some_and(|error| error.contains(expected)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn device_lost_feedback(
+        receiver: &Receiver<MediaFeedback>,
+    ) -> (&'static str, bool, Option<String>) {
+        match receiver
+            .try_recv()
+            .expect("a device state feedback for every audio output event")
+        {
+            MediaFeedback::DeviceLost {
+                subsystem,
+                recovered,
+                message,
+            } => (subsystem, recovered, message),
+            other => panic!("expected a device state feedback, saw {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_feedback_pairs_loss_and_recovery_without_touching_video() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::PipeWire, "Broken pipe".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::PipeWire, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        assert_eq!(loss.0, "PipeWire");
+        assert!(!loss.1);
+        assert_eq!(loss.2.as_deref(), Some("Broken pipe"));
+
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(
+            recovery.0, "PipeWire",
+            "recovery must clear the audio subsystem that lost output"
+        );
+        assert!(recovery.1);
+        assert!(
+            recovery
+                .2
+                .as_deref()
+                .is_some_and(|message| message.contains("ALSA") && message.contains("PipeWire")),
+            "recovery must name the sink that accepted output, saw {:?}",
+            recovery.2
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "one loss and one recovery only"
+        );
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.video_desynced.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_recovery_pairs_a_backend_that_recovered_itself() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::Alsa, "Device lost".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::Alsa, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(loss, ("ALSA", false, Some("Device lost".to_owned())));
+        assert_eq!(
+            recovery.0, loss.0,
+            "a backend that accepted output again clears its own loss"
+        );
+        assert!(recovery.1);
+        assert!(receiver.try_recv().is_err());
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
     }
 
     #[cfg(target_os = "windows")]

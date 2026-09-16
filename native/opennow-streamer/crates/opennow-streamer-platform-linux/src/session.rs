@@ -150,6 +150,10 @@ pub enum BackendEvent {
         backend: AudioBackend,
         message: String,
     },
+    AudioOutputRecovered {
+        from: AudioBackend,
+        to: AudioBackend,
+    },
     AudioUnavailable {
         backend: AudioBackend,
         reason: String,
@@ -536,6 +540,17 @@ impl ReferenceRecovery {
     }
 }
 
+fn publish_video_readiness(
+    state: &Mutex<LifecycleState>,
+    events: &EventQueue,
+    backend: DecoderBackend,
+    startup: &mpsc::SyncSender<Result<DecoderBackend>>,
+) -> bool {
+    emit(events, BackendEvent::DecoderSelected(backend));
+    transition_state(state, LifecycleState::Running, events);
+    startup.send(Ok(backend)).is_ok()
+}
+
 fn run_video_worker(
     config: SessionConfig,
     state: Arc<Mutex<LifecycleState>>,
@@ -552,11 +567,9 @@ fn run_video_worker(
             return;
         }
     };
-    if startup.send(Ok(backend)).is_err() {
+    if !publish_video_readiness(&state, &events, backend, &startup) {
         return;
     }
-    emit(&events, BackendEvent::DecoderSelected(backend));
-    transition_state(&state, LifecycleState::Running, &events);
     // Never feed a fresh hardware decoder an inter-frame packet. In
     // particular, an AV1 stream can deliver its sequence header separately;
     // treating the following delta frame as startup input caused an avoidable
@@ -1030,9 +1043,17 @@ fn write_audio(
                         reason: fallback_error.to_string(),
                     });
                 }
+                let lost_backend = *backend;
                 *backend = fallback_backend;
                 *sink = fallback;
                 emit(events, BackendEvent::AudioSelected(*backend));
+                emit(
+                    events,
+                    BackendEvent::AudioOutputRecovered {
+                        from: lost_backend,
+                        to: fallback_backend,
+                    },
+                );
                 return Ok(());
             }
             Err(fallback_error) => {
@@ -1519,6 +1540,59 @@ mod tests {
     }
 
     #[test]
+    fn video_readiness_is_published_only_after_running() {
+        let state = Arc::new(Mutex::new(LifecycleState::Starting));
+        let events: EventQueue = Arc::new(BoundedQueue::new(8));
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let worker = {
+            let state = Arc::clone(&state);
+            let events = Arc::clone(&events);
+            thread::spawn(move || {
+                publish_video_readiness(&state, &events, DecoderBackend::Ffmpeg, &startup_tx)
+            })
+        };
+
+        assert!(matches!(
+            events.pop_timeout(Duration::from_secs(5)),
+            Some(BackendEvent::DecoderSelected(DecoderBackend::Ffmpeg))
+        ));
+        assert_eq!(*guard, LifecycleState::Starting);
+        assert!(matches!(
+            startup_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(guard);
+        assert!(worker.join().unwrap());
+        assert_eq!(
+            *state.lock().unwrap_or_else(|poison| poison.into_inner()),
+            LifecycleState::Running
+        );
+        assert_eq!(
+            startup_rx.try_recv().map(|result| result.unwrap()),
+            Ok(DecoderBackend::Ffmpeg)
+        );
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn successful_start_accepts_the_first_video_submission() {
+        let format = StreamFormat::video_default(64, 64).unwrap();
+        let mut config = SessionConfig::new(format);
+        config.decoder_preference = DecoderPreference::SoftwareOnly;
+        config.audio = None;
+
+        let mut session = LinuxSession::start(config).unwrap();
+        assert_eq!(session.state(), LifecycleState::Running);
+
+        let frame = EncodedVideoFrame::new(vec![0_u8; 32], 0, true).unwrap();
+        assert_eq!(session.submit_video(frame).unwrap(), PushOutcome::Queued);
+
+        assert!(session.stop().is_ok());
+    }
+
+    #[test]
     fn overflow_preserves_recovery_keyframe_and_rejects_inter_frames_until_it_arrives() {
         let commands = BoundedQueue::new(2);
         let events = Arc::new(BoundedQueue::new(8));
@@ -1640,6 +1714,39 @@ mod tests {
         }
     }
 
+    fn use_audio_failure_fixture() {
+        unsafe {
+            std::env::set_var(
+                "ALSA_CONFIG_PATH",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/audio-failure.conf"
+                ),
+            )
+        };
+    }
+
+    struct RejectingAudioSink {
+        backend: crate::AudioBackend,
+    }
+
+    impl super::AudioSink for RejectingAudioSink {
+        fn backend(&self) -> crate::AudioBackend {
+            self.backend
+        }
+
+        fn write(&mut self, _: &[f32], _: &dyn Fn() -> bool) -> crate::Result<()> {
+            Err(crate::Error::backend(
+                crate::Subsystem::Alsa,
+                "test sink rejected PCM",
+            ))
+        }
+    }
+
+    fn rejecting_output_sink(backend: crate::AudioBackend) -> Box<dyn super::AudioSink + Send> {
+        Box::new(RejectingAudioSink { backend })
+    }
+
     fn audio_packet(data: &[u8], rtp_timestamp: u32) -> super::AudioPacket {
         super::AudioPacket::new(Arc::<[u8]>::from(data.to_vec()), rtp_timestamp, 48_000, 7)
             .expect("valid audio packet input")
@@ -1653,15 +1760,7 @@ mod tests {
         super::EventQueue,
         thread::JoinHandle<()>,
     ) {
-        unsafe {
-            std::env::set_var(
-                "ALSA_CONFIG_PATH",
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/audio-failure.conf"
-                ),
-            )
-        };
+        use_audio_failure_fixture();
         let packets = Arc::new(super::BoundedQueue::new(64));
         let unavailable = Arc::new(AtomicBool::new(false));
         let events: super::EventQueue = Arc::new(super::BoundedQueue::new(512));
@@ -2015,6 +2114,12 @@ mod tests {
                 .any(|event| matches!(event, super::BackendEvent::StateChanged(_))),
             "an audio output failure must not fail the shared session, saw {observed:?}"
         );
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, super::BackendEvent::AudioOutputRecovered { .. })),
+            "a terminal output failure must not report recovery, saw {observed:?}"
+        );
         assert!(packets.is_closed());
         assert!(unavailable.load(Ordering::Acquire));
         worker.join().expect("audio worker thread");
@@ -2053,5 +2158,157 @@ mod tests {
         assert!(packets.is_closed());
         assert!(unavailable.load(Ordering::Acquire));
         worker.join().expect("audio worker thread");
+    }
+
+    #[test]
+    fn audio_output_recovery_is_reported_once_the_replacement_sink_accepts_output() {
+        use_audio_failure_fixture();
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(32));
+        let config = super::AudioConfig {
+            alsa_device: "opennow_test_output".to_owned(),
+            preference: crate::AudioBackendPreference::PipeWireThenAlsa,
+            ..super::AudioConfig::default()
+        };
+        let pcm = [0.0f32; 960 * 2];
+        let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+        let mut backend = crate::AudioBackend::PipeWire;
+        assert!(
+            super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false).is_ok(),
+            "the ALSA fallback must accept output"
+        );
+        assert_eq!(backend, crate::AudioBackend::Alsa);
+        let observed = collect_events(&events);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, super::BackendEvent::AudioOutputRecovered { .. }))
+                .count(),
+            1,
+            "one accepted replacement is one recovery observation, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputError { backend, message }
+                    if *backend == crate::AudioBackend::PipeWire
+                        && message.contains("test sink rejected PCM")
+            )),
+            "the lost sink is reported before recovery, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputRecovered { from, to }
+                    if *from == crate::AudioBackend::PipeWire && *to == crate::AudioBackend::Alsa
+            )),
+            "the recovery pairs the lost sink with the accepting one, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioSelected(backend)
+                    if *backend == crate::AudioBackend::Alsa
+            )),
+            "the accepting sink becomes the selected sink, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_audio_output_recoveries_report_each_accepted_replacement_once() {
+        use_audio_failure_fixture();
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(64));
+        let config = super::AudioConfig {
+            alsa_device: "opennow_test_output".to_owned(),
+            preference: crate::AudioBackendPreference::PipeWireThenAlsa,
+            ..super::AudioConfig::default()
+        };
+        let pcm = [0.0f32; 960 * 2];
+        let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+        let mut backend = crate::AudioBackend::PipeWire;
+        for _ in 0..2 {
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_ok(),
+                "the ALSA fallback must accept output"
+            );
+            assert_eq!(backend, crate::AudioBackend::Alsa);
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_ok(),
+                "the selected sink must keep accepting output"
+            );
+            let accepted = collect_events(&events);
+            assert_eq!(
+                accepted
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        super::BackendEvent::AudioOutputRecovered { .. }
+                    ))
+                    .count(),
+                1,
+                "an accepted replacement reports recovery once, saw {accepted:?}"
+            );
+            sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+            backend = crate::AudioBackend::PipeWire;
+        }
+        let observed = collect_events(&events);
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, super::BackendEvent::StateChanged(_))),
+            "audio output recovery must not fail the shared session, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn audio_output_loss_without_an_accepting_replacement_reports_no_recovery() {
+        use_audio_failure_fixture();
+        let pcm = [0.0f32; 960 * 2];
+        for (scenario, config) in [
+            (
+                "a fixed output device refuses fallback",
+                super::AudioConfig {
+                    output_device: "alsa:opennow_test_output".to_owned(),
+                    ..audio_worker_config(
+                        "opennow_test_output",
+                        crate::AudioBackendPreference::PipeWireThenAlsa,
+                    )
+                },
+            ),
+            (
+                "the replacement sink does not open",
+                super::AudioConfig {
+                    alsa_device: "opennow_test_missing_output".to_owned(),
+                    ..audio_worker_config("", crate::AudioBackendPreference::PipeWireThenAlsa)
+                },
+            ),
+        ] {
+            let events: super::EventQueue = Arc::new(super::BoundedQueue::new(32));
+            let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+            let mut backend = crate::AudioBackend::PipeWire;
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_err(),
+                "{scenario} must not accept output"
+            );
+            assert_eq!(backend, crate::AudioBackend::PipeWire, "{scenario}");
+            let observed = collect_events(&events);
+            assert!(
+                observed.iter().all(|event| !matches!(
+                    event,
+                    super::BackendEvent::AudioOutputRecovered { .. }
+                )),
+                "{scenario} must not report recovery, saw {observed:?}"
+            );
+            assert!(
+                observed.iter().any(|event| matches!(
+                    event,
+                    super::BackendEvent::AudioOutputError { backend, .. }
+                        if *backend == crate::AudioBackend::PipeWire
+                )),
+                "{scenario} must still report the loss, saw {observed:?}"
+            );
+        }
     }
 }
