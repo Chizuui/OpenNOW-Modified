@@ -5205,6 +5205,7 @@ impl NvstAudioReceiver {
                 received_at_us,
                 keyframe: false,
                 contiguous: true,
+                ssrc: Some(*header.ssrc),
             });
         };
         let recovered_packets = if *header.payload_type == GFN_RED_PAYLOAD_TYPE {
@@ -6555,6 +6556,7 @@ fn forward_receive_event(
                 .unwrap_or(u64::MAX),
             keyframe: frame.keyframe,
             contiguous: frame.contiguous && !*delivery_gap,
+            ssrc: None,
         };
         let frame_index = frame.frame_index;
         feedback.publish_assembled_frame(frame_index, delivered_at);
