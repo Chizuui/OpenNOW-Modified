@@ -8,6 +8,7 @@ pub struct NvstControllerRumble {
     pub low_frequency: u16,
     pub high_frequency: u16,
     pub duration_ms: u32,
+    pub source_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +58,7 @@ impl NvstHaptics {
                     } else {
                         u32::from(duration)
                     },
+                    source_incarnation: None,
                 };
                 if pending.0[usize::from(controller_id)]
                     .replace(command)
@@ -75,6 +77,26 @@ impl NvstHaptics {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    pub(super) fn store_sony(&self, rumble: opennow_streamer_hid::SonyRumble) {
+        let command = NvstControllerRumble {
+            controller_id: rumble.slot,
+            low_frequency: rumble.low_frequency,
+            high_frequency: rumble.high_frequency,
+            duration_ms: 0,
+            source_incarnation: Some(rumble.incarnation),
+        };
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.0[usize::from(rumble.slot)]
+            .replace(command)
+            .is_some()
+        {
+            pending.1 = pending.1.saturating_add(1);
+        }
     }
 }
 
@@ -108,6 +130,7 @@ mod tests {
                 low_frequency: 65535,
                 high_frequency: 0,
                 duration_ms: 250,
+                source_incarnation: None,
             })
         );
     }
@@ -126,13 +149,44 @@ mod tests {
                 controller_id: 0,
                 low_frequency: 0x1234,
                 high_frequency: 0xabcd,
-                duration_ms: 1000
+                duration_ms: 1000,
+                source_incarnation: None,
             })
         );
         assert_eq!(commands[1].unwrap().duration_ms, 321);
         assert_eq!(commands[2].unwrap().duration_ms, 1000);
         assert_eq!(commands[3].unwrap().low_frequency, 65535);
         assert_eq!(haptics.take(), ([None; 4], 0));
+    }
+
+    #[test]
+    fn sony_output_uses_the_existing_bounded_slot_with_the_source_incarnation() {
+        let haptics = NvstHaptics::default();
+        haptics.store_sony(opennow_streamer_hid::SonyRumble {
+            slot: 3,
+            incarnation: 77,
+            low_frequency: 0x4000,
+            high_frequency: 0x8000,
+        });
+        haptics.store_sony(opennow_streamer_hid::SonyRumble {
+            slot: 3,
+            incarnation: 77,
+            low_frequency: 0x1000,
+            high_frequency: 0x2000,
+        });
+        let (commands, coalesced) = haptics.take();
+        assert_eq!(coalesced, 1);
+        assert_eq!(
+            commands[3],
+            Some(NvstControllerRumble {
+                controller_id: 3,
+                low_frequency: 0x1000,
+                high_frequency: 0x2000,
+                duration_ms: 0,
+                source_incarnation: Some(77),
+            })
+        );
+        assert_eq!(commands[0], None);
     }
 
     #[test]

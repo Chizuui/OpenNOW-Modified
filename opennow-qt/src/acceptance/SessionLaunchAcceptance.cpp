@@ -132,6 +132,12 @@ int AcceptanceSession::startSessionLaunchWorkload()
             QKeyEvent release(QEvent::KeyRelease, value, Qt::NoModifier);
             QGuiApplication::sendEvent(window, &release);
         };
+        const auto saveStreamEvidence = [this, window](const QString &suffix) {
+            const auto index = m_arguments.indexOf(u"--screenshot-stream"_s);
+            if (index < 0) return true;
+            return index + 1 < m_arguments.size()
+                && window->grabWindow().save(m_arguments.at(index + 1) + suffix + u".png"_s);
+        };
         const int tick = ++state->tick;
         auto *cover = window->findChild<QQuickItem *>(u"desktopSessionStarting"_s);
         auto *motion = window->findChild<QObject *>(u"sessionLaunchMotion"_s);
@@ -207,11 +213,19 @@ int AcceptanceSession::startSessionLaunchWorkload()
         if (tick == 120) {
             if (!require(!cover->isVisible() && surface->isEnabled(),
                          "statistics reopened the launch screen")) return;
+            if (!require(m_controller.overlay() == u"desktop-stream-stats"_s,
+                         "statistics overlay is not shown over the stream surface")) return;
+            if (m_arguments.contains(u"--smoke-session-launch-video"_s)
+                && !require(video->rendered.load(), "statistics covered a non-playing video item")) return;
+            if (!require(saveStreamEvidence(u"-stats"_s), "could not save stream statistics capture")) return;
             m_controller.showOverlay(u"desktop-stream-menu"_s);
         }
         if (tick == 130) {
             if (!require(!cover->isVisible() && !surface->property("inputEnabled").toBool(),
                          "session menu failed to retain video and block input")) return;
+            if (m_arguments.contains(u"--smoke-session-launch-video"_s)
+                && !require(video->rendered.load(), "menu covered a non-playing video item")) return;
+            if (!require(saveStreamEvidence(u"-menu"_s), "could not save stream menu capture")) return;
             m_controller.showOverlay({});
             store->setProperty("streamer", starting);
             store->setProperty("streamState", u"reconnecting"_s);
@@ -226,6 +240,10 @@ int AcceptanceSession::startSessionLaunchWorkload()
             if (!require(m_controller.overlay() == u"desktop-stream-exit-confirm"_s
                     && !surface->property("inputEnabled").toBool(),
                     "first frame dismissed confirmation or enabled gameplay behind it")) return;
+            if (m_arguments.contains(u"--smoke-session-launch-video"_s)
+                && !require(video->rendered.load(), "confirmation covered a non-playing video item")) return;
+            if (!require(saveStreamEvidence(u"-confirm"_s),
+                         "could not save stream confirmation capture")) return;
             key(Qt::Key_Escape);
             store->setProperty("streamer", QVariantMap{{u"status"_s, u"error"_s},
                 {u"message"_s, u"Connection interrupted"_s}});

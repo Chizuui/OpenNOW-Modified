@@ -7,6 +7,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use opennow_streamer_core::{Engine, EventSender};
+use opennow_streamer_hid::{
+    HidRuntime, InventoryOutcome, SdlDeviceClaim, SnapshotAdmission, SonySnapshot,
+};
 use opennow_streamer_platform::{
     CapturedInput, CapturedInputQueue, EmbeddedInputCapture, EmbeddedLocalAction,
     EmbeddedRuntimeConfig, GraphicsApi, GraphicsContext, GraphicsFramePublisher,
@@ -20,7 +23,7 @@ use serde_json::Value;
 
 static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
 
-pub const OPENNOW_STREAMER_FFI_ABI_VERSION: u32 = 10;
+pub const OPENNOW_STREAMER_FFI_ABI_VERSION: u32 = 11;
 pub const OPENNOW_STREAMER_MAX_TEXT_BYTES: usize =
     opennow_streamer_protocol::text_input::MAX_TEXT_BYTES;
 pub const OPENNOW_STREAMER_VULKAN_DEVICE_INFO_VERSION: u32 = 1;
@@ -34,6 +37,42 @@ pub type OpenNowStreamerFrameAvailableCallback =
     Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type OpenNowStreamerCursorCallback =
     Option<unsafe extern "C" fn(bytes: *const u8, length: usize, user_data: *mut c_void)>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OpenNowSdlDeviceClaim {
+    pub slot: u8,
+    pub reserved: [u8; 7],
+    pub incarnation: u64,
+    pub vendor: u16,
+    pub product: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OpenNowSonySnapshot {
+    pub version: u32,
+    pub struct_size: usize,
+    pub slot: u8,
+    pub touchpad_click: u8,
+    pub reserved: [u8; 2],
+    pub incarnation: u64,
+    pub buttons: u16,
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
+    pub contact_active: [u8; 2],
+    pub reserved2: [u8; 2],
+    pub contact_x: [f32; 2],
+    pub contact_y: [f32; 2],
+    pub reserved3: u32,
+    pub observed_at_us: u64,
+}
+
+pub const OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -202,6 +241,8 @@ pub enum OpenNowStreamerStatus {
     RenderFailed = 10,
     SceneGraphActive = 11,
     FrameAlreadyRecorded = 12,
+    SonyInactive = 13,
+    SdlClaimRejected = 14,
     Panic = 255,
 }
 
@@ -338,6 +379,7 @@ pub struct OpenNowStreamer {
     graphics: RenderThreadGraphics,
     frame_publisher: GraphicsFramePublisher,
     input: EmbeddedInputCapture,
+    hid: Arc<HidRuntime>,
     #[cfg(target_os = "windows")]
     windows_adapter_luid: Option<WindowsAdapterLuid>,
 }
@@ -346,6 +388,7 @@ impl OpenNowStreamer {
     fn create(
         config: OpenNowStreamerConfig,
         captured_input: Arc<CapturedInputQueue>,
+        hid: Arc<HidRuntime>,
         engine_factory: impl FnOnce(EventSender, GraphicsFramePublisher, SyncSender<Vec<u8>>) -> Engine
         + Send
         + 'static,
@@ -433,6 +476,7 @@ impl OpenNowStreamer {
             graphics,
             frame_publisher,
             input: EmbeddedInputCapture::new(captured_input),
+            hid,
             #[cfg(target_os = "windows")]
             windows_adapter_luid: WindowsAdapterLuid::new(config.windows_adapter_luid),
         })
@@ -819,14 +863,17 @@ pub unsafe extern "C" fn opennow_streamer_create(
         let windows_adapter_luid = WindowsAdapterLuid::new(config.windows_adapter_luid);
         let captured_input = Arc::new(CapturedInputQueue::default());
         let runtime_input = Arc::clone(&captured_input);
+        let hid = Arc::new(HidRuntime::new());
+        let engine_hid = Arc::clone(&hid);
         match OpenNowStreamer::create(
             config,
             captured_input,
+            Arc::clone(&hid),
             move |events, frames, cursor_updates| {
                 let cursor_update = Arc::new(move |bytes: Vec<u8>| {
                     let _ = cursor_updates.try_send(bytes);
                 });
-                Engine::with_embedded_media_runtime(
+                Engine::with_embedded_media_runtime_and_hid(
                     events,
                     create_embedded_runtime_with_config(
                         frames,
@@ -837,6 +884,7 @@ pub unsafe extern "C" fn opennow_streamer_create(
                             windows_adapter_luid,
                         },
                     ),
+                    engine_hid,
                 )
             },
             || {},
@@ -1079,6 +1127,115 @@ pub unsafe extern "C" fn opennow_streamer_submit_gamepad(
 }
 
 #[unsafe(no_mangle)]
+unsafe extern "C" fn opennow_streamer_replace_sdl_device_claims(
+    handle: *const OpenNowStreamer,
+    claims: *const OpenNowSdlDeviceClaim,
+    claim_count: usize,
+) -> OpenNowStreamerStatus {
+    ffi_status(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return OpenNowStreamerStatus::NullPointer;
+        };
+        if claim_count > 4 {
+            return OpenNowStreamerStatus::InvalidConfig;
+        }
+        if claim_count > 0 && claims.is_null() {
+            return OpenNowStreamerStatus::NullPointer;
+        }
+        let mut entries = [None; 4];
+        for (index, entry) in entries.iter_mut().enumerate().take(claim_count) {
+            let claim = unsafe { claims.add(index).read() };
+            let Some(claim) =
+                SdlDeviceClaim::new(claim.slot, claim.incarnation, claim.vendor, claim.product)
+            else {
+                return OpenNowStreamerStatus::SdlClaimRejected;
+            };
+            *entry = Some(claim);
+        }
+        match handle.hid.replace_inventory(&entries).outcome {
+            InventoryOutcome::Replaced => OpenNowStreamerStatus::Ok,
+            InventoryOutcome::DuplicateSlot
+            | InventoryOutcome::DuplicateIncarnation
+            | InventoryOutcome::MalformedEntry => OpenNowStreamerStatus::SdlClaimRejected,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn opennow_streamer_submit_sony_snapshot(
+    handle: *const OpenNowStreamer,
+    snapshot: *const OpenNowSonySnapshot,
+) -> OpenNowStreamerStatus {
+    ffi_status(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return OpenNowStreamerStatus::NullPointer;
+        };
+        let Some(raw) = (unsafe { snapshot.as_ref() }) else {
+            return OpenNowStreamerStatus::NullPointer;
+        };
+        if raw.version != OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION
+            || raw.struct_size < size_of::<OpenNowSonySnapshot>()
+            || raw.reserved != [0; 2]
+            || raw.reserved2 != [0; 2]
+            || raw.reserved3 != 0
+        {
+            return OpenNowStreamerStatus::InvalidConfig;
+        }
+        if raw.touchpad_click > 1 || raw.contact_active.iter().any(|flag| *flag > 1) {
+            return OpenNowStreamerStatus::InvalidConfig;
+        }
+        if raw
+            .contact_x
+            .iter()
+            .chain(raw.contact_y.iter())
+            .any(|coordinate| !coordinate.is_finite())
+        {
+            return OpenNowStreamerStatus::InvalidConfig;
+        }
+        let mut snapshot = SonySnapshot::neutral(raw.slot, raw.incarnation, raw.observed_at_us);
+        snapshot.buttons = raw.buttons;
+        snapshot.left_trigger = raw.left_trigger;
+        snapshot.right_trigger = raw.right_trigger;
+        snapshot.left_stick_x = raw.left_stick_x;
+        snapshot.left_stick_y = raw.left_stick_y;
+        snapshot.right_stick_x = raw.right_stick_x;
+        snapshot.right_stick_y = raw.right_stick_y;
+        snapshot.touchpad_click = raw.touchpad_click == 1;
+        for index in 0..2 {
+            snapshot.contacts[index] = opennow_streamer_hid::SonyContact {
+                active: raw.contact_active[index] == 1,
+                x: opennow_streamer_hid::ds4::normalize_touch_axis(raw.contact_x[index]),
+                y: opennow_streamer_hid::ds4::normalize_touch_axis(raw.contact_y[index]),
+            };
+        }
+        match handle
+            .hid
+            .submit_snapshot_with(snapshot, |snapshot, bitmap| {
+                handle.input.submit(CapturedInput::Gamepad {
+                    controller_id: snapshot.slot,
+                    bitmap,
+                    buttons: snapshot.buttons,
+                    left_trigger: snapshot.left_trigger,
+                    right_trigger: snapshot.right_trigger,
+                    left_stick_x: snapshot.left_stick_x,
+                    left_stick_y: snapshot.left_stick_y.saturating_neg(),
+                    right_stick_x: snapshot.right_stick_x,
+                    right_stick_y: snapshot.right_stick_y.saturating_neg(),
+                });
+            }) {
+            SnapshotAdmission::Admitted => OpenNowStreamerStatus::Ok,
+            SnapshotAdmission::AdmittedInactive => OpenNowStreamerStatus::SonyInactive,
+            SnapshotAdmission::Unbound | SnapshotAdmission::StaleSource => {
+                OpenNowStreamerStatus::Closed
+            }
+            SnapshotAdmission::Faulted | SnapshotAdmission::Overflow => {
+                OpenNowStreamerStatus::QueueFull
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Submits one shell-local action to the embedded input queue.
 ///
 /// # Safety
@@ -1121,7 +1278,9 @@ pub unsafe extern "C" fn opennow_streamer_set_capture_active(
         if handle.is_null() || raw_input_active.is_null() {
             return OpenNowStreamerStatus::NullPointer;
         }
-        let raw = unsafe { &*handle }
+        let handle = unsafe { &*handle };
+        handle.hid.set_active(active);
+        let raw = handle
             .input
             .set_active(active, relative_mouse, window_handle);
         unsafe {
@@ -1477,7 +1636,8 @@ pub unsafe extern "C" fn opennow_streamer_destroy(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1485,6 +1645,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use opennow_streamer_hid::SourceMode;
 
     #[test]
     fn logging_throttles_only_periodic_snapshots_not_drop_deltas_or_warnings() {
@@ -1615,8 +1776,39 @@ mod tests {
     }
 
     #[test]
+    fn abi_eleven_appends_the_sony_snapshot_contract() {
+        assert_eq!(OPENNOW_STREAMER_FFI_ABI_VERSION, 11);
+        assert_eq!(std::mem::offset_of!(OpenNowSdlDeviceClaim, incarnation), 8);
+        assert_eq!(std::mem::offset_of!(OpenNowSdlDeviceClaim, vendor), 16);
+        assert_eq!(std::mem::offset_of!(OpenNowSdlDeviceClaim, product), 18);
+        assert_eq!(size_of::<OpenNowSdlDeviceClaim>(), 24);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, struct_size), 8);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, slot), 16);
+        assert_eq!(
+            std::mem::offset_of!(OpenNowSonySnapshot, touchpad_click),
+            17
+        );
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, incarnation), 24);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, buttons), 32);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, left_trigger), 34);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, left_stick_x), 36);
+        assert_eq!(
+            std::mem::offset_of!(OpenNowSonySnapshot, contact_active),
+            44
+        );
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, contact_x), 48);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, contact_y), 56);
+        assert_eq!(std::mem::offset_of!(OpenNowSonySnapshot, reserved3), 64);
+        assert_eq!(
+            std::mem::offset_of!(OpenNowSonySnapshot, observed_at_us),
+            72
+        );
+        assert_eq!(size_of::<OpenNowSonySnapshot>(), 80);
+    }
+
+    #[test]
     fn abi_ten_appends_the_windows_adapter_luid() {
-        assert_eq!(OPENNOW_STREAMER_FFI_ABI_VERSION, 10);
+        const { assert!(OPENNOW_STREAMER_FFI_ABI_VERSION >= 10) };
         assert_eq!(
             std::mem::offset_of!(OpenNowStreamerConfig, windows_adapter_luid),
             std::mem::offset_of!(OpenNowStreamerConfig, vulkan_device)
@@ -1778,6 +1970,7 @@ mod tests {
         let handle = OpenNowStreamer::create(
             test_config(messages),
             runtime.captured_input(),
+            Arc::new(HidRuntime::new()),
             move |events, _frames, _cursor| Engine::with_embedded_media_runtime(events, runtime),
             move || shutdown_runtime.shutdown(),
         )
@@ -2004,6 +2197,7 @@ mod tests {
         OpenNowStreamer::create(
             test_config(messages),
             Arc::new(CapturedInputQueue::default()),
+            Arc::new(HidRuntime::new()),
             |events, _frames, _cursor| Engine::embedded(events),
             || {},
         )
@@ -2167,11 +2361,562 @@ mod tests {
     #[test]
     fn abi_10_header_and_text_bound_match_rust() {
         let header = include_str!("../include/opennow_streamer_ffi.h");
-        assert!(header.contains("#define OPENNOW_STREAMER_FFI_ABI_VERSION 10u"));
+        assert!(header.contains(&format!(
+            "#define OPENNOW_STREAMER_FFI_ABI_VERSION {}u",
+            OPENNOW_STREAMER_FFI_ABI_VERSION
+        )));
         assert!(header.contains("uint64_t windows_adapter_luid;"));
+        assert!(header.contains(&format!(
+            "#define OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION {}u",
+            OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION
+        )));
+        assert!(header.contains("OpenNowSonySnapshot"));
+        assert!(header.contains("opennow_streamer_submit_sony_snapshot("));
+        assert!(header.contains("opennow_streamer_replace_sdl_device_claims("));
         assert!(header.contains("#define OPENNOW_STREAMER_MAX_TEXT_BYTES 65536u"));
         assert_eq!(OPENNOW_STREAMER_MAX_TEXT_BYTES, 65_536);
         assert!(header.contains("opennow_streamer_submit_text("));
+    }
+
+    #[test]
+    fn sdl_claims_replace_atomically_and_reject_malformed_entries() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        let claim = |slot: u8, incarnation: u64| OpenNowSdlDeviceClaim {
+            slot,
+            reserved: [0; 7],
+            incarnation,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(
+                    &handle,
+                    [claim(0, 11), claim(1, 12)].as_ptr(),
+                    2,
+                )
+            },
+            OpenNowStreamerStatus::Ok
+        );
+        assert_eq!(handle.hid.inventory().incarnation(0), Some(11));
+        assert_eq!(handle.hid.inventory().incarnation(1), Some(12));
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(
+                    &handle,
+                    [claim(0, 21), claim(0, 22)].as_ptr(),
+                    2,
+                )
+            },
+            OpenNowStreamerStatus::SdlClaimRejected
+        );
+        assert_eq!(handle.hid.inventory().incarnation(0), Some(11));
+        assert_eq!(handle.hid.inventory().incarnation(1), Some(12));
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(&handle, [claim(4, 31)].as_ptr(), 1)
+            },
+            OpenNowStreamerStatus::SdlClaimRejected
+        );
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(&handle, [claim(0, 0)].as_ptr(), 1)
+            },
+            OpenNowStreamerStatus::SdlClaimRejected
+        );
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, std::ptr::null(), 1) },
+            OpenNowStreamerStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(std::ptr::null(), std::ptr::null(), 0)
+            },
+            OpenNowStreamerStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(&handle, [claim(0, 11)].as_ptr(), 5)
+            },
+            OpenNowStreamerStatus::InvalidConfig
+        );
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, std::ptr::null(), 0) },
+            OpenNowStreamerStatus::Ok
+        );
+        assert_eq!(handle.hid.inventory().incarnation(0), None);
+        assert_eq!(handle.hid.inventory().incarnation(1), None);
+    }
+
+    #[test]
+    fn sony_snapshots_validate_version_size_and_source_incarnation() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, std::ptr::null()) },
+            OpenNowStreamerStatus::NullPointer
+        );
+        let mut snapshot = OpenNowSonySnapshot {
+            version: OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION,
+            struct_size: size_of::<OpenNowSonySnapshot>(),
+            slot: 0,
+            touchpad_click: 0,
+            reserved: [0; 2],
+            incarnation: 41,
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            contact_active: [0; 2],
+            reserved2: [0; 2],
+            contact_x: [0.0; 2],
+            contact_y: [0.0; 2],
+            reserved3: 0,
+            observed_at_us: 1000,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 0,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        handle.hid.set_active(true);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(1).is_some());
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        handle
+            .hid
+            .set_session_admission(0b0001, handle.hid.inventory_snapshot().1);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Ok
+        );
+        snapshot.incarnation = 42;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        snapshot.incarnation = 41;
+        snapshot.version = OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION + 1;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::InvalidConfig
+        );
+        snapshot.version = OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION;
+        snapshot.reserved = [1; 2];
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::InvalidConfig
+        );
+        snapshot.reserved = [0; 2];
+        snapshot.struct_size = 8;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::InvalidConfig
+        );
+        snapshot.struct_size = size_of::<OpenNowSonySnapshot>();
+        snapshot.buttons = 0x1000;
+        let mut accepted = 0_usize;
+        while unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) }
+            == OpenNowStreamerStatus::Ok
+        {
+            accepted += 1;
+            assert!(accepted <= 64);
+        }
+        assert!(accepted > 0);
+        assert_eq!(handle.hid.pending_states(), 0);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::QueueFull
+        );
+        handle.hid.set_active(false);
+        snapshot.buttons = 0x1000;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::SonyInactive
+        );
+        assert_eq!(handle.hid.pending_states(), 0);
+        snapshot.buttons = 0;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::SonyInactive
+        );
+        assert_eq!(handle.hid.pending_states(), 0);
+    }
+
+    #[test]
+    fn fallback_admission_is_linearized_against_session_unbinding() {
+        let messages = Box::new(CallbackMessages::default());
+        let queue = Arc::new(CapturedInputQueue::default());
+        let hid = Arc::new(HidRuntime::new());
+        let handle = OpenNowStreamer::create(
+            test_config(&messages),
+            Arc::clone(&queue),
+            Arc::clone(&hid),
+            |events, _frames, _cursor| Engine::embedded(events),
+            || {},
+        )
+        .expect("FFI handle");
+        handle.input.set_active(true, false, 0);
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 1,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        let endpoint = hid.open_endpoint();
+        assert!(hid.bind_session(7).is_some());
+        hid.set_active(true);
+        hid.set_session_admission(0, hid.inventory_snapshot().1);
+
+        let entered = Arc::new(Barrier::new(2));
+        let unbind_requested = Arc::new(Barrier::new(2));
+        let unbind_completed = Arc::new(AtomicBool::new(false));
+        let unbinder = {
+            let hid = Arc::clone(&hid);
+            let entered = Arc::clone(&entered);
+            let unbind_requested = Arc::clone(&unbind_requested);
+            let unbind_completed = Arc::clone(&unbind_completed);
+            std::thread::spawn(move || {
+                entered.wait();
+                unbind_requested.wait();
+                hid.unbind_session(7);
+                unbind_completed.store(true, Ordering::Release);
+            })
+        };
+
+        let mut snapshot = opennow_streamer_hid::SonySnapshot::neutral(1, 41, 5_000);
+        snapshot.buttons = 0x1000;
+        let admission = hid.submit_snapshot_with(snapshot, |snapshot, bitmap| {
+            entered.wait();
+            unbind_requested.wait();
+            assert_eq!(bitmap, 0x0202);
+            handle.input.submit(CapturedInput::Gamepad {
+                controller_id: snapshot.slot,
+                bitmap,
+                buttons: snapshot.buttons,
+                left_trigger: snapshot.left_trigger,
+                right_trigger: snapshot.right_trigger,
+                left_stick_x: snapshot.left_stick_x,
+                left_stick_y: snapshot.left_stick_y,
+                right_stick_x: snapshot.right_stick_x,
+                right_stick_y: snapshot.right_stick_y,
+            });
+        });
+        assert_eq!(admission, SnapshotAdmission::Admitted);
+        unbinder.join().unwrap();
+        assert!(unbind_completed.load(Ordering::Acquire));
+        assert!(
+            queue.take().is_some(),
+            "the linearized admission must be enqueued before the unbind wins"
+        );
+        assert_eq!(hid.session_generation(), None);
+        let mut rejected = opennow_streamer_hid::SonySnapshot::neutral(1, 41, 6_000);
+        rejected.buttons = 0x1000;
+        assert_eq!(
+            hid.submit_snapshot_with(rejected, |_, _| {
+                panic!("unbound sessions must not admit fallback input")
+            }),
+            SnapshotAdmission::Unbound
+        );
+        hid.close_endpoint(endpoint);
+    }
+
+    #[test]
+    fn parent_review_fallback_rejects_stale_incarnation() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        handle.input.set_active(true, false, 0);
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 1,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(1).is_some());
+        handle.hid.set_active(true);
+        handle
+            .hid
+            .set_session_admission(0, handle.hid.inventory_snapshot().1);
+        let mut snapshot = OpenNowSonySnapshot {
+            version: OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION,
+            struct_size: size_of::<OpenNowSonySnapshot>(),
+            slot: 1,
+            touchpad_click: 0,
+            reserved: [0; 2],
+            incarnation: 41,
+            buttons: 0x1000,
+            left_trigger: 7,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 12_000,
+            right_stick_x: 0,
+            right_stick_y: -12_000,
+            contact_active: [0; 2],
+            reserved2: [0; 2],
+            contact_x: [0.0; 2],
+            contact_y: [0.0; 2],
+            reserved3: 0,
+            observed_at_us: 1000,
+        };
+        snapshot.incarnation = 99;
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        assert!(handle.input.queue().take().is_none());
+    }
+
+    #[test]
+    fn parent_review_changed_inventory_requires_reconciliation() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        handle.input.set_active(true, false, 0);
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 1,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(1).is_some());
+        handle.hid.set_active(true);
+        handle
+            .hid
+            .set_session_admission(0, handle.hid.inventory_snapshot().1);
+        assert_eq!(
+            handle.hid.source_mode(1),
+            Some(SourceMode::OrdinaryFallback)
+        );
+        let snapshot = OpenNowSonySnapshot {
+            version: OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION,
+            struct_size: size_of::<OpenNowSonySnapshot>(),
+            slot: 1,
+            touchpad_click: 0,
+            reserved: [0; 2],
+            incarnation: 41,
+            buttons: 0x1000,
+            left_trigger: 7,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 12_000,
+            right_stick_x: 0,
+            right_stick_y: -12_000,
+            contact_active: [0; 2],
+            reserved2: [0; 2],
+            contact_x: [0.0; 2],
+            contact_y: [0.0; 2],
+            reserved3: 0,
+            observed_at_us: 1000,
+        };
+        let mut replacement = claim;
+        replacement.incarnation = 99;
+        assert_eq!(
+            unsafe {
+                opennow_streamer_replace_sdl_device_claims(&handle, [replacement].as_ptr(), 1)
+            },
+            OpenNowStreamerStatus::Ok
+        );
+        assert_eq!(handle.hid.source_mode(snapshot.slot), None);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        assert!(handle.input.queue().take().is_none());
+        let stale_epoch = handle.hid.inventory_snapshot().1 - 1;
+        assert!(!handle.hid.set_session_admission(0, stale_epoch));
+        assert_eq!(handle.hid.source_mode(snapshot.slot), None);
+    }
+
+    #[test]
+    fn session_unbinding_closes_snapshot_admission_for_the_next_association() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 0,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        handle.input.set_active(true, false, 0);
+        assert_eq!(handle.hid.session_generation(), None);
+        let endpoint = handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(7).is_some());
+        handle.hid.set_active(true);
+        handle
+            .hid
+            .set_session_admission(0b0001, handle.hid.inventory_snapshot().1);
+        let snapshot = OpenNowSonySnapshot {
+            version: OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION,
+            struct_size: size_of::<OpenNowSonySnapshot>(),
+            slot: 0,
+            touchpad_click: 0,
+            reserved: [0; 2],
+            incarnation: 41,
+            buttons: 0x1000,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            contact_active: [0; 2],
+            reserved2: [0; 2],
+            contact_x: [0.0; 2],
+            contact_y: [0.0; 2],
+            reserved3: 0,
+            observed_at_us: 1000,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Ok
+        );
+        assert_eq!(handle.hid.pending_states(), 1);
+        handle.hid.unbind_session(7);
+        assert_eq!(handle.hid.session_generation(), None);
+        assert_eq!(handle.hid.pending_states(), 0);
+        assert!(handle.hid.drain(8).is_empty());
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        assert_eq!(handle.hid.source_mode(0), None);
+        handle.hid.close_endpoint(endpoint);
+        assert!(handle.hid.bind_session(8).is_none());
+        assert_eq!(handle.hid.session_generation(), None);
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Closed
+        );
+        handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(8).is_some());
+        assert_eq!(handle.hid.session_generation(), Some(8));
+        assert_eq!(handle.hid.source_mode(0), None);
+        assert_eq!(handle.hid.pending_states(), 0);
+    }
+
+    #[test]
+    fn sony_fallback_routes_snapshots_through_the_ordinary_formatter() {
+        let messages = Box::new(CallbackMessages::default());
+        let handle = graphics_test_handle(&messages);
+        handle.input.set_active(true, false, 0);
+        let claim = OpenNowSdlDeviceClaim {
+            slot: 1,
+            reserved: [0; 7],
+            incarnation: 41,
+            vendor: 0x054c,
+            product: 0x05c4,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_replace_sdl_device_claims(&handle, [claim].as_ptr(), 1) },
+            OpenNowStreamerStatus::Ok
+        );
+        handle.hid.open_endpoint();
+        assert!(handle.hid.bind_session(1).is_some());
+        handle.hid.set_active(true);
+        handle
+            .hid
+            .set_session_admission(0, handle.hid.inventory_snapshot().1);
+        assert_eq!(
+            handle.hid.source_mode(1),
+            Some(SourceMode::OrdinaryFallback)
+        );
+        let snapshot = OpenNowSonySnapshot {
+            version: OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION,
+            struct_size: size_of::<OpenNowSonySnapshot>(),
+            slot: 1,
+            touchpad_click: 0,
+            reserved: [0; 2],
+            incarnation: 41,
+            buttons: 0x1000,
+            left_trigger: 7,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 12_000,
+            right_stick_x: 0,
+            right_stick_y: -12_000,
+            contact_active: [0; 2],
+            reserved2: [0; 2],
+            contact_x: [0.0; 2],
+            contact_y: [0.0; 2],
+            reserved3: 0,
+            observed_at_us: 1000,
+        };
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Ok
+        );
+        let queue = handle.input.queue();
+        let Some(CapturedInput::Gamepad {
+            controller_id,
+            bitmap,
+            buttons,
+            left_trigger,
+            left_stick_y,
+            right_stick_y,
+            ..
+        }) = queue.take()
+        else {
+            panic!("missing fallback gamepad report")
+        };
+        assert_eq!(controller_id, 1);
+        assert_eq!(bitmap, 0x0202);
+        assert_eq!(buttons, 0x1000);
+        assert_eq!(left_trigger, 7);
+        assert_eq!(left_stick_y, -12_000);
+        assert_eq!(right_stick_y, 12_000);
+        assert_eq!(handle.hid.pending_states(), 0);
+        handle
+            .hid
+            .set_session_admission(0b0010, handle.hid.inventory_snapshot().1);
+        assert_eq!(handle.hid.source_mode(1), Some(SourceMode::Rich));
+        assert_eq!(
+            unsafe { opennow_streamer_submit_sony_snapshot(&handle, &snapshot) },
+            OpenNowStreamerStatus::Ok
+        );
+        assert_eq!(handle.hid.pending_states(), 1);
+        assert!(handle.input.queue().take().is_none());
     }
 
     #[test]

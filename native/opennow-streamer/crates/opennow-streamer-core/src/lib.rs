@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use decode_progress::{
     DecodeProgressEvent, DecodeProgressPolicy, DecodeProgressStage, DecodeProgressWatchdog,
 };
+use opennow_streamer_hid::HidRuntime;
 use opennow_streamer_platform::{
     CapturedInput, CapturedInputQueue, CapturedInputSample, DecodeStageTimings,
     DecodeTimingsReport, EncodedFrame, MediaCodec, MediaColorQuality, MediaControl, MediaFeedback,
@@ -213,6 +214,7 @@ pub struct Engine {
     clip_cancelled: Arc<AtomicBool>,
     replay_budget: Arc<AtomicUsize>,
     microphone: Option<MicrophoneController>,
+    hid_runtime: Arc<HidRuntime>,
 }
 
 #[derive(Debug)]
@@ -251,6 +253,7 @@ impl Engine {
             clip_cancelled: Arc::new(AtomicBool::new(false)),
             replay_budget: Arc::new(AtomicUsize::new(0)),
             microphone: None,
+            hid_runtime: Arc::new(HidRuntime::new()),
         }
     }
 
@@ -289,6 +292,7 @@ impl Engine {
             clip_cancelled: Arc::new(AtomicBool::new(false)),
             replay_budget: Arc::new(AtomicUsize::new(0)),
             microphone: None,
+            hid_runtime: Arc::new(HidRuntime::new()),
         }
     }
 
@@ -323,11 +327,22 @@ impl Engine {
             clip_cancelled: Arc::new(AtomicBool::new(false)),
             replay_budget: Arc::new(AtomicUsize::new(0)),
             microphone: None,
+            hid_runtime: Arc::new(HidRuntime::new()),
         }
     }
 
     pub fn with_embedded_media_runtime(events: EventSender, media_runtime: MediaRuntime) -> Self {
         Self::with_media_runtime_and_event_sender(events, media_runtime)
+    }
+
+    pub fn with_embedded_media_runtime_and_hid(
+        events: EventSender,
+        media_runtime: MediaRuntime,
+        hid_runtime: Arc<HidRuntime>,
+    ) -> Self {
+        let mut engine = Self::with_media_runtime_and_event_sender(events, media_runtime);
+        engine.hid_runtime = hid_runtime;
+        engine
     }
 
     pub fn handle(&mut self, command: Command) -> (Vec<Value>, bool) {
@@ -835,6 +850,7 @@ impl Engine {
                 event_sender.clone(),
                 reserved_socket,
                 reserved_rtc,
+                Arc::clone(&self.hid_runtime),
             ) {
                 Ok(transport) => transport,
                 Err(transport_error) => {
@@ -921,6 +937,14 @@ impl Engine {
             lifecycle.state = State::Connected;
             lifecycle.generation
         };
+        if self.hid_runtime.bind_session(generation).is_none() {
+            self.stop("NVST association exited before the session start was accepted");
+            return Err(error(
+                Some(&command.id),
+                "nvst-start-failed",
+                "NVST association exited before the session start was accepted",
+            ));
+        }
         if let Some(nvst_events) = nvst_events {
             let output = self.events.clone();
             let lifecycle = self.lifecycle.clone();
@@ -963,6 +987,8 @@ impl Engine {
                     lifecycle.context = None;
                     lifecycle.state = State::Idle;
                 }
+                drop(lifecycle);
+                self.hid_runtime.unbind_session(generation);
                 return Err(error(
                     Some(&command.id),
                     "media-worker-failed",
@@ -1154,6 +1180,9 @@ impl Engine {
 
     fn stop(&mut self, reason: &str) {
         self.clip_cancelled.store(true, Ordering::Release);
+        if let Some(generation) = self.hid_runtime.session_generation() {
+            self.hid_runtime.unbind_session(generation);
+        }
         let was_active = {
             let mut lifecycle = lock_lifecycle(&self.lifecycle);
             let was_active = lifecycle.state != State::Idle;
@@ -1907,18 +1936,19 @@ fn forward_controller_rumble(
     if current.generation != generation || current.state != State::Connected {
         return true;
     }
-    output
-        .send(event(
-            "controller-rumble",
-            json!({
-                "startId": start_id,
-                "controllerId": command.controller_id,
-                "lowFrequency": command.low_frequency,
-                "highFrequency": command.high_frequency,
-                "durationMs": command.duration_ms,
-            }),
-        ))
-        .is_ok()
+    let mut payload = json!({
+        "startId": start_id,
+        "controllerId": command.controller_id,
+        "lowFrequency": command.low_frequency,
+        "highFrequency": command.high_frequency,
+        "durationMs": command.duration_ms,
+    });
+    if let Some(incarnation) = command.source_incarnation
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("sourceIncarnation".to_owned(), json!(incarnation));
+    }
+    output.send(event("controller-rumble", payload)).is_ok()
 }
 
 #[derive(Default)]
@@ -3929,6 +3959,7 @@ mod tests {
             event_sender,
             Some(socket),
             None,
+            Arc::new(HidRuntime::new()),
         )
         .unwrap();
         let resources = ActiveNvstResources {
@@ -4790,6 +4821,7 @@ mod tests {
             low_frequency: 0,
             high_frequency: 0,
             duration_ms: 1000,
+            source_incarnation: None,
         });
         let pending = resources.rumble.clone();
         let worker_lifecycle = lifecycle.clone();
@@ -4837,6 +4869,7 @@ mod tests {
             low_frequency: 65535,
             high_frequency: 12345,
             duration_ms: 65535,
+            source_incarnation: None,
         };
         assert!(forward_controller_rumble(
             &output, &lifecycle, 7, "start-7", command
@@ -4862,6 +4895,32 @@ mod tests {
             &output, &lifecycle, 7, "start-7", command
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn sony_rumble_carries_the_source_incarnation_and_stays_session_scoped() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let output = EventSender::bounded(sender);
+        let lifecycle = connected_lifecycle();
+        assert!(forward_controller_rumble(
+            &output,
+            &lifecycle,
+            7,
+            "start-7",
+            opennow_streamer_transport::NvstControllerRumble {
+                controller_id: 1,
+                low_frequency: 0x4000,
+                high_frequency: 0x8000,
+                duration_ms: 0,
+                source_incarnation: Some(91),
+            }
+        ));
+        assert_eq!(
+            receiver.try_recv().expect("sony rumble event"),
+            json!({"type":"controller-rumble",
+            "startId":"start-7", "controllerId":1, "lowFrequency":0x4000,
+            "highFrequency":0x8000, "durationMs":0, "sourceIncarnation":91})
+        );
     }
 
     #[test]
@@ -5536,6 +5595,63 @@ mod tests {
     }
 
     #[test]
+    fn accepted_start_binds_the_hid_endpoint_and_termination_closes_it() {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let (media_sender, _media_receiver) = std::sync::mpsc::sync_channel(4);
+        let mut engine = Engine::with_media_consumer(sender, media_sender);
+        let mut context = synthetic_context("hid-endpoint-lifecycle", json!([]));
+        context["settings"]["codec"] = json!("AV1");
+        context["nvstVideo"] = json!({
+            "clientUdpPort": unused_udp_port(),
+            "videoPeerIp": "127.0.0.1",
+            "videoPeerPort": 5004,
+            "srtpAesKeyHex": "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "srtpSaltHex": "00000000000000009ECA935E",
+            "codec": "H264"
+        });
+        let (responses, _) = engine.handle(command(json!({
+            "id": "start",
+            "type": "start",
+            "context": context,
+        })));
+        assert_eq!(responses[0]["type"], "ok");
+        let generation = lock_lifecycle(&engine.lifecycle).generation;
+        assert_eq!(engine.hid_runtime.session_generation(), Some(generation));
+        assert!(
+            engine
+                .hid_runtime
+                .bind_session(generation.wrapping_add(1))
+                .is_some()
+        );
+        engine
+            .hid_runtime
+            .unbind_session(generation.wrapping_add(1));
+        assert_eq!(engine.hid_runtime.session_generation(), None);
+
+        if let Some(transport) = engine.nvst_transport.take() {
+            transport.stop();
+        }
+        assert_eq!(
+            engine.hid_runtime.session_generation(),
+            None,
+            "terminating the owned transport must close the HID endpoint"
+        );
+        assert!(
+            engine.hid_runtime.bind_session(9_999).is_none(),
+            "a closed endpoint must refuse late binding"
+        );
+
+        let (responses, _) = engine.handle(command(json!({
+            "id": "stop",
+            "type": "stop",
+            "reason": "test complete",
+        })));
+        assert_eq!(responses[0]["type"], "ok");
+        assert_eq!(lifecycle_state(&engine), State::Idle);
+        assert!(engine.hid_runtime.bind_session(10_000).is_none());
+    }
+
+    #[test]
     fn explicit_invalid_nvst_handoff_fails_closed() {
         let (sender, _receiver) = std::sync::mpsc::channel();
         let mut engine = Engine::new(sender);
@@ -5554,6 +5670,8 @@ mod tests {
         assert_eq!(responses[0]["code"], "invalid-nvst-handoff");
         assert_eq!(lifecycle_state(&engine), State::Idle);
         assert!(engine.nvst_transport.is_none());
+        assert!(engine.hid_runtime.bind_session(1).is_none());
+        assert_eq!(engine.hid_runtime.session_generation(), None);
     }
 
     #[test]

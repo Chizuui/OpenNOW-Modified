@@ -44,13 +44,19 @@ use super::nvst_control::{
     frame_pacing_report, idr_request,
 };
 use super::nvst_cursor::{CursorCommand, NvstCursorCapture, valid_cursor_channel_message};
+use super::nvst_haptics::NvstHaptics;
 use super::nvst_input::{
-    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec,
-    native_input_type_is_motion, native_input_type_name, native_input_types,
-    next_control_keepalive, server_cursor_messages,
+    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec, SonyDeviceControl,
+    for_each_sony_output, native_input_type_is_motion, native_input_type_name, native_input_types,
+    next_control_keepalive, server_cursor_messages, sony_device_change_command,
+    sony_report_command,
 };
 use super::{
     EncodedMediaFrame, MediaConsumer, TransportError, deliver_media_frame, install_crypto,
+};
+use opennow_streamer_hid::{
+    DRAIN_PER_ITERATION, EndpointToken, HidOutbound, HidRuntime, HidSession, IngressItem,
+    SonyCapability,
 };
 
 const RTP_FIXED_HEADER_LEN: usize = 12;
@@ -983,6 +989,7 @@ pub struct NvstVideoConfig {
     /// The peer assigned RTCP feedback to the `rtcp1` SCTP data channel. When true, the
     /// dedicated Mjolnir socket must not send a second raw SRTCP Receiver Report.
     rtcp_on_sctp: bool,
+    hid_device_mask: u32,
     /// Dedicated NATT-only video (Mjolnir) socket port in the official two-socket
     /// cloud model. When set, video RTP/SRTP arrives on this socket while the
     /// ICE/DTLS bundle socket only carries control/audio keepalive traffic.
@@ -1020,6 +1027,7 @@ impl fmt::Debug for NvstVideoConfig {
                 &self.remote_dtls_fingerprint.as_ref().map(String::len),
             )
             .field("rtcp_on_sctp", &self.rtcp_on_sctp)
+            .field("hid_device_mask", &self.hid_device_mask)
             .field("mjolnir_udp_port", &self.mjolnir_udp_port)
             .field("codec", &self.codec)
             .field("audio_track", &self.audio_track)
@@ -1281,6 +1289,7 @@ impl NvstVideoConfig {
                 field: "mjolnirUdpPort",
             });
         }
+        let hid_device_mask = optional_u32(object, "hidDeviceMask")?.unwrap_or(0);
         let stun_credentials = if ping_version == Some(6) || remote_dtls_fingerprint.is_some() {
             Some(NvstStunCredentials {
                 local_username_fragment: required_ice_credential(
@@ -1353,6 +1362,7 @@ impl NvstVideoConfig {
             remote_dtls_fingerprint,
             rtcp_on_sctp,
             mjolnir_udp_port,
+            hid_device_mask,
             codec,
             audio_track,
             microphone_available,
@@ -1419,6 +1429,10 @@ impl NvstVideoConfig {
 
     pub fn rtcp_on_sctp(&self) -> bool {
         self.rtcp_on_sctp
+    }
+
+    pub fn hid_device_mask(&self) -> u32 {
+        self.hid_device_mask
     }
 
     pub fn mjolnir_udp_port(&self) -> Option<u16> {
@@ -4820,7 +4834,7 @@ fn routed_host_addr(peer: Option<SocketAddr>, local: SocketAddr) -> SocketAddr {
     local
 }
 
-fn logical_ice_addr(addr: SocketAddr, loopback_octet: u8) -> SocketAddr {
+pub fn logical_ice_addr(addr: SocketAddr, loopback_octet: u8) -> SocketAddr {
     match addr.ip() {
         IpAddr::V4(ip) if ip.is_link_local() => SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, loopback_octet)),
@@ -5063,8 +5077,16 @@ pub fn spawn_nvst_udp_receiver(
     config: NvstVideoConfig,
     media_consumer: MediaConsumer,
     event_sender: Sender<NvstReceiveEvent>,
+    hid_runtime: Arc<HidRuntime>,
 ) -> Result<NvstUdpReceiverSession, NvstUdpReceiverError> {
-    spawn_nvst_udp_receiver_with_socket(config, media_consumer, event_sender, None, None)
+    spawn_nvst_udp_receiver_with_socket(
+        config,
+        media_consumer,
+        event_sender,
+        None,
+        None,
+        hid_runtime,
+    )
 }
 
 pub fn spawn_nvst_udp_receiver_with_socket(
@@ -5073,6 +5095,7 @@ pub fn spawn_nvst_udp_receiver_with_socket(
     event_sender: Sender<NvstReceiveEvent>,
     reserved_socket: Option<UdpSocket>,
     reserved_rtc: Option<Rtc>,
+    hid_runtime: Arc<HidRuntime>,
 ) -> Result<NvstUdpReceiverSession, NvstUdpReceiverError> {
     let bind_ip = match config.video_peer.ip() {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -5112,6 +5135,7 @@ pub fn spawn_nvst_udp_receiver_with_socket(
         media_consumer,
         event_sender,
         rtc,
+        Some(hid_runtime),
     )
 }
 
@@ -5146,6 +5170,7 @@ pub fn spawn_nvst_mjolnir_receiver(
         media_consumer,
         event_sender,
         None,
+        None,
     )
 }
 
@@ -5163,6 +5188,7 @@ fn spawn_receiver_thread(
     media_consumer: MediaConsumer,
     event_sender: Sender<NvstReceiveEvent>,
     rtc: Option<Rtc>,
+    hid_runtime: Option<Arc<HidRuntime>>,
 ) -> Result<NvstUdpReceiverSession, NvstUdpReceiverError> {
     socket
         .set_read_timeout(Some(UDP_RECEIVE_POLL_INTERVAL))
@@ -5175,9 +5201,15 @@ fn spawn_receiver_thread(
     )));
     let worker_microphone = microphone.clone();
     let transport_origin = Instant::now();
+    let endpoint = hid_runtime
+        .as_ref()
+        .map(|runtime| (Arc::clone(runtime), runtime.open_endpoint()));
+    let worker_endpoint = endpoint.clone();
     let join = thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
+            let _endpoint_guard =
+                worker_endpoint.map(|(runtime, token)| EndpointGuard { runtime, token });
             run_nvst_udp_receiver(
                 socket,
                 config,
@@ -5190,13 +5222,19 @@ fn spawn_receiver_thread(
                 },
                 transport_origin,
                 rtc,
+                hid_runtime,
             );
             worker_input_ready.store(false, Ordering::Release);
             if let Ok(mut queue) = worker_microphone.lock() {
                 queue.close();
             }
         })
-        .map_err(NvstUdpReceiverError::Spawn)?;
+        .map_err(|error| {
+            if let Some((runtime, token)) = endpoint {
+                runtime.close_endpoint(token);
+            }
+            NvstUdpReceiverError::Spawn(error)
+        })?;
     Ok(NvstUdpReceiverSession {
         commands,
         join: Some(join),
@@ -5541,6 +5579,158 @@ fn send_nvst_captured_input(
     false
 }
 
+struct EndpointGuard {
+    runtime: Arc<HidRuntime>,
+    token: EndpointToken,
+}
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        self.runtime.close_endpoint(self.token);
+    }
+}
+
+const SONY_SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_millis(50);
+
+fn queue_hid_shutdown(hid_session: &mut HidSession, channels: NvstInputChannels, rtc: &mut Rtc) {
+    for outbound in hid_session.retire_all() {
+        let command = match outbound {
+            HidOutbound::Release { low_id, bytes } => sony_report_command(low_id, &bytes),
+            HidOutbound::Removal { low_id } => {
+                sony_device_change_command(SonyDeviceControl::Removal, low_id)
+            }
+            HidOutbound::Attach { .. } | HidOutbound::Report { .. } => None,
+        };
+        if let Some(command) = command {
+            let _ = channels.send_control_teardown(rtc, &command);
+        }
+    }
+}
+
+fn forward_rtc_outputs<F: FnMut(&Output)>(rtc: &mut Rtc, mut transmit: F, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match rtc.poll_output() {
+            Ok(output @ Output::Transmit(_)) => transmit(&output),
+            Ok(_) | Err(_) => break,
+        }
+    }
+}
+
+fn pump_hid_pending(
+    hid_runtime: &HidRuntime,
+    hid_session: &mut HidSession,
+    input_codec: &mut NvstInputCodec,
+    channels: NvstInputChannels,
+    rtc: &mut Rtc,
+    published_mask: &mut u16,
+    timestamp_us: u64,
+) -> bool {
+    if hid_runtime.session_generation().is_none() {
+        return true;
+    }
+    let (inventory, inventory_epoch) = hid_runtime.inventory_snapshot();
+    let mut attaches = Vec::new();
+    for item in hid_session.reconcile(&inventory) {
+        match item {
+            HidOutbound::Release { low_id, bytes } => {
+                if let Some(command) = sony_report_command(low_id, &bytes)
+                    && !channels.send_control_teardown(rtc, &command)
+                {
+                    return false;
+                }
+            }
+            HidOutbound::Removal { low_id } => {
+                if let Some(command) =
+                    sony_device_change_command(SonyDeviceControl::Removal, low_id)
+                    && !channels.send_control_teardown(rtc, &command)
+                {
+                    return false;
+                }
+            }
+            HidOutbound::Attach { low_id } => attaches.push(low_id),
+            HidOutbound::Report { .. } => {}
+        }
+    }
+    let mask = hid_session.rich_slot_mask();
+    hid_runtime.set_session_admission(mask, inventory_epoch);
+    if mask != *published_mask {
+        let retirement = input_codec.set_rich_slot_mask(mask, timestamp_us);
+        let mut failed = false;
+        for message in &retirement {
+            if !channels.send_encoded(rtc, message) {
+                failed = true;
+                break;
+            }
+        }
+        if !failed {
+            *published_mask = mask;
+        } else {
+            return false;
+        }
+    }
+    for low_id in attaches {
+        if let Some(command) = sony_device_change_command(SonyDeviceControl::Attach, low_id)
+            && !channels.send_control(rtc, &command)
+        {
+            return false;
+        }
+    }
+    let mut published = true;
+    for item in hid_runtime.drain(DRAIN_PER_ITERATION) {
+        let (slot, faulted, observed_at_us) = match item {
+            IngressItem::Snapshot(snapshot) => {
+                if let Some((low_id, bytes)) = hid_session.build_report(&snapshot)
+                    && let Some(command) = sony_report_command(low_id, &bytes)
+                    && !channels.send_control(rtc, &command)
+                {
+                    published = false;
+                }
+                continue;
+            }
+            IngressItem::Release {
+                slot,
+                observed_at_us,
+                ..
+            } => (slot, false, observed_at_us),
+            IngressItem::Fault {
+                slot,
+                observed_at_us,
+                ..
+            } => (slot, true, observed_at_us),
+        };
+        hid_session.observe_slot(slot, observed_at_us);
+        if let Some((low_id, bytes)) = hid_session.release_snapshot(slot)
+            && let Some(command) = sony_report_command(low_id, &bytes)
+            && !channels.send_control_teardown(rtc, &command)
+        {
+            published = false;
+        }
+        if faulted {
+            eprintln!(
+                "Sony source in slot {slot} overflowed its bounded mailbox and was neutralized"
+            );
+        }
+    }
+    published
+}
+
+fn store_sony_output(
+    hid_session: &mut HidSession,
+    hid_runtime: &HidRuntime,
+    low_id: u8,
+    operation: &[u8],
+    haptics: &NvstHaptics,
+) {
+    let Some(rumble) = hid_session.take_output(operation, low_id) else {
+        return;
+    };
+    if !hid_runtime.output_admitted(rumble.slot) {
+        return;
+    }
+    haptics.store_sony(rumble);
+}
+
 fn run_nvst_webrtc_bundle(
     socket: UdpSocket,
     config: NvstVideoConfig,
@@ -5548,6 +5738,7 @@ fn run_nvst_webrtc_bundle(
     outputs: NvstReceiverOutputs,
     transport_origin: Instant,
     mut rtc: Rtc,
+    hid_runtime: Option<Arc<HidRuntime>>,
 ) {
     let NvstReceiverOutputs {
         media_consumer,
@@ -5573,6 +5764,7 @@ fn run_nvst_webrtc_bundle(
     // control/audio keepalive traffic; the Mjolnir receiver owns the media
     // timeout, so the bundle must not raise a spurious media recovery.
     let owns_media_timeout = config.mjolnir_udp_port.is_none();
+    let hid_device_mask = config.hid_device_mask();
     let physical_local = socket.local_addr().ok().map_or_else(
         || bundle_peer,
         |local| routed_host_addr(Some(bundle_peer), local),
@@ -5616,6 +5808,13 @@ fn run_nvst_webrtc_bundle(
     let mut last_ack_frame = None;
     let mut sctp_started_at: Option<Instant> = None;
     let mut input_channels: Option<NvstInputChannels> = None;
+    let mut hid_session = hid_runtime.as_ref().map(|_| {
+        HidSession::new(SonyCapability {
+            server_mask: hid_device_mask,
+            ..SonyCapability::default()
+        })
+    });
+    let mut hid_published_mask = 0_u16;
     let mut input_state = NvstInputChannelState::default();
     let mut input_codec = NvstInputCodec::default();
     let mut last_input_types = Vec::new();
@@ -5624,7 +5823,8 @@ fn run_nvst_webrtc_bundle(
     let mut control_keepalive_at = next_control_keepalive(Instant::now());
     let mut input_timeout_reported = false;
     let mut audio_receiver = NvstAudioReceiver::default();
-    loop {
+    'bundle: loop {
+        let now = Instant::now();
         loop {
             match commands.try_recv() {
                 Ok(UdpReceiverCommand::Pause) => forward_optional(&event_sender, receiver.pause()),
@@ -5718,16 +5918,35 @@ fn run_nvst_webrtc_bundle(
                         ) {
                             rtc.disconnect();
                             forward_optional(&event_sender, receiver.stop());
-                            return;
+                            break 'bundle;
                         }
                     } else if let Some(reply) = reply {
                         let _ = reply.send(Err(TransportError::InputNotReady));
                     }
                 }
                 Ok(UdpReceiverCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                    if let (Some(_), Some(hid_session), Some(channels)) =
+                        (hid_runtime.as_ref(), hid_session.as_mut(), input_channels)
+                    {
+                        queue_hid_shutdown(hid_session, channels, &mut rtc);
+                        forward_rtc_outputs(
+                            &mut rtc,
+                            |output| {
+                                if let Output::Transmit(transmit) = output {
+                                    let _ = socket.send_to(&transmit.contents, bundle_peer);
+                                }
+                            },
+                            SONY_SHUTDOWN_FLUSH_BUDGET,
+                        );
+                    }
+                    if let Some(hid_runtime) = hid_runtime.as_ref()
+                        && let Some(generation) = hid_runtime.session_generation()
+                    {
+                        hid_runtime.unbind_session(generation);
+                    }
                     rtc.disconnect();
                     forward_optional(&event_sender, receiver.stop());
-                    return;
+                    break 'bundle;
                 }
                 Err(TryRecvError::Empty) => break,
             }
@@ -5735,7 +5954,6 @@ fn run_nvst_webrtc_bundle(
 
         // Official first burst is three ICE Binding Requests, plus NATT
         // ping-string PING. After DTLS they keep pinging at 100ms.
-        let now = Instant::now();
         if input_state.control_is_open() && now >= control_keepalive_at {
             if let Some(channels) = input_channels
                 && !channels.send_keepalive(&mut rtc, 0)
@@ -5753,6 +5971,34 @@ fn run_nvst_webrtc_bundle(
             })
         {
             let _ = event_sender.send(NvstReceiveEvent::CursorCapture(false));
+        }
+        if input_state.is_ready()
+            && let (Some(hid_runtime), Some(hid_session), Some(channels)) =
+                (hid_runtime.as_ref(), hid_session.as_mut(), input_channels)
+        {
+            let timestamp_us = now
+                .duration_since(transport_origin)
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            if !pump_hid_pending(
+                hid_runtime,
+                hid_session,
+                &mut input_codec,
+                channels,
+                &mut rtc,
+                &mut hid_published_mask,
+                timestamp_us,
+            ) {
+                input_ready.store(false, Ordering::Release);
+                let _ = event_sender.send(NvstReceiveEvent::InputUnavailable(
+                    "sony hid output could not be queued; stopping to prevent stuck input"
+                        .to_owned(),
+                ));
+                rtc.disconnect();
+                forward_optional(&event_sender, receiver.stop());
+                break 'bundle;
+            }
         }
         if !input_timeout_reported && input_state.handshake_timed_out(sctp_started_at, now) {
             input_timeout_reported = true;
@@ -5778,7 +6024,7 @@ fn run_nvst_webrtc_bundle(
                         if let Err(error) = socket.send_to(&ice, bundle_peer) {
                             eprintln!("NVST ICE send failed: {error}");
                             forward_optional(&event_sender, receiver.stop());
-                            return;
+                            break 'bundle;
                         }
                     }
                 }
@@ -5795,7 +6041,7 @@ fn run_nvst_webrtc_bundle(
                 if let Err(error) = socket.send_to(&natt, bundle_peer) {
                     eprintln!("NVST NATT send failed: {error}");
                     forward_optional(&event_sender, receiver.stop());
-                    return;
+                    break 'bundle;
                 }
                 ping_tracker.sent(natt_tid, sent_at);
                 Some(natt)
@@ -5895,20 +6141,18 @@ fn run_nvst_webrtc_bundle(
         // every second.
         if rtcp_channel_open
             && now.duration_since(last_rtcp_send) >= SRTCP_RR_INTERVAL
-            && let Some(channel_id) = rtcp_channel
             && let Some(report_block) = feedback.report_snapshot(true)
         {
-            let mut channel = rtc.channel(channel_id);
-            if let Some(channel) = channel.as_mut() {
-                let report = build_rtcp_receiver_report(rtcp_sender_ssrc, report_block);
-                if channel.write(true, &report).unwrap_or(false) {
-                    rtcp_reports_sent += 1;
-                    if rtcp_reports_sent == 1 || rtcp_reports_sent % 10 == 0 {
-                        eprintln!(
-                            "NVST rtcp1 RR sent={rtcp_reports_sent} mediaSsrc={} highestSeq={}",
-                            report_block.media_ssrc, report_block.highest_sequence,
-                        );
-                    }
+            let report = build_rtcp_receiver_report(rtcp_sender_ssrc, report_block);
+            let admitted =
+                input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &report));
+            if admitted {
+                rtcp_reports_sent += 1;
+                if rtcp_reports_sent == 1 || rtcp_reports_sent % 10 == 0 {
+                    eprintln!(
+                        "NVST rtcp1 RR sent={rtcp_reports_sent} mediaSsrc={} highestSeq={}",
+                        report_block.media_ssrc, report_block.highest_sequence,
+                    );
                 }
             }
             last_rtcp_send = now;
@@ -5921,23 +6165,22 @@ fn run_nvst_webrtc_bundle(
             && let Some((media_ssrc, _)) = feedback.stream_snapshot()
         {
             if rtcp_channel_open
-                && let Some(channel_id) = rtcp_channel
-                && let Some(mut channel) = rtc.channel(channel_id)
+                && let Some((first_missing_index, last_missing_index)) = feedback.take_nack(now)
             {
-                if let Some((first_missing_index, last_missing_index)) = feedback.take_nack(now) {
-                    let nack = build_rtcp_nack(
-                        rtcp_sender_ssrc,
-                        media_ssrc,
-                        first_missing_index,
-                        last_missing_index,
+                let nack = build_rtcp_nack(
+                    rtcp_sender_ssrc,
+                    media_ssrc,
+                    first_missing_index,
+                    last_missing_index,
+                );
+                let admitted =
+                    input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &nack));
+                if admitted {
+                    eprintln!(
+                        "NVST rtcp1 NACK sent for mediaSsrc={media_ssrc} missing={first_missing_index}..={last_missing_index}"
                     );
-                    if channel.write(true, &nack).unwrap_or(false) {
-                        eprintln!(
-                            "NVST rtcp1 NACK sent for mediaSsrc={media_ssrc} missing={first_missing_index}..={last_missing_index}"
-                        );
-                    } else {
-                        feedback.mark_nack_send_failed(first_missing_index, last_missing_index);
-                    }
+                } else {
+                    feedback.mark_nack_send_failed(first_missing_index, last_missing_index);
                 }
             }
             last_recovery_send = now;
@@ -5954,14 +6197,10 @@ fn run_nvst_webrtc_bundle(
         );
         if try_pli || try_idr {
             let mut pli_queued = false;
-            if try_pli
-                && let Some((media_ssrc, _)) = feedback.stream_snapshot()
-                && let Some(channel_id) = rtcp_channel
-                && let Some(mut channel) = rtc.channel(channel_id)
-            {
-                pli_queued = channel
-                    .write(true, &build_rtcp_pli(rtcp_sender_ssrc, media_ssrc))
-                    .unwrap_or(false);
+            if try_pli && let Some((media_ssrc, _)) = feedback.stream_snapshot() {
+                let pli = build_rtcp_pli(rtcp_sender_ssrc, media_ssrc);
+                pli_queued =
+                    input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &pli));
             }
             let idr_queued = try_idr
                 && input_channels.is_some_and(|channels| {
@@ -6037,7 +6276,7 @@ fn run_nvst_webrtc_bundle(
                         }
                         eprintln!("NVST WebRTC send failed: {error}");
                         forward_optional(&event_sender, receiver.stop());
-                        return;
+                        break 'bundle;
                     }
                     ice_responses.sent(&transmit.contents);
                     // Official ICE-on WebRtcTransport skips setupDtls until a real
@@ -6119,6 +6358,20 @@ fn run_nvst_webrtc_bundle(
                                 || data.id == channels.control_partial
                             {
                                 feedback.haptics.receive(&data.data);
+                            }
+                            if data.id == channels.control_reliable
+                                && let (Some(hid_session), Some(hid_runtime)) =
+                                    (hid_session.as_mut(), hid_runtime.as_ref())
+                            {
+                                for_each_sony_output(&data.data, |low_id, operation| {
+                                    store_sony_output(
+                                        hid_session,
+                                        hid_runtime,
+                                        low_id,
+                                        operation,
+                                        &feedback.haptics,
+                                    );
+                                });
                             }
                             let cursor_messages = if data.id == channels.cursor {
                                 Vec::new()
@@ -6268,7 +6521,7 @@ fn run_nvst_webrtc_bundle(
                                         ));
                                         rtc.disconnect();
                                         forward_optional(&event_sender, receiver.stop());
-                                        return;
+                                        break 'bundle;
                                     }
                                 }
                             }
@@ -6291,7 +6544,7 @@ fn run_nvst_webrtc_bundle(
                                 ) {
                                     rtc.disconnect();
                                     forward_optional(&event_sender, receiver.stop());
-                                    return;
+                                    break 'bundle;
                                 }
                             }
                         }
@@ -6301,7 +6554,7 @@ fn run_nvst_webrtc_bundle(
                 Err(error) => {
                     eprintln!("NVST WebRTC bundle failed: {error}");
                     forward_optional(&event_sender, receiver.stop());
-                    return;
+                    break 'bundle;
                 }
             }
         };
@@ -6314,13 +6567,13 @@ fn run_nvst_webrtc_bundle(
             if let Err(error) = rtc.handle_input(Input::Timeout(Instant::now())) {
                 eprintln!("NVST WebRTC timer failed: {error}");
                 forward_optional(&event_sender, receiver.stop());
-                return;
+                break 'bundle;
             }
         } else {
             if let Err(error) = socket.set_read_timeout(Some(wait)) {
                 eprintln!("NVST UDP timeout configuration failed: {error}");
                 forward_optional(&event_sender, receiver.stop());
-                return;
+                break 'bundle;
             }
             match socket.recv_from(&mut datagram) {
                 Ok((length, source)) => {
@@ -6360,7 +6613,7 @@ fn run_nvst_webrtc_bundle(
                         if let Err(error) = socket.send_to(b"PONG", source) {
                             eprintln!("NVST PONG send failed: {error}");
                             forward_optional(&event_sender, receiver.stop());
-                            return;
+                            break 'bundle;
                         }
                         continue;
                     }
@@ -6404,7 +6657,7 @@ fn run_nvst_webrtc_bundle(
                     )) {
                         eprintln!("NVST WebRTC handle_input failed: {error}");
                         forward_optional(&event_sender, receiver.stop());
-                        return;
+                        break 'bundle;
                     }
                 }
                 Err(error)
@@ -6418,7 +6671,7 @@ fn run_nvst_webrtc_bundle(
                 Err(error) => {
                     log_udp_error("bundle-receive", local_port, &error);
                     forward_optional(&event_sender, receiver.stop());
-                    return;
+                    break 'bundle;
                 }
             }
         }
@@ -6435,6 +6688,25 @@ fn run_nvst_webrtc_bundle(
         }
         forward_optional(&event_sender, timeout);
     }
+    if let Some(hid_runtime) = hid_runtime.as_ref() {
+        if let (Some(hid_session), Some(channels)) = (hid_session.as_mut(), input_channels) {
+            for outbound in hid_session.retire_all() {
+                let command = match outbound {
+                    HidOutbound::Release { low_id, bytes } => sony_report_command(low_id, &bytes),
+                    HidOutbound::Removal { low_id } => {
+                        sony_device_change_command(SonyDeviceControl::Removal, low_id)
+                    }
+                    HidOutbound::Attach { .. } | HidOutbound::Report { .. } => None,
+                };
+                if let Some(command) = command {
+                    let _ = channels.send_control_teardown(&mut rtc, &command);
+                }
+            }
+        }
+        if let Some(generation) = hid_runtime.session_generation() {
+            hid_runtime.unbind_session(generation);
+        }
+    }
 }
 
 fn run_nvst_udp_receiver(
@@ -6444,9 +6716,18 @@ fn run_nvst_udp_receiver(
     outputs: NvstReceiverOutputs,
     transport_origin: Instant,
     rtc: Option<Rtc>,
+    hid_runtime: Option<Arc<HidRuntime>>,
 ) {
     if let Some(rtc) = rtc {
-        run_nvst_webrtc_bundle(socket, config, commands, outputs, transport_origin, rtc);
+        run_nvst_webrtc_bundle(
+            socket,
+            config,
+            commands,
+            outputs,
+            transport_origin,
+            rtc,
+            hid_runtime,
+        );
         return;
     }
     let local_port = socket.local_addr().map_or(0, |addr| addr.port());
@@ -6860,6 +7141,9 @@ mod tests {
     }
     mod qos_tests {
         include!("nvst_qos_tests.rs");
+    }
+    mod budget_tests {
+        include!("nvst_budget_tests.rs");
     }
     use super::*;
     use serde_json::json;
@@ -7688,6 +7972,24 @@ mod tests {
             decode_fixed_hex::<12>("00000000000000009ECA935E", NvstConfigError::InvalidSrtpSalt)
                 .expect("salt"),
         );
+    }
+
+    #[test]
+    fn handoff_carries_the_negotiated_hid_device_mask() {
+        let mut handoff = legacy_handoff();
+        assert_eq!(config().hid_device_mask(), 0);
+        handoff["hidDeviceMask"] = json!(0x5);
+        let config = NvstVideoConfig::from_legacy_handoff(&handoff, None).expect("valid config");
+        assert_eq!(config.hid_device_mask(), 0x5);
+        handoff["hidDeviceMask"] = json!(u32::MAX);
+        let config = NvstVideoConfig::from_legacy_handoff(&handoff, None).expect("valid config");
+        assert_eq!(config.hid_device_mask(), u32::MAX);
+        handoff["hidDeviceMask"] = json!(-1);
+        assert!(NvstVideoConfig::from_legacy_handoff(&handoff, None).is_err());
+        handoff["hidDeviceMask"] = json!(u64::from(u32::MAX) + 1);
+        assert!(NvstVideoConfig::from_legacy_handoff(&handoff, None).is_err());
+        handoff["hidDeviceMask"] = json!("5");
+        assert!(NvstVideoConfig::from_legacy_handoff(&handoff, None).is_err());
     }
 
     #[test]
@@ -10298,6 +10600,7 @@ mod tests {
             event_sender.clone(),
             Some(bundle),
             None,
+            Arc::new(HidRuntime::new()),
         )
         .unwrap();
         let video_session =
@@ -10366,6 +10669,7 @@ mod tests {
             event_sender,
             Some(client_reservation),
             None,
+            Arc::new(HidRuntime::new()),
         )
         .expect("UDP receiver");
 

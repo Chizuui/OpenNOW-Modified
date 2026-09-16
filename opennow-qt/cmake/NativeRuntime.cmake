@@ -238,6 +238,39 @@ add_custom_command(
 add_custom_target(opennow-streamer-ffi-build
     DEPENDS ${OPENNOW_STREAMER_FFI_ARTIFACTS})
 
+set(OPENNOW_STREAMER_PEER_PROBE_NAME "nvst-peer-probe")
+set(OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR "${CMAKE_BINARY_DIR}/peer-probe-rust-target")
+set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}")
+if(OPENNOW_RUST_TARGET)
+    set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT
+        "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}/${OPENNOW_RUST_TARGET}")
+endif()
+set(OPENNOW_STREAMER_PEER_PROBE
+    "${OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT}/release/${OPENNOW_STREAMER_PEER_PROBE_NAME}")
+add_custom_command(
+    OUTPUT "${OPENNOW_STREAMER_PEER_PROBE}"
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=MAKEFLAGS --unset=MFLAGS
+            "CMAKE=${CMAKE_COMMAND}"
+            "${CARGO_EXECUTABLE}" build
+            --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+            --target-dir "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}"
+            --package opennow-streamer-transport
+            --features sony-peer-probe
+            --bin nvst-peer-probe
+            ${OPENNOW_RUST_TARGET_ARGS}
+            --release
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+        ${OPENNOW_STREAMER_RUST_SOURCES}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer"
+    COMMENT "Building the Sony chain RTC peer probe"
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+)
+add_custom_target(opennow-streamer-peer-probe
+    DEPENDS "${OPENNOW_STREAMER_PEER_PROBE}")
+
 # The Rust core still probes streamer capabilities through the standalone
 # streamer executable next to opennow-core, so build and ship it alongside
 # the in-process FFI library. Always release: a debug streamer is too slow

@@ -606,6 +606,10 @@ pub fn prepare_owned_nvst(
         ));
     }
     let rtcp_on_sctp = sdp_attribute(&describe.body, "general.rtcpOnSctp").as_deref() == Some("1");
+    let hid_device_mask = sdp_attribute(&describe.body, "ri.hidDeviceMask")
+        .as_deref()
+        .map(parse_hid_device_mask)
+        .unwrap_or(0);
     let microphone_available = negotiate_microphone(context, &describe.body);
 
     let mut setup_headers = common_headers.clone();
@@ -721,6 +725,7 @@ pub fn prepare_owned_nvst(
         "localDtlsFingerprint":identity.dtls_fingerprint,
         "remoteDtlsFingerprint":remote_fingerprint,
         "rtcpOnSctp":rtcp_on_sctp,
+        "hidDeviceMask":hid_device_mask,
         "microphoneOnBundle":microphone_available,
         "codec":codec,
         "audioTrack":{"payloadType":111,"codec":"opus","clockRateHz":48000,"channels":2,"mid":"0"},
@@ -1272,6 +1277,27 @@ fn media_control(sdp: &str, kind: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_hid_device_mask(value: &str) -> u32 {
+    let trimmed = value.trim();
+    let (radix, digits) = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (16, hex)
+    } else if trimmed
+        .chars()
+        .any(|character| character.is_ascii_hexdigit())
+        && trimmed
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+    {
+        (16, trimmed)
+    } else {
+        (10, trimmed)
+    };
+    u32::from_str_radix(digits, radix).unwrap_or(0)
 }
 
 fn sdp_attribute(sdp: &str, name: &str) -> Option<String> {

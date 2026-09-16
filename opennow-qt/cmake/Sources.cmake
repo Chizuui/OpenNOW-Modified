@@ -55,6 +55,8 @@ qt_add_executable(opennow-qt
     src/diagnostics/DiagnosticsPaths.h
     src/input/ControllerInput.cpp
     src/input/ControllerInput.h
+    src/input/SdlDeviceClaim.h
+    src/input/SonySnapshotWire.h
     src/input/InputModeTracker.cpp
     src/input/InputModeTracker.h
     src/localization/Localization.cpp

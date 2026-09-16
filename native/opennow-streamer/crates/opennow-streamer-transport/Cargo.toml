@@ -13,6 +13,7 @@ getrandom.workspace = true
 ghash.workspace = true
 hmac.workspace = true
 mtu.workspace = true
+opennow-streamer-hid = { path = "../opennow-streamer-hid" }
 opennow-streamer-protocol = { path = "../opennow-streamer-protocol" }
 serde_json.workspace = true
 sha1.workspace = true
@@ -35,3 +36,11 @@ str0m = { workspace = true, features = ["rust-crypto"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[features]
+sony-peer-probe = []
+
+[[bin]]
+name = "nvst-peer-probe"
+path = "src/bin/nvst_peer_probe.rs"
+required-features = ["sony-peer-probe"]

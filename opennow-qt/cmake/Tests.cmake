@@ -794,6 +794,38 @@ if(BUILD_TESTING)
              COMMAND opennow-nativestreamruntime-tests -o -,txt)
     set_tests_properties(opennow-nativestreamruntime-tests PROPERTIES TIMEOUT 8)
 
+    if(UNIX AND NOT APPLE)
+        qt_add_executable(opennow-sonychain-tests
+            tests/tst_sonychain.cpp
+            src/input/ControllerInput.cpp
+            src/input/ControllerInput.h
+            src/input/SdlDeviceClaim.h
+            src/input/SonySnapshotWire.h
+            ${OPENNOW_STREAM_RUNTIME_SOURCES}
+        )
+        target_include_directories(opennow-sonychain-tests PRIVATE src)
+        target_link_libraries(opennow-sonychain-tests PRIVATE
+            Qt6::Test Qt6::Core Qt6::Gui Qt6::Network SDL3::SDL3 opennow-streamer-ffi)
+        target_compile_definitions(opennow-sonychain-tests PRIVATE
+            OPENNOW_QT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(opennow-sonychain-tests
+            opennow-streamer-ffi-build opennow-streamer-peer-probe)
+        add_custom_target(opennow-streamer-peer-probe-deploy ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${OPENNOW_STREAMER_PEER_PROBE}"
+                "$<TARGET_FILE_DIR:opennow-sonychain-tests>/${OPENNOW_STREAMER_PEER_PROBE_NAME}"
+            DEPENDS opennow-streamer-peer-probe
+            COMMENT "Deploying the Sony chain RTC peer probe"
+            VERBATIM)
+        add_dependencies(opennow-sonychain-tests opennow-streamer-peer-probe-deploy)
+        add_test(NAME opennow-sonychain-tests
+                 COMMAND opennow-sonychain-tests -o -,txt)
+        set_tests_properties(opennow-sonychain-tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+            TIMEOUT 180
+        )
+    endif()
+
     if(APPLE OR WIN32)
         add_custom_target(opennow-streamer-ffi-test-runtime ALL
             COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -852,6 +884,7 @@ if(BUILD_TESTING)
         tests/tst_controllerinput.cpp
         src/input/ControllerInput.cpp
         src/input/ControllerInput.h
+        src/input/SdlDeviceClaim.h
     )
     target_include_directories(opennow-controllerinput-tests PRIVATE src)
     target_link_libraries(opennow-controllerinput-tests PRIVATE
@@ -866,6 +899,7 @@ if(BUILD_TESTING)
         tests/tst_controllernavigation.cpp
         src/input/ControllerInput.cpp
         src/input/ControllerInput.h
+        src/input/SdlDeviceClaim.h
     )
     target_include_directories(opennow-controllernavigation-tests PRIVATE src)
     target_link_libraries(opennow-controllernavigation-tests PRIVATE
@@ -880,6 +914,7 @@ if(BUILD_TESTING)
         tests/tst_controllertuning.cpp
         src/input/ControllerInput.cpp
         src/input/ControllerInput.h
+        src/input/SdlDeviceClaim.h
     )
     target_include_directories(opennow-controllertuning-tests PRIVATE src)
     target_link_libraries(opennow-controllertuning-tests PRIVATE
@@ -894,6 +929,7 @@ if(BUILD_TESTING)
         tests/tst_controllersources.cpp
         src/input/ControllerInput.cpp
         src/input/ControllerInput.h
+        src/input/SdlDeviceClaim.h
     )
     target_include_directories(opennow-controllersources-tests PRIVATE src)
     target_link_libraries(opennow-controllersources-tests PRIVATE
@@ -908,6 +944,7 @@ if(BUILD_TESTING)
         tests/tst_controllermetadata.cpp
         src/input/ControllerInput.cpp
         src/input/ControllerInput.h
+        src/input/SdlDeviceClaim.h
     )
     target_include_directories(opennow-controllermetadata-tests PRIVATE src)
     target_link_libraries(opennow-controllermetadata-tests PRIVATE

@@ -11,6 +11,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "input/SdlDeviceClaim.h"
+
 class ControllerInput final : public QObject
 {
     Q_OBJECT
@@ -26,6 +28,30 @@ class ControllerInput final : public QObject
 
 public:
     static constexpr quint32 syntheticControllerScanCode = 0x4f504e57;
+    static constexpr int maxSources = maxSdlSources;
+    static constexpr float sonyContactCenter = 0.5f;
+
+    struct SonyContact {
+        bool active = false;
+        bool hasPosition = false;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+
+    struct SonySnapshot {
+        quint8 slot = 0;
+        quint64 incarnation = 0;
+        quint16 buttons = 0;
+        quint8 leftTrigger = 0;
+        quint8 rightTrigger = 0;
+        qint16 leftStickX = 0;
+        qint16 leftStickY = 0;
+        qint16 rightStickX = 0;
+        qint16 rightStickY = 0;
+        bool touchpadClick = false;
+        std::array<SonyContact, 2> contacts{};
+        quint64 observedAtUs = 0;
+    };
 
     explicit ControllerInput(QObject *parent = nullptr);
     ~ControllerInput() override;
@@ -45,8 +71,10 @@ public:
     void setLeftStickDeadzone(int percent);
     void setRightStickDeadzone(int percent);
     void setVibrationIntensity(int percent);
-    void playRumble(quint8 controllerId, quint16 lowFrequency, quint16 highFrequency, quint32 durationMs);
+    void playRumble(quint8 controllerId, quint16 lowFrequency, quint16 highFrequency, quint32 durationMs,
+                    quint64 sourceIncarnation = 0);
     void stopRumble();
+    [[nodiscard]] QList<SdlDeviceClaim> deviceClaims() const;
 
 signals:
     void controllerCountChanged(int count);
@@ -64,6 +92,8 @@ signals:
                          quint8 leftTrigger, quint8 rightTrigger,
                          qint16 leftStickX, qint16 leftStickY,
                          qint16 rightStickX, qint16 rightStickY);
+    void deviceClaimsChanged();
+    void sonySnapshot(const ControllerInput::SonySnapshot &snapshot);
     void localActionRequested(quint32 action);
 
 private slots:
@@ -88,6 +118,12 @@ private:
         quint8 leftTrigger = 0;
         quint8 rightTrigger = 0;
         bool rumbleFailureReported = false;
+        quint64 incarnation = 0;
+        quint16 vendor = 0;
+        quint16 product = 0;
+        bool touchpadClick = false;
+        bool guideLatched = false;
+        std::array<SonyContact, 2> contacts{};
         QHash<int, QPointer<QObject>> shellKeys;
         std::array<RepeatingDirection, 4> directions{{
             {false, 0, 0, Qt::Key_Left}, {false, 0, 0, Qt::Key_Right},
@@ -98,6 +134,14 @@ private:
     void closeController(SDL_JoystickID id);
     void handleButton(const SDL_GamepadButtonEvent &event, bool pressed);
     void handleAxis(const SDL_GamepadAxisEvent &event);
+    void handleTouchpad(const SDL_GamepadTouchpadEvent &event);
+    void sampleSonyContacts(int slotIndex);
+    void publishSonySnapshot(int slotIndex, bool neutral = false);
+    void publishConnectedSony(bool neutral = false);
+    void publishConnectedInputs(bool neutral = false);
+    void publishSlotSnapshot(int slotIndex, bool neutral = false);
+    void releaseSonyContacts(int slotIndex);
+    [[nodiscard]] int effectiveSlot(int slotIndex) const;
     bool updateDirection(RepeatingDirection &direction, bool active);
     void reportActivity(int slot, const QString &control, int value);
     void dispatchRepeats(qint64 now);
@@ -112,6 +156,7 @@ private:
     void publishConnectedGamepads(bool neutral = false);
     void updateSlotSnapshot(int slot);
     void updatePollInterval();
+    [[nodiscard]] bool isSonySlot(int slotIndex) const;
     void refreshControllerMetadata();
     static quint16 buttonMask(Uint8 button);
     static QPair<qint16, qint16> radialDeadzone(qint16 x, qint16 y, int percent);
@@ -132,4 +177,7 @@ private:
     int m_vibrationIntensity = 100;
     qint64 m_lastControllerMetadataAt = 0;
     qint64 m_lastGamepadSnapshotAt = 0;
+    quint64 m_nextIncarnation = 1;
 };
+
+Q_DECLARE_METATYPE(ControllerInput::SonySnapshot)

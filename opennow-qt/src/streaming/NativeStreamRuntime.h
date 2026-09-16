@@ -1,6 +1,7 @@
 #pragma once
 
 #include "opennow_streamer_ffi.h"
+#include "input/SdlDeviceClaim.h"
 
 #include <QByteArray>
 #include <QJsonObject>
@@ -53,6 +54,10 @@ public:
                                                              std::uint32_t);
         using SetCaptureActive = OpenNowStreamerStatus (*)(const OpenNowStreamer *, bool,
                                                             bool, std::uintptr_t, bool *);
+        using ReplaceSdlDeviceClaims = OpenNowStreamerStatus (*)(
+            const OpenNowStreamer *, const OpenNowSdlDeviceClaim *, std::size_t);
+        using SubmitSonySnapshot = OpenNowStreamerStatus (*)(
+            const OpenNowStreamer *, const OpenNowSonySnapshot *);
 
         Create create = nullptr;
         Send send = nullptr;
@@ -70,6 +75,8 @@ public:
         SubmitGamepad submitGamepad = nullptr;
         SubmitLocalAction submitLocalAction = nullptr;
         SetCaptureActive setCaptureActive = nullptr;
+        ReplaceSdlDeviceClaims replaceSdlDeviceClaims = nullptr;
+        SubmitSonySnapshot submitSonySnapshot = nullptr;
         SetLogFile setLogFile = nullptr;
         Send submitText = nullptr;
     };
@@ -138,6 +145,8 @@ public:
     OpenNowStreamerStatus setCaptureActive(bool active, bool relativeMouse,
                                            std::uintptr_t windowHandle,
                                            bool *rawInputActive);
+    OpenNowStreamerStatus replaceSdlDeviceClaims(const QList<SdlDeviceClaim> &claims);
+    OpenNowStreamerStatus submitSonySnapshot(const OpenNowSonySnapshot &snapshot);
 
 signals:
     void inputCaptureReset();
@@ -152,7 +161,8 @@ signals:
     void cursorCaptureChanged(bool composited);
     void cursorStateReset();
     void controllerRumbleRequested(quint8 controllerId, quint16 lowFrequency,
-                                   quint16 highFrequency, quint32 durationMs);
+                                   quint16 highFrequency, quint32 durationMs,
+                                   quint64 sourceIncarnation);
     void controllerRumbleStopped();
     void callbacksDropped(int count);
 
