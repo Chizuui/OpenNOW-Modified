@@ -37,9 +37,17 @@ if native {
 
 `codec: "auto"` on native requests H.264 on purpose so CloudMatch cannot pick AV1 or HEVC before local decode is known. Official Auto is wire `0` and this machine still selected HEVC.
 
-Desktop AUTO FPS writes `0`. Core clamps fps to 30–240 with fallback 60, so AUTO is 60.
+Desktop AUTO FPS writes `0`. Core resolves the request through `frame_rate::request_frame_rate`: a missing `fps` defaults to 60 and any present value clamps to the 30–360 request range, so the stored AUTO `0` clamps to 30. Resolution then caps that at 360 for 1920x1080 and 1920x1200 and 240 elsewhere, and rates above 240 additionally need an entitlement at least that high plus a confirmed hardware decoder for the selected codec, otherwise they fall back to the entitlement capped at 240, or to 240 when no entitlement is reported.
 
 `OPENNOW_NATIVE_VIDEO_BACKEND` comes from `nativeVideoBackend` and `decoderPreference`. Auto prefers D3D12 for H.264 and H.265 when the probe succeeds. AV1 auto stays on D3D11 because D3D11-on-12 would flush every frame.
+
+`saveBandwidth` selects the NVIDIA `dynamicStreamingMode` policy requested at `session.create`. The official shared settings schema defines `0` off/do-not-adjust, `1` prefer-FPS, `2` prefer-resolution, and `3` on, and the official client passes the selected profile value into the streaming start request. OpenNOW exposes the bandwidth-saving half of that policy as one toggle and requests `1` (prefer-FPS) when it is on, matching the official Data Saver, Balanced, and Competitive profiles. Off requests `0`, so the request is unchanged.
+
+The request is remembered per session, not per preference. `negotiatedStreamProfile.dynamicStreamingMode` is resolved from the session's own feature bag (finalized overrides the requested echo, out-of-range falls back to unreported), and NVST ANNOUNCE reads only that. RESUME omits requested streaming features by design, so a resumed session keeps the policy it was created with, and toggling the setting mid-session cannot change the wire policy of the running session.
+
+At the streamer, ANNOUNCE sends `x-nv-vqos[0].dynamicStreamingMode` with that policy and `x-nv-vqos[0].dfc.adjustResAndFps` as the binary enable that follows it (`1` whenever the policy is non-zero). `x-nv-vqos[0].drc.enable` and the `resControl` attributes keep their existing values: `drc` is the separate bitrate axis, and the `resControl` attributes are not emitted by OpenNOW at all, so omitting them inherits the streamer default rather than overriding it.
+
+Midstream adaptation is handled locally: the decoder reports a format change, the Linux session adopts the new format and emits `BackendEvent::FormatChanged`, and `LinuxFrameProducer::ensure_slot` reallocates the Vulkan output image and framebuffer for the new dimensions.
 
 Official persist on this machine (`sharedstorage.json` `customProfile`):
 

@@ -198,6 +198,16 @@ Column {
             }
         }
         DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "drop"; title: qsTr("Save bandwidth")
+            description: qsTr("Lets the server trade resolution and image quality for a steadier frame rate when your connection cannot sustain the selected profile. Off requests no dynamic adjustment. Applies to new sessions.")
+            DesktopSettingsToggle {
+                objectName: "saveBandwidthToggle"
+                checked: page.settingsScreen.boolSetting("saveBandwidth", false)
+                Accessible.name: qsTr("Save bandwidth")
+                onValueChangedByUser: value => page.settingsScreen.setSetting("saveBandwidth", value)
+            }
+        }
+        DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "bolt"; title: qsTr("Reflex low latency")
             description: qsTr("When the game supports it"); showDivider: false
             DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("enableCloudGsync",false); onValueChangedByUser: value => page.settingsScreen.setSetting("enableCloudGsync",value) }

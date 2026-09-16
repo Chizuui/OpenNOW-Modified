@@ -1368,7 +1368,7 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     features["hidDevices"] = Value::Null;
     features["qosPolicy"] = json!(0);
     features["touchSupport"] = json!(false);
-    features["dynamicStreamingMode"] = json!(0);
+    features["dynamicStreamingMode"] = json!(dynamic_streaming_mode(settings));
     json!({"sessionRequestData":{
         "appId":app_id.parse::<i64>().unwrap_or_default(),
         "externalAppId":null,
@@ -1691,6 +1691,8 @@ fn negotiated_profile(monitor: &Value, features: &Value) -> Value {
         _ => None,
     });
     let color = profile_color(&json!(bit_depth), &json!(chroma));
+    let dynamic_streaming_mode =
+        value_i64(&features["dynamicStreamingMode"]).filter(|value| (0..=3).contains(value));
     json!({
         "resolution":resolution,
         "fps":value_i64(&monitor["framesPerSecond"]),
@@ -1700,6 +1702,7 @@ fn negotiated_profile(monitor: &Value, features: &Value) -> Value {
         "chromaFormat":chroma,
         "bitDepthSource":if features.get("bitDepth").is_some() { "request" } else { "unreported" },
         "chromaFormatSource":if features.get("chromaFormat").is_some() { "request" } else { "unreported" },
+        "dynamicStreamingMode":dynamic_streaming_mode,
         "enableL4S":features["enabledL4S"],
         "enableCloudGsync":features["cloudGsync"],
         "enableReflex":features["reflex"]
@@ -2260,6 +2263,10 @@ fn setting_i64(settings: &Value, key: &str, fallback: i64) -> i64 {
 
 fn setting_bool(settings: &Value, key: &str, fallback: bool) -> bool {
     settings[key].as_bool().unwrap_or(fallback)
+}
+
+fn dynamic_streaming_mode(settings: &Value) -> u8 {
+    u8::from(setting_bool(settings, "saveBandwidth", false))
 }
 
 fn resolved_cloud_gsync(settings: &Value) -> bool {
@@ -4293,6 +4300,58 @@ mod tests {
         assert_eq!(features["codec"], 3);
         assert_eq!(features["bitDepth"], 1);
         assert_eq!(features["chromaFormat"], 0);
+    }
+
+    #[test]
+    fn bandwidth_saving_requests_the_prefer_fps_dynamic_quality_policy() {
+        for (saved, mode) in [(None, 0), (Some(false), 0), (Some(true), 1)] {
+            let mut settings = json!({
+                "resolution":"1920x1080",
+                "fps":60,
+                "maxBitrateMbps":75
+            });
+            if let Some(saved) = saved {
+                settings["saveBandwidth"] = json!(saved);
+            }
+            let body = build_create_body(
+                "12345",
+                &json!({"title":"Portal 2"}),
+                &settings,
+                "device-id",
+            );
+            assert_eq!(
+                body["sessionRequestData"]["requestedStreamingFeatures"]["dynamicStreamingMode"],
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn negotiated_profile_carries_the_session_dynamic_quality_policy() {
+        let base = trusted_cloudmatch_base(DEFAULT_STREAMING_BASE).unwrap();
+        let parse = |session| {
+            session_info(&json!({"session":session}), &base, "", "123", "device").unwrap()
+        };
+        for (echoed, finalized, mode) in [
+            (None, None, Value::Null),
+            (Some(1), None, json!(1)),
+            (Some(1), Some(0), json!(0)),
+            (None, Some(3), json!(3)),
+            (Some(7), None, Value::Null),
+        ] {
+            let mut session = json!({"sessionId":"seat","status":2});
+            if let Some(echoed) = echoed {
+                session["sessionRequestData"]["requestedStreamingFeatures"]["dynamicStreamingMode"] =
+                    json!(echoed);
+            }
+            if let Some(finalized) = finalized {
+                session["finalizedStreamingFeatures"]["dynamicStreamingMode"] = json!(finalized);
+            }
+            assert_eq!(
+                parse(session)["negotiatedStreamProfile"]["dynamicStreamingMode"],
+                mode
+            );
+        }
     }
 
     #[test]

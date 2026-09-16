@@ -2769,7 +2769,11 @@ mod tests {
                     "session": {
                         "sessionId": "session-one",
                         "status": 2,
-                        "signalingUrl": "wss://server.nvidiagrid.net/nvst/"
+                        "signalingUrl": "wss://server.nvidiagrid.net/nvst/",
+                        "negotiatedStreamProfile": {
+                            "codec": "H264",
+                            "dynamicStreamingMode": 1
+                        }
                     }
                 }),
                 &json!({
@@ -2786,6 +2790,10 @@ mod tests {
         assert_eq!(prepared["context"]["settings"]["codec"], "H264");
         assert_eq!(prepared["context"]["settings"]["transportMode"], "nvst");
         assert_eq!(prepared["context"]["settings"]["maxBitrateMbps"], 200);
+        assert_eq!(
+            prepared["context"]["session"]["negotiatedStreamProfile"]["dynamicStreamingMode"],
+            1
+        );
         assert_eq!(prepared["context"]["surface"], Value::Null);
         assert!(service.worker.lock().expect("streamer worker").is_none());
     }
