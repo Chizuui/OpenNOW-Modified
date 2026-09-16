@@ -40,6 +40,44 @@ Recorded store-subscription IDs must match the account's active subscriptions.
 App playability, variant readiness, patch metadata, and membership restrictions
 remain independent checks. Unknown metadata is not a positive authorization.
 
+`catalog.launch.store.inspect({store?})` resolves the platform-client apps for the
+current streaming region with a `PLATFORM_CLIENT` type filter and returns
+`{store, appId, variantId, game, scope, decision, catalogRevision, fetchedAt,
+freshness}`. The resolved `appId`, `variantId`, and `game` are the values the
+platform-client query returned for this account. `store` defaults to `STEAM`,
+the only supported store-client launch, and any other value is `invalid_params`.
+The eligible target is the first game exposing a variant whose exact `appStore`
+value matches the store and whose `id` is a bounded identifier; extra variants and
+extra platform-client apps are searched, not rejected.
+
+The store-launch decision reuses the shared decision vocabulary. It requires the
+exact parent identity and variant identity, the exact store on the resolved
+variant, a present `gfn.status` of `AVAILABLE`, and any patching or maintenance
+metadata the server returns. It then requires the persistent-storage entitlement:
+the subscription `addons` entry whose `type` is `STORAGE` and whose `subType` is
+`PERMANENT_STORAGE` and whose `status` is `OK`, which the core publishes as
+`subscription.storageAddon`. An ephemeral storage add-on, including
+`EPHEMERAL_STORAGE`, does not authorize a store launch. Store-account linking
+requirements, recorded store subscriptions, membership tier, and
+`isGamePlayAllowed` apply from the same account metadata the ordinary launch path
+uses.
+
+A platform client that the ordinary catalog resolution also returns is judged by
+that resolution's metadata, so catalog `playabilityState` and patch state are
+enforced there. When the ordinary resolution does not return the app, the store
+query's own `gfn.status` is the readiness field, because that query selects no
+catalog playability. When the ordinary resolution returns the app but not the
+discovered variant, the two sources disagree and the decision is
+`metadata_unconfirmed` rather than a guess.
+
+`catalog.launch.inspect` and `session.create` accept `storeLaunch: true`, a
+boolean that selects the platform-client resolution source and the
+persistent-storage requirement. The flag grants nothing: the same mutation
+admission, scope, catalog revision, active-seat, and exact-variant checks run, and
+a store intent that names a target the platform-client resolution does not return
+is not ready. Missing, non-boolean, or mismatched values do not fall back to
+another target.
+
 All five mutation RPCs require a bounded nonempty parent `appId` and the current
 `scope: {generation, userId, providerIdpId}`. Ownership mutations also require the
 exact `variantId`. `catalog.ownership.add` requires
@@ -318,6 +356,7 @@ and artwork only near the viewport, using the section's local category ID
 - `catalog.library.list` returns one bounded upstream page, not an aggregate library.
 - `catalog.game.get`, `catalog.definitions.get`, `catalog.languages.get`
 - `catalog.launch.inspect`, `catalog.favorites.list`
+- `catalog.launch.store.inspect` resolves the eligible Steam store-client launch target.
 - `catalog.favorites.add`, `catalog.favorites.remove`
 - `catalog.ownership.add`, `catalog.ownership.remove`, `catalog.ownership.select`
 - `catalog.store.list`, `catalog.store.local`, `catalog.store.presentation`
@@ -899,6 +938,101 @@ in [the machine-readable parity manifest](../native/opennow-core/contracts/legac
 validated against its [JSON schema](../native/opennow-core/contracts/legacy-open-now-api.schema.json)
 and executable golden-fixture tests. A method is not considered ported until its
 owner, wire shape, fixtures and replacement disposition are recorded there.
+
+### Push invalidation capability
+
+Protocol 5 advertises `account.pushInvalidation.v1` when the core ships the native
+push subscriber. The capability only describes the accelerator below; the shell
+must keep working when it is absent.
+
+The core may open a native FCM/PNS subscription for the signed-in account. The subscription is
+provider-scoped and bounded: it exists only while an account is signed in, and it is torn down or
+paused on sign-out, account switch, or shutdown.
+
+`push.json` in the data directory is an optional override, never required. When it is genuinely
+absent, the core uses a bundled default built from the vendor's public client identifiers (see
+provenance below). When it is present, it always wins: the core never falls back to the bundled
+default for an existing override. The override is either a single object or an array of objects,
+each with `providerIdpId`, `projectId`, `apiKey`, `senderId`, `appId`, `firebaseAppId`, optional
+`vapidKey`, `pnsServer`, optional `pnsVersion`, and `pnsClientId`, plus an optional `enabled`
+boolean. The entry whose `providerIdpId` matches the signed-in provider is the only one used. A
+present override suppresses the default when it disables push (`"enabled": false`, whole-file or
+per entry), is unreadable, malformed, or larger than 64 KiB, or carries no complete entry for the
+signed-in provider. The override file is read-only deployment input: the core never writes it,
+never logs it, never returns it from `settings.get`, and never stores it in the user settings
+schema.
+
+The bundled default contains only public client identifiers: a Firebase web API key, app,
+project, and sender identifiers, the VAPID public key, and the PNS client id and server. It
+carries no credentials and the core never writes it to the data directory. Per-account and
+per-device secrets — the ECE key pair, the auth secret, and the GCM/FCM tokens — are generated
+locally and stay in the OS credential store, and the PNS bearer token is the user's own sign-in
+token. The default is bound to the authenticated provider and generation snapshot by the same
+owner guards as an override, so it is re-evaluated on account and provider changes. Whether the
+PNS backend accepts registrations for providers other than the vendor's own is unverified; the
+bundled default mirrors the vendor client's authenticated-account gate and does not claim
+guaranteed acceptance.
+
+The bundled default derives from the vendor's public client configuration asset
+(`shared/assets/config/config.json` inside the official package, SHA256
+8e7db09026e5b48b0eabb364395c726543fcab9778b3561529fcb6a96208db65; official package archive
+SHA256 47ddbe0425b9ab560f64fa42a0052794c9de335ded0fd59637f082dd7a161ad4), mapping
+`firebase.pns` to the Firebase identity and `pnsServerConfig` to the PNS endpoint. A subscription
+delivers invalidation hints only. Each hint is emitted as an ordinary event envelope:
+
+```json
+{"type":"event","name":"account.push.changed","payload":{"generation":7,"kind":"library","changedIds":["app-id"]}}
+```
+
+`kind` is one of `library`, `favorites`, `subscription`, `linked-account`, or
+`platform-sync`. `generation` is the GFN state generation the hint belongs to;
+a shell drops hints whose generation does not match its current account
+generation. `changedIds` is bounded and advisory.
+
+Hints never assert a result. `platform-sync` carries the store's reported
+`platformCode`, `syncState`, `syncDate`, and `syncGameCount` and only makes the
+shell observe the existing sync earlier; completion still requires a fresh
+`syncDate` with `syncState` `SYNC_SUCCESS` from
+`account.connections.sync.status`. A hint that arrives while its account is no
+longer current is discarded, and a subscription never serves another account's
+registration.
+
+Push registration state is per account and stored in the OS credential store. No token, key,
+or message body is written to settings, diagnostics, or logs. The subscriber
+uses only deadline-bounded network operations, and a configuration change,
+sign-out, or account switch retires the current subscription before another one
+starts. Every registration stage is guarded between requests, so a retired scope
+or shutdown stops the remaining stages after at most one in-flight request
+deadline.
+
+A refused MCS login (a non-zero `LoginResponse.error.code`) is a session failure, not a
+credential verdict: it triggers one bounded registration refresh that keeps the stored device
+identity and replaces only the registration keys and tokens. A `LoginResponse` that carries a
+zero error code is accepted as a successful login. The device identity is replaced only when the
+check-in authority rejects it with HTTP 400 or 401.
+
+Every received frame counts toward the `last_stream_id_received` the session advertises. The
+session acknowledges incoming heartbeat pings, answers an immediate-ack data message or every
+ten unacknowledged persistent messages with an IQ stream acknowledgement (`extension id` 13),
+and honours the heartbeat interval the server negotiates through `LoginResponse.heartbeat_config`
+within bounded limits. A heartbeat that stays unanswered past the acknowledgement deadline, or a
+login request without a response within its deadline, ends the session so the owner reconnects
+with the stored registration rather than holding a half-open connection.
+
+Encrypted bodies are selected the way the maintained client selects them: a declared
+`content-encoding` of `aes128gcm` uses the RFC 8291 body header (salt, record size, key id),
+`aesgcm` uses the legacy `Crypto-Key`/`Encryption` headers, any other declared value is
+rejected, and an absent declaration falls back to the legacy headers when both are present and
+to the RFC 8291 body otherwise. This follows Chromium's
+`components/gcm_driver/crypto/gcm_encryption_provider.cc`, where `content-encoding` is the
+`kContentEncodingProperty` discriminator and the legacy path is keyed on the presence of both
+`Encryption` and `Crypto-Key`. No ciphertext shape is guessed: an unsupported declaration is an
+error, not a heuristic.
+
+Live delivery remains unverified. The subscriber ships complete in code with the bundled default
+and is covered by fixtures, but no live Google check-in, c2dm, FIS, FCM, PNS, or end-to-end
+encrypted delivery has been exercised, and hardware and account-backed validation are out of
+scope for the fixture path.
 
 ### Catalog page and metadata capabilities
 

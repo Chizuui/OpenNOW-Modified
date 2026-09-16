@@ -16,6 +16,7 @@ mod media;
 mod network;
 mod persistent_storage;
 mod proxy;
+mod push_registry;
 mod requests;
 mod server_vpc_cache;
 mod settings;
@@ -49,11 +50,12 @@ struct AppCore {
     session_update_gate: Mutex<()>,
     artwork: artwork_cache::ArtworkCache,
     settings: Mutex<SettingsStore>,
-    gfn: GfnService,
+    gfn: Arc<GfnService>,
     streamer: StreamerService,
     diagnostics: diagnostics::DiagnosticsService,
     media: media::MediaService,
     updater: updater::UpdaterService,
+    push: Mutex<push_registry::PushRegistry>,
     community: community::CommunityService,
     thanks: thanks::ThanksService,
     discord: discord::DiscordService,
@@ -92,13 +94,19 @@ fn run() -> Result<(), String> {
             }
         })
         .map_err(|error| error.to_string())?;
+    let gfn = Arc::new(GfnService::new(data_dir.clone())?);
+    let push = Mutex::new(push_registry::PushRegistry::new(
+        Arc::clone(&gfn),
+        output_tx.clone(),
+        data_dir.clone(),
+    ));
     let core = Arc::new(AppCore {
         session_update_gate: Mutex::new(()),
         artwork: artwork_cache::ArtworkCache::new(&data_dir, output_tx.clone()),
         settings: Mutex::new(
             SettingsStore::load(Some(data_dir.clone())).map_err(|error| error.to_string())?,
         ),
-        gfn: GfnService::new(data_dir.clone())?,
+        gfn,
         streamer: StreamerService::new(),
         diagnostics: diagnostics::DiagnosticsService::new(&data_dir)
             .map_err(|error| format!("Could not initialize diagnostics: {error}"))?,
@@ -106,6 +114,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("Could not initialize media library: {error}"))?,
         updater: updater::UpdaterService::new(&data_dir)
             .map_err(|error| format!("Could not initialize updater: {error}"))?,
+        push,
         community: community::CommunityService::new()
             .map_err(|error| format!("Could not initialize community services: {error}"))?,
         thanks: thanks::ThanksService::new()
@@ -114,6 +123,7 @@ fn run() -> Result<(), String> {
         telemetry: telemetry::TelemetryService::new()
             .map_err(|error| format!("Could not initialize reporting services: {error}"))?,
     });
+    reconcile_push(&core);
     let requests = Arc::new(requests::Requests::default());
     let stdin = io::stdin();
 
@@ -203,6 +213,17 @@ fn run() -> Result<(), String> {
                 }
                 let _ = worker_output.send(json!({"type":"event", "name":"updater.changed", "payload":worker_core.updater.state()}));
             }
+            if matches!(
+                method.as_str(),
+                "auth.device.complete"
+                    | "auth.logout"
+                    | "auth.accounts.logoutAll"
+                    | "auth.accounts.switch"
+                    | "auth.accounts.remove"
+                    | "settings.set"
+            ) {
+                reconcile_push(&worker_core);
+            }
             if !was_cancelled {
                 match result {
                     Ok((value, event)) => {
@@ -233,6 +254,14 @@ fn update_session_idle(session: &Value, streamer: &Value) -> bool {
             streamer["streamer"]["status"].as_str(),
             Some("stopped" | "error")
         )
+}
+
+fn reconcile_push(core: &AppCore) {
+    let _ = core
+        .push
+        .lock()
+        .expect("push registry poisoned")
+        .reconcile();
 }
 
 fn unix_time_millis() -> u128 {
@@ -346,7 +375,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 ));
             }
             Ok((
-                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v7", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
+                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "account.pushInvalidation.v1", "catalog.languages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v7", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
                 None,
             ))
         }
@@ -528,6 +557,13 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
                 .catalog_launch_inspect(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.launch.store.inspect" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .store_launch_inspect(params, None, &settings)
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
@@ -884,7 +920,11 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(|error| ("acceptance_export_failed".to_owned(), error.to_string()))
         }
-        "media.root.get" => Ok((core.media.root(), None)),
+        "media.root.get" => core
+            .media
+            .root()
+            .map(|value| (value, None))
+            .map_err(|message| ("media_unavailable".to_owned(), message)),
         "media.recording.target" => core
             .media
             .recording_target(params)

@@ -467,6 +467,7 @@ pub struct EncodedFrame {
     pub clock_rate_hz: u32,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,6 +669,32 @@ impl CapturedInputQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeStageTimings {
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTimingsReport {
+    pub call: Option<DecodeStageTimings>,
+    pub residence: Option<DecodeStageTimings>,
+    pub call_window_samples: usize,
+    pub residence_window_samples: usize,
+    pub submissions_total: u64,
+    pub outputs_total: u64,
+    pub output_calls_total: u64,
+    pub last_submission_at: Option<Instant>,
+    pub last_output_at: Option<Instant>,
+    pub in_flight: usize,
+    pub oldest_in_flight_at: Option<Instant>,
+    pub epoch: u64,
+    pub epoch_started_at: Option<Instant>,
+    pub unmatched_outputs: u64,
+    pub unmatched_submissions: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFeedback {
     VideoFrameAccepted {
@@ -696,6 +723,15 @@ pub enum MediaFeedback {
         codec: &'static str,
         message: String,
     },
+    AudioDecoderError {
+        message: String,
+        consecutive: u32,
+    },
+    AudioUnavailable {
+        backend: &'static str,
+        reason: String,
+        rejected: u64,
+    },
     QueueDropped {
         media: &'static str,
         count: usize,
@@ -708,6 +744,7 @@ pub enum MediaFeedback {
         recovered: bool,
         message: Option<String>,
     },
+    DecodeTimings(DecodeTimingsReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2903,6 +2940,9 @@ fn run_linux_video(shared: Arc<SharedPipeline>, host_commands: Sender<HostComman
                 }
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(reason) => trigger_linux_fallback(
                 &shared,
                 &host_commands,
@@ -2961,6 +3001,9 @@ fn run_embedded_linux_video(shared: Arc<SharedPipeline>) {
                 request_linux_keyframe(&shared, "embedded Linux decoder queue overflow");
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: shared.linux_codec.label(),
@@ -2981,9 +3024,27 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
         let MediaCodec::Opus { .. } = frame.codec else {
             continue;
         };
+        let Some(ssrc) = frame.ssrc else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries no sender source identifier"
+                    .to_owned(),
+            });
+            continue;
+        };
+        let Ok(rtp_timestamp) = u32::try_from(frame.timestamp) else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries an out-of-range RTP timestamp"
+                    .to_owned(),
+            });
+            continue;
+        };
         let packet = match opennow_streamer_platform_linux::AudioPacket::new(
             Arc::clone(&frame.data),
-            media_timestamp_us(frame.timestamp, frame.clock_rate_hz),
+            rtp_timestamp,
+            frame.clock_rate_hz,
+            ssrc,
         ) {
             Ok(packet) => packet,
             Err(error) => {
@@ -3013,7 +3074,8 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
                 });
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Queued)
-            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused)
+            | Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {}
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "opus",
@@ -3034,9 +3096,11 @@ fn run_embedded_linux_monitor(
     use std::time::Duration;
 
     let mut playback_started = false;
+    let mut last_decode_timings_report = Instant::now();
     let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
-        let (frames, events) = {
+        let report_decode_timings = last_decode_timings_report.elapsed() >= Duration::from_secs(1);
+        let (frames, events, decode_timings) = {
             let session = shared
                 .linux_session
                 .lock()
@@ -3052,8 +3116,40 @@ fn run_embedded_linux_monitor(
             while let Some(event) = session.try_recv_event() {
                 events.push(event);
             }
-            (decoded, events)
+            let decode_timings = report_decode_timings.then(|| session.decode_timings());
+            (decoded, events, decode_timings)
         };
+        if let Some(timings) = decode_timings {
+            last_decode_timings_report = Instant::now();
+            if timings.has_observable_state() {
+                let stage = |stage: opennow_streamer_platform_linux::DecodeStagePercentiles| {
+                    DecodeStageTimings {
+                        p50_us: stage.p50_us,
+                        p95_us: stage.p95_us,
+                        max_us: stage.max_us,
+                    }
+                };
+                let _ = shared
+                    .feedback
+                    .send(MediaFeedback::DecodeTimings(DecodeTimingsReport {
+                        call: timings.call.map(stage),
+                        residence: timings.residence.map(stage),
+                        call_window_samples: timings.call_window_samples,
+                        residence_window_samples: timings.residence_window_samples,
+                        submissions_total: timings.submissions_total,
+                        outputs_total: timings.outputs_total,
+                        output_calls_total: timings.output_calls_total,
+                        last_submission_at: timings.last_submission_at,
+                        last_output_at: timings.last_output_at,
+                        in_flight: timings.in_flight,
+                        oldest_in_flight_at: timings.oldest_in_flight_at,
+                        epoch: timings.epoch,
+                        epoch_started_at: timings.epoch_started_at,
+                        unmatched_outputs: timings.unmatched_outputs,
+                        unmatched_submissions: timings.unmatched_submissions,
+                    }));
+            }
+        }
         if !shared.paused.load(Ordering::Acquire) {
             for decoded in frames {
                 let Some(lease) = publisher.context() else {
@@ -3132,6 +3228,34 @@ fn run_embedded_linux_monitor(
                     shared.audio.close();
                     stop_linux_session(&shared);
                     return;
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
                 }
                 opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
                     report_linux_color_format_change(&shared, &mut reported_color, format);
@@ -3228,6 +3352,34 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                     &host_commands,
                     "Linux hardware media session failed".to_owned(),
                 ),
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
                 opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
                     report_linux_color_format_change(&shared, &mut reported_color, format);
                 }
@@ -3336,6 +3488,46 @@ const fn linux_embedded_backend_label(
         }
         _ => "Linux decoder/embedded Vulkan",
     }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_audio_backend_name(
+    backend: opennow_streamer_platform_linux::AudioBackend,
+) -> &'static str {
+    match backend {
+        opennow_streamer_platform_linux::AudioBackend::PipeWire => "PipeWire",
+        opennow_streamer_platform_linux::AudioBackend::Alsa => "ALSA",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_loss(
+    shared: &SharedPipeline,
+    backend: opennow_streamer_platform_linux::AudioBackend,
+    message: String,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(backend),
+        recovered: false,
+        message: Some(message),
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_recovery(
+    shared: &SharedPipeline,
+    from: opennow_streamer_platform_linux::AudioBackend,
+    to: opennow_streamer_platform_linux::AudioBackend,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(from),
+        recovered: true,
+        message: Some(format!(
+            "{} accepted audio output after the {} sink failed",
+            linux_audio_backend_name(to),
+            linux_audio_backend_name(from)
+        )),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -4253,6 +4445,83 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn device_lost_feedback(
+        receiver: &Receiver<MediaFeedback>,
+    ) -> (&'static str, bool, Option<String>) {
+        match receiver
+            .try_recv()
+            .expect("a device state feedback for every audio output event")
+        {
+            MediaFeedback::DeviceLost {
+                subsystem,
+                recovered,
+                message,
+            } => (subsystem, recovered, message),
+            other => panic!("expected a device state feedback, saw {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_feedback_pairs_loss_and_recovery_without_touching_video() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::PipeWire, "Broken pipe".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::PipeWire, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        assert_eq!(loss.0, "PipeWire");
+        assert!(!loss.1);
+        assert_eq!(loss.2.as_deref(), Some("Broken pipe"));
+
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(
+            recovery.0, "PipeWire",
+            "recovery must clear the audio subsystem that lost output"
+        );
+        assert!(recovery.1);
+        assert!(
+            recovery
+                .2
+                .as_deref()
+                .is_some_and(|message| message.contains("ALSA") && message.contains("PipeWire")),
+            "recovery must name the sink that accepted output, saw {:?}",
+            recovery.2
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "one loss and one recovery only"
+        );
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.video_desynced.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_recovery_pairs_a_backend_that_recovered_itself() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::Alsa, "Device lost".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::Alsa, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(loss, ("ALSA", false, Some("Device lost".to_owned())));
+        assert_eq!(
+            recovery.0, loss.0,
+            "a backend that accepted output again clears its own loss"
+        );
+        assert!(recovery.1);
+        assert!(receiver.try_recv().is_err());
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn embedded_playback_starts_only_once_after_a_successful_record() {
@@ -4501,6 +4770,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         recording.publish(&frame);
         replay.publish(&frame);
@@ -4555,6 +4825,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         for _ in 0..=RECORDING_TAP_QUEUE_CAPACITY {
             tap.publish(&frame);
@@ -4727,6 +4998,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("decoded pending frame");
@@ -4767,6 +5039,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("recovered IDR");
@@ -4812,6 +5085,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         assert!(shared.video_desynced.load(Ordering::Acquire));
@@ -4899,6 +5173,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Paused
         );
@@ -4913,6 +5188,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Closed
         );
@@ -4950,6 +5226,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::DroppedOldest
         );
