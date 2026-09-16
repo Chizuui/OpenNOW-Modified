@@ -1825,4 +1825,95 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[ignore = "requires the FFmpeg CLI with libx264; run under --features linux-ffmpeg-bundled"]
+    fn ffmpeg_software_decoder_reports_a_midstream_resolution_change() {
+        let encode = |width: u32, height: u32| {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc=size={width}x{height}:rate=30"),
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-tune",
+                    "zerolatency",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "h264",
+                    "pipe:1",
+                ])
+                .output()
+                .expect("FFmpeg CLI must start");
+            assert!(
+                output.status.success(),
+                "sample encode failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty());
+            output.stdout
+        };
+
+        initialize_ffmpeg().unwrap();
+        let initial = encode(256, 144);
+        let resized = encode(320, 180);
+        let mut decoder = FfmpegDecoder::open(
+            VideoCodec::H264,
+            StreamFormat::video_default(256, 144).unwrap(),
+            FfmpegMode::Software,
+        )
+        .unwrap();
+
+        let mut observed = Vec::new();
+        let mut changes = Vec::new();
+        for (payload, timestamp) in [(initial, 1_u64), (resized, 2)] {
+            let packet = EncodedVideoFrame::new(payload, timestamp, true).unwrap();
+            observed.extend(
+                decoder
+                    .decode(&packet)
+                    .unwrap()
+                    .into_iter()
+                    .map(|frame| (frame.format.width, frame.format.height)),
+            );
+            changes.extend(
+                decoder
+                    .take_format_change()
+                    .map(|format| (format.width, format.height)),
+            );
+        }
+        observed.extend(
+            decoder
+                .flush()
+                .unwrap()
+                .into_iter()
+                .map(|frame| (frame.format.width, frame.format.height)),
+        );
+        changes.extend(
+            decoder
+                .take_format_change()
+                .map(|format| (format.width, format.height)),
+        );
+
+        assert!(
+            observed.contains(&(256, 144)),
+            "the first packet must decode at its own size: {observed:?}"
+        );
+        assert!(
+            observed.contains(&(320, 180)),
+            "the resized packet must decode at the new size: {observed:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![(320, 180)],
+            "the decoder must report exactly the resized format as a change"
+        );
+    }
 }

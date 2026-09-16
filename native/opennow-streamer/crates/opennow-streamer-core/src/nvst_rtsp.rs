@@ -840,6 +840,8 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         0
     };
     let (bit_depth, chroma_format) = negotiated_color_format(context, &codec);
+    let dynamic_streaming_mode = negotiated_dynamic_streaming_mode(context);
+    let adjust_res_and_fps = negotiated_adjustment_enabled(dynamic_streaming_mode);
     let mut lines = vec![
         "v=0".to_owned(),
         "o=unknown 0 14 IN IPv4 127.0.0.1".to_owned(),
@@ -892,13 +894,13 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-vqos[0].bllFec.enable:0".to_owned(),
         "a=x-nv-vqos[0].grc.enable:7".to_owned(),
         "a=x-nv-vqos[0].drc.enable:0".to_owned(),
-        "a=x-nv-vqos[0].dfc.adjustResAndFps:0".to_owned(),
+        format!("a=x-nv-vqos[0].dfc.adjustResAndFps:{adjust_res_and_fps}"),
         "a=x-nv-vqos[0].calculateAvgVideoStreamingBitrate:1".to_owned(),
         format!("a=x-nv-vqos[0].bw.maximumBitrateKbps:{bitrate}"),
         "a=x-nv-vqos[0].bw.minimumBitrateKbps:1000".to_owned(),
         "a=x-nv-vqos[0].drc.bitrateIirFilterFactor:128".to_owned(),
         "a=x-nv-vqos[0].resControl.bitrateIirFilterFactor:128".to_owned(),
-        "a=x-nv-vqos[0].dynamicStreamingMode:0".to_owned(),
+        format!("a=x-nv-vqos[0].dynamicStreamingMode:{dynamic_streaming_mode}"),
         "a=x-nv-packetPacing.version:3".to_owned(),
         "a=x-nv-packetPacing.mode:1".to_owned(),
         "a=x-nv-packetPacing.numGroups:5".to_owned(),
@@ -1054,6 +1056,22 @@ fn negotiated_codec(context: &SessionContext) -> String {
         .or_else(|| context.settings.get("codec").and_then(Value::as_str))
         .unwrap_or("H264")
         .to_ascii_uppercase()
+}
+
+fn negotiated_dynamic_streaming_mode(context: &SessionContext) -> u8 {
+    context
+        .session
+        .extra
+        .get("negotiatedStreamProfile")
+        .and_then(|profile| profile.get("dynamicStreamingMode"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= 3)
+        .unwrap_or(0)
+}
+
+fn negotiated_adjustment_enabled(policy: u8) -> u8 {
+    u8::from(policy != 0)
 }
 
 fn advertised_srtp_profile<'a>(response: &'a RtspResponse, sdp: &'a str) -> Option<&'a str> {
@@ -1653,6 +1671,43 @@ mod tests {
                 None,
                 "{measured}"
             );
+        }
+    }
+
+    #[test]
+    fn announce_uses_the_negotiated_dynamic_quality_policy_not_the_saved_preference() {
+        for (profile, policy, adjust) in [
+            (None, 0, 0),
+            (Some(1), 1, 1),
+            (Some(2), 2, 1),
+            (Some(3), 3, 1),
+            (Some(7), 0, 0),
+        ] {
+            let mut value = context();
+            value.settings["saveBandwidth"] = json!(true);
+            if let Some(profile) = profile {
+                value.session.extra["negotiatedStreamProfile"]["dynamicStreamingMode"] =
+                    json!(profile);
+            }
+            let sdp = build_announce(
+                &value,
+                AnnounceParams {
+                    key: &"01".repeat(32),
+                    key_id: 7,
+                    port: 49006,
+                    address: "192.0.2.10",
+                    ufrag: "abcd",
+                    password: "abcdefghijklmnopqrstuv",
+                    fingerprint: "AA:BB",
+                    video_port: 5004,
+                    video_packet_size: 1280,
+                    rtcp_on_sctp: true,
+                    microphone_available: false,
+                },
+            );
+            assert!(sdp.contains(&format!("a=x-nv-vqos[0].dynamicStreamingMode:{policy}\r\n")));
+            assert!(sdp.contains(&format!("a=x-nv-vqos[0].dfc.adjustResAndFps:{adjust}\r\n")));
+            assert!(sdp.contains("a=x-nv-vqos[0].drc.enable:0\r\n"));
         }
     }
 

@@ -236,6 +236,7 @@ int AcceptanceSession::startSmokeWorkload()
                      || m_arguments.contains(u"--smoke-collections"_s)
                      || m_arguments.contains(u"--smoke-steam-big-picture"_s)
                      || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
+                     || m_arguments.contains(u"--smoke-save-bandwidth"_s)
                      || m_arguments.contains(u"--smoke-store-launch"_s)
                      || m_arguments.contains(u"--smoke-network-test"_s)
                      || m_arguments.contains(u"--smoke-idle-mode"_s)
@@ -270,6 +271,8 @@ int AcceptanceSession::startSmokeWorkload()
             ? u"qrc:/acceptance/SteamBigPictureAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
             ? u"qrc:/acceptance/PersistentInGameSettingsAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-save-bandwidth"_s)
+            ? u"qrc:/acceptance/SaveBandwidthAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-store-launch"_s)
             ? u"qrc:/acceptance/StoreLaunchAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-network-test"_s)
@@ -300,6 +303,7 @@ int AcceptanceSession::startSmokeWorkload()
             || m_arguments.contains(u"--smoke-collections"_s)
             || m_arguments.contains(u"--smoke-steam-big-picture"_s)
             || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
+            || m_arguments.contains(u"--smoke-save-bandwidth"_s)
             || m_arguments.contains(u"--smoke-store-launch"_s)
             || m_arguments.contains(u"--smoke-network-test"_s)) {
             auto *client = fixture->property("client").value<QObject *>();

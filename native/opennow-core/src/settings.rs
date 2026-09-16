@@ -893,7 +893,7 @@ fn defaults() -> Map<String, Value> {
         "onboardingCompleted":false,
         "resolution":"1920x1080", "aspectRatio":"16:9", "posterSizeScale":1.05,
         "fps":60, "frameGeneration":"off", "upscaling":"off", "upscalingSharpness":10, "upscalingDenoise":0,
-        "maxBitrateMbps":75, "recordingBitrateMbps":null,
+        "maxBitrateMbps":75, "saveBandwidth":false, "recordingBitrateMbps":null,
         "recordingResolution":"720p", "recordingFps":30, "streamClientMode":"native",
         "replayBufferEnabled":false, "replayBufferSeconds":30, "replayBufferMemoryMiB":256,
         "nativeVideoBackend":"auto", "nativeStreamerExecutablePath":"", "audioOutputDevice":"",
@@ -2175,9 +2175,22 @@ mod tests {
             store.set("reducedMotion", json!(true)).unwrap(),
             json!(true)
         );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!("yes")).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
         let loaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(loaded.all()["fps"], json!(240));
         assert_eq!(loaded.all()["maxBitrateMbps"], json!(200));
+        assert_eq!(loaded.all()["saveBandwidth"], json!(true));
         assert_eq!(loaded.all()["launchInConsoleMode"], json!(false));
         assert_eq!(loaded.all()["reducedMotion"], json!(true));
         assert!(store.set("notASetting", json!(true)).is_err());
