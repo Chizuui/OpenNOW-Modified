@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 
-from nightly_release import expected_packages
+from nightly_release import BASE_VERSION, BUILD_METADATA, expected_packages, validate_nightly_base
 
 
 def decode_key(value):
@@ -126,18 +127,46 @@ def sign(source, destination, version, commit, public_key, private_seed):
         staged.rename(destination)
 
 
+def published_stable_version(pages):
+    if type(pages) is not list or not pages:
+        raise ValueError("Expected pages of published releases")
+    versions = set()
+    for page in pages:
+        if type(page) is not list:
+            raise ValueError("Expected pages of published releases")
+        for release in page:
+            if (type(release) is not dict or type(release.get("tag_name")) is not str
+                    or type(release.get("draft")) is not bool
+                    or type(release.get("prerelease")) is not bool):
+                raise ValueError("Unexpected release metadata")
+            match = re.fullmatch(r"v?" + BASE_VERSION + BUILD_METADATA, release["tag_name"])
+            if match and not (release["draft"] or release["prerelease"]):
+                versions.add(tuple(int(value) for value in match.groups()))
+    return ".".join(map(str, max(versions))) if versions else None
+
+
+def release_guard(version, releases):
+    validate_nightly_base(version, published_stable_version(json.loads(releases.read_text())))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("preflight", "sign", "verify"))
+    parser.add_argument("command", choices=("preflight", "release-guard", "sign", "verify"))
     parser.add_argument("--source", type=Path)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--commit")
+    parser.add_argument("--releases", type=Path)
     args = parser.parse_args()
     public_key = os.environ.get("OPENNOW_UPDATE_PUBLIC_KEY", "")
     if args.command == "preflight":
         if public_key or os.environ.get("PUBLISH_NIGHTLY") == "true":
             decode_key(public_key)
+        return
+    if args.command == "release-guard":
+        if not args.version or not args.releases:
+            parser.error("release-guard requires --version and --releases")
+        release_guard(args.version, args.releases)
         return
     if not args.source or not args.version or not args.commit:
         parser.error("sign and verify require --source, --version, and --commit")

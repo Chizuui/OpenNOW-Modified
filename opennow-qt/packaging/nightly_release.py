@@ -6,6 +6,28 @@ import re
 import shutil
 
 
+BASE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+BUILD_METADATA = r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+RUN_IDENTITY = r"\.[1-9][0-9]*\.[1-9][0-9]*"
+NIGHTLY_VERSION = BASE_VERSION + "-nightly" + RUN_IDENTITY
+
+
+def version_base(version):
+    match = re.fullmatch(BASE_VERSION + r"(?:-[0-9A-Za-z.-]+)?" + BUILD_METADATA, version.removeprefix("v"))
+    if not match:
+        raise ValueError(f"Invalid version: {version}")
+    return tuple(int(value) for value in match.group(1, 2, 3))
+
+
+def validate_nightly_base(version, stable=None):
+    if not re.fullmatch(NIGHTLY_VERSION, version):
+        raise ValueError(f"Invalid nightly version: {version}")
+    base = version_base(version)
+    if stable is not None and version_base(stable) >= base:
+        raise ValueError(f"Nightly version {version} must be newer than the published stable {stable}")
+    return base
+
+
 def nightly_version(cmake_file, run, attempt, channel="nightly"):
     if channel not in ("nightly", "supporter", "stable"):
         raise ValueError("Invalid unsigned build channel")
@@ -18,8 +40,8 @@ def nightly_version(cmake_file, run, attempt, channel="nightly"):
 def expected_packages(version, commit, channel="nightly"):
     if channel not in ("nightly", "supporter", "stable"):
         raise ValueError("Invalid unsigned build channel")
-    suffix = "" if channel == "stable" else "-" + channel + r"\.[1-9][0-9]*\.[1-9][0-9]*"
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" + suffix, version):
+    suffix = "" if channel == "stable" else "-" + channel + RUN_IDENTITY
+    if not re.fullmatch(BASE_VERSION + suffix, version):
         raise ValueError(f"Invalid {channel} version")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Expected an immutable source commit")
