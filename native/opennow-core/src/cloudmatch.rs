@@ -1306,7 +1306,7 @@ fn monitor_display_data(hdr: bool, settings: &Value) -> Value {
 
 fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: &str) -> Value {
     let (width, height) = parse_resolution(&setting_string(settings, "resolution", "1920x1080"));
-    let fps = setting_i64(settings, "fps", 60).clamp(30, 240);
+    let fps = crate::frame_rate::request_frame_rate(settings, params, width, height);
     let bitrate = setting_i64(settings, "maxBitrateMbps", 75).clamp(1, 200) * 1000;
     let codec = codec_wire(&setting_string(settings, "codec", "auto"));
     let hdr = setting_bool(settings, "enableHdr", false)
@@ -4188,6 +4188,74 @@ mod tests {
         assert_eq!(features["dynamicStreamingMode"], 0);
         assert_eq!(features["audioChannelCount"], 2);
         assert_eq!(features["vsync"], false);
+    }
+
+    #[test]
+    fn session_create_requests_the_documented_frame_rate_ceiling() {
+        let hardware = json!({"protocolVersion":7, "videoBackends":[{"backend":"vaapi",
+            "available":true, "codecs":[{"codec":"h265", "available":true,
+                "colorQualities":["8bit_420"]}]}]});
+        let software = json!({"protocolVersion":7, "videoBackends":[{"backend":"software",
+            "available":true, "codecs":[{"codec":"h265", "available":true,
+                "colorQualities":["8bit_420"]}]}]});
+        let request = |resolution: &str, fps: i64, capabilities: &Value, entitled: i64| {
+            let body = build_create_body(
+                "12345",
+                &json!({"title":"Portal 2", "runtimeCapabilities":capabilities,
+                    "maxEntitledFps":entitled}),
+                &json!({"resolution":resolution, "fps":fps, "codec":"h265"}),
+                "device-id",
+            );
+            body["sessionRequestData"]["clientRequestMonitorSettings"][0]["framesPerSecond"].clone()
+        };
+        assert_eq!(request("1920x1080", 360, &hardware, 360), json!(360));
+        assert_eq!(request("1920x1200", 360, &hardware, 360), json!(360));
+        for resolution in [
+            "2560x1440",
+            "2560x1600",
+            "3440x1440",
+            "3840x2160",
+            "3840x1080",
+        ] {
+            assert_eq!(
+                request(resolution, 360, &hardware, 360),
+                json!(240),
+                "{resolution} must not request the full-HD-only tier"
+            );
+            assert_eq!(request(resolution, 240, &hardware, 360), json!(240));
+        }
+        assert_eq!(request("1920x1080", 999, &hardware, 360), json!(360));
+        assert_eq!(request("1920x1080", 1, &hardware, 360), json!(30));
+        assert_eq!(
+            request("1920x1080", 360, &software, 360),
+            json!(240),
+            "a software-only decode path cannot request the top tier"
+        );
+        assert_eq!(
+            request("1920x1080", 360, &json!({}), 360),
+            json!(240),
+            "an unreported capability probe is not affirmative support"
+        );
+        assert_eq!(
+            request("1920x1080", 360, &hardware, 0),
+            json!(240),
+            "unconfirmed entitlement cannot request the top tier"
+        );
+        assert_eq!(
+            request("1920x1080", 360, &hardware, 240),
+            json!(240),
+            "a 240 FPS entitlement cannot request the top tier"
+        );
+        assert_eq!(
+            request("1920x1080", 360, &hardware, 120),
+            json!(120),
+            "a lower entitlement bounds the request"
+        );
+        assert_eq!(
+            request("1920x1080", 240, &software, 0),
+            json!(240),
+            "base rates stay unaffected by the capability verdict"
+        );
     }
 
     #[test]

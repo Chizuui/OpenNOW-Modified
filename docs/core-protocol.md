@@ -562,6 +562,19 @@ attempts; only a presented first frame resets this budget. Ending the session ca
 recovery. A native stop stalled for 30 seconds reports an error without launching
 another transport over the still-owned resources.
 
+For the embedded Qt client, `session.create` also accepts an optional numeric `maxEntitledFps`:
+the highest frame rate the signed-in membership entitles at the requested resolution, or `0`
+or absent when that is not confirmed. Qt derives it from the normalized `entitledResolutions`
+entries it already displays; the core never invents it. The requested frame rate is bounded by
+the documented resolution ceiling (1920x1080 and 1920x1200 top out at 360 FPS, every other
+resolution at 240 FPS) and, above 240 FPS, by both a hardware decoder for the selected codec
+confirmed in `runtimeCapabilities` and an entitlement limit that covers the requested rate.
+An absent or software-only capability probe and an absent or lower entitlement limit both bound
+the request to the unconditional 240 FPS ceiling, so the saved preference cannot request the
+conditional tier without affirmative evidence. This is a necessary condition, not a throughput
+qualification: the client does not measure decoder throughput, and CloudMatch remains the
+authority on the finalized profile.
+
 For the embedded Qt client, `session.create` and `streamer.prepare` accept an optional
 `runtimeCapabilities` object copied from the in-process streamer's protocol-7 `hello` response.
 The core filters its available `videoBackends` by the persisted `nativeVideoBackend` preference
@@ -1160,6 +1173,14 @@ Restored strings remain visible, but a shared request resolver replaces corrupt
 game or keyboard values with the existing respective defaults before create,
 immediate resume, or claim requests. The interface locale never enters these
 query parameters.
+
+`settings.choices.get({runtimeCapabilities})` also returns `frameRates` for the documented
+frame-rate tiers, using the same `value`, `disabled`, and nullable `reason` descriptor shape.
+The conditional top tier reports a reason for each unconfirmed condition: a resolution outside
+full HD, an unreported capability probe, or a reported probe without a hardware decoder for the
+selected codec. Missing or unreported capabilities never imply support, and only rates at or
+below 240 FPS are unconditional. The entitlement limit stays a Qt-side decision because the
+core holds no subscription data.
 
 `settings.choices.get({runtimeCapabilities})` returns `colorQualities` for the current
 persisted settings and embedded streamer capability snapshot. Each of the four

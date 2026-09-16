@@ -10,6 +10,7 @@ mod credential_vault;
 mod device_identity;
 mod diagnostics;
 mod discord;
+mod frame_rate;
 mod gfn;
 mod language;
 mod media;
@@ -402,6 +403,8 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             let settings = core.settings.lock().expect("settings poisoned").all();
             Ok((
                 json!({"colorQualities":streamer::StreamerService::color_quality_choices(
+                &settings, &params["runtimeCapabilities"]),
+                "frameRates":frame_rate::frame_rate_choices(
                 &settings, &params["runtimeCapabilities"])}),
                 None,
             ))

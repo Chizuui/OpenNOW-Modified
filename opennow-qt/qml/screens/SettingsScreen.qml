@@ -211,14 +211,11 @@ FocusScope {
     }
 
     function fpsChoices() {
-        // Full canonical list; unentitled rates are locked via
-        // fpsLockedValues() instead of hidden, so members can see what a
-        // higher tier unlocks. Falls back to everything enabled offline.
         return ShellStore.canonicalFpsValues()
     }
 
     function fpsLockedValues() {
-        return ShellStore.unentitledFpsValues(String(ShellStore.settings.resolution || ""))
+        return ShellStore.lockedFpsValues(String(ShellStore.settings.resolution || ""))
     }
 
     function fpsNote() {
@@ -232,8 +229,13 @@ FocusScope {
             : qsTr("Membership")
         if (entitled.length === 0)
             return qsTr("Only rates your membership entitles are selectable")
-        return qsTr("Only rates your membership entitles are selectable · %1 up to %2 FPS")
-            .arg(tier).arg(entitled[entitled.length - 1])
+        const resolution = String(ShellStore.settings.resolution || "")
+        const selectable = ShellStore.selectableFpsValues(resolution)
+        const top = selectable.length ? selectable[selectable.length - 1] : entitled[entitled.length - 1]
+        const note = qsTr("Only rates your membership entitles are selectable · %1 up to %2 FPS")
+            .arg(tier).arg(top)
+        const reason = ShellStore.lockedFpsReason()
+        return top < entitled[entitled.length - 1] && reason !== "" ? note + " · " + reason : note
     }
 
     function captureShortcut(event) {

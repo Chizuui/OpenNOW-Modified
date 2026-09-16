@@ -55,6 +55,7 @@ QtObject {
         subscription: root.subscription
         scopeGeneration: root.authGeneration
         settingsActive: String(AppController.route).indexOf("settings") === 0
+        capabilitiesActive: String(AppController.route).indexOf("settings") === 0 || root.onboardingRequired
         nativeHdrOutputSupported: HdrOutput.supported
         providerIdpId: root.authSession && root.authSession.provider ? String(root.authSession.provider.idpId || "") : ""
         providerCode: root.authSession && root.authSession.provider ? String(root.authSession.provider.code || "") : ""
@@ -557,7 +558,10 @@ QtObject {
                 root.streamState = "requesting"
                 root.pendingRequestedColorQuality = String(root.settings.colorQuality || "8bit_420")
                 root.streamCreateRequestId = CoreClient.request("session.create",
-                    Object.assign({}, root.pendingLaunchParams, {runtimeCapabilities: root.nativeRuntimeCapabilities}), 60000)
+                    Object.assign({}, root.pendingLaunchParams, {
+                        runtimeCapabilities: root.nativeRuntimeCapabilities,
+                        maxEntitledFps: settingsOwner.maxEntitledFps(String(root.settings.resolution || ""))
+                    }), 60000)
             }
         }
         function onRequestFailed(id, code, message) {
@@ -1080,6 +1084,26 @@ QtObject {
 
     function unentitledFpsValues(resolution) {
         return settingsOwner.unentitledFpsValues(resolution)
+    }
+
+    function lockedFpsValues(resolution) {
+        return settingsOwner.lockedFpsValues(resolution)
+    }
+
+    function selectableFpsValues(resolution) {
+        return settingsOwner.selectableFpsValues(resolution)
+    }
+
+    function frameRateReason(value) {
+        return settingsOwner.frameRateReason(value)
+    }
+
+    function maxEntitledFps(resolution) {
+        return settingsOwner.maxEntitledFps(resolution)
+    }
+
+    function lockedFpsReason() {
+        return settingsOwner.lockedFpsReason()
     }
 
     function resolveEntitledFps(resolution, requested) {

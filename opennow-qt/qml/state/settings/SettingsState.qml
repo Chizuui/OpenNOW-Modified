@@ -40,6 +40,7 @@ QtObject {
     property double scopeGeneration: 0
     property bool nativeHdrOutputSupported: false
     property bool settingsActive: false
+    property bool capabilitiesActive: false
     property var keyboardLayouts: []
     property var languageResult: ({})
     property string languageState: "idle"
@@ -47,13 +48,14 @@ QtObject {
     property string languageRequestId: ""
     property var colorDescriptors: []
     property string colorRequestId: ""
+    property var frameRateDescriptors: []
     property string cancellingRequestId: ""
     property var settingWrites: ({})
     readonly property string languageContext: JSON.stringify([ready, scopeGeneration,
         providerIdpId, settings.sessionProxyEnabled, settings.sessionProxyUrl])
     readonly property string colorContext: JSON.stringify([ready, nativeRuntimeReady,
         nativeRuntimeCapabilities, nativeHdrOutputSupported, settings.codec, settings.nativeVideoBackend,
-        settings.decoderPreference, settings.enableHdr])
+        settings.decoderPreference, settings.enableHdr, settings.resolution])
     readonly property string gameLanguageDescription: qsTr("Requested when the game supports it; some games require an in-game change. Applies to the next session.")
     readonly property string keyboardLayoutDescription: qsTr("Physical key mapping requested from GeForce NOW. Applies to the next session.")
     readonly property string interfaceLanguageDescription: qsTr("OpenNOW interface only. Community translated through Crowdin.")
@@ -126,16 +128,15 @@ QtObject {
         cancelOwnedRequest(request)
         if (settingsActive && ready) Qt.callLater(root.ensureGameLanguages)
     }
-    onSettingsActiveChanged: if (settingsActive) {
-        ensureGameLanguages()
-        colorRefresh.restart()
-    }
+    onSettingsActiveChanged: if (settingsActive) ensureGameLanguages()
+    onCapabilitiesActiveChanged: if (capabilitiesActive) colorRefresh.restart()
     onColorContextChanged: {
         const request = colorRequestId
         colorRequestId = ""
         colorDescriptors = []
+        frameRateDescriptors = []
         cancelOwnedRequest(request)
-        if (settingsActive) colorRefresh.restart()
+        if (capabilitiesActive) colorRefresh.restart()
     }
     property Timer languageDeadline: Timer {
         interval: 15000
@@ -150,7 +151,7 @@ QtObject {
     property Timer colorRefresh: Timer {
         interval: 0
         onTriggered: {
-            if (!root.ready || !root.nativeRuntimeReady || !root.settingsActive || root.colorRequestId !== "") return
+            if (!root.ready || !root.nativeRuntimeReady || !root.capabilitiesActive || root.colorRequestId !== "") return
             root.colorRequestId = root.coreClient.request("settings.choices.get", {runtimeCapabilities:root.nativeRuntimeCapabilities}, 15000)
         }
     }
@@ -221,6 +222,8 @@ QtObject {
         if (id !== "" && id === colorRequestId) {
             colorRequestId = ""
             colorDescriptors = result.colorQualities || []
+            frameRateDescriptors = result.frameRates || []
+            clampFpsToEntitlement()
             return true
         }
         return finishSettingWrite(id, result, "")
@@ -238,6 +241,7 @@ QtObject {
         if (id !== "" && id === colorRequestId) {
             colorRequestId = ""
             colorDescriptors = []
+            frameRateDescriptors = []
             return true
         }
         return finishSettingWrite(id, null, message)
@@ -318,19 +322,45 @@ QtObject {
         return result
     }
 
-    // Canonical frame rates offered by GeForce NOW clients. The Rust core
-    // clamps fps to 30–240, so 360 (an Electron-legacy preset) is excluded.
     function canonicalFpsValues() {
-        return [30, 60, 90, 120, 144, 165, 240]
+        return [30, 60, 90, 120, 144, 165, 240, 360]
     }
 
-    // Official catalog rates per resolution. 1080p rigs offer 240 FPS;
-    // other modes top out at 120 FPS. Exact MES tuples (e.g. 90 FPS) are
-    // preserved separately and never synthesized from a higher envelope.
     function presetFpsForResolution(width, height) {
         if (width === 1920 && (height === 1080 || height === 1200))
-            return [30, 60, 120, 240]
+            return [30, 60, 120, 240, 360]
         return [30, 60, 120]
+    }
+
+    readonly property var capabilityGatedFpsValues: [360]
+
+    function frameRateDescriptor(value) {
+        for (let index = 0; index < frameRateDescriptors.length; ++index) {
+            if (Number(frameRateDescriptors[index].value) === Number(value))
+                return frameRateDescriptors[index]
+        }
+        return null
+    }
+
+    function frameRateGated(value) {
+        return capabilityGatedFpsValues.indexOf(Number(value)) >= 0
+    }
+
+    function frameRateEligible(value) {
+        const descriptor = frameRateDescriptor(value)
+        if (descriptor !== null)
+            return descriptor.disabled !== true
+        return !frameRateGated(value)
+    }
+
+    function maxEntitledFps(resolution) {
+        const entitled = entitledFpsForResolution(resolution)
+        return entitled.length ? entitled[entitled.length - 1] : 0
+    }
+
+    function frameRateReason(value) {
+        const descriptor = frameRateDescriptor(value)
+        return descriptor && descriptor.disabled === true ? String(descriptor.reason || "") : ""
     }
 
     function isFpsCoveredByEntitlement(width, height, fps) {
@@ -390,25 +420,66 @@ QtObject {
         return locked
     }
 
-    // Clamp a requested fps to the nearest entitled rate at or below it,
-    // mirroring resolveEntitledStreamProfile. Returns the input when the
-    // subscription is unknown.
-    function resolveEntitledFps(resolution, requested) {
-        const entitled = entitledFpsForResolution(resolution)
-        if (entitled.length === 0)
-            return requested
-        const wanted = Math.trunc(Number(requested || 0))
-        if (wanted === 0 || entitled.indexOf(wanted) >= 0)
-            return wanted
-        for (let index = entitled.length - 1; index >= 0; --index) {
-            if (entitled[index] <= wanted)
-                return entitled[index]
-        }
-        return entitled[0]
+    function selectableFpsValues(resolution) {
+        const locked = lockedFpsValues(resolution)
+        return canonicalFpsValues().filter(value => locked.indexOf(value) < 0)
     }
 
-    // Persistently correct settings.fps when the resolution or subscription
-    // changed underneath it (e.g. tier downgrade). No-op while offline.
+    function knownLockedFpsValues(resolution) {
+        const locked = unentitledFpsValues(resolution)
+        const canonical = canonicalFpsValues()
+        for (let index = 0; index < canonical.length; ++index) {
+            const descriptor = frameRateDescriptor(canonical[index])
+            if (descriptor && descriptor.disabled === true && locked.indexOf(canonical[index]) < 0)
+                locked.push(canonical[index])
+        }
+        return locked
+    }
+
+    function lockedFpsValues(resolution) {
+        const locked = knownLockedFpsValues(resolution)
+        const canonical = canonicalFpsValues()
+        const entitled = entitledFpsForResolution(resolution)
+        for (let index = 0; index < canonical.length; ++index) {
+            const value = canonical[index]
+            const unconfirmed = frameRateGated(value)
+                && (entitled.indexOf(value) < 0 || !frameRateEligible(value))
+            if (unconfirmed && locked.indexOf(value) < 0)
+                locked.push(value)
+        }
+        return locked
+    }
+
+    function lockedFpsReason() {
+        const canonical = canonicalFpsValues()
+        for (let index = 0; index < canonical.length; ++index) {
+            const reason = frameRateReason(canonical[index])
+            if (reason !== "")
+                return reason
+        }
+        const locked = lockedFpsValues(settings.resolution)
+        for (let index = 0; index < locked.length; ++index) {
+            if (frameRateGated(locked[index]))
+                return qsTr("Capability not confirmed")
+        }
+        return ""
+    }
+
+    function resolveEntitledFps(resolution, requested) {
+        const locked = knownLockedFpsValues(resolution)
+        const selectable = canonicalFpsValues().filter(value => locked.indexOf(value) < 0)
+        if (selectable.length === 0)
+            return requested
+        const wanted = Math.trunc(Number(requested || 0))
+        if (wanted === 0 || selectable.indexOf(wanted) >= 0)
+            return wanted
+        for (let index = selectable.length - 1; index >= 0; --index) {
+            if (selectable[index] <= wanted)
+                return selectable[index]
+        }
+        return selectable[0]
+    }
+
     function clampFpsToEntitlement() {
         const clamped = resolveEntitledFps(settings.resolution, settings.fps)
         if (Number(clamped) !== Number(settings.fps))

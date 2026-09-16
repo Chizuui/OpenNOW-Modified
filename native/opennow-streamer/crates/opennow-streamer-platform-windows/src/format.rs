@@ -107,9 +107,9 @@ impl VideoFormat {
             )));
         }
         let fps = self.frame_rate_numerator.get() as f64 / self.frame_rate_denominator.get() as f64;
-        if !(1.0..=240.0).contains(&fps) {
+        if !(1.0..=360.0).contains(&fps) {
             return Err(BackendError::InvalidConfig(
-                "video frame rate must be between 1 and 240 fps".to_owned(),
+                "video frame rate must be between 1 and 360 fps".to_owned(),
             ));
         }
         if self.average_bitrate == 0 {
@@ -545,6 +545,22 @@ mod tests {
         assert!(
             VideoFormat {
                 average_bitrate: 0,
+                ..video_format()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            VideoFormat {
+                frame_rate_numerator: NonZeroU32::new(360).unwrap(),
+                ..video_format()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            VideoFormat {
+                frame_rate_numerator: NonZeroU32::new(480).unwrap(),
                 ..video_format()
             }
             .validate()

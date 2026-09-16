@@ -68,10 +68,12 @@ Column {
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "speed"; title: qsTr("Frame rate"); description: page.settingsScreen.fpsEntitlementNote()
             DesktopSettingsSegmented {
+                objectName: "desktopFrameRateControl"
+                readonly property var canonical: ShellStore.canonicalFpsValues().map(value => String(value))
                 readonly property string current: Number(page.settingsScreen.valueSetting("fps",60)) === 0 ? "AUTO" : String(page.settingsScreen.valueSetting("fps",60))
-                options: ["60","90","120","144","240"].indexOf(current) >= 0 ? ["60","90","120","144","240"] : [current,"60","90","120","144","240"]
+                options: canonical.indexOf(current) >= 0 ? canonical : [current].concat(canonical)
                 optionWidth: 50; selectedIndex: options.indexOf(current)
-                disabledValues: page.settingsScreen.unentitledFpsValues(); disabledHint: page.settingsScreen.fpsLockedHint()
+                disabledValues: page.settingsScreen.lockedFpsValues(); disabledHint: page.settingsScreen.fpsLockedHint()
                 onSelected: (index,value) => page.settingsScreen.setSetting("fps",value === "AUTO" ? 0 : Number(value))
             }
         }

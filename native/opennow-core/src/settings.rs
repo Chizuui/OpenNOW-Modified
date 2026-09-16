@@ -416,7 +416,7 @@ impl SettingsStore {
             100,
             100,
         );
-        clamp_integer(&mut self.values, "fps", 30, 240, 60);
+        clamp_integer(&mut self.values, "fps", 30, 360, 60);
         clamp_integer(&mut self.values, "maxBitrateMbps", 1, 200, 75);
         clamp_integer(&mut self.values, "windowWidth", 960, 7680, 1400);
         clamp_integer(&mut self.values, "windowHeight", 540, 4320, 900);
@@ -2163,7 +2163,9 @@ mod tests {
         assert_eq!(preferences.all()["statsShowFps"], json!(false));
         assert_eq!(preferences.all()["statsShowRegion"], json!(false));
         assert_eq!(preferences.all()["statsOverlayScale"], json!(1.5));
-        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(240));
+        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(360)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(240)).unwrap(), json!(240));
         assert_eq!(store.set("maxBitrateMbps", json!(200)).unwrap(), json!(200));
         assert_eq!(
             store.set("launchInConsoleMode", json!(false)).unwrap(),
