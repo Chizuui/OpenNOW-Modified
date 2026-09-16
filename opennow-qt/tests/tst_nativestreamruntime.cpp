@@ -2,6 +2,7 @@
 #include "streaming/rendering/StreamFramePacer.h"
 
 #include <QElapsedTimer>
+#include <QCoreApplication>
 #include <QFile>
 #include <QScopeGuard>
 #include <QTemporaryDir>
@@ -11,6 +12,7 @@
 #include <QThread>
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -567,6 +569,133 @@ private slots:
         QTRY_VERIFY(runtime.presentationAllowed());
         QCOMPARE(errors.size(), 0);
         QVERIFY(runtime.lastError().isEmpty());
+        QVERIFY(runtime.shutdown());
+    }
+
+    void upstreamProgressTelemetryIsScopedToTheAcceptedSession()
+    {
+        static OpenNowStreamerConfig callbackConfig;
+        auto api = fakeApi();
+        api.create = [](const OpenNowStreamerConfig *config, OpenNowStreamer **output) {
+            callbackConfig = *config;
+            return fakeCreate(config, output);
+        };
+        NativeStreamRuntime runtime(api);
+        QVERIFY(runtime.start());
+        const auto start = [&](const QString &id) {
+            return runtime.send({{QStringLiteral("type"), QStringLiteral("start")},
+                                 {QStringLiteral("id"), id}});
+        };
+        const auto deliver = [](const QJsonObject &event) {
+            const auto bytes = QJsonDocument(event).toJson(QJsonDocument::Compact);
+            std::thread callback([bytes] {
+                callbackConfig.event_callback(
+                    reinterpret_cast<const std::uint8_t *>(bytes.constData()),
+                    static_cast<std::size_t>(bytes.size()), callbackConfig.user_data);
+            });
+            callback.join();
+        };
+        const auto telemetry = [](const QString &startId, bool transportStalled,
+                                  const QString &decodeStage, const QJsonValue &decodeTimings) {
+            QJsonObject event{{QStringLiteral("type"), QStringLiteral("telemetry")},
+                              {QStringLiteral("startId"), startId},
+                              {QStringLiteral("transportFrameProgressStalled"), transportStalled},
+                              {QStringLiteral("decodeProgressStage"), decodeStage}};
+            if (!decodeTimings.isUndefined())
+                event.insert(QStringLiteral("decodeTimings"), decodeTimings);
+            return event;
+        };
+        const auto sample = [&] {
+            const auto progress = runtime.upstreamProgress();
+            return std::pair{progress.hasDecodeTimings, progress.stalled};
+        };
+        const QJsonObject timings{{QStringLiteral("epoch"), 4},
+                                  {QStringLiteral("outputsTotal"), 512}};
+
+        deliver(telemetry(QStringLiteral("session-a"), true, QString(), timings));
+        QCOMPARE(sample(), (std::pair{false, false}));
+
+        QVERIFY(start(QStringLiteral("session-a")));
+        QTRY_VERIFY(runtime.presentationAllowed());
+        QCOMPARE(sample(), (std::pair{false, false}));
+
+        deliver(telemetry(QStringLiteral("session-a"), true, QStringLiteral("tracking"), timings));
+        QTRY_COMPARE(sample(), (std::pair{true, true}));
+        deliver(telemetry(QStringLiteral("session-a"), false, QStringLiteral("tracking"), timings));
+        QTRY_COMPARE(sample(), (std::pair{true, false}));
+        QCOMPARE(runtime.upstreamProgress().decodeEpoch, quint64(4));
+        QCOMPARE(runtime.upstreamProgress().decodedOutputsTotal, quint64(512));
+        deliver(telemetry(QStringLiteral("session-a"), false, QStringLiteral("keyframe-pending"),
+                          timings));
+        QTRY_COMPARE(sample(), (std::pair{true, true}));
+        deliver(telemetry(QStringLiteral("session-a"), false, QStringLiteral("recovery-required"),
+                          timings));
+        QTRY_COMPARE(sample(), (std::pair{true, true}));
+
+        deliver(telemetry(QStringLiteral("session-b"), false, QStringLiteral("tracking"), timings));
+        QCOMPARE(sample(), (std::pair{true, true}));
+        deliver(telemetry(QString(), false, QStringLiteral("tracking"), timings));
+        QCOMPARE(sample(), (std::pair{true, true}));
+        deliver(telemetry(QStringLiteral("session-a"), false, QStringLiteral("tracking"),
+                          QJsonObject{{QStringLiteral("epoch"), -1},
+                                      {QStringLiteral("outputsTotal"), 1.5}}));
+        QTRY_COMPARE(sample(), (std::pair{false, false}));
+
+        deliver(telemetry(QStringLiteral("session-a"), false, QStringLiteral("tracking"), timings));
+        QTRY_COMPARE(sample(), (std::pair{true, false}));
+
+        QVERIFY(start(QStringLiteral("session-b")));
+        QTRY_VERIFY(runtime.presentationAllowed());
+        QCOMPARE(sample(), (std::pair{false, false}));
+        deliver(telemetry(QStringLiteral("session-b"), false, QStringLiteral("tracking"), timings));
+        QTRY_COMPARE(sample(), (std::pair{true, false}));
+        QVERIFY(runtime.shutdown());
+    }
+
+    void upstreamProgressStaysCoherentUnderConcurrentTelemetry()
+    {
+        static OpenNowStreamerConfig callbackConfig;
+        auto api = fakeApi();
+        api.create = [](const OpenNowStreamerConfig *config, OpenNowStreamer **output) {
+            callbackConfig = *config;
+            return fakeCreate(config, output);
+        };
+        NativeStreamRuntime runtime(api);
+        QVERIFY(runtime.start());
+        QVERIFY(runtime.send({{QStringLiteral("type"), QStringLiteral("start")},
+                              {QStringLiteral("id"), QStringLiteral("session")}}));
+        QTRY_VERIFY(runtime.presentationAllowed());
+        const auto deliver = [](const QJsonObject &event) {
+            const auto bytes = QJsonDocument(event).toJson(QJsonDocument::Compact);
+            std::thread callback([bytes] {
+                callbackConfig.event_callback(
+                    reinterpret_cast<const std::uint8_t *>(bytes.constData()),
+                    static_cast<std::size_t>(bytes.size()), callbackConfig.user_data);
+            });
+            callback.join();
+        };
+
+        std::atomic<bool> stop{false};
+        std::atomic<bool> incoherent{false};
+        std::thread reader([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto progress = runtime.upstreamProgress();
+                if (progress.hasDecodeTimings
+                    && progress.decodeEpoch != progress.decodedOutputsTotal)
+                    incoherent.store(true, std::memory_order_relaxed);
+            }
+        });
+        for (int index = 1; index <= 300; ++index) {
+            deliver(QJsonObject{{QStringLiteral("type"), QStringLiteral("telemetry")},
+                                {QStringLiteral("startId"), QStringLiteral("session")},
+                                {QStringLiteral("decodeTimings"),
+                                 QJsonObject{{QStringLiteral("epoch"), index},
+                                             {QStringLiteral("outputsTotal"), index}}}});
+            QCoreApplication::processEvents();
+        }
+        stop.store(true, std::memory_order_relaxed);
+        reader.join();
+        QVERIFY(!incoherent.load());
         QVERIFY(runtime.shutdown());
     }
 

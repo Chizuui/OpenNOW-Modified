@@ -171,6 +171,10 @@ impl FrameStageTimingsAccumulator {
         self.epoch_started_at = Some(at);
     }
 
+    pub(crate) fn last_assembled_at(&self) -> Option<Instant> {
+        self.last_assembled_at
+    }
+
     pub(crate) fn snapshot(&self) -> FrameStageTimings {
         FrameStageTimings {
             delivery_to_admission: summarize(&self.delivery_to_admission_us),
