@@ -35,9 +35,25 @@ uses the existing shared send budget, and restores the attempt after admission
 failure. An unavailable channel does not trigger a fallback to another dialect.
 The private route does not depend on the RTCP channel being open.
 
-This change retains the 64-packet batch limit, 4 ms retry interval, three-attempt
-limit, 52 ms tracking timeout, and existing reference recovery. Receiver Reports,
-PLI, IDR, and the shared channel profile are unchanged.
+Mjolnir retries use the current RTT plus 4 ms. The total send-count cap, including
+the first request, is `clamp(floor(52 ms / RTT), 1, 3)`. A zero RTT uses the
+three-send cap and a 4 ms interval without division. The first request remains
+immediately eligible; the existing 4 ms control-loop tick can round retry times
+up but does not permit early retries.
+
+RTT comes from the existing feedback owner in the same priority order as the
+displayed ping: selected ICE pair, video STUN, then bundle STUN. Samples expire
+after five seconds. With no fresh sample, retry selection uses the inspected
+tracker's 30 ms starting value, which permits one send within the 52 ms budget.
+This is a fallback estimate, not a reported measurement. Each poll uses the
+current RTT without resetting attempt counts or the loss deadline.
+
+The 64-packet batch limit, 52 ms tracking timeout, and existing reference recovery
+are unchanged. Sent requests remain resolvable until expiry even after reaching
+their send cap. Bundle-only Generic NACK retains fixed 4 ms retries and a
+three-send cap. Receiver Reports, PLI, IDR, and the shared channel profile are
+unchanged. The official initial-delay and mode-dependent 52/68 ms wait policies
+are outside this implementation.
 
 OpenNOW's partial control channel is unordered with a 300 ms lifetime. The
 inspected official default is ordered with two SCTP retransmissions. Reusing the
@@ -62,6 +78,10 @@ Addresses below are ELF virtual addresses in that artifact:
   Logical channel 1 is not SCTP SID 1; OpenNOW's profile uses SID 6.
 - `0x284c62` initializes the video ordinal to zero. `0x2b6b14` stores it in
   the feedback owner, and `0x2b74e5` writes its low byte into payload byte 1.
+- `0x33e2b9` through `0x33e321` compare retry age against RTT plus extra wait.
+  `0x33dcd4` through `0x33de34` clamp the count using packet wait divided by
+  RTT, not RTT plus extra wait. Constants at `0xdb23c0` and `0xd69f80` are
+  the 4 ms extra wait and the tracker's initial 30 ms RTT respectively.
 
 The unit fixtures are authored from this format, not copied packet captures.
 `nvst_control` tests cover exact bytes and bounded round trips.
