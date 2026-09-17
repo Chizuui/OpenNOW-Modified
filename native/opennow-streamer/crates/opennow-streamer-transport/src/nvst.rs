@@ -78,10 +78,9 @@ const GFN_SRTCP_SALT_LABEL: u8 = 0x05;
 const SRTCP_ENCRYPTED_FLAG: u32 = 0x8000_0000;
 const RTCP_SENDER_SSRC: u32 = 0x4f4e_4f57; // "ONOW"
 const SRTCP_RR_INTERVAL: Duration = Duration::from_secs(1);
-// Poll at the official retry cadence so a 4 ms NACK retry is not silently rounded
-// up to the old 10 ms control-loop interval.
 const RTCP_RECOVERY_INTERVAL: Duration = Duration::from_millis(4);
 const NACK_RETRY_INTERVAL: Duration = Duration::from_millis(4);
+const DEFAULT_NACK_RTT: Duration = Duration::from_millis(30);
 const NACK_TRACKING_TIMEOUT: Duration = Duration::from_millis(52);
 const MAX_NACK_ATTEMPTS: u8 = 3;
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(250);
@@ -496,7 +495,6 @@ pub struct NvstFeedbackState {
     bundle_ping: Mutex<Option<(Instant, Duration)>>,
     /// Remains set through send attempts until assembly receives a fresh keyframe.
     keyframe_needed: AtomicBool,
-    /// Missing extended RTP sequence ranges awaiting RFC 4585 generic NACK.
     pending_nacks: Mutex<VecDeque<PendingNackRange>>,
     completed_frames: AtomicU32,
     completed_frame_bytes: AtomicU64,
@@ -562,6 +560,10 @@ impl NvstFeedbackState {
     }
 
     pub fn ping_ms(&self, now: Instant) -> Option<f64> {
+        self.ping(now).map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+    }
+
+    fn ping(&self, now: Instant) -> Option<Duration> {
         [&self.ice_ping, &self.video_ping, &self.bundle_ping]
             .into_iter()
             .find_map(|sample| {
@@ -571,7 +573,7 @@ impl NvstFeedbackState {
                     .filter(|(received, _)| {
                         now.saturating_duration_since(*received) < STREAM_PING_TIMEOUT
                     })
-                    .map(|(_, elapsed)| elapsed.as_secs_f64() * 1000.0)
+                    .map(|(_, elapsed)| elapsed)
             })
     }
 
@@ -905,7 +907,17 @@ impl NvstFeedbackState {
         (rtcp_open && self.stream_snapshot().is_some(), control_open)
     }
 
-    fn take_nack(&self, now: Instant) -> Option<(u64, u64)> {
+    fn take_nack(&self, now: Instant, retry_rtt: Option<Duration>) -> Option<(u64, u64)> {
+        let (retry_interval, max_attempts) =
+            retry_rtt.map_or((NACK_RETRY_INTERVAL, MAX_NACK_ATTEMPTS), |rtt| {
+                let attempts = if rtt.is_zero() {
+                    MAX_NACK_ATTEMPTS
+                } else {
+                    (NACK_TRACKING_TIMEOUT.as_nanos() / rtt.as_nanos())
+                        .clamp(1, u128::from(MAX_NACK_ATTEMPTS)) as u8
+                };
+                (rtt.saturating_add(NACK_RETRY_INTERVAL), attempts)
+            });
         let mut pending = self
             .pending_nacks
             .lock()
@@ -914,9 +926,9 @@ impl NvstFeedbackState {
             now.saturating_duration_since(range.requested_at) < NACK_TRACKING_TIMEOUT
         });
         let index = pending.iter().position(|range| {
-            range.attempts < MAX_NACK_ATTEMPTS
+            range.attempts < max_attempts
                 && range.last_sent_at.is_none_or(|last_sent| {
-                    now.saturating_duration_since(last_sent) >= NACK_RETRY_INTERVAL
+                    now.saturating_duration_since(last_sent) >= retry_interval
                 })
         })?;
         let mut range = pending.remove(index)?;
@@ -2474,7 +2486,8 @@ fn send_pending_nack(
     if rtc.channel(channel).is_none() {
         return;
     }
-    let Some((first, last)) = feedback.take_nack(now) else {
+    let retry_rtt = mjolnir.then(|| feedback.ping(now).unwrap_or(DEFAULT_NACK_RTT));
+    let Some((first, last)) = feedback.take_nack(now, retry_rtt) else {
         return;
     };
     let admitted = if mjolnir {
@@ -9268,7 +9281,7 @@ mod tests {
         assert_eq!(frame.frame_index, 9);
         assert!(frame.keyframe);
         assert_eq!(frame.bytes, [0, 0, 0, 1, 0x65, 0xaa, 0xbb]);
-        assert_eq!(feedback.take_nack(Instant::now()), None);
+        assert_eq!(feedback.take_nack(Instant::now(), None), None);
         assert_eq!(feedback.completed_frame_snapshot(), (1, 7, frame.timestamp));
         assert!(feedback.take_completed_frame().is_none());
         feedback.publish_accepted_frame(frame.frame_index, 7, Instant::now());
@@ -9898,8 +9911,8 @@ mod tests {
         for packet in &packets {
             let _ = receiver.process_datagram(peer(), packet, Instant::now());
         }
-        assert_eq!(feedback.take_nack(Instant::now()), Some((2, 2)));
-        assert_eq!(feedback.take_nack(Instant::now()), None);
+        assert_eq!(feedback.take_nack(Instant::now(), None), Some((2, 2)));
+        assert_eq!(feedback.take_nack(Instant::now(), None), None);
     }
 
     #[test]
@@ -10175,16 +10188,16 @@ mod tests {
         let now = Instant::now();
         feedback.request_nack(10, 100, now);
         feedback.resolve_nack(12);
-        assert_eq!(feedback.take_nack(now), Some((10, 11)));
-        assert_eq!(feedback.take_nack(now), Some((13, 76)));
-        assert_eq!(feedback.take_nack(now), Some((77, 100)));
-        assert_eq!(feedback.take_nack(now), None);
+        assert_eq!(feedback.take_nack(now, None), Some((10, 11)));
+        assert_eq!(feedback.take_nack(now, None), Some((13, 76)));
+        assert_eq!(feedback.take_nack(now, None), Some((77, 100)));
+        assert_eq!(feedback.take_nack(now, None), None);
 
         feedback.clear_nacks();
         feedback.request_nack(10, 100, now);
-        assert_eq!(feedback.take_nack(now), Some((10, 73)));
-        assert_eq!(feedback.take_nack(now), Some((74, 100)));
-        assert_eq!(feedback.take_nack(now), None);
+        assert_eq!(feedback.take_nack(now, None), Some((10, 73)));
+        assert_eq!(feedback.take_nack(now, None), Some((74, 100)));
+        assert_eq!(feedback.take_nack(now, None), None);
     }
 
     #[test]
@@ -10196,11 +10209,14 @@ mod tests {
 
         feedback.request_nack(42, 42, now);
 
-        assert_eq!(feedback.take_nack(now), Some((42, 42)));
+        assert_eq!(feedback.take_nack(now, None), Some((42, 42)));
         feedback.request_nack(42, 42, now + Duration::from_millis(1));
-        assert_eq!(feedback.take_nack(now + NACK_RETRY_INTERVAL / 2), None);
+        assert_eq!(
+            feedback.take_nack(now + NACK_RETRY_INTERVAL / 2, None),
+            None
+        );
         assert!(feedback.resolve_nack(42));
-        assert_eq!(feedback.take_nack(now + NACK_RETRY_INTERVAL), None);
+        assert_eq!(feedback.take_nack(now + NACK_RETRY_INTERVAL, None), None);
     }
 
     #[test]
@@ -10211,12 +10227,15 @@ mod tests {
 
         for attempt in 0..MAX_NACK_ATTEMPTS {
             assert_eq!(
-                feedback.take_nack(now + NACK_RETRY_INTERVAL * u32::from(attempt)),
+                feedback.take_nack(now + NACK_RETRY_INTERVAL * u32::from(attempt), None),
                 Some((7, 7))
             );
         }
-        assert_eq!(feedback.take_nack(now + NACK_RETRY_INTERVAL * 4), None);
-        assert_eq!(feedback.take_nack(now + NACK_TRACKING_TIMEOUT), None);
+        assert_eq!(
+            feedback.take_nack(now + NACK_RETRY_INTERVAL * 4, None),
+            None
+        );
+        assert_eq!(feedback.take_nack(now + NACK_TRACKING_TIMEOUT, None), None);
     }
 
     #[test]
