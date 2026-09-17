@@ -626,6 +626,82 @@ fn delayed_library_result_cannot_publish_after_account_replacement() {
 }
 
 #[test]
+fn dynamic_nvidia_queue_route_does_not_require_discovery() {
+    let (service, path) = service("http://127.0.0.1:1");
+    let session = auth_fixture("account-a");
+    let params = json!({"zone":"NP-NEW9-01","streamingBaseUrl":"https://np-new9-01.cloudmatchbeta.nvidiagrid.net/"});
+    let settings = json!({"region":"https://saved.nvidiagrid.net/"});
+    let (routed, effective) = service
+        .scoped_session_route(&params, &settings, &session)
+        .unwrap();
+    assert_eq!(routed, params);
+    assert_eq!(effective["region"], "");
+    assert_eq!(settings["region"], "https://saved.nvidiagrid.net/");
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn dynamic_queue_route_rejects_mismatched_urls_malformed_ids_and_alliance() {
+    let (url, worker) = mock_requests(
+        vec![(
+            200,
+            json!({"requestStatus":{"serverId":"fixture"},"metaData":[]}),
+        )],
+        |_, request| {
+            assert!(request.starts_with("GET /v2/serverInfo "));
+        },
+    );
+    let (service, path) = service(&url);
+    let mut session = auth_fixture("account-a");
+    for (zone, base) in [
+        (
+            "NP-NEW9-01",
+            "https://np-new9-02.cloudmatchbeta.nvidiagrid.net/",
+        ),
+        (
+            "NP-NEW9-01",
+            "https://np-new9-01.cloudmatchbeta.nvidiagrid.net.evil/",
+        ),
+        (
+            "NP-NEW9-01",
+            "https://user@np-new9-01.cloudmatchbeta.nvidiagrid.net/",
+        ),
+        (
+            "NP-NEW9-01",
+            "https://np-new9-01.cloudmatchbeta.nvidiagrid.net/path",
+        ),
+        (
+            "NP-NEW9-01",
+            "http://np-new9-01.cloudmatchbeta.nvidiagrid.net/",
+        ),
+        (
+            "NP-NEW9-01.evil",
+            "https://np-new9-01.evil.cloudmatchbeta.nvidiagrid.net/",
+        ),
+        (
+            "NPA-NEW9-01",
+            "https://npa-new9-01.cloudmatchbeta.nvidiagrid.net/",
+        ),
+    ] {
+        let (routed, _) = service
+            .scoped_session_route(
+                &json!({"zone":zone,"streamingBaseUrl":base}),
+                &json!({}),
+                &session,
+            )
+            .unwrap();
+        assert!(routed["streamingBaseUrl"].is_null(), "{base}");
+    }
+    session.provider.idp_id = "alliance".into();
+    session.provider.code = "ALLIANCE".into();
+    service.state.lock().unwrap().providers = vec![session.provider.clone()];
+    let (routed, _) = service.scoped_session_route(&json!({"zone":"NP-NEW9-01","streamingBaseUrl":"https://np-new9-01.cloudmatchbeta.nvidiagrid.net/"}), &json!({}), &session).unwrap();
+    assert!(routed["streamingBaseUrl"].is_null());
+    worker.join().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn region_overrides_require_current_provider_membership_and_preserve_saved_preferences() {
     let (url, worker) = mock_requests(
         vec![(

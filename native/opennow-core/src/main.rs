@@ -19,6 +19,7 @@ mod network_test;
 mod persistent_storage;
 mod proxy;
 mod push_registry;
+mod queue_servers;
 mod requests;
 mod server_vpc_cache;
 mod settings;
@@ -641,6 +642,9 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "network.regions.ping" => network::ping_regions(params)
             .map(|value| (value, None))
             .map_err(|message| ("region_ping_failed".to_owned(), message)),
+        "queue.servers.list" => queue_servers::list()
+            .map(|value| (value, None))
+            .map_err(gfn_error),
         "account.subscription.get" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn

@@ -193,6 +193,11 @@ FocusScope {
         onGameRequested: game => { ShellStore.selectedGame = game; ShellStore.launchSelectedGame(false) }
     }
 
+    DesktopQueueSelector {
+        selector: ShellStore.queueSelector
+        settingsStore: ShellStore
+    }
+
     Rectangle {
         anchors.top: parent.top
         layer.enabled: HdrOutput.chromeRequired && root.streamVisible

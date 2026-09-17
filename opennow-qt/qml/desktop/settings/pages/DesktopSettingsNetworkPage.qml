@@ -44,6 +44,18 @@ Column {
                 onClicked: ShellStore.pingRegions()
             }
         }
+        DesktopSettingsRow {
+            visible: ShellStore.queueSelectorFreeTier
+            width: parent.width; paperStyle: true; glyph: "globe"
+            title: qsTr("Free-tier queue selector")
+            description: qsTr("Compare queues and latency before launching a game")
+            showDivider: false
+            DesktopSettingsToggle {
+                objectName: "queueSelectorEnabled"
+                checked: !page.settingsScreen.boolSetting("hideQueueSelector", false)
+                onValueChangedByUser: value => page.settingsScreen.setSetting("hideQueueSelector", !value)
+            }
+        }
     }
     DesktopSettingsPanel {
         width: parent.width; paperStyle: true

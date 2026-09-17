@@ -353,6 +353,19 @@ Useful development switches are `--route <name>`, `--overlay <name>`,
 `--reduced-motion`, `--core <path>` and `--screenshot <png-path>`. The test suite
 opens every route and overlay with QML warnings treated as failures.
 
+The desktop free-tier queue selector compares PrintedWaste queue estimates with
+local TCP latency before a new NVIDIA launch. The choice is session-local; “Use
+default region” preserves the saved region. “Don't show again” persists the opt-out,
+which can be reversed under Settings → Network → Free-tier queue selector.
+Paid, unknown-tier, alliance, and console-mode launches do not show this dialog.
+
+Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'queueselector|qml-queue-selector'`
+for state, interaction, layout, attribution-link, and launch-routing coverage.
+`--smoke-test --desktop --route home --smoke-queue-selector --queue-selector-preview
+--screenshot <absolute-png-path>` captures public-safe sample queues in the real
+desktop shell. Add `--queue-selector-large`, `--smoke-light-theme`, or
+`--smoke-width 960 --smoke-height 540` to check scaling, appearance, and compact layout.
+
 Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'theme-tests|qml-theme-settings'`
 to check all built-in packs in both appearances, accent contrast, preview restoration,
 and the desktop Look controls at compact and desktop widths. The

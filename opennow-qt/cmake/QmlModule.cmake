@@ -249,6 +249,7 @@ qt_add_qml_module(opennow-qt
         qml/desktop/components/DesktopBackdrop.qml
         qml/desktop/components/DesktopButton.qml
         qml/desktop/components/DesktopGameModal.qml
+        qml/desktop/components/DesktopQueueSelector.qml
         qml/desktop/components/DesktopGlyph.qml
         qml/desktop/components/DesktopKeyHint.qml
         qml/desktop/components/DesktopPoster.qml
@@ -347,6 +348,7 @@ qt_add_qml_module(opennow-qt
         qml/state/ShellStore.qml
         qml/state/SessionSetupProgress.qml
         qml/state/account/AccountServicesState.qml
+        qml/state/account/QueueSelectorState.qml
         qml/state/catalog/ArtworkState.qml
         qml/state/catalog/CatalogState.qml
         qml/state/settings/SettingsState.qml
