@@ -25,6 +25,11 @@ does not send product requests before this succeeds. Version mismatches, a
 five-second handshake deadline, process exit and invalid data all transition the
 transport to `failed` with a credential-free diagnostic.
 
+The desktop queue selector requires the `queue.servers.v1` capability in this
+handshake. The Qt client and relocated package probes reject cores that omit it,
+including older protocol-5 binaries, before sending any product requests. This
+additive capability leaves the JSON envelope and native streaming ABI unchanged.
+
 ## Cloud library actions and launch decisions
 
 `catalog.launch.inspect({appId, variantId})` always resolves the exact parent and
