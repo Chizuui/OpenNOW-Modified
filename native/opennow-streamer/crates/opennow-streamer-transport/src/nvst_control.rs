@@ -4,6 +4,8 @@ pub(crate) const FRAME_ACK_CODE: u16 = 0x204;
 pub(crate) const FRAME_PACING_CODE: u16 = 0x203;
 pub(crate) const QOS_REPORT_CODE: u16 = 0x207;
 pub(crate) const IDR_REQUEST_CODE: u16 = 0x302;
+pub(crate) const NACK_V2_CODE: u16 = 0x317;
+pub(crate) const MAX_NACK_PACKET_COUNT: usize = 64;
 
 pub(crate) const FRAME_ACK_PAYLOAD_LEN: usize = 102;
 pub(crate) const FRAME_PACING_PAYLOAD_LEN: usize = 28;
@@ -31,6 +33,38 @@ impl NvstControlCommand {
         encoded.extend_from_slice(&self.payload);
         encoded
     }
+}
+
+pub(crate) fn nack_v2(stream_index: u8, missing: &[u16]) -> Option<NvstControlCommand> {
+    if missing.is_empty() || missing.len() > MAX_NACK_PACKET_COUNT {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(3 + missing.len() * 10);
+    payload.extend_from_slice(&[2, stream_index, 0]);
+    let mut base = missing[0];
+    let mut bitmap = 0_u64;
+    for &sequence in &missing[1..] {
+        let distance = sequence.wrapping_sub(base);
+        if distance == 0 {
+            continue;
+        }
+        if distance <= 64 {
+            bitmap |= 1_u64 << (distance - 1);
+        } else {
+            payload.extend_from_slice(&base.to_le_bytes());
+            payload.extend_from_slice(&bitmap.to_le_bytes());
+            payload[2] += 1;
+            base = sequence;
+            bitmap = 0;
+        }
+    }
+    payload.extend_from_slice(&base.to_le_bytes());
+    payload.extend_from_slice(&bitmap.to_le_bytes());
+    payload[2] += 1;
+    Some(NvstControlCommand {
+        code: NACK_V2_CODE,
+        payload,
+    })
 }
 
 pub(crate) fn frame_ack(
@@ -152,6 +186,82 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         assert_eq!(command.encoded(), [0x07, 0x02, 0x03, 0x00, 1, 2, 3]);
+    }
+
+    #[test]
+    fn nack_v2_encodes_the_implicit_base_without_a_bitmap_bit() {
+        let command = nack_v2(0, &[0x1234]).unwrap();
+        assert_eq!(command.code, NACK_V2_CODE);
+        assert_eq!(command.encoded(), hex("17030d0002000134120000000000000000"));
+    }
+
+    #[test]
+    fn nack_v2_uses_all_64_bitmap_bits_before_starting_another_record() {
+        let command = nack_v2(7, &[0x1234, 0x1235, 0x1274, 0x1275]).unwrap();
+        assert_eq!(
+            command.encoded(),
+            hex("170317000207023412010000000000008075120000000000000000")
+        );
+    }
+
+    #[test]
+    fn nack_v2_groups_across_sequence_wrap_without_requesting_the_holes() {
+        let command = nack_v2(0, &[65534, 65535, 0, 62, 63]).unwrap();
+        assert_eq!(
+            command.encoded(),
+            hex("17031700020002feff03000000000000803f000000000000000000")
+        );
+    }
+
+    #[test]
+    fn nack_v2_bounds_missing_packets_not_sequence_span_or_record_count() {
+        assert!(nack_v2(0, &[]).is_none());
+        assert!(nack_v2(0, &[0; MAX_NACK_PACKET_COUNT + 1]).is_none());
+        let contiguous: Vec<u16> = (0..64).collect();
+        assert_eq!(
+            nack_v2(0, &contiguous).unwrap().encoded(),
+            hex("17030d000200010000ffffffffffffff7f")
+        );
+        let sparse: Vec<u16> = (0..64).map(|index| index * 65).collect();
+        let command = nack_v2(0, &sparse).unwrap();
+        assert_eq!(command.payload.len(), 643);
+        assert_eq!(&command.encoded()[..7], &[0x17, 3, 0x83, 2, 2, 0, 64]);
+        for (record, sequence) in command.payload[3..].chunks_exact(10).zip(sparse) {
+            assert_eq!(&record[..2], &sequence.to_le_bytes());
+            assert_eq!(&record[2..], &[0; 8]);
+        }
+    }
+
+    #[test]
+    fn nack_v2_round_trip_preserves_only_requested_sequences() {
+        use std::collections::BTreeSet;
+
+        for base in [0_u16, 1, 32767, 65534, 65535] {
+            for step in [0_u16, 1, 2, 64, 65, 127, 4095, 65535] {
+                for count in 1..=MAX_NACK_PACKET_COUNT {
+                    let missing: Vec<u16> = (0..count)
+                        .map(|index| base.wrapping_add((index as u16).wrapping_mul(step)))
+                        .collect();
+                    let command = nack_v2(3, &missing).unwrap();
+                    assert_eq!(
+                        command.payload.len(),
+                        3 + usize::from(command.payload[2]) * 10
+                    );
+                    let mut decoded = BTreeSet::new();
+                    for record in command.payload[3..].chunks_exact(10) {
+                        let base = u16::from_le_bytes(record[..2].try_into().unwrap());
+                        let bitmap = u64::from_le_bytes(record[2..].try_into().unwrap());
+                        decoded.insert(base);
+                        for bit in 0..64 {
+                            if bitmap & (1_u64 << bit) != 0 {
+                                decoded.insert(base.wrapping_add(bit + 1));
+                            }
+                        }
+                    }
+                    assert_eq!(decoded, missing.into_iter().collect());
+                }
+            }
+        }
     }
 
     #[test]
