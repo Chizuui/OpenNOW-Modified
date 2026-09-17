@@ -915,7 +915,7 @@ fn defaults() -> Map<String, Value> {
         "muteWhenOutOfFocus":false, "backgroundStreamReminder":false,
         "showAntiAfkIndicator":true, "antiAfkReminderEveryMinutes":15,
         "antiAfkReminderDurationSeconds":5, "showStatsOnLaunch":false,
-        "statsOverlayPosition":"top-right", "hideServerSelector":false,
+        "statsOverlayPosition":"top-right", "hideServerSelector":false, "hideQueueSelector":false,
         "desktopUiScale":1.0, "statsOverlayScale":1.0, "statsOverlayOpacity":85,
         "themeAccentOverride":false,
         "statsShowFps":true, "statsShowRegion":true, "statsShowPing":true,
@@ -1221,6 +1221,21 @@ mod tests {
             );
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn queue_selector_preference_is_typed_persisted_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], false);
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], true);
+        for invalid in [json!("true"), json!(1), json!(null), json!([])] {
+            assert_eq!(store.set("hideQueueSelector", invalid).unwrap(), false);
+        }
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        assert_eq!(store.reset().unwrap()["hideQueueSelector"], false);
     }
 
     #[test]

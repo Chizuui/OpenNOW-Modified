@@ -52,6 +52,21 @@ if(BUILD_TESTING)
     qt_add_shaders(opennow-hdrcolor-tests "opennow-hdrchrome-test-shaders"
         BATCHABLE PREFIX "/opennow/shaders" BASE "shaders" FILES ${OPENNOW_CHROME_SHADERS})
     find_package(Qt6 6.8 REQUIRED COMPONENTS QuickTest)
+    qt_add_executable(opennow-queueselector-tests tests/tst_queueselector.cpp)
+    target_link_libraries(opennow-queueselector-tests PRIVATE Qt6::QuickTest Qt6::Quick)
+    target_compile_definitions(opennow-queueselector-tests PRIVATE
+        OPENNOW_QML_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml")
+    add_test(NAME opennow-queueselector-tests COMMAND opennow-queueselector-tests
+        -input "${CMAKE_CURRENT_SOURCE_DIR}/tests/queueselector")
+    set_tests_properties(opennow-queueselector-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+    qt_add_resources(opennow-qt "queue-selector-acceptance"
+        PREFIX "/acceptance" BASE tests FILES tests/QueueSelectorAcceptance.qml)
+    add_test(NAME qml-queue-selector COMMAND opennow-qt
+        --smoke-test --allow-multiple-instances --desktop --route home
+        --smoke-queue-selector --reduced-motion)
+    set_tests_properties(qml-queue-selector PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
     qt_add_executable(opennow-hevchelp-tests tests/tst_hevchelp.cpp)
     target_link_libraries(opennow-hevchelp-tests PRIVATE Qt6::QuickTest Qt6::Quick)
     target_compile_definitions(opennow-hevchelp-tests PRIVATE

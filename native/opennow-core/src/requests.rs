@@ -60,7 +60,8 @@ impl Requests {
     pub fn admit(self: &Arc<Self>, id: &str, method: &str) -> Option<Permit> {
         let background = method.starts_with("catalog.")
             || method.starts_with("artwork.")
-            || method == "network.regions.ping";
+            || method == "network.regions.ping"
+            || method == "queue.servers.list";
         let mut active = self.0.lock().expect("request state poisoned");
         if active.contains_key(id)
             || active.len() >= MAX_ACTIVE

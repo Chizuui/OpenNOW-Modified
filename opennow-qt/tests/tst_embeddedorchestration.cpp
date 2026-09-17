@@ -17,9 +17,13 @@ bool prepareLaunchGuards(QJSEngine &engine)
         var launchInspectRequestId='', launchInspectStage='', directLookupRequestId='', authGeneration=0;
         var catalogOwner={selectedIdentity:'selection',actionGeneration:0,requestContextKey:'',mutationBusy:false,authScope:{generation:0}};
         var signedIn=true;
+        var desktopUiActive=false, queueLaunchWaitingForSubscription=false;
+        var remoteSessionsRequestId='';
+        var queueSelector={opened:false,begin:function(title){return false}};
     )JS")).isError()) return false;
     const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
-    for (const auto &name : {"launchIntentCurrent", "inspectLaunch", "invalidateLaunchInspection"}) {
+    for (const auto &name : {"launchIntentCurrent", "inspectLaunch", "invalidateLaunchInspection",
+             "continueInspectedLaunch", "discoverPendingLaunch"}) {
         const auto match = QRegularExpression(QStringLiteral(
             "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
             QRegularExpression::DotMatchesEverythingOption).match(shell);

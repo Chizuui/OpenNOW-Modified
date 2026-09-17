@@ -537,9 +537,7 @@ QtObject {
                 return
             }
             if (stage === "discover") {
-                root.streamState = "checking"
-                root.remoteSessionsRequestId = CoreClient.request("session.remote.list", root.pendingLaunchParams, 30000)
-                AppController.navigate("inserting")
+                root.continueInspectedLaunch()
             } else if (stage === "stop") {
                 if (!root.conflictSession || String(root.conflictSession.sessionId) !== seatId) {
                     root.streamState = "error"
@@ -757,6 +755,7 @@ QtObject {
     }
     readonly property bool streamBusy: streamCreateRequestId !== "" || streamStopRequestId !== ""
         || remoteSessionsRequestId !== "" || sessionClaimRequestId !== "" || launchInspectRequestId !== ""
+        || queueSelector.opened || queueLaunchWaitingForSubscription
 
     signal fullscreenToggleRequested()
     signal pointerLockToggleRequested()
@@ -1579,6 +1578,58 @@ QtObject {
         if (/^\d+$/.test(variantId) && Number(variantId) > 0 && Number(variantId) <= 2147483647)
             return variantId
         return ""
+    }
+
+    readonly property bool queueSelectorFreeTier: signedIn && queueSelector.freeTier
+    property bool queueLaunchWaitingForSubscription: false
+    readonly property bool queueLaunchIntentCurrent: launchIntentCurrent()
+    onQueueLaunchIntentCurrentChanged: {
+        if (!queueLaunchIntentCurrent) queueLaunchWaitingForSubscription = false
+    }
+    property QueueSelectorState queueSelector: QueueSelectorState {
+        coreClient: CoreClient
+        authSession: root.authSession
+        subscription: root.subscription
+        eligible: root.ready && root.desktopUiActive && root.queueSelectorFreeTier
+            && root.settings.hideQueueSelector !== true && !root.activeSession
+        launchValid: root.queueLaunchIntentCurrent
+        onSelected: location => {
+            if (!root.launchIntentCurrent()) return
+            if (location) root.pendingLaunchParams = Object.assign({}, root.pendingLaunchParams, {
+                zone: location.zoneId, streamingBaseUrl: location.streamingBaseUrl
+            })
+            root.discoverPendingLaunch()
+        }
+        onDismissed: {
+            root.queueLaunchWaitingForSubscription = false
+            root.pendingLaunchParams = null
+            root.streamState = "idle"
+            root.streamMessage = ""
+        }
+    }
+    onSubscriptionRequestIdChanged: {
+        if (subscriptionRequestId === "" && queueLaunchWaitingForSubscription) {
+            queueLaunchWaitingForSubscription = false
+            Qt.callLater(root.continueInspectedLaunch)
+        }
+    }
+
+    function continueInspectedLaunch() {
+        if (!launchIntentCurrent()) return
+        if (desktopUiActive && subscriptionRequestId !== "") {
+            queueLaunchWaitingForSubscription = true
+            return
+        }
+        if (pendingLaunchParams.queueSelectorHandled === true
+                || !queueSelector.begin(pendingLaunchParams.title)) discoverPendingLaunch()
+    }
+
+    function discoverPendingLaunch() {
+        if (!launchIntentCurrent() || remoteSessionsRequestId !== "") return
+        pendingLaunchParams = Object.assign({}, pendingLaunchParams, {queueSelectorHandled: true})
+        streamState = "checking"
+        remoteSessionsRequestId = CoreClient.request("session.remote.list", pendingLaunchParams, 30000)
+        AppController.navigate("inserting")
     }
 
     function launchSelectedGame(directConsoleMode) {

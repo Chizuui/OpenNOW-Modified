@@ -224,6 +224,7 @@ int AcceptanceSession::startSmokeWorkload()
             });
         });
     } else if (m_smokeTest && (m_arguments.contains(u"--smoke-backend-availability"_s)
+                     || m_arguments.contains(u"--smoke-queue-selector"_s)
                      || m_arguments.contains(u"--smoke-command-search"_s)
                      || m_arguments.contains(u"--smoke-game-details-layout"_s)
                      || m_arguments.contains(u"--smoke-ownership"_s)
@@ -245,6 +246,8 @@ int AcceptanceSession::startSmokeWorkload()
                      || m_arguments.contains(u"--smoke-stream-recovery"_s))) {
         QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-command-search"_s)
             ? u"qrc:/acceptance/CommandSearchAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-queue-selector"_s)
+            ? u"qrc:/acceptance/QueueSelectorAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-game-details-layout"_s)
             ? u"qrc:/acceptance/GameDetailsLayoutAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-color-format"_s)
@@ -293,6 +296,7 @@ int AcceptanceSession::startSmokeWorkload()
             m_engine.rootContext()->setContextProperty(u"NativeStreamRuntime"_s, runtime);
         }
         if (m_arguments.contains(u"--smoke-stream-recovery"_s)
+            || m_arguments.contains(u"--smoke-queue-selector"_s)
             || m_arguments.contains(u"--smoke-command-search"_s)
             || m_arguments.contains(u"--smoke-game-details-layout"_s)
             || m_arguments.contains(u"--smoke-ownership"_s)
@@ -359,6 +363,7 @@ int AcceptanceSession::startSmokeWorkload()
                 return;
             }
             if (ok && (m_arguments.contains(u"--smoke-collections"_s)
+                       || m_arguments.contains(u"--smoke-queue-selector"_s)
                        || m_arguments.contains(u"--smoke-ownership"_s)
                        || m_arguments.contains(u"--smoke-push-invalidation"_s)
                        || m_arguments.contains(u"--smoke-catalog-sync"_s)
@@ -368,6 +373,7 @@ int AcceptanceSession::startSmokeWorkload()
                        || m_arguments.contains(u"--smoke-store-launch"_s))) {
                 QTimer::singleShot(250, this, [this, window, fixture] {
                     if (m_arguments.contains(u"--smoke-ownership"_s)
+                        || m_arguments.contains(u"--smoke-queue-selector"_s)
                         || m_arguments.contains(u"--smoke-color-format"_s)
                         || m_arguments.contains(u"--smoke-store-launch"_s)
                         || m_arguments.contains(u"--smoke-push-invalidation"_s)) {

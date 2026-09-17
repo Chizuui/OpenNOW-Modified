@@ -25,6 +25,11 @@ does not send product requests before this succeeds. Version mismatches, a
 five-second handshake deadline, process exit and invalid data all transition the
 transport to `failed` with a credential-free diagnostic.
 
+The desktop queue selector requires the `queue.servers.v1` capability in this
+handshake. The Qt client and relocated package probes reject cores that omit it,
+including older protocol-5 binaries, before sending any product requests. This
+additive capability leaves the JSON envelope and native streaming ABI unchanged.
+
 ## Cloud library actions and launch decisions
 
 `catalog.launch.inspect({appId, variantId})` always resolves the exact parent and
@@ -362,6 +367,7 @@ and artwork only near the viewport, using the section's local category ID
 - `catalog.store.list`, `catalog.store.local`, `catalog.store.presentation`
 - `network.regions.list`
 - `network.regions.ping`
+- `queue.servers.list`
 - `account.subscription.get`
 - `account.connections.list`, `account.connections.sync`, `account.connections.unlink`
 - `account.connections.sync.status`, `account.connections.sync.cancel`
@@ -458,6 +464,59 @@ provider's server-info list. An unavailable or incompatible override falls back
 once to that provider's base without deleting the saved preference. Provider and
 region bases must be HTTPS NVIDIA-grid names without userinfo or nonstandard ports.
 Arbitrary partner domains require a separate evidenced trust policy.
+
+### Free-tier queue locations
+
+`queue.servers.list({})` returns `{locations, recommendedZoneId}`. Each location
+contains `zoneId`, `title`, `region`, `queuePosition` (nonnegative integer),
+`etaMs` (milliseconds or null), `lastUpdated` (Unix seconds), `pingMs`
+(milliseconds or null), `streamingBaseUrl`, and `alternateCount` (the number of
+other fresh zones folded into this location). Missing mapping entries retain
+their raw zone ID as the title and a friendly continent name as the region.
+Mapping failure does not prevent use of valid queue data. Mapping entries marked
+`nuked: true`, malformed rows, non-NVIDIA zones, timestamps over 15 minutes old,
+and timestamps more than 60 seconds in the future are excluded. No usable fresh
+rows, invalid queue payloads, and HTTP failures return `queue_servers_failed`;
+cancellation returns `cancelled`.
+
+The core requests PrintedWaste's public queue and mapping endpoints without
+credentials, account identifiers, cookies, proxies, or redirects. Each fetch has
+a five-second deadline and a 256 KiB streamed body limit, with at most 256 input
+entries and 128 usable zones. Only strict `NP-<3–8 uppercase alphanumeric
+location beginning with a letter>-<2 digits>` identifiers generate a probe or
+launch URL: `https://<lowercase-zone>.cloudmatchbeta.nvidiagrid.net/`. Neither
+provider payload can supply an arbitrary host. Latency uses a TCP warm-up and two
+TCP connection samples, each bounded to 750 ms across all resolved addresses,
+with 50 ms between samples. Probes run in batches of at most 32 and check
+cancellation between samples and batches. DNS resolution has a 750 ms caller
+deadline, uses at most 32 resolver workers and 32 queued jobs, and returns at most
+eight addresses per host. Stalled system DNS calls cannot block the caller or
+spawn additional workers; expired/cancelled jobs are skipped before resolution.
+`pingMs` is the rounded-up mean of successful TCP samples, excluding DNS, TLS,
+and server processing. All-failed probes produce null latency, not fabricated
+ping values.
+
+Zones sharing a title and region are grouped. Each primary and the final
+recommendation prefer measured zones when available, then minimize a normalized
+75% latency / 25% queue score. A score winner above 100 ms is replaced by the
+lowest-latency candidate. Without measurements the shortest queue wins. Ties
+are deterministic. `recommendedZoneId` always names a returned location primary;
+that row sorts first, with remaining rows ordered by region and title.
+
+The desktop shell presents this selector only for an explicitly known `FREE`
+NVIDIA membership, not for unknown membership or alliance accounts.
+`hideQueueSelector` is a persisted boolean preference, default `false`, exposed
+through the standard settings API and boolean normalization. It does not change
+the separate region-selector preference. The public queue RPC is unauthenticated
+and does not itself authorize gameplay or infer membership.
+
+For a fresh NVIDIA launch, the shell may pass a selected location's exact `zone`
+and `streamingBaseUrl` to `session.create`. The core accepts a strict zone and
+its exact derived URL for the NVIDIA IDP and NVIDIA provider code even when that
+zone is absent from server-info discovery. This exception does not apply to
+alliance providers, does not alter persisted region preferences, and does not
+bypass account scope, catalog eligibility, or subscription checks. All other
+region overrides retain the provider-discovery rules above.
 
 `session.create` requires `catalogAppId` as the parent LCARS identifier,
 `variantId` as the selected positive GraphQL Int identifier encoded as a string,

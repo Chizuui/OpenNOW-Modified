@@ -2055,6 +2055,16 @@ impl GfnService {
             });
         }
         drop(state);
+        if session.provider.idp_id == DEFAULT_IDP_ID
+            && session.provider.code.eq_ignore_ascii_case("NVIDIA")
+            && let Some(zone) = params["zone"].as_str()
+            && let Some(expected_url) = crate::queue_servers::zone_url(zone)
+            && params["streamingBaseUrl"].as_str() == Some(expected_url.as_str())
+        {
+            let mut settings = settings.clone();
+            settings["region"] = json!("");
+            return Ok((params.clone(), settings));
+        }
         let mut params = params.clone();
         let mut settings = settings.clone();
         let selected = params["streamingBaseUrl"]
