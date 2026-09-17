@@ -40,8 +40,8 @@ use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig};
 
 use super::frame_stage_timing::FrameStageTimingsAccumulator;
 use super::nvst_control::{
-    DEFAULT_FRAME_TIME_US, QOS_REPORT_INTERVAL, QOS_WARM_UP, QosReport, frame_ack,
-    frame_pacing_report, idr_request,
+    DEFAULT_FRAME_TIME_US, MAX_NACK_PACKET_COUNT, QOS_REPORT_INTERVAL, QOS_WARM_UP, QosReport,
+    frame_ack, frame_pacing_report, idr_request, nack_v2,
 };
 use super::nvst_cursor::{CursorCommand, NvstCursorCapture, valid_cursor_channel_message};
 use super::nvst_haptics::NvstHaptics;
@@ -185,7 +185,6 @@ fn verbose_diagnostics_enabled() -> bool {
             .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
     })
 }
-const MAX_NACK_PACKET_COUNT: usize = 64;
 const MAX_NACK_FCI_ENTRIES: usize = MAX_NACK_PACKET_COUNT.div_ceil(17);
 // At 120 FPS several FEC blocks can arrive during a single retransmission round trip. Keep them
 // ordered instead of throwing away the incomplete head block when its successor arrives.
@@ -2456,6 +2455,48 @@ fn build_rtcp_nack(
         packet.extend_from_slice(&blp.to_be_bytes());
     }
     packet
+}
+
+fn send_pending_nack(
+    feedback: &NvstFeedbackState,
+    now: Instant,
+    rtc: &mut Rtc,
+    channels: NvstInputChannels,
+    mjolnir: bool,
+    sender_ssrc: u32,
+    media_ssrc: u32,
+) {
+    let channel = if mjolnir {
+        channels.control_partial
+    } else {
+        channels.rtcp
+    };
+    if rtc.channel(channel).is_none() {
+        return;
+    }
+    let Some((first, last)) = feedback.take_nack(now) else {
+        return;
+    };
+    let admitted = if mjolnir {
+        let missing: Vec<u16> = (first..=last).map(|index| index as u16).collect();
+        nack_v2(0, &missing)
+            .is_some_and(|command| channels.send_partial_control(rtc, &command.encoded()))
+    } else {
+        channels.send_rtcp(rtc, &build_rtcp_nack(sender_ssrc, media_ssrc, first, last))
+    };
+    if admitted {
+        let format = if mjolnir {
+            "private-v2"
+        } else {
+            "rtcp-generic"
+        };
+        eprintln!(
+            "NVST NACK sent format={format} channel={} mediaSsrc={media_ssrc} missing={first}..={last}",
+            channels.label(channel),
+        );
+    } else {
+        feedback.mark_nack_send_failed(first, last);
+    }
 }
 
 #[derive(Clone)]
@@ -5751,9 +5792,6 @@ fn run_nvst_webrtc_bundle(
     let ping_payload = b"PING";
     log_udp_receiver_start("bundle", &socket, bundle_peer, &config, ping_payload);
     let stun_credentials = config.stun_credentials.clone();
-    // Feedback plane shared with the Mjolnir video receiver: it publishes the
-    // stream SSRC/sequence and recovery requests; this bundle sends the RTCP
-    // Receiver Reports / NACK / PLI over the `rtcp1` SCTP data channel.
     let feedback = config.feedback();
     // Arm startup before either feedback channel opens. In particular, control
     // IDR must work even if no video packet has arrived to identify its SSRC.
@@ -5763,7 +5801,8 @@ fn run_nvst_webrtc_bundle(
     // With a dedicated Mjolnir video socket the bundle only carries
     // control/audio keepalive traffic; the Mjolnir receiver owns the media
     // timeout, so the bundle must not raise a spurious media recovery.
-    let owns_media_timeout = config.mjolnir_udp_port.is_none();
+    let mjolnir = config.mjolnir_udp_port.is_some();
+    let owns_media_timeout = !mjolnir;
     let hid_device_mask = config.hid_device_mask();
     let physical_local = socket.local_addr().ok().map_or_else(
         || bundle_peer,
@@ -6164,24 +6203,16 @@ fn run_nvst_webrtc_bundle(
         if now.duration_since(last_recovery_send) >= RTCP_RECOVERY_INTERVAL
             && let Some((media_ssrc, _)) = feedback.stream_snapshot()
         {
-            if rtcp_channel_open
-                && let Some((first_missing_index, last_missing_index)) = feedback.take_nack(now)
-            {
-                let nack = build_rtcp_nack(
+            if let Some(channels) = input_channels {
+                send_pending_nack(
+                    &feedback,
+                    now,
+                    &mut rtc,
+                    channels,
+                    mjolnir,
                     rtcp_sender_ssrc,
                     media_ssrc,
-                    first_missing_index,
-                    last_missing_index,
                 );
-                let admitted =
-                    input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &nack));
-                if admitted {
-                    eprintln!(
-                        "NVST rtcp1 NACK sent for mediaSsrc={media_ssrc} missing={first_missing_index}..={last_missing_index}"
-                    );
-                } else {
-                    feedback.mark_nack_send_failed(first_missing_index, last_missing_index);
-                }
             }
             last_recovery_send = now;
         }
@@ -7144,6 +7175,9 @@ mod tests {
     }
     mod budget_tests {
         include!("nvst_budget_tests.rs");
+    }
+    mod nack_tests {
+        include!("nvst_nack_tests.rs");
     }
     use super::*;
     use serde_json::json;

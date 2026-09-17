@@ -38,7 +38,7 @@ fn exchange(local: &mut Rtc, remote: &mut Rtc, now: Instant) {
     }
 }
 
-fn connect_bundle_pair() -> (Rtc, Rtc, NvstInputChannels, NvstInputChannels) {
+pub(super) fn connect_bundle_pair() -> (Rtc, Rtc, NvstInputChannels, NvstInputChannels) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut local = create_nvst_bundle_rtc(&socket).unwrap();
     let mut remote = create_nvst_bundle_rtc(&socket).unwrap();
