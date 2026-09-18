@@ -1,5 +1,7 @@
 #include <QFontDatabase>
 #include <QDesktopServices>
+#include <QFont>
+#include <QGuiApplication>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlPropertyMap>
@@ -39,6 +41,10 @@ public slots:
             qmlRegisterType(QUrl::fromLocalFile(source + "/desktop/settings/controls/" + name + ".qml"), "OpenNOW", 1, 0, name);
         }
         QFontDatabase::addApplicationFont(source + "/../res/fonts/Nunito-Variable.ttf");
+        QFont applicationFont(QStringLiteral("Nunito"));
+        applicationFont.setHintingPreference(QFont::PreferNoHinting);
+        applicationFont.setStyleStrategy(QFont::PreferAntialias);
+        QGuiApplication::setFont(applicationFont);
     }
 
     void qmlEngineAvailable(QQmlEngine *engine)

@@ -1026,6 +1026,7 @@ if(BUILD_TESTING)
         set_target_properties(
             opennow-applicationicons-tests
             opennow-tenbitwarning-tests
+            opennow-queueselector-tests
             opennow-graphicsdevices-tests
             opennow-consolelayout-tests
             opennow-consoleactions-tests
