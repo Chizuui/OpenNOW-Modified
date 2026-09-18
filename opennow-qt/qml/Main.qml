@@ -339,7 +339,7 @@ ApplicationWindow {
             window.lockedStreamDesktopSurface = !enabled
             window.streamSurfaceLocked = true
         }
-        if (ShellStore.signedIn && AppController.route === "sign-in")
+        if (ShellStore.signedIn && !ShellStore.addingAccount && AppController.route === "sign-in")
             AppController.navigate("home")
         window.synchronizeRenderedSurface()
     }
@@ -727,7 +727,7 @@ ApplicationWindow {
         PauseAnimation { duration: AppController.reducedMotion ? 0 : 160 }
         ScriptAction {
             script: {
-                if (ShellStore.signedIn && AppController.route === "sign-in")
+                if (ShellStore.signedIn && !ShellStore.addingAccount && AppController.route === "sign-in")
                     AppController.navigate("home")
             }
         }

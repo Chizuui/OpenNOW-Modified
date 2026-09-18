@@ -15,8 +15,7 @@ FocusScope {
     property double clockMs: Date.now()
     property double challengeReceivedAt: Date.now()
     readonly property var challenge: ShellStore.authChallenge
-    readonly property var providers: ShellStore.providers && ShellStore.providers.length
-        ? ShellStore.providers : [{displayName:"NVIDIA · GeForce NOW", idpId:"", region:"GLOBAL"}]
+    readonly property var providers: ShellStore.providers || []
     readonly property var selectedProvider: ShellStore.selectedProvider || {displayName:qsTr("Select a provider"), idpId:ShellStore.selectedProviderIdpId, region:""}
     readonly property bool waiting: ShellStore.authState === "starting" || ShellStore.authState === "waiting" || ShellStore.authState === "completing"
     readonly property bool failed: ShellStore.authState === "error"
@@ -316,14 +315,17 @@ FocusScope {
                             objectName: "providerDiscoveryNotice"
                             width: parent.width
                             visible: ShellStore.providerDiscoveryDegraded
-                            text: qsTr("Provider discovery is unavailable. Known providers are shown. Refresh to try again.")
+                            text: root.providers.length
+                                ? qsTr("Provider discovery is unavailable. Known providers are shown. Refresh to try again.")
+                                : qsTr("No providers are available. Refresh to try again.")
                             color: DesktopTokens.textMuted
                         }
                         AuthButton {
                             width: parent.width
                             visible: ShellStore.providerDiscoveryDegraded
                             text: qsTr("Refresh providers")
-                            onClicked: ShellStore.refreshProviders()
+                            enabled: ShellStore.ready && ShellStore.providersRequestId === ""
+                            onClicked: ShellStore.refreshProviders(true)
                         }
                         ItemDelegate {
                             id: providerButton
@@ -458,7 +460,7 @@ FocusScope {
                             glyph: "desktop-qr.svg"
                             glyphSize: DesktopTokens.px(14)
                             text: qsTr("Sign in with a QR code")
-                            enabled: ShellStore.ready
+                            enabled: ShellStore.ready && ShellStore.selectedProvider !== null
                             onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn) }
                         }
                     }
@@ -745,7 +747,7 @@ FocusScope {
 
     Connections {
         target: ShellStore
-        function onSignedInChanged() { if (ShellStore.signedIn) root.signedIn() }
+        function onSignedInChanged() { if (ShellStore.signedIn && !ShellStore.addingAccount) root.signedIn() }
         function onAuthChallengeChanged() {
             root.challengeReceivedAt = Date.now()
             root.clockMs = root.challengeReceivedAt

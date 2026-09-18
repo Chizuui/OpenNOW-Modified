@@ -621,6 +621,11 @@ attempts; only a presented first frame resets this budget. Ending the session ca
 recovery. A native stop stalled for 30 seconds reports an error without launching
 another transport over the still-owned resources.
 
+An exhausted video SETUP negotiation (`missing-video-peer`) or an explicitly
+unsupported legacy transport (`nvst-legacy-transport-unsupported`) stops automatic
+recovery and preserves the original error and owned seat for an explicit retry or
+stop. These compatibility failures do not trigger another claim of the same seat.
+
 For the embedded Qt client, `session.create` also accepts an optional numeric `maxEntitledFps`:
 the highest frame rate the signed-in membership entitles at the requested resolution, or `0`
 or absent when that is not confirmed. Qt derives it from the normalized `entitledResolutions`
