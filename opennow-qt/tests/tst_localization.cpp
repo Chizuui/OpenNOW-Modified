@@ -14,6 +14,18 @@ class LocalizationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void displayNamesPreserveExactWireIdentifiers()
+    {
+        Localization localization;
+        for (const auto &id : {QStringLiteral("es_419"), QStringLiteral("zh_Hant_TW"),
+                              QStringLiteral("sr-Latn-RS"), QStringLiteral("future_001")}) {
+            QVERIFY(localization.localeDisplayName(id).contains(id));
+        }
+        QCOMPARE(localization.localeDisplayName(QStringLiteral("future_001")), QStringLiteral("future_001"));
+        QVERIFY(!localization.localeDisplayName(QStringLiteral("de")).isEmpty());
+        QCOMPARE(localization.locale(), QStringLiteral("system"));
+    }
+
     void loadsAvailableLocalesAndUsesEnglishFallback()
     {
         Localization localization;

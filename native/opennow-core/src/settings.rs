@@ -3,11 +3,20 @@ use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const NATIVE_TRANSPORT: &str = "nvst";
 const CONSOLE_POLICY_VERSION: &str = "qtConsoleModePolicyVersion";
+const WINDOWS_GPU_DEVICE_ID: &str = "windowsGpuDeviceId";
+const MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES: usize = 1024;
+const MAXIMUM_BOOTSTRAP_SETTINGS_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadPolicy {
+    ReadWrite,
+    ReadOnly,
+}
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -20,25 +29,50 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     pub fn load(data_dir: Option<PathBuf>) -> io::Result<Self> {
+        Self::load_with_policy(data_dir, LoadPolicy::ReadWrite)
+    }
+
+    pub(super) fn windows_gpu_device_id_read_only(data_dir: Option<PathBuf>) -> io::Result<String> {
+        let store = Self::load_with_policy(data_dir, LoadPolicy::ReadOnly)?;
+        Ok(store.values[WINDOWS_GPU_DEVICE_ID]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    fn load_with_policy(data_dir: Option<PathBuf>, policy: LoadPolicy) -> io::Result<Self> {
         let path = data_dir
             .unwrap_or_else(default_data_dir)
             .join("settings.json");
         let defaults = defaults();
         let mut values = defaults.clone();
         let mut passthrough = Map::new();
+        let mut migrate_onboarding = false;
         if path.exists() {
-            match fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Map<String, Value>>(&text).ok())
-            {
+            match read_persisted_settings(&path, policy) {
                 Some(persisted) => {
+                    migrate_onboarding = policy == LoadPolicy::ReadWrite
+                        && !persisted.contains_key("onboardingCompleted");
+                    if migrate_onboarding {
+                        values.insert("onboardingCompleted".to_owned(), json!(true));
+                    }
                     for (key, value) in persisted {
                         if defaults.contains_key(&key) {
                             let value = if key == "gameCollections" {
-                                normalize_game_collections(value).map_err(|error| {
-                                    io::Error::new(io::ErrorKind::InvalidData, error)
-                                })?
-                            } else if key == "mouseAcceleration" {
+                                match normalize_game_collections(value) {
+                                    Ok(value) => value,
+                                    Err(_) if policy == LoadPolicy::ReadOnly => {
+                                        defaults["gameCollections"].clone()
+                                    }
+                                    Err(error) => {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            error,
+                                        ));
+                                    }
+                                }
+                            } else if policy == LoadPolicy::ReadWrite && key == "mouseAcceleration"
+                            {
                                 value.as_bool().map_or(value.clone(), |enabled| {
                                     Value::Number((if enabled { 100 } else { 1 }).into())
                                 })
@@ -46,8 +80,10 @@ impl SettingsStore {
                                 value
                             };
                             values.insert(key, value);
-                        } else if key != "nativeHdrSupported" {
-                            if key == "sessionTimeRemainingDisplay"
+                        } else if !matches!(key.as_str(), "nativeHdrSupported" | "nativeHdrDisplay")
+                        {
+                            if policy == LoadPolicy::ReadWrite
+                                && key == "sessionTimeRemainingDisplay"
                                 && matches!(value.as_str(), Some("stats" | "both"))
                             {
                                 values.insert(
@@ -60,8 +96,10 @@ impl SettingsStore {
                     }
                 }
                 None => {
-                    let corrupt_path = path.with_extension("json.corrupt");
-                    let _ = fs::rename(&path, corrupt_path);
+                    if policy == LoadPolicy::ReadWrite {
+                        let corrupt_path = path.with_extension("json.corrupt");
+                        let _ = fs::rename(&path, corrupt_path);
+                    }
                 }
             }
         }
@@ -70,12 +108,14 @@ impl SettingsStore {
             values,
             passthrough,
         };
-        store.migrate_native_fullscreen_shortcut();
+        if policy == LoadPolicy::ReadWrite {
+            store.migrate_native_fullscreen_shortcut();
+        }
         // Old builds enabled automatic switching by default, so an existing
         // true value is not reliable evidence of opt-in. Reset that policy once;
         // subsequent explicit opt-ins survive every restart.
-        let migrate_console_policy =
-            store.passthrough.get(CONSOLE_POLICY_VERSION) != Some(&json!(1));
+        let migrate_console_policy = policy == LoadPolicy::ReadWrite
+            && store.passthrough.get(CONSOLE_POLICY_VERSION) != Some(&json!(1));
         if migrate_console_policy {
             store
                 .values
@@ -85,7 +125,10 @@ impl SettingsStore {
                 .insert(CONSOLE_POLICY_VERSION.to_owned(), json!(1));
         }
         store.normalize();
-        if migrate_console_policy && store.path.exists() {
+        if policy == LoadPolicy::ReadWrite
+            && (migrate_console_policy || migrate_onboarding)
+            && store.path.exists()
+        {
             store.save()?;
         }
         Ok(store)
@@ -96,19 +139,20 @@ impl SettingsStore {
     }
 
     pub fn set(&mut self, key: &str, mut value: Value) -> Result<Value, String> {
+        if matches!(key, "providerRegions" | "regionProviderIdpId") {
+            return Err("Provider region metadata is managed with the selected region".into());
+        }
         if !defaults().contains_key(key) {
             return Err(format!("Unknown setting: {key}"));
         }
+        if matches!(key, "gameLanguage" | "keyboardLayout") {
+            crate::language::validate_setting(key, &value)?;
+        }
         if key == "audioOutputDevice" {
-            let device = value
-                .as_str()
-                .ok_or_else(|| "audioOutputDevice must be a string".to_owned())?;
-            if device.len() > 1024 || device.contains('\0') {
-                return Err(
-                    "audioOutputDevice must be at most 1024 bytes without NUL characters"
-                        .to_owned(),
-                );
-            }
+            validate_bounded_string(&value, key, 1024)?;
+        }
+        if key == WINDOWS_GPU_DEVICE_ID {
+            validate_bounded_string(&value, key, MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES)?;
         }
         if key == "gameCollections" {
             value = normalize_game_collections(value)?;
@@ -161,12 +205,42 @@ impl SettingsStore {
     pub fn reset(&mut self) -> Result<Value, String> {
         let previous_values = self.values.clone();
         self.values = defaults();
+        self.values.insert(
+            "onboardingCompleted".to_owned(),
+            previous_values["onboardingCompleted"].clone(),
+        );
         self.normalize();
         if let Err(error) = self.save() {
             self.values = previous_values;
             return Err(format!("Could not reset settings: {error}"));
         }
         Ok(self.all())
+    }
+
+    pub fn set_provider_region(&mut self, provider: &str, value: Value) -> Result<Value, String> {
+        validate_bounded_string(&value, "region", 256)?;
+        if provider.is_empty() || provider.len() > 256 {
+            return Err("Invalid region provider".into());
+        }
+        let previous_values = self.values.clone();
+        let mut regions = self.values["providerRegions"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if !regions.contains_key(provider) && regions.len() >= 32 {
+            return Err("Too many saved region providers".into());
+        }
+        regions.insert(provider.to_owned(), value.clone());
+        self.values
+            .insert("providerRegions".into(), Value::Object(regions));
+        self.values
+            .insert("regionProviderIdpId".into(), json!(provider));
+        self.values.insert("region".into(), value.clone());
+        if let Err(error) = self.save() {
+            self.values = previous_values;
+            return Err(format!("Could not save region: {error}"));
+        }
+        Ok(value)
     }
 
     fn normalize(&mut self) {
@@ -177,6 +251,15 @@ impl SettingsStore {
         {
             self.values
                 .insert("audioOutputDevice".to_owned(), json!(""));
+        }
+        if self.values[WINDOWS_GPU_DEVICE_ID]
+            .as_str()
+            .is_some_and(|device| {
+                device.len() > MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES || device.contains('\0')
+            })
+        {
+            self.values
+                .insert(WINDOWS_GPU_DEVICE_ID.to_owned(), json!(""));
         }
         normalize_resolution(&mut self.values);
         normalize_choice(
@@ -260,7 +343,12 @@ impl SettingsStore {
             "8bit_420",
         );
         normalize_choice(&mut self.values, "frameGeneration", &["off", "2x"], "off");
-        normalize_choice(&mut self.values, "upscaling", &["off", "metalfx"], "off");
+        normalize_choice(
+            &mut self.values,
+            "upscaling",
+            &["off", "metalfx", "fsr1"],
+            "off",
+        );
         clamp_integer(&mut self.values, "upscalingSharpness", 0, 15, 10);
         clamp_integer(&mut self.values, "upscalingDenoise", 0, 20, 0);
         for key in ["decoderPreference", "encoderPreference"] {
@@ -316,11 +404,11 @@ impl SettingsStore {
             &mut self.values,
             "updateChannel",
             &["stable", "nightly"],
-            "stable",
+            crate::version::update_channel(crate::version::APPLICATION_VERSION),
         );
         clamp_integer(&mut self.values, "mouseAcceleration", 1, 150, 1);
-        clamp_integer(&mut self.values, "controllerLeftStickDeadzone", 0, 50, 24);
-        clamp_integer(&mut self.values, "controllerRightStickDeadzone", 0, 50, 27);
+        clamp_integer(&mut self.values, "controllerLeftStickDeadzone", 0, 50, 5);
+        clamp_integer(&mut self.values, "controllerRightStickDeadzone", 0, 50, 5);
         clamp_integer(
             &mut self.values,
             "controllerVibrationIntensity",
@@ -328,7 +416,7 @@ impl SettingsStore {
             100,
             100,
         );
-        clamp_integer(&mut self.values, "fps", 30, 240, 60);
+        clamp_integer(&mut self.values, "fps", 30, 360, 60);
         clamp_integer(&mut self.values, "maxBitrateMbps", 1, 200, 75);
         clamp_integer(&mut self.values, "windowWidth", 960, 7680, 1400);
         clamp_integer(&mut self.values, "windowHeight", 540, 4320, 900);
@@ -406,6 +494,38 @@ impl SettingsStore {
         }
         Ok(())
     }
+}
+
+fn read_persisted_settings(path: &Path, policy: LoadPolicy) -> Option<Map<String, Value>> {
+    match policy {
+        LoadPolicy::ReadWrite => fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok()),
+        LoadPolicy::ReadOnly => {
+            let mut data = Vec::new();
+            fs::File::open(path)
+                .ok()?
+                .take(MAXIMUM_BOOTSTRAP_SETTINGS_BYTES + 1)
+                .read_to_end(&mut data)
+                .ok()?;
+            if data.len() as u64 > MAXIMUM_BOOTSTRAP_SETTINGS_BYTES {
+                return None;
+            }
+            serde_json::from_slice(&data).ok()
+        }
+    }
+}
+
+fn validate_bounded_string(value: &Value, key: &str, maximum_bytes: usize) -> Result<(), String> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("{key} must be a string"))?;
+    if value.len() > maximum_bytes || value.contains('\0') {
+        return Err(format!(
+            "{key} must be at most {maximum_bytes} bytes without NUL characters"
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_game_collections(mut value: Value) -> Result<Value, String> {
@@ -596,6 +716,7 @@ fn normalize_optional_integer(
 fn normalize_bounded_strings(values: &mut Map<String, Value>) {
     for (key, maximum) in [
         ("region", 256_usize),
+        ("regionProviderIdpId", 256_usize),
         ("sessionProxyUrl", 2_048),
         ("nativeStreamerExecutablePath", 2_048),
         ("microphoneDeviceId", 512),
@@ -769,17 +890,20 @@ fn legacy_data_dirs(primary: &Path) -> Vec<PathBuf> {
 
 fn defaults() -> Map<String, Value> {
     json!({
+        "onboardingCompleted":false,
         "resolution":"1920x1080", "aspectRatio":"16:9", "posterSizeScale":1.05,
         "fps":60, "frameGeneration":"off", "upscaling":"off", "upscalingSharpness":10, "upscalingDenoise":0,
-        "maxBitrateMbps":75, "recordingBitrateMbps":null,
+        "maxBitrateMbps":75, "saveBandwidth":false, "recordingBitrateMbps":null,
         "recordingResolution":"720p", "recordingFps":30, "streamClientMode":"native",
         "replayBufferEnabled":false, "replayBufferSeconds":30, "replayBufferMemoryMiB":256,
         "nativeVideoBackend":"auto", "nativeStreamerExecutablePath":"", "audioOutputDevice":"",
+        "windowsGpuDeviceId":"",
         "nativeCloudGsyncMode":"auto", "nativeD3dFullscreenMode":"auto",
         "nativeExternalRenderer":false, "transportMode":"nvst", "showNativeStreamerStats":false,
         "codec":"auto", "fallbackCodec":"auto", "decoderPreference":"auto",
-        "encoderPreference":"auto", "colorQuality":"8bit_420", "enableHdr":false, "region":"",
-        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false,
+        "encoderPreference":"auto", "colorQuality":"8bit_420", "enableHdr":false, "region":"", "regionProviderIdpId":"", "providerRegions":{},
+        "suppressTenBitWarning":false,
+        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false, "networkTest":false,
         "enableGyroscopeControls":false, "steamControllerCompatibilityMode":false,
         "nativeCursorOverlay":true, "mouseSensitivity":1, "mouseAcceleration":1,
         "shortcutToggleStats":"Ctrl+N", "shortcutTogglePointerLock":"F8",
@@ -788,9 +912,10 @@ fn defaults() -> Map<String, Value> {
         "shortcutScreenshot":"Ctrl+F11", "shortcutToggleRecording":"F12",
         "shortcutSaveClip":"Ctrl+F12",
         "microphoneMode":"disabled", "microphoneDeviceId":"", "hideStreamButtons":false,
+        "muteWhenOutOfFocus":false, "backgroundStreamReminder":false,
         "showAntiAfkIndicator":true, "antiAfkReminderEveryMinutes":15,
         "antiAfkReminderDurationSeconds":5, "showStatsOnLaunch":false,
-        "statsOverlayPosition":"top-right", "hideServerSelector":false,
+        "statsOverlayPosition":"top-right", "hideServerSelector":false, "hideQueueSelector":false,
         "desktopUiScale":1.0, "statsOverlayScale":1.0, "statsOverlayOpacity":85,
         "themeAccentOverride":false,
         "statsShowFps":true, "statsShowRegion":true, "statsShowPing":true,
@@ -800,7 +925,7 @@ fn defaults() -> Map<String, Value> {
         "appAccentColor":"green", "appTheme":"auto", "appLanguage":"system", "themePack":"nocturne", "translucentUI":false,
         "showTileLabels":true,
         "controllerMode":true, "controllerModePromptDismissed":false,
-        "controllerLeftStickDeadzone":24, "controllerRightStickDeadzone":27,
+        "controllerLeftStickDeadzone":5, "controllerRightStickDeadzone":5,
         "controllerVibrationIntensity":100,
         "reducedMotion":false,
         "launchInConsoleMode":false, "consoleProfilePickerOnLaunch":true,
@@ -811,10 +936,11 @@ fn defaults() -> Map<String, Value> {
         "showSessionReport":true, "showSessionTimeRemainingInStatsOverlay":false,
         "sessionClockShowEveryMinutes":60, "sessionClockShowDurationSeconds":30,
         "windowWidth":1400, "windowHeight":900, "keyboardLayout":"en-US",
-        "gameLanguage":"en_US", "enablePersistingInGameSettings":false, "enableL4S":false,
+        "gameLanguage":"en_US", "enablePersistingInGameSettings":true, "enableL4S":false,
         "identifyAsSteamDeck":false, "steamBigPictureMode":false,
         "enableCloudGsync":false, "discordRichPresence":false,
-        "autoCheckForUpdates":true, "updateChannel":"stable",
+        "autoCheckForUpdates":true, "autoDownloadUpdates":false,
+        "updateChannel":crate::version::update_channel(crate::version::APPLICATION_VERSION),
         "allowEscapeToExitFullscreen":false, "lastSeenReleaseHighlightsVersion":"",
         "videoShader":{"enabled":false,"sharpen":40,"saturation":100,"contrast":100,"brightness":100,"vibrance":0,"filmGrain":0},
         "frameInterpolation":{"enabled":false,"factor":2,"quality":480},
@@ -829,6 +955,398 @@ fn defaults() -> Map<String, Value> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn language_preferences_are_independent_and_rejected_writes_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        for (key, value) in [
+            ("appLanguage", "ja"),
+            ("gameLanguage", "es_419"),
+            ("keyboardLayout", "ja-JP"),
+        ] {
+            store.set(key, json!(value)).unwrap();
+        }
+        let saved = store.all();
+        for (key, value) in [
+            ("gameLanguage", "auto"),
+            ("gameLanguage", "system"),
+            ("gameLanguage", "en\nUS"),
+            ("keyboardLayout", "en_US"),
+            ("keyboardLayout", "m-us"),
+        ] {
+            assert!(store.set(key, json!(value)).is_err());
+            assert_eq!(store.all(), saved);
+        }
+        assert_eq!(
+            SettingsStore::load(Some(directory.path().to_path_buf()))
+                .unwrap()
+                .all(),
+            saved
+        );
+        store.set("appLanguage", json!("de")).unwrap();
+        assert_eq!(store.all()["gameLanguage"], "es_419");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        store.set("gameLanguage", json!("future_001")).unwrap();
+        assert_eq!(store.all()["appLanguage"], "de");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        std::fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        let saved = store.all();
+        assert!(store.set("gameLanguage", json!("pt_BR")).is_err());
+        assert_eq!(store.all(), saved);
+    }
+
+    #[test]
+    fn restored_language_ids_are_not_rewritten_but_corrupt_values_never_reach_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("settings.json"),
+            json!({
+                "gameLanguage":"auto", "keyboardLayout":"unknown", "appLanguage":"fr",
+                "onboardingCompleted":true, "qtConsoleModePolicyVersion":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = SettingsStore::load(Some(directory.path().to_path_buf()))
+            .unwrap()
+            .all();
+        assert_eq!(settings["gameLanguage"], "auto");
+        assert_eq!(settings["keyboardLayout"], "unknown");
+        let mut url = url::Url::parse("https://fixture.invalid/").unwrap();
+        crate::language::append_session_preferences(&mut url, &settings);
+        assert_eq!(url.query(), Some("keyboardLayout=en-US&languageCode=en_US"));
+    }
+
+    #[test]
+    fn provider_region_preferences_are_atomic_isolated_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        store
+            .set_provider_region("nvidia", json!("https://nvidia-region.nvidiagrid.net/"))
+            .unwrap();
+        store
+            .set_provider_region("alliance", json!("https://alliance-region.nvidiagrid.net/"))
+            .unwrap();
+        let restored = SettingsStore::load(Some(directory.path().to_path_buf()))
+            .unwrap()
+            .all();
+        assert_eq!(
+            restored["providerRegions"]["nvidia"],
+            "https://nvidia-region.nvidiagrid.net/"
+        );
+        assert_eq!(restored["providerRegions"]["alliance"], restored["region"]);
+        assert_eq!(restored["regionProviderIdpId"], "alliance");
+        assert!(store.set("providerRegions", json!({})).is_err());
+        assert!(
+            store
+                .set_provider_region("alliance", json!("x".repeat(257)))
+                .is_err()
+        );
+        assert_eq!(store.all(), restored);
+        std::fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        assert!(
+            store
+                .set_provider_region("nvidia", json!("changed"))
+                .is_err()
+        );
+        assert_eq!(store.all(), restored);
+    }
+
+    #[test]
+    fn updater_preferences_are_independent_and_preserved() {
+        let directory =
+            env::temp_dir().join(format!("opennow-update-settings-{}", rand::random::<u64>()));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["autoDownloadUpdates"], json!(false));
+        assert_eq!(
+            store.all()["updateChannel"],
+            json!(crate::version::update_channel(
+                crate::version::APPLICATION_VERSION
+            ))
+        );
+        store.set("autoCheckForUpdates", json!(false)).unwrap();
+        store.set("autoDownloadUpdates", json!(true)).unwrap();
+        store.set("updateChannel", json!("stable")).unwrap();
+        let settings = SettingsStore::load(Some(directory.clone())).unwrap().all();
+        assert_eq!(settings["autoCheckForUpdates"], json!(false));
+        assert_eq!(settings["autoDownloadUpdates"], json!(true));
+        assert_eq!(settings["updateChannel"], json!("stable"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_new_profile_stays_incomplete_across_unrelated_writes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-new-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["onboardingCompleted"], json!(false));
+        assert!(!directory.join("settings.json").exists());
+        for (key, value) in [
+            ("launchInConsoleMode", json!(true)),
+            ("windowWidth", json!(1600)),
+            ("windowHeight", json!(1000)),
+        ] {
+            store.set(key, value).unwrap();
+            store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(false));
+        }
+        store.set("onboardingCompleted", json!(true)).unwrap();
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()["onboardingCompleted"],
+            json!(true)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_existing_profiles_migrate_and_persist_completion() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-existing-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        for persisted in [
+            json!({}),
+            json!({"qtConsoleModePolicyVersion": 1, "switchToConsoleOnPad": true}),
+        ] {
+            fs::write(
+                directory.join("settings.json"),
+                serde_json::to_vec(&persisted).unwrap(),
+            )
+            .unwrap();
+            let store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(true));
+            if persisted.get("qtConsoleModePolicyVersion").is_some() {
+                assert_eq!(store.all()["switchToConsoleOnPad"], json!(true));
+            }
+            let saved: Value =
+                serde_json::from_slice(&fs::read(directory.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["onboardingCompleted"], json!(true));
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all()["onboardingCompleted"],
+                json!(true)
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_explicit_values_survive_migration_and_reset() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-reset-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        for completed in [false, true] {
+            fs::write(
+                directory.join("settings.json"),
+                serde_json::to_vec(&json!({"onboardingCompleted": completed})).unwrap(),
+            )
+            .unwrap();
+            let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(completed));
+            store.set("windowWidth", json!(1600)).unwrap();
+            store.set("launchInConsoleMode", json!(true)).unwrap();
+            store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(completed));
+            let reset = store.reset().unwrap();
+            assert_eq!(reset["onboardingCompleted"], json!(completed));
+            assert_eq!(reset["windowWidth"], json!(1400));
+            assert_eq!(reset["launchInConsoleMode"], json!(false));
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all(),
+                reset
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_malformed_files_are_new_profiles() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-corrupt-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        for contents in ["{", "null", "[]", "true"] {
+            fs::write(directory.join("settings.json"), contents).unwrap();
+            let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(false));
+            assert_eq!(
+                fs::read_to_string(directory.join("settings.json.corrupt")).unwrap(),
+                contents
+            );
+            fs::remove_file(directory.join("settings.json.corrupt")).unwrap();
+            store.set("windowWidth", json!(1600)).unwrap();
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all()["onboardingCompleted"],
+                json!(false)
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_requires_boolean_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-types-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        for invalid in [json!("true"), json!(1), json!(null), json!([]), json!({})] {
+            fs::write(
+                directory.join("settings.json"),
+                serde_json::to_vec(&json!({"onboardingCompleted": invalid})).unwrap(),
+            )
+            .unwrap();
+            let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+            assert_eq!(store.all()["onboardingCompleted"], json!(false));
+            store.set("onboardingCompleted", json!(true)).unwrap();
+            assert_eq!(
+                store.set("onboardingCompleted", invalid).unwrap(),
+                json!(false)
+            );
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all()["onboardingCompleted"],
+                json!(false)
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn queue_selector_preference_is_typed_persisted_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], false);
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], true);
+        for invalid in [json!("true"), json!(1), json!(null), json!([])] {
+            assert_eq!(store.set("hideQueueSelector", invalid).unwrap(), false);
+        }
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        assert_eq!(store.reset().unwrap()["hideQueueSelector"], false);
+    }
+
+    #[test]
+    fn background_stream_preferences_are_opt_in_and_persisted() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-background-stream-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        for key in ["muteWhenOutOfFocus", "backgroundStreamReminder"] {
+            assert_eq!(store.all()[key], json!(false));
+            store.set(key, json!(true)).unwrap();
+        }
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        for key in ["muteWhenOutOfFocus", "backgroundStreamReminder"] {
+            assert_eq!(store.all()[key], json!(true));
+            for invalid in [json!("true"), json!(1), json!(null), json!([])] {
+                assert_eq!(store.set(key, invalid).unwrap(), json!(false));
+            }
+        }
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["muteWhenOutOfFocus"], json!(false));
+        assert_eq!(store.all()["backgroundStreamReminder"], json!(false));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ten_bit_warning_opt_out_is_typed_persisted_and_resettable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-ten-bit-warning-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["suppressTenBitWarning"], json!(false));
+        store.set("suppressTenBitWarning", json!(true)).unwrap();
+        store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["suppressTenBitWarning"], json!(true));
+        for invalid in [json!("true"), json!(1), json!(null), json!([])] {
+            assert_eq!(
+                store.set("suppressTenBitWarning", invalid).unwrap(),
+                json!(false)
+            );
+        }
+        store.set("suppressTenBitWarning", json!(true)).unwrap();
+        assert_eq!(
+            store.reset().unwrap()["suppressTenBitWarning"],
+            json!(false)
+        );
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()["suppressTenBitWarning"],
+            json!(false)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_save_and_reset_failures_preserve_previous_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-onboarding-save-failure-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        for completed in [false, true] {
+            store.set("onboardingCompleted", json!(completed)).unwrap();
+            store.set("windowWidth", json!(1600)).unwrap();
+            let original = store.all();
+            let persisted = fs::read(directory.join("settings.json")).unwrap();
+            fs::create_dir(directory.join("settings.json.tmp")).unwrap();
+            assert!(store.set("onboardingCompleted", json!(!completed)).is_err());
+            assert_eq!(store.all(), original);
+            assert!(store.reset().is_err());
+            assert_eq!(store.all(), original);
+            assert_eq!(
+                fs::read(directory.join("settings.json")).unwrap(),
+                persisted
+            );
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all(),
+                original
+            );
+            fs::remove_dir(directory.join("settings.json.tmp")).unwrap();
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_migration_save_failure_leaves_existing_file_intact() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            env::temp_dir().join(format!("opennow-onboarding-migration-failure-{unique}"));
+        fs::create_dir_all(directory.join("settings.json.tmp")).unwrap();
+        let persisted = br#"{"qtConsoleModePolicyVersion":1}"#;
+        fs::write(directory.join("settings.json"), persisted).unwrap();
+        assert!(SettingsStore::load(Some(directory.clone())).is_err());
+        assert_eq!(
+            fs::read(directory.join("settings.json")).unwrap(),
+            persisted
+        );
+        fs::remove_dir(directory.join("settings.json.tmp")).unwrap();
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()["onboardingCompleted"],
+            json!(true)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn replay_is_opt_in_bounded_and_persisted() {
@@ -993,6 +1511,41 @@ mod tests {
         assert!(store.set("appAccentColor", json!("green")).is_err());
         assert_eq!(store.all(), before);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn in_game_settings_persistence_survives_restart_and_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let load = || SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        let mut store = load();
+        assert_eq!(store.all()["enablePersistingInGameSettings"], true);
+        fs::write(directory.path().join("settings.json"), br#"{"fps":120}"#).unwrap();
+        store = load();
+        assert_eq!(store.all()["enablePersistingInGameSettings"], true);
+        for enabled in [true, false, true] {
+            store
+                .set("enablePersistingInGameSettings", json!(enabled))
+                .unwrap();
+            store = load();
+            assert_eq!(store.all()["enablePersistingInGameSettings"], enabled);
+            store.set("fps", json!(120)).unwrap();
+            store = load();
+            assert_eq!(store.all()["enablePersistingInGameSettings"], enabled);
+        }
+        fs::create_dir(directory.path().join("settings.json.tmp")).unwrap();
+        assert!(
+            store
+                .set("enablePersistingInGameSettings", json!(false))
+                .is_err()
+        );
+        assert_eq!(store.all()["enablePersistingInGameSettings"], true);
+        assert_eq!(load().all()["enablePersistingInGameSettings"], true);
+        fs::remove_dir(directory.path().join("settings.json.tmp")).unwrap();
+        store
+            .set("enablePersistingInGameSettings", json!(false))
+            .unwrap();
+        store.reset().unwrap();
+        assert_eq!(load().all()["enablePersistingInGameSettings"], true);
     }
 
     #[test]
@@ -1317,6 +1870,14 @@ mod tests {
         let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(store.all()["enableHdr"], false);
         assert!(store.set("nativeHdrSupported", json!(true)).is_err());
+        assert!(
+            store
+                .set(
+                    "nativeHdrDisplay",
+                    json!({"minimumNits":0.005,"maximumNits":620})
+                )
+                .is_err()
+        );
         assert_eq!(store.set("enableHdr", json!(true)).unwrap(), true);
         assert_eq!(
             SettingsStore::load(Some(directory.clone())).unwrap().all()["enableHdr"],
@@ -1325,12 +1886,15 @@ mod tests {
         let path = directory.join("settings.json");
         let mut persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         persisted["nativeHdrSupported"] = json!(true);
+        persisted["nativeHdrDisplay"] = json!({"minimumNits":0.005,"maximumNits":620});
         fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         let mut loaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert!(loaded.all().get("nativeHdrSupported").is_none());
+        assert!(loaded.all().get("nativeHdrDisplay").is_none());
         loaded.set("enableHdr", json!(true)).unwrap();
         let persisted: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(persisted.get("nativeHdrSupported").is_none());
+        assert!(persisted.get("nativeHdrDisplay").is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1423,6 +1987,137 @@ mod tests {
     }
 
     #[test]
+    fn windows_gpu_device_preference_roundtrips_and_resets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-windows-gpu-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()[WINDOWS_GPU_DEVICE_ID], json!(""));
+
+        let device_id = "é".repeat(MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES / 2);
+        assert_eq!(device_id.len(), MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES);
+        assert_eq!(
+            store
+                .set(WINDOWS_GPU_DEVICE_ID, json!(device_id.clone()))
+                .unwrap(),
+            json!(device_id)
+        );
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()[WINDOWS_GPU_DEVICE_ID],
+            json!(device_id)
+        );
+
+        let reset = store.reset().unwrap();
+        assert_eq!(reset[WINDOWS_GPU_DEVICE_ID], json!(""));
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()[WINDOWS_GPU_DEVICE_ID],
+            json!("")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_gpu_device_preference_rejects_invalid_set_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-windows-gpu-invalid-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        store
+            .set(WINDOWS_GPU_DEVICE_ID, json!("valid-device"))
+            .unwrap();
+
+        for invalid in [
+            json!(null),
+            json!(false),
+            json!(42),
+            json!(["device"]),
+            json!({"device":"id"}),
+            json!("x".repeat(MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES + 1)),
+            json!("device\0id"),
+        ] {
+            assert!(store.set(WINDOWS_GPU_DEVICE_ID, invalid).is_err());
+            assert_eq!(store.all()[WINDOWS_GPU_DEVICE_ID], json!("valid-device"));
+        }
+        assert_eq!(
+            SettingsStore::load(Some(directory.clone())).unwrap().all()[WINDOWS_GPU_DEVICE_ID],
+            json!("valid-device")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_gpu_device_preference_normalizes_invalid_saved_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-windows-gpu-saved-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+
+        for invalid in [
+            json!(null),
+            json!(123),
+            json!("x".repeat(MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES + 1)),
+            json!("device\0id"),
+        ] {
+            fs::write(
+                directory.join("settings.json"),
+                serde_json::to_vec(&json!({"windowsGpuDeviceId":invalid})).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                SettingsStore::load(Some(directory.clone())).unwrap().all()[WINDOWS_GPU_DEVICE_ID],
+                json!("")
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn read_only_gpu_preference_load_never_migrates_or_renames_settings() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-windows-gpu-read-only-{unique}"));
+        let path = directory.join("settings.json");
+        fs::create_dir_all(&directory).unwrap();
+
+        let legacy = br#"{"windowsGpuDeviceId":"legacy-device","mouseAcceleration":true,"gameCollections":[{"invalid":true}]}"#;
+        fs::write(&path, legacy).unwrap();
+        assert_eq!(
+            SettingsStore::windows_gpu_device_id_read_only(Some(directory.clone())).unwrap(),
+            "legacy-device"
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(!directory.join("settings.json.bak").exists());
+        assert!(!directory.join("settings.json.tmp").exists());
+
+        let corrupt = b"{";
+        fs::write(&path, corrupt).unwrap();
+        assert_eq!(
+            SettingsStore::windows_gpu_device_id_read_only(Some(directory.clone())).unwrap(),
+            ""
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert!(!directory.join("settings.json.corrupt").exists());
+
+        let oversized = vec![b' '; MAXIMUM_BOOTSTRAP_SETTINGS_BYTES as usize + 1];
+        fs::write(&path, &oversized).unwrap();
+        assert_eq!(
+            SettingsStore::windows_gpu_device_id_read_only(Some(directory.clone())).unwrap(),
+            ""
+        );
+        assert_eq!(fs::read(&path).unwrap(), oversized);
+        assert!(!directory.join("settings.json.corrupt").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn persists_and_normalizes_settings() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1483,7 +2178,9 @@ mod tests {
         assert_eq!(preferences.all()["statsShowFps"], json!(false));
         assert_eq!(preferences.all()["statsShowRegion"], json!(false));
         assert_eq!(preferences.all()["statsOverlayScale"], json!(1.5));
-        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(240));
+        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(360)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(240)).unwrap(), json!(240));
         assert_eq!(store.set("maxBitrateMbps", json!(200)).unwrap(), json!(200));
         assert_eq!(
             store.set("launchInConsoleMode", json!(false)).unwrap(),
@@ -1493,9 +2190,22 @@ mod tests {
             store.set("reducedMotion", json!(true)).unwrap(),
             json!(true)
         );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!("yes")).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
         let loaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(loaded.all()["fps"], json!(240));
         assert_eq!(loaded.all()["maxBitrateMbps"], json!(200));
+        assert_eq!(loaded.all()["saveBandwidth"], json!(true));
         assert_eq!(loaded.all()["launchInConsoleMode"], json!(false));
         assert_eq!(loaded.all()["reducedMotion"], json!(true));
         assert!(store.set("notASetting", json!(true)).is_err());
@@ -1621,6 +2331,32 @@ mod tests {
             serde_json::to_vec(&json!({"upscaling": "invalid"})).unwrap(),
         )
         .unwrap();
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["upscaling"], json!("off"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn fsr_upscaling_persists_without_changing_stream_or_metalfx_preferences() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-fsr-upscaling-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        let fps = store.all()["fps"].clone();
+        let resolution = store.all()["resolution"].clone();
+        store.set("upscalingDenoise", json!(7)).unwrap();
+        assert_eq!(
+            store.set("upscaling", json!("fsr1")).unwrap(),
+            json!("fsr1")
+        );
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["upscaling"], json!("fsr1"));
+        assert_eq!(store.all()["fps"], fps);
+        assert_eq!(store.all()["resolution"], resolution);
+        assert_eq!(store.all()["upscalingDenoise"], json!(7));
+        store.set("upscaling", json!("off")).unwrap();
         let store = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(store.all()["upscaling"], json!("off"));
         let _ = fs::remove_dir_all(directory);
@@ -1800,8 +2536,8 @@ mod tests {
         let directory = env::temp_dir().join(format!("opennow-controller-tuning-{unique}"));
         let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
         for (key, default, maximum) in [
-            ("controllerLeftStickDeadzone", 24, 50),
-            ("controllerRightStickDeadzone", 27, 50),
+            ("controllerLeftStickDeadzone", 5, 50),
+            ("controllerRightStickDeadzone", 5, 50),
             ("controllerVibrationIntensity", 100, 100),
         ] {
             assert_eq!(store.all()[key], json!(default));

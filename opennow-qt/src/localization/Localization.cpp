@@ -62,6 +62,17 @@ void Localization::setLocale(const QString &locale)
     emit localeChanged();
 }
 
+QString Localization::localeDisplayName(const QString &locale) const
+{
+    if (locale == u"system"_s) return source(u"System"_s);
+    const QLocale parsed(locale);
+    if (parsed.language() == QLocale::C) return locale;
+    const auto language = parsed.nativeLanguageName();
+    if (language.isEmpty()) return locale;
+    return locale.contains(u'_') || locale.contains(u'-')
+        ? u"%1 (%2)"_s.arg(language, locale) : language;
+}
+
 QString Localization::source(const QString &sourceText) const
 {
     return source(sourceText, m_revision);

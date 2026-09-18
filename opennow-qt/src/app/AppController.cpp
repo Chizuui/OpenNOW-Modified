@@ -1,4 +1,5 @@
 #include "app/AppController.h"
+#include "media/MediaPaths.h"
 
 #include <algorithm>
 #include <QCoreApplication>
@@ -18,6 +19,7 @@
 #include <QStandardPaths>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QWindow>
 
 #include <utility>
 
@@ -176,14 +178,22 @@ bool AppController::applyOverlay(const QString &overlay)
 bool AppController::cyclePrimaryRoute(int direction)
 {
     const auto &items = primaryRoutes();
-    auto index = items.indexOf(m_route);
+    const auto current = m_overlay == u"friends"_s ? u"friends"_s
+        : m_route.startsWith(u"settings"_s) || m_route == u"controllers"_s
+            ? u"settings"_s : m_route;
+    auto index = items.indexOf(current);
     if (index < 0) {
         index = 0;
     } else {
         const auto delta = direction < 0 ? -1 : 1;
         index = (index + delta + items.size()) % items.size();
     }
-    return navigate(items.at(index));
+    const auto &target = items.at(index);
+    if (target == u"friends"_s)
+        return showOverlay(target);
+    if (target == m_route)
+        return showOverlay({});
+    return navigate(target);
 }
 
 bool AppController::cycleGuidePage(int direction)
@@ -267,11 +277,11 @@ bool AppController::copyScreenshotTo(const QString &sourcePath,
             || source.size() > 512LL * 1024 * 1024) {
         return false;
     }
-    const auto pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    if (pictures.isEmpty()) return false;
-    QDir screenshots(QDir(pictures).filePath(u"OpenNOW/Screenshots"_s));
+    const auto screenshotsPath = mediaScreenshotsDirectory();
+    if (screenshotsPath.isEmpty()) return false;
+    const QDir screenshots(screenshotsPath);
     if (!screenshots.exists()
-            || QDir::cleanPath(source.absolutePath()) != QDir::cleanPath(screenshots.absolutePath())) {
+            || QDir::cleanPath(source.absolutePath()) != QDir::cleanPath(screenshotsPath)) {
         return false;
     }
     const auto sourceSuffix = source.suffix().toLower();
@@ -326,14 +336,9 @@ QString AppController::captureScreenRegion(int x, int y, int width, int height,
     const auto image = screen->grabWindow(0, local.x(), local.y(), local.width(), local.height());
     if (image.isNull()) return {};
 
-    auto pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    if (pictures.isEmpty()) return {};
-    QDir directory(pictures);
-    if (!directory.mkpath(u"OpenNOW/Screenshots"_s)
-            || !directory.cd(u"OpenNOW"_s)
-            || !directory.cd(u"Screenshots"_s)) {
-        return {};
-    }
+    const auto screenshotsPath = mediaScreenshotsDirectory();
+    if (screenshotsPath.isEmpty() || !QDir().mkpath(screenshotsPath)) return {};
+    QDir directory(screenshotsPath);
     auto safeTitle = gameTitle.trimmed();
     safeTitle.replace(QRegularExpression(uR"([^A-Za-z0-9._-]+)"_s), u"-"_s);
     safeTitle = safeTitle.left(72).trimmed();
@@ -357,13 +362,9 @@ bool AppController::captureScreenRegionTo(int x, int y, int width, int height,
             || !output.completeBaseName().endsWith(u"-thumb"_s)) {
         return false;
     }
-    const auto pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    if (pictures.isEmpty()) return false;
-    QDir directory(pictures);
-    if (!directory.mkpath(u"OpenNOW/Recordings"_s)
-            || !directory.cd(u"OpenNOW"_s)
-            || !directory.cd(u"Recordings"_s)
-            || QDir::cleanPath(output.absolutePath()) != QDir::cleanPath(directory.absolutePath())) {
+    const auto recordingsPath = mediaRecordingsDirectory();
+    if (recordingsPath.isEmpty() || !QDir().mkpath(recordingsPath)
+            || QDir::cleanPath(output.absolutePath()) != QDir::cleanPath(recordingsPath)) {
         return false;
     }
 
@@ -403,6 +404,13 @@ bool AppController::ensureDirectLaunchAssociation() const
 #endif
 }
 
+void AppController::requestWindowAttention(QWindow *window) const
+{
+    if (window && !window->isActive()
+        && QGuiApplication::applicationState() != Qt::ApplicationActive)
+        window->alert(5000);
+}
+
 void AppController::activateWindow()
 {
     emit activationRequested();
@@ -411,6 +419,11 @@ void AppController::activateWindow()
 void AppController::quitApplication()
 {
     QCoreApplication::quit();
+}
+
+void AppController::restartApplication()
+{
+    emit restartRequested();
 }
 
 bool AppController::handleArguments(const QStringList &arguments)
@@ -543,7 +556,6 @@ const QStringList &AppController::primaryRoutes()
         u"library"_s,
         u"store"_s,
         u"friends"_s,
-        u"controllers"_s,
         u"settings"_s,
     };
     return value;

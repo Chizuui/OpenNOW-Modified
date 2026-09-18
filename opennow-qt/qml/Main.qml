@@ -20,6 +20,8 @@ ApplicationWindow {
     property string activeRoute: AppController.route
     readonly property var frameGenerationStats: activeRoute === "stream" && routeLoader.item
         ? (routeLoader.item.frameGenerationStats || ({})) : ({})
+    readonly property var swapStats: activeRoute === "stream" && routeLoader.item
+        ? (routeLoader.item.swapStats || ({})) : ({})
     readonly property string frameGenerationStatus: String(frameGenerationStats.status || "")
     readonly property string frameGenerationDiagnosticKey: [frameGenerationStatus,
         frameGenerationStats.timingSource || "none", frameGenerationStats.rejectionReason || "none",
@@ -39,6 +41,13 @@ ApplicationWindow {
     }
     property bool geometryRestored: false
     readonly property bool settingsLoaded: Object.keys(ShellStore.settings || {}).length > 0
+    readonly property bool onboardingVisible: ShellStore.signedIn
+        && !ShellStore.authRestorePending
+        && !ShellStore.onboardingReplaying
+        && (ShellStore.onboardingRequired || ShellStore.onboardingSaving
+            || ShellStore.onboardingError !== "")
+        && !ShellStore.activeSession
+        && ["stream", "inserting", "joining"].indexOf(activeRoute) < 0
     property bool consoleHeldByPad: false
     property bool pointerRecentlyActive: false
     property bool desktopSelectedByPointer: false
@@ -91,7 +100,7 @@ ApplicationWindow {
         "accounts", "profile-pin", "game-accounts", "persistent-storage", "media",
         "diagnostics", "feedback", "theme-store"].indexOf(activeRoute) < 0
     readonly property bool targetDesktopSurface: streamSurfaceLocked
-        ? lockedStreamDesktopSurface : desktopRequested && desktopEligibleRoute
+        ? lockedStreamDesktopSurface : onboardingVisible || (desktopRequested && desktopEligibleRoute)
     readonly property bool streamQmlOverlayActive: (activeRoute === "stream" || activeRoute === "inserting")
         && (AppController.overlay.startsWith("desktop-stream-")
             || AppController.overlay.startsWith("stream-stats"))
@@ -107,9 +116,6 @@ ApplicationWindow {
     readonly property string modePersistenceErrorForSmokeTest: ShellStore.lastError
     readonly property var streamerSnapshotForSmokeTest: ShellStore.streamer
     readonly property bool shellCaptureEnabledForSmokeTest: ControllerInput.shellCaptureEnabled
-    readonly property real designWidth: desktopSurfaceActive ? 1440 : 1920
-    readonly property real designHeight: desktopSurfaceActive ? 900 : 1080
-    readonly property real designScale: Math.min(width / designWidth, height / designHeight)
 
     Timer {
         id: geometrySaveTimer
@@ -153,6 +159,9 @@ ApplicationWindow {
 
     Connections {
         target: ShellStore
+        function onBackgroundStreamReminderRequested() {
+            AppController.requestWindowAttention(window)
+        }
         function onFullscreenToggleRequested() {
             if (window.activeRoute === "stream")
                 window.toggleFullscreen()
@@ -171,12 +180,12 @@ ApplicationWindow {
     Binding {
         target: ControllerInput
         property: "leftStickDeadzone"
-        value: Number(ShellStore.settings.controllerLeftStickDeadzone ?? 24)
+        value: Number(ShellStore.settings.controllerLeftStickDeadzone ?? 5)
     }
     Binding {
         target: ControllerInput
         property: "rightStickDeadzone"
-        value: Number(ShellStore.settings.controllerRightStickDeadzone ?? 27)
+        value: Number(ShellStore.settings.controllerRightStickDeadzone ?? 5)
     }
     Binding {
         target: ControllerInput
@@ -415,6 +424,7 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        Qt.callLater(() => CoreClient.markUiReady())
         initializeStartupMode()
         updateSessionWindowMode()
         updateStreamSurfaceLock()
@@ -522,23 +532,18 @@ ApplicationWindow {
         }
     }
 
-    FocusScope {
+    ShellViewport {
+        desktopSurfaceActive: window.desktopSurfaceActive
         layer.enabled: HdrOutput.chromeRequired && window.activeRoute !== "stream"
         layer.effect: HdrChromeEffect {}
-        x: window.desktopSurfaceActive ? 0 : Math.round((window.width - width * scale) / 2)
-        y: window.desktopSurfaceActive ? 0 : Math.round((window.height - height * scale) / 2)
-        width: window.desktopSurfaceActive ? window.width : window.designWidth
-        height: window.desktopSurfaceActive ? window.height : window.designHeight
-        scale: window.desktopSurfaceActive ? 1 : window.designScale
-        transformOrigin: Item.TopLeft
         focus: true
 
         Loader {
             id: routeLoader
             objectName: "mainRouteLoader"
             anchors.fill: parent
-            sourceComponent: window.desktopSurfaceActive
-                ? desktopAppScreen : window.componentForRoute(window.activeRoute)
+            sourceComponent: window.onboardingVisible ? onboardingScreen
+                : window.desktopSurfaceActive ? desktopAppScreen : window.componentForRoute(window.activeRoute)
             opacity: 1
 
             onLoaded: {
@@ -587,6 +592,10 @@ ApplicationWindow {
             target: ShellStore
             function onStreamerChanged() { window.showConfiguredStreamStats() }
             function onConsoleSurfaceRequested(enabled) { window.applyConsoleSurface(enabled) }
+            function onOnboardingCompleted() {
+                if (window.activeRoute === "sign-in")
+                    AppController.navigate("home")
+            }
             function onSettingsChanged() {
                 window.initializeStartupMode()
                 window.syncInputOwnership()
@@ -599,6 +608,10 @@ ApplicationWindow {
         }
 
         Keys.onPressed: event => {
+            if (window.onboardingVisible) {
+                event.accepted = true
+                return
+            }
             if (event.key === Qt.Key_F11 && window.activeRoute === "stream") {
                 window.toggleFullscreen()
                 event.accepted = true
@@ -639,11 +652,14 @@ ApplicationWindow {
         id: consoleOverlayHost
         layer.enabled: HdrOutput.chromeRequired
         layer.effect: HdrChromeEffect {}
-        readonly property real consoleScale: Math.min(window.width / 1920, window.height / 1080)
+        readonly property bool desktopSessionConflict: window.desktopSurfaceActive
+            && presentedOverlay === "session-conflict"
+        readonly property real consoleScale: desktopSessionConflict
+            ? 1 : Math.min(window.width / 1920, window.height / 1080)
         x: Math.round((window.width - width * consoleScale) / 2)
         y: Math.round((window.height - height * consoleScale) / 2)
-        width: 1920
-        height: 1080
+        width: desktopSessionConflict ? window.width : 1920
+        height: desktopSessionConflict ? window.height : 1080
         scale: consoleScale
         transformOrigin: Item.TopLeft
         overlay: AppController.overlay
@@ -654,10 +670,13 @@ ApplicationWindow {
 
     DesktopStreamOverlayHost {
         id: desktopStreamOverlay
+        notificationsEnabled: window.activeRoute === "stream"
+        connectionNotificationsEnabled: window.desktopSurfaceActive
         layer.enabled: HdrOutput.chromeRequired
         layer.effect: HdrChromeEffect {}
         anchors.fill: parent
         frameGenerationStats: window.frameGenerationStats
+        swapStats: window.swapStats
         pointerLocked: window.activeRoute === "stream" && routeLoader.item
             && routeLoader.item.streamPointerLocked === true
         overlay: AppController.overlay
@@ -816,7 +835,16 @@ ApplicationWindow {
         }
     }
 
+    UpdateFailureDialog {
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        failureMessage: ShellStore.updaterFailureMessage
+        sessionSafe: ShellStore.updaterSessionSafe
+        onDismissed: ShellStore.updaterFailureMessage = ""
+    }
+
     Component { id: desktopAppScreen; DesktopApp {} }
+    Component { id: onboardingScreen; DesktopOnboardingScreen {} }
     Component { id: homeScreen; HomeScreen {} }
     Component { id: libraryScreen; LibraryScreen {} }
     Component { id: storeScreen; StoreScreen {} }

@@ -6,7 +6,7 @@ QtObject {
     required property var appController
     required property bool ready
     required property bool signedIn
-    required property var reloadCatalogForSession
+    required property var refreshCatalogAfterAccountChange
     required property var refreshAccountServices
     signal accessibilityAnnounced(string message)
     property var subscription: null
@@ -27,6 +27,56 @@ QtObject {
     property string gameAccountActionRequestId: ""
     property string accountLinkStartRequestId: ""
     property string accountLinkPollRequestId: ""
+    property var acceptsScope: function(scope) { return true }
+    property var syncOperation: null
+    property string syncStatusRequestId: ""
+    property string syncCancelRequestId: ""
+    property var storeSubscriptions: []
+    property var catalogDefinitions: ({})
+    onReadyChanged: if (!ready) invalidateAccount()
+    function storeSubscriptionLabels(account) {
+        const items = catalogDefinitions.subscriptions && catalogDefinitions.subscriptions.items || []
+        const active = storeSubscriptions.map(item => item.id)
+        return items.filter(item => active.indexOf(item.subscription) >= 0
+            && (item.primaryStore === account.provider || (item.additionalStores || []).some(store => store.store === account.provider)))
+            .map(item => item.label).join(", ")
+    }
+    function gameAccountAction(account) {
+        if (!account) return "none"
+        if (account.supportsLinking && (!account.isConnected || account.status === "expired"
+                || (account.syncState === "SYNC_DENIED" && account.provider !== "STEAM"))) return "link"
+        if (account.supportsSync) return "sync"
+        if (account.isConnected && account.supportsLinking) return "unlink"
+        return "none"
+    }
+    property Timer syncPollTimer: Timer {
+        interval: 2000
+        repeat: false
+        onTriggered: root.pollSync()
+    }
+    property Connections syncResponses: Connections {
+        target: root.coreClient
+        function onResponseReceived(requestId, result) {
+            if (requestId === root.syncCancelRequestId && requestId !== "") {
+                root.syncCancelRequestId = ""
+                return
+            }
+            if (requestId !== root.syncStatusRequestId || requestId === "") return
+            root.syncStatusRequestId = ""
+            if (!root.acceptsScope(result.scope)) return
+            root.acceptSync(result)
+        }
+        function onRequestFailed(requestId, code, message) {
+            if (requestId === root.syncCancelRequestId && requestId !== "") {
+                root.syncCancelRequestId = ""
+                return
+            }
+            if (requestId !== root.syncStatusRequestId || requestId === "") return
+            root.syncStatusRequestId = ""
+            root.gameAccountMessage = qsTr("Could not check sync completion: %1").arg(message)
+            if (root.syncOperation && root.signedIn) root.syncPollTimer.restart()
+        }
+    }
     property Timer accountLinkPollTimer: Timer {
         interval: 1200
         repeat: true
@@ -37,6 +87,33 @@ QtObject {
     property string storageMessage: ""
     property string storageLocationsRequestId: ""
     property string storageResetRequestId: ""
+
+    function invalidateAccount() {
+        accountLinkPollTimer.stop()
+        syncPollTimer.stop()
+        for (const key of ["subscriptionRequestId", "regionsRequestId", "regionPingRequestId",
+                "gameAccountsRequestId", "gameAccountActionRequestId", "accountLinkStartRequestId",
+                "accountLinkPollRequestId", "syncStatusRequestId", "syncCancelRequestId", "storageLocationsRequestId", "storageResetRequestId"]) {
+            const requestId = root[key]
+            root[key] = ""
+            if (requestId !== "") coreClient.cancel(requestId)
+        }
+        subscription = null
+        regions = []
+        regionsVpcId = ""
+        regionPingPending = false
+        regionPingResults = ({})
+        regionPingMessage = ""
+        gameAccounts = []
+        gameAccountsState = "idle"
+        gameAccountMessage = ""
+        accountLinkAttempt = null
+        syncOperation = null
+        storeSubscriptions = []
+        catalogDefinitions = ({})
+        storageLocations = []
+        storageMessage = ""
+    }
 
     function refreshRegions() {
         if (!ready || !signedIn || regionsRequestId !== "")
@@ -106,10 +183,57 @@ QtObject {
     }
 
     function syncGameAccount(provider) {
-        if (!ready || gameAccountActionRequestId !== "")
+        if (!ready || gameAccountActionRequestId !== "" || syncOperation)
             return
         gameAccountMessage = qsTr("Starting library sync…")
         gameAccountActionRequestId = coreClient.request("account.connections.sync", { provider: provider }, 30000)
+    }
+
+    function pollSync() {
+        if (!ready || !signedIn || !syncOperation || syncStatusRequestId !== "") return
+        syncStatusRequestId = coreClient.request("account.connections.sync.status", {operationId: syncOperation.operationId}, 30000)
+    }
+
+    function cancelSyncObservation() {
+        syncPollTimer.stop()
+        const id = syncStatusRequestId
+        syncStatusRequestId = ""
+        if (id !== "") coreClient.cancel(id)
+        if (syncOperation && ready)
+            syncCancelRequestId = coreClient.request("account.connections.sync.cancel", {operationId: syncOperation.operationId}, 10000)
+        syncOperation = null
+        gameAccountMessage = qsTr("Stopped waiting. The remote store sync may still finish.")
+    }
+
+    function acceptSync(result) {
+        syncOperation = result
+        if (result.phase === "waiting_remote" || result.phase === "starting") {
+            gameAccountMessage = qsTr("Store sync accepted. Waiting for the store to finish…")
+            syncPollTimer.interval = Math.max(2000, Number(result.retryAfterMs || 2000))
+            syncPollTimer.restart()
+        } else if (result.phase === "refreshing_library") {
+            gameAccountMessage = qsTr("Store sync finished. Refreshing your library…")
+            refreshGameAccounts()
+            refreshCatalogAfterAccountChange()
+        } else {
+            syncOperation = null
+            syncPollTimer.stop()
+            gameAccountMessage = result.phase === "timed_out"
+                ? qsTr("Sync completion could not be confirmed. The store may still finish; refresh or retry later.")
+                : qsTr("The store could not complete the sync. Check the connection and try again.")
+            refreshGameAccounts()
+        }
+    }
+
+    function libraryRefreshFinished(complete, message) {
+        if (!syncOperation || syncOperation.phase !== "refreshing_library") return
+        if (complete) {
+            syncCancelRequestId = coreClient.request("account.connections.sync.status", {
+                operationId: syncOperation.operationId, libraryRefreshed: true
+            }, 10000)
+            syncOperation = null
+            gameAccountMessage = qsTr("Store sync and library refresh completed.")
+        } else gameAccountMessage = qsTr("Store sync finished, but the library refresh is incomplete: %1").arg(message)
     }
 
     function unlinkGameAccount(provider) {
@@ -206,7 +330,8 @@ QtObject {
         root.gameAccountsRequestId = ""
         root.gameAccounts = result.accounts || []
         root.gameAccountsState = "ready"
-        root.gameAccountMessage = qsTr("")
+        root.storeSubscriptions = result.subscriptions || []
+        root.catalogDefinitions = result.definitions || ({})
     }
 
     function failGameAccounts(message) {
@@ -217,9 +342,13 @@ QtObject {
 
     function acceptGameAccountAction(result) {
         root.gameAccountActionRequestId = ""
+        if (result.operationId) {
+            acceptSync(result)
+            return
+        }
         root.gameAccountMessage = result.message || qsTr("Account updated")
         root.refreshGameAccounts()
-        root.reloadCatalogForSession()
+        root.refreshCatalogAfterAccountChange()
     }
 
     function failGameAccountAction(message) {
@@ -247,6 +376,8 @@ QtObject {
         root.accountLinkPollRequestId = ""
         const status = result.status || "error"
         if (status === "pending") {
+            if (result.phase === "verifying_account")
+                root.gameAccountMessage = qsTr("Sign-in received. Confirming the store connection…")
             return
         }
         root.accountLinkPollTimer.stop()
@@ -254,7 +385,7 @@ QtObject {
         if (status === "complete") {
             root.gameAccountMessage = qsTr("Account connected")
             root.refreshGameAccounts()
-            root.reloadCatalogForSession()
+            root.refreshCatalogAfterAccountChange()
         } else {
             root.gameAccountMessage = result.message || qsTr("Account linking expired")
         }

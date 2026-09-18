@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define OPENNOW_STREAMER_FFI_ABI_VERSION 9u
+#define OPENNOW_STREAMER_FFI_ABI_VERSION 11u
 #define OPENNOW_STREAMER_MAX_TEXT_BYTES 65536u
 #define OPENNOW_STREAMER_VULKAN_DEVICE_INFO_VERSION 1u
 #define OPENNOW_STREAMER_GRAPHICS_CONTEXT_VERSION 3u
@@ -69,6 +69,8 @@ typedef struct OpenNowStreamerConfig {
     OpenNowStreamerCallback cursor_callback;
     void *user_data;
     const OpenNowStreamerVulkanDevice *vulkan_device;
+    /* Packed Windows LUID bits. Zero selects the system default adapter. */
+    uint64_t windows_adapter_luid;
 } OpenNowStreamerConfig;
 
 /*
@@ -140,6 +142,40 @@ typedef struct OpenNowStreamerRecordedFrame {
     uint64_t presentation_time_ns;
 } OpenNowStreamerRecordedFrame;
 
+#define OPENNOW_STREAMER_SDL_MAX_SOURCES 4u
+#define OPENNOW_STREAMER_SONY_CONTACTS 2u
+#define OPENNOW_STREAMER_SONY_SNAPSHOT_VERSION 1u
+
+typedef struct OpenNowSdlDeviceClaim {
+    uint8_t slot;
+    uint8_t reserved[7];
+    uint64_t incarnation;
+    uint16_t vendor;
+    uint16_t product;
+} OpenNowSdlDeviceClaim;
+
+typedef struct OpenNowSonySnapshot {
+    uint32_t version;
+    size_t struct_size;
+    uint8_t slot;
+    uint8_t touchpad_click;
+    uint8_t reserved[2];
+    uint64_t incarnation;
+    uint16_t buttons;
+    uint8_t left_trigger;
+    uint8_t right_trigger;
+    int16_t left_stick_x;
+    int16_t left_stick_y;
+    int16_t right_stick_x;
+    int16_t right_stick_y;
+    uint8_t contact_active[OPENNOW_STREAMER_SONY_CONTACTS];
+    uint8_t reserved2[2];
+    float contact_x[OPENNOW_STREAMER_SONY_CONTACTS];
+    float contact_y[OPENNOW_STREAMER_SONY_CONTACTS];
+    uint32_t reserved3;
+    uint64_t observed_at_us;
+} OpenNowSonySnapshot;
+
 typedef enum OpenNowStreamerStatus {
     OPENNOW_STREAMER_OK = 0,
     OPENNOW_STREAMER_NULL_POINTER = 1,
@@ -154,6 +190,8 @@ typedef enum OpenNowStreamerStatus {
     OPENNOW_STREAMER_RENDER_FAILED = 10,
     OPENNOW_STREAMER_SCENE_GRAPH_ACTIVE = 11,
     OPENNOW_STREAMER_FRAME_ALREADY_RECORDED = 12,
+    OPENNOW_STREAMER_SONY_INACTIVE = 13,
+    OPENNOW_STREAMER_SDL_CLAIM_REJECTED = 14,
     OPENNOW_STREAMER_PANIC = 255
 } OpenNowStreamerStatus;
 
@@ -232,6 +270,15 @@ OpenNowStreamerStatus opennow_streamer_submit_gamepad(
     int16_t left_stick_y,
     int16_t right_stick_x,
     int16_t right_stick_y);
+
+OpenNowStreamerStatus opennow_streamer_replace_sdl_device_claims(
+    const OpenNowStreamer *handle,
+    const OpenNowSdlDeviceClaim *claims,
+    size_t claim_count);
+
+OpenNowStreamerStatus opennow_streamer_submit_sony_snapshot(
+    const OpenNowStreamer *handle,
+    const OpenNowSonySnapshot *snapshot);
 
 OpenNowStreamerStatus opennow_streamer_submit_local_action(
     const OpenNowStreamer *handle,

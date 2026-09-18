@@ -10,6 +10,19 @@ FocusScope {
     readonly property string artwork: game.heroImageUrl || game.imageUrl || ""
     readonly property bool canLaunch: Boolean(previewGame) || !ShellStore.signedIn || ShellStore.selectedLaunchAppId() !== ""
 
+    Keys.onPressed: event => {
+        if (platformPicker.expanded)
+            return
+        if (event.key === Qt.Key_Y) {
+            if (!event.isAutoRepeat)
+                ShellStore.toggleFavorite(root.game)
+        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (!event.isAutoRepeat)
+                play.click()
+        } else return
+        event.accepted = true
+    }
+
     function aspectLabel(resolution) {
         const parts = String(resolution || "").split("x")
         if (parts.length !== 2)
@@ -42,7 +55,7 @@ FocusScope {
     }
 
     function regionLabel() {
-        const selected = String(ShellStore.settings.region || "")
+        const selected = String(ShellStore.selectedRegion || "")
         if (selected.length)
             return selected
         return qsTr("Automatic region")
@@ -82,11 +95,11 @@ FocusScope {
     }
 
     GlassPanel {
-        x: 1146; y: 297; width: 560; height: 464; panelRadius: 34
+        x: 1146; y: 225; width: 560; height: 650; panelRadius: 34
         Text {
             x: 28; y: 28; width: 504; height: 52
             wrapMode: Text.WordWrap; elide: Text.ElideRight; maximumLineCount: 2
-            text: root.game.longDescription || root.game.description || qsTr("Stream this title from your GeForce NOW library with your controller, keyboard, or mouse.")
+            text: ShellStore.readinessNotice(root.game) || root.game.longDescription || root.game.description || qsTr("Stream this title from your GeForce NOW library with your controller, keyboard, or mouse.")
             color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: 18; font.weight: Font.DemiBold
         }
         Row {
@@ -110,7 +123,7 @@ FocusScope {
             id: platformPicker
             x: 28; y: 205; width: 504
             variants: root.game.variants || []
-            currentIndex: Math.max(0, Number(root.game.selectedVariantIndex || 0))
+            currentIndex: Number(root.game.selectedVariantIndex || 0)
             KeyNavigation.down: play
             onVariantSelected: index => root.selectVariant(index)
         }
@@ -134,13 +147,29 @@ FocusScope {
         }
         Row {
             x: 28; y: 378; width: 504; spacing: 10
-            GlassButton { id: play; width: 215; height: 56; text: ShellStore.signedIn ? (root.canLaunch ? qsTr("Play") : qsTr("Unavailable")) : qsTr("Sign in"); glyph: "A"; primary: true; enabled: root.canLaunch; KeyNavigation.up: platformPicker; onClicked: { if (!root.previewGame) ShellStore.launchSelectedGame() } Component.onCompleted: forceActiveFocus() }
-            GlassButton { width: 279; height: 56; text: ShellStore.isFavorite(root.game) ? qsTr("Remove from My games") : qsTr("Add to My games"); glyph: "Y"; onClicked: ShellStore.toggleFavorite(root.game) }
+            GlassButton { id: play; objectName: "consolePlayButton"; width: 260; height: 56; text: ShellStore.selectedGameActionLabel(); glyph: "A"; primary: true; enabled: root.canLaunch && !ShellStore.cloudMutationBusy; KeyNavigation.up: platformPicker; KeyNavigation.right: favoriteButton; onClicked: { if (!root.previewGame) ShellStore.activateSelectedGame() } Component.onCompleted: forceActiveFocus() }
+            GlassButton { id: favoriteButton; objectName: "consoleFavoriteButton"; width: 234; height: 56; text: ShellStore.isFavorite(root.game) ? qsTr("Remove from Home") : qsTr("Pin to Home"); glyph: "Y"; KeyNavigation.left: play; onClicked: ShellStore.toggleFavorite(root.game) }
+        }
+        Flickable {
+            x: 28; y: 446; width: 504; height: 182
+            contentHeight: cloudActions.height
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {}
+            CloudLibraryActions { id: cloudActions; width: parent.width; game: root.game }
         }
     }
     Component.onCompleted: {
         if (initialPlatformOpen)
             Qt.callLater(platformPicker.openMenu)
     }
-    AppChrome { anchors.fill: parent; title: root.game.title; currentRoute: "home"; onRouteRequested: route => AppController.navigate(route) }
+    AppChrome {
+        anchors.fill: parent
+        title: root.game.title
+        currentRoute: "home"
+        leftHints: [{glyph: "Y", label: favoriteButton.text},
+                    {glyph: "B", label: qsTr("Back")}]
+        rightHints: [{glyph: "A", label: play.text}]
+        onRouteRequested: route => AppController.navigate(route)
+    }
 }

@@ -1,9 +1,12 @@
 #include "app/AppController.h"
+#include "app/platform/GraphicsDeviceSelection.h"
 #include "acceptance/AcceptanceSession.h"
 #include "app/ApplicationStartup.h"
+#include "app/platform/MacAwdlController.h"
 #include "input/ControllerInput.h"
 #include "core/CoreClient.h"
 #include "input/InputModeTracker.h"
+#include "input/SonySnapshotWire.h"
 #include "localization/Localization.h"
 #include "streaming/rendering/LinuxVulkanGraphics.h"
 #include "streaming/rendering/HdrOutput.h"
@@ -16,7 +19,9 @@
 #include "media/ThumbnailGenerator.h"
 
 #include <QGuiApplication>
+#include <QIcon>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <QFont>
 #include <QFontDatabase>
 #include <QQmlApplicationEngine>
@@ -27,6 +32,7 @@
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QFileOpenEvent>
+#include <QProcess>
 
 #include <cstdlib>
 
@@ -60,7 +66,7 @@ private:
 };
 }
 
-int runApplication(int argc, char *argv[])
+static int runApplicationSession(int argc, char *argv[], QString &restartExecutable)
 {
     qputenv("QT_TLS_BACKEND", "schannel");
     QElapsedTimer startupTimer;
@@ -81,6 +87,11 @@ int runApplication(int argc, char *argv[])
     QQuickStyle::setStyle(u"Basic"_s);
 
     QGuiApplication application(argc, argv);
+    QGuiApplication::setDesktopFileName(u"io.github.opencloudgaming.OpenNOW"_s);
+    QIcon applicationIcon;
+    for (const int size : {16, 24, 32, 48, 64, 128, 256, 512, 1024})
+        applicationIcon.addFile(u":/icons/opennow-%1.png"_s.arg(size), QSize(size, size));
+    QGuiApplication::setWindowIcon(applicationIcon);
 #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
     LinuxVulkanGraphics::requestDeviceExtensions();
 #endif
@@ -107,6 +118,15 @@ int runApplication(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
     AppController controller;
+    QObject::connect(&controller, &AppController::restartRequested, &application, [&] {
+        restartExecutable = QCoreApplication::applicationFilePath();
+#ifdef Q_OS_LINUX
+        const auto appImage = qEnvironmentVariable("APPIMAGE");
+        if (!appImage.isEmpty())
+            restartExecutable = appImage;
+#endif
+        application.quit();
+    });
     if (!controller.ensureDirectLaunchAssociation())
         qWarning("Could not register the opennow:// direct-launch association");
     FileOpenFilter fileOpenFilter(&controller);
@@ -116,6 +136,16 @@ int runApplication(int argc, char *argv[])
     Localization localization;
     application.installTranslator(&localization);
     CoreClient coreClient;
+    const auto coreProgram = AcceptanceSession::coreProgram(arguments);
+    GraphicsDeviceSelection graphicsDevices(GraphicsDeviceSelection::detectAdapters(),
+#ifdef Q_OS_WIN
+                                             CoreClient::graphicsPreference(coreProgram)
+#else
+                                             QString{}
+#endif
+    );
+    QObject::connect(&localization, &Localization::localeChanged,
+                     &graphicsDevices, &GraphicsDeviceSelection::choicesChanged);
 #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
     NativeStreamRuntime::initializeDiagnostics();
     LinuxVulkanGraphics::Device vulkanDevice;
@@ -125,10 +155,13 @@ int runApplication(int argc, char *argv[])
                  qUtf8Printable(vulkanDevice.lastError()));
 #endif
 #ifdef OPENNOW_EMBEDDED_STREAMER
-    NativeStreamRuntime nativeStreamRuntime(nullptr
+    NativeStreamRuntime nativeStreamRuntime(nullptr,
 #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
-                                           , vulkanDevice.handle()
+                                           vulkanDevice.handle(),
+#else
+                                           nullptr,
 #endif
+                                           graphicsDevices.adapterLuid()
     );
     if (!nativeStreamRuntime.start())
         qWarning("Could not start the embedded streamer runtime: %s",
@@ -152,6 +185,16 @@ int runApplication(int argc, char *argv[])
                      &nativeStreamRuntime, [&nativeStreamRuntime](quint32 action) {
                          nativeStreamRuntime.submitLocalAction(action);
                      });
+    QObject::connect(&controllerInput, &ControllerInput::deviceClaimsChanged,
+                     &nativeStreamRuntime, [&controllerInput, &nativeStreamRuntime] {
+                         nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
+                     });
+    QObject::connect(
+        &controllerInput, &ControllerInput::sonySnapshot, &nativeStreamRuntime,
+        [&nativeStreamRuntime](const ControllerInput::SonySnapshot &snapshot) {
+            nativeStreamRuntime.submitSonySnapshot(openNowWireSonySnapshot(snapshot));
+        });
+    nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
 #endif
     InputModeTracker inputModeTracker(&controller);
     application.installEventFilter(&inputModeTracker);
@@ -177,8 +220,18 @@ int runApplication(int argc, char *argv[])
     QObject::connect(&localization, &Localization::localeChanged, &hdrOutput, &HdrOutput::changed);
     QObject::connect(&hdrOutput, &HdrOutput::changed, &coreClient, [&] {
         coreClient.setNativeHdrSupported(hdrOutput.supported());
+        const auto display = hdrOutput.displayData();
+        CoreClient::NativeHdrDisplay snapshot;
+        snapshot.available = display.available;
+        snapshot.minimumNits = display.minimumNits;
+        snapshot.maximumNits = display.maximumNits;
+        coreClient.setNativeHdrDisplay(snapshot);
     });
     qmlRegisterType<HdrChromeEffect>("OpenNOW", 1, 0, "HdrChromeEffect");
+    qmlRegisterType<QTimer>("OpenNOW", 1, 0, "NativeTimer");
+    qmlRegisterUncreatableType<MacAwdlController>("OpenNOW", 1, 0, "MacAwdlController",
+                                                u"Use the application-owned MacAwdl instance"_s);
+    MacAwdlController macAwdl;
     QQmlApplicationEngine engine;
     engine.setInitialProperties({{u"visible"_s, false}, {u"visibility"_s, QWindow::Hidden}});
     AcceptanceSession acceptance(application, engine, controller, coreClient, arguments);
@@ -187,7 +240,9 @@ int runApplication(int argc, char *argv[])
     engine.rootContext()->setContextProperty(u"ThumbnailGenerator"_s, &thumbnailGenerator);
     engine.rootContext()->setContextProperty(u"I18n"_s, &localization);
     engine.rootContext()->setContextProperty(u"CoreClient"_s, &coreClient);
+    engine.rootContext()->setContextProperty(u"GraphicsDevices"_s, &graphicsDevices);
     engine.rootContext()->setContextProperty(u"HdrOutput"_s, &hdrOutput);
+    engine.rootContext()->setContextProperty(u"MacAwdl"_s, &macAwdl);
 #ifdef OPENNOW_EMBEDDED_STREAMER
     engine.rootContext()->setContextProperty(u"NativeStreamRuntime"_s,
                                              &nativeStreamRuntime);
@@ -205,6 +260,10 @@ int runApplication(int argc, char *argv[])
     engine.loadFromModule(u"OpenNOW"_s, u"Main"_s);
     auto *rootWindow = engine.rootObjects().isEmpty() ? nullptr
         : qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+    if (!graphicsDevices.applyTo(rootWindow)) {
+        qCritical("Could not select the graphics adapter before scene-graph initialization");
+        return EXIT_FAILURE;
+    }
     hdrOutput.attach(rootWindow);
 #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
     if (vulkanDevice.handle() && !vulkanDevice.adopt(rootWindow)) {
@@ -241,22 +300,7 @@ int runApplication(int argc, char *argv[])
     if (acceptance.measureStartup(startupTimer, qmlReadyMs) != EXIT_SUCCESS)
         return EXIT_FAILURE;
 
-    const auto coreIndex = arguments.indexOf(u"--core"_s);
-    if (acceptance.allowsExplicitCore()
-            && coreIndex >= 0 && coreIndex + 1 < arguments.size()) {
-        coreClient.start(arguments.at(coreIndex + 1));
-    } else if (acceptance.allowsBundledCore()) {
-        const auto bundledCore = QDir(QCoreApplication::applicationDirPath()).filePath(
-#ifdef Q_OS_WIN
-            u"opennow-core.exe"_s
-#else
-            u"opennow-core"_s
-#endif
-        );
-        if (QFileInfo::exists(bundledCore)) {
-            coreClient.start(bundledCore);
-        }
-    }
+    if (!coreProgram.isEmpty()) coreClient.start(coreProgram);
 
     if (acceptance.startWorkload() != EXIT_SUCCESS) return EXIT_FAILURE;
 
@@ -270,5 +314,18 @@ int runApplication(int argc, char *argv[])
                  qUtf8Printable(nativeStreamRuntime.lastError()));
     }
 #endif
+    return exitCode;
+}
+
+int runApplication(int argc, char *argv[])
+{
+    QString restartExecutable;
+    const auto exitCode = runApplicationSession(argc, argv, restartExecutable);
+    if (restartExecutable.isEmpty())
+        return exitCode;
+    if (!QProcess::startDetached(restartExecutable, {}, QFileInfo(restartExecutable).absolutePath())) {
+        qCritical("Could not restart OpenNOW. Reopen the application to continue setup.");
+        return EXIT_FAILURE;
+    }
     return exitCode;
 }

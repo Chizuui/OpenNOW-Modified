@@ -4,6 +4,8 @@ pub(crate) const FRAME_ACK_CODE: u16 = 0x204;
 pub(crate) const FRAME_PACING_CODE: u16 = 0x203;
 pub(crate) const QOS_REPORT_CODE: u16 = 0x207;
 pub(crate) const IDR_REQUEST_CODE: u16 = 0x302;
+pub(crate) const NACK_V2_CODE: u16 = 0x317;
+pub(crate) const MAX_NACK_PACKET_COUNT: usize = 64;
 
 pub(crate) const FRAME_ACK_PAYLOAD_LEN: usize = 102;
 pub(crate) const FRAME_PACING_PAYLOAD_LEN: usize = 28;
@@ -33,23 +35,49 @@ impl NvstControlCommand {
     }
 }
 
+pub(crate) fn nack_v2(stream_index: u8, missing: &[u16]) -> Option<NvstControlCommand> {
+    if missing.is_empty() || missing.len() > MAX_NACK_PACKET_COUNT {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(3 + missing.len() * 10);
+    payload.extend_from_slice(&[2, stream_index, 0]);
+    let mut base = missing[0];
+    let mut bitmap = 0_u64;
+    for &sequence in &missing[1..] {
+        let distance = sequence.wrapping_sub(base);
+        if distance == 0 {
+            continue;
+        }
+        if distance <= 64 {
+            bitmap |= 1_u64 << (distance - 1);
+        } else {
+            payload.extend_from_slice(&base.to_le_bytes());
+            payload.extend_from_slice(&bitmap.to_le_bytes());
+            payload[2] += 1;
+            base = sequence;
+            bitmap = 0;
+        }
+    }
+    payload.extend_from_slice(&base.to_le_bytes());
+    payload.extend_from_slice(&bitmap.to_le_bytes());
+    payload[2] += 1;
+    Some(NvstControlCommand {
+        code: NACK_V2_CODE,
+        payload,
+    })
+}
+
 pub(crate) fn frame_ack(
     frame_number: u32,
     client_time_ms: f64,
     frame_bytes: u32,
     frame_time_us: u32,
-    measured_stage_ms: Option<f32>,
 ) -> NvstControlCommand {
     let mut payload = vec![0; FRAME_ACK_PAYLOAD_LEN];
     put_u16(&mut payload, 0, 1);
     put_u16(&mut payload, 2, 9);
     put_u32(&mut payload, 4, frame_number);
     put_u64(&mut payload, 12, client_time_ms.to_bits());
-    if let Some(stage_ms) = measured_stage_ms.filter(|value| value.is_finite() && *value >= 0.0) {
-        for offset in (28..=44).step_by(4) {
-            put_u32(&mut payload, offset, stage_ms.to_bits());
-        }
-    }
     put_u32(&mut payload, 48, (-1.0_f32).to_bits());
     put_u32(&mut payload, 72, frame_bytes);
     put_u32(&mut payload, 84, 16_384);
@@ -78,6 +106,7 @@ pub(crate) fn frame_pacing_report(
     }
 }
 
+#[derive(Debug, Default)]
 pub(crate) struct QosReport {
     pub(crate) sequence: u32,
     pub(crate) frames_received: u32,
@@ -99,6 +128,15 @@ impl QosReport {
         put_u16(&mut payload, 32, 1_000);
         put_u16(&mut payload, 34, 12_708);
         put_u32(&mut payload, 36, self.rtp_timestamp);
+        if self.warmed_up {
+            put_u32(
+                &mut payload,
+                44,
+                self.bytes_received
+                    .wrapping_sub(self.previous_bytes_received)
+                    .saturating_mul(8),
+            );
+        }
         put_u32(&mut payload, 48, self.previous_bytes_received);
         NvstControlCommand {
             code: QOS_REPORT_CODE,
@@ -151,6 +189,82 @@ mod tests {
     }
 
     #[test]
+    fn nack_v2_encodes_the_implicit_base_without_a_bitmap_bit() {
+        let command = nack_v2(0, &[0x1234]).unwrap();
+        assert_eq!(command.code, NACK_V2_CODE);
+        assert_eq!(command.encoded(), hex("17030d0002000134120000000000000000"));
+    }
+
+    #[test]
+    fn nack_v2_uses_all_64_bitmap_bits_before_starting_another_record() {
+        let command = nack_v2(7, &[0x1234, 0x1235, 0x1274, 0x1275]).unwrap();
+        assert_eq!(
+            command.encoded(),
+            hex("170317000207023412010000000000008075120000000000000000")
+        );
+    }
+
+    #[test]
+    fn nack_v2_groups_across_sequence_wrap_without_requesting_the_holes() {
+        let command = nack_v2(0, &[65534, 65535, 0, 62, 63]).unwrap();
+        assert_eq!(
+            command.encoded(),
+            hex("17031700020002feff03000000000000803f000000000000000000")
+        );
+    }
+
+    #[test]
+    fn nack_v2_bounds_missing_packets_not_sequence_span_or_record_count() {
+        assert!(nack_v2(0, &[]).is_none());
+        assert!(nack_v2(0, &[0; MAX_NACK_PACKET_COUNT + 1]).is_none());
+        let contiguous: Vec<u16> = (0..64).collect();
+        assert_eq!(
+            nack_v2(0, &contiguous).unwrap().encoded(),
+            hex("17030d000200010000ffffffffffffff7f")
+        );
+        let sparse: Vec<u16> = (0..64).map(|index| index * 65).collect();
+        let command = nack_v2(0, &sparse).unwrap();
+        assert_eq!(command.payload.len(), 643);
+        assert_eq!(&command.encoded()[..7], &[0x17, 3, 0x83, 2, 2, 0, 64]);
+        for (record, sequence) in command.payload[3..].chunks_exact(10).zip(sparse) {
+            assert_eq!(&record[..2], &sequence.to_le_bytes());
+            assert_eq!(&record[2..], &[0; 8]);
+        }
+    }
+
+    #[test]
+    fn nack_v2_round_trip_preserves_only_requested_sequences() {
+        use std::collections::BTreeSet;
+
+        for base in [0_u16, 1, 32767, 65534, 65535] {
+            for step in [0_u16, 1, 2, 64, 65, 127, 4095, 65535] {
+                for count in 1..=MAX_NACK_PACKET_COUNT {
+                    let missing: Vec<u16> = (0..count)
+                        .map(|index| base.wrapping_add((index as u16).wrapping_mul(step)))
+                        .collect();
+                    let command = nack_v2(3, &missing).unwrap();
+                    assert_eq!(
+                        command.payload.len(),
+                        3 + usize::from(command.payload[2]) * 10
+                    );
+                    let mut decoded = BTreeSet::new();
+                    for record in command.payload[3..].chunks_exact(10) {
+                        let base = u16::from_le_bytes(record[..2].try_into().unwrap());
+                        let bitmap = u64::from_le_bytes(record[2..].try_into().unwrap());
+                        decoded.insert(base);
+                        for bit in 0..64 {
+                            if bitmap & (1_u64 << bit) != 0 {
+                                decoded.insert(base.wrapping_add(bit + 1));
+                            }
+                        }
+                    }
+                    assert_eq!(decoded, missing.into_iter().collect());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn frame_pacing_report_matches_the_source_test_vector() {
         let command = frame_pacing_report(1, 16_000, 16_000);
         assert_eq!(command.code, FRAME_PACING_CODE);
@@ -163,7 +277,7 @@ mod tests {
 
     #[test]
     fn frame_ack_places_only_source_pinned_fields() {
-        let command = frame_ack(42, 20_320.16, 15_168, 16_667, Some(4.5));
+        let command = frame_ack(42, 20_320.16, 15_168, 16_667);
         assert_eq!(command.code, FRAME_ACK_CODE);
         assert_eq!(command.payload.len(), FRAME_ACK_PAYLOAD_LEN);
         assert_eq!(&command.payload[0..4], &[1, 0, 9, 0]);
@@ -175,12 +289,7 @@ mod tests {
             u64::from_le_bytes(command.payload[12..20].try_into().unwrap()),
             20_320.16_f64.to_bits()
         );
-        for offset in (28..=44).step_by(4) {
-            assert_eq!(
-                u32::from_le_bytes(command.payload[offset..offset + 4].try_into().unwrap()),
-                4.5_f32.to_bits()
-            );
-        }
+        assert!(command.payload[28..48].iter().all(|byte| *byte == 0));
         assert_eq!(
             u32::from_le_bytes(command.payload[48..52].try_into().unwrap()),
             (-1.0_f32).to_bits()
@@ -201,14 +310,14 @@ mod tests {
         assert_eq!(
             command.payload,
             hex(
-                "010009002a00000000000000d7a3703d0ad8d34000000000000000000000904000009040000090400000904000009040000080bf0000000000000000000000000000000000000000403b000000000000000000000040000000000000000000001b4100000000"
+                "010009002a00000000000000d7a3703d0ad8d34000000000000000000000000000000000000000000000000000000000000080bf0000000000000000000000000000000000000000403b000000000000000000000040000000000000000000001b4100000000"
             )
         );
     }
 
     #[test]
-    fn frame_ack_leaves_unavailable_stage_metrics_zero() {
-        let command = frame_ack(1, 0.0, 7, DEFAULT_FRAME_TIME_US, None);
+    fn frame_ack_never_writes_a_measured_value_into_unpinned_stage_slots() {
+        let command = frame_ack(1, 0.0, 7, DEFAULT_FRAME_TIME_US);
         assert!(command.payload[28..48].iter().all(|byte| *byte == 0));
     }
 

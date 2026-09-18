@@ -1,0 +1,86 @@
+# Activate nightly update signing
+
+Publication requires a protected `qt-update-signing` environment and an installed
+production key. Each signing job runs separately on `blacksmith-2vcpu-ubuntu-2404`;
+no manually registered `opennow-release-signer` is needed. The workflow does not
+create the environment, configure its protections, or install a production key.
+
+## Configure the protected signer
+
+1. In the repository's Settings → Environments, create `qt-update-signing`.
+2. Enable required reviewers and prevent self-review. Disable administrator bypass
+   where the repository plan permits it.
+3. Restrict deployment branches and tags to the protected release refs your reviewers
+   approve. For nightly dispatches from `dev`, explicitly allow protected `dev`.
+   Do not allow unreviewed feature branches or pull-request refs.
+4. Enable Blacksmith for this repository and retain the separate signing jobs on
+   `blacksmith-2vcpu-ubuntu-2404`. Do not combine signing with platform build or test jobs.
+5. Keep signing workspaces uncached. Each signing job checks for Python 3.11 or newer,
+   OpenSSL 3, `jq`, and GNU checksum tools before accessing the seed. Do not execute
+   candidate programs on the signer. Both jobs have a 30-minute deadline.
+6. Retain the existing production Ed25519 key outside CI; do not generate a replacement
+   for already deployed clients. Add only its canonical
+   base64-encoded 32-byte private seed as the environment secret
+   `OPENNOW_UPDATE_ED25519_PRIVATE_KEY`. Do not put the seed in repository secrets,
+   workflow inputs, CMake arguments, build artifacts, logs, or a developer message.
+7. Use the public key recorded in `opennow-qt/packaging/update-public-key.base64` for dispatches.
+   The public key is not secret. The signing job derives it independently from the
+   seed and rejects a mismatch.
+
+Environment protections are part of the trust boundary. GitHub can create an environment
+name referenced by a workflow without adding protections. Verify the reviewer and ref
+rules before the first dispatch; the YAML cannot enforce those server-side settings.
+Reviewers must approve the exact dispatched source/workflow revision and inspect its
+workflow and packaging/signing scripts before allowing access to the seed. The signer
+checks out only that immutable revision, with persisted Git credentials disabled, and
+treats downloaded packages as data. Never execute downloaded artifacts or candidate
+programs on the signer. Only the approved release tooling may run there.
+
+## Publish the first update-enabled nightly
+
+1. Select the reviewed protected revision in GitHub Actions → qt-ci → Run workflow.
+2. Retain the default production `public_key` and set `publish_nightly` to `true`.
+3. Wait for shared checks, all platform checks, and the complete package build to pass.
+4. Inspect the source commit, nine packages, and two AppImage sidecars before approving the
+   `qt-update-signing` deployment.
+5. Confirm that the publisher verifies the signed set and uploads all 24 files before
+   making the draft prerelease public. These are nine packages, two sidecars, eleven sibling manifests,
+   `RELEASE-INFO.json`, and `SHA256SUMS`.
+
+For artifact-only testing, leave `publish_nightly` false. An empty `public_key` is
+allowed only for that non-public path. The resulting build cannot download updates
+because its signature policy remains `unconfigured-fail-closed`.
+
+Users running an earlier nightly without a pinned key must manually download and
+install the first update-enabled nightly once. That older application cannot securely
+learn a trust key from release metadata. Do not bypass signature checks to bootstrap it.
+Later updates require manifests signed by the already pinned key.
+
+Update-manifest signing does not remove Windows publisher warnings or macOS Gatekeeper
+warnings. The platform packages remain unsigned. Nightly release notes use GitHub-generated
+changelogs; installation guidance and known limitations are documented in
+[`qt-nightly-release.md`](qt-nightly-release.md). Update signing does not fix partner
+authentication or streaming compatibility.
+
+## Verify the repository contract without production credentials
+
+Run the packaging and workflow tests:
+
+```sh
+python3 -m venv build/icon-tools
+build/icon-tools/bin/python -m pip install -r opennow-qt/packaging/icon-requirements.txt
+build/icon-tools/bin/python -m unittest discover -s opennow-qt/tests -p 'test_*.py'
+actionlint -color=false .github/workflows/qt-ci.yml .github/workflows/qt-checks.yml \
+  .github/workflows/qt-build.yml .github/workflows/qt-release-candidate.yml
+```
+
+The signing tests generate ephemeral test-only keys, sign and verify all eleven fixture
+nightly assets with OpenSSL. Candidate promotion tests exercise the production candidate's
+signing script with twelve fixture assets. Both reject mismatched keys, incomplete inventories, changed
+packages, changed manifests, and invalid public inputs. No production seed is needed.
+
+The platform-check action also runs `opennow-qt/tests/run_update_helper_integration.py`
+with `python` on Windows x64 and `python3` on Linux x64 and macOS ARM64. That driver
+builds the helper and candidate fixtures in a temporary Cargo target directory and
+runs all four signed-helper integration tests with an ephemeral key. It runs only
+on platform test workers, never on the protected release signer.

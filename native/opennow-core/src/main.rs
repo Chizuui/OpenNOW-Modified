@@ -2,17 +2,24 @@
 
 mod account_connections;
 mod artwork_cache;
+mod catalog_types;
 mod cloudmatch;
 mod community;
 mod console_profiles;
 mod credential_vault;
+mod device_identity;
 mod diagnostics;
 mod discord;
+mod frame_rate;
 mod gfn;
+mod language;
 mod media;
 mod network;
+mod network_test;
 mod persistent_storage;
 mod proxy;
+mod push_registry;
+mod queue_servers;
 mod requests;
 mod server_vpc_cache;
 mod settings;
@@ -27,6 +34,7 @@ mod updater;
 mod version;
 
 use gfn::GfnService;
+use opennow_core::update_apply;
 use rand::RngCore;
 use serde_json::{Value, json};
 use settings::{SettingsStore, resolve_data_dir};
@@ -38,17 +46,19 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use streamer::StreamerService;
 
-const PROTOCOL_VERSION: i64 = 1;
+const PROTOCOL_VERSION: i64 = 5;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 
 struct AppCore {
+    session_update_gate: Mutex<()>,
     artwork: artwork_cache::ArtworkCache,
     settings: Mutex<SettingsStore>,
-    gfn: GfnService,
+    gfn: Arc<GfnService>,
     streamer: StreamerService,
     diagnostics: diagnostics::DiagnosticsService,
     media: media::MediaService,
     updater: updater::UpdaterService,
+    push: Mutex<push_registry::PushRegistry>,
     community: community::CommunityService,
     thanks: thanks::ThanksService,
     discord: discord::DiscordService,
@@ -64,6 +74,15 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let data_dir = resolve_data_dir(argument_value("--data-dir").map(PathBuf::from));
+    if env::args_os().any(|argument| argument == "--graphics-preferences") {
+        let windows_gpu_device_id = SettingsStore::windows_gpu_device_id_read_only(Some(data_dir))
+            .map_err(|error| error.to_string())?;
+        let stdout = io::stdout();
+        return write_json(
+            &mut stdout.lock(),
+            &json!({"version":1,"windowsGpuDeviceId":windows_gpu_device_id}),
+        );
+    }
     let (output_tx, output_rx) = mpsc::channel::<Value>();
     thread::Builder::new()
         .name("opennow-core-writer".to_owned())
@@ -78,12 +97,19 @@ fn run() -> Result<(), String> {
             }
         })
         .map_err(|error| error.to_string())?;
+    let gfn = Arc::new(GfnService::new(data_dir.clone())?);
+    let push = Mutex::new(push_registry::PushRegistry::new(
+        Arc::clone(&gfn),
+        output_tx.clone(),
+        data_dir.clone(),
+    ));
     let core = Arc::new(AppCore {
+        session_update_gate: Mutex::new(()),
         artwork: artwork_cache::ArtworkCache::new(&data_dir, output_tx.clone()),
         settings: Mutex::new(
             SettingsStore::load(Some(data_dir.clone())).map_err(|error| error.to_string())?,
         ),
-        gfn: GfnService::new(data_dir.clone())?,
+        gfn,
         streamer: StreamerService::new(),
         diagnostics: diagnostics::DiagnosticsService::new(&data_dir)
             .map_err(|error| format!("Could not initialize diagnostics: {error}"))?,
@@ -91,6 +117,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("Could not initialize media library: {error}"))?,
         updater: updater::UpdaterService::new(&data_dir)
             .map_err(|error| format!("Could not initialize updater: {error}"))?,
+        push,
         community: community::CommunityService::new()
             .map_err(|error| format!("Could not initialize community services: {error}"))?,
         thanks: thanks::ThanksService::new()
@@ -99,6 +126,7 @@ fn run() -> Result<(), String> {
         telemetry: telemetry::TelemetryService::new()
             .map_err(|error| format!("Could not initialize reporting services: {error}"))?,
     });
+    reconcile_push(&core);
     let requests = Arc::new(requests::Requests::default());
     let stdin = io::stdin();
 
@@ -114,6 +142,12 @@ fn run() -> Result<(), String> {
         if message["type"] == "cancel" {
             if let Some(id) = message["id"].as_str() {
                 requests.cancel(id);
+            }
+            continue;
+        }
+        if message["type"] == "ack" {
+            if let Some(id) = message["id"].as_str() {
+                requests.acknowledge(id);
             }
             continue;
         }
@@ -152,11 +186,55 @@ fn run() -> Result<(), String> {
                 format!("outcome={outcome} durationMs={}", started.elapsed().as_millis()),
             );
             let was_cancelled = permit.token.cancelled();
+            if method == "session.create"
+                && let Err((code, message)) = &result
+                && code == "session_cleanup_pending"
+            {
+                let _ = worker_output.send(json!({"type":"event","name":"session.cleanup.pending",
+                    "payload":{"code":code,"message":message}}));
+            }
+            if method == "session.create"
+                && let Ok((value, _)) = &result
+                && let Some(session_id) = value["session"]["sessionId"].as_str()
+            {
+                let delivered = !was_cancelled && worker_output.send(json!({"type":"response", "id":id, "ok":true, "result":value})).is_ok();
+                let accepted = delivered && permit.token.await_acceptance(std::time::Duration::from_secs(10));
+                let cleanup = worker_core.gfn.finish_session_create(session_id, accepted);
+                worker_core.diagnostics.record("session", "allocation-handoff", format!(
+                    "accepted={accepted} cleanup={}", cleanup.as_ref().map_or_else(|error| error.code, |()| "ok")
+                ));
+                if let Err(error) = cleanup {
+                    let _ = worker_output.send(json!({"type":"event","name":"session.cleanup.pending","payload":{
+                        "sessionId":session_id,"code":error.code,"message":"The cancelled cloud session could not be closed. End it before starting another game."
+                    }}));
+                }
+                return;
+            }
+            if matches!(method.as_str(), "updater.check" | "updater.download" | "updater.install") {
+                if let Err((_, message)) = &result {
+                    worker_core.updater.request_failed(message);
+                }
+                let _ = worker_output.send(json!({"type":"event", "name":"updater.changed", "payload":worker_core.updater.state()}));
+            }
+            if matches!(
+                method.as_str(),
+                "auth.device.complete"
+                    | "auth.logout"
+                    | "auth.accounts.logoutAll"
+                    | "auth.accounts.switch"
+                    | "auth.accounts.remove"
+                    | "settings.set"
+            ) {
+                reconcile_push(&worker_core);
+            }
             if !was_cancelled {
                 match result {
                     Ok((value, event)) => {
+                        if let Some(("settings.changed", payload)) = &event {
+                            let _ = worker_output.send(json!({"type":"event", "name":"settings.changed", "payload":payload}));
+                        }
                         let _ = worker_output.send(json!({"type":"response", "id":id, "ok":true, "result":value}));
-                        if let Some((name, payload)) = event {
+                        if let Some((name, payload)) = event && name != "settings.changed" {
                             let _ = worker_output.send(json!({"type":"event", "name":name, "payload":payload}));
                         }
                     }
@@ -172,6 +250,22 @@ fn run() -> Result<(), String> {
 }
 
 type DispatchResult = Result<(Value, Option<(&'static str, Value)>), (String, String)>;
+
+fn update_session_idle(session: &Value, streamer: &Value) -> bool {
+    session.get("session") == Some(&Value::Null)
+        && matches!(
+            streamer["streamer"]["status"].as_str(),
+            Some("stopped" | "error")
+        )
+}
+
+fn reconcile_push(core: &AppCore) {
+    let _ = core
+        .push
+        .lock()
+        .expect("push registry poisoned")
+        .reconcile();
+}
 
 fn unix_time_millis() -> u128 {
     SystemTime::now()
@@ -255,6 +349,26 @@ fn acceptance_shell_evidence(params: &Value) -> Result<Value, (String, String)> 
 }
 
 fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
+    let session_transition = matches!(
+        method,
+        "session.create" | "session.claim" | "session.poll" | "streamer.start" | "streamer.prepare"
+    );
+    let _session_update_guard = if session_transition || method == "updater.install" {
+        Some(core.session_update_gate.try_lock().map_err(|_| {
+            (
+                "session_update_busy".to_owned(),
+                "A session transition or update preparation is in progress".to_owned(),
+            )
+        })?)
+    } else {
+        None
+    };
+    if session_transition && core.updater.installation_pending() {
+        return Err((
+            "update_pending".to_owned(),
+            "An update is waiting for OpenNOW to exit".to_owned(),
+        ));
+    }
     match method {
         "core.hello" => {
             if params["protocolVersion"].as_i64() != Some(PROTOCOL_VERSION) {
@@ -264,7 +378,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 ));
             }
             Ok((
-                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v6", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
+                json!({"protocolVersion":PROTOCOL_VERSION, "coreVersion":version::APPLICATION_VERSION, "capabilities":["settings", "gfn.deviceAuth", "gfn.providers", "gfn.publicCatalog", "catalog.storePages.v1", "catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "account.pushInvalidation.v1", "catalog.languages.v1", "queue.servers.v1", "catalog.storeLocal.v1", "gfn.accountLibrary", "gfn.regions", "gfn.subscription", "gfn.cloudmatch", "sessionProxy", "catalogArtworkCache.v1", "nativeStreamer.v7", "nativeStreamer.ownedNvstNegotiation", "nativeStreamer.dynamicSurface", "nativeStreamer.acceptanceEvidence", "liveAcceptance.v1", "osCredentialStore", "electronAccountMigration", "redactedDiagnostics", "mediaLibrary", "githubUpdateDiscovery", "discordRpc", "optInTelemetry", "feedback", "bugReports", "social.capabilitySurface"]}),
                 None,
             ))
         }
@@ -283,9 +397,20 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             None,
         )),
         "settings.get" => Ok((
-            json!({"settings":core.settings.lock().expect("settings poisoned").all()}),
+            json!({"settings":core.settings.lock().expect("settings poisoned").all(),
+                "keyboardLayouts":language::keyboard_choices()}),
             None,
         )),
+        "settings.choices.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            Ok((
+                json!({"colorQualities":streamer::StreamerService::color_quality_choices(
+                &settings, &params["runtimeCapabilities"]),
+                "frameRates":frame_rate::frame_rate_choices(
+                &settings, &params["runtimeCapabilities"])}),
+                None,
+            ))
+        }
         "settings.set" => {
             let key = params["key"].as_str().ok_or((
                 "invalid_params".to_owned(),
@@ -295,6 +420,17 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 "invalid_params".to_owned(),
                 "settings.set requires a value".to_owned(),
             ))?;
+            if key == "region" {
+                let provider = params["providerIdpId"].as_str().unwrap_or("");
+                let event = core.gfn.with_region_provider(provider, || {
+                    let mut settings = core.settings.lock().expect("settings poisoned");
+                    let applied = settings.set_provider_region(provider, value).map_err(|message| gfn::ServiceError { code: "invalid_setting", message })?;
+                    Ok(json!({"key":key,"value":applied,"changes":{
+                        "regionProviderIdpId":provider,"providerRegions":settings.all()["providerRegions"]
+                    }}))
+                }).map_err(gfn_error)?;
+                return Ok((event.clone(), Some(("settings.changed", event))));
+            }
             let mut settings = core.settings.lock().expect("settings poisoned");
             let applied = settings
                 .set(key, value)
@@ -360,17 +496,11 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             .map_err(gfn_error),
         "auth.logout" => {
             let value = core.gfn.logout().map_err(gfn_error)?;
-            Ok((
-                value.clone(),
-                Some(("auth.session.changed", json!({"session":value["session"]}))),
-            ))
+            Ok((value.clone(), Some(("auth.session.changed", value))))
         }
         "auth.accounts.logoutAll" => {
             let value = core.gfn.logout_all().map_err(gfn_error)?;
-            Ok((
-                value,
-                Some(("auth.session.changed", json!({"session":null}))),
-            ))
+            Ok((value.clone(), Some(("auth.session.changed", value))))
         }
         "auth.accounts.list" => core
             .gfn
@@ -385,7 +515,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "auth.accounts.remove" => core
             .gfn
             .remove_account(params)
-            .map(|value| (value, None))
+            .map(|value| (value.clone(), Some(("auth.session.changed", value))))
             .map_err(gfn_error),
         "auth.pin.status" => core
             .gfn
@@ -421,6 +551,59 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
+        "catalog.game.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_game(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.launch.inspect" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_launch_inspect(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.launch.store.inspect" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .store_launch_inspect(params, None, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.favorites.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_favorites(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.favorites.add"
+        | "catalog.favorites.remove"
+        | "catalog.ownership.add"
+        | "catalog.ownership.remove"
+        | "catalog.ownership.select" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_mutate(method, params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.definitions.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_definitions(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "catalog.languages.get" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .catalog_languages(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "catalog.store.local" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
@@ -449,14 +632,19 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(|message| ("invalid_params".to_owned(), message))
         }
-        "network.regions.list" => core
-            .gfn
-            .regions()
-            .map(|value| (value, None))
-            .map_err(gfn_error),
+        "network.regions.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .regions(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "network.regions.ping" => network::ping_regions(params)
             .map(|value| (value, None))
             .map_err(|message| ("region_ping_failed".to_owned(), message)),
+        "queue.servers.list" => queue_servers::list()
+            .map(|value| (value, None))
+            .map_err(gfn_error),
         "account.subscription.get" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
             core.gfn
@@ -464,31 +652,58 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(gfn_error)
         }
-        "account.connections.list" => core
-            .gfn
-            .account_connections()
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.sync" => core
-            .gfn
-            .sync_account_connection(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.unlink" => core
-            .gfn
-            .unlink_account_connection(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.link.start" => core
-            .gfn
-            .start_account_link(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
-        "account.connections.link.poll" => core
-            .gfn
-            .poll_account_link(params)
-            .map(|value| (value, None))
-            .map_err(gfn_error),
+        "account.connections.list" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_connections(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .sync_account_connection(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.unlink" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .unlink_account_connection(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.link.start" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .start_account_link(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.link.poll" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .poll_account_link(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync.status" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_sync_status(params, &settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
+        "account.connections.sync.cancel" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .account_sync_status(
+                    &json!({"operationId":params["operationId"],"cancelObservation":true}),
+                    &settings,
+                )
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "account.storage.locations" => core
             .gfn
             .persistent_storage_locations(params)
@@ -521,13 +736,20 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "session.poll" => core
             .gfn
             .poll_session(params)
-            .map(|value| (value.clone(), Some(("session.changed", value))))
+            .map(|value| {
+                (
+                    value.clone(),
+                    (params["recoveryMode"] != true).then_some(("session.changed", value)),
+                )
+            })
             .map_err(gfn_error),
-        "session.stop" => core
-            .gfn
-            .stop_session(params)
-            .map(|value| (value.clone(), Some(("session.changed", value))))
-            .map_err(gfn_error),
+        "session.stop" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .stop_session(params, &settings)
+                .map(|value| (value.clone(), Some(("session.changed", value))))
+                .map_err(gfn_error)
+        }
         "session.active.get" => core
             .gfn
             .active_session()
@@ -568,8 +790,15 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         }
         "streamer.prepare" => {
             let settings = core.settings.lock().expect("settings poisoned").all();
-            core.streamer
-                .prepare_embedded(params, &settings)
+            core.gfn
+                .prepare_owned_stream(params, |owned| {
+                    core.streamer
+                        .prepare_embedded(owned, &settings)
+                        .map_err(|error| gfn::ServiceError {
+                            code: error.code,
+                            message: error.message,
+                        })
+                })
                 .inspect_err(|error| {
                     core.diagnostics.record(
                         "streamer",
@@ -583,7 +812,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                     );
                 })
                 .map(|value| (value, None))
-                .map_err(streamer_error)
+                .map_err(gfn_error)
         }
         "streamer.status.get" => Ok((core.streamer.status(), None)),
         "streamer.stop" => core
@@ -699,7 +928,11 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 .map(|value| (value, None))
                 .map_err(|error| ("acceptance_export_failed".to_owned(), error.to_string()))
         }
-        "media.root.get" => Ok((core.media.root(), None)),
+        "media.root.get" => core
+            .media
+            .root()
+            .map(|value| (value, None))
+            .map_err(|message| ("media_unavailable".to_owned(), message)),
         "media.recording.target" => core
             .media
             .recording_target(params)
@@ -733,12 +966,17 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             .map(|value| (value, None))
             .map_err(|message| ("community_proxy_failed".to_owned(), message)),
         "updater.state.get" => Ok((core.updater.state(), None)),
+        "updater.startup.ack" => {
+            update_apply::acknowledge_startup_from_env(version::APPLICATION_VERSION)
+                .map(|acknowledged| (json!({"acknowledged":acknowledged}), None))
+                .map_err(|message| ("update_startup_ack_failed".to_owned(), message))
+        }
         "updater.check" => {
             let value = core
                 .updater
                 .check(params)
                 .map_err(|message| ("update_check_failed".to_owned(), message))?;
-            Ok((value.clone(), Some(("updater.changed", value))))
+            Ok((value, None))
         }
         "updater.highlights.get" => {
             let highlights = core.updater.highlights();
@@ -788,13 +1026,21 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "updater.download" => core
             .updater
             .download()
-            .map(|value| (value.clone(), Some(("updater.changed", value))))
+            .map(|value| (value, None))
             .map_err(|message| ("update_download_failed".to_owned(), message)),
-        "updater.install" => core
-            .updater
-            .install(params)
-            .map(|value| (value.clone(), Some(("updater.changed", value))))
-            .map_err(|message| ("update_install_failed".to_owned(), message)),
+        "updater.install" => {
+            let session = core.gfn.active_session().map_err(gfn_error)?;
+            if !update_session_idle(&session, &core.streamer.status()) {
+                return Err((
+                    "update_session_active".to_owned(),
+                    "End the active session before installing an update".to_owned(),
+                ));
+            }
+            core.updater
+                .install(params)
+                .map(|value| (value, None))
+                .map_err(|message| ("update_install_failed".to_owned(), message))
+        }
         "discord.activity.sync" => core
             .discord
             .sync(params)
@@ -898,6 +1144,38 @@ fn argument_value(name: &str) -> Option<String> {
 #[cfg(test)]
 mod acceptance_tests {
     use super::*;
+
+    #[test]
+    fn updates_require_no_session_and_a_terminal_streamer() {
+        for status in ["stopped", "error"] {
+            assert!(update_session_idle(
+                &json!({"session":null}),
+                &json!({"streamer":{"status":status}})
+            ));
+        }
+        for status in [
+            "starting",
+            "streaming",
+            "recovering",
+            "negotiating",
+            "unknown",
+        ] {
+            assert!(!update_session_idle(
+                &json!({"session":null}),
+                &json!({"streamer":{"status":status}})
+            ));
+        }
+        for session in [
+            json!({}),
+            json!({"session":{"phase":"queued"}}),
+            json!({"session":{"phase":"ready"}}),
+        ] {
+            assert!(!update_session_idle(
+                &session,
+                &json!({"streamer":{"status":"stopped"}})
+            ));
+        }
+    }
 
     #[test]
     fn shell_acceptance_evidence_is_bounded_normalized_and_complete() {

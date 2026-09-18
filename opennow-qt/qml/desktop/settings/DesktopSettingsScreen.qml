@@ -17,25 +17,27 @@ FocusScope {
     readonly property var acceptancePanels: ({stats:statsSettingsPage, audio:audioPage,
         interface:interfacePage, console:consolePage, shortcuts:shortcutsPage,
         controllers:controllersPage, subscription:subscriptionPage, recording:recordingPage})
-    readonly property bool compactNavigation: width < 1050
+    readonly property bool compactNavigation: width < DesktopTokens.px(1050)
     readonly property int selectedGroup: sections.findIndex(section => section.page ===
         ([0,1,2].indexOf(selectedSection) >= 0 ? 0 : selectedSection === 10 ? 5 : selectedSection === 7 ? 8 : selectedSection))
     onSelectedSectionChanged: { advancedOpen = false }
     signal requestConsoleMode(bool enabled)
 
+    TenBitWarningDialog { id: tenBitWarning; settingsStore: ShellStore }
+
     readonly property var sections: [
-        {label: qsTr("Stream"), detail: qsTr("Picture, codec, bitrate"), icon: "monitor", page: 3, keywords: "resolution fps hdr color audio stats overlay bitrate codec reflex backend gpu directx vulkan steam big picture launch gamepad fullscreen session ready"},
-        {label: qsTr("Audio"), detail: qsTr("Output and stream audio"), icon: "wave", page: 4, keywords: "sound audio volume output microphone"},
-        {label: qsTr("Recording"), detail: qsTr("Capture, replay, shortcuts"), icon: "image", page: 12, keywords: "recording capture clip replay buffer memory duration folder resolution fps quality shortcuts F12"},
-        {label: qsTr("Controls"), detail: qsTr("Pads, mouse, shortcuts"), icon: "controller", page: 5, keywords: "controller gyroscope steam sensitivity keyboard language shortcuts"},
-        {label: qsTr("Look"), detail: qsTr("Theme, accent, layout"), icon: "palette", page: 8, keywords: "theme accent interface language scale motion console sidebar tiles"},
-        {label: qsTr("Console mode"), detail: qsTr("Gamepad-first interface"), icon: "controller", page: 9, keywords: "console fullscreen gamepad startup"},
+        {label: qsTr("Stream"), detail: qsTr("Picture, codec, bitrate"), icon: "monitor", page: 3, keywords: "resolution fps hdr color stats overlay timer bitrate codec reflex backend gpu directx vulkan steam big picture launch gamepad fullscreen session ready persistent in-game graphics settings background reminder afk taskbar"},
         {label: qsTr("Network"), detail: qsTr("Region, ping, proxy"), icon: "globe", page: 6, keywords: "server region ping proxy l4s"},
+        {label: qsTr("Audio"), detail: qsTr("Output and stream audio"), icon: "wave", page: 4, keywords: "sound audio volume output microphone mute focus"},
+        {label: qsTr("Controls"), detail: qsTr("Pads, mouse, shortcuts"), icon: "controller", page: 5, keywords: "controller gyroscope steam sensitivity keyboard language shortcuts"},
+        {label: qsTr("Recording"), detail: qsTr("Capture, replay, shortcuts"), icon: "image", page: 12, keywords: "recording capture clip replay buffer memory duration folder resolution fps quality shortcuts F12"},
+        {label: qsTr("Appearance"), detail: qsTr("Theme, accent, layout"), icon: "palette", page: 8, keywords: "theme accent interface language scale motion console sidebar tiles"},
+        {label: qsTr("Console mode"), detail: qsTr("Gamepad-first interface"), icon: "controller", page: 9, keywords: "console fullscreen gamepad startup"},
         {label: qsTr("Account"), detail: qsTr("NVIDIA, stores, privacy"), icon: "person", page: 0, keywords: "profile subscription stores steam epic xbox ubisoft battle gaijin privacy"},
-        {label: qsTr("About"), detail: qsTr("Updates, diagnostics"), icon: "info", page: 11, keywords: "version release update diagnostics"}
+        {label: qsTr("About & support"), detail: qsTr("Updates, diagnostics"), icon: "info", page: 11, keywords: "version release update diagnostics onboarding introduction replay setup restart reset"}
     ]
-    readonly property var pageTitles: [qsTr("Account"), qsTr("Account"), qsTr("Account"), qsTr("Stream"), qsTr("Audio"), qsTr("Controls"), qsTr("Network"), qsTr("Look"), qsTr("Look"), qsTr("Console mode"), qsTr("Controls"), qsTr("About"), qsTr("Recording")]
-    readonly property var pageComponents: [accountGroup, subscriptionPage, accountGroup, streamPage, audioPage, controlsGroup, networkPage, lookGroup, lookGroup, consolePage, controlsGroup, aboutPage, recordingPage]
+    readonly property var pageTitles: [qsTr("Account"), qsTr("Account"), qsTr("Account"), qsTr("Stream"), qsTr("Audio"), qsTr("Controls"), qsTr("Network"), qsTr("Appearance"), qsTr("Appearance"), qsTr("Console mode"), qsTr("Controls"), qsTr("About & support"), qsTr("Recording")]
+    readonly property var pageComponents: [accountGroup, accountGroup, accountGroup, streamPage, audioPage, controlsGroup, networkPage, lookGroup, lookGroup, consolePage, controlsGroup, aboutPage, recordingPage]
 
     function matchesSection(section) {
         const query = searchQuery.trim().toLowerCase()
@@ -52,34 +54,24 @@ FocusScope {
     }
 
     function valueSetting(key, fallbackValue) {
+        if (key === "region") return ShellStore.selectedRegion
         const value = ShellStore.settings[key]
         return value === undefined || value === null || value === "" ? fallbackValue : value
     }
 
     function setSetting(key, value) {
-        ShellStore.applySetting(key, value)
+        if (!ShellStore.settingsOwnerState.ownsConfirmedSetting(key))
+            ShellStore.applySetting(key, value)
         ShellStore.setSetting(key, value)
         if (key === "resolution")
             Qt.callLater(root.clampFpsToEntitlement)
     }
 
     function setChoice(key, value) {
-        const normalized = String(value || "").toLowerCase()
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (key === "colorQuality") {
-            if (codec === "h264" && normalized !== "8bit_420")
-                return
-            if (codec === "av1" && normalized.indexOf("444") >= 0)
-                return
-        }
         const currentQuality = String(root.valueSetting("colorQuality", "8bit_420"))
         root.setSetting(key, value)
-        if (key === "codec") {
-            if (normalized === "h264" && currentQuality !== "8bit_420")
-                root.setSetting("colorQuality", "8bit_420")
-            else if (normalized === "av1" && currentQuality.indexOf("444") >= 0)
-                root.setSetting("colorQuality", currentQuality.replace("444", "420"))
-        }
+        if (key === "colorQuality")
+            tenBitWarning.notifySelection(currentQuality, value)
     }
 
     function choices(values) {
@@ -87,35 +79,12 @@ FocusScope {
     }
 
     function colorQualityItems() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        const h264 = codec === "h264"
-        const chroma444Unavailable = h264 || codec === "av1"
-        return [
-            {kind:"choice", label:qsTr("8-bit, YUV 4:2:0"), detail:qsTr("All codecs"), value:"8bit_420"},
-            {kind:"choice", label:qsTr("8-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Sharper color"), value:"8bit_444", disabled:chroma444Unavailable},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:2:0"), detail:h264 ? qsTr("H.265 / AV1 required") : qsTr("Smoother gradients"), value:"10bit_420", disabled:h264},
-            {kind:"choice", label:qsTr("10-bit, YUV 4:4:4"), detail:chroma444Unavailable ? qsTr("H.265 required") : qsTr("Highest color quality"), value:"10bit_444", disabled:chroma444Unavailable}
-        ]
+        return ShellStore.settingsOwnerState.colorQualityItems
     }
 
     function colorQualityFooter() {
-        const codec = String(root.valueSetting("codec", "auto")).toLowerCase()
-        if (codec === "h264")
-            return qsTr("H.264 supports 8-bit YUV 4:2:0 only")
-        if (codec === "av1")
-            return qsTr("AV1 supports YUV 4:2:0; use H.265 for 4:4:4")
-        return qsTr("4:4:4 profiles use H.265")
-    }
-
-    function colorQualityLabel() {
-        const labels = {
-            "8bit_420": qsTr("8-bit, YUV 4:2:0"),
-            "8bit_444": qsTr("8-bit, YUV 4:4:4"),
-            "10bit_420": qsTr("10-bit, YUV 4:2:0"),
-            "10bit_444": qsTr("10-bit, YUV 4:4:4")
-        }
-        const value = String(root.valueSetting("colorQuality", "8bit_420"))
-        return labels[value] || labels["8bit_420"]
+        const current = colorQualityItems().find(item => item.value === root.valueSetting("colorQuality", "8bit_420"))
+        return current ? current.detail : ShellStore.settingsOwnerState.colorDescription
     }
 
     function liveTierBadge() {
@@ -316,6 +285,10 @@ FocusScope {
         return ShellStore.unentitledFpsValues(root.currentResolutionValue())
     }
 
+    function lockedFpsValues() {
+        return ShellStore.lockedFpsValues(root.currentResolutionValue())
+    }
+
     function fpsEntitlementNote() {
         if (!root.fpsEntitlementKnown())
             return ShellStore.signedIn
@@ -325,12 +298,22 @@ FocusScope {
         const tier = root.liveTierBadge() || qsTr("Membership")
         if (entitled.length === 0)
             return qsTr("%1 · no exact entitlement for this resolution").arg(tier)
-        const max = entitled[entitled.length - 1]
+        const selectable = ShellStore.selectableFpsValues(root.currentResolutionValue())
+        const max = selectable.length ? selectable[selectable.length - 1] : entitled[entitled.length - 1]
         return qsTr("%1 · up to %2 FPS at %3").arg(tier).arg(max)
             .arg(root.currentResolutionValue().replace("x", "×"))
     }
 
     function fpsLockedHint() {
+        if (!root.unentitledFpsValues().length) {
+            const reason = ShellStore.lockedFpsReason()
+            if (reason !== "")
+                return reason
+        } else if (root.lockedFpsValues().length > root.unentitledFpsValues().length) {
+            const reason = ShellStore.lockedFpsReason()
+            if (reason !== "")
+                return reason
+        }
         const tier = root.liveTierBadge()
         return tier
             ? qsTr("Not entitled on %1 — upgrade on NVIDIA to unlock").arg(tier)
@@ -363,41 +346,51 @@ FocusScope {
     }
 
     function storeStatus(account) {
+        const action = ShellStore.gameAccountAction(account)
         if (account.status === "expired")
             return { text: qsTr("EXPIRED"), color: Theme.yellow, action: qsTr("Reconnect"), connected: false, primary: true }
         if (account.status === "sync_error")
-            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: qsTr("Resync"), connected: true }
+            return { text: qsTr("SYNC ISSUE"), color: Theme.coral, action: action === "link" ? qsTr("Reconnect") : qsTr("Sync library"), connected: true }
         if (account.isConnected || account.status === "connected")
             return { text: qsTr("LINKED"), color: DesktopTokens.green, action: account.supportsSync ? qsTr("Resync") : qsTr("Unlink"), connected: true }
-        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: qsTr("Link"), connected: false }
+        return { text: qsTr("NOT LINKED"), color: Theme.textMuted, action: action === "sync" ? qsTr("Sync library") : qsTr("Link"), connected: false }
     }
 
     function storeDescription(account) {
+        if (account.capabilitySource === "fallback" || account.capabilitySource === "stale")
+            return qsTr("Store capabilities could not be refreshed. Retry before changing this connection.")
+        if (account.status === "sync_error") {
+            if (account.provider === "STEAM" && account.syncState === "SYNC_DENIED") return qsTr("Make your store profile and game library public, then sync again.")
+            if (account.syncState === "PROFILE_NOT_CREATED") return qsTr("Create your store profile, then sync again.")
+            if (account.syncState === "SYNC_DENIED") return qsTr("Store authorization was denied. Reconnect this account.")
+            return qsTr("The store reported a sync error: %1").arg(account.syncState || qsTr("Unknown"))
+        }
+        const subscriptions = ShellStore.storeSubscriptionLabels(account)
+        if (subscriptions) return qsTr("Active store subscriptions: %1").arg(subscriptions)
         if (account.displayName)
             return account.displayName
         if (account.isConnected && account.syncedGames !== undefined && account.syncedGames !== null)
-            return qsTr("%1 cloud-ready games synced").arg(account.syncedGames)
+            return qsTr("%1 games reported by the last store sync").arg(account.syncedGames)
         if (account.isConnected)
             return qsTr("Connected through your NVIDIA account")
         return qsTr("Link this store on NVIDIA to add its games to your library")
     }
 
     function runStoreAction(account) {
-        const status = storeStatus(account)
-        if (status.action === qsTr("Resync"))
+        const action = ShellStore.gameAccountAction(account)
+        if (action === "sync")
             ShellStore.syncGameAccount(account.provider)
-        else if (status.connected)
+        else if (action === "unlink")
             ShellStore.unlinkGameAccount(account.provider)
-        else
+        else if (action === "link")
             ShellStore.startAccountLink(account.provider)
     }
 
     function projectLinks() {
         return [
-            {id: "source", label: qsTr("Source on GitHub"), hint: "↗"},
-            {id: "issues", label: qsTr("Report an issue"), hint: "↗"},
             {id: "diagnostics", label: qsTr("Copy diagnostics"), hint: "NO PERSONAL DATA"},
-            {id: "captures", label: qsTr("Reveal captures folder"), hint: ShellStore.mediaRootPath ? "↗" : "…"}
+            {id: "issues", label: qsTr("Report an issue"), hint: "↗"},
+            {id: "source", label: qsTr("Source on GitHub"), hint: "↗"}
         ]
     }
 
@@ -410,29 +403,10 @@ FocusScope {
             AppController.openExternalUrl("https://github.com/OpenCloudGaming/OpenNOW/issues")
         else if (link.id === "diagnostics")
             ShellStore.exportDiagnostics()
-        else if (link.id === "captures") {
-            if (ShellStore.mediaRootPath)
-                AppController.openLocalPath(ShellStore.mediaRootPath, false)
-            else
-                ShellStore.refreshMedia()
-        }
     }
 
     function resolutionItems() {
-        const groups = [
-            ["16:9 STANDARD", [["720p","1280x720"],["900p","1600x900"],["1080p","1920x1080"],["1440p","2560x1440"],["1800p","3200x1800"],["4K","3840x2160"],["5K","5120x2880"],["8K","7680x4320"]]],
-            ["16:10 WIDESCREEN", [["800p","1280x800"],["900p","1440x900"],["1050p","1680x1050"],["1200p","1920x1200"],["1600p","2560x1600"],["2400p","3840x2400"]]],
-            ["21:9 ULTRAWIDE", [["UW 1080p","2560x1080"],["UW 1440p","3440x1440"],["UW 1600p","3840x1600"],["UW 1800p","3840x1800"],["UW 2160p","5120x2160"]]],
-            ["32:9 SUPER ULTRAWIDE", [["Dual 1080p","3840x1080"],["Dual 1440p","5120x1440"]]]
-        ]
-        const items = []
-        for (const group of groups) {
-            items.push({kind:"heading",label:group[0]})
-            for (const option of group[1])
-                items.push({kind:"choice",label:option[0],detail:option[1].replace("x","×"),value:option[1],
-                    disabled: root.fpsEntitlementKnown() && ShellStore.entitledFpsForResolution(option[1]).length === 0})
-        }
-        return items
+        return ShellStore.resolutionItems()
     }
 
     Column {
@@ -468,24 +442,25 @@ FocusScope {
         }
         Flickable {
             width: parent.width
-            height: root.compactNavigation ? DesktopTokens.px(52) : Math.max(0, root.height - settingsRail.y - settingsSearch.height - 36)
-            contentWidth: root.compactNavigation ? navigation.implicitWidth : width
+            height: root.compactNavigation ? navigation.implicitHeight : Math.max(0, root.height - settingsRail.y - settingsSearch.height - 36)
+            contentWidth: width
             contentHeight: navigation.implicitHeight
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             Flow {
                 id: navigation
-                width: root.compactNavigation ? implicitWidth : parent.width
-                flow: root.compactNavigation ? Flow.TopToBottom : Flow.LeftToRight
-                height: root.compactNavigation ? DesktopTokens.px(52) : implicitHeight
+                width: parent.width
+                height: implicitHeight
                 spacing: DesktopTokens.px(6)
                 Repeater {
                     model: root.sections
                     delegate: Button {
                         required property var modelData
                         required property int index
+                        objectName: "settingsNavigation-" + modelData.page
+                        Accessible.name: modelData.label
                         visible: root.matchesSection(modelData)
-                        width: root.compactNavigation ? DesktopTokens.px(130) : settingsRail.width
+                        width: root.compactNavigation ? Math.max(DesktopTokens.px(104), navLabel.implicitWidth + DesktopTokens.px(40)) : settingsRail.width
                         height: DesktopTokens.px(root.compactNavigation ? 48 : 64)
                         padding: 12
                         hoverEnabled: true
@@ -507,7 +482,7 @@ FocusScope {
                             ColumnLayout {
                                 Layout.fillWidth: true
                                 spacing: 2
-                                Text { Layout.fillWidth: true; text: modelData.label; color: Theme.label; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.bodySize; font.weight: root.selectedGroup === index ? Font.ExtraBold : Font.Bold; elide: Text.ElideRight }
+                                Text { id: navLabel; Layout.fillWidth: true; text: modelData.label; color: Theme.label; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.bodySize; font.weight: root.selectedGroup === index ? Font.ExtraBold : Font.Bold; elide: Text.ElideRight }
                                 Text { visible: !root.compactNavigation; Layout.fillWidth: true; text: modelData.detail; color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: DesktopTokens.captionSize; elide: Text.ElideRight }
                             }
                         }
@@ -525,6 +500,7 @@ FocusScope {
         height: root.height - y - DesktopTokens.px(18)
         Flickable {
             id: contentFlick
+            objectName: "desktopSettingsContent"
             anchors.fill: parent
             contentWidth: width
             contentHeight: pageLoader.height
@@ -577,7 +553,6 @@ FocusScope {
         DesktopSettingsLookPage {
             availableWidth: contentFlick.width
             settingsScreen: root
-            statsSettingsPageComponent: statsSettingsPage
             interfacePageComponent: interfacePage
         }
     }
@@ -619,6 +594,7 @@ FocusScope {
         DesktopSettingsStreamPage {
             availableWidth: contentFlick.width
             settingsScreen: root
+            statsSettingsPageComponent: statsSettingsPage
         }
     }
 

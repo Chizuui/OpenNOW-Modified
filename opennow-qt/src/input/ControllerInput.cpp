@@ -4,6 +4,7 @@
 #include <QGuiApplication>
 #include <QKeyEvent>
 #include <QVariantMap>
+#include <QWindow>
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,7 @@ ControllerInput::ControllerInput(QObject *parent)
     : QObject(parent), m_pollTimer(this)
 {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    qRegisterMetaType<ControllerInput::SonySnapshot>();
     m_sdlReady = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     if (!m_sdlReady) {
         qWarning("SDL gamepad initialization failed: %s", SDL_GetError());
@@ -44,7 +46,7 @@ ControllerInput::~ControllerInput()
 {
     m_pollTimer.stop();
     stopRumble();
-    publishConnectedGamepads(true);
+    publishConnectedInputs(true);
     for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
         releaseShellButtons(slot);
     for (auto &slot : m_slots) {
@@ -85,17 +87,18 @@ void ControllerInput::setInputControllerId(quint32 id)
 {
     if (id == m_inputControllerId || (id != 0 && !m_gamepadSlots.contains(id))) return;
     stopRumble();
-    publishConnectedGamepads(true);
+    publishConnectedInputs(true);
     for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
         releaseShellButtons(slot);
     resetDirections();
     m_inputControllerId = id;
     for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
         updateSlotSnapshot(slot);
-    if (!m_shellCaptureEnabled) publishConnectedGamepads();
+    emit controllerCountChanged(controllerCount());
+    emit deviceClaimsChanged();
+    if (!m_shellCaptureEnabled) publishConnectedInputs();
     refreshControllerMetadata();
     updatePollInterval();
-    emit controllerCountChanged(controllerCount());
     emit inputControllerIdChanged();
 }
 
@@ -189,7 +192,7 @@ void ControllerInput::setLeftStickDeadzone(int percent)
     percent = std::clamp(percent, 0, 50);
     if (m_leftStickDeadzone == percent) return;
     m_leftStickDeadzone = percent;
-    if (!m_shellCaptureEnabled) publishConnectedGamepads();
+    if (!m_shellCaptureEnabled) publishConnectedInputs();
     emit leftStickDeadzoneChanged();
 }
 
@@ -198,7 +201,7 @@ void ControllerInput::setRightStickDeadzone(int percent)
     percent = std::clamp(percent, 0, 50);
     if (m_rightStickDeadzone == percent) return;
     m_rightStickDeadzone = percent;
-    if (!m_shellCaptureEnabled) publishConnectedGamepads();
+    if (!m_shellCaptureEnabled) publishConnectedInputs();
     emit rightStickDeadzoneChanged();
 }
 
@@ -212,7 +215,8 @@ void ControllerInput::setVibrationIntensity(int percent)
 }
 
 void ControllerInput::playRumble(quint8 controllerId, quint16 lowFrequency,
-                               quint16 highFrequency, quint32 durationMs)
+                               quint16 highFrequency, quint32 durationMs,
+                               quint64 sourceIncarnation)
 {
     if (m_shellCaptureEnabled || m_inputSuspended || m_vibrationIntensity == 0) return;
     const auto slotIndex = m_inputControllerId
@@ -221,6 +225,7 @@ void ControllerInput::playRumble(quint8 controllerId, quint16 lowFrequency,
     if (slotIndex < 0 || slotIndex >= static_cast<int>(m_slots.size())) return;
     auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
     if (!slot.gamepad || !acceptsController(slot.instanceId)) return;
+    if (sourceIncarnation != 0 && slot.incarnation != sourceIncarnation) return;
     const auto properties = SDL_GetGamepadProperties(slot.gamepad);
     if (!SDL_GetBooleanProperty(properties, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false)) return;
     if (!SDL_RumbleGamepad(slot.gamepad,
@@ -248,7 +253,7 @@ void ControllerInput::setInputSuspended(bool suspended)
     if (m_inputSuspended == suspended) return;
     if (suspended) {
         stopRumble();
-        publishConnectedGamepads(true);
+        publishConnectedInputs(true);
         for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
             releaseShellButtons(slot);
     }
@@ -257,7 +262,7 @@ void ControllerInput::setInputSuspended(bool suspended)
     if (!suspended && !m_shellCaptureEnabled) {
         for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
             updateSlotSnapshot(slot);
-        publishConnectedGamepads();
+        publishConnectedInputs();
     }
     updatePollInterval();
     emit inputSuspendedChanged();
@@ -268,7 +273,7 @@ void ControllerInput::setShellCaptureEnabled(bool enabled)
     if (m_shellCaptureEnabled == enabled) return;
     if (enabled) {
         stopRumble();
-        publishConnectedGamepads(true);
+        publishConnectedInputs(true);
     } else {
         for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
             releaseShellButtons(slot);
@@ -277,7 +282,7 @@ void ControllerInput::setShellCaptureEnabled(bool enabled)
     if (!enabled) {
         for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot)
             updateSlotSnapshot(slot);
-        publishConnectedGamepads();
+        publishConnectedInputs();
         m_lastGamepadSnapshotAt = m_clock.elapsed();
     } else {
         resetDirections();
@@ -306,6 +311,11 @@ void ControllerInput::poll()
         case SDL_EVENT_GAMEPAD_AXIS_MOTION:
             handleAxis(event.gaxis);
             break;
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+            handleTouchpad(event.gtouchpad);
+            break;
         default:
             break;
         }
@@ -314,7 +324,7 @@ void ControllerInput::poll()
     const auto now = m_clock.elapsed();
     dispatchRepeats(now);
     if (!m_shellCaptureEnabled && now - m_lastGamepadSnapshotAt >= gamepadKeepaliveMs) {
-        publishConnectedGamepads();
+        publishConnectedInputs();
         m_lastGamepadSnapshotAt = now;
     }
     if (now - m_lastControllerMetadataAt >= 2'000) {
@@ -336,9 +346,19 @@ void ControllerInput::openController(SDL_JoystickID id)
     }
     const auto slot = static_cast<int>(std::distance(m_slots.begin(), freeSlot));
     *freeSlot = {.gamepad = gamepad, .instanceId = id};
+    freeSlot->incarnation = m_nextIncarnation++;
+    freeSlot->vendor = SDL_GetGamepadVendor(gamepad);
+    freeSlot->product = SDL_GetGamepadProduct(gamepad);
+    if (isSonySlot(slot)) {
+        for (auto &contact : freeSlot->contacts) {
+            contact.x = sonyContactCenter;
+            contact.y = sonyContactCenter;
+        }
+    }
     m_gamepadSlots.insert(id, slot);
     updateSlotSnapshot(slot);
-    if (!m_shellCaptureEnabled) publishGamepad(slot);
+    if (!m_shellCaptureEnabled) publishSlotSnapshot(slot);
+    emit deviceClaimsChanged();
     emit controllerCountChanged(controllerCount());
     updatePollInterval();
     refreshControllerMetadata();
@@ -352,12 +372,15 @@ void ControllerInput::closeController(SDL_JoystickID id)
     auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
     if (!slot.gamepad) return;
     const auto accepted = acceptsController(id);
+    const auto publishedSlot = effectiveSlot(slotIndex);
+    const auto sony = isSonySlot(slotIndex);
     releaseShellButtons(slotIndex);
+    if (sony) releaseSonyContacts(slotIndex);
     SDL_CloseGamepad(slot.gamepad);
     slot = {};
-    if (accepted)
-        emit gamepadSnapshot(m_inputControllerId ? 0 : static_cast<quint8>(slotIndex),
-                             gamepadBitmap(), 0, 0, 0, 0, 0, 0, 0);
+    emit deviceClaimsChanged();
+    if (accepted && !sony)
+        emit gamepadSnapshot(static_cast<quint8>(publishedSlot), gamepadBitmap(), 0, 0, 0, 0, 0, 0, 0);
     if (m_inputControllerId == id) {
         setInputControllerId(0);
         return;
@@ -373,12 +396,21 @@ void ControllerInput::handleButton(const SDL_GamepadButtonEvent &event, bool pre
     if (slotIndex < 0 || !acceptsController(event.which)) return;
     auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
     if (event.button == SDL_GAMEPAD_BUTTON_GUIDE) {
-        if (pressed && !m_shellCaptureEnabled && !m_inputSuspended)
-            emit localActionRequested(guideLocalAction);
+        if (pressed) {
+            if (slot.guideLatched) return;
+            slot.guideLatched = true;
+            if (!m_shellCaptureEnabled && !m_inputSuspended)
+                emit localActionRequested(guideLocalAction);
+        } else {
+            slot.guideLatched = false;
+        }
+    } else if (event.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+        slot.touchpadClick = pressed;
+        if (isSonySlot(slotIndex)) publishSonySnapshot(slotIndex);
     } else if (const auto mask = buttonMask(event.button); mask != 0) {
         if (pressed) slot.buttons |= mask;
         else slot.buttons &= static_cast<quint16>(~mask);
-        if (!m_shellCaptureEnabled) publishGamepad(slotIndex);
+        if (!m_shellCaptureEnabled) publishSlotSnapshot(slotIndex);
     }
 
     if (!m_shellCaptureEnabled || m_inputSuspended) return;
@@ -403,7 +435,7 @@ void ControllerInput::handleAxis(const SDL_GamepadAxisEvent &event)
     case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: slot.rightTrigger = triggerValue(event.value); break;
     default: return;
     }
-    if (!m_shellCaptureEnabled) publishGamepad(slotIndex);
+    if (!m_shellCaptureEnabled) publishSlotSnapshot(slotIndex);
     if (!m_shellCaptureEnabled || m_inputSuspended) return;
 
     const auto value = event.value;
@@ -424,13 +456,27 @@ void ControllerInput::handleAxis(const SDL_GamepadAxisEvent &event)
 
 quint16 ControllerInput::gamepadBitmap() const
 {
-    if (m_inputControllerId) return m_gamepadSlots.contains(m_inputControllerId) ? 0x0101 : 0;
     quint16 bitmap = 0;
     for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot) {
-        if (m_slots[static_cast<std::size_t>(slot)].gamepad)
-            bitmap |= static_cast<quint16>((1u << slot) | (1u << (slot + 8)));
+        const auto &entry = m_slots[static_cast<std::size_t>(slot)];
+        if (!entry.gamepad || !acceptsController(entry.instanceId)) continue;
+        const auto published = effectiveSlot(slot);
+        bitmap |= static_cast<quint16>((1u << published) | (1u << (published + 8)));
     }
     return bitmap;
+}
+
+int ControllerInput::effectiveSlot(int slotIndex) const
+{
+    if (m_inputControllerId == 0) return slotIndex;
+    return m_slots[static_cast<std::size_t>(slotIndex)].instanceId == m_inputControllerId ? 0
+                                                                                          : slotIndex;
+}
+
+void ControllerInput::publishSlotSnapshot(int slotIndex, bool neutral)
+{
+    if (isSonySlot(slotIndex)) publishSonySnapshot(slotIndex, neutral);
+    else publishGamepad(slotIndex, neutral);
 }
 
 void ControllerInput::publishGamepad(int slotIndex, bool neutral)
@@ -442,7 +488,7 @@ void ControllerInput::publishGamepad(int slotIndex, bool neutral)
         : radialDeadzone(slot.rawLeftX, slot.rawLeftY, m_leftStickDeadzone);
     const auto right = neutral ? QPair<qint16, qint16>{}
         : radialDeadzone(slot.rawRightX, slot.rawRightY, m_rightStickDeadzone);
-    emit gamepadSnapshot(m_inputControllerId ? 0 : static_cast<quint8>(slotIndex), gamepadBitmap(),
+    emit gamepadSnapshot(static_cast<quint8>(effectiveSlot(slotIndex)), gamepadBitmap(),
                          neutral ? 0 : slot.buttons,
                          neutral ? 0 : slot.leftTrigger, neutral ? 0 : slot.rightTrigger,
                          left.first, static_cast<qint16>(-left.second),
@@ -452,8 +498,145 @@ void ControllerInput::publishGamepad(int slotIndex, bool neutral)
 void ControllerInput::publishConnectedGamepads(bool neutral)
 {
     for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot) {
-        if (m_slots[static_cast<std::size_t>(slot)].gamepad) publishGamepad(slot, neutral);
+        if (m_slots[static_cast<std::size_t>(slot)].gamepad && !isSonySlot(slot))
+            publishGamepad(slot, neutral);
     }
+}
+
+bool ControllerInput::isSonySlot(int slotIndex) const
+{
+    const auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    if (slot.vendor != 0x054c) return false;
+    switch (slot.product) {
+    case 0x05c4:
+    case 0x09cc:
+    case 0x0ba0:
+    case 0x0ce6:
+    case 0x0df2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ControllerInput::sampleSonyContacts(int slotIndex)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    if (!slot.gamepad || !isSonySlot(slotIndex)) return;
+    for (int finger = 0; finger < 2; ++finger) {
+        bool down = false;
+        float x = 0.0f;
+        float y = 0.0f;
+        float pressure = 0.0f;
+        if (!SDL_GetGamepadTouchpadFinger(slot.gamepad, 0, finger, &down, &x, &y, &pressure))
+            continue;
+        auto &contact = slot.contacts[static_cast<std::size_t>(finger)];
+        if (!std::isfinite(x) || !std::isfinite(y)) continue;
+        contact.x = x;
+        contact.y = y;
+        contact.hasPosition = true;
+        contact.active = down;
+    }
+}
+
+void ControllerInput::publishSonySnapshot(int slotIndex, bool neutral)
+{
+    const auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    if (!slot.gamepad || !isSonySlot(slotIndex) || !acceptsController(slot.instanceId)) return;
+    if (m_inputSuspended && !neutral) return;
+    if (m_shellCaptureEnabled) return;
+    const auto cleared = neutral || m_inputSuspended;
+    const auto left = cleared ? QPair<qint16, qint16>{}
+        : radialDeadzone(slot.rawLeftX, slot.rawLeftY, m_leftStickDeadzone);
+    const auto right = cleared ? QPair<qint16, qint16>{}
+        : radialDeadzone(slot.rawRightX, slot.rawRightY, m_rightStickDeadzone);
+    SonySnapshot snapshot;
+    snapshot.slot = static_cast<quint8>(effectiveSlot(slotIndex));
+    snapshot.incarnation = slot.incarnation;
+    snapshot.buttons = cleared ? 0 : slot.buttons;
+    snapshot.leftTrigger = cleared ? 0 : slot.leftTrigger;
+    snapshot.rightTrigger = cleared ? 0 : slot.rightTrigger;
+    snapshot.leftStickX = left.first;
+    snapshot.leftStickY = left.second;
+    snapshot.rightStickX = right.first;
+    snapshot.rightStickY = right.second;
+    snapshot.touchpadClick = !cleared && slot.touchpadClick;
+    for (std::size_t finger = 0; finger < snapshot.contacts.size(); ++finger)
+        snapshot.contacts[finger] = slot.contacts[finger];
+    if (cleared) {
+        for (auto &contact : snapshot.contacts) contact.active = false;
+    }
+    snapshot.observedAtUs = static_cast<quint64>(m_clock.elapsed() * 1000);
+    emit sonySnapshot(snapshot);
+}
+
+void ControllerInput::publishConnectedSony(bool neutral)
+{
+    for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot) {
+        if (m_slots[static_cast<std::size_t>(slot)].gamepad && isSonySlot(slot))
+            publishSonySnapshot(slot, neutral);
+    }
+}
+
+void ControllerInput::publishConnectedInputs(bool neutral)
+{
+    publishConnectedGamepads(neutral);
+    publishConnectedSony(neutral);
+}
+
+void ControllerInput::releaseSonyContacts(int slotIndex)
+{
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    slot.contacts[0].active = false;
+    slot.contacts[1].active = false;
+    slot.touchpadClick = false;
+    publishSonySnapshot(slotIndex, true);
+}
+
+void ControllerInput::handleTouchpad(const SDL_GamepadTouchpadEvent &event)
+{
+    const auto slotIndex = m_gamepadSlots.value(event.which, -1);
+    if (slotIndex < 0 || !acceptsController(event.which)) return;
+    if (event.touchpad != 0) return;
+    if (event.finger < 0 || event.finger > 1) return;
+    auto &slot = m_slots[static_cast<std::size_t>(slotIndex)];
+    auto &contact = slot.contacts[static_cast<std::size_t>(event.finger)];
+    const auto finite = std::isfinite(event.x) && std::isfinite(event.y);
+    switch (event.type) {
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+        if (!finite) return;
+        contact.x = event.x;
+        contact.y = event.y;
+        contact.hasPosition = true;
+        contact.active = true;
+        break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+        contact.active = false;
+        if (finite) {
+            contact.x = event.x;
+            contact.y = event.y;
+            contact.hasPosition = true;
+        }
+        break;
+    default:
+        return;
+    }
+    if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN && (m_shellCaptureEnabled || m_inputSuspended))
+        return;
+    publishSonySnapshot(slotIndex);
+}
+
+QList<SdlDeviceClaim> ControllerInput::deviceClaims() const
+{
+    QList<SdlDeviceClaim> claims;
+    for (int slot = 0; slot < static_cast<int>(m_slots.size()); ++slot) {
+        const auto &entry = m_slots[static_cast<std::size_t>(slot)];
+        if (!entry.gamepad || !acceptsController(entry.instanceId)) continue;
+        claims.append(SdlDeviceClaim{static_cast<quint8>(effectiveSlot(slot)), entry.incarnation,
+                                     entry.vendor, entry.product});
+    }
+    return claims;
 }
 
 void ControllerInput::updateSlotSnapshot(int slotIndex)
@@ -473,6 +656,7 @@ void ControllerInput::updateSlotSnapshot(int slotIndex)
         SDL_GetGamepadAxis(slot.gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
     slot.rightTrigger = triggerValue(
         SDL_GetGamepadAxis(slot.gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+    sampleSonyContacts(slotIndex);
 }
 
 quint16 ControllerInput::buttonMask(Uint8 button)
@@ -566,7 +750,7 @@ void ControllerInput::handleShellButton(int slotIndex, int key, bool pressed)
 {
     auto &keys = m_slots[static_cast<std::size_t>(slotIndex)].shellKeys;
     if (keys.contains(key) == pressed) return;
-    QPointer<QObject> target = pressed ? QPointer<QObject>(QGuiApplication::focusObject()) : keys.take(key);
+    QPointer<QObject> target = pressed ? QPointer<QObject>(QGuiApplication::focusWindow()) : keys.take(key);
     if (pressed && !target) target = QCoreApplication::instance();
     for (const auto &slot : m_slots) {
         if (!slot.shellKeys.contains(key)) continue;
@@ -586,7 +770,7 @@ void ControllerInput::releaseShellButtons(int slotIndex)
 void ControllerInput::postKey(int key, bool pressed, bool autoRepeat, QObject *target)
 {
     if (!m_shellCaptureEnabled || m_inputSuspended) return;
-    if (!target) target = QGuiApplication::focusObject();
+    if (!target) target = QGuiApplication::focusWindow();
     if (!target) target = QCoreApplication::instance();
     const auto type = pressed ? QEvent::KeyPress : QEvent::KeyRelease;
     QCoreApplication::postEvent(

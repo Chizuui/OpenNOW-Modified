@@ -30,6 +30,7 @@ FocusScope {
         && root.streamer.firstFrameLatencyMs !== undefined
         && root.streamer.firstFrameLatencyMs !== null
     property var frameGenerationStats: streamVideo.frameGenerationStats || ({})
+    property var swapStats: streamVideo.swapStats || ({})
     property double clockNowMs: Date.now()
     readonly property int clockSeconds: ShellStore.streamStartedAtMs > 0
         ? Math.max(0, Math.floor((clockNowMs - ShellStore.streamStartedAtMs) / 1000)) : 0
@@ -99,6 +100,7 @@ FocusScope {
         videoSize: Qt.size(Number(root.profile.width || 0), Number(root.profile.height || 0))
         frameGeneration: String(ShellStore.settings.frameGeneration || 'off') === '2x'
         metalFxUpscaling: Qt.platform.os === "osx" && ShellStore.settings.upscaling === "metalfx"
+        fsrUpscaling: Qt.platform.os !== "osx" && ShellStore.settings.upscaling === "fsr1"
         upscalingSharpness: Number(ShellStore.settings.upscalingSharpness ?? 10)
         upscalingDenoise: Number(ShellStore.settings.upscalingDenoise ?? 0)
         z: 0

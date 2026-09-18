@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use str0m::Rtc;
 use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 
+use crate::nvst_budget::{TEXT_BATCH_GUARD, WriteClass, admit_write};
+
 pub(crate) const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const INPUT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -138,19 +140,17 @@ impl NvstInputChannels {
         timestamp_us: u64,
     ) -> bool {
         let messages = unicode_text_messages(text, timestamp_us);
-        let buffered: usize = self
-            .all()
-            .into_iter()
-            .chain([self.rtcp])
-            .filter_map(|id| rtc.channel(id).map(|mut channel| channel.buffered_amount()))
-            .sum();
+        let total_bytes: usize = messages.iter().map(|message| message.bytes.len()).sum();
+        let buffered = self.buffered_total(rtc);
+        if !text_batch_fits(buffered, total_bytes, TEXT_BATCH_GUARD) {
+            return false;
+        }
+        if !admit_write(buffered, total_bytes, WriteClass::Normal).is_admitted() {
+            return false;
+        }
         let Some(mut channel) = rtc.channel(self.control_reliable) else {
             return false;
         };
-        let total_bytes: usize = messages.iter().map(|message| message.bytes.len()).sum();
-        if !text_batch_fits(buffered, total_bytes) {
-            return false;
-        }
         if text.is_cancelled() {
             return true;
         }
@@ -206,11 +206,19 @@ impl NvstInputChannels {
     }
 
     pub(crate) fn send_control(self, rtc: &mut Rtc, bytes: &[u8]) -> bool {
-        write_channel(rtc, self.control_reliable, bytes)
+        self.write(rtc, self.control_reliable, bytes, WriteClass::Normal)
+    }
+
+    pub(crate) fn send_control_teardown(self, rtc: &mut Rtc, bytes: &[u8]) -> bool {
+        self.write(rtc, self.control_reliable, bytes, WriteClass::Teardown)
+    }
+
+    pub(crate) fn send_rtcp(self, rtc: &mut Rtc, bytes: &[u8]) -> bool {
+        self.write(rtc, self.rtcp, bytes, WriteClass::Normal)
     }
 
     pub(crate) fn send_partial_control(self, rtc: &mut Rtc, bytes: &[u8]) -> bool {
-        write_channel(rtc, self.control_partial, bytes)
+        self.write(rtc, self.control_partial, bytes, WriteClass::Normal)
     }
 
     pub(crate) fn send_keepalive(self, rtc: &mut Rtc, stream_value: u32) -> bool {
@@ -237,7 +245,23 @@ impl NvstInputChannels {
             NvstInputRoute::ControlPartial => self.control_partial,
             NvstInputRoute::InputPartial => self.input_partial,
         };
-        write_channel(rtc, id, &message.bytes)
+        self.write(rtc, id, &message.bytes, WriteClass::Normal)
+    }
+
+    fn write(self, rtc: &mut Rtc, id: ChannelId, bytes: &[u8], class: WriteClass) -> bool {
+        if !admit_write(self.buffered_total(rtc), bytes.len(), class).is_admitted() {
+            return false;
+        }
+        rtc.channel(id)
+            .is_some_and(|mut channel| channel.write(true, bytes).unwrap_or(false))
+    }
+
+    pub(crate) fn buffered_total(self, rtc: &mut Rtc) -> usize {
+        self.all()
+            .into_iter()
+            .chain([self.rtcp])
+            .filter_map(|id| rtc.channel(id).map(|mut channel| channel.buffered_amount()))
+            .sum()
     }
 
     fn all(self) -> [ChannelId; 7] {
@@ -253,8 +277,8 @@ impl NvstInputChannels {
     }
 }
 
-fn text_batch_fits(buffered: usize, batch_bytes: usize) -> bool {
-    buffered.saturating_add(batch_bytes) <= 128 * 1024
+fn text_batch_fits(buffered: usize, batch_bytes: usize, guard: usize) -> bool {
+    buffered.saturating_add(batch_bytes) <= guard
 }
 
 fn channel_config(definition: NvstChannelDefinition) -> ChannelConfig {
@@ -272,11 +296,6 @@ fn channel_config(definition: NvstChannelDefinition) -> ChannelConfig {
         negotiated: None,
         protocol: String::new(),
     }
-}
-
-fn write_channel(rtc: &mut Rtc, id: ChannelId, bytes: &[u8]) -> bool {
-    rtc.channel(id)
-        .is_some_and(|mut channel| channel.write(true, bytes).unwrap_or(false))
 }
 
 #[derive(Debug, Default)]
@@ -421,10 +440,6 @@ pub(crate) struct NvstServerCursorMessage {
     pub(crate) normalized: Option<Vec<u8>>,
 }
 
-/// Scans a data-channel message for cursor commands instead of assuming that
-/// the host always places them at byte zero on `control_channel_reliable`.
-/// This is deliberately cursor-specific: arbitrary custom-channel payloads
-/// must not be interpreted as general NVST control traffic.
 pub(crate) fn server_cursor_messages(bytes: &[u8]) -> Vec<NvstServerCursorMessage> {
     let mut updates = Vec::new();
     let mut offset = 0_usize;
@@ -436,12 +451,10 @@ pub(crate) fn server_cursor_messages(bytes: &[u8]) -> Vec<NvstServerCursorMessag
             break;
         };
         if payload_end > bytes.len() {
-            offset += 1;
-            continue;
+            break;
         }
         let payload = &bytes[payload_start..payload_end];
         match code {
-            super::nvst_haptics::HAPTIC_COMMAND_CODE => {}
             COMMAND_SYSTEM_CURSOR if payload.len() >= 4 => {
                 let cursor_id =
                     u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -490,10 +503,7 @@ pub(crate) fn server_cursor_messages(bytes: &[u8]) -> Vec<NvstServerCursorMessag
                     normalized: None,
                 });
             }
-            _ => {
-                offset += 1;
-                continue;
-            }
+            _ => {}
         }
         offset = payload_end;
     }
@@ -569,9 +579,68 @@ impl fmt::Display for NvstInputCodecError {
 pub(crate) struct NvstInputCodec {
     gamepad_sequences: [u16; 4],
     gamepad_bitmap: Option<u16>,
+    rich_slot_mask: u16,
+    last_gamepad_report: Option<[u8; 38]>,
 }
 
 impl NvstInputCodec {
+    pub(crate) fn set_rich_slot_mask(
+        &mut self,
+        mask: u16,
+        timestamp_us: u64,
+    ) -> Vec<NvstEncodedInput> {
+        if self.rich_slot_mask == mask {
+            return Vec::new();
+        }
+        self.rich_slot_mask = mask;
+        let mut encoded = Vec::new();
+        let Some(previous) = self.gamepad_bitmap else {
+            return encoded;
+        };
+        let filtered = previous & !mask;
+        if filtered != previous {
+            self.emit_topology_transition(previous, filtered, timestamp_us, &mut encoded);
+        }
+        encoded
+    }
+
+    fn emit_topology_transition(
+        &mut self,
+        previous: u16,
+        filtered: u16,
+        timestamp_us: u64,
+        encoded: &mut Vec<NvstEncodedInput>,
+    ) {
+        for id in 0..self.gamepad_sequences.len() {
+            if previous & (1 << id) != 0 && filtered & (1 << id) == 0 {
+                let mut neutral = self.last_gamepad_report.unwrap_or([0_u8; 38]);
+                neutral[6..8].copy_from_slice(&(id as u16).to_le_bytes());
+                neutral[8..10].copy_from_slice(&previous.to_le_bytes());
+                neutral[12..24].fill(0);
+                neutral[30..38].copy_from_slice(&timestamp_us.to_be_bytes());
+                let mut payload = Vec::with_capacity(48);
+                payload.push(0x23);
+                payload.extend_from_slice(&timestamp_us.to_be_bytes());
+                payload.push(0x22);
+                payload.extend_from_slice(&neutral);
+                encoded.push(NvstEncodedInput {
+                    route: NvstInputRoute::ControlReliable,
+                    bytes: control_command(COMMAND_GAMEPAD, &payload),
+                });
+            }
+        }
+        for id in 0..self.gamepad_sequences.len() {
+            if filtered & (1 << id) == 0 {
+                self.gamepad_sequences[id] = 0;
+            }
+        }
+        self.gamepad_bitmap = Some(filtered);
+        encoded.push(NvstEncodedInput {
+            route: NvstInputRoute::ControlReliable,
+            bytes: device_descriptor(timestamp_us, filtered),
+        });
+    }
+
     pub(crate) fn encode(
         &mut self,
         packet: &[u8],
@@ -684,35 +753,22 @@ impl NvstInputCodec {
                         ));
                     }
                     let bitmap = read_u16_le(event.bytes, 8).expect("gamepad length checked");
-                    if self.gamepad_bitmap != Some(bitmap) {
+                    self.last_gamepad_report = Some(
+                        event.bytes[..38]
+                            .try_into()
+                            .expect("gamepad length checked"),
+                    );
+                    let filtered = bitmap & !self.rich_slot_mask;
+                    if self.gamepad_bitmap != Some(filtered) {
                         let previous_bitmap = self.gamepad_bitmap.unwrap_or_default();
-                        for id in 0..self.gamepad_sequences.len() {
-                            if previous_bitmap & (1 << id) != 0 && bitmap & (1 << id) == 0 {
-                                let mut neutral = event.bytes[..38].to_vec();
-                                neutral[6..8].copy_from_slice(&(id as u16).to_le_bytes());
-                                neutral[8..10].copy_from_slice(&previous_bitmap.to_le_bytes());
-                                neutral[12..24].fill(0);
-                                let mut payload = Vec::with_capacity(48);
-                                payload.push(0x23);
-                                payload.extend_from_slice(&timestamp.to_be_bytes());
-                                payload.push(0x22);
-                                payload.extend_from_slice(&neutral);
-                                encoded.push(NvstEncodedInput {
-                                    route: NvstInputRoute::ControlReliable,
-                                    bytes: control_command(COMMAND_GAMEPAD, &payload),
-                                });
-                            }
-                            if bitmap & (1 << id) == 0 {
-                                self.gamepad_sequences[id] = 0;
-                            }
-                        }
-                        self.gamepad_bitmap = Some(bitmap);
-                        encoded.push(NvstEncodedInput {
-                            route: NvstInputRoute::ControlReliable,
-                            bytes: device_descriptor(timestamp, bitmap),
-                        });
+                        self.emit_topology_transition(
+                            previous_bitmap,
+                            filtered,
+                            timestamp,
+                            &mut encoded,
+                        );
                     }
-                    if bitmap & (1 << controller_id) == 0 {
+                    if filtered & (1 << controller_id) == 0 {
                         continue;
                     }
                     self.gamepad_sequences[controller_id] =
@@ -922,6 +978,94 @@ fn gamepad_command(packet: &[u8], timestamp_us: u64, sequence: u16) -> Vec<u8> {
     payload.extend_from_slice(&38_u16.to_be_bytes());
     payload.extend_from_slice(&packet[..38]);
     control_command(COMMAND_GAMEPAD, &payload)
+}
+
+pub(crate) const RI_TYPE_DEVICE_CHANGE: u32 = 0x12;
+pub(crate) const RI_TYPE_HID_REPORT: u32 = 0x11;
+pub(crate) const HID_REPORT_MARKER: u8 = 0x22;
+pub(crate) const SONY_DEVICE_CHANGE_FLAGS: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SonyDeviceControl {
+    Attach,
+    Removal,
+}
+
+impl SonyDeviceControl {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Attach => 1,
+            Self::Removal => 3,
+        }
+    }
+}
+
+pub(crate) fn sony_low_id_in_range(low_id: u8) -> Option<()> {
+    let offset = low_id.checked_sub(opennow_streamer_hid::ds4::DS4_LOW_ID_BASE)?;
+    (usize::from(offset) < opennow_streamer_hid::MAX_SOURCES).then_some(())
+}
+
+pub(crate) fn sony_device_change_command(
+    control: SonyDeviceControl,
+    low_id: u8,
+) -> Option<Vec<u8>> {
+    sony_low_id_in_range(low_id)?;
+    let mut body = Vec::with_capacity(14);
+    body.push(low_id);
+    body.push(control.code());
+    body.extend_from_slice(&SONY_DEVICE_CHANGE_FLAGS.to_be_bytes());
+    body.extend_from_slice(&0_u16.to_be_bytes());
+    body.extend_from_slice(&0_u16.to_be_bytes());
+    body.extend_from_slice(&0_u16.to_be_bytes());
+    body.extend_from_slice(&0_u16.to_be_bytes());
+    Some(control_command(
+        COMMAND_REMOTE_INPUT,
+        &remote_input_packet(RI_TYPE_DEVICE_CHANGE, &body),
+    ))
+}
+
+pub(crate) fn sony_report_command(
+    low_id: u8,
+    report: &[u8; opennow_streamer_hid::ds4::DS4_REPORT_BYTES],
+) -> Option<Vec<u8>> {
+    sony_low_id_in_range(low_id)?;
+    let mut payload = Vec::with_capacity(72);
+    payload.push(HID_REPORT_MARKER);
+    payload.extend_from_slice(&RI_TYPE_HID_REPORT.to_le_bytes());
+    payload.push(low_id);
+    payload.push(opennow_streamer_hid::ds4::DS4_INTERFACE);
+    payload.push(0);
+    payload.extend_from_slice(report);
+    Some(control_command(COMMAND_GAMEPAD, &payload))
+}
+
+pub(crate) fn parse_sony_output(payload: &[u8]) -> Option<(u8, &[u8])> {
+    if payload.len() < 13 {
+        return None;
+    }
+    if u32::from_le_bytes(payload[0..4].try_into().ok()?) != RI_TYPE_HID_REPORT {
+        return None;
+    }
+    let low_id = payload[4];
+    sony_low_id_in_range(low_id)?;
+    Some((low_id, &payload[7..]))
+}
+
+pub(crate) fn for_each_sony_output(mut bytes: &[u8], mut handle: impl FnMut(u8, &[u8])) {
+    while bytes.len() >= 4 {
+        let code = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let length = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+        let Some(payload) = bytes.get(4..4 + length) else {
+            return;
+        };
+        bytes = &bytes[4 + length..];
+        if code != COMMAND_REMOTE_INPUT {
+            continue;
+        }
+        if let Some((low_id, operation)) = parse_sony_output(payload) {
+            handle(low_id, operation);
+        }
+    }
 }
 
 fn text_messages(event: &NativeEvent<'_>) -> Result<Vec<NvstEncodedInput>, NvstInputCodecError> {
@@ -1198,10 +1342,33 @@ mod tests {
 
     #[test]
     fn unicode_text_batch_admission_rejects_whole_batch_before_capacity_overflow() {
-        assert!(text_batch_fits(0, 70_000));
-        assert!(text_batch_fits(128 * 1024 - 70_000, 70_000));
-        assert!(!text_batch_fits(128 * 1024 - 70_000 + 1, 70_000));
-        assert!(!text_batch_fits(usize::MAX, 70_000));
+        assert!(text_batch_fits(0, 70_000, TEXT_BATCH_GUARD));
+        assert!(text_batch_fits(
+            128 * 1024 - 70_000,
+            70_000,
+            TEXT_BATCH_GUARD
+        ));
+        assert!(!text_batch_fits(
+            128 * 1024 - 70_000 + 1,
+            70_000,
+            TEXT_BATCH_GUARD
+        ));
+        assert!(!text_batch_fits(usize::MAX, 70_000, TEXT_BATCH_GUARD));
+    }
+
+    #[test]
+    fn text_admission_is_normal_traffic_bounded_by_the_shared_budget() {
+        let guard = crate::nvst_budget::TEXT_BATCH_GUARD;
+        assert!(guard <= crate::nvst_budget::TRANSPORT_AGGREGATE_CAPACITY);
+        assert!(guard > crate::nvst_budget::NORMAL_BUDGET);
+        assert_eq!(
+            crate::nvst_budget::admit_write(guard, 0, WriteClass::Normal),
+            crate::nvst_budget::WriteAdmission::EmptyWrite
+        );
+        assert_eq!(
+            crate::nvst_budget::admit_write(0, guard, WriteClass::Normal),
+            crate::nvst_budget::WriteAdmission::OverBudget
+        );
     }
 
     fn hex(value: &str) -> Vec<u8> {
@@ -1388,6 +1555,63 @@ mod tests {
         assert_eq!(cursors.len(), 1);
         assert_eq!(cursors[0].offset, 16);
         assert_eq!(cursors[0].cursor_id, Some(1));
+    }
+
+    #[test]
+    fn unrelated_control_payloads_cannot_toggle_cursor_lock() {
+        for code in [0x010a, 0x0111, 0x0200, 0xffff] {
+            let mut bytes = control_command(COMMAND_SYSTEM_CURSOR, &0_u32.to_le_bytes());
+            let unrelated = control_command(
+                code,
+                &hex("0f010400010000000f01040000000000100108000000000000000000"),
+            );
+            bytes.extend_from_slice(&unrelated);
+            let visible_offset = bytes.len();
+            bytes.extend_from_slice(&control_command(
+                COMMAND_SYSTEM_CURSOR,
+                &12_u32.to_le_bytes(),
+            ));
+
+            let cursors = server_cursor_messages(&bytes);
+            assert_eq!(cursors.len(), 2, "outer command {code:#06x}");
+            assert_eq!(cursors[0].offset, 0);
+            assert_eq!(cursors[0].normalized, Some(hex("00000000000000")));
+            assert_eq!(cursors[1].offset, visible_offset);
+            assert_eq!(cursors[1].normalized, Some(hex("000c0000000000")));
+        }
+    }
+
+    #[test]
+    fn truncated_control_payloads_cannot_invent_cursor_notifications() {
+        for code in [0x010a, COMMAND_SYSTEM_CURSOR, COMMAND_BITMAP_CURSOR] {
+            let mut bytes = control_command(COMMAND_SYSTEM_CURSOR, &0_u32.to_le_bytes());
+            bytes.extend_from_slice(&code.to_le_bytes());
+            bytes.extend_from_slice(&100_u16.to_le_bytes());
+            bytes.extend_from_slice(&hex("0f01040001000000100108000000000000000000"));
+
+            let cursors = server_cursor_messages(&bytes);
+            assert_eq!(cursors.len(), 1, "truncated command {code:#06x}");
+            assert_eq!(cursors[0].offset, 0);
+            assert_eq!(cursors[0].normalized, Some(hex("00000000000000")));
+        }
+    }
+
+    #[test]
+    fn short_cursor_payloads_do_not_consume_following_commands() {
+        for (code, minimum_length) in [(COMMAND_SYSTEM_CURSOR, 4), (COMMAND_BITMAP_CURSOR, 8)] {
+            for length in 0..minimum_length {
+                let mut bytes = control_command(code, &vec![0x0f; length]);
+                let visible_offset = bytes.len();
+                bytes.extend_from_slice(&control_command(
+                    COMMAND_SYSTEM_CURSOR,
+                    &1_u32.to_le_bytes(),
+                ));
+                let cursors = server_cursor_messages(&bytes);
+                assert_eq!(cursors.len(), 1);
+                assert_eq!(cursors[0].offset, visible_offset);
+                assert_eq!(cursors[0].normalized, Some(hex("00010000000000")));
+            }
+        }
     }
 
     #[test]
@@ -1719,5 +1943,107 @@ mod tests {
         assert!(!state.is_ready());
         assert!(!state.channel_closed(channels, channels.input_partial));
         assert!(!state.is_ready());
+    }
+
+    #[test]
+    fn sony_device_change_attaches_and_removes_with_the_proved_envelope() {
+        let attach = sony_device_change_command(SonyDeviceControl::Attach, 6).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&COMMAND_REMOTE_INPUT.to_le_bytes());
+        expected.extend_from_slice(&22_u16.to_le_bytes());
+        expected.extend_from_slice(&18_u32.to_be_bytes());
+        expected.extend_from_slice(&RI_TYPE_DEVICE_CHANGE.to_le_bytes());
+        expected.push(6);
+        expected.push(1);
+        expected.extend_from_slice(&SONY_DEVICE_CHANGE_FLAGS.to_be_bytes());
+        expected.extend_from_slice(&[0; 8]);
+        assert_eq!(attach, expected);
+        assert_eq!(attach.len(), 26);
+
+        let removal = sony_device_change_command(SonyDeviceControl::Removal, 9).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&COMMAND_REMOTE_INPUT.to_le_bytes());
+        expected.extend_from_slice(&22_u16.to_le_bytes());
+        expected.extend_from_slice(&18_u32.to_be_bytes());
+        expected.extend_from_slice(&RI_TYPE_DEVICE_CHANGE.to_le_bytes());
+        expected.push(9);
+        expected.push(3);
+        expected.extend_from_slice(&SONY_DEVICE_CHANGE_FLAGS.to_be_bytes());
+        expected.extend_from_slice(&[0; 8]);
+        assert_eq!(removal, expected);
+        assert_eq!(removal.len(), 26);
+    }
+
+    #[test]
+    fn sony_device_change_rejects_ids_outside_the_reserved_domain() {
+        for low_id in [0, 1, 5, 10, 255] {
+            assert!(sony_device_change_command(SonyDeviceControl::Attach, low_id).is_none());
+        }
+        for low_id in [6, 7, 8, 9] {
+            assert!(sony_device_change_command(SonyDeviceControl::Attach, low_id).is_some());
+        }
+    }
+
+    #[test]
+    fn sony_report_command_matches_the_single_report_wire_shape() {
+        let mut report = [0_u8; 64];
+        report[0] = 0x01;
+        report[35] = 0x01;
+        let command = sony_report_command(7, &report).unwrap();
+        assert_eq!(&command[0..2], &0x020d_u16.to_le_bytes());
+        assert_eq!(&command[2..4], &72_u16.to_le_bytes());
+        assert_eq!(command[4], 0x22);
+        assert_eq!(&command[5..9], &0x11_u32.to_le_bytes());
+        assert_eq!(command[9], 7);
+        assert_eq!(command[10], 4);
+        assert_eq!(command[11], 0);
+        assert_eq!(&command[12..76], &report);
+        assert_eq!(command.len(), 76);
+    }
+
+    #[test]
+    fn sony_report_command_rejects_ids_outside_the_reserved_domain() {
+        let report = [0_u8; 64];
+        assert!(sony_report_command(5, &report).is_none());
+        assert!(sony_report_command(10, &report).is_none());
+        assert!(sony_report_command(9, &report).is_some());
+    }
+
+    #[test]
+    fn sony_output_parser_extracts_the_low_id_and_operation_payload() {
+        let mut payload = vec![0x11, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00];
+        payload.extend_from_slice(&[5, 0x01, 0, 0, 0x40, 0x80]);
+        let (low_id, operation) = parse_sony_output(&payload).unwrap();
+        assert_eq!(low_id, 8);
+        assert_eq!(operation, &[5, 0x01, 0, 0, 0x40, 0x80]);
+    }
+
+    #[test]
+    fn sony_output_parser_rejects_short_unknown_and_high_id_payloads() {
+        let mut payload = vec![0x11, 0x00, 0x00, 0x00, 0x06, 0x04, 0x00];
+        payload.extend_from_slice(&[5, 0x01, 0, 0, 0x40, 0x80]);
+        assert!(parse_sony_output(&payload).is_some());
+        assert!(parse_sony_output(&payload[..12]).is_none());
+        let mut wrong_type = payload.clone();
+        wrong_type[0] = 0x12;
+        assert!(parse_sony_output(&wrong_type).is_none());
+        let mut high_id = payload.clone();
+        high_id[4] = 10;
+        assert!(parse_sony_output(&high_id).is_none());
+        let mut low_id = payload;
+        low_id[4] = 5;
+        assert!(parse_sony_output(&low_id).is_none());
+    }
+
+    #[test]
+    fn sony_report_route_uses_the_reliable_control_channel_not_the_partial_one() {
+        let report = [0_u8; 64];
+        let command = sony_report_command(6, &report).unwrap();
+        let encoded = NvstEncodedInput {
+            route: NvstInputRoute::ControlReliable,
+            bytes: command,
+        };
+        assert_eq!(encoded.route, NvstInputRoute::ControlReliable);
+        assert_ne!(encoded.route, NvstInputRoute::InputPartial);
     }
 }

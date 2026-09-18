@@ -48,6 +48,24 @@ The Qt path does not create an SDL video window or a child streamer process. `Na
 
 The FFI exposes no CPU image, encoded-frame callback, swap chain, window or Qt object. See `crates/opennow-streamer-ffi/README.md` for ownership and threading details.
 
+### Local playback mute
+
+Protocol 7 accepts `{"type":"setAudioMuted","id":"audio-mute-1","muted":true}`
+and returns the correlated `ok` response. `muted` must be a boolean; omitting it
+returns `missing-muted`. Set it to `false` to restore speaker playback.
+
+The mute state belongs to the media runtime, defaults to false, and can be set
+before starting a session. It survives stops, reconnects, backend fallback, and
+audio device recovery within that runtime. Creating a new runtime resets it, so
+the shell must resend its desired state when its native runtime becomes ready.
+The FFI ABI is unchanged.
+
+Mute replaces samples with silence only at SDL, ALSA/PipeWire, CoreAudio, and
+WASAPI playback boundaries. Playback queues keep draining; transport, Opus decode,
+recording, replay capture, microphone capture, and video remain active. Samples
+already handed to the operating system or device may finish playing during its
+existing bounded output latency; mute does not stop or flush those devices.
+
 ### Audio output selection
 
 Protocol 5 accepts the additive request `{"type":"audioDevices","id":"audio-1"}`
@@ -148,7 +166,7 @@ polling timer when no capture is active. Output enumeration and input-pause
 commands never open, mute, or restart capture. The actual audio-device-aware
 stream-start entry point resets the microphone clock; mute/unmute does not.
 
-The local JSON protocol is version 6; the C ABI is unchanged. `hello` exposes
+The local JSON protocol is version 7; the C ABI is unchanged. `hello` exposes
 `supportsMicrophone` for runtime capture support, while the `start` response
 reports the negotiated session capability. `microphone-set` requires a boolean
 `enabled`; `microphone-toggle` toggles the current capture state. Both require an
@@ -170,10 +188,20 @@ suppression are not provided by this capture path.
 ### Embedded session diagnostics
 
 Protocol 5 telemetry includes optional `jitterMs` (RTP interarrival jitter on
-the video 90 kHz clock) and `packetLossPercent` (cumulative authenticated RTP
-reception loss since stream start). Values are null before a stream is known.
-Reading these measurements does not advance RTCP report intervals. Qt forwards
+the video 90 kHz clock) and `packetLossPercent` (authenticated RTP reception loss
+over the latest sampled interval, normally one second). Loss sampling requires
+new traffic and an interval between one and three seconds. The first sample
+establishes a baseline and returns null. A longer gap, stream change, or counter
+reset starts a new baseline. Late recovery cannot produce negative loss. Sampling
+does not change cumulative RTCP loss or advance RTCP report intervals. Qt forwards
 measured values without converting nulls into zeros.
+
+Qt's shared connection-health state requires at least 0.5% loss sustained for two
+seconds before showing an unstable header or popup. A fresh sample below 0.1%
+restores healthy status and dismisses the loss popup. Missing or invalid samples,
+or five seconds without a fresh measurement, clear health to unknown. Historical
+video frame and audio packet drop totals remain unchanged. Loss popups keep their
+four-second lifetime and thirty-second cooldown across local overlay changes.
 
 The optional `pingMs` field measures network round-trip time on the active session. It prefers
 the nominated ICE candidate pair's measured RTT, then authenticated STUN/NATT replies
@@ -183,6 +211,11 @@ STUN replies must match an outstanding transaction, the peer address, fingerprin
 message integrity. Each receiver tracks at most 64 probes. ICE statistics only refresh
 the sample when the pair's response count changes; rereading old statistics cannot keep
 an old measurement alive.
+
+The bundle remembers up to 64 emitted ICE transactions and forwards each authenticated
+success response to the ICE library only once. Delayed duplicate replies must not overwrite
+the original completion time and turn the age of an old probe into the displayed network RTT.
+This does not cap genuine network latency or filter first replies based on their timing.
 
 Session liveness follows [OpenNOW-Mac's live-tested keepalive method](https://github.com/OpenCloudGaming/OpenNOW-Mac/blob/90627114383501dd18ef165baa005d9ea603fdf3/GFN/NVST/Rtsp/NvstRtspConnection.swift#L161-L234):
 send `GET_PARAMETER` with the RTSP Session header every two seconds over the existing

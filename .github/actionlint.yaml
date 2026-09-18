@@ -11,6 +11,7 @@ self-hosted-runner:
     - blacksmith-8vcpu-ubuntu-2404
     - blacksmith-8vcpu-ubuntu-2404-arm
     - blacksmith-8vcpu-windows-2025
-    - opennow-release-signer
+    - blacksmith-16vcpu-ubuntu-2404
+    - blacksmith-16vcpu-windows-2025
 
 config-variables: null

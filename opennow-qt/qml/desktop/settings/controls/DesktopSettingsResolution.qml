@@ -39,10 +39,18 @@ Item {
         if (expanded) gridFlick.forceActiveFocus()
         else stepper.focusSelector()
     }
+    Keys.onEscapePressed: event => {
+        if (!root.expanded) {
+            event.accepted = false
+            return
+        }
+        root.expanded = false
+        event.accepted = true
+    }
     function step(direction) {
         if (!available.length) return
         const index = available.findIndex(item => item.value === value)
-        root.selected(available[(Math.max(0,index) + direction + available.length) % available.length].value)
+        root.selected(available[(Math.max(0, index) + direction + available.length) % available.length].value)
     }
     Rectangle {
         visible: reveal.present; opacity: reveal.progress
@@ -52,7 +60,6 @@ Item {
     DesktopSettingsRow {
         id: header
         width: parent.width; paperStyle: true; glyph: "monitor"; expanded: root.expanded
-        rowHeight: DesktopTokens.px(68)
         title: qsTr("Resolution")
         description: root.expanded ? qsTr("%1 available · Esc closes").arg(root.available.length)
             : root.current ? root.current.detail : root.value.replace("x", "×")
@@ -68,8 +75,8 @@ Item {
         }
         DesktopSettingsSegmented {
             visible: root.expanded
-            options: [{label: qsTr("All"), width: DesktopTokens.px(46)},
-                {label: qsTr("Fits monitor"), width: DesktopTokens.px(108)}]
+            options: [{label: qsTr("All"), width: 46},
+                {label: qsTr("Fits monitor"), width: 108}]
             selectedIndex: root.fitsMonitor ? 1 : 0
             onSelected: index => root.fitsMonitor = index === 1
         }
@@ -84,7 +91,6 @@ Item {
         contentWidth: width; contentHeight: gridContents.implicitHeight+14
         clip: true; boundsBehavior: Flickable.StopAtBounds
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-        Keys.onEscapePressed: event => { root.expanded = false; event.accepted = true }
         Column {
             id: gridContents; width: parent.width; spacing: 14
             Repeater {
@@ -111,7 +117,6 @@ Item {
                                 hoverEnabled: true
                                 Accessible.name: modelData.label + " " + modelData.detail
                                 onClicked: { root.selected(modelData.value); root.expanded = false }
-                                Keys.onEscapePressed: event => { root.expanded = false; event.accepted = true }
                                 background: Rectangle {
                                     radius: 12; color: tile.selected ? Theme.focus : tile.hovered ? DesktopTokens.raisedStrong : DesktopTokens.raised
                                     border.width: 1; border.color: tile.activeFocus ? Theme.focus : DesktopTokens.seamSoft

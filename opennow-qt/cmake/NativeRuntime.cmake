@@ -104,6 +104,41 @@ if(WIN32 AND NOT OPENNOW_RUST_EFFECTIVE_TARGET)
     string(REGEX MATCH "host: ([^\r\n]+)" OPENNOW_RUST_HOST_MATCH "${OPENNOW_RUSTC_VERSION}")
     set(OPENNOW_RUST_EFFECTIVE_TARGET "${CMAKE_MATCH_1}")
 endif()
+
+set(OPENNOW_UPDATE_HELPER_TARGET_DIR "${OPENNOW_CORE_TARGET_DIR}")
+set(OPENNOW_UPDATE_HELPER_ARTIFACT_ROOT "${OPENNOW_CORE_ARTIFACT_ROOT}")
+set(OPENNOW_UPDATE_HELPER_TARGET_ARGS ${OPENNOW_RUST_TARGET_ARGS})
+set(OPENNOW_UPDATE_HELPER_ENV)
+if(WIN32)
+    set(OPENNOW_UPDATE_HELPER_TARGET_DIR "${CMAKE_BINARY_DIR}/update-helper-rust-target")
+    set(OPENNOW_UPDATE_HELPER_ARTIFACT_ROOT
+        "${OPENNOW_UPDATE_HELPER_TARGET_DIR}/${OPENNOW_RUST_EFFECTIVE_TARGET}")
+    set(OPENNOW_UPDATE_HELPER_TARGET_ARGS --target "${OPENNOW_RUST_EFFECTIVE_TARGET}")
+    set(OPENNOW_UPDATE_HELPER_ENV --unset=CARGO_ENCODED_RUSTFLAGS
+        "RUSTFLAGS=-C target-feature=+crt-static")
+endif()
+add_custom_target(opennow-update-helper-build ALL
+    COMMAND "${CMAKE_COMMAND}" -E env ${OPENNOW_UPDATE_HELPER_ENV}
+            "OPENNOW_UPDATE_ED25519_PUBLIC_KEY=${OPENNOW_UPDATE_ED25519_PUBLIC_KEY}"
+            "OPENNOW_BUILD_VERSION=${OPENNOW_BUILD_VERSION}"
+            "${CARGO_EXECUTABLE}" build
+            --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-core/Cargo.toml"
+            --target-dir "${OPENNOW_UPDATE_HELPER_TARGET_DIR}"
+            --bin opennow-update-helper
+            ${OPENNOW_UPDATE_HELPER_TARGET_ARGS}
+            $<$<CONFIG:Release>:--release>
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${OPENNOW_UPDATE_HELPER_ARTIFACT_ROOT}/${OPENNOW_CORE_PROFILE}/opennow-update-helper${OPENNOW_CORE_SUFFIX}"
+            "$<TARGET_FILE_DIR:opennow-qt>/opennow-update-helper${OPENNOW_CORE_SUFFIX}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-core"
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+)
+if(NOT WIN32)
+    add_dependencies(opennow-update-helper-build opennow-core)
+endif()
+add_dependencies(opennow-qt opennow-update-helper-build)
+
 # The Rust target determines its import-library format, not the Qt compiler.
 # MinGW can consume the MSVC COFF import library for our C-only FFI.
 if(WIN32 AND MINGW AND OPENNOW_RUST_EFFECTIVE_TARGET MATCHES "-msvc$")
@@ -202,6 +237,39 @@ add_custom_command(
 )
 add_custom_target(opennow-streamer-ffi-build
     DEPENDS ${OPENNOW_STREAMER_FFI_ARTIFACTS})
+
+set(OPENNOW_STREAMER_PEER_PROBE_NAME "nvst-peer-probe")
+set(OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR "${CMAKE_BINARY_DIR}/peer-probe-rust-target")
+set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}")
+if(OPENNOW_RUST_TARGET)
+    set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT
+        "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}/${OPENNOW_RUST_TARGET}")
+endif()
+set(OPENNOW_STREAMER_PEER_PROBE
+    "${OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT}/release/${OPENNOW_STREAMER_PEER_PROBE_NAME}")
+add_custom_command(
+    OUTPUT "${OPENNOW_STREAMER_PEER_PROBE}"
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=MAKEFLAGS --unset=MFLAGS
+            "CMAKE=${CMAKE_COMMAND}"
+            "${CARGO_EXECUTABLE}" build
+            --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+            --target-dir "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}"
+            --package opennow-streamer-transport
+            --features sony-peer-probe
+            --bin nvst-peer-probe
+            ${OPENNOW_RUST_TARGET_ARGS}
+            --release
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+        ${OPENNOW_STREAMER_RUST_SOURCES}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer"
+    COMMENT "Building the Sony chain RTC peer probe"
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+)
+add_custom_target(opennow-streamer-peer-probe
+    DEPENDS "${OPENNOW_STREAMER_PEER_PROBE}")
 
 # The Rust core still probes streamer capabilities through the standalone
 # streamer executable next to opennow-core, so build and ship it alongside

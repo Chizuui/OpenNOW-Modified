@@ -27,6 +27,7 @@ FocusScope {
     readonly property bool streamVisible: !signInVisible && route === "stream"
     readonly property bool streamPointerLocked: streamVisible && desktopStream.streamPointerLocked
     readonly property var frameGenerationStats: streamVisible ? desktopStream.frameGenerationStats : ({})
+    readonly property var swapStats: streamVisible ? desktopStream.swapStats : ({})
     readonly property bool shellVisible: !signInVisible && !sessionStartingVisible && !streamVisible
 
     function titleForRoute(value) {
@@ -160,7 +161,8 @@ FocusScope {
         focus: enabled
         z: 90
         onCancelRequested: ShellStore.requestStreamExitConfirmation()
-        onRetryRequested: ShellStore.retryNativeStreamer()
+        onRetryRequested: root.route === "stream"
+            ? ShellStore.retryNativeStreamer() : ShellStore.retrySessionLaunch()
     }
 
     DesktopStreamScreen {
@@ -179,14 +181,21 @@ FocusScope {
         opened: root.shellVisible && root.route === "game-detail"
         z: 100
         onCloseRequested: AppController.goBack()
-        onPlayRequested: ShellStore.launchSelectedGame(false)
+        onPlayRequested: ShellStore.activateSelectedGame()
+        onVariantSelected: index => ShellStore.selectGameVariant(index)
     }
     DesktopCommandPalette {
+        objectName: "desktopCommandPalette"
         opened: root.commandOpen && root.shellVisible
         z: 120
         onCloseRequested: root.commandOpen = false
         onRouteRequested: route => AppController.navigate(route)
         onGameRequested: game => { ShellStore.selectedGame = game; ShellStore.launchSelectedGame(false) }
+    }
+
+    DesktopQueueSelector {
+        selector: ShellStore.queueSelector
+        settingsStore: ShellStore
     }
 
     Rectangle {

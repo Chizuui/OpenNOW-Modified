@@ -11,12 +11,18 @@ use std::sync::{Arc, Mutex, Weak};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 512;
+const PAGE_TTL_MS: u64 = 15 * 60 * 1000;
 
 type FetchLocks = HashMap<(PathBuf, u64), Weak<Mutex<()>>>;
 
+pub struct CachePolicy {
+    pub ttl_ms: u64,
+    pub allow_stale: bool,
+}
+
 pub struct StoreCache {
     root: PathBuf,
-    index: Mutex<Option<(String, crate::store_index::StoreIndex)>>,
+    index: Mutex<Option<(String, crate::store_index::StoreIndex, u64)>>,
     // IO is serialized, but network work never holds the lock. Invalidation
     // advances the epoch so an older in-flight fetch cannot refill cleared data.
     epoch: Mutex<u64>,
@@ -31,7 +37,7 @@ fn digest(value: &Value) -> String {
 impl StoreCache {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
-            root: data_dir.join("store-cache-v1"),
+            root: data_dir.join("store-cache-v2"),
             index: Mutex::new(None),
             epoch: Mutex::new(0),
             fetches: Mutex::new(HashMap::new()),
@@ -46,12 +52,88 @@ impl StoreCache {
         refresh: bool,
         fetch: impl FnOnce() -> Result<Value, ServiceError>,
     ) -> Result<Value, ServiceError> {
+        self.load_with_policy(
+            scope,
+            key,
+            refresh,
+            CachePolicy {
+                ttl_ms: PAGE_TTL_MS,
+                allow_stale: false,
+            },
+            fetch,
+        )
+    }
+
+    pub fn catalog_revision(&self) -> u64 {
+        let path = self.root.join("revision");
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return 0;
+            }
+            Err(_) => return now_ms(),
+        };
+        let mut bytes = Vec::new();
+        if file.take(32).read_to_end(&mut bytes).is_err() {
+            return now_ms();
+        }
+        serde_json::from_slice::<u64>(&bytes)
+            .ok()
+            .filter(|revision| *revision < (1_u64 << 52))
+            .unwrap_or_else(now_ms)
+    }
+
+    pub fn invalidate(&self, revision: u64) -> Result<(), ServiceError> {
+        let mut epoch = self.epoch.lock().expect("Store cache poisoned");
+        *epoch = epoch.wrapping_add(1);
+        *self.index.lock().expect("Store index poisoned") = None;
+        self.write(
+            &self.root.join("revision"),
+            &serde_json::json!(revision.max(self.catalog_revision())),
+        )
+        .map_err(|_| ServiceError {
+            code: "catalog_cache_invalidation_failed",
+            message: "The catalog cache revision could not be saved. Retry the refresh.".into(),
+        })
+    }
+
+    pub fn invalidate_key(&self, scope: &Value, key: &Value) {
+        let mut epoch = self.epoch.lock().expect("Store cache poisoned");
+        *epoch = epoch.wrapping_add(1);
+        let _ = fs::remove_file(
+            self.root
+                .join(format!("{}-{}.json", digest(scope), digest(key))),
+        );
+        *self.index.lock().expect("Store index poisoned") = None;
+    }
+
+    pub fn load_with_policy(
+        &self,
+        scope: &Value,
+        key: &Value,
+        refresh: bool,
+        policy: CachePolicy,
+        fetch: impl FnOnce() -> Result<Value, ServiceError>,
+    ) -> Result<Value, ServiceError> {
         crate::requests::check()?;
+        let CachePolicy {
+            ttl_ms,
+            allow_stale,
+        } = policy;
         let prefix = format!("{}-", digest(scope));
         let path = self.root.join(format!("{prefix}{}.json", digest(key)));
+        let prior_fetch = if refresh && allow_stale {
+            self.read(&path).map(|value| value["fetchedAt"].clone())
+        } else {
+            None
+        };
         let epoch = {
             let mut epoch = self.epoch.lock().expect("Store cache poisoned");
-            if refresh {
+            if refresh && !allow_stale {
                 *self.index.lock().expect("Store index poisoned") = None;
                 *epoch = epoch.wrapping_add(1);
                 // Only this cache's generated, flat response files are targets.
@@ -63,7 +145,7 @@ impl StoreCache {
                         }
                     }
                 }
-            } else if let Some(mut value) = self.read(&path) {
+            } else if !refresh && let Some(mut value) = self.read_fresh(&path) {
                 value["cacheHit"] = Value::Bool(true);
                 return Ok(value);
             }
@@ -83,13 +165,41 @@ impl StoreCache {
             }
         };
         let _fetch = crate::store_requests::lock(&fetch_lock)?;
-        if let Some(mut value) = self.read(&path) {
+        if let Some(mut value) = self.read_fresh(&path)
+            && (!refresh || (allow_stale && prior_fetch.as_ref() != Some(&value["fetchedAt"])))
+        {
             value["cacheHit"] = Value::Bool(true);
             return Ok(value);
         }
-        let mut value = fetch()?;
+        let mut value = match fetch() {
+            Ok(value) => value,
+            Err(error)
+                if allow_stale
+                    && !matches!(
+                        error.code,
+                        "cancelled" | "stale_account" | "http_unauthorized"
+                    ) =>
+            {
+                let mut value = self.read(&path).unwrap_or_else(|| serde_json::json!({}));
+                value["status"] = serde_json::json!(if value["fetchedAt"].is_number() {
+                    "stale"
+                } else {
+                    "error"
+                });
+                value["freshness"] = value["status"].clone();
+                value["error"] = serde_json::json!({"code":error.code,"message":error.message});
+                return Ok(value);
+            }
+            Err(error) => return Err(error),
+        };
         crate::requests::check()?;
         value["cacheHit"] = Value::Bool(false);
+        let fetched_at = now_ms();
+        value["fetchedAt"] = serde_json::json!(fetched_at);
+        value["expiresAt"] = serde_json::json!(fetched_at.saturating_add(ttl_ms));
+        value["freshness"] = serde_json::json!("fresh");
+        value["status"] = serde_json::json!("success");
+        value["error"] = Value::Null;
         let value = crate::store_catalog_page::bounded_result(value)?;
         let current = self.epoch.lock().expect("Store cache poisoned");
         if epoch == *current {
@@ -106,11 +216,17 @@ impl StoreCache {
     pub fn local_query(&self, scope: &Value, params: &Value) -> Result<Value, ServiceError> {
         crate::requests::check()?;
         let scope_key = digest(scope);
-        let read_key =
-            |key: &Value| self.read(&self.root.join(format!("{scope_key}-{}.json", digest(key))));
+        let read_key = |key: &Value| {
+            self.read_fresh(&self.root.join(format!("{scope_key}-{}.json", digest(key))))
+        };
         let mut cached = self.index.lock().expect("Store index poisoned");
-        if params["refresh"] == true || cached.as_ref().is_none_or(|(key, _)| key != &scope_key) {
+        if params["refresh"] == true
+            || cached
+                .as_ref()
+                .is_none_or(|(key, _, expires)| key != &scope_key || *expires <= now_ms())
+        {
             let mut index = crate::store_index::StoreIndex::default();
+            let mut expires = u64::MAX;
             let mut cursor = String::new();
             let mut seen = std::collections::HashSet::new();
             for _ in 0..100 {
@@ -119,6 +235,7 @@ impl StoreCache {
                 let Some(page) = read_key(&key) else {
                     break;
                 };
+                expires = expires.min(page["expiresAt"].as_u64().unwrap_or(0));
                 for (at, game) in page["games"].as_array().into_iter().flatten().enumerate() {
                     index.add(game, key.clone(), format!("/games/{at}"), None);
                 }
@@ -135,11 +252,12 @@ impl StoreCache {
             }
             let key = serde_json::json!(["presentation", "panels"]);
             if let Some(panels) = read_key(&key) {
+                expires = expires.min(panels["expiresAt"].as_u64().unwrap_or(0));
                 index.add_panels(&panels, &key);
             }
-            *cached = Some((scope_key.clone(), index));
+            *cached = Some((scope_key.clone(), index, expires));
         }
-        let (_, index) = cached.as_ref().expect("Store index initialized");
+        let (_, index, _) = cached.as_ref().expect("Store index initialized");
         if index.pages == 0 {
             return Err(ServiceError {
                 code: "store_cache_missing",
@@ -170,7 +288,13 @@ impl StoreCache {
             value["section"].as_str(),
             Some("panels" | "marquee" | "filters")
         ) && value["items"].is_array();
-        (page || section).then_some(value)
+        let metadata = value["metadataKind"].is_string();
+        (page || section || metadata).then_some(value)
+    }
+
+    fn read_fresh(&self, path: &PathBuf) -> Option<Value> {
+        let value = self.read(path)?;
+        (value["expiresAt"].as_u64()? > now_ms()).then_some(value)
     }
 
     fn write(&self, path: &PathBuf, value: &Value) -> std::io::Result<()> {
@@ -230,6 +354,13 @@ impl StoreCache {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +390,118 @@ mod tests {
             .unwrap();
         assert_eq!(hit["games"][0]["id"], "saved");
         assert_eq!(hit["cacheHit"], true);
+        fs::remove_dir_all(cache.root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn expired_disk_pages_require_network_and_metadata_refreshes_coalesce() {
+        let cache = cache();
+        let scope = json!("scope");
+        let key = json!("page");
+        cache
+            .load_or_fetch(&scope, &key, false, || Ok(page("old")))
+            .unwrap();
+        let path = cache
+            .root
+            .join(format!("{}-{}.json", digest(&scope), digest(&key)));
+        let mut expired = cache.read(&path).unwrap();
+        expired["expiresAt"] = json!(0);
+        cache.write(&path, &expired).unwrap();
+        let refreshed = cache
+            .load_or_fetch(&scope, &key, false, || Ok(page("new")))
+            .unwrap();
+        assert_eq!(refreshed["cacheHit"], false);
+        assert_eq!(refreshed["games"][0]["id"], "new");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(4);
+        std::thread::scope(|threads| {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                workers.push(threads.spawn(|| {
+                    ready.wait();
+                    cache
+                        .load_with_policy(
+                            &scope,
+                            &key,
+                            true,
+                            CachePolicy {
+                                ttl_ms: 1000,
+                                allow_stale: true,
+                            },
+                            || {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                Ok(page("coalesced"))
+                            },
+                        )
+                        .unwrap()
+                }));
+            }
+            for worker in workers {
+                assert_eq!(worker.join().unwrap()["games"][0]["id"], "coalesced");
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fs::remove_dir_all(cache.root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn catalog_invalidation_survives_restart_and_out_of_order_writers() {
+        let cache = cache();
+        cache.invalidate(2).unwrap();
+        cache.invalidate(1).unwrap();
+        let restarted = StoreCache::new(cache.root.parent().unwrap().to_path_buf());
+        assert_eq!(restarted.catalog_revision(), 2);
+        fs::write(cache.root.join("revision"), b"corrupt").unwrap();
+        assert!(restarted.catalog_revision() > 2);
+        fs::remove_dir_all(cache.root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn absent_revision_starts_in_the_initial_namespace() {
+        let cache = cache();
+        assert_eq!(cache.catalog_revision(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_revision_cannot_reuse_pre_sync_pages_or_erase_reference_metadata() {
+        let cache = cache();
+        let page_key = json!(["page", 100, "", ""]);
+        cache
+            .load_or_fetch(&json!(["account", 0]), &page_key, false, || {
+                Ok(page("pre-sync"))
+            })
+            .unwrap();
+        let reference_scope = json!(["definitions", "account"]);
+        let reference_key = json!(["genres"]);
+        cache
+            .load_or_fetch(&reference_scope, &reference_key, false, || {
+                Ok(json!({"metadataKind":"genres","items":[{"genre":"ACTION","label":"Action"}]}))
+            })
+            .unwrap();
+        cache.invalidate(1).unwrap();
+        let revision_path = cache.root.join("revision");
+        fs::remove_file(&revision_path).unwrap();
+        std::os::unix::fs::symlink("revision", &revision_path).unwrap();
+        assert!(File::open(&revision_path).is_err());
+
+        let restarted = StoreCache::new(cache.root.parent().unwrap().to_path_buf());
+        let revision = restarted.catalog_revision();
+        assert_ne!(revision, 0);
+        let result = restarted
+            .load_or_fetch(&json!(["account", revision]), &page_key, false, || {
+                Ok(page("fresh-network"))
+            })
+            .unwrap();
+        assert_eq!(result["games"][0]["id"], "fresh-network");
+        assert_eq!(result["cacheHit"], false);
+        let reference = restarted
+            .load_or_fetch(&reference_scope, &reference_key, false, || {
+                panic!("reference metadata was invalidated")
+            })
+            .unwrap();
+        assert_eq!(reference["items"][0]["genre"], "ACTION");
         fs::remove_dir_all(cache.root.parent().unwrap()).unwrap();
     }
 

@@ -1,19 +1,56 @@
 #include "core/CoreClient.h"
 #include "diagnostics/DiagnosticsPaths.h"
+#include "media/MediaPaths.h"
 
 #ifndef OPENNOW_VERSION
 #define OPENNOW_VERSION "1.0.0"
 #endif
 
 #include <QDateTime>
+#include <QElapsedTimer>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonParseError>
-#include <QStandardPaths>
+#include <QProcessEnvironment>
 
 using namespace Qt::StringLiterals;
+
+QString CoreClient::graphicsPreference(const QString &program)
+{
+    if (program.isEmpty()) return {};
+    QProcess process;
+    process.setStandardErrorFile(QProcess::nullDevice());
+    QElapsedTimer elapsed;
+    elapsed.start();
+    process.start(program, {u"--graphics-preferences"_s});
+    QByteArray output;
+    bool bounded = process.waitForStarted(500);
+    while (bounded && process.state() != QProcess::NotRunning && elapsed.elapsed() < 2'000) {
+        process.waitForReadyRead(int(qBound(qint64(0), 2'000 - elapsed.elapsed(), qint64(50))));
+        output += process.read(8'193 - output.size());
+        bounded = output.size() <= 8'192;
+    }
+    if (!bounded || process.state() != QProcess::NotRunning) {
+        process.kill();
+        process.waitForFinished(1'000);
+        qWarning("Graphics preference bootstrap failed; using Automatic");
+        return {};
+    }
+    output += process.read(8'193 - output.size());
+    const auto document = QJsonDocument::fromJson(output);
+    const auto preference = document.object().value(u"windowsGpuDeviceId"_s);
+    if (output.size() > 8'192 || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0
+        || document.object().value(u"version"_s).toInt() != 1 || !preference.isString()
+        || preference.toString().toUtf8().size() > 1'024 || preference.toString().contains(QChar::Null)) {
+        qWarning("Graphics preference bootstrap returned invalid data; using Automatic");
+        return {};
+    }
+    return preference.toString();
+}
 
 namespace {
 QString safeText(const QJsonValue &value, const QString &fallback)
@@ -77,6 +114,25 @@ void CoreClient::logShellDiagnostic(const QString &message)
 CoreClient::CoreClient(QObject *parent)
     : QObject(parent)
 {
+    for (const auto *name : {"OPENNOW_UPDATE_PLAN", "OPENNOW_UPDATE_NONCE"}) {
+        if (qEnvironmentVariableIsSet(name))
+            m_updateStartupEnvironment.insert(QString::fromLatin1(name), qEnvironmentVariable(name));
+        qunsetenv(name);
+    }
+    if (!m_updateStartupEnvironment.isEmpty()) m_updateStartupElapsed.start();
+    connect(this, &CoreClient::responseReceived, this, [this](const QString &id, const QJsonObject &result) {
+        if (id != m_updateStartupRequestId || id.isEmpty()) return;
+        m_updateStartupRequestId.clear();
+        if (result.value(u"acknowledged"_s).toBool())
+            m_updateStartupEnvironment.clear();
+        else
+            QTimer::singleShot(1'000, this, &CoreClient::acknowledgeUpdateStartup);
+    });
+    connect(this, &CoreClient::requestFailed, this, [this](const QString &id, const QString &, const QString &) {
+        if (id != m_updateStartupRequestId || id.isEmpty()) return;
+        m_updateStartupRequestId.clear();
+        QTimer::singleShot(1'000, this, &CoreClient::acknowledgeUpdateStartup);
+    });
     m_process.setProcessChannelMode(QProcess::SeparateChannels);
     connect(&m_process, &QProcess::readyReadStandardOutput, this, &CoreClient::processStdout);
     connect(&m_process, &QProcess::readyReadStandardError, this, &CoreClient::processStderr);
@@ -145,8 +201,32 @@ bool CoreClient::start(const QString &program, const QStringList &arguments)
     m_droppedEvents = 0;
     setLastError({});
     setState(u"starting"_s);
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.remove(u"OPENNOW_UPDATE_PLAN"_s);
+    environment.remove(u"OPENNOW_UPDATE_NONCE"_s);
+    environment.insert(m_updateStartupEnvironment);
+    environment.insert(u"OPENNOW_APP_EXECUTABLE"_s,
+                       QFileInfo(QCoreApplication::applicationFilePath()).canonicalFilePath());
+    environment.insert(u"OPENNOW_APP_PID"_s, QString::number(QCoreApplication::applicationPid()));
+    environment.insert(u"OPENNOW_PICTURES_DIR"_s, mediaPicturesRoot());
+    m_process.setProcessEnvironment(environment);
     m_process.start(program, arguments, QIODevice::ReadWrite | QIODevice::Unbuffered);
     return true;
+}
+
+void CoreClient::markUiReady()
+{
+    m_uiReady = true;
+    acknowledgeUpdateStartup();
+}
+
+void CoreClient::acknowledgeUpdateStartup()
+{
+    if (m_updateStartupElapsed.isValid() && m_updateStartupElapsed.hasExpired(90'000))
+        m_updateStartupEnvironment.clear();
+    if (!m_uiReady || m_state != u"ready"_s || m_updateStartupEnvironment.isEmpty()
+        || !m_updateStartupRequestId.isEmpty()) return;
+    m_updateStartupRequestId = request(u"updater.startup.ack"_s, {}, 5'000);
 }
 
 void CoreClient::stop()
@@ -174,15 +254,24 @@ void CoreClient::stop()
 
 QString CoreClient::request(const QString &method, const QJsonObject &params, int timeoutMs)
 {
-    if (method.trimmed().isEmpty() || m_process.state() != QProcess::Running) {
+    if (method.trimmed().isEmpty() || m_process.state() != QProcess::Running
+        || (m_state != u"ready"_s && !(m_state == u"handshaking"_s && method == u"core.hello"_s))) {
         return {};
     }
     const auto id = QString::number(m_nextRequestId++);
     const auto deadline = QDateTime::currentMSecsSinceEpoch() + qBound(100, timeoutMs, 300'000);
     auto runtimeParams = params;
-    if (method == u"session.create"_s || method == u"streamer.prepare"_s) {
+    if (method == u"session.create"_s || method == u"streamer.prepare"_s
+            || method == u"settings.choices.get"_s) {
         auto capabilities = runtimeParams.value(u"runtimeCapabilities"_s).toObject();
         capabilities.insert(u"nativeHdrSupported"_s, m_nativeHdrSupported);
+        if (m_nativeHdrDisplay.available) {
+            capabilities.insert(u"nativeHdrDisplay"_s,
+                QJsonObject{{u"minimumNits"_s, m_nativeHdrDisplay.minimumNits},
+                            {u"maximumNits"_s, m_nativeHdrDisplay.maximumNits}});
+        } else {
+            capabilities.remove(u"nativeHdrDisplay"_s);
+        }
         runtimeParams.insert(u"runtimeCapabilities"_s, capabilities);
     }
     const QJsonObject message{{u"type"_s, u"request"_s},
@@ -362,8 +451,14 @@ void CoreClient::processLine(const QByteArray &line)
             pending->retryDelayMs = qMin(pending->retryDelayMs * 2, 1'000);
             return;
         }
+        const auto method = pending->message.value(u"method"_s).toString();
         m_pending.erase(pending);
         if (message.value(u"ok"_s).toBool(false)) {
+            if (method == u"session.create"_s
+                    && !writeMessage(QJsonObject{{u"type"_s, u"ack"_s}, {u"id"_s, id}})) {
+                emit requestFailed(id, u"core_write_failed"_s, u"Could not accept the allocated session"_s);
+                return;
+            }
             const auto result = message.value(u"result"_s).toObject();
             if (id == m_handshakeRequestId) {
                 const auto version = result.value(u"protocolVersion"_s).toInt(-1);
@@ -371,8 +466,18 @@ void CoreClient::processLine(const QByteArray &line)
                     protocolFailure(u"Core protocol version is incompatible"_s);
                     return;
                 }
+                const auto capabilities = result.value(u"capabilities"_s).toArray();
+                for (const auto &capability : {u"catalog.libraryPages.v1"_s, u"catalog.metadata.v1"_s,
+                                             u"account.syncObservation.v1"_s, u"catalog.languages.v1"_s,
+                                             u"queue.servers.v1"_s}) {
+                    if (!capabilities.contains(capability)) {
+                        protocolFailure(u"The packaged core lacks a required capability: "_s + capability);
+                        return;
+                    }
+                }
                 m_restartAttempts = 0;
                 setState(u"ready"_s);
+                acknowledgeUpdateStartup();
             }
             emit responseReceived(id, result);
         } else {

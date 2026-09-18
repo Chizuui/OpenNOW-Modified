@@ -4,13 +4,17 @@ on:
   workflow_call:
     inputs:
       channel:
-        description: Unsigned build channel (nightly or supporter)
+        description: Unsigned build channel (nightly, supporter, or stable)
         type: string
         default: nightly
       upload_complete:
         description: Upload the verified complete package set
         type: boolean
         default: false
+      update_public_key:
+        description: Optional base64 Ed25519 public key pinned into the application core
+        type: string
+        default: ""
     outputs:
       version:
         description: Immutable package version
@@ -77,7 +81,7 @@ jobs:
             build-parallel: 8
             qt-host: windows
             qt-arch: win64_msvc2022_arm64_cross_compiled
-            package-generator: ZIP
+            package-generator: "WIX;ZIP"
             rust-target: aarch64-pc-windows-msvc
             cmake-arch: ARM64
           - label: windows-x64
@@ -85,7 +89,7 @@ jobs:
             build-parallel: 8
             qt-host: windows
             qt-arch: win64_msvc2022_64
-            package-generator: ZIP
+            package-generator: "WIX;ZIP"
             rust-target: ""
             cmake-arch: ""
             linuxdeploy-arch: ""
@@ -97,7 +101,7 @@ jobs:
             build-parallel: 3
             qt-host: mac
             qt-arch: clang_64
-            package-generator: ZIP
+            package-generator: "DragNDrop;ZIP"
             rust-target: aarch64-apple-darwin
             cmake-arch: ""
 
@@ -105,6 +109,7 @@ jobs:
       CARGO_TERM_COLOR: always
       SDL_VERSION: release-3.2.20
       OPENNOW_BUILD_VERSION: ${{ needs.metadata.outputs.version }}
+      OPENNOW_UPDATE_PUBLIC_KEY: ${{ inputs.update_public_key }}
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.label == 'macos-arm64' && '13.0' || '' }}
 
     steps:
@@ -112,6 +117,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+
+      - name: Prepare Ubuntu HTTPS mirrors
+        if: matrix.label == 'linux-x64'
+        shell: bash
+        run: sudo python3 .github/scripts/prepare-ubuntu-apt-https.py
 
       - name: Enable Windows Media Foundation
         if: runner.os == 'Windows'
@@ -132,6 +142,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: opennow-qt/tests/test_windows_release.ps1
+
+      - name: Install WiX Toolset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "WiX installation failed" }
+          $wixBin = Join-Path ${env:ProgramFiles(x86)} "WiX Toolset v3.14/bin"
+          foreach ($tool in @("candle.exe", "light.exe")) {
+            if (-not (Test-Path (Join-Path $wixBin $tool))) { throw "WiX is missing $tool" }
+          }
+          $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Test Windows MSI upgrades and stable isolation
+        if: matrix.label == 'windows-x64'
+        shell: pwsh
+        run: |
+          opennow-qt/tests/test_windows_installer.ps1
+          opennow-qt/tests/test_windows_helper_dependencies.ps1
 
       - name: Add package Rust target
         if: matrix.rust-target != ''
@@ -275,6 +305,7 @@ jobs:
             native/opennow-core -> target
             native/opennow-streamer -> target
             native/opennow-core -> ../../build/opennow-qt-release/rust-target
+            native/opennow-core -> ../../build/opennow-qt-release/update-helper-rust-target
             native/opennow-streamer -> ../../build/opennow-qt-release/streamer-rust-target
 
       - name: Cache Qt C++ compilation
@@ -317,6 +348,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DOPENNOW_BUILD_VERSION="$OPENNOW_BUILD_VERSION" \
+            -DOPENNOW_UPDATE_ED25519_PUBLIC_KEY="$OPENNOW_UPDATE_PUBLIC_KEY" \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/SDL-install" \
             "${OPENNOW_CMAKE_ARGS[@]}"
 
@@ -334,7 +366,7 @@ jobs:
         run: ctest --test-dir build/opennow-qt-release -C Release --output-on-failure --parallel 4 --no-tests=error -LE interactive-desktop
 
       - name: Create unsigned package
-        if: runner.os != 'macOS'
+        if: runner.os == 'Windows'
         shell: bash
         env:
           PACKAGE_GENERATOR: ${{ matrix.package-generator }}
@@ -344,7 +376,40 @@ jobs:
           cpack --config build/opennow-qt-release/CPackConfig.cmake \
             -C Release \
             -G "$PACKAGE_GENERATOR" \
-            -B build/qt-packages
+            -B build/qt-packages || {
+              status=$?
+              if [[ "$RUNNER_OS" == Windows ]]; then
+                log_count=0
+                while IFS= read -r -d '' log; do
+                  printf '\n--- WiX packaging log: %s (last 200 lines, at most 64 KiB) ---\n' "$log"
+                  tail -n 200 "$log" | tail -c 65536 || true
+                  log_count=$((log_count + 1))
+                  if [[ "$log_count" -ge 4 ]]; then
+                    echo "WiX diagnostics limited to four logs."
+                    break
+                  fi
+                done < <(find build/qt-packages -maxdepth 6 -type f -iname wix.log -print0)
+                if [[ "$log_count" -eq 0 ]]; then echo "No generated WiX logs found."; fi
+              fi
+              exit "$status"
+            }
+
+      - name: Verify Windows MSI and portable ZIP payloads
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./opennow-qt/packaging/windows-release.ps1
+          $msi = @(Get-ChildItem build/qt-packages -Filter *.msi)
+          $zip = @(Get-ChildItem build/qt-packages -Filter *.zip)
+          if ($msi.Count -ne 1 -or $zip.Count -ne 1) { throw "Expected one MSI and one ZIP" }
+          $msiExpanded = Join-Path $env:RUNNER_TEMP "nightly-msi-expanded"
+          $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/a `"$($msi[0].FullName)`" /qn TARGETDIR=`"$msiExpanded`""
+          if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
+          Assert-OpenNowPackagePayload -Root $msiExpanded -DeploymentRoot build/opennow-qt-release/Release
+          $zipExpanded = Join-Path $env:RUNNER_TEMP "nightly-zip-expanded"
+          Expand-Archive $zip[0].FullName $zipExpanded
+          Assert-OpenNowPackagePayload -Root $zipExpanded -DeploymentRoot build/opennow-qt-release/Release
 
       - name: Create Linux AppImage
         if: runner.os == 'Linux'
@@ -357,12 +422,14 @@ jobs:
           LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy-sha256 }}
           QT_PLUGIN_SHA256: ${{ matrix.qt-plugin-sha256 }}
           APPIMAGE_RUNTIME_SHA256: ${{ matrix.appimage-runtime-sha256 }}
+          BUILD_CHANNEL: ${{ inputs.channel }}
+          PACKAGE_ARCH: ${{ matrix.linuxdeploy-arch == 'aarch64' && 'arm64' || 'x64' }}
         run: |
           export LD_LIBRARY_PATH="$RUNNER_TEMP/SDL-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          mkdir -p build/qt-packages
           cmake --install build/opennow-qt-release --config Release \
             --prefix "$PWD/build/AppDir/usr"
-          deb=$(find build/qt-packages -maxdepth 1 -type f -name '*.deb' -print -quit)
-          python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin --deb "$deb"
+          python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin
           curl --fail --location --retry 3 \
             "https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage" \
             --output "build/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage"
@@ -377,6 +444,11 @@ jobs:
             --output "build/appimage-runtime-${LINUXDEPLOY_ARCH}"
           echo "$APPIMAGE_RUNTIME_SHA256  build/appimage-runtime-${LINUXDEPLOY_ARCH}" | sha256sum --check --strict
           chmod +x "build/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage" "build/linuxdeploy-plugin-qt-${LINUXDEPLOY_ARCH}.AppImage"
+          install -Dm644 opennow-qt/packaging/opennow-vaapi-hook.sh \
+            build/AppDir/apprun-hooks/opennow-vaapi-hook.sh
+          export LDAI_UPDATE_INFORMATION
+          LDAI_UPDATE_INFORMATION=$(python3 opennow-qt/packaging/appimage_updates.py information \
+            --channel "$BUILD_CHANNEL" --arch "$PACKAGE_ARCH")
           QMAKE="$QT_ROOT_DIR/bin/qmake" \
           QML_SOURCES_PATHS="$PWD/opennow-qt/qml" \
           LDAI_RUNTIME_FILE="$PWD/build/appimage-runtime-${LINUXDEPLOY_ARCH}" \
@@ -396,8 +468,23 @@ jobs:
           test -f build/AppDir/usr/plugins/platforms/libqwayland-generic.so
           test -f build/AppDir/usr/plugins/wayland-shell-integration/libxdg-shell.so
           LD_LIBRARY_PATH="$PWD/build/AppDir/usr/lib:$LD_LIBRARY_PATH" \
-            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin
-          mv OpenNOW-Qt-*.AppImage build/qt-packages/
+            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin --appdir build/AppDir
+          python3 opennow-qt/packaging/appimage_updates.py verify \
+            --channel "$BUILD_CHANNEL" --arch "$PACKAGE_ARCH" \
+            --appimage "OpenNOW-Qt-${OPENNOW_BUILD_VERSION}-Linux-${PACKAGE_ARCH}.AppImage"
+          mv OpenNOW-Qt-*.AppImage OpenNOW-Qt-*.AppImage.zsync build/qt-packages/
+
+      - name: Create bundled Linux DEB
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cpack --config build/opennow-qt-release/CPackConfig.cmake \
+            -D "CPACK_PROJECT_CONFIG_FILE=$PWD/opennow-qt/packaging/LinuxBundledDeb.cmake" \
+            -D "OPENNOW_APPDIR=$PWD/build/AppDir" \
+            -C Release -G DEB -B build/qt-packages
+          debs=(build/qt-packages/*.deb)
+          [[ ${#debs[@]} -eq 1 && -f "${debs[0]}" ]]
+          bash opennow-qt/packaging/verify_bundled_deb.sh "${debs[0]}"
 
       - name: Smoke-test Linux AppImage
         if: runner.os == 'Linux'
@@ -420,8 +507,10 @@ jobs:
           name: opennow-qt-${{ matrix.label }}-unsigned
           path: |
             build/qt-packages/*.AppImage
+            build/qt-packages/*.AppImage.zsync
             build/qt-packages/*.deb
             build/qt-packages/*.dmg
+            build/qt-packages/*.msi
             build/qt-packages/*.zip
           if-no-files-found: error
           retention-days: 14
@@ -444,7 +533,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DOPENNOW_MACOS_ADHOC_SIGN=ON \
             -DOPENNOW_BUILD_VERSION="$OPENNOW_BUILD_VERSION" \
+            -DOPENNOW_UPDATE_ED25519_PUBLIC_KEY="$OPENNOW_UPDATE_PUBLIC_KEY" \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/SDL-install"
           cmake --build build/opennow-qt-release --parallel 3
       - name: Test Qt shell and embedded runtime offscreen
@@ -453,46 +544,64 @@ jobs:
         run: |
           ctest --test-dir build/opennow-qt-release --output-on-failure --parallel 2 --no-tests=error -LE interactive-desktop \
             -R '^opennow-.*-tests$|^opennow-acceptance-verifier-help$|^qml-(desktop-route-(home|settings|stream)|fullscreen-.*stats-shortcut|desktop-stream-.*|streamer-event-contract)$'
-      - name: Package unsigned macOS validation bundle
+      - name: Package unsigned macOS DMG and validation ZIP
         if: runner.os == 'macOS'
         shell: bash
         run: |
           mkdir -p build/qt-packages
           cpack --config build/opennow-qt-release/CPackConfig.cmake \
-            -G ZIP -B build/qt-packages
+            -G 'DragNDrop;ZIP' -B build/qt-packages
       - name: Test relocated bundle without development libraries
         if: runner.os == 'macOS'
         shell: bash
         run: |
           packages=(build/qt-packages/OpenNOW-Qt-*-Darwin-arm64.zip)
           [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
-          ditto -x -k "${packages[0]}" "$RUNNER_TEMP/relocated"
-          app=$(find "$RUNNER_TEMP/relocated" -name OpenNOW.app -type d -print -quit)
-          [[ -n "$app" ]]
-          bin="$app/Contents/MacOS"
-          for executable in OpenNOW opennow-core opennow-acceptance-verify opennow-streamer; do
-            test -x "$bin/$executable"
-            lipo "$bin/$executable" -verify_arch arm64
-          done
-          test -f "$bin/libopennow_streamer_ffi.dylib"
-          lipo "$bin/libopennow_streamer_ffi.dylib" -verify_arch arm64
-          otool -D build/opennow-qt-release/OpenNOW.app/Contents/MacOS/libopennow_streamer_ffi.dylib \
-            | grep -Fx '@rpath/libopennow_streamer_ffi.dylib'
-          test -f "$app/Contents/Resources/licenses/THIRD_PARTY_NOTICES"
-          test -f "$app/Contents/PlugIns/imageformats/libqsvg.dylib"
-          restore() {
-            for path in "$PWD/build/opennow-qt-release" "$QT_ROOT_DIR" "$RUNNER_TEMP/SDL-install"; do
-              if [[ -d "$path.unavailable" ]]; then mv "$path.unavailable" "$path"; fi
+          ditto -x -k "${packages[0]}" "$RUNNER_TEMP/zip-relocated"
+          zip_app=$(find "$RUNNER_TEMP/zip-relocated" -name OpenNOW.app -type d -print -quit)
+          [[ -n "$zip_app" ]]
+          dmgs=(build/qt-packages/OpenNOW-Qt-*-Darwin-arm64.dmg)
+          [[ ${#dmgs[@]} -eq 1 && -f "${dmgs[0]}" ]]
+          hdiutil verify "${dmgs[0]}"
+          mount="$RUNNER_TEMP/opennow-dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/dmg-relocated"
+          hdiutil attach "${dmgs[0]}" -readonly -nobrowse -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          test -d "$mount/OpenNOW.app"
+          ditto "$mount/OpenNOW.app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"
+          hdiutil detach "$mount"
+          trap - EXIT
+          for app in "$zip_app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"; do
+            /usr/bin/codesign --verify --deep --strict "$app"
+            [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist") == io.github.opencloudgaming.OpenNOW ]]
+            identity=$(/usr/bin/codesign --display --verbose=4 "$app" 2>&1)
+            printf '%s\n' "$identity" | grep -Fx 'Identifier=io.github.opencloudgaming.OpenNOW'
+            printf '%s\n' "$identity" | grep -Fx 'Signature=adhoc'
+            printf '%s\n' "$identity" | grep -Fx 'TeamIdentifier=not set'
+            bin="$app/Contents/MacOS"
+            for executable in OpenNOW opennow-core opennow-acceptance-verify opennow-update-helper opennow-streamer; do
+              test -x "$bin/$executable"
+              lipo "$bin/$executable" -verify_arch arm64
             done
-          }
-          trap restore EXIT
-          mv build/opennow-qt-release build/opennow-qt-release.unavailable
-          mv "$QT_ROOT_DIR" "$QT_ROOT_DIR.unavailable"
-          mv "$RUNNER_TEMP/SDL-install" "$RUNNER_TEMP/SDL-install.unavailable"
-          unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH
-          unset DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
-          "$bin/opennow-acceptance-verify" --help
-          python3 - "$bin" <<'PY'
+            test -f "$bin/libopennow_streamer_ffi.dylib"
+            lipo "$bin/libopennow_streamer_ffi.dylib" -verify_arch arm64
+            otool -D "$bin/libopennow_streamer_ffi.dylib" \
+              | grep -Fx '@rpath/libopennow_streamer_ffi.dylib'
+            test -f "$app/Contents/Resources/licenses/THIRD_PARTY_NOTICES"
+            test -f "$app/Contents/PlugIns/imageformats/libqsvg.dylib"
+            restore() {
+              for path in "$PWD/build/opennow-qt-release" "$QT_ROOT_DIR" "$RUNNER_TEMP/SDL-install"; do
+                if [[ -d "$path.unavailable" ]]; then mv "$path.unavailable" "$path"; fi
+              done
+            }
+            trap restore EXIT
+            mv build/opennow-qt-release build/opennow-qt-release.unavailable
+            mv "$QT_ROOT_DIR" "$QT_ROOT_DIR.unavailable"
+            mv "$RUNNER_TEMP/SDL-install" "$RUNNER_TEMP/SDL-install.unavailable"
+            unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH
+            unset DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+            "$bin/opennow-acceptance-verify" --help
+            python3 - "$bin" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -503,7 +612,7 @@ jobs:
 
           bin_dir = Path(sys.argv[1])
           for name in ("OpenNOW", "opennow-core", "opennow-acceptance-verify",
-                       "opennow-streamer", "libopennow_streamer_ffi.dylib"):
+                       "opennow-update-helper", "opennow-streamer", "libopennow_streamer_ffi.dylib"):
               dependencies = subprocess.check_output(["otool", "-L", bin_dir / name], text=True)
               for line in dependencies.splitlines()[1:]:
                   dependency = line.strip().split(" (", 1)[0]
@@ -511,7 +620,7 @@ jobs:
                       ("/System/Library/", "/usr/lib/")), (name, dependency)
           probe = subprocess.run(
               [bin_dir / "opennow-streamer"],
-              input='{"id":"package-probe","type":"hello","protocolVersion":6}\n'
+              input='{"id":"package-probe","type":"hello","protocolVersion":7}\n'
                     '{"id":"package-shutdown","type":"shutdown"}\n',
               text=True, capture_output=True, check=True, timeout=30)
           messages = [json.loads(line) for line in probe.stdout.splitlines()]
@@ -524,11 +633,12 @@ jobs:
                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
               try:
                   core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
-                                   '"params":{"protocolVersion":1}}\n')
+                                   '"params":{"protocolVersion":5}}\n')
                   core.stdin.flush()
                   assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
                   response = json.loads(core.stdout.readline())
                   assert response.get("id") == "package-core" and response.get("ok") is True, response
+                  assert {"catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "queue.servers.v1"}.issubset(response["result"]["capabilities"]), response
               finally:
                   core.kill()
                   core.communicate(timeout=5)
@@ -537,12 +647,25 @@ jobs:
                "--desktop", "--route", "home", "--reduced-motion"],
               env={**os.environ, "QT_QPA_PLATFORM": "cocoa"}, check=True, timeout=30)
           PY
+            restore
+            trap - EXIT
+          done
       - name: Upload macOS validation package
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: opennow-macos-arm64-validation
           path: build/qt-packages/*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload unsigned macOS DMG
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: opennow-qt-macos-arm64-unsigned
+          path: build/qt-packages/*.dmg
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -563,7 +686,7 @@ jobs:
         with:
           pattern: opennow-qt-*-unsigned
           path: unsigned-artifacts
-      - name: Verify all six packages and prepare release checksums
+      - name: Verify all nine packages and AppImage sidecars and prepare release checksums
         shell: bash
         run: |
           python3 opennow-qt/packaging/nightly_release.py assemble \

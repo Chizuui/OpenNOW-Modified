@@ -33,28 +33,39 @@ impl PersistentStorageService {
             url.query_pairs_mut().append_pair("vpcId", vpc_id);
         }
         let token = session_token(auth)?;
-        let response = self.client.get(url).headers(paywall_headers(token)?).send();
-        let mut locations = response
-            .ok()
-            .and_then(|response| {
-                if !response.status().is_success() {
-                    return None;
-                }
-                response
-                    .json::<Value>()
-                    .ok()
-                    .map(|payload| locations_from_products(&payload, current_code))
-            })
-            .unwrap_or_default();
-        if locations.is_empty() {
-            locations = fallback_locations(current_code, current_name);
+        let response = self
+            .client
+            .get(url)
+            .headers(paywall_headers(token)?)
+            .send()
+            .map_err(|error| ServiceError::network("Storage region discovery failed", error))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ServiceError {
+                code: if status.as_u16() == 401 {
+                    "http_unauthorized"
+                } else {
+                    "upstream_error"
+                },
+                message: format!("Storage region discovery failed ({status})"),
+            });
         }
+        let payload = response
+            .json::<Value>()
+            .map_err(|error| ServiceError::network("Invalid storage region response", error))?;
+        if !payload["products"].is_array() {
+            return Err(ServiceError {
+                code: "invalid_upstream_response",
+                message: "Storage region response has no products".into(),
+            });
+        }
+        let mut locations = locations_from_products(&payload, current_code);
         if let Some(code) = current_code
             && !locations
                 .iter()
                 .any(|location| location["code"].as_str() == Some(code))
         {
-            locations.insert(0, json!({"code":code,"name":current_name.unwrap_or(code),"isAvailable":true,"isCurrent":true}));
+            locations.insert(0, json!({"code":code,"name":current_name.unwrap_or(code),"isAvailable":false,"isCurrent":true}));
         }
         Ok(
             json!({"locations":locations,"currentRegionCode":current_code,"currentRegionName":current_name}),
@@ -138,35 +149,6 @@ fn locations_from_products(payload: &Value, current_code: Option<&str>) -> Vec<V
             "isCurrent":current_code == Some(code),"isRecommended":region["isRecommendedRegion"].as_bool().unwrap_or(false)
         }))
     }).collect()
-}
-
-fn fallback_locations(current_code: Option<&str>, current_name: Option<&str>) -> Vec<Value> {
-    const LOCATIONS: [(&str, &str); 20] = [
-        ("NP-SJC6-04", "Northern California (USA)"),
-        ("NP-LAX-03", "Southern California (USA)"),
-        ("NP-PDX-01", "Oregon (USA)"),
-        ("NP-PHX-02", "Arizona (USA)"),
-        ("NP-DAL-04", "Texas (USA)"),
-        ("NP-CHI-04", "Illinois (USA)"),
-        ("NP-MIA-03", "Florida (USA)"),
-        ("NP-ATL-03", "Georgia (USA)"),
-        ("NP-ASH-04", "Virginia (USA)"),
-        ("NP-NWK-03", "New Jersey (USA)"),
-        ("NP-MON-02", "Quebec (Canada)"),
-        ("NP-LON-07", "United Kingdom"),
-        ("NP-STH-03", "Sweden"),
-        ("NP-AMS-07", "Netherlands North"),
-        ("NP-FRK-06", "Germany"),
-        ("NP-PAR-05", "France"),
-        ("NP-WAW-01", "Poland"),
-        ("NP-SOF-02", "Bulgaria"),
-        ("NP-BOM-01", "India"),
-        ("NP-TYO-01", "Japan"),
-    ];
-    LOCATIONS.into_iter().map(|(code,name)| json!({
-        "code":code,"name":if current_code == Some(code) { current_name.unwrap_or(name) } else { name },
-        "isAvailable":true,"isCurrent":current_code == Some(code),"isRecommended":false
-    })).collect()
 }
 
 fn paywall_headers(token: &str) -> Result<HeaderMap, ServiceError> {

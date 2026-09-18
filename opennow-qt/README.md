@@ -5,6 +5,12 @@ or newer and uses SDL3 for controller input. A bundled Rust process owns setting
 and is the start of the shell-neutral application core. See
 `docs/qt-migration.md` for the migration history and remaining release checklist.
 
+For a sandboxed Linux x86_64 package, follow [Build and install the Flatpak](packaging/flatpak/README.md).
+The separate **Qt Flatpak build** workflow produces an installable bundle without publishing a release.
+
+If Linux Stream settings show no usable video backend, follow
+[Troubleshoot unavailable Linux video backends](../docs/linux-video-backends.md).
+
 ## CI checks and manual builds
 
 Pull requests and pushes to `dev` or `main` run workflow lint, packaging-contract
@@ -59,21 +65,27 @@ ctest --test-dir build/opennow-qt -C Debug --output-on-failure --no-tests=error 
 ### Manual artifact-only builds
 
 In GitHub **Actions → qt-ci → Run workflow**, select `dev` (or the branch or tag
-to build) and leave **Publish an unsigned nightly prerelease after all checks pass**
-unchecked. The existing workflow uploads build artifacts without creating a release
-or tag. No separate supporter-build workflow is needed.
+to build) and leave **Publish a nightly with signed update manifests after all checks pass**
+unchecked. Leave the `public_key` input empty for a no-key artifact-only build. The workflow
+uploads build artifacts without creating a release, tag, or updater manifests, and requires
+no signing environment. No separate supporter-build workflow is needed.
 
 After a successful run, download
 `opennow-qt-<version>-complete-unsigned` from the run's **Artifacts** section.
 Versions use `<project-version>-nightly.<run-number>.<attempt>` even when release
-publishing is disabled. The complete archive contains Windows x64/ARM64 portable ZIPs, Linux
-x64/ARM64 AppImages and DEBs, `SHA256SUMS`, and source-commit metadata. The macOS
-ARM64 validation ZIP is a separate artifact. Artifacts expire after 14 days.
+publishing is disabled. The complete archive contains Windows x64/ARM64 MSI installers and
+portable ZIPs, Linux x64/ARM64 AppImages and DEBs, the Apple Silicon macOS DMG, `SHA256SUMS`,
+and source-commit metadata. The macOS ARM64 validation ZIP is a separate artifact.
+Artifacts expire after 14 days.
 
-These builds are unsigned and require manual downloads for updates. Windows may
-show a SmartScreen warning; macOS packages are not notarized. Windows ARM64 is
-cross-built rather than runtime-tested. Linux DEBs require Qt 6.8+ and SDL3;
-AppImages are the portable option. Download the files and distribute them through
+These default no-key builds have no platform publisher signatures and require manual downloads
+for updates. Public publishing instead requires a pinned public key and the protected isolated
+signer described in the [signing setup guide](../docs/update-signing-setup.md); see the
+[nightly release runbook](../docs/qt-nightly-release.md) for the publishing command. Users of
+earlier no-key nightlies must manually install an update-enabled build once before verified
+in-app updates can work. Windows may show a SmartScreen warning; macOS packages are not notarized.
+Windows ARM64 is cross-built rather than runtime-tested. Release Linux DEBs bundle Qt and SDL3
+for Ubuntu 24.04 / Linux Mint 22.x; AppImages are the portable option. Download the files and distribute them through
 your supporter channel. **Actions artifacts in this public repository are not
 private or supporter-access-controlled**, even though they do not appear in Releases.
 
@@ -215,7 +227,7 @@ cmake -S opennow-qt -B build/opennow-qt -DCMAKE_BUILD_TYPE=Release \
 cmake --build build/opennow-qt --parallel 4
 ctest --test-dir build/opennow-qt --output-on-failure --parallel 2
 ./build/opennow-qt/OpenNOW.app/Contents/MacOS/OpenNOW
-cpack --config build/opennow-qt/CPackConfig.cmake -G ZIP -B build/qt-packages
+cpack --config build/opennow-qt/CPackConfig.cmake -G 'DragNDrop;ZIP' -B build/qt-packages
 ```
 
 CMake selects the matching Rust target; an explicitly supplied
@@ -227,9 +239,12 @@ The app explicitly links Qt Svg so macdeployqt includes the SVG image plugin use
 by the QML icons; the relocated-bundle check requires that plugin to be present.
 
 The manual `macos-arm64` package matrix entry builds and tests the native Apple Silicon
-stack, then checks a relocated ZIP with the development dependencies hidden.
-These are unsigned validation artifacts, not notarized releases, and are not
-part of the Linux/Windows nightly inventory. Offscreen tests cover shell and FFI
+stack, then checks both a relocated ZIP and an app copied from the mounted DMG with development
+dependencies hidden. The Apple Silicon DMG is part of the public nightly inventory; the ZIP
+remains a separate CI validation artifact. These applications have no Developer ID signature or
+notarization and require manual updates. See
+[`qt-nightly-release.md`](../docs/qt-nightly-release.md) for installation warnings and the
+Windows MSI/portable ZIP contract. Offscreen tests cover shell and FFI
 contracts; real VideoToolbox/Metal presentation, audio, input capture, and login
 still require macOS hardware and a GFN account.
 
@@ -249,6 +264,84 @@ release, and restore the actual system cursor. A live session with two displays 
 still required to verify physical mouse containment, mixed-DPI transitions, and
 the server/client cursor handoff.
 
+### First-run onboarding
+
+New profiles enter setup after provider sign-in. The flow covers the 1.0.0 beta
+notice, desktop or console mode, streaming preferences, optional frame generation,
+macOS-only MetalFX upscaling, and optional GitHub Sponsors support. Existing
+profiles migrate with onboarding completed and retain their preferences.
+
+Choices stay in a local draft until **Finish setup** or **Skip setup**. Both actions
+save the current choices, then persist `onboardingCompleted` last. If a write fails,
+setup keeps the draft and presents the error for retry. Selecting console mode does
+not replace the wizard while its settings are being saved. No payment or diagnostic
+upload happens during onboarding.
+
+To repeat setup, open **Settings → About → Replay onboarding** at the bottom of
+the page, then confirm **Restart and replay**. OpenNOW saves only
+`onboardingCompleted=false` before restarting; other preferences and saved accounts
+are kept. End an active or starting stream first. A failed save leaves the app open
+and allows retrying. The replacement process starts after the old window, core,
+native runtime and single-instance listener have been released.
+
+The Picture step uses the same aspect-ratio groups, monitor filter and resolution
+stepper as Settings. Selection still edits the onboarding draft rather than saving
+immediately. Short pages center within the available content area; longer pages
+remain scrollable, including keyboard focus inside the expanded resolution picker.
+
+On macOS, setup requires the `awdl0` interface to be down. Boost offers an explicit,
+confirmed disable action using the macOS administrator prompt. Finish and Skip
+both check the current interface state, with a fresh check before sending the
+completion-marker write after the other settings. Enabled, unreadable and busy
+states block completion and return to Boost without discarding the draft. A
+confirmed absent interface needs no change; other platforms have no AWDL requirement.
+Re-enabling AWDL from the card undoes the network change and blocks completion again.
+OpenNOW never disables AWDL automatically, stores administrator credentials, or
+installs a service. Disabling AWDL can interrupt AirDrop, AirPlay, Sidecar and other
+Continuity features for all users. macOS may re-enable it after the check; OpenNOW
+does not enforce its state after setup. An interface-down reading is not proof of
+zero AWDL radio traffic or a guaranteed fix for streaming stutter.
+
+Run persistence and whole-app acceptance without an account:
+
+```sh
+ctest --test-dir build/opennow-qt -R 'onboarding' --output-on-failure
+QT_QPA_PLATFORM=offscreen build/opennow-qt/opennow-qt \
+  --smoke-test --allow-multiple-instances --desktop --route home \
+  --smoke-onboarding --onboarding-step 0 --smoke-width 1440 \
+  --reduced-motion --screenshot /absolute/path/onboarding.png
+```
+
+`--onboarding-step` accepts 0 through 5. Add `--smoke-light-theme` or
+`--onboarding-ui-scale 1.25` to inspect alternate appearances. For the existing
+provider sign-in screen, replace `--onboarding-step 0` with `--onboarding-login`.
+Add `--onboarding-ui-check` to verify centering and draft resolution selection, and
+`--onboarding-resolution-expanded --onboarding-step 2` to exercise the expanded
+picker. Use `--onboarding-replay-check` to verify the Settings confirmation,
+cancellation and failed-save retry; add `--onboarding-replay-dialog` for a dialog
+screenshot. These replay UI fixtures do not restart the test process.
+Add `--onboarding-awdl-check --onboarding-step 3` to exercise the macOS card with an
+injected controller on any platform. This checks confirmation, cancellation,
+restore, busy, error and unsupported states without changing a network interface.
+These switches run only with the smoke fixture; they do not start provider login,
+open donation links, or write account settings. Real provider approval and native
+MetalFX output still require the corresponding account and macOS device.
+
+Capture every setup step in desktop, compact 1.25×, and light appearances, plus
+desktop and compact login, for visual comparison with the Paper design:
+
+```sh
+bash scripts/capture-qt-onboarding.sh build/opennow-qt/opennow-qt /absolute/path/onboarding-review
+```
+
+The compact scroll checks focus every eligible control, verify that the focused
+control fits inside the viewport, and capture the final scrolled position. The
+capture script uses OpenGL and starts Xvfb on headless Linux, so shader-backed
+controls render rather than disappearing under the offscreen software backend.
+It requires a built app and `xvfb-run` on headless Linux. Each PNG has a matching
+acceptance log. The mode cards use the original Paper shell previews; these are
+illustrations, not the signed-in user's library.
+
 Run with the offscreen Qt platform plugin for a startup smoke test:
 
 ```sh
@@ -259,6 +352,19 @@ QT_QPA_PLATFORM=offscreen ./build/opennow-qt/opennow-qt \
 Useful development switches are `--route <name>`, `--overlay <name>`,
 `--reduced-motion`, `--core <path>` and `--screenshot <png-path>`. The test suite
 opens every route and overlay with QML warnings treated as failures.
+
+The desktop free-tier queue selector compares PrintedWaste queue estimates with
+local TCP latency before a new NVIDIA launch. The choice is session-local; “Use
+default region” preserves the saved region. “Don't show again” persists the opt-out,
+which can be reversed under Settings → Network → Free-tier queue selector.
+Paid, unknown-tier, alliance, and console-mode launches do not show this dialog.
+
+Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'queueselector|qml-queue-selector'`
+for state, interaction, layout, attribution-link, and launch-routing coverage.
+`--smoke-test --desktop --route home --smoke-queue-selector --queue-selector-preview
+--screenshot <absolute-png-path>` captures public-safe sample queues in the real
+desktop shell. Add `--queue-selector-large`, `--smoke-light-theme`, or
+`--smoke-width 960 --smoke-height 540` to check scaling, appearance, and compact layout.
 
 Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'theme-tests|qml-theme-settings'`
 to check all built-in packs in both appearances, accent contrast, preview restoration,
@@ -464,6 +570,21 @@ and `--smoke-test --desktop --route stream --overlay desktop-stream-menu
 `--smoke-microphone` acceptance workload checks state, commands and reconnect mute
 preservation against a mock runtime.
 
+Settings → Audio contains two independent, default-off background options.
+**Mute when out of focus** silences local playback while another app is active and
+restores it on return. It does not pause video, microphone capture, or recording.
+**Background stream reminder** requests taskbar or dock attention every five minutes
+while a session is streaming in the background. Returning to OpenNOW, ending the
+stream, or disabling the option stops the timer. Desktop support determines how
+the attention request appears; this is not an AFK-timeout warning or anti-AFK control.
+
+Run `ctest --test-dir build/opennow-qt -R qml-background-stream --output-on-failure`
+to check toggles, focus transitions, reminder cancellation, and runtime restart state.
+For live acceptance, enable both options and switch apps during a stream in windowed
+and fullscreen modes, with the stream menu open and closed. Check silence on leaving,
+audio restoration on return, uninterrupted video and recording, and attention after
+five minutes away. Repeat with each option disabled independently.
+
 Settings → Controls → **Clipboard paste** enables local-to-stream plain-text paste
 with Ctrl+V (Command+V on macOS). The console Controls page exposes the same persisted
 `clipboardPaste` preference. It is disabled by default and only reads the clipboard
@@ -494,7 +615,7 @@ they also duplicate input.
 **Settings → Input & controllers** includes independent left/right stick dead zones
 (0–50%) and controller vibration intensity (0–100%) in both desktop and console mode.
 These global preferences are saved and apply without restarting the session. Defaults
-are 24% left and 27% right, rounded from the XInput-style thresholds used by OpenNOW-Mac.
+are 5% for both sticks. Existing saved preferences are preserved.
 The radial filter suppresses resting drift and rescales the remaining travel, preserving
 full axis and diagonal output. Set either stick to 0% to leave its dead zone to the game;
 shell navigation retains its separate press/release thresholds.
@@ -562,7 +683,7 @@ The versioned Rust core owns settings, NVIDIA device login and token refresh,
 OS-protected accounts, PINs, catalogs, subscriptions, regions and latency tests,
 account connections, persistent storage, CloudMatch lifecycle/recovery/ads,
 NVST session orchestration, diagnostics, media listing, Discord, telemetry,
-feedback and update discovery. The protocol-v6 native streamer is linked into
+feedback and update discovery. The protocol-v7 native streamer is linked into
 the Qt executable as an in-process Rust library. It owns NVST RTSPS negotiation,
 Mjolnir video, the ICE/DTLS/SCTP control bundle, decode, audio and native input.
 Qt/QML owns stream status, stats, menus, recovery, failure and fullscreen

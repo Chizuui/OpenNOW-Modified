@@ -3,6 +3,8 @@
 
 #include "streaming/NativeStreamRuntime.h"
 #include "streaming/rendering/LinuxVulkanGraphics.h"
+#include "streaming/rendering/StreamPresentTimings.h"
+#include "streaming/rendering/StreamSwapStallWatchdog.h"
 #include "streaming/rendering/StreamVideoRenderCallback.h"
 #include "streaming/rendering/StreamVideoTextureRenderer.h"
 #include "streaming/rendering/StreamFrameInterpolator.h"
@@ -50,10 +52,14 @@ public:
     void initialize(QRhi *rhi, QRhiCommandBuffer *commandBuffer,
                     QRhiRenderTarget *renderTarget) override
     {
-        if (m_rhi != rhi) releaseResources();
-        if (m_runtime && m_presentationGeneration != m_runtime->presentationGeneration()) {
-            releaseResources();
-            m_presentationGeneration = m_runtime->presentationGeneration();
+        const bool ownRearm = std::exchange(m_resourceRearmPending, false);
+        const bool deviceChanged = m_rhi != rhi;
+        const bool generationChanged = m_runtime
+            && m_presentationGeneration != m_runtime->presentationGeneration();
+        if (ownRearm || deviceChanged || generationChanged) {
+            tearDownResources(ownRearm, deviceChanged, generationChanged);
+            if (generationChanged)
+                m_presentationGeneration = m_runtime->presentationGeneration();
         }
         m_textures.initialize(rhi, renderTarget);
         if (m_rhi == rhi && m_graphicsReady) return;
@@ -136,6 +142,16 @@ public:
 
     void prepareFrame(QRhiCommandBuffer *commandBuffer) override
     {
+        prepareNativeFrame(commandBuffer);
+        if (!m_runtime || !m_runtime->presentationAllowed()
+            || m_presentationGeneration != m_runtime->presentationGeneration()
+            || !m_graphicsReady || !m_rhi || !commandBuffer) return;
+        m_textures.prepareUpscaling(commandBuffer, m_upscalingTarget, m_fsrUpscaling,
+            m_sourceColorSpace == OPENNOW_STREAMER_COLOR_SPACE_SDR709, m_upscalingSharpness);
+    }
+
+    void prepareNativeFrame(QRhiCommandBuffer *commandBuffer)
+    {
         if (!m_runtime || !m_runtime->presentationAllowed()
                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
         if (!m_graphicsReady || !m_rhi || !commandBuffer) return;
@@ -154,7 +170,7 @@ public:
         command.version = OPENNOW_STREAMER_RENDER_COMMAND_VERSION;
         command.struct_size = sizeof(command);
         command.frame_slot = static_cast<std::uint32_t>(m_rhi->currentFrameSlot());
-        if (m_rhi->backend() == QRhi::Metal && !m_upscalingTarget.isEmpty()) {
+        if (m_rhi->backend() == QRhi::Metal && !m_fsrUpscaling && !m_upscalingTarget.isEmpty()) {
             command.upscale_width = static_cast<std::uint32_t>(m_upscalingTarget.width());
             command.upscale_height = static_cast<std::uint32_t>(m_upscalingTarget.height());
             command.upscale_sharpness = static_cast<std::uint32_t>(m_upscalingSharpness);
@@ -321,8 +337,14 @@ public:
     {
         const auto target = size.width() > 0 && size.height() > 0
                 && size.width() <= 16384 && size.height() <= 16384 ? size : QSize();
-        if (m_upscalingTarget != target) m_resetFrameGeneration = true;
+        if (m_upscalingTarget != target && m_rhi && m_rhi->backend() == QRhi::Metal)
+            m_resetFrameGeneration = true;
         m_upscalingTarget = target;
+    }
+
+    void setFsrUpscaling(bool enabled) override
+    {
+        m_fsrUpscaling = enabled;
     }
 
     void setUpscalingEnhancement(int sharpness, int denoise) override
@@ -332,7 +354,8 @@ public:
         if (m_upscalingSharpness == sharpness && m_upscalingDenoise == denoise) return;
         m_upscalingSharpness = sharpness;
         m_upscalingDenoise = denoise;
-        if (!m_upscalingTarget.isEmpty()) m_resetFrameGeneration = true;
+        if (!m_upscalingTarget.isEmpty() && m_rhi && m_rhi->backend() == QRhi::Metal)
+            m_resetFrameGeneration = true;
     }
 
     void setFrameGeneration(bool enabled, double refreshRate) override
@@ -349,10 +372,40 @@ public:
         return m_needsFrame.load() && m_runtime && m_runtime->presentationAllowed();
     }
 
+    QVariantMap swapStats() const override
+    {
+        const auto snapshot = m_swapTimings.snapshot();
+        QVariantMap stats;
+        stats.insert(QStringLiteral("available"), snapshot.available);
+        if (snapshot.available) {
+            stats.insert(QStringLiteral("p50Ms"), double(snapshot.submitToSwap.p50Ns) / 1.0e6);
+            stats.insert(QStringLiteral("p95Ms"), double(snapshot.submitToSwap.p95Ns) / 1.0e6);
+            stats.insert(QStringLiteral("maxMs"), double(snapshot.submitToSwap.maxNs) / 1.0e6);
+        }
+        stats.insert(QStringLiteral("windowSamples"), int(snapshot.windowSamples));
+        stats.insert(QStringLiteral("swappedFramesTotal"),
+                     qulonglong(snapshot.swappedFramesTotal));
+        stats.insert(QStringLiteral("epoch"), qulonglong(snapshot.epoch));
+        if (snapshot.hasLastSwap)
+            stats.insert(QStringLiteral("sinceLastSwapMs"),
+                         double(clockNs() - snapshot.lastSwapNs) / 1.0e6);
+        return stats;
+    }
+
+    void setSwapGated(bool gated, const QString &) override
+    {
+        m_swapGateActive = gated;
+        m_swapTimings.setGated(gated);
+        if (gated) m_swapStall.reset();
+    }
+
     void frameSwapped() override
     {
         const int kind = m_submittedKind.exchange(0);
-        if (kind) ++m_outputCount;
+        if (kind) {
+            ++m_outputCount;
+            m_swapTimings.markSwap(clockNs());
+        }
         if (kind == 2) m_midpointSwapped.store(true);
         const auto now = clockNs();
         const auto start = m_sampleStart.load();
@@ -408,7 +461,9 @@ public:
         if (m_outputDirty) {
             m_submittedKind.store(m_outputKind);
             m_outputDirty = false;
+            if (m_outputKind == 1) m_swapTimings.markSubmit(clockNs());
         }
+        observeSwapProgress();
     }
 
     void finishFrame() override
@@ -419,11 +474,18 @@ public:
 
     void releaseResources() override
     {
+        tearDownResources(false, false, false);
+    }
+
+    void tearDownResources(bool ownRearm, bool deviceChanged, bool generationChanged)
+    {
+        m_swapStall.onResourcesReleased(ownRearm, deviceChanged, generationChanged);
         if (m_rhi && m_graphicsReady) m_rhi->finish();
         finishFrame();
         m_textures.release();
         m_interpolator.release();
         m_pacer.reset();
+        m_swapTimings.reset();
         updateTimingStats();
         m_needsFrame.store(false);
         m_submittedKind.store(0);
@@ -443,6 +505,29 @@ public:
         m_rhi = nullptr;
     }
 
+    void observeSwapProgress()
+    {
+        const auto snapshot = m_swapTimings.snapshot();
+        const auto now = clockNs();
+        StreamSwapStallWatchdog::Observation observation;
+        observation.gated = m_swapGateActive;
+        observation.hasPendingSubmit = snapshot.hasPendingSubmit;
+        observation.hasLastSwap = snapshot.hasLastSwap;
+        observation.lastSwapNs = snapshot.lastSwapNs;
+        const auto progress = m_runtime
+            ? m_runtime->upstreamProgress() : NativeStreamRuntime::UpstreamProgress{};
+        observation.upstreamStalled = progress.stalled;
+        observation.hasUpstreamSample = progress.hasDecodeTimings;
+        observation.upstreamEpoch = progress.decodeEpoch;
+        observation.upstreamOutputsTotal = progress.decodedOutputsTotal;
+        const auto outcome = m_swapStall.observe(observation, now);
+        if (outcome == StreamSwapStallWatchdog::Outcome::ResourceRearm) {
+            m_resourceRearmPending = true;
+        } else if (outcome == StreamSwapStallWatchdog::Outcome::Unrecovered) {
+            reportFailure(QStringLiteral("The render thread stopped swapping decoded frames. The last presentation resource re-arm did not restore the stream, so the session must reconnect."));
+        }
+    }
+
 private:
     NativeStreamRuntime *m_runtime;
     QRhi *m_rhi = nullptr;
@@ -450,6 +535,10 @@ private:
     std::uint32_t m_reportedColorSpace = 0;
     int m_reportedOutputBits = 0;
     StreamVideoTextureRenderer m_textures;
+    StreamPresentTimings m_swapTimings;
+    StreamSwapStallWatchdog m_swapStall;
+    bool m_swapGateActive = false;
+    bool m_resourceRearmPending = false;
     int m_sourceColorSpace = OPENNOW_STREAMER_COLOR_SPACE_SDR709;
     StreamFrameInterpolator m_interpolator;
     StreamFramePacer m_pacer;
@@ -458,6 +547,7 @@ private:
     double m_refreshRate = 0;
     bool m_frameGeneration = false;
     QSize m_upscalingTarget;
+    bool m_fsrUpscaling = false;
     int m_upscalingSharpness = 10;
     int m_upscalingDenoise = 0;
     bool m_frameGenerationFailed = false;
@@ -486,8 +576,7 @@ private:
     quint64 m_presentationGeneration = 0;
     static std::int64_t clockNs()
     {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return streamMonotonicClockNs();
     }
 
     void updateTimingStats()

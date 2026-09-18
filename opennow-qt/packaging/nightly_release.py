@@ -6,27 +6,57 @@ import re
 import shutil
 
 
+BASE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+BUILD_METADATA = r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+RUN_IDENTITY = r"\.[1-9][0-9]*\.[1-9][0-9]*"
+NIGHTLY_VERSION = BASE_VERSION + "-nightly" + RUN_IDENTITY
+
+
+def version_base(version):
+    match = re.fullmatch(BASE_VERSION + r"(?:-[0-9A-Za-z.-]+)?" + BUILD_METADATA, version.removeprefix("v"))
+    if not match:
+        raise ValueError(f"Invalid version: {version}")
+    return tuple(int(value) for value in match.group(1, 2, 3))
+
+
+def validate_nightly_base(version, stable=None):
+    if not re.fullmatch(NIGHTLY_VERSION, version):
+        raise ValueError(f"Invalid nightly version: {version}")
+    base = version_base(version)
+    if stable is not None and version_base(stable) >= base:
+        raise ValueError(f"Nightly version {version} must be newer than the published stable {stable}")
+    return base
+
+
 def nightly_version(cmake_file, run, attempt, channel="nightly"):
-    if channel not in ("nightly", "supporter"):
+    if channel not in ("nightly", "supporter", "stable"):
         raise ValueError("Invalid unsigned build channel")
     match = re.search(r"project\(OpenNOWQt VERSION (\d+\.\d+\.\d+) LANGUAGES", cmake_file.read_text())
     if not match or run < 1 or attempt < 1:
         raise ValueError("Expected a project version and positive run/attempt numbers")
-    return f"{match[1]}-{channel}.{run}.{attempt}"
+    return match[1] if channel == "stable" else f"{match[1]}-{channel}.{run}.{attempt}"
 
 
-def assemble(source, destination, version, commit, channel="nightly"):
-    if channel not in ("nightly", "supporter"):
+def expected_packages(version, commit, channel="nightly"):
+    if channel not in ("nightly", "supporter", "stable"):
         raise ValueError("Invalid unsigned build channel")
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-" + channel + r"\.[1-9][0-9]*\.[1-9][0-9]*", version):
+    suffix = "" if channel == "stable" else "-" + channel + RUN_IDENTITY
+    if not re.fullmatch(BASE_VERSION + suffix, version):
         raise ValueError(f"Invalid {channel} version")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Expected an immutable source commit")
     expected = {
         f"OpenNOW-Qt-{version}-{platform}-{arch}.{extension}"
         for arch in ("x64", "arm64")
-        for platform, extension in (("Windows", "zip"), ("Linux", "AppImage"), ("Linux", "deb"))
+        for platform, extension in (("Windows", "msi"), ("Windows", "zip"), ("Linux", "AppImage"), ("Linux", "deb"))
     }
+    expected.add(f"OpenNOW-Qt-{version}-Darwin-arm64.dmg")
+    expected.update(name + ".zsync" for name in tuple(expected) if name.endswith(".AppImage"))
+    return expected
+
+
+def assemble(source, destination, version, commit, channel="nightly"):
+    expected = expected_packages(version, commit, channel)
     files = {}
     for path in source.rglob("*"):
         if path.is_symlink():
@@ -66,13 +96,13 @@ def main():
     version.add_argument("--cmake-file", type=Path, default=Path("opennow-qt/CMakeLists.txt"))
     version.add_argument("--run", type=int, required=True)
     version.add_argument("--attempt", type=int, required=True)
-    version.add_argument("--channel", choices=("nightly", "supporter"), default="nightly")
+    version.add_argument("--channel", choices=("nightly", "supporter", "stable"), default="nightly")
     collect = commands.add_parser("assemble")
     collect.add_argument("--source", type=Path, required=True)
     collect.add_argument("--destination", type=Path, required=True)
     collect.add_argument("--version", required=True)
     collect.add_argument("--commit", required=True)
-    collect.add_argument("--channel", choices=("nightly", "supporter"), default="nightly")
+    collect.add_argument("--channel", choices=("nightly", "supporter", "stable"), default="nightly")
     args = parser.parse_args()
     if args.command == "version":
         print(nightly_version(args.cmake_file, args.run, args.attempt, args.channel))

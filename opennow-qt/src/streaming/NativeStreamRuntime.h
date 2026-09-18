@@ -1,6 +1,7 @@
 #pragma once
 
 #include "opennow_streamer_ffi.h"
+#include "input/SdlDeviceClaim.h"
 
 #include <QByteArray>
 #include <QJsonObject>
@@ -53,6 +54,10 @@ public:
                                                              std::uint32_t);
         using SetCaptureActive = OpenNowStreamerStatus (*)(const OpenNowStreamer *, bool,
                                                             bool, std::uintptr_t, bool *);
+        using ReplaceSdlDeviceClaims = OpenNowStreamerStatus (*)(
+            const OpenNowStreamer *, const OpenNowSdlDeviceClaim *, std::size_t);
+        using SubmitSonySnapshot = OpenNowStreamerStatus (*)(
+            const OpenNowStreamer *, const OpenNowSonySnapshot *);
 
         Create create = nullptr;
         Send send = nullptr;
@@ -70,6 +75,8 @@ public:
         SubmitGamepad submitGamepad = nullptr;
         SubmitLocalAction submitLocalAction = nullptr;
         SetCaptureActive setCaptureActive = nullptr;
+        ReplaceSdlDeviceClaims replaceSdlDeviceClaims = nullptr;
+        SubmitSonySnapshot submitSonySnapshot = nullptr;
         SetLogFile setLogFile = nullptr;
         Send submitText = nullptr;
     };
@@ -81,15 +88,25 @@ public:
     static void initializeDiagnostics(Api::SetLogFile setLogFile = &opennow_streamer_set_log_file);
 
     explicit NativeStreamRuntime(QObject *parent = nullptr,
-                                 const OpenNowStreamerVulkanDevice *vulkanDevice = nullptr);
+                                 const OpenNowStreamerVulkanDevice *vulkanDevice = nullptr,
+                                 quint64 windowsAdapterLuid = 0);
     explicit NativeStreamRuntime(Api api, QObject *parent = nullptr,
-                                 const OpenNowStreamerVulkanDevice *vulkanDevice = nullptr);
+                                 const OpenNowStreamerVulkanDevice *vulkanDevice = nullptr,
+                                 quint64 windowsAdapterLuid = 0);
     ~NativeStreamRuntime() override;
 
     [[nodiscard]] bool running() const;
     [[nodiscard]] QString lastError() const;
     [[nodiscard]] quint64 presentationGeneration() const;
     [[nodiscard]] bool presentationAllowed() const;
+    struct UpstreamProgress
+    {
+        bool stalled = false;
+        bool hasDecodeTimings = false;
+        quint64 decodeEpoch = 0;
+        quint64 decodedOutputsTotal = 0;
+    };
+    [[nodiscard]] UpstreamProgress upstreamProgress() const;
     [[nodiscard]] bool inputAllowed() const;
     [[nodiscard]] bool serverCursorComposited() const;
     [[nodiscard]] const OpenNowStreamerVulkanDevice *vulkanDevice() const;
@@ -128,6 +145,8 @@ public:
     OpenNowStreamerStatus setCaptureActive(bool active, bool relativeMouse,
                                            std::uintptr_t windowHandle,
                                            bool *rawInputActive);
+    OpenNowStreamerStatus replaceSdlDeviceClaims(const QList<SdlDeviceClaim> &claims);
+    OpenNowStreamerStatus submitSonySnapshot(const OpenNowSonySnapshot &snapshot);
 
 signals:
     void inputCaptureReset();
@@ -142,7 +161,8 @@ signals:
     void cursorCaptureChanged(bool composited);
     void cursorStateReset();
     void controllerRumbleRequested(quint8 controllerId, quint16 lowFrequency,
-                                   quint16 highFrequency, quint32 durationMs);
+                                   quint16 highFrequency, quint32 durationMs,
+                                   quint64 sourceIncarnation);
     void controllerRumbleStopped();
     void callbacksDropped(int count);
 

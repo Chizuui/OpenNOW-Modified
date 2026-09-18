@@ -72,14 +72,42 @@ struct HardwareFormatSelection {
     exportable_vulkan_frames: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaapiDevicePolicy {
+    Default,
+    Require(super::vaapi_probe::VaapiDepth),
+}
+
+fn vaapi_device_policy(
+    codec: VideoCodec,
+    mode: FfmpegMode,
+    pixel_format: PixelFormat,
+) -> VaapiDevicePolicy {
+    match (mode, pixel_format) {
+        (FfmpegMode::Vaapi, PixelFormat::P010) => {
+            VaapiDevicePolicy::Require(super::vaapi_probe::VaapiDepth::TenBit420)
+        }
+        (FfmpegMode::Vaapi, PixelFormat::Nv12)
+            if super::vaapi_probe::color_queries(codec).is_some() =>
+        {
+            VaapiDevicePolicy::Require(super::vaapi_probe::VaapiDepth::EightBit420)
+        }
+        _ => VaapiDevicePolicy::Default,
+    }
+}
+
 impl FfmpegDecoder {
-    pub(crate) fn supports_vaapi_ten_bit(codec: VideoCodec) -> bool {
-        initialize_ffmpeg().is_ok()
-            && ffmpeg::decoder::find_by_name(native_decoder_name(codec)).is_some_and(|decoder| {
-                hardware_pixel_format(decoder, ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI)
-                    .is_some()
-            })
-            && super::vaapi_probe::ten_bit_device(codec).is_some()
+    pub(crate) fn supports_vaapi_color(codec: VideoCodec) -> super::VaapiColorSupport {
+        let Some(decoder) = initialize_ffmpeg()
+            .ok()
+            .and_then(|()| ffmpeg::decoder::find_by_name(native_decoder_name(codec)))
+        else {
+            return super::VaapiColorSupport::default();
+        };
+        if hardware_pixel_format(decoder, ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI).is_none() {
+            return super::VaapiColorSupport::default();
+        }
+        super::vaapi_probe::color_support(codec)
     }
 
     pub(crate) fn open(codec: VideoCodec, format: StreamFormat, mode: FfmpegMode) -> Result<Self> {
@@ -151,16 +179,23 @@ impl FfmpegDecoder {
         }
 
         let mut wanted_hw_format = None;
-        let vaapi_device = if mode == FfmpegMode::Vaapi && format.pixel_format == PixelFormat::P010
-        {
-            Some(super::vaapi_probe::ten_bit_device(codec).ok_or_else(|| {
-                Error::unavailable(
-                    Subsystem::VaApi,
-                    "no VAAPI decode profile supports the requested 10-bit 4:2:0 format",
-                )
-            })?)
-        } else {
-            None
+        let vaapi_device = match vaapi_device_policy(codec, mode, format.pixel_format) {
+            VaapiDevicePolicy::Require(depth) => Some(
+                super::vaapi_probe::device_for_profile(codec, depth).ok_or_else(|| {
+                    Error::unavailable(
+                        Subsystem::VaApi,
+                        match depth {
+                            super::vaapi_probe::VaapiDepth::EightBit420 => {
+                                "no VAAPI decode profile supports the requested 8-bit 4:2:0 format"
+                            }
+                            super::vaapi_probe::VaapiDepth::TenBit420 => {
+                                "no VAAPI decode profile supports the requested 10-bit 4:2:0 format"
+                            }
+                        },
+                    )
+                })?,
+            ),
+            VaapiDevicePolicy::Default => None,
         };
         let device_path = vaapi_device
             .as_ref()
@@ -1224,6 +1259,58 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn vaapi_device_policy_only_requires_a_profile_where_one_was_negotiated() {
+        use super::super::vaapi_probe::VaapiDepth;
+
+        for codec in [VideoCodec::H265, VideoCodec::Av1] {
+            assert_eq!(
+                vaapi_device_policy(codec, FfmpegMode::Vaapi, PixelFormat::Nv12),
+                VaapiDevicePolicy::Require(VaapiDepth::EightBit420)
+            );
+            assert_eq!(
+                vaapi_device_policy(codec, FfmpegMode::Vaapi, PixelFormat::P010),
+                VaapiDevicePolicy::Require(VaapiDepth::TenBit420)
+            );
+        }
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H264, FfmpegMode::Vaapi, PixelFormat::P010),
+            VaapiDevicePolicy::Require(VaapiDepth::TenBit420)
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H264, FfmpegMode::Vaapi, PixelFormat::Nv12),
+            VaapiDevicePolicy::Default
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H265, FfmpegMode::Vulkan, PixelFormat::P010),
+            VaapiDevicePolicy::Default
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H265, FfmpegMode::Software, PixelFormat::Nv12),
+            VaapiDevicePolicy::Default
+        );
+        for pixel_format in [PixelFormat::Nv24, PixelFormat::P410, PixelFormat::I420] {
+            assert_eq!(
+                vaapi_device_policy(VideoCodec::H265, FfmpegMode::Vaapi, pixel_format),
+                VaapiDevicePolicy::Default
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_8_bit_selection_never_reuses_the_10_bit_profile_query() {
+        use super::super::vaapi_probe::{VaapiDepth, color_queries};
+
+        let eight = VaapiDepth::EightBit420.query(VideoCodec::H265).unwrap();
+        let ten = VaapiDepth::TenBit420.query(VideoCodec::H265).unwrap();
+        assert_ne!(eight, ten);
+        assert_eq!(color_queries(VideoCodec::H265), Some([eight, ten]));
+        assert_ne!(
+            VaapiDepth::EightBit420.query(VideoCodec::Av1).unwrap(),
+            VaapiDepth::TenBit420.query(VideoCodec::Av1).unwrap()
+        );
+    }
+
     #[cfg(all(target_arch = "aarch64", feature = "ffmpeg-bundled"))]
     #[test]
     fn bundled_arm64_hevc_exposes_request_hwaccel() {
@@ -1737,5 +1824,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires the FFmpeg CLI with libx264; run under --features linux-ffmpeg-bundled"]
+    fn ffmpeg_software_decoder_reports_a_midstream_resolution_change() {
+        let encode = |width: u32, height: u32| {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc=size={width}x{height}:rate=30"),
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-tune",
+                    "zerolatency",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "h264",
+                    "pipe:1",
+                ])
+                .output()
+                .expect("FFmpeg CLI must start");
+            assert!(
+                output.status.success(),
+                "sample encode failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty());
+            output.stdout
+        };
+
+        initialize_ffmpeg().unwrap();
+        let initial = encode(256, 144);
+        let resized = encode(320, 180);
+        let mut decoder = FfmpegDecoder::open(
+            VideoCodec::H264,
+            StreamFormat::video_default(256, 144).unwrap(),
+            FfmpegMode::Software,
+        )
+        .unwrap();
+
+        let mut observed = Vec::new();
+        let mut changes = Vec::new();
+        for (payload, timestamp) in [(initial, 1_u64), (resized, 2)] {
+            let packet = EncodedVideoFrame::new(payload, timestamp, true).unwrap();
+            observed.extend(
+                decoder
+                    .decode(&packet)
+                    .unwrap()
+                    .into_iter()
+                    .map(|frame| (frame.format.width, frame.format.height)),
+            );
+            changes.extend(
+                decoder
+                    .take_format_change()
+                    .map(|format| (format.width, format.height)),
+            );
+        }
+        observed.extend(
+            decoder
+                .flush()
+                .unwrap()
+                .into_iter()
+                .map(|frame| (frame.format.width, frame.format.height)),
+        );
+        changes.extend(
+            decoder
+                .take_format_change()
+                .map(|format| (format.width, format.height)),
+        );
+
+        assert!(
+            observed.contains(&(256, 144)),
+            "the first packet must decode at its own size: {observed:?}"
+        );
+        assert!(
+            observed.contains(&(320, 180)),
+            "the resized packet must decode at the new size: {observed:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![(320, 180)],
+            "the decoder must report exactly the resized format as a change"
+        );
     }
 }

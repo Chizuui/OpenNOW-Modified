@@ -448,7 +448,7 @@ unsafe extern "C-unwind" fn decompression_callback(
 
 fn frame_duration_seconds(duration: CMTime) -> f64 {
     if duration.value > 0 && duration.timescale > 0 {
-        (duration.value as f64 / f64::from(duration.timescale)).clamp(1.0 / 240.0, 1.0 / 24.0)
+        (duration.value as f64 / f64::from(duration.timescale)).clamp(1.0 / 360.0, 1.0 / 24.0)
     } else {
         1.0 / 60.0
     }
@@ -631,6 +631,17 @@ mod tests {
             epoch: 0,
         };
         assert!((frame_duration_seconds(duration) - 1.0 / 120.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn converts_top_tier_core_media_duration_without_clamping_to_240() {
+        let duration = CMTime {
+            value: 250,
+            timescale: 90_000,
+            flags: CMTimeFlags(1),
+            epoch: 0,
+        };
+        assert!((frame_duration_seconds(duration) - 1.0 / 360.0).abs() < f64::EPSILON);
     }
 
     #[test]

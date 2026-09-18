@@ -37,6 +37,7 @@ pub fn client_for_settings_with(
     let proxy = Proxy::all(&config.normalized_url).map_err(|_| INVALID_PROXY.to_owned())?;
     configure(
         Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
             .pool_idle_timeout(Duration::from_secs(60))

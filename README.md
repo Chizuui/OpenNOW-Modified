@@ -35,6 +35,11 @@ OpenNOW is a community-built GeForce NOW client. The desktop app uses Qt Quick f
 the interface and Rust for account services and streaming. Use a keyboard and mouse,
 or switch to the console layout for a controller. Both layouts run in the same app.
 
+> [!NOTE]
+> OpenNOW 1.0.0 rebuilds the desktop client with Qt Quick and a native Rust streaming
+> engine. It replaces the retired Electron app. See the
+> [announcement post](https://x.com/Zortosdev/status/2093023076191440963) for a first look at the new UI.
+
 > [!IMPORTANT]
 > You need your own GeForce NOW account. Your subscription, region, and hardware
 > determine which games and stream settings you can use. OpenNOW is not affiliated
@@ -56,17 +61,22 @@ If there's no published Qt nightly, sign in to GitHub and download the artifacts
 
 | Platform | Qt package | How to run it |
 | --- | --- | --- |
-| Windows x64 / ARM64 | Portable `.zip` | Extract the entire archive, then run `bin/OpenNOW.exe`. |
+| Windows x64 / ARM64 | `.msi`, portable `.zip` | Install the MSI, or extract the entire ZIP and run `bin/OpenNOW.exe`. |
 | Linux x64 / ARM64 | `.AppImage`, recommended | Make the file executable, then launch it. |
 | Linux x64 / ARM64 | `.deb` | Your distribution must provide Qt 6.8+ and SDL3. Use the AppImage on stock Ubuntu 24.04. |
-| macOS | No Qt nightly package | See the separate [OpenNOW-Mac](https://github.com/OpenCloudGaming/OpenNOW-Mac) project. |
+| macOS Apple Silicon, macOS 13+ | `.dmg`, nightlies | Open the DMG and drag OpenNOW into Applications. Intel Macs are not included. |
 
-Nightlies are unsigned. Windows may show an unknown-publisher warning, and you'll
-need to download updates yourself. Checksums help detect corrupted downloads;
-they don't verify who published a package.
+Nightly platform packages are unsigned. Windows may show an unknown-publisher warning.
+The macOS app is not notarized; if Gatekeeper blocks it, use System Settings → Privacy &
+Security → Open Anyway when offered. Do not disable Gatekeeper globally.
+Published update-enabled nightlies use signed update manifests. Older builds without a
+pinned signing key need one manual upgrade. Checksums alone detect corrupted downloads;
+they do not verify who published a package.
 
-The [nightly guide](docs/qt-nightly-release.md) covers these packages. For signed
-builds and verified updates, read the [release-candidate guide](docs/qt-release-candidate.md).
+The [nightly guide](docs/qt-nightly-release.md) covers these packages. The signed
+1.0.0 candidate workflow currently builds Windows and Linux only; see the
+[release-candidate guide](docs/qt-release-candidate.md). The separate
+[OpenNOW-Mac](https://github.com/OpenCloudGaming/OpenNOW-Mac) project is also available.
 
 ### Other platforms
 
@@ -119,7 +129,7 @@ explains the graphics backends and how Qt uses them.
 
 ## Build from source
 
-Use the `dev` branch for the Qt app. Before building, install:
+Use `main` for the release source or `dev` for ongoing development. Before building, install:
 
 - Qt 6.8+ with Quick, Multimedia, and ShaderTools.
 - CMake 3.24+ and a C++20 toolchain.
@@ -129,7 +139,7 @@ Linux also needs `pkg-config`, `libwayland-dev`, and `wayland-protocols`, even f
 X11 builds. Check the [build guide](opennow-qt/README.md#build) for platform-specific details.
 
 ```sh
-git clone --branch dev https://github.com/OpenCloudGaming/OpenNOW.git
+git clone --branch main https://github.com/OpenCloudGaming/OpenNOW.git
 cd OpenNOW
 cmake -S opennow-qt -B build/opennow-qt -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/opennow-qt
@@ -183,11 +193,11 @@ You can also ask for help on [Discord](https://discord.gg/8EJYaJcNfD).
 ## Star history
 
 <a href="https://www.star-history.com/?repos=OpenCloudGaming%2FOpenNOW&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=OpenCloudGaming/OpenNOW&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=OpenCloudGaming/OpenNOW&type=date&legend=top-left" />
-    <img alt="OpenNOW star history chart" src="https://api.star-history.com/image?repos=OpenCloudGaming/OpenNOW&type=date&legend=top-left" />
-  </picture>
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=OpenCloudGaming/OpenNOW&type=date&theme=dark&legend=top-left&sealed_token=13YQdHqPNeJl_PZ60Tn1heFHwLWvLm3sH5u-7HePhBdXpG1poEyGeM3QG_jf08kKYWxfy65fe7OZDjBzuhznLOS5gdEMLDUXY6D7NCLdFIpOTHrmG_JN8Q" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=OpenCloudGaming/OpenNOW&type=date&legend=top-left&sealed_token=13YQdHqPNeJl_PZ60Tn1heFHwLWvLm3sH5u-7HePhBdXpG1poEyGeM3QG_jf08kKYWxfy65fe7OZDjBzuhznLOS5gdEMLDUXY6D7NCLdFIpOTHrmG_JN8Q" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=OpenCloudGaming/OpenNOW&type=date&legend=top-left&sealed_token=13YQdHqPNeJl_PZ60Tn1heFHwLWvLm3sH5u-7HePhBdXpG1poEyGeM3QG_jf08kKYWxfy65fe7OZDjBzuhznLOS5gdEMLDUXY6D7NCLdFIpOTHrmG_JN8Q" />
+ </picture>
 </a>
 
 ## License

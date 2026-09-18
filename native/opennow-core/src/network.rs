@@ -1,12 +1,132 @@
 use serde_json::{Value, json};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
 
 const MAX_REGIONS: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const QUEUE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const RESOLVER_WORKERS: usize = 32;
+
+struct ResolveJob {
+    host: String,
+    port: u16,
+    deadline: Instant,
+    cancellation: crate::requests::Cancellation,
+    result: mpsc::SyncSender<Vec<SocketAddr>>,
+}
+
+fn resolver() -> Option<&'static mpsc::SyncSender<ResolveJob>> {
+    static RESOLVER: OnceLock<Option<mpsc::SyncSender<ResolveJob>>> = OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<ResolveJob>(RESOLVER_WORKERS);
+            let receiver = Arc::new(Mutex::new(receiver));
+            for index in 0..RESOLVER_WORKERS {
+                let receiver = receiver.clone();
+                thread::Builder::new()
+                    .name(format!("queue-dns-{index}"))
+                    .spawn(move || {
+                        loop {
+                            let job = match receiver.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(job) = job else { return };
+                            if job.cancellation.cancelled() || Instant::now() >= job.deadline {
+                                continue;
+                            }
+                            let addresses = (job.host.as_str(), job.port)
+                                .to_socket_addrs()
+                                .map(|addresses| addresses.take(8).collect())
+                                .unwrap_or_default();
+                            let _ = job.result.try_send(addresses);
+                        }
+                    })
+                    .ok()?;
+            }
+            Some(sender)
+        })
+        .as_ref()
+}
+
+pub(super) fn resolve_bounded(host: String, port: u16) -> Option<Vec<SocketAddr>> {
+    let cancellation = crate::requests::current();
+    if cancellation.cancelled() {
+        return None;
+    }
+    let deadline = Instant::now() + QUEUE_PROBE_TIMEOUT;
+    let (result, receive) = mpsc::sync_channel(1);
+    resolver()?
+        .try_send(ResolveJob {
+            host,
+            port,
+            deadline,
+            cancellation: cancellation.clone(),
+            result,
+        })
+        .ok()?;
+    receive_addresses(&receive, deadline, &cancellation)
+}
+
+fn receive_addresses(
+    receive: &mpsc::Receiver<Vec<SocketAddr>>,
+    deadline: Instant,
+    cancellation: &crate::requests::Cancellation,
+) -> Option<Vec<SocketAddr>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || cancellation.cancelled() {
+            return None;
+        }
+        match receive.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(addresses) => return Some(addresses),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+pub(super) fn measure_queue_region(region_url: &str) -> Option<u64> {
+    if crate::requests::check().is_err() {
+        return None;
+    }
+    let parsed = Url::parse(region_url).ok()?;
+    let addresses = resolve_bounded(
+        parsed.host_str()?.to_owned(),
+        parsed.port_or_known_default()?,
+    )?;
+    let _ = bounded_tcp_ping(&addresses);
+    let mut samples = Vec::with_capacity(2);
+    for attempt in 0..2 {
+        if crate::requests::check().is_err() {
+            return None;
+        }
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(sample) = bounded_tcp_ping(&addresses) {
+            samples.push(sample);
+        }
+    }
+    (!samples.is_empty()).then(|| samples.iter().sum::<u64>().div_ceil(samples.len() as u64))
+}
+
+fn bounded_tcp_ping(addresses: &[SocketAddr]) -> Option<u64> {
+    let started = Instant::now();
+    for address in addresses {
+        let remaining = QUEUE_PROBE_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() || crate::requests::check().is_err() {
+            return None;
+        }
+        if TcpStream::connect_timeout(address, remaining).is_ok() {
+            return Some(started.elapsed().as_millis() as u64);
+        }
+    }
+    None
+}
 
 pub fn ping_regions(params: &Value) -> Result<Value, String> {
     let cancellation = crate::requests::current();
@@ -110,6 +230,50 @@ fn tcp_ping(addresses: &[SocketAddr]) -> Option<u128> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn queue_tcp_measurement_warms_up_then_takes_two_samples_without_http() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            use std::io::Read;
+            for _ in 0..3 {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                assert_eq!(connection.read(&mut [0]).unwrap(), 0);
+            }
+        });
+        assert!(measure_queue_region(&format!("http://127.0.0.1:{port}")).is_some());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_resolution_obeys_deadline_and_cancellation() {
+        let (_sender, receive) = mpsc::sync_channel(1);
+        let cancellation = crate::requests::Cancellation::default();
+        let started = Instant::now();
+        assert!(
+            receive_addresses(&receive, started + Duration::from_millis(20), &cancellation)
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let requests = Arc::new(crate::requests::Requests::default());
+        let permit = requests.admit("dns", "queue.servers.list").unwrap();
+        requests.cancel("dns");
+        assert!(
+            receive_addresses(
+                &receive,
+                Instant::now() + Duration::from_secs(60),
+                &permit.token
+            )
+            .is_none()
+        );
+        crate::requests::scope(permit.token.clone(), || {
+            assert!(resolve_bounded("unresolvable.invalid".into(), 443).is_none());
+        });
+    }
 
     #[test]
     fn cancelled_region_measurement_does_not_start_network_work() {

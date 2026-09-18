@@ -9,6 +9,25 @@ QT_SOURCE = Path(__file__).resolve().parents[1]
 
 
 class MacOSBuildContractTest(unittest.TestCase):
+    def test_public_dmg_is_copied_before_relocated_smoke(self):
+        workflow = (QT_SOURCE.parent / ".github/workflows/qt-build.yml").read_text()
+        self.assertIn("-G 'DragNDrop;ZIP'", workflow)
+        commands = [
+            'hdiutil verify "${dmgs[0]}"',
+            'hdiutil attach "${dmgs[0]}" -readonly -nobrowse -mountpoint "$mount"',
+            'ditto "$mount/OpenNOW.app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"',
+            'hdiutil detach "$mount"\n',
+            'for app in "$zip_app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"; do',
+            '/usr/bin/codesign --verify --deep --strict "$app"',
+            "grep -Fx 'Identifier=io.github.opencloudgaming.OpenNOW'",
+            'mv "$QT_ROOT_DIR" "$QT_ROOT_DIR.unavailable"',
+            '[bin_dir / "OpenNOW", "--smoke-test"',
+        ]
+        positions = [workflow.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("name: opennow-qt-macos-arm64-unsigned", workflow)
+        self.assertIn("name: opennow-macos-arm64-validation", workflow)
+
     def test_architecture_validation_places_input_before_architecture_list(self):
         workflow = QT_SOURCE.parent / ".github/workflows/qt-build.yml"
         commands = [shlex.split(line.strip()) for line in workflow.read_text().splitlines()
@@ -20,7 +39,7 @@ class MacOSBuildContractTest(unittest.TestCase):
              ["lipo", "$bin/libopennow_streamer_ffi.dylib", "-verify_arch", "arm64"]],
         )
 
-    def configure(self, arch="arm64", rust_target=""):
+    def configure(self, arch="arm64", rust_target="", adhoc=False):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         source = Path(directory.name)
@@ -31,6 +50,7 @@ class MacOSBuildContractTest(unittest.TestCase):
 project(MacOSBuildContract VERSION 1.0.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 add_executable(opennow-qt main.cpp)
+set_target_properties(opennow-qt PROPERTIES MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.opencloudgaming.OpenNOW")
 set(APPLE TRUE)
 set(WIN32 FALSE)
 set(CMAKE_SYSTEM_NAME Darwin)
@@ -38,6 +58,7 @@ set(CMAKE_OSX_ARCHITECTURES "{arch}")
 set(CMAKE_CURRENT_SOURCE_DIR "{QT_SOURCE.as_posix()}")
 set(OPENNOW_RUST_TARGET "{rust_target}")
 set(CARGO_EXECUTABLE cargo)
+set(OPENNOW_MACOS_ADHOC_SIGN {"ON" if adhoc else "OFF"})
 include("{QT_SOURCE.as_posix()}/cmake/BuildMetadata.cmake")
 include("{QT_SOURCE.as_posix()}/cmake/NativeRuntime.cmake")
 set(OPENNOW_EXECUTABLE_NAME OpenNOW)
@@ -98,9 +119,15 @@ file(GENERATE OUTPUT "${{CMAKE_BINARY_DIR}}/contract.txt" CONTENT
     def test_bundle_explicitly_installs_native_helpers(self):
         result, build = self.configure()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rule = (build / "CMakeFiles/opennow-update-helper-build.dir/build.make").read_text()
+        self.assertIn("--bin opennow-update-helper", rule)
+        self.assertIn("rust-target/aarch64-apple-darwin/release/opennow-update-helper", rule)
+        cpack = (build / "CPackConfig.cmake").read_text()
+        self.assertIn('set(CPACK_GENERATOR "DragNDrop;ZIP")', cpack)
+        self.assertIn('set(CPACK_PACKAGE_FILE_NAME "OpenNOW-Qt-1.0.0-Darwin-arm64")', cpack)
         install = (build / "cmake_install.cmake").read_text()
         self.assertIn("OpenNOW.app/Contents/MacOS", install)
-        for helper in ("opennow-core", "opennow-acceptance-verify"):
+        for helper in ("opennow-core", "opennow-acceptance-verify", "opennow-update-helper"):
             self.assertIn(f"rust-target/aarch64-apple-darwin/release/{helper}", install)
         for runtime in ("opennow-streamer", "libopennow_streamer_ffi.dylib"):
             self.assertIn(f"streamer-rust-target/aarch64-apple-darwin/release/{runtime}", install)
@@ -109,8 +136,34 @@ file(GENERATE OUTPUT "${{CMAKE_BINARY_DIR}}/contract.txt" CONTENT
         result, build = self.configure()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = (build / "deploy-args.txt").read_text().split(";")
-        for helper in ("opennow-core", "opennow-acceptance-verify", "opennow-streamer"):
+        for helper in ("opennow-core", "opennow-acceptance-verify", "opennow-update-helper", "opennow-streamer"):
             self.assertIn(f"-executable=OpenNOW.app/Contents/MacOS/{helper}", arguments)
+
+    def test_nightly_deployment_explicitly_seals_bundle_with_adhoc_identity(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                result, build = self.configure(adhoc=enabled)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                arguments = (build / "deploy-args.txt").read_text().split(";")
+                self.assertEqual("-codesign=-" in arguments, enabled)
+                install = (build / "cmake_install.cmake").read_text()
+                self.assertEqual("macos-adhoc-seal.cmake" in install, enabled)
+                if enabled:
+                    self.assertLess(install.index("/deploy.cmake"), install.index("/macos-adhoc-seal.cmake"))
+                    seal = (build / "macos-adhoc-seal.cmake").read_text()
+                    self.assertIn('--identifier "io.github.opencloudgaming.OpenNOW"', seal)
+                    self.assertIn("--verify --deep --strict", seal)
+                    self.assertIn('$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/OpenNOW.app', seal)
+        workflow = (QT_SOURCE.parent / ".github/workflows/qt-build.yml").read_text()
+        self.assertIn("-DOPENNOW_MACOS_ADHOC_SIGN=ON", workflow)
+        self.assertIn("grep -Fx 'Signature=adhoc'", workflow)
+        self.assertIn("grep -Fx 'TeamIdentifier=not set'", workflow)
+        self.assertIn("Print :CFBundleIdentifier", workflow)
+        main = (QT_SOURCE / "CMakeLists.txt").read_text()
+        self.assertIn('MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.opencloudgaming.OpenNOW"', main)
+        self.assertIn("${MACOSX_BUNDLE_GUI_IDENTIFIER}", (QT_SOURCE / "packaging/Info.plist.in").read_text())
+        candidate = (QT_SOURCE.parent / ".github/workflows/qt-release-candidate.yml").read_text()
+        self.assertNotIn("OPENNOW_MACOS_ADHOC_SIGN", candidate)
 
 
 if __name__ == "__main__":

@@ -217,6 +217,8 @@ qt_add_qml_module(opennow-qt
     QML_FILES
         qml/Main.qml
         qml/components/AppChrome.qml
+        qml/components/UpdateFailureDialog.qml
+        qml/components/ShellViewport.qml
         qml/components/ArtworkSource.qml
         qml/components/ControllerGlyph.qml
         qml/components/InputPromptIcons.qml
@@ -232,6 +234,7 @@ qt_add_qml_module(opennow-qt
         qml/components/NavPill.qml
         qml/components/PageEntrance.qml
         qml/components/PlatformPicker.qml
+        qml/components/CloudLibraryActions.qml
         qml/components/PosterTile.qml
         qml/components/ReleaseNotes.qml
         qml/components/RoundedArtwork.qml
@@ -241,11 +244,14 @@ qt_add_qml_module(opennow-qt
         qml/components/StreamCaptureStatus.qml
         qml/components/StreamInputNotice.qml
         qml/components/TogglePill.qml
+        qml/components/TenBitWarningDialog.qml
         qml/components/VirtualKeyboard.qml
         qml/desktop/auth/DesktopSignInScreen.qml
         qml/desktop/components/DesktopBackdrop.qml
+        qml/desktop/components/DesktopBrandLockup.qml
         qml/desktop/components/DesktopButton.qml
         qml/desktop/components/DesktopGameModal.qml
+        qml/desktop/components/DesktopQueueSelector.qml
         qml/desktop/components/DesktopGlyph.qml
         qml/desktop/components/DesktopKeyHint.qml
         qml/desktop/components/DesktopPoster.qml
@@ -257,8 +263,15 @@ qt_add_qml_module(opennow-qt
         qml/desktop/library/DesktopLibraryScreen.qml
         qml/desktop/library/DesktopCollectionDialog.qml
         qml/desktop/settings/DesktopSettingsScreen.qml
+        qml/desktop/onboarding/DesktopOnboardingScreen.qml
+        qml/desktop/onboarding/DesktopOnboardingBackdrop.qml
+        qml/desktop/onboarding/DesktopOnboardingModeCard.qml
+        qml/desktop/onboarding/DesktopOnboardingPicture.qml
+        qml/desktop/onboarding/DesktopOnboardingBoost.qml
+        qml/desktop/onboarding/DesktopOnboardingNetwork.qml
         qml/desktop/settings/controls/DesktopSettingsAdvanced.qml
         qml/desktop/settings/controls/DesktopSettingsButton.qml
+        qml/desktop/settings/controls/DesktopSettingsHevcHelp.qml
         qml/desktop/settings/controls/DesktopSettingsChoice.qml
         qml/desktop/settings/controls/DesktopSettingsDisclosure.qml
         qml/desktop/settings/controls/DesktopSettingsDropdown.qml
@@ -305,6 +318,8 @@ qt_add_qml_module(opennow-qt
         qml/desktop/stream/DesktopStreamOverlayHost.qml
         qml/desktop/stream/DesktopStreamScreen.qml
         qml/desktop/stream/DesktopStreamStats.qml
+        qml/desktop/stream/DesktopStreamToast.qml
+        qml/desktop/stream/DesktopStreamToasts.qml
         qml/desktop/updates/DesktopUpdateScreen.qml
         qml/overlays/FriendsOverlay.qml
         qml/overlays/GuideOverlay.qml
@@ -332,15 +347,21 @@ qt_add_qml_module(opennow-qt
         qml/screens/ThemeStoreScreen.qml
         qml/screens/UpdateScreen.qml
         qml/state/ShellStore.qml
+        qml/state/SessionSetupProgress.qml
         qml/state/account/AccountServicesState.qml
+        qml/state/account/QueueSelectorState.qml
         qml/state/catalog/ArtworkState.qml
         qml/state/catalog/CatalogState.qml
         qml/state/settings/SettingsState.qml
+        qml/state/BackgroundStreamState.qml
+        qml/state/ConnectionHealthState.qml
+        qml/state/settings/OnboardingState.qml
         qml/theme/Theme.qml
     RESOURCES
         ${OPENNOW_CONTROLLER_ICON_FILES}
         ${OPENNOW_KEYBOARD_ICON_FILES}
         res/icons/nav-home.svg
+        res/icons/stats-globe.svg
         res/icons/nav-library.svg
         res/icons/nav-controller.svg
         res/icons/nav-friends.svg
@@ -366,6 +387,8 @@ qt_add_qml_module(opennow-qt
         res/brand/opennow-mark.png
         res/brand/signin-hero.jpg
         res/brand/desktop-renew.jpg
+        res/onboarding/desktop-preview.png
+        res/onboarding/console-preview.png
         res/fonts/Nunito-Variable.ttf
         res/fonts/IBMPlexMono-Regular.ttf
         res/fonts/IBMPlexMono-Medium.ttf
