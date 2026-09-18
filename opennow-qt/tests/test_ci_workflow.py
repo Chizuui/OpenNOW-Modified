@@ -188,8 +188,8 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("ensure-windows-media-foundation.ps1", checks)
         cmake = (ROOT / "opennow-qt/cmake/Tests.cmake").read_text()
         targets = re.search(r"set\(OPENNOW_CI_UNIT_TEST_TARGETS\s+(.*?)\)", cmake, re.DOTALL)[1].split()
-        self.assertEqual(len(targets), 30)
-        self.assertEqual(len(set(targets)), 30)
+        self.assertEqual(len(targets), 31)
+        self.assertEqual(len(set(targets)), 31)
         self.assertIn("opennow-updatefailure-tests", targets)
         self.assertIn('add_test(NAME opennow-updatefailure-tests COMMAND opennow-updatefailure-tests', cmake)
         self.assertIn('-input "${CMAKE_CURRENT_SOURCE_DIR}/tests/qml-updater"', cmake)
@@ -208,6 +208,7 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("opennow-controllericons-tests", targets)
         self.assertIn("opennow-streamtoasts-tests", targets)
         self.assertIn("opennow-waylandhdroutput-tests", targets)
+        self.assertIn("opennow-queueselector-tests", targets)
         for forbidden in ("opennow-qt", "opennow-streamvideo-tests", "opennow-nativestreamruntime-tests",
                           "opennow-nativeframegeneration-tests", "opennow-linuxvulkangraphics-tests"):
             self.assertNotIn(forbidden, targets)
