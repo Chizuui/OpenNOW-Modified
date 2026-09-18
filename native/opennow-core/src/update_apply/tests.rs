@@ -5,6 +5,19 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_update_preparation_rejects_cross_format_replacement() {
+    use std::ffi::OsStr;
+    let image = Some(OsStr::new("/home/user/OpenNOW.AppImage"));
+    assert!(validate_linux_install_kind(InstallKind::AppImage, image).is_ok());
+    assert!(validate_linux_install_kind(InstallKind::DebianPackage, None).is_ok());
+    assert!(validate_linux_install_kind(InstallKind::AppImage, None).is_err());
+    assert!(validate_linux_install_kind(InstallKind::AppImage, Some(OsStr::new(""))).is_err());
+    assert!(validate_linux_install_kind(InstallKind::DebianPackage, image).is_err());
+    assert!(validate_linux_install_kind(InstallKind::WindowsMsi, None).is_err());
+}
+
 #[test]
 fn flatpak_detection_accepts_environment_or_sandbox_marker() {
     use std::ffi::OsStr;
@@ -736,6 +749,61 @@ fn transaction_lock_releases_ownership_with_an_inherited_descriptor_open() {
     next.try_lock_exclusive().unwrap();
     FileExt::unlock(&next).unwrap();
     drop(inherited);
+}
+
+#[test]
+fn portable_qt_runtime_roots_are_replaced_without_preserving_stale_libraries() {
+    let directory = TempDir::new().unwrap();
+    let mut plan = plan(directory.path(), InstallKind::WindowsPortable);
+    plan.data_dir = plan.target.join("profile");
+    fs::create_dir_all(&plan.data_dir).unwrap();
+    fs::write(plan.data_dir.join("settings.json"), b"user settings").unwrap();
+    let payload = directory.path().join("payload");
+    for root in ["bin", "plugins", "qml", "share", "translations"] {
+        fs::create_dir_all(plan.target.join(root)).unwrap();
+        fs::write(plan.target.join(root).join("old-runtime"), b"old").unwrap();
+        fs::create_dir_all(payload.join(root)).unwrap();
+        fs::write(payload.join(root).join("new-runtime"), b"new").unwrap();
+    }
+    let paths = preserve_portable_data(&plan, &payload).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        fs::read(payload.join("profile/settings.json")).unwrap(),
+        b"user settings"
+    );
+    for root in ["bin", "plugins", "qml", "share", "translations"] {
+        assert!(!payload.join(root).join("old-runtime").exists());
+        assert_eq!(
+            fs::read(payload.join(root).join("new-runtime")).unwrap(),
+            b"new"
+        );
+    }
+}
+
+#[test]
+fn portable_explicit_profile_inside_qt_runtime_is_preserved_and_overlap_rejected() {
+    let directory = TempDir::new().unwrap();
+    let mut plan = plan(directory.path(), InstallKind::WindowsPortable);
+    plan.data_dir = plan.target.join("plugins/profile");
+    fs::create_dir_all(&plan.data_dir).unwrap();
+    fs::write(plan.data_dir.join("settings.json"), b"user settings").unwrap();
+    let payload = directory.path().join("payload");
+    fs::create_dir_all(payload.join("plugins")).unwrap();
+    let paths = preserve_portable_data(&plan, &payload).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        fs::read(payload.join("plugins/profile/settings.json")).unwrap(),
+        b"user settings"
+    );
+    assert!(
+        preserve_portable_data(&plan, &payload)
+            .unwrap_err()
+            .contains("overlaps preserved user data")
+    );
+    assert_eq!(
+        fs::read(plan.data_dir.join("settings.json")).unwrap(),
+        b"user settings"
+    );
 }
 
 #[test]

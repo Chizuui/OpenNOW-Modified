@@ -88,15 +88,8 @@ fn deb_identity(package: &Path, target: &Path, version: &str) -> Result<Identity
                 .to_owned(),
         );
     }
-    let owner = output(
-        Command::new("/usr/bin/dpkg-query")
-            .arg("--search")
-            .arg(target),
-    )?;
-    if !owner.lines().any(|line| {
-        line.strip_prefix("opennow: ")
-            .is_some_and(|path| Path::new(path) == target)
-    }) {
+    let files = deb_file_owners(target)?;
+    if !deb_owns_file(&files, target) {
         return Err(
             "Running application is not owned by the installed OpenNOW DEB package".to_owned(),
         );
@@ -114,6 +107,31 @@ fn deb_identity(package: &Path, target: &Path, version: &str) -> Result<Identity
         version,
         architecture,
         installed_product: "opennow".to_owned(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn deb_file_owners(target: &Path) -> Result<String, String> {
+    let name = target.file_name().ok_or("Application has no file name")?;
+    let mut pattern = std::ffi::OsString::from("*");
+    pattern.push(name);
+    output(
+        Command::new("/usr/bin/dpkg-query")
+            .arg("--search")
+            .arg(pattern),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn deb_owns_file(files: &str, target: &Path) -> bool {
+    let Ok(target) = super::canonical_file(target) else {
+        return false;
+    };
+    files.lines().any(|line| {
+        line.strip_prefix("opennow: ").is_some_and(|file| {
+            Path::new(file).is_absolute()
+                && super::canonical_file(Path::new(file)).is_ok_and(|path| path == target)
+        })
     })
 }
 
@@ -437,9 +455,7 @@ pub(super) fn install(plan: &Plan, directory: &Path) -> Result<(), String> {
         return Ok(());
     }
     if code != 0 {
-        let mut message = format!(
-            "Native package manager exited with code {code}; update completion is not confirmed"
-        );
+        let mut message = installer_failure_message(plan.kind, code);
         if prepare(plan.kind, &plan.package, &plan.target, &plan.version).is_ok()
             && super::canonical_file(&plan.application_executable).is_ok()
         {
@@ -483,6 +499,22 @@ pub(super) fn install(plan: &Plan, directory: &Path) -> Result<(), String> {
     super::cleanup_completed(plan, directory)
 }
 
+fn installer_failure_message(kind: InstallKind, code: i32) -> String {
+    let reason = match (kind, code) {
+        (InstallKind::DebianPackage, 126) => {
+            "Update authorization was cancelled. Try installing the update again and approve the authorization prompt"
+        }
+        (InstallKind::DebianPackage, 127) => {
+            "Update authorization failed. Ensure a PolicyKit authentication agent is running, then try again and approve the authorization prompt"
+        }
+        (InstallKind::WindowsMsi, 1602) => {
+            "Windows Installer was cancelled. Try installing the update again and complete the installer prompts"
+        }
+        _ => "Native package manager failed",
+    };
+    format!("{reason} (exit code {code}); update completion is not confirmed")
+}
+
 pub(super) fn verify_installed(
     kind: InstallKind,
     identity: &Identity,
@@ -508,6 +540,13 @@ pub(super) fn verify_installed(
                     "The OpenNOW DEB is not configured at the expected version and architecture."
                         .to_owned(),
                 );
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let files = deb_file_owners(target)?;
+                if !deb_owns_file(&files, target) {
+                    return Err("Installed OpenNOW DEB does not own the application".to_owned());
+                }
             }
             Ok(())
         }
@@ -535,5 +574,87 @@ pub(super) fn verify_installed(
             Err("MSI updates require Windows".to_owned())
         }
         _ => Err("Not a managed package".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installer_failures_explain_authorization_and_cancellation_without_claiming_success() {
+        for (kind, code, explanation) in [
+            (
+                InstallKind::DebianPackage,
+                126,
+                "authorization was cancelled",
+            ),
+            (
+                InstallKind::DebianPackage,
+                127,
+                "PolicyKit authentication agent",
+            ),
+            (
+                InstallKind::WindowsMsi,
+                1602,
+                "Windows Installer was cancelled",
+            ),
+        ] {
+            let message = installer_failure_message(kind, code);
+            assert!(message.contains(explanation), "{message}");
+            assert!(message.contains(&format!("exit code {code}")), "{message}");
+            assert!(message.ends_with("update completion is not confirmed"));
+        }
+    }
+
+    #[test]
+    fn installer_failure_codes_are_interpreted_only_for_their_package_manager() {
+        for (kind, code) in [
+            (InstallKind::DebianPackage, 1602),
+            (InstallKind::WindowsMsi, 126),
+            (InstallKind::WindowsMsi, 127),
+            (InstallKind::DebianPackage, 1),
+            (InstallKind::WindowsMsi, 1603),
+        ] {
+            assert_eq!(
+                installer_failure_message(kind, code),
+                format!(
+                    "Native package manager failed (exit code {code}); update completion is not confirmed"
+                )
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deb_ownership_matches_canonical_directories_but_rejects_file_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("usr/bin");
+        std::fs::create_dir_all(&actual).unwrap();
+        let target = actual.join("opennow-qt");
+        std::fs::write(&target, b"application").unwrap();
+        let alias = directory.path().join("bin");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let registered = alias.join("opennow-qt");
+        let owners = format!("opennow: {}", registered.display());
+        assert!(deb_owns_file(&owners, &target));
+        let unrelated = directory.path().join("unrelated");
+        std::fs::write(&unrelated, b"other application").unwrap();
+        assert!(!deb_owns_file(&owners, &unrelated));
+        let link = actual.join("opennow-link");
+        std::os::unix::fs::symlink(&unrelated, &link).unwrap();
+        assert!(!deb_owns_file(
+            &format!("opennow: {}", link.display()),
+            &unrelated
+        ));
+        assert!(!deb_owns_file(
+            &format!("opennow: {}", unrelated.display()),
+            &link
+        ));
+        assert!(!deb_owns_file(
+            &format!("other-package: {}", target.display()),
+            &target
+        ));
+        assert!(!deb_owns_file("opennow: relative/path", &target));
     }
 }

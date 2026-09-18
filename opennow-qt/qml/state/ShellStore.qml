@@ -277,11 +277,14 @@ QtObject {
     property string diagnosticsMessage: ""
     property var updaterState: ({status: "idle", currentVersion: Qt.application.version, canCheck: false})
     property string updaterError: ""
+    property string updaterFailureMessage: ""
     property bool updaterInstallConfirmed: false
     property bool updaterExitScheduled: false
     property bool updaterReconciling: false
     property double lastAutoUpdateCheckMs: 0
     property string autoDownloadAttempt: ""
+    property int autoDownloadAttemptCount: 0
+    property double autoDownloadAttemptMs: 0
     readonly property bool updaterSessionSafe: !activeSession && !streamBusy && !sessionRecoveryPending
         && activeSessionRequestId === "" && sessionClaimRequestId === "" && streamCreateRequestId === ""
         && streamerStartRequestId === "" && streamerPrepareRequestId === "" && streamerStopRequestId === ""
@@ -1302,6 +1305,8 @@ QtObject {
         if (!ready || updaterBusy || updaterState.canCheck !== true)
             return
         updaterError = ""
+        autoDownloadAttempt = ""
+        autoDownloadAttemptCount = 0
         updaterCheckRequestId = CoreClient.request("updater.check", {
             channel: settings.updateChannel || "stable"
         }, 30000)
@@ -1328,6 +1333,9 @@ QtObject {
     }
 
     function acceptUpdaterState(state) {
+        if (["failed", "rolled-back"].indexOf(state.status) >= 0 && state.message
+                && (state.status !== updaterState.status || state.message !== updaterState.message))
+            updaterFailureMessage = state.message
         if (state.status !== updaterState.status
                 || ["error", "failed", "rolled-back", "succeeded", "managed-pending", "reboot-required"].indexOf(state.status) >= 0)
             updaterError = ""
@@ -1366,12 +1374,19 @@ QtObject {
                 + ":" + String(settings.updateChannel || "stable")
             if (release !== autoDownloadAttempt) {
                 autoDownloadAttempt = release
+                autoDownloadAttemptCount = 0
+            }
+            if (autoDownloadAttemptCount < 3 && (autoDownloadAttemptCount === 0
+                    || Date.now() - autoDownloadAttemptMs >= 60000 * Math.pow(2, autoDownloadAttemptCount - 1))) {
+                autoDownloadAttemptCount += 1
+                autoDownloadAttemptMs = Date.now()
                 downloadUpdate()
                 return
             }
         }
         if (settings.autoCheckForUpdates === true && updaterState.canCheck === true
-                && (lastAutoUpdateCheckMs === 0 || Date.now() - lastAutoUpdateCheckMs >= 21600000)) {
+                && (lastAutoUpdateCheckMs === 0 || Date.now() - lastAutoUpdateCheckMs
+                    >= (updaterState.status === "error" ? 300000 : 21600000))) {
             lastAutoUpdateCheckMs = Date.now()
             checkForUpdates()
         }
@@ -3668,6 +3683,7 @@ QtObject {
                 root.reconcileUpdaterFailure(message)
             } else if (requestId === root.updaterInstallRequestId) {
                 root.updaterInstallRequestId = ""
+                root.updaterFailureMessage = message
                 root.reconcileUpdaterFailure(message)
             } else if (requestId === root.socialCapabilitiesRequestId) {
                 root.socialCapabilitiesRequestId = ""
