@@ -60,18 +60,20 @@ FocusScope {
     }
 
     GlassPanel {
-        x: root.width * 0.65; y: 180; width: root.width * 0.27; height: 510; panelRadius: 36; strong: true
+        x: root.width * 0.65; y: 180; width: root.width * 0.27; height: accountActions.implicitHeight + 56; panelRadius: 36; strong: true
         Column {
+            id: accountActions
             anchors.fill: parent; anchors.margins: 28; spacing: 13
             Text { text: root.selectedAccount ? root.selectedAccount.displayName : qsTr("Add a profile"); color: Theme.label; font.family: Theme.displayFont; font.pixelSize: 28; font.weight: Font.Black }
             Text { width: parent.width; wrapMode: Text.WordWrap; text: root.selectedAccount && root.selectedAccount.hasPin ? qsTr("A four-digit living-room PIN is required before this account can become active.") : qsTr("Profile PINs are local to this device and never sent to NVIDIA."); color: Theme.textMuted; font.family: Theme.bodyFont; font.pixelSize: 15; lineHeight: 1.2 }
             GlassButton {
                 id: switchButton; width: parent.width; glyph: "A"; primary: true
                 text: !root.selectedAccount ? qsTr("Add NVIDIA account") : (root.selectedAccount.userId === root.activeUserId ? qsTr("Currently active") : qsTr("Switch profile"))
-                enabled: !root.selectedAccount || root.selectedAccount.userId !== root.activeUserId
+                enabled: ShellStore.ready && ShellStore.accountSwitchRequestId === ""
+                    && (!root.selectedAccount || root.selectedAccount.userId !== root.activeUserId)
                 onClicked: {
                     if (!root.selectedAccount)
-                        AppController.navigate("sign-in")
+                        ShellStore.beginAddAccount()
                     else if (root.selectedAccount.hasPin)
                         ShellStore.openPin("unlock", root.selectedAccount)
                     else
@@ -87,7 +89,7 @@ FocusScope {
             }
             GlassButton {
                 width: parent.width; glyph: "+"; text: qsTr("Add another account")
-                onClicked: AppController.navigate("sign-in")
+                onClicked: ShellStore.beginAddAccount()
             }
             GlassButton {
                 width: parent.width; glyph: "×"; text: qsTr("Forget this profile")
@@ -100,6 +102,18 @@ FocusScope {
                 onClicked: root.confirmLogoutAll = true
             }
             GlassButton { width: parent.width; glyph: "B"; text: qsTr("Back to account settings"); onClicked: AppController.navigate("settings-account") }
+            Text {
+                objectName: "accountActionError"
+                width: parent.width
+                visible: text !== ""
+                text: ShellStore.accountMessage
+                color: Theme.coral
+                font.family: Theme.bodyFont
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.AlertMessage
+                Accessible.name: text
+            }
         }
     }
 

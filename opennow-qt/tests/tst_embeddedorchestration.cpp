@@ -31,6 +31,60 @@ bool prepareLaunchGuards(QJSEngine &engine)
     }
     return true;
 }
+
+bool loadShellFunction(QJSEngine &engine, const QString &name, int indentation = 4)
+{
+    const auto prefix = QString(indentation, u' ');
+    const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+    const auto match = QRegularExpression(prefix + QStringLiteral("function %1\\([^\\n]*\\) \\{\\n.*?\\n").arg(name)
+        + prefix + u'}', QRegularExpression::DotMatchesEverythingOption)
+        .match(indentation == 8 ? shell.section(QStringLiteral("property Connections coreConnections:"), 1) : shell);
+    if (!match.hasMatch()) return false;
+    const auto result = engine.evaluate(match.captured());
+    if (result.isError()) qWarning().noquote() << result.toString();
+    return !result.isError();
+}
+
+bool prepareAuthentication(QJSEngine &engine)
+{
+    const auto setup = engine.evaluate(QStringLiteral(R"JS(
+        var root = this, ready = true, providersRequestId = '', providerRetryAttempts = 0;
+        var providers = [{idpId:'alliance',displayName:'Alliance'}], selectedProviderIdpId = 'alliance';
+        var providerDiscoveryDegraded = false, authGeneration = 0, authSessionRequestId = '';
+        var authSession = {user:{userId:'old',displayName:'Old'},provider:{idpId:'alliance'}};
+        Object.defineProperty(root, 'signedIn', {get: function() { return authSession !== null; }});
+        var addingAccount = false, authState = 'signed-in', authMessage = '', accountMessage = '';
+        var accountSwitchRequestId = '', accountRemoveRequestId = '', logoutAllRequestId = '';
+        var deviceStartRequestId = '', devicePollRequestId = '', deviceCompleteRequestId = '';
+        var pendingStaySignedIn = true, authChallenge = null, sessionPersistence = 'secure-store';
+        var sessionPersistenceMessage = '', pinMessage = '', lastError = '', requests = [], cancelled = [];
+        var providerRetryTimer = {running:false,interval:31000,restarts:0,
+            restart:function() {this.running=true;this.restarts++;},stop:function() {this.running=false;}};
+        var devicePollTimer = {running:false,interval:1000,
+            restart:function() {this.running=true;},stop:function() {this.running=false;}};
+        var CoreClient = {request:function(method,params) {
+            requests.push({method:method,params:params});return 'request-' + requests.length;
+        },cancel:function(id) {cancelled.push(id);}};
+        var AppController = {route:'accounts',navigate:function(route) {this.route=route;}};
+        var settingsOwner = {acceptResponse:function() {return false;},acceptFailure:function() {return false;}};
+        var onboardingOwner = {acceptResponse:function() {return false;},acceptFailure:function() {return false;}};
+        function ownedSessionTermination() {return null;}
+        function finishArtworkRequest() {return false;}
+        function acceptAuthEnvelope() {return true;}
+        function reloadCatalogForSession() {}
+        function refreshAccountServices() {}
+        function resolveDirectLaunch() {}
+        function qsTr(text) {return text;}
+        String.prototype.arg = function(value) {return this.replace(/%[12]/,String(value));};
+    )JS"));
+    if (setup.isError()) return false;
+    for (const auto &name : {"refreshProviders", "scheduleProviderRetry", "beginAddAccount",
+             "startDeviceLogin", "cancelDeviceLogin", "switchAccount"}) {
+        if (!loadShellFunction(engine, QString::fromLatin1(name))) return false;
+    }
+    return loadShellFunction(engine, QStringLiteral("onResponseReceived"), 8)
+        && loadShellFunction(engine, QStringLiteral("onRequestFailed"), 8);
+}
 }
 
 class EmbeddedOrchestrationTest final : public QObject
@@ -38,6 +92,208 @@ class EmbeddedOrchestrationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void providerRpcFailureOffersBoundedAndManualRecovery()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            providers = [];
+            refreshProviders();
+            onRequestFailed(providersRequestId,'deadline_exceeded','Provider lookup timed out');
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("providerDiscoveryDegraded && providerRetryTimer.running && providersRequestId === ''")).toBool());
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+                providerRetryTimer.running = false;
+                providerRetryAttempts++;
+                refreshProviders();
+                onRequestFailed(providersRequestId,'network_error','Offline');
+            )JS")).isError());
+            QCOMPARE(engine.evaluate(QStringLiteral("providerRetryTimer.running")).toBool(), attempt < 3);
+        }
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 4);
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            refreshProviders(true);
+            var manualRequest = providersRequestId;
+            refreshProviders(true);
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 5);
+        QCOMPARE(engine.evaluate(QStringLiteral("providerRetryAttempts")).toInt(), 0);
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            onResponseReceived(manualRequest,{providers:[{idpId:'alliance'}],discovery:{state:'ready'}});
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("!providerDiscoveryDegraded && !providerRetryTimer.running")).toBool());
+        const auto desktop = source(QStringLiteral("qml/desktop/auth/DesktopSignInScreen.qml"));
+        const auto console = source(QStringLiteral("qml/screens/SignInScreen.qml"));
+        QVERIFY(desktop.contains(QStringLiteral("onClicked: ShellStore.refreshProviders(true)")));
+        QVERIFY(console.contains(QStringLiteral("onClicked: ShellStore.refreshProviders(true)")));
+    }
+
+    void failedDeviceLoginClearsTheChallengeAndCanRestart_data()
+    {
+        QTest::addColumn<QString>("phase");
+        for (const auto &phase : {"expired", "denied", "start-rpc", "poll-rpc", "complete-rpc"})
+            QTest::newRow(phase) << QString::fromLatin1(phase);
+    }
+
+    void failedDeviceLoginClearsTheChallengeAndCanRestart()
+    {
+        QFETCH(QString, phase);
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            authSession = null;
+            authChallenge = {attemptId:'expired-attempt',verificationUriComplete:'https://example.invalid/expired'};
+            authState = 'waiting';
+            devicePollTimer.running = true;
+        )JS")).isError());
+        QString failure;
+        if (phase.endsWith(QStringLiteral("-rpc"))) {
+            const auto field = phase == QStringLiteral("start-rpc") ? QStringLiteral("deviceStartRequestId")
+                : phase == QStringLiteral("poll-rpc") ? QStringLiteral("devicePollRequestId") : QStringLiteral("deviceCompleteRequestId");
+            failure = QStringLiteral("%1='failed'; onRequestFailed('failed','network_error','Login unavailable');").arg(field);
+        } else {
+            failure = QStringLiteral("devicePollRequestId='failed'; onResponseReceived('failed',{status:'%1',error:'Login unavailable'});").arg(phase);
+        }
+        const auto result = engine.evaluate(failure);
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QVERIFY(engine.evaluate(QStringLiteral("authChallenge === null && authState === 'error' && !devicePollTimer.running")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("startDeviceLogin('alliance',false)")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[requests.length-1].method")).toString(), QStringLiteral("auth.device.start"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authState")).toString(), QStringLiteral("starting"));
+        QVERIFY(!engine.evaluate(QStringLiteral("pendingStaySignedIn")).toBool());
+    }
+
+    void addingAnAccountFinishesWithoutSignedInChanging()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral("beginAddAccount()")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("addingAccount && signedIn && authSession.user.userId === 'old' && AppController.route === 'sign-in'")).toBool());
+        const auto console = source(QStringLiteral("qml/screens/SignInScreen.qml"));
+        const auto connected = QRegularExpression(QStringLiteral("readonly property bool connected: ([^\\n]+)")).match(console);
+        QVERIFY(connected.hasMatch());
+        engine.globalObject().setProperty(QStringLiteral("ShellStore"), engine.globalObject());
+        QVERIFY(!engine.evaluate(connected.captured(1)).toBool());
+        const auto completion = engine.evaluate(QStringLiteral(R"JS(
+            deviceCompleteRequestId='complete';
+            onResponseReceived('complete',{session:{user:{userId:'new',displayName:'New'},provider:{idpId:'alliance'}},persistence:'secure-store'});
+        )JS"));
+        QVERIFY2(!completion.isError(), qPrintable(completion.toString()));
+        QVERIFY(engine.evaluate(QStringLiteral("signedIn && !addingAccount && authSession.user.userId === 'new'")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("AppController.route")).toString(), QStringLiteral("home"));
+        QVERIFY(source(QStringLiteral("qml/screens/AccountsScreen.qml")).contains(QStringLiteral("onClicked: ShellStore.beginAddAccount()")));
+    }
+
+    void cancellingAnAddedAccountReturnsToIdleInsteadOfWaiting()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            beginAddAccount();
+            authChallenge = {attemptId:'add-attempt',verificationUriComplete:'https://example.invalid/add'};
+            authState = 'waiting';
+            authMessage = 'Scan the QR code';
+            devicePollTimer.running = true;
+            cancelDeviceLogin();
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("authChallenge === null && authState === 'idle' && authMessage === ''")).toBool());
+        QVERIFY(engine.evaluate(QStringLiteral("addingAccount && signedIn && authSession.user.userId === 'old'")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("devicePollTimer.running")).toBool());
+        const auto desktop = source(QStringLiteral("qml/desktop/auth/DesktopSignInScreen.qml"));
+        const auto waiting = QRegularExpression(QStringLiteral("readonly property bool waiting: ([^\\n]+)")).match(desktop);
+        QVERIFY(waiting.hasMatch());
+        engine.globalObject().setProperty(QStringLiteral("ShellStore"), engine.globalObject());
+        QVERIFY(!engine.evaluate(waiting.captured(1)).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("startDeviceLogin('alliance',false)")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[requests.length-1].method")).toString(), QStringLiteral("auth.device.start"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authState")).toString(), QStringLiteral("starting"));
+    }
+
+    void accountSwitchFailureIsVisibleAndClearedOnRetry()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        const auto failure = engine.evaluate(QStringLiteral(R"JS(
+            switchAccount('new','');
+            onRequestFailed(accountSwitchRequestId,'network_error','Cannot reach your provider');
+        )JS"));
+        QVERIFY2(!failure.isError(), qPrintable(failure.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("accountMessage")).toString(), QStringLiteral("Cannot reach your provider"));
+        QCOMPARE(engine.evaluate(QStringLiteral("pinMessage")).toString(), QStringLiteral("Cannot reach your provider"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authSession.user.userId")).toString(), QStringLiteral("old"));
+        QVERIFY(!engine.evaluate(QStringLiteral("switchAccount('new','')")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("accountMessage")).toString(), QString());
+        const auto accounts = source(QStringLiteral("qml/screens/AccountsScreen.qml"));
+        QVERIFY(accounts.contains(QStringLiteral("objectName: \"accountActionError\"")));
+        QVERIFY(accounts.contains(QStringLiteral("text: ShellStore.accountMessage")));
+    }
+
+    void exhaustedTransportNegotiationDoesNotReclaimTheSeat_data()
+    {
+        QTest::addColumn<QString>("code");
+        QTest::addColumn<bool>("terminal");
+        QTest::addColumn<bool>("recoveryPending");
+        QTest::newRow("missing-video-peer") << QStringLiteral("missing-video-peer") << true << false;
+        QTest::newRow("legacy-unsupported") << QStringLiteral("nvst-legacy-transport-unsupported") << true << false;
+        QTest::newRow("missing-video-peer-during-recovery") << QStringLiteral("missing-video-peer") << true << true;
+        QTest::newRow("legacy-unsupported-during-recovery") << QStringLiteral("nvst-legacy-transport-unsupported") << true << true;
+        QTest::newRow("transient-network") << QStringLiteral("network_error") << false << false;
+        QTest::newRow("unknown-error") << QStringLiteral("new_native_error") << false << false;
+    }
+
+    void exhaustedTransportNegotiationDoesNotReclaimTheSeat()
+    {
+        QFETCH(QString, code);
+        QFETCH(bool, terminal);
+        QFETCH(bool, recoveryPending);
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root=this, activeSession={sessionId:'seat'},streamer={status:'starting'},runtimeStreamProfile={};
+            var streamInputStateKnown=true,streamReplayEnabled=false,mediaClipTargetRequestId='',streamClipRequestId='';
+            var streamRecordingActive=false,streamerStopExpected=false,sessionRecoveryPending=false;
+            var streamState='starting',streamMessage='',sessionReconnectAttempts=0,maximumSessionReconnectAttempts=8;
+            var streamStopRequestId='',streamerRecoveryExhausted=false,lastError='',streamerRestartAttempts=0;
+            var recoveryDiscoveryRequestId='',sessionClaimRequestId='',streamerStopRequestId='',recoverySessionId='';
+            var sessionClaimIsRecovery=false,resumePollAttempts=0,resumePollDeadlineMs=0,ready=true;
+            var NativeStreamRuntime={running:false},requests=[];
+            var CoreClient={cancel:function() {},request:function(method,params) {requests.push({method:method,params:params});return 'recovery';}};
+            var streamerRestartTimer={running:false,restart:function() {this.running=true;},stop:function() {this.running=false;}};
+            var streamPollTimer={stop:function() {}},streamerPrepareRequestId='',streamPollRequestId='';
+            function inspectStreamerOverlayRequest() {} function inspectStreamerScreenshotRequest() {}
+            function inspectStreamerRecordingRequest() {} function inspectStreamerShortcutAction() {}
+            function qsTr(text) {return text;}
+        )JS")).isError());
+        for (const auto &name : {"acceptStreamerSnapshot", "isRemoteSessionTermination", "cancelSessionRecovery",
+                 "scheduleSessionRecovery", "retryNativeStreamer", "recoverStreamingSession", "discoverRecoverySession"})
+            QVERIFY(loadShellFunction(engine, QString::fromLatin1(name)));
+        engine.globalObject().setProperty(QStringLiteral("failureCode"), code);
+        if (recoveryPending) {
+            QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+                sessionRecoveryPending=true; recoveryDiscoveryRequestId='old-discovery';
+                sessionClaimRequestId='old-claim'; streamerRestartTimer.running=true;
+            )JS")).isError());
+        }
+        const auto result = engine.evaluate(QStringLiteral(R"JS(
+            acceptStreamerSnapshot({status:'error',errorCode:failureCode,message:'Original transport failure'});
+            acceptStreamerSnapshot({status:'stopped',message:'Later stopped event'});
+        )JS"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerRecoveryExhausted")).toBool(), terminal);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerRestartTimer.running")).toBool(), !terminal);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), terminal ? QStringLiteral("error") : QStringLiteral("reconnecting"));
+        QCOMPARE(engine.evaluate(QStringLiteral("streamMessage")).toString(), QStringLiteral("Original transport failure"));
+        QCOMPARE(engine.evaluate(QStringLiteral("activeSession.sessionId")).toString(), QStringLiteral("seat"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 0);
+        if (terminal) {
+            QVERIFY(engine.evaluate(QStringLiteral("!sessionRecoveryPending && recoveryDiscoveryRequestId === '' && sessionClaimRequestId === ''")).toBool());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral("retryNativeStreamer()")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("streamerRecoveryExhausted")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("session.poll"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].params.sessionId")).toString(), QStringLiteral("seat"));
+    }
+
     void allianceAccountInvalidationRejectsOldRegionsAndKeepsProviderPreferences()
     {
         const auto account = source(QStringLiteral("qml/state/account/AccountServicesState.qml"));

@@ -84,6 +84,38 @@ start new closes it only after you choose that action. Repeat with the session i
 different region and while the network is unavailable. A failed lookup must offer a
 retry rather than create another session. Verify windowed and fullscreen presentation.
 
+## Alliance login and stream negotiation
+
+Run the native negotiation and Qt orchestration checks before testing an affected provider:
+
+```sh
+cargo test --manifest-path native/opennow-streamer/Cargo.toml -p opennow-streamer-core nvst_rtsp
+ctest --test-dir build/opennow-qt --output-on-failure -R 'embedded-orchestration|alliance|auth|stream-recovery'
+```
+
+Verify provider-list timeout recovery, a fresh login after an expired device challenge,
+and adding another provider account while already signed in. A failed profile switch must
+leave the original account active and show an error on the account page. Test both desktop
+and console modes; synthetic account fixtures do not prove a provider accepts login.
+
+Video SETUP tries a bounded set of control-URI and Transport forms within one request
+budget. A successful response must still supply a usable server-authored video endpoint.
+After all forms fail to supply one, `missing-video-peer` is a terminal negotiation error,
+not a reason to repeatedly reclaim the same seat. Unsupported legacy transport is also
+terminal. Transient network failures retain the existing bounded session recovery.
+
+For a partner that still cannot start, reproduce once and export diagnostics. Keep the
+`video-setup` and `video-setup-transport` lines. They describe response status, field
+presence, source/port shape, quoting and key spacing without logging raw addresses,
+credentials or Transport values. Do not add unredacted headers or SDP to bug reports.
+The field-shape diagnostics distinguish a parser incompatibility from missing server
+metadata; a SETUP `200` alone does not prove that an endpoint was negotiated.
+
+Confirm login, catalog load, launch through the first video frame, stop, and reconnect
+with the affected provider before claiming its compatibility issue is fixed. Repeat
+with an NVIDIA account to check the unchanged first SETUP request. Passing synthetic
+fallback and parser tests is not a substitute for this live check.
+
 ## Required live matrix
 
 | Platform | Architecture | Window system | Required package |

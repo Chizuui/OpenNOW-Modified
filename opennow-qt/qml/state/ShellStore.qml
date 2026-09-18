@@ -174,14 +174,35 @@ QtObject {
         }
     }
 
-    function refreshProviders() {
-        if (ready && providersRequestId === "")
-            providersRequestId = CoreClient.request("auth.providers.list", {}, 10000)
+    function refreshProviders(manual) {
+        if (!ready || providersRequestId !== "") return
+        if (manual === true) {
+            providerRetryAttempts = 0
+            providerRetryTimer.stop()
+        }
+        providersRequestId = CoreClient.request("auth.providers.list", {}, 10000)
+        if (providersRequestId === "") scheduleProviderRetry(0)
+    }
+
+    function scheduleProviderRetry(retryAfterMs) {
+        providerDiscoveryDegraded = true
+        if (ready && providerRetryAttempts < 3) {
+            providerRetryTimer.interval = Math.max(31000, Number(retryAfterMs || 0) + 1000)
+            providerRetryTimer.restart()
+        }
     }
     property var authSession: null
     property var authChallenge: null
     property string authState: "idle"
     property string authMessage: ""
+    property bool addingAccount: false
+    property string accountMessage: ""
+    property Connections accountNavigation: Connections {
+        target: AppController
+        function onRouteChanged() {
+            if (AppController.route !== "sign-in") root.addingAccount = false
+        }
+    }
     property alias catalogGames: catalogOwner.catalogGames
     readonly property var gameCollections: catalogOwner.gameCollections
     property alias activeCollectionId: catalogOwner.activeCollectionId
@@ -1429,16 +1450,20 @@ QtObject {
 
     function switchAccount(userId, pin) {
         cancelDeviceLogin()
-        if (ready && accountSwitchRequestId === "")
+        if (ready && accountSwitchRequestId === "") {
+            accountMessage = ""
             accountSwitchRequestId = CoreClient.request("auth.accounts.switch", {
                 userId: userId,
                 pin: pin || ""
             }, 30000)
+        }
     }
 
     function removeAccount(userId) {
-        if (ready && accountRemoveRequestId === "")
+        if (ready && accountRemoveRequestId === "") {
+            accountMessage = ""
             accountRemoveRequestId = CoreClient.request("auth.accounts.remove", { userId: userId })
+        }
     }
 
     function openPin(mode, account) {
@@ -2068,6 +2093,14 @@ QtObject {
             ? qsTr("Native media startup failed") : qsTr("The native media runtime stopped unexpectedly"))
         if (!activeSession)
             return
+        if (streamer.errorCode === "missing-video-peer"
+                || streamer.errorCode === "nvst-legacy-transport-unsupported") {
+            cancelSessionRecovery()
+            streamerRecoveryExhausted = true
+            streamState = "error"
+            lastError = streamMessage
+            return
+        }
         if (sessionRecoveryPending || streamerRestartTimer.running)
             return
         scheduleSessionRecovery(streamMessage)
@@ -2592,6 +2625,14 @@ QtObject {
         }, 35000)
     }
 
+    function beginAddAccount() {
+        cancelDeviceLogin()
+        addingAccount = true
+        authState = "idle"
+        authMessage = ""
+        AppController.navigate("sign-in")
+    }
+
     function startDeviceLogin(providerIdpId, staySignedIn) {
         if (!ready || deviceStartRequestId !== "")
             return
@@ -2604,7 +2645,7 @@ QtObject {
         pendingStaySignedIn = staySignedIn !== false
         cancelDeviceLogin()
         lastError = qsTr("")
-        authMessage = qsTr("Contacting NVIDIA…")
+        authMessage = qsTr("Contacting provider…")
         authState = "starting"
         const params = providerIdpId ? { providerIdpId: providerIdpId } : {}
         deviceStartRequestId = CoreClient.request("auth.device.start", params, 30000)
@@ -2637,8 +2678,10 @@ QtObject {
         if (authChallenge && ready)
             CoreClient.request("auth.device.cancel", { attemptId: authChallenge.attemptId })
         authChallenge = null
-        if (!signedIn)
+        if (!signedIn || addingAccount) {
             authState = "idle"
+            authMessage = ""
+        }
     }
 
     function logout() {
@@ -2649,8 +2692,10 @@ QtObject {
 
     function logoutAll() {
         cancelDeviceLogin()
-        if (ready && logoutAllRequestId === "")
+        if (ready && logoutAllRequestId === "") {
+            accountMessage = ""
             logoutAllRequestId = CoreClient.request("auth.accounts.logoutAll", {})
+        }
     }
 
     function acceptAuthEnvelope(payload) {
@@ -3217,10 +3262,8 @@ QtObject {
                 if (Number(result.generation || 0) > root.authGeneration && root.authSessionRequestId === "")
                     root.authSessionRequestId = CoreClient.request("auth.session.get", {})
                 root.providerDiscoveryDegraded = Boolean(result.discovery && result.discovery.state === "degraded")
-                if (root.providerDiscoveryDegraded && root.providerRetryAttempts < 3) {
-                    root.providerRetryTimer.interval = Math.max(31000, Number(result.discovery.retryAfterMs || 0) + 1000)
-                    root.providerRetryTimer.restart()
-                }
+                if (root.providerDiscoveryDegraded)
+                    root.scheduleProviderRetry(result.discovery.retryAfterMs)
                 else if (!root.providerDiscoveryDegraded) {
                     root.providerRetryAttempts = 0
                     root.providerRetryTimer.stop()
@@ -3275,7 +3318,7 @@ QtObject {
                     root.devicePollTimer.interval = Math.max(1000, Number(result.retryAfterMs || Number(result.intervalSeconds || 5) * 1000))
                     root.devicePollTimer.restart()
                 } else {
-                    root.devicePollTimer.stop()
+                    root.cancelDeviceLogin()
                     root.authState = "error"
                     root.authMessage = result.error || qsTr("Device sign-in failed")
                 }
@@ -3296,6 +3339,10 @@ QtObject {
                     root.reloadCatalogForSession()
                 if (root.authSession)
                     root.refreshAccountServices()
+                if (root.authSession) {
+                    root.addingAccount = false
+                    if (AppController.route === "sign-in") AppController.navigate("home")
+                }
                 root.resolveDirectLaunch()
             } else if (requestId === root.logoutRequestId) {
                 root.authSession = result.session || null
@@ -3594,6 +3641,7 @@ QtObject {
                 catalogOwner.failStore(message)
             } else if (requestId === root.providersRequestId) {
                 root.providersRequestId = ""
+                if (code !== "cancelled") root.scheduleProviderRetry(0)
             } else if (requestId === root.authSessionRequestId) {
                 root.authSessionRequestId = ""
                 root.authRestorePending = false
@@ -3603,18 +3651,19 @@ QtObject {
             } else if (requestId === root.deviceStartRequestId
                        || requestId === root.devicePollRequestId
                        || requestId === root.deviceCompleteRequestId) {
-                root.devicePollTimer.stop()
-                root.authState = code === "cancelled" ? "idle" : "error"
-                root.authMessage = code === "cancelled" ? "" : message
                 root.deviceStartRequestId = ""
                 root.devicePollRequestId = ""
                 root.deviceCompleteRequestId = ""
+                root.cancelDeviceLogin()
+                root.authState = code === "cancelled" ? "idle" : "error"
+                root.authMessage = code === "cancelled" ? "" : message
             } else if (requestId === root.logoutRequestId) {
                 root.logoutRequestId = ""
                 root.authMessage = message
             } else if (requestId === root.logoutAllRequestId) {
                 root.logoutAllRequestId = ""
                 root.authMessage = message
+                root.accountMessage = message
             } else if (requestId === root.subscriptionRequestId) {
                 accountServicesOwner.failSubscription(message)
             } else if (requestId === root.regionsRequestId) {
@@ -3626,8 +3675,10 @@ QtObject {
             } else if (requestId === root.accountSwitchRequestId) {
                 root.accountSwitchRequestId = ""
                 root.pinMessage = message
+                root.accountMessage = message
             } else if (requestId === root.accountRemoveRequestId) {
                 root.accountRemoveRequestId = ""
+                root.accountMessage = message
             } else if (requestId === root.pinRequestId) {
                 root.pinRequestId = ""
                 root.pinMessage = message
