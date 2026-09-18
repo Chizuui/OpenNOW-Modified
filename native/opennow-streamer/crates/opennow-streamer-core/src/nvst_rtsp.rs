@@ -16,10 +16,10 @@ use tungstenite::http::{HeaderValue, Uri};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
-#[path = "nvst_rtsp_transport_diagnostics.rs"]
-mod transport_diagnostics;
 #[path = "nvst_rtsp_color.rs"]
 mod color;
+#[path = "nvst_rtsp_transport_diagnostics.rs"]
+mod transport_diagnostics;
 use color::NvstColorNegotiation;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -205,28 +205,7 @@ impl RtspClient {
     }
 
     fn connect(endpoint: &str, session_id: &str) -> Result<(Self, String), NvstRtspError> {
-        let translated = endpoint
-            .replacen("rtsps://", "https://", 1)
-            .replacen("rtsp://", "http://", 1);
-        let parsed = translated
-            .parse::<Uri>()
-            .map_err(|_| NvstRtspError::new("invalid-rtsps-endpoint", "Invalid RTSPS endpoint"))?;
-        let host = parsed.host().ok_or_else(|| {
-            NvstRtspError::new("invalid-rtsps-endpoint", "RTSPS endpoint has no host")
-        })?;
-        if !trusted_nvst_host(host) {
-            return Err(NvstRtspError::new(
-                "untrusted-rtsps-endpoint",
-                "Refusing an untrusted RTSPS endpoint",
-            ));
-        }
-        let port = parsed.port_u16().unwrap_or(322);
-        let authority_host = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        };
-        let wss = format!("wss://{authority_host}:{port}/rtsp");
+        let (wss, target) = rtsp_endpoint_urls(endpoint)?;
         let mut request = wss
             .into_client_request()
             .map_err(|error| NvstRtspError::new("nvst-connect-failed", error.to_string()))?;
@@ -251,7 +230,7 @@ impl RtspClient {
                 cseq: 0,
                 buffer: String::new(),
             },
-            format!("rtsps://{host}:{port}"),
+            target,
         ))
     }
 
@@ -1346,16 +1325,54 @@ fn take_rtsp_response(
     }))
 }
 
+fn rtsp_endpoint_urls(endpoint: &str) -> Result<(String, String), NvstRtspError> {
+    let translated = endpoint
+        .replacen("rtsps://", "https://", 1)
+        .replacen("rtsp://", "http://", 1);
+    let parsed = translated
+        .parse::<Uri>()
+        .map_err(|_| NvstRtspError::new("invalid-rtsps-endpoint", "Invalid RTSPS endpoint"))?;
+    let host = parsed.host().ok_or_else(|| {
+        NvstRtspError::new("invalid-rtsps-endpoint", "RTSPS endpoint has no host")
+    })?;
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .filter(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host);
+    if !trusted_nvst_host(address_host) {
+        return Err(NvstRtspError::new(
+            "untrusted-rtsps-endpoint",
+            "Refusing an untrusted RTSPS endpoint",
+        ));
+    }
+    let port = parsed.port_u16().unwrap_or(322);
+    Ok((
+        format!("wss://{host}:{port}/rtsp"),
+        format!("rtsps://{host}:{port}"),
+    ))
+}
+
 fn trusted_nvst_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if host == "nvidiagrid.net" || host.ends_with(".nvidiagrid.net") {
         return true;
     }
+    let trusted_ipv4 = |ip: std::net::Ipv4Addr| {
+        !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+    };
     host.parse::<IpAddr>().is_ok_and(|ip| match ip {
-        IpAddr::V4(ip) => {
-            !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unicast_link_local() && !ip.is_unspecified(),
+        IpAddr::V4(ip) => trusted_ipv4(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+            || {
+                !ip.is_loopback()
+                    && !ip.is_unicast_link_local()
+                    && !ip.is_unspecified()
+                    && !ip.is_unique_local()
+                    && !ip.is_multicast()
+            },
+            trusted_ipv4,
+        ),
     })
 }
 
@@ -2135,6 +2152,80 @@ mod tests {
         assert!(!trusted_nvst_host("localhost"));
         assert!(!trusted_nvst_host("127.0.0.1"));
         assert!(!trusted_nvst_host("10.0.0.8"));
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_one_ipv6_bracket_pair_and_the_selected_port() {
+        for (endpoint, port) in [
+            ("rtsps://[2001:4860:4860::8888]:48322/session", 48322),
+            ("rtsps://[2001:4860:4860::8888]/session", 322),
+            ("rtsp://[2001:4860:4860::8888]:48322/session", 48322),
+        ] {
+            let (wss, target) = rtsp_endpoint_urls(endpoint).unwrap();
+            let authority = format!("[2001:4860:4860::8888]:{port}");
+            assert_eq!(wss, format!("wss://{authority}/rtsp"));
+            assert_eq!(target, format!("rtsps://{authority}"));
+            let request = wss.into_client_request().unwrap();
+            assert_eq!(request.headers()["host"], authority);
+            assert_eq!(request.uri().host(), Some("[2001:4860:4860::8888]"));
+            assert_eq!(request.uri().port_u16(), Some(port));
+            let target = target.parse::<Uri>().unwrap();
+            assert_eq!(target.authority().unwrap().as_str(), authority);
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_dns_and_ipv4_behavior() {
+        for (endpoint, authority) in [
+            (
+                "rtsps://seat.nvidiagrid.net/session",
+                "seat.nvidiagrid.net:322",
+            ),
+            ("rtsps://8.8.8.8:48322/session", "8.8.8.8:48322"),
+        ] {
+            assert_eq!(
+                rtsp_endpoint_urls(endpoint).unwrap(),
+                (
+                    format!("wss://{authority}/rtsp"),
+                    format!("rtsps://{authority}"),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_host_policy_for_ipv6_and_bracketed_non_ipv6() {
+        for endpoint in [
+            "rtsps://[::1]:322",
+            "rtsps://[::]:322",
+            "rtsps://[fe80::1]:322",
+            "rtsps://[fc00::1]:322",
+            "rtsps://[fd00::1]:322",
+            "rtsps://[ff02::1]:322",
+            "rtsps://[::ffff:127.0.0.1]:322",
+            "rtsps://[::ffff:10.0.0.1]:322",
+            "rtsps://[::ffff:169.254.1.1]:322",
+            "rtsps://[::ffff:0.0.0.0]:322",
+            "rtsps://[seat.nvidiagrid.net]:322",
+            "rtsps://[8.8.8.8]:322",
+            "rtsps://[[2001:4860:4860::8888]]:322",
+            "rtsps://partner.example:322",
+            "rtsps://127.0.0.1:322",
+            "rtsps://10.0.0.8:322",
+        ] {
+            assert!(rtsp_endpoint_urls(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_accept_ipv4_mapped_public_addresses() {
+        assert_eq!(
+            rtsp_endpoint_urls("rtsps://[::ffff:8.8.8.8]:48322/session").unwrap(),
+            (
+                "wss://[::ffff:8.8.8.8]:48322/rtsp".to_owned(),
+                "rtsps://[::ffff:8.8.8.8]:48322".to_owned(),
+            )
+        );
     }
 
     #[test]
