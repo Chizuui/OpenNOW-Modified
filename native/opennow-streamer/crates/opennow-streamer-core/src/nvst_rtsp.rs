@@ -23,6 +23,12 @@ mod transport_diagnostics;
 use color::NvstColorNegotiation;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// A rig whose video streamer is still starting answers SETUP with 200 but no
+// Transport peer yet. Re-sweep on a bounded pace then instead of failing in
+// under a second; pure rejections still fail immediately. Worst case adds 9s
+// inside the shared 20s budget above.
+const SETUP_PEER_RETRY_ROUNDS: u32 = 3;
+const SETUP_PEER_RETRY_DELAY: Duration = Duration::from_secs(3);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const CONTROL_PING_EXPIRY: Duration = Duration::from_secs(5);
@@ -114,11 +120,77 @@ impl RtspClient {
         headers: &[(&str, String)],
         client_port: u16,
     ) -> Result<VideoSetup, NvstRtspError> {
+        self.setup_video_with_retry(
+            control,
+            target,
+            headers,
+            client_port,
+            SETUP_PEER_RETRY_ROUNDS,
+            SETUP_PEER_RETRY_DELAY,
+        )
+    }
+
+    fn setup_video_with_retry(
+        &mut self,
+        control: &str,
+        target: &str,
+        headers: &[(&str, String)],
+        client_port: u16,
+        max_peer_retries: u32,
+        peer_retry_delay: Duration,
+    ) -> Result<VideoSetup, NvstRtspError> {
+        // A rig whose video streamer is still starting answers SETUP with 200
+        // but no Transport peer yet. Re-sweep on a bounded pace then: the
+        // official client negotiates through progress callbacks instead of
+        // one fast burst. Pure rejections (400/404/459+) mean the forms are
+        // wrong for this server, so those still fail immediately.
         let candidates = video_setup_candidates(control, target);
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         let mut headers = headers.to_vec();
         headers.push(("Transport", String::new()));
         let transport_index = headers.len() - 1;
+        let mut round = 0u32;
+        loop {
+            match self.setup_video_sweep(
+                &candidates,
+                &mut headers,
+                transport_index,
+                client_port,
+                &deadline,
+            ) {
+                Ok(setup) => return Ok(setup),
+                Err(error) if error.code != "missing-video-peer" => return Err(error),
+                Err(error) if round >= max_peer_retries => return Err(error),
+                Err(error) => {
+                    round += 1;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    let sleep_for = peer_retry_delay.min(remaining);
+                    opennow_streamer_protocol::log::log_line(
+                        "INFO",
+                        "rtsps",
+                        &format!(
+                            "video-setup-retry round={round}/{max_peer_retries} sleep_ms={}",
+                            sleep_for.as_millis(),
+                        ),
+                    );
+                    std::thread::sleep(sleep_for);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setup_video_sweep(
+        &mut self,
+        candidates: &[String],
+        headers: &mut [(&str, String)],
+        transport_index: usize,
+        client_port: u16,
+        deadline: &Instant,
+    ) -> Result<VideoSetup, NvstRtspError> {
         let mut missing_peer = false;
         let mut last_status = 0;
         for transport in [
@@ -143,7 +215,7 @@ impl RtspClient {
                     ));
                 }
                 let response =
-                    self.request_with_timeout("SETUP", candidate, &headers, "", remaining)?;
+                    self.request_with_timeout("SETUP", candidate, headers, "", remaining)?;
                 let transport = header_value(&response, "transport");
                 let peer = transport
                     .and_then(parse_video_peer)

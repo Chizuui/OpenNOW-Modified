@@ -99,10 +99,15 @@ leave the original account active and show an error on the account page. Test bo
 and console modes; synthetic account fixtures do not prove a provider accepts login.
 
 Video SETUP tries a bounded set of control-URI and Transport forms within one request
-budget. A successful response must still supply a usable server-authored video endpoint.
-After all forms fail to supply one, `missing-video-peer` is a terminal negotiation error,
+budget. When the server answers 200 without a usable video endpoint (a rig whose
+video streamer is still starting), the sweep repeats on a bounded pace (3s pauses,
+at most 3 extra rounds inside the same budget) instead of failing in under a
+second. A successful response must still supply a usable server-authored video
+endpoint. After all rounds fail to supply one, `missing-video-peer` is a terminal
+negotiation error,
 not a reason to repeatedly reclaim the same seat. Unsupported legacy transport is also
-terminal. Transient network failures retain the existing bounded session recovery.
+terminal. Pure rejections (400/404/459+) still fail fast without retries, and transient
+network failures retain the existing bounded session recovery.
 
 For a partner that still cannot start, reproduce once and export diagnostics. Keep the
 `video-setup` and `video-setup-transport` lines. They describe response status, field
