@@ -7,6 +7,7 @@ QtObject {
     required property var i18n
     required property bool ready
     required property var subscription
+    required property var authSession
     required property bool nativeRuntimeReady
     required property var nativeRuntimeCapabilities
     required property var refreshAccountServices
@@ -47,6 +48,7 @@ QtObject {
     property string languageError: ""
     property string languageRequestId: ""
     property var colorDescriptors: []
+    property var codecDescriptors: []
     property string colorRequestId: ""
     property var frameRateDescriptors: []
     property string cancellingRequestId: ""
@@ -54,7 +56,7 @@ QtObject {
     readonly property string languageContext: JSON.stringify([ready, scopeGeneration,
         providerIdpId, settings.sessionProxyEnabled, settings.sessionProxyUrl])
     readonly property string colorContext: JSON.stringify([ready, nativeRuntimeReady,
-        nativeRuntimeCapabilities, nativeHdrOutputSupported, settings.codec, settings.nativeVideoBackend,
+        nativeRuntimeCapabilities, nativeHdrOutputSupported, settings.codec, settings.colorQuality, settings.nativeVideoBackend,
         settings.decoderPreference, settings.enableHdr, settings.resolution])
     readonly property string gameLanguageDescription: qsTr("Requested when the game supports it; some games require an in-game change. Applies to the next session.")
     readonly property string keyboardLayoutDescription: qsTr("Physical key mapping requested from GeForce NOW. Applies to the next session.")
@@ -114,9 +116,46 @@ QtObject {
         ["10bit_420", qsTr("10-bit, YUV 4:2:0")], ["10bit_444", qsTr("10-bit, YUV 4:4:4")]
     ].map(pair => {
         const descriptor = colorDescriptors.find(item => item.value === pair[0])
-        return {value:pair[0], label:pair[1], disabled:!descriptor || descriptor.disabled,
-            detail:descriptor ? String(descriptor.reason || qsTr("Supported by the current profile")) : qsTr("Capability not confirmed")}
+        const gateReason = colorQualityGate(pair[0])
+        const blocked = gateReason !== "" || !descriptor || descriptor.disabled
+        return {value:pair[0], label:pair[1], disabled:blocked,
+            detail: gateReason !== ""
+                ? gateReason
+                : descriptor ? String(descriptor.reason || qsTr("Supported by the current profile")) : qsTr("Capability not confirmed")}
     })
+
+    function membershipTierName() {
+        const tier = (subscription && subscription.membershipTier)
+            || (authSession && authSession.user && authSession.user.membershipTier)
+            || ""
+        return String(tier).toUpperCase()
+    }
+
+    // 10-bit color precision and HDR10 require Ultimate or Performance.
+    // Unknown tiers fail open; the service remains the final arbiter.
+    function tenBitAllowedByMembership() {
+        return membershipTierName() !== "FREE"
+    }
+
+    function fourFourFourAllowedByMembership() {
+        const tier = membershipTierName()
+        return tier === "" || tier === "ULTIMATE"
+    }
+
+    // Membership/platform gates mirroring GeForce NOW's documented
+    // availability. Returns "" when allowed, else a display reason.
+    function colorQualityGate(value) {
+        const quality = String(value || "")
+        if (quality.indexOf("444") >= 0) {
+            if (Qt.platform.os !== "windows" && Qt.platform.os !== "osx")
+                return qsTr("Available in the Windows and macOS apps")
+            if (!fourFourFourAllowedByMembership())
+                return qsTr("Requires an Ultimate membership")
+        }
+        if (quality.indexOf("10bit") === 0 && !tenBitAllowedByMembership())
+            return qsTr("Requires a Performance or Ultimate membership")
+        return ""
+    }
 
     onLanguageContextChanged: {
         const request = languageRequestId
@@ -134,6 +173,7 @@ QtObject {
         const request = colorRequestId
         colorRequestId = ""
         colorDescriptors = []
+        codecDescriptors = []
         frameRateDescriptors = []
         cancelOwnedRequest(request)
         if (capabilitiesActive) colorRefresh.restart()
@@ -199,8 +239,13 @@ QtObject {
         const writes = Object.assign({}, settingWrites)
         delete writes[key]
         settingWrites = writes
-        if (result) applySetting(key, result.value)
-        else if (!write.queued) errorReported(message)
+        if (result) {
+            // Coupled values first (per protocol): core repairs persisted together
+            // with the primary key, e.g. an explicit codec the new color mode
+            // cannot use is healed toward Auto in the same save.
+            applyCoupledSettings(result.changes)
+            applySetting(key, result.value)
+        } else if (!write.queued) errorReported(message)
         if (write.queued && ready) beginSettingWrite(key, write.next)
         return true
     }
@@ -222,6 +267,7 @@ QtObject {
         if (id !== "" && id === colorRequestId) {
             colorRequestId = ""
             colorDescriptors = result.colorQualities || []
+            codecDescriptors = result.codecs || []
             frameRateDescriptors = result.frameRates || []
             clampFpsToEntitlement()
             return true
@@ -241,6 +287,7 @@ QtObject {
         if (id !== "" && id === colorRequestId) {
             colorRequestId = ""
             colorDescriptors = []
+            codecDescriptors = []
             frameRateDescriptors = []
             return true
         }
@@ -291,35 +338,30 @@ QtObject {
             && codecNamesFromCapabilities(nativeRuntimeCapabilities).indexOf(name) >= 0
     }
 
+    function codecDescriptor(codec) {
+        const name = String(codec || "").toLowerCase()
+        for (let index = 0; index < codecDescriptors.length; ++index) {
+            if (String(codecDescriptors[index].value || "").toLowerCase() === name)
+                return codecDescriptors[index]
+        }
+        return null
+    }
+
+    // Core-resolved gating for the current color quality, backend, and HDR mode.
+    // Fails open while descriptors are unconfirmed: decoder capability gating
+    // (codecAvailable) still applies, and launch validation rejects the rest.
+    function codecDisabledByProfile(codec) {
+        const descriptor = codecDescriptor(codec)
+        return descriptor !== null && descriptor.disabled === true
+    }
+
+    function codecsDisabledByProfile() {
+        return ["av1", "h264", "h265"].filter(codec => codecDisabledByProfile(codec))
+    }
+
     function hdrDecoderAvailable() {
         return nativeRuntimeReady && settings.decoderPreference !== "software"
             && codecNamesFromCapabilities(nativeRuntimeCapabilities, true).length > 0
-    }
-
-    function availableCodecValues() {
-        const result = []
-        if (codecAvailable("h264")) {
-            result.push("auto")
-            result.push("h264")
-        }
-        if (codecAvailable("h265"))
-            result.push("h265")
-        if (codecAvailable("av1"))
-            result.push("av1")
-        // Keep the persisted choice visible when the child is missing or the selected decoder
-        // policy has no compatible codec. Prelaunch validation still rejects it before CloudMatch.
-        return result.length ? result : [String(settings.codec || "auto").toLowerCase()]
-    }
-
-    function availableCodecLabels() {
-        const values = availableCodecValues()
-        const result = []
-        for (let index = 0; index < values.length; ++index) {
-            result.push(values[index] === "auto" ? "Auto"
-                : values[index] === "h264" ? "H.264"
-                : values[index] === "h265" ? "H.265" : "AV1")
-        }
-        return result
     }
 
     function canonicalFpsValues() {

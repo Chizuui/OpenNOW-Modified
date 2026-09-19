@@ -44,8 +44,8 @@ Column {
             width: parent.width; paperStyle: true; glyph: "chip"; title: qsTr("Codec")
             description: ShellStore.streamerDetectionMessage
             DesktopSettingsSegmented {
-                options: [{label:qsTr("Auto"),value:"auto"},{label:"AV1",value:"av1",enabled:ShellStore.codecAvailable("av1")},{label:"H.265",value:"h265",enabled:ShellStore.codecAvailable("h265")},{label:"H.264",value:"h264",enabled:ShellStore.codecAvailable("h264")}]
-                disabledHint: qsTr("Not supported by the detected native decoder")
+                options: [{label:qsTr("Auto"),value:"auto"},{label:"AV1",value:"av1",enabled:ShellStore.codecAvailable("av1") && !ShellStore.codecDisabledByProfile("av1")},{label:"H.265",value:"h265",enabled:ShellStore.codecAvailable("h265") && !ShellStore.codecDisabledByProfile("h265")},{label:"H.264",value:"h264",enabled:ShellStore.codecAvailable("h264") && !ShellStore.codecDisabledByProfile("h264")}]
+                disabledHint: qsTr("Not supported by the detected decoder or the selected color quality")
                 optionWidth: 64; selectedIndex: options.findIndex(item => item.value === page.settingsScreen.valueSetting("codec","auto"))
                 onSelected: (index,item) => page.settingsScreen.setChoice("codec",item.value)
             }
@@ -68,12 +68,13 @@ Column {
         }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "sun"; title: qsTr("HDR")
-            description: HdrOutput.supported && !ShellStore.hdrDecoderAvailable()
+            description: !ShellStore.tenBitAllowedByMembership() ? qsTr("HDR10 requires a Performance or Ultimate membership.")
+                : HdrOutput.supported && !ShellStore.hdrDecoderAvailable()
                 ? qsTr("HDR requires a supported 10-bit H.265 or AV1 hardware decoder.") : HdrOutput.status
             DesktopSettingsToggle {
                 objectName: "enableHdrToggle"
                 checked: page.settingsScreen.boolSetting("enableHdr", false)
-                enabled: (HdrOutput.supported && ShellStore.hdrDecoderAvailable()) || checked
+                enabled: ((HdrOutput.supported && ShellStore.hdrDecoderAvailable()) || checked) && (ShellStore.tenBitAllowedByMembership() || checked)
                 opacity: enabled ? 1 : 0.45
                 Accessible.name: qsTr("HDR")
                 onValueChangedByUser: value => page.settingsScreen.setSetting("enableHdr", value)

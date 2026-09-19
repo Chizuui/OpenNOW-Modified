@@ -20,7 +20,7 @@ use tungstenite::{Message, WebSocket, connect};
 mod color;
 #[path = "nvst_rtsp_transport_diagnostics.rs"]
 mod transport_diagnostics;
-use color::NvstColorNegotiation;
+use color::announce_color_lines;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 // A rig whose video streamer is still starting answers SETUP with 200 but no
@@ -740,18 +740,15 @@ pub fn prepare_owned_nvst(
     describe_headers.push(("x-nv-abtesting", "2".to_owned()));
     let describe = client.request("DESCRIBE", &target, &describe_headers, "")?;
     ensure_rtsp_ok("DESCRIBE", &describe)?;
-    let requested_stream = super::media_stream_config(context);
-    let color = NvstColorNegotiation::resolve(requested_stream, &describe.body)?;
+    let stream = super::media_stream_config(context);
     opennow_streamer_protocol::log::log_line(
         "INFO",
         "nvst-color",
         &format!(
-            "requested={} requested_hdr={} effective={} effective_hdr={} announce={:?}",
-            requested_stream.color_quality.protocol_name(),
-            requested_stream.hdr,
-            color.stream.color_quality.protocol_name(),
-            color.stream.hdr,
-            color.announce_lines(),
+            "color={} hdr={} announce={:?}",
+            stream.color_quality.protocol_name(),
+            stream.hdr,
+            announce_color_lines(stream),
         ),
     );
 
@@ -935,7 +932,7 @@ pub fn prepare_owned_nvst(
     let announce_body = build_announce(
         context,
         AnnounceParams {
-            color: &color,
+            stream,
             key: handoff["srtpAesKeyHex"].as_str().unwrap_or_default(),
             key_id,
             port: client_port,
@@ -962,7 +959,7 @@ pub fn prepare_owned_nvst(
         announced: false,
         owns_session: true,
         handoff,
-        media_config: color.stream,
+        media_config: stream,
     })
 }
 
@@ -980,7 +977,7 @@ fn ensure_tls_crypto_provider() -> Result<(), NvstRtspError> {
 }
 
 struct AnnounceParams<'a> {
-    color: &'a NvstColorNegotiation,
+    stream: MediaStreamConfig,
     key: &'a str,
     key_id: u32,
     port: u16,
@@ -1029,6 +1026,13 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "s=NVIDIA Streaming Client".to_owned(),
         format!("a=x-nv-video[0].clientViewportWd:{width}"),
         format!("a=x-nv-video[0].clientViewportHt:{height}"),
+        // Encoder identity the seat reads before initializing: the captured
+        // official client reports profile 3 / level 61 across codecs, with the
+        // same pair on the H.264 keys.
+        "a=x-nv-video[0].maxCodecProfile:3".to_owned(),
+        "a=x-nv-video[0].maxCodecLevel:61".to_owned(),
+        "a=x-nv-video[0].maxH264Profile:3".to_owned(),
+        "a=x-nv-video[0].maxH264Level:61".to_owned(),
         "a=x-nv-video[0].videoSplitEncodeStripsPerFrame:64".to_owned(),
         "a=x-nv-video[0].updateSplitEncodeStateDynamically:1".to_owned(),
         format!("a=x-nv-video[0].packetSize:{}", params.video_packet_size),
@@ -1150,7 +1154,7 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         lines.push("a=x-nv-general.rtcMicOnNativeBundle:1".to_owned());
         lines.push("a=x-nv-mic.micSsrcConfig.senderSsrc:1".to_owned());
     }
-    lines.extend(params.color.announce_lines());
+    lines.extend(announce_color_lines(params.stream));
     lines.extend([
         "t=0 0".to_owned(),
         format!("m=video {}", params.video_port),
@@ -1211,7 +1215,11 @@ fn negotiated_codec(context: &SessionContext) -> String {
 }
 
 fn negotiated_dynamic_streaming_mode(context: &SessionContext) -> u8 {
-    context
+    // The dynamic quality policy is RTSP-only in the official client: it never
+    // travels in CloudMatch requestedStreamingFeatures, so a negotiated value can
+    // only come from a server-finalized override. Otherwise the live client
+    // setting decides, matching the official Data Saver behavior at ANNOUNCE time.
+    if let Some(policy) = context
         .session
         .extra
         .get("negotiatedStreamProfile")
@@ -1219,7 +1227,16 @@ fn negotiated_dynamic_streaming_mode(context: &SessionContext) -> u8 {
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
         .filter(|value| *value <= 3)
-        .unwrap_or(0)
+    {
+        return policy;
+    }
+    u8::from(
+        context
+            .settings
+            .get("saveBandwidth")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
 }
 
 fn negotiated_adjustment_enabled(policy: u8) -> u8 {
@@ -1666,15 +1683,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn color(context: &SessionContext) -> NvstColorNegotiation {
-        NvstColorNegotiation::resolve(super::super::media_stream_config(context), "").unwrap()
+    fn stream_config(context: &SessionContext) -> MediaStreamConfig {
+        super::super::media_stream_config(context)
     }
 
     fn announce_color_format(context: &SessionContext) -> (u8, u8) {
-        let stream = color(context).stream;
+        let stream = stream_config(context);
         (
             stream.color_quality.bit_depth(),
-            u8::from(stream.color_quality.is_444()),
+            if stream.color_quality.is_444() { 3 } else { 1 },
         )
     }
 
@@ -1776,7 +1793,7 @@ mod tests {
         let sdp = build_announce(
             &value,
             AnnounceParams {
-                color: &color(&value),
+                stream: stream_config(&value),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1798,7 +1815,7 @@ mod tests {
         let sdp = build_announce(
             &runaway,
             AnnounceParams {
-                color: &color(&runaway),
+                stream: stream_config(&runaway),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1822,7 +1839,7 @@ mod tests {
         let sdp = build_announce(
             &value,
             AnnounceParams {
-                color: &color(&value),
+                stream: stream_config(&value),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1838,7 +1855,9 @@ mod tests {
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:120"));
         assert!(sdp.contains("a=x-nv-video[0].bitDepth:10"));
-        assert!(sdp.contains("a=x-nv-video[0].chromaFormat:0"));
+        assert!(sdp.contains("a=x-nv-video[0].chromaFormat:1"));
+        assert!(sdp.contains("a=x-nv-video[0].maxCodecProfile:3"));
+        assert!(sdp.contains("a=x-nv-video[0].maxCodecLevel:61"));
         assert!(sdp.contains("a=x-nv-video[0].encoderCscMode:2"));
         assert!(sdp.contains("a=x-nv-vqos[0].bitStreamFormat:2"));
         assert!(sdp.contains("a=x-nv-general.clientBundlePort:49006"));
@@ -1853,7 +1872,7 @@ mod tests {
             let sdp = build_announce(
                 &context(),
                 AnnounceParams {
-                    color: &color(&context()),
+                    stream: stream_config(&context()),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -1889,7 +1908,7 @@ mod tests {
         let sdp = build_announce(
             &context,
             AnnounceParams {
-                color: &color(&context),
+                stream: stream_config(&context),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1930,16 +1949,21 @@ mod tests {
     }
 
     #[test]
-    fn announce_uses_the_negotiated_dynamic_quality_policy_not_the_saved_preference() {
-        for (profile, policy, adjust) in [
-            (None, 0, 0),
-            (Some(1), 1, 1),
-            (Some(2), 2, 1),
-            (Some(3), 3, 1),
-            (Some(7), 0, 0),
+    fn announce_prefers_a_finalized_policy_but_falls_back_to_live_settings() {
+        // The official client never sends dynamicStreamingMode to CloudMatch, so a
+        // negotiated value can only be a server-finalized override. Otherwise the
+        // live saveBandwidth setting decides, matching the official RTSP-only policy.
+        for (profile, save, policy, adjust) in [
+            (None, false, 0, 0),
+            (None, true, 1, 1),
+            (Some(1), false, 1, 1),
+            (Some(2), false, 2, 1),
+            (Some(3), false, 3, 1),
+            (Some(7), true, 1, 1),
+            (Some(7), false, 0, 0),
         ] {
             let mut value = context();
-            value.settings["saveBandwidth"] = json!(true);
+            value.settings["saveBandwidth"] = json!(save);
             if let Some(profile) = profile {
                 value.session.extra["negotiatedStreamProfile"]["dynamicStreamingMode"] =
                     json!(profile);
@@ -1947,7 +1971,7 @@ mod tests {
             let sdp = build_announce(
                 &value,
                 AnnounceParams {
-                    color: &color(&value),
+                    stream: stream_config(&value),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -1969,10 +1993,10 @@ mod tests {
 
     #[test]
     fn announce_dynamic_range_follows_accepted_hdr_not_saved_intent() {
-        for (accepted, requested, mode) in [
-            (json!(true), false, 1),
-            (json!(false), true, 0),
-            (Value::Null, true, 0),
+        for (accepted, requested, hdr) in [
+            (json!(true), false, true),
+            (json!(false), true, false),
+            (Value::Null, true, false),
         ] {
             let mut value = context();
             value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
@@ -1982,7 +2006,7 @@ mod tests {
             let sdp = build_announce(
                 &value,
                 AnnounceParams {
-                    color: &color(&value),
+                    stream: stream_config(&value),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -1996,9 +2020,11 @@ mod tests {
                     microphone_available: false,
                 },
             );
-            assert!(sdp.contains(&format!("a=x-nv-video[0].dynamicRangeMode:{mode}\r\n")));
+            // HDR carries an explicit :1; SDR omits the line, like the official client.
+            assert_eq!(sdp.contains("a=x-nv-video[0].dynamicRangeMode:1\r\n"), hdr);
+            assert!(!sdp.contains("a=x-nv-video[0].dynamicRangeMode:0"));
             assert!(sdp.contains("a=x-nv-video[0].bitDepth:10\r\n"));
-            assert!(sdp.contains("a=x-nv-video[0].chromaFormat:0\r\n"));
+            assert!(sdp.contains("a=x-nv-video[0].chromaFormat:1\r\n"));
         }
     }
 
@@ -2009,7 +2035,7 @@ mod tests {
         let sdp = build_announce(
             &value,
             AnnounceParams {
-                color: &color(&value),
+                stream: stream_config(&value),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -2047,7 +2073,7 @@ mod tests {
                 let sdp = build_announce(
                     &value,
                     AnnounceParams {
-                        color: &color(&value),
+                        stream: stream_config(&value),
                         key: &"01".repeat(32),
                         key_id: 7,
                         port: 49006,
@@ -2080,23 +2106,23 @@ mod tests {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H264");
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(announce_color_format(&value), (8, 0));
+        assert_eq!(announce_color_format(&value), (8, 1));
     }
 
     #[test]
     fn av1_announce_stays_420_but_preserves_ten_bit_depth() {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(announce_color_format(&value), (10, 0));
+        assert_eq!(announce_color_format(&value), (10, 1));
     }
 
     #[test]
     fn accepted_hevc_color_preserves_nvst_depth_and_chroma_enum_space() {
         for (color, format) in [
-            ("8bit_420", (8, 0)),
-            ("8bit_444", (8, 1)),
-            ("10bit_420", (10, 0)),
-            ("10bit_444", (10, 1)),
+            ("8bit_420", (8, 1)),
+            ("8bit_444", (8, 3)),
+            ("10bit_420", (10, 1)),
+            ("10bit_444", (10, 3)),
         ] {
             let mut value = context();
             value.settings["colorQuality"] = json!("8bit_420");
@@ -2111,38 +2137,23 @@ mod tests {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(announce_color_format(&value), (10, 1));
+        assert_eq!(announce_color_format(&value), (10, 3));
     }
 
     #[test]
-    fn full_announce_uses_resolved_color_without_reintroducing_requested_values() {
-        for (suffix, expected_color, expected_hdr, expected_depth, expected_chroma) in [
-            (
-                "a=x-nv-video[0].bitDepth:8\r\na=x-nv-video[0].chromaFormat:0\r\na=x-nv-video[0].dynamicRangeMode:0\r\n",
-                opennow_streamer_platform::MediaColorQuality::EightBit420,
-                false,
-                None,
-                None,
-            ),
-            (
-                "a=x-nv-video[0].bitDepth:10\r\na=x-nv-video[0].chromaFormat:1\r\na=x-nv-video[0].dynamicRangeMode:1\r\n",
-                opennow_streamer_platform::MediaColorQuality::TenBit444,
-                true,
-                Some("10".to_owned()),
-                Some("1".to_owned()),
-            ),
+    fn full_announce_always_states_depth_chroma_and_hdr_explicitly() {
+        for (codec, color, hdr, depth, chroma) in [
+            ("H265", "10bit_444", false, "10", "3"),
+            ("H265", "10bit_420", false, "10", "1"),
+            ("H264", "8bit_420", false, "8", "1"),
         ] {
             let mut value = context();
-            value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
-            let resolved = NvstColorNegotiation::resolve(
-                super::super::media_stream_config(&value),
-                &format!("a=x-nv-general.nativeRtcOnBundlePort:1\r\n;;{suffix}"),
-            )
-            .unwrap();
+            value.session.extra["negotiatedStreamProfile"]["codec"] = json!(codec);
+            value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!(color);
             let sdp = build_announce(
                 &value,
                 AnnounceParams {
-                    color: &resolved,
+                    stream: stream_config(&value),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -2156,24 +2167,35 @@ mod tests {
                     microphone_available: false,
                 },
             );
-            assert_eq!(resolved.stream.color_quality, expected_color);
-            assert_eq!(resolved.stream.hdr, expected_hdr);
-            assert_eq!(sdp_attribute(&sdp, "video[0].bitDepth"), expected_depth);
+            assert_eq!(
+                sdp_attribute(&sdp, "video[0].bitDepth"),
+                Some(depth.to_owned())
+            );
             assert_eq!(
                 sdp_attribute(&sdp, "video[0].chromaFormat"),
-                expected_chroma
+                Some(chroma.to_owned())
             );
+            // SDR never carries a dynamic-range line; HDR always carries :1.
             assert_eq!(
                 sdp_attribute(&sdp, "video[0].dynamicRangeMode"),
-                expected_hdr.then(|| "1".to_owned())
+                hdr.then(|| "1".to_owned())
             );
-            for field in ["bitDepth", "chromaFormat", "dynamicRangeMode"] {
-                assert!(sdp.matches(&format!("a=x-nv-video[0].{field}:")).count() <= 1);
+            for field in ["bitDepth", "chromaFormat"] {
+                assert_eq!(
+                    sdp.matches(&format!("a=x-nv-video[0].{field}:")).count(),
+                    1,
+                    "{codec}/{color}"
+                );
             }
-            assert_eq!(
-                value.session.extra["negotiatedStreamProfile"]["colorQuality"],
-                "10bit_444"
-            );
+            // Encoder identity the seat reads before initializing.
+            for line in [
+                "a=x-nv-video[0].maxCodecProfile:3",
+                "a=x-nv-video[0].maxCodecLevel:61",
+                "a=x-nv-video[0].maxH264Profile:3",
+                "a=x-nv-video[0].maxH264Level:61",
+            ] {
+                assert!(sdp.contains(line), "{line}");
+            }
         }
     }
 

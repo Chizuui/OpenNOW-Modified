@@ -289,17 +289,22 @@ FocusScope {
             ]
         }
         if (root.selectedSection === 1) {
-            const codecValues = ShellStore.availableCodecValues()
-            const codecLabels = codecValues.map(value => value === "auto" ? "Auto" : value === "h264" ? "H.264" : value === "h265" ? "H.265" : String(value).toUpperCase())
+            const codecValues = ["auto", "av1", "h264", "h265"]
+            const codecLabels = ["Auto", "AV1", "H.264", "H.265"]
+            const codecDisabled = ShellStore.codecsDisabledByProfile()
+            const capsDisabled = codecValues.filter(value => value !== "auto" && !ShellStore.codecAvailable(value))
+            const disabledCodecs = codecDisabled.concat(capsDisabled.filter(value => codecDisabled.indexOf(value) < 0))
             const frameGeneration = String(settings.frameGeneration || "off") === "2x"
             const hdrAvailable = HdrOutput.supported && ShellStore.hdrDecoderAvailable()
-            const hdrDescription = HdrOutput.supported && !ShellStore.hdrDecoderAvailable()
+            const hdrTierOk = ShellStore.tenBitAllowedByMembership()
+            const hdrDescription = !hdrTierOk ? qsTr("HDR10 requires a Performance or Ultimate membership.")
+                : HdrOutput.supported && !ShellStore.hdrDecoderAvailable()
                 ? qsTr("HDR requires a supported 10-bit H.265 or AV1 hardware decoder.") : HdrOutput.status
             return [
-                {t:"Codec", d:"Auto prefers AV1, then H.264, then H.265", v:root.titleCase(settings.codec || "auto"), key:"codec", values:codecValues, labels:codecLabels, segmentLabels:["Auto","AV1","H.264","H.265"], control:"segments", selectedIndex:["auto","av1","h264","h265"].indexOf(String(settings.codec || "auto"))},
-                choice("Fallback codec", "Used when the preferred codec isn't offered by the rig", "fallbackCodec", codecValues, codecLabels),
+                {t:"Codec", d:"Auto prefers AV1, then H.265, then H.264", v:root.titleCase(settings.codec || "auto"), key:"codec", values:codecValues, labels:codecLabels, segmentLabels:codecLabels, control:"segments", selectedIndex:codecValues.indexOf(String(settings.codec || "auto")), disabledValues:disabledCodecs},
+                choice("Fallback codec", "Used when the preferred codec isn't offered by the rig", "fallbackCodec", ["auto","h264","h265"], ["Auto","H.264","H.265"], "dropdown", disabledCodecs),
                 descriptorChoice(qsTr("Color quality"), ShellStore.settingsOwnerState.colorDescription, "colorQuality", ShellStore.settingsOwnerState.colorQualityItems),
-                {t:qsTr("HDR"), d:hdrDescription, v:Boolean(settings.enableHdr) ? qsTr("On") : qsTr("Off"), key:"enableHdr", values:[false,true], labels:[qsTr("Off"),qsTr("On")], control:"segments", selectedIndex:Boolean(settings.enableHdr) ? 1 : 0, disabledValues:hdrAvailable ? [] : [true]},
+                {t:qsTr("HDR"), d:hdrDescription, v:Boolean(settings.enableHdr) ? qsTr("On") : qsTr("Off"), key:"enableHdr", values:[false,true], labels:[qsTr("Off"),qsTr("On")], control:"segments", selectedIndex:Boolean(settings.enableHdr) ? 1 : 0, disabledValues:(hdrAvailable && hdrTierOk) ? [] : [true]},
                 {t:"Max bitrate", d:"Maximum requested stream bitrate", v:Number(settings.maxBitrateMbps || 75) + " Mbps", key:"maxBitrateMbps", values:[25,50,75,100,150,200], labels:["25 Mbps","50 Mbps","75 Mbps","100 Mbps","150 Mbps","200 Mbps"], control:"slider", sliderPercent:Number(settings.maxBitrateMbps || 75) / 106},
                 toggle(qsTr("Save bandwidth"), qsTr("Lets the server trade resolution and image quality for a steadier frame rate when your connection cannot sustain the selected profile. Off requests no dynamic adjustment. Applies to new sessions."), "saveBandwidth"),
                 {t:qsTr("Frame generation (Experimental)"), d:qsTr("Targets 120 displayed FPS from a 60 FPS stream. Requires a fast GPU and 120 Hz display; adds latency and artifacts."), v:frameGeneration ? qsTr("2×") : qsTr("Off"), key:"frameGeneration", values:["off","2x"], labels:[qsTr("Off"),qsTr("2×")], control:"segments", selectedIndex:frameGeneration ? 1 : 0},

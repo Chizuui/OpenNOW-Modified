@@ -124,9 +124,17 @@ impl SettingsStore {
                 .passthrough
                 .insert(CONSOLE_POLICY_VERSION.to_owned(), json!(1));
         }
+        let codec_before_normalize = store.values["codec"].clone();
+        let fallback_before_normalize = store.values["fallbackCodec"].clone();
         store.normalize();
+        // Persist a first-launch codec/color heal: profiles saved before the
+        // settings page greyed out unsupported combinations are repaired toward
+        // Auto above; write the repaired values back so the fix sticks.
+        let codec_color_healed = policy == LoadPolicy::ReadWrite
+            && (store.values["codec"] != codec_before_normalize
+                || store.values["fallbackCodec"] != fallback_before_normalize);
         if policy == LoadPolicy::ReadWrite
-            && (migrate_console_policy || migrate_onboarding)
+            && (migrate_console_policy || migrate_onboarding || codec_color_healed)
             && store.path.exists()
         {
             store.save()?;
@@ -144,6 +152,24 @@ impl SettingsStore {
         }
         if !defaults().contains_key(key) {
             return Err(format!("Unknown setting: {key}"));
+        }
+        if matches!(key, "codec" | "fallbackCodec") {
+            // Reject only recognized explicit codecs that the saved color mode
+            // cannot use. Unknown spellings fall through to normalize_choice,
+            // which clamps them to Auto.
+            if let Some(codec) = value.as_str() {
+                let name = codec.trim().to_ascii_lowercase();
+                let known_explicit =
+                    matches!(name.as_str(), "h264" | "avc" | "h265" | "hevc" | "av1");
+                if known_explicit {
+                    let color = self.values["colorQuality"].as_str().unwrap_or("8bit_420");
+                    if !crate::streamer::codec_supports_color_quality(&name, color) {
+                        return Err(format!(
+                            "{codec} cannot request {color}. Select Auto or H.265 for advanced color."
+                        ));
+                    }
+                }
+            }
         }
         if matches!(key, "gameLanguage" | "keyboardLayout") {
             crate::language::validate_setting(key, &value)?;
@@ -342,6 +368,22 @@ impl SettingsStore {
             &["8bit_420", "10bit_420", "8bit_444", "10bit_444"],
             "8bit_420",
         );
+        // Keep an explicitly saved codec compatible with the saved color mode,
+        // mirroring the official settings gating (H.264 is 8-bit 4:2:0 only, AV1
+        // is 4:2:0 only). Repairing toward Auto preserves the saved quality
+        // choice. This heals older profiles on load and re-heals after an
+        // explicit color change; settings.set rejects newly incompatible
+        // explicit codec selections outright.
+        let color = self.values["colorQuality"]
+            .as_str()
+            .unwrap_or("8bit_420")
+            .to_owned();
+        for key in ["codec", "fallbackCodec"] {
+            let codec = self.values[key].as_str().unwrap_or("auto");
+            if !crate::streamer::codec_supports_color_quality(codec, &color) {
+                self.values.insert(key.to_owned(), json!("auto"));
+            }
+        }
         normalize_choice(&mut self.values, "frameGeneration", &["off", "2x"], "off");
         normalize_choice(
             &mut self.values,
@@ -2552,6 +2594,97 @@ mod tests {
                 json!(12)
             );
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_saved_codec_color_combo_heals_to_auto_on_first_launch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-color-heal-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            r#"{"codec":"av1","fallbackCodec":"h264","colorQuality":"10bit_444"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        assert_eq!(store.all()["codec"], json!("auto"));
+        assert_eq!(store.all()["fallbackCodec"], json!("auto"));
+
+        // The repair persists so the next launch starts from a valid profile.
+        let reloaded = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(reloaded.all()["codec"], json!("auto"));
+        assert_eq!(reloaded.all()["fallbackCodec"], json!("auto"));
+        assert_eq!(reloaded.all()["colorQuality"], json!("10bit_444"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compatible_saved_codec_color_combo_survives_reload_unchanged() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-color-keep-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            r#"{"codec":"h265","fallbackCodec":"auto","colorQuality":"10bit_444"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["codec"], json!("h265"));
+        assert_eq!(store.all()["fallbackCodec"], json!("auto"));
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn color_change_heals_an_incompatible_explicit_codec() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-color-change-heal-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        store.set("codec", json!("av1")).unwrap();
+        store.set("colorQuality", json!("10bit_444")).unwrap();
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        assert_eq!(store.all()["codec"], json!("auto"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_codec_selection_rejects_color_incompatible_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-reject-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        store.set("colorQuality", json!("10bit_444")).unwrap();
+        for codec in ["av1", "h264"] {
+            let error = store.set("codec", json!(codec)).unwrap_err();
+            assert!(error.contains(codec), "{error}");
+            assert_eq!(store.all()["codec"], json!("auto"));
+        }
+        for codec in ["auto", "h265"] {
+            store.set("codec", json!(codec)).unwrap();
+            assert_eq!(store.all()["codec"], json!(codec));
+        }
+        let error = store.set("fallbackCodec", json!("h264")).unwrap_err();
+        assert!(error.contains("h264"), "{error}");
+        store.set("colorQuality", json!("8bit_420")).unwrap();
+        store.set("codec", json!("h264")).unwrap();
+        store.set("fallbackCodec", json!("h264")).unwrap();
+        assert_eq!(store.all()["codec"], json!("h264"));
+        assert_eq!(store.all()["fallbackCodec"], json!("h264"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

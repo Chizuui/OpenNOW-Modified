@@ -1575,19 +1575,26 @@ fn validate_context(context: &SessionContext, id: &str) -> Result<(), Value> {
             ));
         }
     }
-    if media_stream_config(context).hdr {
-        let profile = &context.session.extra["negotiatedStreamProfile"];
-        if !matches!(
-            (profile["codec"].as_str(), profile["colorQuality"].as_str()),
-            (Some("H265" | "HEVC"), Some("10bit_420" | "10bit_444"))
-                | (Some("AV1"), Some("10bit_420"))
-        ) {
-            return Err(error(
-                Some(id),
-                "invalid-context",
-                "HDR requires an accepted HEVC/AV1 10-bit profile with supported chroma",
-            ));
-        }
+    // HDR acceptance comes from the negotiated profile, but the codec is
+    // client-selected (the official client never sends it to CloudMatch), so
+    // validate the effective stream config rather than the raw profile: a
+    // session without a server-reported codec must not fail when the client
+    // selected HEVC/AV1 with 10-bit color.
+    let stream = media_stream_config(context);
+    if stream.hdr
+        && !matches!(
+            (stream.codec, stream.color_quality),
+            (
+                MediaVideoCodec::H265,
+                MediaColorQuality::TenBit420 | MediaColorQuality::TenBit444
+            ) | (MediaVideoCodec::Av1, MediaColorQuality::TenBit420)
+        )
+    {
+        return Err(error(
+            Some(id),
+            "invalid-context",
+            "HDR requires an accepted HEVC/AV1 10-bit profile with supported chroma",
+        ));
     }
     if let Some(endpoint) = &context.session.media_connection_info {
         if endpoint.ip.trim().is_empty() || endpoint.port == 0 || endpoint.port > u16::MAX.into() {
