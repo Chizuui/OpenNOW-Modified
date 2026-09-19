@@ -1,5 +1,7 @@
 #include <QFontDatabase>
 #include <QDesktopServices>
+#include <QFont>
+#include <QGuiApplication>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlPropertyMap>
@@ -25,6 +27,7 @@ public slots:
 
     void applicationAvailable()
     {
+        qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
         QDesktopServices::setUrlHandler("https", this, "captureUrl");
         const auto source = QStringLiteral(OPENNOW_QML_SOURCE_DIR);
         qmlRegisterSingletonType(QUrl::fromLocalFile(source + "/theme/Theme.qml"), "OpenNOW", 1, 0, "Theme");
@@ -36,7 +39,14 @@ public slots:
         for (const auto *name : {"DesktopSettingsButton", "DesktopSettingsIcon"}) {
             qmlRegisterType(QUrl::fromLocalFile(source + "/desktop/settings/controls/" + name + ".qml"), "OpenNOW", 1, 0, name);
         }
-        QFontDatabase::addApplicationFont(source + "/../res/fonts/Nunito-Variable.ttf");
+        for (const auto *font : {"Nunito-Variable.ttf", "IBMPlexMono-Regular.ttf",
+                 "IBMPlexMono-Medium.ttf", "IBMPlexMono-Bold.ttf"}) {
+            QFontDatabase::addApplicationFont(source + "/../res/fonts/" + font);
+        }
+        QFont applicationFont(QStringLiteral("Nunito"));
+        applicationFont.setHintingPreference(QFont::PreferNoHinting);
+        applicationFont.setStyleStrategy(QFont::PreferAntialias);
+        QGuiApplication::setFont(applicationFont);
     }
 
     void qmlEngineAvailable(QQmlEngine *engine)

@@ -978,6 +978,7 @@ if(BUILD_TESTING)
     )
     set(OPENNOW_CI_UNIT_TEST_TARGETS
         opennow-updatefailure-tests
+        opennow-queueselector-tests
         opennow-applicationicons-tests
         opennow-tenbitwarning-tests
         opennow-graphicsdevices-tests
@@ -1010,6 +1011,7 @@ if(BUILD_TESTING)
     )
     if(WIN32)
         list(REMOVE_ITEM OPENNOW_CI_UNIT_TEST_TARGETS opennow-hdrcolor-tests)
+        list(REMOVE_ITEM OPENNOW_CI_UNIT_TEST_TARGETS opennow-queueselector-tests)
         set_tests_properties(opennow-hdrcolor-tests PROPERTIES LABELS "interactive-desktop")
         add_custom_target(opennow-interactive-tests DEPENDS opennow-hdrcolor-tests)
     elseif(APPLE)
@@ -1025,6 +1027,7 @@ if(BUILD_TESTING)
         set_target_properties(
             opennow-applicationicons-tests
             opennow-tenbitwarning-tests
+            opennow-queueselector-tests
             opennow-graphicsdevices-tests
             opennow-consolelayout-tests
             opennow-consoleactions-tests
