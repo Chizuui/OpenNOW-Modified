@@ -53,6 +53,7 @@ QtObject {
         i18n: I18n
         ready: root.ready
         subscription: root.subscription
+        authSession: root.authSession
         scopeGeneration: root.authGeneration
         settingsActive: String(AppController.route).indexOf("settings") === 0
         capabilitiesActive: String(AppController.route).indexOf("settings") === 0 || root.onboardingRequired
@@ -1104,16 +1105,20 @@ QtObject {
         return settingsOwner.codecAvailable(codec)
     }
 
+    function codecDisabledByProfile(codec) {
+        return settingsOwner.codecDisabledByProfile(codec)
+    }
+
+    function codecsDisabledByProfile() {
+        return settingsOwner.codecsDisabledByProfile()
+    }
+
     function hdrDecoderAvailable() {
         return settingsOwner.hdrDecoderAvailable()
     }
 
-    function availableCodecValues() {
-        return settingsOwner.availableCodecValues()
-    }
-
-    function availableCodecLabels() {
-        return settingsOwner.availableCodecLabels()
+    function tenBitAllowedByMembership() {
+        return settingsOwner.tenBitAllowedByMembership()
     }
 
     function canonicalFpsValues() {

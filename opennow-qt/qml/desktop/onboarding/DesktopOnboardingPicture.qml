@@ -205,7 +205,8 @@ Column {
                 }
                 SettingRow {
                     id: hdrRow
-                    readonly property string status: HdrOutput.supported && !root.store.hdrDecoderAvailable()
+                    readonly property string status: !root.store.tenBitAllowedByMembership() ? qsTr("HDR10 requires a Performance or Ultimate membership.")
+                        : HdrOutput.supported && !root.store.hdrDecoderAvailable()
                         ? qsTr("HDR requires a supported 10-bit H.265 or AV1 hardware decoder.") : HdrOutput.status
                     width: parent.width; title: qsTr("HDR"); glyph: "sun"
                     description: !HdrOutput.supported ? qsTr("HDR is unavailable on this display.") : status
@@ -216,7 +217,7 @@ Column {
                     DesktopSettingsToggle {
                         objectName: "onboardingHdr"
                         checked: root.settings.enableHdr === true
-                        enabled: (HdrOutput.supported && root.store.hdrDecoderAvailable()) || checked
+                        enabled: ((HdrOutput.supported && root.store.hdrDecoderAvailable()) || checked) && (root.store.tenBitAllowedByMembership() || checked)
                         opacity: enabled ? 1 : 0.45
                         Accessible.name: qsTr("HDR")
                         Accessible.description: hdrRow.status
@@ -229,12 +230,12 @@ Column {
                     Segments {
                         objectName: "onboardingCodec"
                         options: [{label:qsTr("Auto"),value:"auto"},
-                            {label:"AV1",value:"av1",enabled:root.store.codecAvailable("av1")},
-                            {label:"H.265",value:"h265",enabled:root.store.codecAvailable("h265")},
-                            {label:"H.264",value:"h264",enabled:root.store.codecAvailable("h264")}]
+                            {label:"AV1",value:"av1",enabled:root.store.codecAvailable("av1") && !root.store.codecDisabledByProfile("av1")},
+                            {label:"H.265",value:"h265",enabled:root.store.codecAvailable("h265") && !root.store.codecDisabledByProfile("h265")},
+                            {label:"H.264",value:"h264",enabled:root.store.codecAvailable("h264") && !root.store.codecDisabledByProfile("h264")}]
                         optionWidth: 59
                         selectedIndex: options.findIndex(item => item.value === String(root.settings.codec || "auto"))
-                        disabledHint: qsTr("Not supported by the detected native decoder")
+                        disabledHint: qsTr("Not supported by the detected decoder or the selected color quality")
                         onSelected: (index, item) => root.store.setOnboardingSetting("codec", item.value)
                     }
                 }

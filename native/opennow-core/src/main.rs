@@ -36,7 +36,7 @@ mod version;
 use gfn::GfnService;
 use opennow_core::update_apply;
 use rand::RngCore;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use settings::{SettingsStore, resolve_data_dir};
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -406,6 +406,8 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
             Ok((
                 json!({"colorQualities":streamer::StreamerService::color_quality_choices(
                 &settings, &params["runtimeCapabilities"]),
+                "codecs":streamer::StreamerService::codec_choices(
+                &settings, &params["runtimeCapabilities"]),
                 "frameRates":frame_rate::frame_rate_choices(
                 &settings, &params["runtimeCapabilities"])}),
                 None,
@@ -432,10 +434,28 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                 return Ok((event.clone(), Some(("settings.changed", event))));
             }
             let mut settings = core.settings.lock().expect("settings poisoned");
+            let codec_before = settings.all()["codec"].clone();
+            let fallback_before = settings.all()["fallbackCodec"].clone();
             let applied = settings
                 .set(key, value)
                 .map_err(|message| ("invalid_setting".to_owned(), message))?;
             let mut event = json!({"key":key, "value":applied});
+            if key == "colorQuality" {
+                // An explicitly saved codec the new color mode cannot use is
+                // healed toward Auto in the same save; report the repair so the
+                // shell follows it without re-reading all settings.
+                let current = settings.all();
+                let mut changes = Map::new();
+                if current["codec"] != codec_before {
+                    changes.insert("codec".to_owned(), current["codec"].clone());
+                }
+                if current["fallbackCodec"] != fallback_before {
+                    changes.insert("fallbackCodec".to_owned(), current["fallbackCodec"].clone());
+                }
+                if !changes.is_empty() {
+                    event["changes"] = Value::Object(changes);
+                }
+            }
             if key == "launchInConsoleMode" && applied == json!(false) {
                 event["changes"] = json!({"switchToConsoleOnPad": false});
             } else if key == "themePack" {

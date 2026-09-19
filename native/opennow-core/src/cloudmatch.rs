@@ -295,7 +295,14 @@ impl CloudMatchService {
             &body["sessionRequestData"]["clientRequestMonitorSettings"][0],
             &body["sessionRequestData"]["requestedStreamingFeatures"],
         );
-        request_profile["codecSource"] = json!("request");
+        // The request no longer names a codec (the official client resolves it
+        // locally and announces it at RTSP time), so only claim request
+        // provenance when a codec value is actually present.
+        if request_profile["codec"].is_null() {
+            request_profile["codecSource"] = json!("unreported");
+        } else {
+            request_profile["codecSource"] = json!("request");
+        }
         let request_codec = json!({
             "sessionId":info["sessionId"],
             "negotiatedStreamProfile":request_profile
@@ -1198,22 +1205,25 @@ fn requested_streaming_base(
     settings: &Value,
     auth: &AuthSession,
 ) -> Result<Url, ServiceError> {
-    let raw = params["streamingBaseUrl"]
+    let raw: String = params["streamingBaseUrl"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
         .or_else(|| {
             settings["region"]
                 .as_str()
                 .filter(|value| value.starts_with("https://"))
+                .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| {
-            if auth.provider.streaming_service_url.trim().is_empty() {
-                DEFAULT_STREAMING_BASE
+            let effective = crate::gfn::effective_provider_url(&auth.provider);
+            if effective.trim().is_empty() {
+                DEFAULT_STREAMING_BASE.to_owned()
             } else {
-                &auth.provider.streaming_service_url
+                effective
             }
         });
-    trusted_cloudmatch_base(raw)
+    trusted_cloudmatch_base(&raw)
 }
 
 fn claim_lookup_base(discovered: Option<&Value>, zone_base: &Url) -> Url {
@@ -1336,7 +1346,10 @@ fn monitor_display_data(hdr: bool, settings: &Value) -> Value {
 fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: &str) -> Value {
     let (width, height) = parse_resolution(&setting_string(settings, "resolution", "1920x1080"));
     let fps = crate::frame_rate::request_frame_rate(settings, params, width, height);
-    let bitrate = setting_i64(settings, "maxBitrateMbps", 75).clamp(1, 200) * 1000;
+    // The codec stays client-selected: the official Bifrost client resolves it from local
+    // preferences ("Selected %s codec from client preferences") and announces the choice
+    // at RTSP time (x-nv-vqos bitStreamFormat). It is only read here to constrain the
+    // requested color envelope, never sent to CloudMatch.
     let codec = codec_wire(&setting_string(settings, "codec", "auto"));
     let hdr = setting_bool(settings, "enableHdr", false)
         && setting_bool(settings, "nativeHdrSupported", false)
@@ -1361,19 +1374,20 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     let reflex = cloud_gsync || fps >= 120;
     let persistence = setting_bool(settings, "enablePersistingInGameSettings", true)
         && params["supportsInGameSettingsPersistence"].as_bool() == Some(true);
-    let physical_resolution = json!({
-        "horizontalPixels": width,
-        "verticalPixels": height
-    })
-    .to_string();
+    // Session metadata, matching the official client: SubSessionId correlates the
+    // allocation, surroundAudioInfo describes the audio layout. No network, signaling,
+    // IME, or resolution hints: none of those keys exist in the official request path.
     let metadata = vec![
-        json!({"key":"ClientImeSupport","value":"0"}),
         json!({"key":"SubSessionId","value":random_uuid()}),
-        json!({"key":"clientPhysicalResolution","value":physical_resolution}),
-        json!({"key":"networkType","value":"Unknown"}),
-        json!({"key":"wssignaling","value":"1"}),
         json!({"key":"surroundAudioInfo","value":"2"}),
     ];
+    // requestedStreamingFeatures, field-for-field with the official Bifrost request
+    // builder: reflex, bitDepth, cloudGsync, enabledL4S, mouseMovementFlags, trueHdr,
+    // supportedHidDevices, profile, fallbackToLogicalResolution, hidDevices,
+    // chromaFormat, prefilterMode/Sharpness/NoiseReduction, hudStreamingMode.
+    // Codec, bitrate ceiling, vsync, channel count, QoS policy, touch support, and the
+    // dynamic quality policy are deliberately absent: the official client resolves the
+    // codec locally and carries bitrate/policy purely in the RTSP ANNOUNCE.
     let mut features = json!({
         "reflex":reflex,
         "bitDepth":bit_depth,
@@ -1386,21 +1400,13 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
         "prefilterMode":0,
         "prefilterSharpness":0,
         "prefilterNoiseReduction":0,
-        "hudStreamingMode":0,
-        "codec":codec,
-        "maxBitrateKbps":bitrate,
-        "vsync":false,
-        "audioChannelCount":2
+        "hudStreamingMode":0
     });
     features["mouseMovementFlags"] = json!(0);
     features["trueHdr"] = json!(hdr);
     features["hidDevices"] = Value::Null;
-    features["qosPolicy"] = json!(0);
-    features["touchSupport"] = json!(false);
-    features["dynamicStreamingMode"] = json!(dynamic_streaming_mode(settings));
     json!({"sessionRequestData":{
         "appId":app_id.parse::<i64>().unwrap_or_default(),
-        "externalAppId":null,
         "internalTitle":params["title"].as_str(),
         "availableSupportedControllers":[2],
         "preferredController":2,
@@ -2453,16 +2459,8 @@ fn setting_string(settings: &Value, key: &str, fallback: &str) -> String {
         .to_owned()
 }
 
-fn setting_i64(settings: &Value, key: &str, fallback: i64) -> i64 {
-    value_i64(&settings[key]).unwrap_or(fallback)
-}
-
 fn setting_bool(settings: &Value, key: &str, fallback: bool) -> bool {
     settings[key].as_bool().unwrap_or(fallback)
-}
-
-fn dynamic_streaming_mode(settings: &Value) -> u8 {
-    u8::from(setting_bool(settings, "saveBandwidth", false))
 }
 
 fn resolved_cloud_gsync(settings: &Value) -> bool {
@@ -3895,7 +3893,6 @@ mod tests {
             assert_eq!(request["sdrHdrMode"], 1);
             assert_eq!(request["clientRequestMonitorSettings"][0]["sdrHdrMode"], 1);
             assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], true);
-            assert_eq!(request["requestedStreamingFeatures"]["codec"], 2);
             assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
             assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 1);
         }
@@ -3932,7 +3929,6 @@ mod tests {
         assert_eq!(request["sdrHdrMode"], 1);
         assert_eq!(request["clientRequestMonitorSettings"][0]["sdrHdrMode"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["trueHdr"], true);
-        assert_eq!(request["requestedStreamingFeatures"]["codec"], 2);
         assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 0);
         let display_data = &request["clientRequestMonitorSettings"][0]["displayData"];
@@ -4291,11 +4287,16 @@ mod tests {
             request["clientRequestMonitorSettings"][0]["widthInPixels"],
             2560
         );
-        assert_eq!(request["requestedStreamingFeatures"]["codec"], 3);
-        assert_eq!(
-            request["requestedStreamingFeatures"]["maxBitrateKbps"],
-            80000
+        // Codec, bitrate ceiling, and the dynamic quality policy stay
+        // client-side: the official request carries neither, resolving the codec
+        // locally and the policy at RTSP ANNOUNCE time.
+        assert!(request["requestedStreamingFeatures"].get("codec").is_none());
+        assert!(
+            request["requestedStreamingFeatures"]
+                .get("maxBitrateKbps")
+                .is_none()
         );
+        assert!(request.get("externalAppId").is_none());
         assert_eq!(request["enablePersistingInGameSettings"], true);
         assert_eq!(request["internalTitle"], "Portal 2");
         assert_eq!(request["accountLinked"], true);
@@ -4308,9 +4309,10 @@ mod tests {
                 .iter()
                 .all(|entry| entry["key"] != "GSStreamerType")
         );
-        assert_eq!(
-            request["requestedStreamingFeatures"]["dynamicStreamingMode"],
-            0
+        assert!(
+            request["requestedStreamingFeatures"]
+                .get("dynamicStreamingMode")
+                .is_none()
         );
     }
 
@@ -4348,15 +4350,16 @@ mod tests {
     }
 
     #[test]
-    fn native_request_does_not_invent_the_clients_network_type() {
+    fn session_metadata_matches_the_official_pair_set() {
         let body = build_create_body("12345", &json!({}), &json!({}), "device-id");
-        let network = body["sessionRequestData"]["metaData"]
+        let mut keys: Vec<&str> = body["sessionRequestData"]["metaData"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["key"] == "networkType")
-            .unwrap();
-        assert_eq!(network["value"], "Unknown");
+            .map(|entry| entry["key"].as_str().unwrap())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["SubSessionId", "surroundAudioInfo"]);
     }
 
     #[test]
@@ -4384,13 +4387,15 @@ mod tests {
             "device-id",
         );
         let features = &body["sessionRequestData"]["requestedStreamingFeatures"];
-        assert_eq!(features["codec"], 0);
+        assert!(features.get("codec").is_none());
         assert_eq!(features["bitDepth"], 1);
         assert_eq!(features["chromaFormat"], 1);
-        assert_eq!(features["maxBitrateKbps"], 75_000);
-        assert_eq!(features["dynamicStreamingMode"], 0);
-        assert_eq!(features["audioChannelCount"], 2);
-        assert_eq!(features["vsync"], false);
+        assert!(features.get("maxBitrateKbps").is_none());
+        assert!(features.get("dynamicStreamingMode").is_none());
+        assert!(features.get("audioChannelCount").is_none());
+        assert!(features.get("vsync").is_none());
+        assert!(features.get("qosPolicy").is_none());
+        assert!(features.get("touchSupport").is_none());
     }
 
     #[test]
@@ -4507,12 +4512,13 @@ mod tests {
             "device-id",
         );
         let request = &body["sessionRequestData"];
-        assert_eq!(request["requestedStreamingFeatures"]["codec"], 3);
+        assert!(request["requestedStreamingFeatures"].get("codec").is_none());
         assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 0);
-        assert_eq!(
-            request["requestedStreamingFeatures"]["dynamicStreamingMode"],
-            0
+        assert!(
+            request["requestedStreamingFeatures"]
+                .get("dynamicStreamingMode")
+                .is_none()
         );
         assert_eq!(request["secureRTSPSupported"], true);
     }
@@ -4526,14 +4532,16 @@ mod tests {
             "device-id",
         );
         let features = &body["sessionRequestData"]["requestedStreamingFeatures"];
-        assert_eq!(features["codec"], 3);
+        assert!(features.get("codec").is_none());
         assert_eq!(features["bitDepth"], 1);
         assert_eq!(features["chromaFormat"], 0);
     }
 
     #[test]
-    fn bandwidth_saving_requests_the_prefer_fps_dynamic_quality_policy() {
-        for (saved, mode) in [(None, 0), (Some(false), 0), (Some(true), 1)] {
+    fn bandwidth_saving_stays_client_side_and_out_of_the_cloudmatch_request() {
+        // The official client never sends dynamicStreamingMode to CloudMatch: the
+        // bandwidth policy is an RTSP ANNOUNCE value resolved from live settings.
+        for saved in [None, Some(false), Some(true)] {
             let mut settings = json!({
                 "resolution":"1920x1080",
                 "fps":60,
@@ -4548,9 +4556,10 @@ mod tests {
                 &settings,
                 "device-id",
             );
-            assert_eq!(
-                body["sessionRequestData"]["requestedStreamingFeatures"]["dynamicStreamingMode"],
-                mode
+            assert!(
+                body["sessionRequestData"]["requestedStreamingFeatures"]
+                    .get("dynamicStreamingMode")
+                    .is_none()
             );
         }
     }
@@ -4584,7 +4593,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_h265_preserves_codec_and_ten_bit_color_on_native_nvst() {
+    fn manual_h265_preserves_ten_bit_color_on_native_nvst() {
         let body = build_create_body(
             "12345",
             &json!({"title":"Portal 2"}),
@@ -4596,12 +4605,13 @@ mod tests {
             "device-id",
         );
         let request = &body["sessionRequestData"];
-        assert_eq!(request["requestedStreamingFeatures"]["codec"], 2);
+        assert!(request["requestedStreamingFeatures"].get("codec").is_none());
         assert_eq!(request["requestedStreamingFeatures"]["bitDepth"], 1);
         assert_eq!(request["requestedStreamingFeatures"]["chromaFormat"], 0);
-        assert_eq!(
-            request["requestedStreamingFeatures"]["dynamicStreamingMode"],
-            0
+        assert!(
+            request["requestedStreamingFeatures"]
+                .get("dynamicStreamingMode")
+                .is_none()
         );
         assert_eq!(request["secureRTSPSupported"], true);
     }
@@ -4619,7 +4629,7 @@ mod tests {
             "device-id",
         );
         let features = &body["sessionRequestData"]["requestedStreamingFeatures"];
-        assert_eq!(features["codec"], 1);
+        assert!(features.get("codec").is_none());
         assert_eq!(features["bitDepth"], 0);
         assert_eq!(features["chromaFormat"], 0);
     }
@@ -4667,11 +4677,18 @@ mod tests {
     }
 
     #[test]
-    fn omitted_codec_preserves_the_exact_session_request_through_hdr_preparation() {
+    fn omitted_codec_keeps_the_client_selected_codec_through_hdr_preparation() {
         let base = Url::parse(DEFAULT_STREAMING_BASE).unwrap();
         let requested = json!({"codec":"h265","colorQuality":"10bit_420","enableHdr":true,"nativeHdrSupported":true});
         let body = build_create_body("123", &json!({}), &requested, "device");
-        let mut initial = session_info(
+        // The official request names no codec: color is negotiated, the codec
+        // stays a client selection until the RTSP ANNOUNCE.
+        assert!(
+            body["sessionRequestData"]["requestedStreamingFeatures"]
+                .get("codec")
+                .is_none()
+        );
+        let initial = session_info(
             &json!({"session":{"sessionId":"omitted-codec","status":1,"sdrHdrMode":1}}),
             &base,
             "auto",
@@ -4679,12 +4696,7 @@ mod tests {
             "device",
         )
         .unwrap();
-        let request = json!({"sessionId":initial["sessionId"],"negotiatedStreamProfile":{
-            "codec":codec_from_wire(&body["sessionRequestData"]["requestedStreamingFeatures"]["codec"]),
-            "codecSource":"request"
-        }});
-        preserve_session_profile(&mut initial, &request);
-        assert_eq!(initial["negotiatedStreamProfile"]["codec"], "H265");
+        assert_eq!(initial["negotiatedStreamProfile"]["codec"], Value::Null);
         let capabilities = json!({"protocolVersion":7,"nativeHdrSupported":true,"videoBackends":[{
             "backend":"videotoolbox","platform":"macos","available":true,"codecs":[{
                 "codec":"h265","available":true,"hdrSupported":true,
@@ -4705,12 +4717,11 @@ mod tests {
             .unwrap();
             assert_eq!(ready["negotiatedStreamProfile"]["codec"], Value::Null);
             preserve_session_profile(&mut ready, &initial);
-            assert_eq!(ready["negotiatedStreamProfile"]["codec"], "H265");
-            assert_eq!(ready["negotiatedStreamProfile"]["codecSource"], "request");
+            assert_eq!(ready["negotiatedStreamProfile"]["codec"], Value::Null);
             let prepared = crate::streamer::StreamerService::new()
                 .prepare_embedded(
                     &json!({"session":ready,"runtimeCapabilities":capabilities}),
-                    &json!({"codec":"h264","colorQuality":"8bit_420","enableHdr":false}),
+                    &json!({"codec":"h265","colorQuality":"10bit_420","enableHdr":true}),
                 )
                 .unwrap();
             assert_eq!(prepared["context"]["settings"]["codec"], "H265");

@@ -1113,3 +1113,38 @@ fn delayed_poll_fences_ordinary_results_but_preserves_exact_seat_termination() {
         }
     }
 }
+
+#[test]
+fn digevo_unreachable_discovery_endpoint_falls_back_to_latam_west() {
+    let stale = LoginProvider {
+        idp_id: PROVIDER_FALLBACKS[0].idp_id.to_owned(),
+        code: "DIG".to_owned(),
+        display_name: "Digevo".to_owned(),
+        streaming_service_url: "https://prod.DIG.geforcenow.nvidiagrid.net/".to_owned(),
+        priority: 10,
+    };
+    // NXDOMAIN (out of footprint, no VPN): use the verified regional fallback.
+    assert_eq!(
+        effective_provider_url_with(&stale, |_| false),
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+    // Reachable (VPN / in footprint): keep the geo-steered discovery endpoint.
+    assert_eq!(
+        effective_provider_url_with(&stale, |_| true),
+        "https://prod.DIG.geforcenow.nvidiagrid.net/"
+    );
+    // Non-Digevo providers and already-regional Digevo URLs are untouched.
+    let nvidia = LoginProvider::default_nvidia();
+    assert_eq!(
+        effective_provider_url_with(&nvidia, |_| false),
+        "https://prod.cloudmatchbeta.nvidiagrid.net/"
+    );
+    let current = LoginProvider {
+        streaming_service_url: "https://latam-west.dig.geforcenow.nvidiagrid.net/".to_owned(),
+        ..stale
+    };
+    assert_eq!(
+        effective_provider_url_with(&current, |_| false),
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+}

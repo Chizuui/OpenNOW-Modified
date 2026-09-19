@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +36,30 @@ mod store_launch_tests;
 
 const DEFAULT_IDP_ID: &str = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 const DEFAULT_STREAMING_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
+// Alliance `prod.*` discovery endpoints are geo-steered: they resolve to the
+// nearest regional PoP from inside the partner footprint (via VPN or local
+// presence) and return NODATA/NXDOMAIN from outside it. For partners below,
+// discovery still advertises only the `prod.*` name, so out-of-footprint
+// users get no DNS at all. Each entry maps that stale name to a globally
+// reachable regional endpoint in the same `nvidiagrid.net` trust policy. The
+// fallback engages only when the advertised host fails DNS resolution, so
+// in-footprint users keep native geo-steering untouched.
+struct ProviderFallback {
+    idp_id: &'static str,
+    stale_host: &'static str,
+    fallback_url: &'static str,
+}
+
+const PROVIDER_FALLBACKS: &[ProviderFallback] = &[
+    // Verified live Sep 2026: serverId NPA-DIG-SCL-01, region "LATAM West",
+    // session create and first video frame at 1080p60 H264. Digevo also
+    // serves LATAM North (Bogota) via geo-steered `prod.dig`.
+    ProviderFallback {
+        idp_id: "IsvVBA3Aj8KZ7gwwuRUhB6-tOF2o2F1wncD-XjYv100",
+        stale_host: "prod.dig.geforcenow.nvidiagrid.net",
+        fallback_url: "https://latam-west.dig.geforcenow.nvidiagrid.net/",
+    },
+];
 const STEAM_DECK_CLIENT_ID: &str = "q61ddeJrVt7O90Nl-P-N7I36yctih4Ml6FyXLrb6j-U";
 const SCOPES: &str = "openid consent email tk_client age";
 const STEAM_DECK_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; Steam Deck) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
@@ -109,11 +134,53 @@ impl LoginProvider {
     }
 
     fn normalize(mut self) -> Self {
+        self.streaming_service_url = effective_provider_url(&self);
         if !self.streaming_service_url.ends_with('/') {
             self.streaming_service_url.push('/');
         }
         self
     }
+}
+
+pub(crate) fn effective_provider_url(provider: &LoginProvider) -> String {
+    effective_provider_url_with(provider, host_resolves)
+}
+
+fn host_resolves(host: &str) -> bool {
+    // The port is irrelevant; this only exercises DNS resolution. NXDOMAIN
+    // answers fast, and successes are OS-cached, so the probe stays cheap
+    // next to the HTTPS calls every caller issues afterwards.
+    format!("{host}:443")
+        .to_socket_addrs()
+        .is_ok_and(|mut addresses| addresses.next().is_some())
+}
+
+fn effective_provider_url_with(
+    provider: &LoginProvider,
+    resolves: impl Fn(&str) -> bool,
+) -> String {
+    let raw = provider.streaming_service_url.trim();
+    let host = url::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let fallback = PROVIDER_FALLBACKS.iter().find(|entry| {
+        provider.idp_id == entry.idp_id && host.eq_ignore_ascii_case(entry.stale_host)
+    });
+    match fallback {
+        Some(entry) if !resolves(&host) => {
+            eprintln!(
+                "provider: {} discovery endpoint is unreachable; using fallback {}",
+                provider.code, entry.fallback_url
+            );
+            entry.fallback_url.to_owned()
+        }
+        _ => raw.to_owned(),
+    }
+}
+
+pub(crate) fn provider_streaming_base(provider: &LoginProvider) -> Result<url::Url, ServiceError> {
+    trusted_streaming_base(&effective_provider_url(provider))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1404,13 +1471,13 @@ impl GfnService {
         write: impl FnOnce() -> Result<T, ServiceError>,
     ) -> Result<T, ServiceError> {
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        if !self
+        if self
             .state
             .lock()
             .expect("GFN state poisoned")
             .session
             .as_ref()
-            .is_some_and(|session| session.provider.idp_id == provider)
+            .is_none_or(|session| session.provider.idp_id != provider)
         {
             return Err(ServiceError {
                 code: "stale_account",
@@ -1682,7 +1749,7 @@ impl GfnService {
         session: &AuthSession,
     ) -> Result<Value, ServiceError> {
         let token = session.tokens.service_token();
-        let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
+        let base = provider_streaming_base(&session.provider)?;
         let url = self.server_info_url(&base)?;
         let response = client
             .get(url)
@@ -2140,7 +2207,7 @@ impl GfnService {
         {
             session.provider = provider.clone();
         }
-        trusted_streaming_base(&session.provider.streaming_service_url)?;
+        provider_streaming_base(&session.provider)?;
         Ok((session, state.generation))
     }
 
@@ -2491,7 +2558,7 @@ impl GfnService {
                         })?;
                     session.provider = provider.clone();
                 }
-                trusted_streaming_base(&session.provider.streaming_service_url)?;
+                provider_streaming_base(&session.provider)?;
                 Ok((session, state.generation))
             })
             .ok_or_else(|| ServiceError {
@@ -2610,7 +2677,7 @@ impl GfnService {
         requests: Option<&crate::store_requests::StoreRequests>,
     ) -> Result<String, ServiceError> {
         self.check_scope(session, generation)?;
-        let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
+        let base = provider_streaming_base(&session.provider)?;
         let url = self.server_info_url(&base)?;
         let headers = lcars_headers(token, "NATIVE", "NVIDIA-CLASSIC", false)?;
         self.server_vpc_cache.resolve(

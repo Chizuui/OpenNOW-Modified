@@ -10,6 +10,7 @@ const EMPTY_TRANSPORT_URIS: [&str; 4] = [
     "rtsps://seat.nvidiagrid.net:322/streamid=video/0",
 ];
 
+#[derive(Clone, Copy)]
 struct Reply {
     uri: &'static str,
     transport: &'static str,
@@ -18,6 +19,14 @@ struct Reply {
 }
 
 fn scripted_setup(replies: Vec<Reply>) -> Result<VideoSetup, NvstRtspError> {
+    scripted_setup_with_retry(replies, 0, Duration::ZERO)
+}
+
+fn scripted_setup_with_retry(
+    replies: Vec<Reply>,
+    max_peer_retries: u32,
+    peer_retry_delay: Duration,
+) -> Result<VideoSetup, NvstRtspError> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let stream = TcpStream::connect(address).unwrap();
@@ -67,7 +76,7 @@ fn scripted_setup(replies: Vec<Reply>) -> Result<VideoSetup, NvstRtspError> {
         cseq: 2,
         buffer: String::new(),
     };
-    let result = client.setup_video(
+    let result = client.setup_video_with_retry(
         "streamid=video/0",
         TARGET,
         &[
@@ -76,6 +85,8 @@ fn scripted_setup(replies: Vec<Reply>) -> Result<VideoSetup, NvstRtspError> {
             ("x-nv-ping", "6".to_owned()),
         ],
         49005,
+        max_peer_retries,
+        peer_retry_delay,
     );
     drop(client);
     server.join().unwrap();
@@ -304,4 +315,78 @@ fn rtsp_request_deadline_bounds_a_partial_response() {
         elapsed < Duration::from_secs(1),
         "deadline exceeded: {elapsed:?}"
     );
+}
+
+#[test]
+fn video_setup_resweeps_when_successes_omit_a_peer_until_the_rig_is_ready() {
+    // Round 1: the rig 200s every form but has no video peer yet. Round 2:
+    // the first URI succeeds with a peer. Mirrors a late-starting encoder.
+    let mut replies: Vec<_> = ["", "unicast;X-GS-ClientPort=49005-49006"]
+        .iter()
+        .flat_map(|transport| {
+            EMPTY_TRANSPORT_URIS.iter().map(move |uri| Reply {
+                uri,
+                transport,
+                status: 200,
+                headers: "",
+            })
+        })
+        .collect();
+    replies.push(Reply {
+        uri: EMPTY_TRANSPORT_URIS[0],
+        transport: "",
+        status: 200,
+        headers: VALID_PEER,
+    });
+    let setup = scripted_setup_with_retry(replies, 3, Duration::ZERO).unwrap();
+    assert_eq!(setup.peer, ("192.0.2.10".to_owned(), 5004, 5005));
+}
+
+#[test]
+fn video_setup_peer_retry_stays_bounded_and_keeps_the_terminal_code() {
+    // Every round 200s without a peer: retries exhaust, then the original
+    // missing-video-peer error (not a timeout, not a new code) is returned.
+    let one_round: Vec<_> = ["", "unicast;X-GS-ClientPort=49005-49006"]
+        .iter()
+        .flat_map(|transport| {
+            EMPTY_TRANSPORT_URIS.iter().map(move |uri| Reply {
+                uri,
+                transport,
+                status: 200,
+                headers: "",
+            })
+        })
+        .collect();
+    let mut replies = Vec::new();
+    for _ in 0..3 {
+        replies.extend(one_round.iter().cloned());
+    }
+    let error = match scripted_setup_with_retry(replies, 2, Duration::ZERO) {
+        Ok(_) => panic!("SETUP without a peer must not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "missing-video-peer");
+    assert!(error.message.contains("4 URI forms and 2 Transport forms"));
+}
+
+#[test]
+fn video_setup_never_retries_pure_rejections() {
+    // No 200 seen at all: the forms are wrong for this server, so fail fast
+    // without burning retry rounds.
+    let replies: Vec<_> = ["", "unicast;X-GS-ClientPort=49005-49006"]
+        .iter()
+        .flat_map(|transport| {
+            EMPTY_TRANSPORT_URIS.iter().map(move |uri| Reply {
+                uri,
+                transport,
+                status: 400,
+                headers: "",
+            })
+        })
+        .collect();
+    let error = match scripted_setup_with_retry(replies, 3, Duration::ZERO) {
+        Ok(_) => panic!("rejected SETUP forms must not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "nvst-rtsp-failed");
 }

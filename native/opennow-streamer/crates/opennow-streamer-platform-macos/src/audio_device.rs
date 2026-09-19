@@ -15,9 +15,9 @@ pub(crate) fn validate_audio_output_device(id: Option<&str>) -> Result<(), Forma
     };
     if id.len() > MAX_AUDIO_OUTPUT_DEVICE_ID_BYTES
         || id.contains('\0')
-        || !id
+        || id
             .strip_prefix(AUDIO_OUTPUT_DEVICE_PREFIX)
-            .is_some_and(|uid| !uid.is_empty())
+            .is_none_or(|uid| uid.is_empty())
     {
         return Err(FormatError::InvalidAudioOutputDevice);
     }
