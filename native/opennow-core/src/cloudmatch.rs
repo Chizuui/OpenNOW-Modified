@@ -4688,7 +4688,7 @@ mod tests {
                 .get("codec")
                 .is_none()
         );
-        let mut initial = session_info(
+        let initial = session_info(
             &json!({"session":{"sessionId":"omitted-codec","status":1,"sdrHdrMode":1}}),
             &base,
             "auto",
