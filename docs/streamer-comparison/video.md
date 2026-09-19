@@ -2,7 +2,7 @@
 
 ## Overview
 
-Both clients decode HEVC or H.264 on Windows with D3D11 and present with a tearing-allowed flip swapchain. Official GFN on this machine ran 10-bit HEVC at 2560×1440@120 for about 76 minutes. OpenNOW's native CloudMatch path forces 8-bit 4:2:0 before the seat is created, then presents 8-bit BGRA even if a 10-bit bitstream arrives.
+Both clients decode HEVC or H.264 on Windows with D3D11 and present with a tearing-allowed flip swapchain. Official GFN on this machine ran 10-bit HEVC at 2560×1440@120 for about 76 minutes. OpenNOW's native CloudMatch path requests the saved color depth/chroma and validates it against local decode before the seat is created.
 
 Recovery is the other split. Official GFN NACKs, then flushes a stalled decode queue, then sends IDR, then invalidates references and can freeze the display on a bad ref. OpenNOW NACKs, then sends RTCP PLI plus control `0x302`. It has no reference-invalidation command.
 
@@ -22,28 +22,25 @@ If you stream on OpenNOW today, you get the official two-socket video path with 
 
 The user changes `resolution`, `fps`, `codec`, `maxBitrateMbps`, and `colorQuality` in Qt. Those values land in `%APPDATA%/OpenNOW/settings.json`. Launch does not resend the profile. `session.create` re-reads the store.
 
-`cloudmatch.rs` `build_create_body` maps the store onto NVIDIA `sessionRequestData`.
-
-On the native path it then overwrites color:
-
-```
-if native {
-    bit_depth = 0;
-    chroma = 0;
-}
-```
-
-`trueHdr` is forced false. `maxBitrateKbps` is omitted from the feature bag. Bitrate still reaches the streamer later through ANNOUNCE `x-nv-vqos` and `MediaStreamConfig`.
-
-`codec: "auto"` on native requests H.264 on purpose so CloudMatch cannot pick AV1 or HEVC before local decode is known. Official Auto is wire `0` and this machine still selected HEVC.
+`cloudmatch.rs` `build_create_body` maps the store onto NVIDIA `sessionRequestData`,
+field-for-field with the official client's request builder: monitor geometry plus
+`requestedStreamingFeatures` with `reflex`, `bitDepth`, `cloudGsync`, `enabledL4S`,
+`mouseMovementFlags`, `trueHdr`, `supportedHidDevices`, `profile`,
+`fallbackToLogicalResolution`, `hidDevices`, `chromaFormat`, and the
+prefilter/HUD tunables. Color follows the saved preference constrained by codec
+(H.264 stays 8-bit 4:2:0, AV1 stays 4:2:0); `trueHdr` is set only for a validated
+HDR request. Codec, bitrate ceiling, vsync, channel count, QoS policy, touch
+support, and the dynamic quality policy are omitted from the feature bag: the
+official client resolves the codec locally and carries bitrate/policy purely in
+the RTSP ANNOUNCE (`x-nv-vqos` and `MediaStreamConfig`).
 
 Desktop AUTO FPS writes `0`. Core resolves the request through `frame_rate::request_frame_rate`: a missing `fps` defaults to 60 and any present value clamps to the 30–360 request range, so the stored AUTO `0` clamps to 30. Resolution then caps that at 360 for 1920x1080 and 1920x1200 and 240 elsewhere, and rates above 240 additionally need an entitlement at least that high plus a confirmed hardware decoder for the selected codec, otherwise they fall back to the entitlement capped at 240, or to 240 when no entitlement is reported.
 
 `OPENNOW_NATIVE_VIDEO_BACKEND` comes from `nativeVideoBackend` and `decoderPreference`. Auto prefers D3D12 for H.264 and H.265 when the probe succeeds. AV1 auto stays on D3D11 because D3D11-on-12 would flush every frame.
 
-`saveBandwidth` selects the NVIDIA `dynamicStreamingMode` policy requested at `session.create`. The official shared settings schema defines `0` off/do-not-adjust, `1` prefer-FPS, `2` prefer-resolution, and `3` on, and the official client passes the selected profile value into the streaming start request. OpenNOW exposes the bandwidth-saving half of that policy as one toggle and requests `1` (prefer-FPS) when it is on, matching the official Data Saver, Balanced, and Competitive profiles. Off requests `0`, so the request is unchanged.
+`saveBandwidth` selects the NVIDIA `dynamicStreamingMode` policy announced at RTSP ANNOUNCE time. The official shared settings schema defines `0` off/do-not-adjust, `1` prefer-FPS, `2` prefer-resolution, and `3` on. The official client never sends this policy to CloudMatch — it exists only as the `x-nv-vqos` ANNOUNCE value resolved from live settings — and OpenNOW matches that: `1` (prefer-FPS) when the toggle is on, matching the official Data Saver, Balanced, and Competitive profiles, else `0`. A server-finalized policy in the negotiated profile, when present, still wins over the live setting.
 
-The request is remembered per session, not per preference. `negotiatedStreamProfile.dynamicStreamingMode` is resolved from the session's own feature bag (finalized overrides the requested echo, out-of-range falls back to unreported), and NVST ANNOUNCE reads only that. RESUME omits requested streaming features by design, so a resumed session keeps the policy it was created with, and toggling the setting mid-session cannot change the wire policy of the running session.
+The negotiated value, when the server reports one, is resolved from the session's own feature bag (finalized overrides the requested echo, out-of-range falls back to unreported). Toggling the setting mid-session cannot change the wire policy of the running session; it applies at the next ANNOUNCE.
 
 At the streamer, ANNOUNCE sends `x-nv-vqos[0].dynamicStreamingMode` with that policy and `x-nv-vqos[0].dfc.adjustResAndFps` as the binary enable that follows it (`1` whenever the policy is non-zero). `x-nv-vqos[0].drc.enable` and the `resControl` attributes keep their existing values: `drc` is the separate bitrate axis, and the `resControl` attributes are not emitted by OpenNOW at all, so omitting them inherits the streamer default rather than overriding it.
 

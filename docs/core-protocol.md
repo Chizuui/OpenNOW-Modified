@@ -825,8 +825,12 @@ CloudMatch chroma enums are `0` for 4:2:0 and `1` for 4:4:4; NVST chroma-format 
 When present, `session.negotiatedStreamProfile.codec` takes precedence over the numeric
 feature-map codec. H.264/AVC and H.265/HEVC names normalize to `H264` and `H265`;
 `AV1` remains unchanged. An explicit null or unsupported codec stays unknown rather
-than falling back to a requested codec. When the server omits every codec field, a new
-allocation retains the exact codec sent in that allocation's request. Polling, direct-server
+than falling back to a requested codec. The request itself names no codec: like the
+official client, codec selection stays client-side and reaches the seat in the RTSP
+ANNOUNCE (`x-nv-vqos` bit-stream format), so a negotiated codec is only ever
+server-reported (echo, finalized features, or a direct profile). When the server omits
+every codec field, downstream stages resolve the codec from current saved preferences
+instead. Polling, direct-server
 responses, claims, and ad updates preserve that evidence only for the same session ID.
 `codecSource` distinguishes `request`, `server`, and `unreported`; a reported codec supersedes
 the request and remains authoritative in later partial responses. Unknown discovered sessions
@@ -840,33 +844,24 @@ reducing chroma; an explicit incompatible codec remains an error.
 
 The native context preserves the resolved profile and codec provenance. Its accepted
 `enableHdr` initializes the native HDR mode (missing means false). Invalid accepted HDR
-profiles are rejected before stream startup. NVST color negotiation uses literal bit depth
-`8` or `10`, `chromaFormat=0` for 4:2:0 or `1` for 4:4:4, and
-`dynamicRangeMode=0` for SDR or `1` for HDR. The NVST chroma enum is distinct from the
-elementary video's `chroma_format_idc` values `1` and `3`; CloudMatch's existing bit-depth
-enum remains `0` or `1`.
+profiles are rejected before stream startup. NVST ANNOUNCE states color explicitly on
+every session using literal bit depth `8` or `10` with `chroma_format_idc`
+(`chromaFormat=1` for 4:2:0, `3` for 4:4:4); `dynamicRangeMode=1` is sent for HDR
+only, and SDR omits the line. This matches the vendor capture of a `10bit_420`
+session (`bitDepth:10 chromaFormat:1`) and the working third-party reference
+clients: a lone `bitDepth` line is never sent, because seats cannot initialize
+an encoder from an incomplete color spec. The internal 0/1 chroma value from the
+client's app-to-NVST conversion is mapped back to idc at SDP emission and never
+reaches the wire. CloudMatch keeps its own bit-depth enum (`0` or `1`) with
+chroma `0`/`1`.
 
-These native values follow the built-in conversion and serializer in the official Linux
-GeForce NOW 2.0.84.127 `libBifrost2.so`, SHA-256
-`8400714f98b7db928ef4377515b1ed35be12523b7fa306566e776b76965537c9`.
-The application-to-NVST chroma conversion is at ELF address `0x1f5d50`, and the unchanged
-byte reaches the SDP formatter through `0x4e0fc5` and `0x3792c5`.
-
-The main DESCRIBE SDP supplies a comparison baseline, not replacement client preferences.
-Its defaults are 8-bit 4:2:0 SDR. Once color attributes or the native-bundle configuration
-are recognized, ANNOUNCE omits color values equal to that baseline. The `;;` new-features
-suffix overrides the selected bit depth, chroma and dynamic-range mode before ANNOUNCE.
-One resolved configuration feeds both the wire values and the media runtime, so a server
-downgrade or upgrade cannot leave the decoder expecting the old color format. The stored
-CloudMatch profile and user preferences are not rewritten.
-
-Overrides are restricted to these primary-stream color attributes. Malformed or conflicting
-values fail with `nvst-color-invalid`; unsupported depth, chroma, dynamic range or codec
-combinations fail with `nvst-color-unsupported` before ANNOUNCE. Existing media-runtime
-hardware and output checks remain in place. Full SDP must not be logged because it contains ICE
-credentials and encryption material. The earlier Mac-reference claim of NVST chroma `1/3`
-does not describe this built-in mapping; a captured final value must also be checked for
-server overrides and the actual selected stream format.
+The ANNOUNCE also carries the encoder identity the seat reads before
+initializing (`maxCodecProfile`/`maxCodecLevel` and the `maxH264` pair, profile
+3 / level 61, as captured). One resolved configuration feeds the wire values,
+the media runtime, and the decoder, so a server color choice cannot leave the
+decoder expecting a different format. The stored CloudMatch profile and user
+preferences are not rewritten. Full SDP must not be logged because it contains
+ICE credentials and encryption material.
 
 After an update check, `updater.highlights.get` returns the latest published
 release notes for the selected channel, even when that release is equal to or
@@ -975,7 +970,12 @@ pre-opt-in settings receive a one-time reset of automatic switching only;
 explicit subsequent opt-ins and the independent startup preference are preserved.
 Existing microphone device selections are cleared only when explicitly selecting Open
 microphone; that write likewise reports `"changes":{"microphoneDeviceId":""}` so the
-shell follows the system-default capture selection.
+shell follows the system-default capture selection. Setting `colorQuality` repairs an
+explicitly saved `codec` (or `fallbackCodec`) the new color mode cannot use toward
+`auto` in the same save — H.264 is 8-bit 4:2:0 only, AV1 is 4:2:0 only — and reports
+the repair in `changes`. Explicit `codec`/`fallbackCodec` selections the saved color
+cannot use are rejected as `invalid_setting` instead; unknown spellings still clamp
+to Auto.
 
 `onboardingCompleted` is a persisted boolean, defaulting to `false` for a new
 profile or an unreadable or malformed settings file. A valid existing settings

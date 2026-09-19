@@ -12,6 +12,7 @@ TestCase {
         i18n: null
         ready: false
         subscription: null
+        authSession: null
         nativeRuntimeReady: false
         nativeRuntimeCapabilities: ({})
         refreshAccountServices: function() {}

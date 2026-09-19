@@ -293,8 +293,9 @@ impl StreamerService {
             .unwrap_or("auto")
             .trim()
             .to_ascii_lowercase();
-        // Auto currently requests the portable H.264 baseline from CloudMatch. Probe it too:
-        // an explicit hardware-only decoder policy can make even that baseline unavailable.
+        // Auto resolves to local decode candidates at session time. Probe the
+        // portable H.264 baseline too: an explicit hardware-only decoder policy
+        // can make even that baseline unavailable.
         let codec = match requested.as_str() {
             "" | "auto" => "h264",
             _ => normalize_codec_name(&requested).ok_or_else(|| invalid("Unknown video codec"))?,
@@ -312,6 +313,21 @@ impl StreamerService {
                     candidate["colorQuality"] = json!(quality);
                     let result = Self::embedded_session_settings(&candidate, capabilities);
                     json!({"value":quality, "disabled":result.is_err(),
+                    "reason":result.err().map(|error| error.message)})
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
+    pub fn codec_choices(settings: &Value, capabilities: &Value) -> Value {
+        json!(
+            ["auto", "av1", "h264", "h265"]
+                .into_iter()
+                .map(|codec| {
+                    let mut candidate = settings.clone();
+                    candidate["codec"] = json!(codec);
+                    let result = Self::embedded_session_settings(&candidate, capabilities);
+                    json!({"value":codec, "disabled":result.is_err(),
                     "reason":result.err().map(|error| error.message)})
                 })
                 .collect::<Vec<_>>()
@@ -456,12 +472,7 @@ impl StreamerService {
                     .get("hdrSupported")
                     .map(|value| value.as_bool().unwrap_or(false));
                 let wire_supported =
-                    match normalize_codec_name(codec["codec"].as_str().unwrap_or("")) {
-                        Some("h264") => color == "8bit_420",
-                        Some("av1") => matches!(color, "8bit_420" | "10bit_420"),
-                        Some("h265") => true,
-                        _ => false,
-                    };
+                    codec_supports_color_quality(codec["codec"].as_str().unwrap_or(""), color);
                 let supported = wire_supported
                     && (!hdr || hdr_supported != Some(false))
                     && (!hdr
@@ -578,10 +589,14 @@ impl StreamerService {
             ));
         }
         let mut context = streamer_context(session, settings);
+        // The codec is client-selected (CloudMatch no longer carries it, matching
+        // the official client), so validate HDR against the normalized settings
+        // codec (negotiated-or-settings) rather than the raw profile, which is
+        // only populated when the server explicitly reports one.
         if context["settings"]["enableHdr"].as_bool() == Some(true)
             && !matches!(
                 (
-                    context["session"]["negotiatedStreamProfile"]["codec"].as_str(),
+                    context["settings"]["codec"].as_str(),
                     context["session"]["negotiatedStreamProfile"]["colorQuality"].as_str(),
                 ),
                 (Some("H265" | "HEVC"), Some("10bit_420" | "10bit_444"))
@@ -1065,6 +1080,23 @@ fn normalize_codec_name(value: &str) -> Option<&'static str> {
         "h265" | "hevc" => Some("h265"),
         "av1" => Some("av1"),
         _ => None,
+    }
+}
+
+/// GFN codec/color support matrix, matching the official client's settings gating:
+/// H.264 is 8-bit 4:2:0 only, AV1 is 4:2:0 only (8- or 10-bit), HEVC supports all
+/// four color modes, and Auto always resolves to a supported codec. Unknown names
+/// fail closed; settings normalization clamps stored values before consulting this.
+pub(crate) fn codec_supports_color_quality(codec: &str, color: &str) -> bool {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => true,
+        "h264" | "avc" => color.trim().eq_ignore_ascii_case("8bit_420"),
+        "av1" => matches!(
+            color.trim().to_ascii_lowercase().as_str(),
+            "8bit_420" | "10bit_420"
+        ),
+        "h265" | "hevc" => true,
+        _ => false,
     }
 }
 
@@ -1996,6 +2028,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn codec_descriptors_match_trial_resolution_and_the_official_matrix() {
+        let caps = json!({"protocolVersion":7,"nativeHdrSupported":true,
+        "videoBackends":[{"backend":"d3d11","available":true,
+            "codecs":[{"codec":"h264","available":true,"colorQualities":["8bit_420"]},
+                {"codec":"h265","available":true,"hdrSupported":true,
+                    "colorQualities":["8bit_420","8bit_444","10bit_420","10bit_444"],
+                    "hdrColorQualities":["10bit_420","10bit_444"]},
+                {"codec":"av1","available":true,"hdrSupported":true,
+                    "colorQualities":["8bit_420","10bit_420"]}]}]});
+        // [color, disabled codecs] mirroring the official settings gating.
+        for (color, disabled) in [
+            ("8bit_420", vec![]),
+            ("8bit_444", vec!["h264", "av1"]),
+            ("10bit_420", vec!["h264"]),
+            ("10bit_444", vec!["h264", "av1"]),
+        ] {
+            let settings = json!({"codec":"auto","colorQuality":color});
+            let choices = StreamerService::codec_choices(&settings, &caps);
+            let choices = choices.as_array().unwrap();
+            assert_eq!(choices.len(), 4);
+            for choice in choices {
+                let mut candidate = settings.clone();
+                candidate["codec"] = choice["value"].clone();
+                let result =
+                    StreamerService::embedded_session_settings(&candidate, &caps);
+                assert_eq!(choice["disabled"], result.is_err(), "{color}");
+                let value = choice["value"].as_str().unwrap();
+                assert_eq!(
+                    choice["disabled"],
+                    json!(disabled.contains(&value)),
+                    "{color}/{value}"
+                );
+            }
+            assert_eq!(settings["codec"], "auto");
         }
     }
 
