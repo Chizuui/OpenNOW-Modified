@@ -40,7 +40,10 @@ public slots:
         for (const auto *name : {"DesktopSettingsButton", "DesktopSettingsIcon"}) {
             qmlRegisterType(QUrl::fromLocalFile(source + "/desktop/settings/controls/" + name + ".qml"), "OpenNOW", 1, 0, name);
         }
-        QFontDatabase::addApplicationFont(source + "/../res/fonts/Nunito-Variable.ttf");
+        for (const auto *font : {"Nunito-Variable.ttf", "IBMPlexMono-Regular.ttf",
+                 "IBMPlexMono-Medium.ttf", "IBMPlexMono-Bold.ttf"}) {
+            QFontDatabase::addApplicationFont(source + "/../res/fonts/" + font);
+        }
         QFont applicationFont(QStringLiteral("Nunito"));
         applicationFont.setHintingPreference(QFont::PreferNoHinting);
         applicationFont.setStyleStrategy(QFont::PreferAntialias);
