@@ -59,7 +59,7 @@ if(BUILD_TESTING)
     set_tests_properties(opennow-updatefailure-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software" TIMEOUT 30)
     qt_add_executable(opennow-queueselector-tests tests/tst_queueselector.cpp)
-    target_link_libraries(opennow-queueselector-tests PRIVATE Qt6::QuickTest Qt6::Quick Qt6::QuickControls2)
+    target_link_libraries(opennow-queueselector-tests PRIVATE Qt6::QuickTest Qt6::Quick)
     target_compile_definitions(opennow-queueselector-tests PRIVATE
         OPENNOW_QML_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml")
     add_test(NAME opennow-queueselector-tests COMMAND opennow-queueselector-tests

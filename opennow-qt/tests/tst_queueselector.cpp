@@ -5,7 +5,6 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlPropertyMap>
-#include <QQuickStyle>
 #include <QtQuickTest/quicktest.h>
 
 class QueueSelectorTestSetup final : public QObject
@@ -28,7 +27,7 @@ public slots:
 
     void applicationAvailable()
     {
-        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
         QDesktopServices::setUrlHandler("https", this, "captureUrl");
         const auto source = QStringLiteral(OPENNOW_QML_SOURCE_DIR);
         qmlRegisterSingletonType(QUrl::fromLocalFile(source + "/theme/Theme.qml"), "OpenNOW", 1, 0, "Theme");
