@@ -34,6 +34,15 @@ mod store_launch_tests;
 
 const DEFAULT_IDP_ID: &str = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 const DEFAULT_STREAMING_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
+// Digevo's discovery endpoint (pcs.geforcenow.com) still advertises
+// https://prod.DIG.geforcenow.nvidiagrid.net/, but that hostname has no DNS
+// records (NODATA/NXDOMAIN globally as of Sep 2026). The working regional
+// endpoint is https://latam-west.dig.geforcenow.nvidiagrid.net/, which returns
+// serverId NPA-DIG-SCL-01 and region "LATAM West". This fallback is an HTTPS
+// NVIDIA-grid name and passes the existing trust policy.
+const DIGEVO_IDP_ID: &str = "IsvVBA3Aj8KZ7gwwuRUhB6-tOF2o2F1wncD-XjYv100";
+const DIGEVO_STALE_HOST: &str = "prod.dig.geforcenow.nvidiagrid.net";
+const DIGEVO_FALLBACK_URL: &str = "https://latam-west.dig.geforcenow.nvidiagrid.net/";
 const STEAM_DECK_CLIENT_ID: &str = "q61ddeJrVt7O90Nl-P-N7I36yctih4Ml6FyXLrb6j-U";
 const SCOPES: &str = "openid consent email tk_client age";
 const STEAM_DECK_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; Steam Deck) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
@@ -107,11 +116,42 @@ impl LoginProvider {
     }
 
     fn normalize(mut self) -> Self {
+        self.streaming_service_url = effective_provider_url(&self);
         if !self.streaming_service_url.ends_with('/') {
             self.streaming_service_url.push('/');
         }
         self
     }
+}
+
+pub(crate) fn effective_provider_url(provider: &LoginProvider) -> String {
+    let raw = provider.streaming_service_url.trim();
+    if provider.idp_id == DIGEVO_IDP_ID {
+        if let Ok(url) = url::Url::parse(raw) {
+            if url
+                .host_str()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(DIGEVO_STALE_HOST)
+            {
+                eprintln!(
+                    "provider: Digevo discovery endpoint has no DNS; using LATAM West fallback"
+                );
+                return DIGEVO_FALLBACK_URL.to_owned();
+            }
+        } else if raw.eq_ignore_ascii_case("https://prod.dig.geforcenow.nvidiagrid.net")
+            || raw.eq_ignore_ascii_case("https://prod.dig.geforcenow.nvidiagrid.net/")
+            || raw.eq_ignore_ascii_case("https://prod.DIG.geforcenow.nvidiagrid.net")
+            || raw.eq_ignore_ascii_case("https://prod.DIG.geforcenow.nvidiagrid.net/")
+        {
+            eprintln!("provider: Digevo discovery endpoint has no DNS; using LATAM West fallback");
+            return DIGEVO_FALLBACK_URL.to_owned();
+        }
+    }
+    raw.to_owned()
+}
+
+pub(crate) fn provider_streaming_base(provider: &LoginProvider) -> Result<url::Url, ServiceError> {
+    trusted_streaming_base(&effective_provider_url(provider))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1459,7 +1499,7 @@ impl GfnService {
         session: &AuthSession,
     ) -> Result<Value, ServiceError> {
         let token = session.tokens.service_token();
-        let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
+        let base = provider_streaming_base(&session.provider)?;
         let url = self.server_info_url(&base)?;
         let response = client
             .get(url)
@@ -1917,7 +1957,7 @@ impl GfnService {
         {
             session.provider = provider.clone();
         }
-        trusted_streaming_base(&session.provider.streaming_service_url)?;
+        provider_streaming_base(&session.provider)?;
         Ok((session, state.generation))
     }
 
@@ -2268,7 +2308,7 @@ impl GfnService {
                         })?;
                     session.provider = provider.clone();
                 }
-                trusted_streaming_base(&session.provider.streaming_service_url)?;
+                provider_streaming_base(&session.provider)?;
                 Ok((session, state.generation))
             })
             .ok_or_else(|| ServiceError {
@@ -2387,7 +2427,7 @@ impl GfnService {
         requests: Option<&crate::store_requests::StoreRequests>,
     ) -> Result<String, ServiceError> {
         self.check_scope(session, generation)?;
-        let base = trusted_streaming_base(&session.provider.streaming_service_url)?;
+        let base = provider_streaming_base(&session.provider)?;
         let url = self.server_info_url(&base)?;
         let headers = lcars_headers(token, "NATIVE", "NVIDIA-CLASSIC", false)?;
         self.server_vpc_cache.resolve(

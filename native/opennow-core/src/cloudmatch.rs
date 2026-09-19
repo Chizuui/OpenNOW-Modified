@@ -1198,22 +1198,25 @@ fn requested_streaming_base(
     settings: &Value,
     auth: &AuthSession,
 ) -> Result<Url, ServiceError> {
-    let raw = params["streamingBaseUrl"]
+    let raw: String = params["streamingBaseUrl"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
         .or_else(|| {
             settings["region"]
                 .as_str()
                 .filter(|value| value.starts_with("https://"))
+                .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| {
-            if auth.provider.streaming_service_url.trim().is_empty() {
-                DEFAULT_STREAMING_BASE
+            let effective = crate::gfn::effective_provider_url(&auth.provider);
+            if effective.trim().is_empty() {
+                DEFAULT_STREAMING_BASE.to_owned()
             } else {
-                &auth.provider.streaming_service_url
+                effective
             }
         });
-    trusted_cloudmatch_base(raw)
+    trusted_cloudmatch_base(&raw)
 }
 
 fn claim_lookup_base(discovered: Option<&Value>, zone_base: &Url) -> Url {
