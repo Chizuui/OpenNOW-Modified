@@ -4,6 +4,7 @@ import OpenNOW
 FocusScope {
     id: root
     property double clockMs: Date.now()
+    readonly property bool connected: ShellStore.signedIn && !ShellStore.addingAccount
     readonly property var challenge: ShellStore.authChallenge
     readonly property var qrRows: challenge && challenge.qrRows ? challenge.qrRows : []
     readonly property int qrSize: qrRows.length
@@ -19,18 +20,19 @@ FocusScope {
 
         GlassPanel {
             width: 720
-            height: 532
+            height: Math.max(532, loginControls.implicitHeight + 88)
             panelRadius: 40
             strong: true
 
             Column {
+                id: loginControls
                 anchors.fill: parent
                 anchors.margins: 44
                 spacing: 22
 
                 Text {
                     width: parent.width
-                    text: ShellStore.signedIn ? qsTr("You’re ready to play.") : qsTr("Bring your games to the big screen.")
+                    text: root.connected ? qsTr("You’re ready to play.") : qsTr("Bring your games to the big screen.")
                     color: Theme.label
                     font.family: Theme.displayFont
                     font.pixelSize: 38
@@ -39,8 +41,11 @@ FocusScope {
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: ShellStore.signedIn
+                    text: root.connected
                           ? qsTr("Signed in as %1. Your NVIDIA password never passes through OpenNOW.").arg(ShellStore.authSession.user.displayName)
+                          : ShellStore.providerDiscoveryDegraded
+                              ? ShellStore.providers.length ? qsTr("Provider discovery is unavailable. Known providers are shown.")
+                                  : qsTr("No providers are available. Refresh to try again.")
                           : qsTr("OpenNOW connects to your GeForce NOW account without storing your NVIDIA password. Sign in from your phone, then come straight back to the controller.")
                     color: Theme.textMuted
                     font.family: Theme.bodyFont
@@ -50,41 +55,52 @@ FocusScope {
                 GlassButton {
                     id: signIn
                     width: parent.width
-                    text: ShellStore.signedIn ? qsTr("Continue to your games")
-                          : ShellStore.authState === "starting" ? qsTr("Contacting NVIDIA…")
+                    text: root.connected ? qsTr("Continue to your games")
+                          : ShellStore.authState === "starting" ? qsTr("Contacting provider…")
                           : ShellStore.authState === "completing" ? qsTr("Loading your profile…")
-                          : root.challenge ? qsTr("Open NVIDIA sign-in") : qsTr("Start device sign-in")
+                          : ShellStore.authState === "error" ? qsTr("Try again")
+                          : root.challenge ? qsTr("Open provider page") : qsTr("Start device sign-in")
                     glyph: "A"
                     primary: true
                     enabled: ShellStore.ready && ShellStore.authState !== "starting" && ShellStore.authState !== "completing"
+                        && (root.connected || root.challenge !== null || ShellStore.selectedProvider !== null)
                     Component.onCompleted: forceActiveFocus()
                     onClicked: {
-                        if (ShellStore.signedIn)
+                        if (root.connected)
                             AppController.navigate("library")
                         else if (root.challenge)
-                            Qt.openUrlExternally(root.challenge.verificationUriComplete)
+                            Qt.openUrlExternally(root.challenge.verificationUriComplete || root.challenge.verificationUri)
                         else
-                            ShellStore.startDeviceLogin("")
+                            ShellStore.startDeviceLogin(ShellStore.selectedProvider ? ShellStore.selectedProvider.idpId : "")
                     }
                 }
                 GlassButton {
                     width: parent.width
-                    visible: !ShellStore.signedIn
-                    text: root.challenge ? qsTr("Cancel this sign-in") : ShellStore.providers.length > 1
-                          ? qsTr("Provider · %1").arg(ShellStore.providers[0].displayName)
-                          : qsTr("Provider · NVIDIA")
+                    visible: !root.connected
+                    text: root.challenge ? qsTr("Cancel this sign-in")
+                          : qsTr("Provider · %1").arg(ShellStore.selectedProvider ? ShellStore.selectedProvider.displayName : qsTr("Select a provider"))
                     glyph: root.challenge ? "B" : "X"
                     enabled: ShellStore.ready
                     onClicked: {
                         if (root.challenge)
                             ShellStore.cancelDeviceLogin()
-                        else
-                            ShellStore.startDeviceLogin(ShellStore.providers.length ? ShellStore.providers[0].idpId : "")
+                        else if (ShellStore.providers.length) {
+                            const index = ShellStore.providers.findIndex(provider => provider.idpId === (ShellStore.selectedProvider ? ShellStore.selectedProvider.idpId : ""))
+                            ShellStore.selectedProviderIdpId = ShellStore.providers[(index + 1) % ShellStore.providers.length].idpId
+                        }
                     }
                 }
                 GlassButton {
+                    objectName: "consoleRefreshProviders"
                     width: parent.width
-                    visible: ShellStore.signedIn
+                    visible: !root.connected && ShellStore.providerDiscoveryDegraded && !root.challenge
+                    text: qsTr("Refresh providers")
+                    enabled: ShellStore.ready && ShellStore.providersRequestId === ""
+                    onClicked: ShellStore.refreshProviders(true)
+                }
+                GlassButton {
+                    width: parent.width
+                    visible: root.connected
                     text: qsTr("Sign out")
                     glyph: "B"
                     danger: true
@@ -143,13 +159,13 @@ FocusScope {
                         anchors.centerIn: parent
                         spacing: 10
                         visible: root.qrSize === 0
-                        Text { anchors.horizontalCenter: parent.horizontalCenter; text: ShellStore.signedIn ? "✓" : "◎"; color: "#111827"; font.pixelSize: 72; font.weight: Font.Black }
-                        Text { anchors.horizontalCenter: parent.horizontalCenter; text: ShellStore.signedIn ? qsTr("Connected") : qsTr("Ready when you are"); color: "#111827"; font.family: Theme.bodyFont; font.pixelSize: 16; font.weight: Font.Bold }
+                        Text { anchors.horizontalCenter: parent.horizontalCenter; text: root.connected ? "✓" : "◎"; color: "#111827"; font.pixelSize: 72; font.weight: Font.Black }
+                        Text { anchors.horizontalCenter: parent.horizontalCenter; text: root.connected ? qsTr("Connected") : qsTr("Ready when you are"); color: "#111827"; font.family: Theme.bodyFont; font.pixelSize: 16; font.weight: Font.Bold }
                     }
                 }
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.challenge ? root.challenge.userCode : ShellStore.signedIn ? ShellStore.authSession.user.membershipTier : qsTr("Scan with your phone")
+                    text: root.challenge ? root.challenge.userCode : root.connected ? ShellStore.authSession.user.membershipTier : qsTr("Scan with your phone")
                     color: Theme.label
                     font.family: Theme.displayFont
                     font.pixelSize: root.challenge ? 24 : 18
@@ -159,7 +175,7 @@ FocusScope {
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: root.challenge ? qsTr("Expires in %1 · %2").arg(root.timeLeft).arg(root.challenge.verificationUri.replace(/^https?:\/\//, ""))
-                                         : ShellStore.signedIn ? qsTr("GeForce NOW account") : qsTr("A real QR code appears after sign-in starts")
+                                         : root.connected ? qsTr("GeForce NOW account") : qsTr("A real QR code appears after sign-in starts")
                     color: Theme.textMuted
                     font.family: Theme.bodyFont
                     font.pixelSize: 13

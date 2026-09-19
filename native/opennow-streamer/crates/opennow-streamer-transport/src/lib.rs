@@ -5,7 +5,9 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use str0m::crypto::from_feature_flags;
 use thiserror::Error;
 
+mod frame_stage_timing;
 pub mod nvst;
+mod nvst_budget;
 mod nvst_control;
 mod nvst_cursor;
 mod nvst_haptics;
@@ -13,16 +15,18 @@ mod nvst_input;
 mod nvst_microphone;
 mod nvst_network;
 
+pub use frame_stage_timing::{FrameStageTimings, StageSummary};
 pub use nvst_haptics::{NvstControllerRumble, NvstHaptics};
 
 pub use nvst::{
     BoundedFrameQueue, EncodedVideoAccessUnit, NvstBundleIdentity, NvstConfigError, NvstDropReason,
+    NvstFrameProgress, NvstFrameProgressEvent, NvstFrameProgressPolicy, NvstFrameProgressStage,
     NvstReceiveEvent, NvstReceiverState, NvstRecovery, NvstSrtpProfile, NvstUdpReceiverControl,
     NvstUdpReceiverError, NvstUdpReceiverSession, NvstUnsupportedFeature, NvstVideoCodec,
     NvstVideoConfig, NvstVideoReceiver, ReservedNvstBundle, SharedNvstFeedback,
-    advertised_nvst_ipv4, nvst_video_packet_size, parse_nvst_video_handoff,
-    reserve_nvst_mjolnir_udp_socket, reserve_nvst_udp_socket, spawn_nvst_mjolnir_receiver,
-    spawn_nvst_udp_receiver, spawn_nvst_udp_receiver_with_socket,
+    advertised_nvst_ipv4, measured_video_packet_size, nvst_video_packet_size,
+    parse_nvst_video_handoff, reserve_nvst_mjolnir_udp_socket, reserve_nvst_udp_socket,
+    spawn_nvst_mjolnir_receiver, spawn_nvst_udp_receiver, spawn_nvst_udp_receiver_with_socket,
 };
 
 static INSTALL_CRYPTO: Once = Once::new();
@@ -64,6 +68,7 @@ pub struct EncodedMediaFrame {
     pub received_at_us: u64,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 pub type MediaConsumer = SyncSender<EncodedMediaFrame>;
@@ -98,6 +103,7 @@ mod tests {
             received_at_us: 2_500,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         }
     }
 

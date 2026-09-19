@@ -655,7 +655,7 @@ FocusScope {
 
             DesktopStoreChip {
                 id: genreChip
-                text: root.activeGenre === qsTr("All") ? qsTr("Genres") : DesktopTokens.genreLabel(root.activeGenre)
+                text: root.activeGenre === qsTr("All") ? qsTr("Genres") : (ShellStore.catalogGenreLabel(root.activeGenre) || DesktopTokens.genreLabel(root.activeGenre))
                 hasMenu: true
                 selected: root.openMenu === "genre"
                           || (root.focusZone === "chips" && root.focusIndex === root.categories.length)
@@ -830,7 +830,7 @@ FocusScope {
                         x: DesktopTokens.px(storeLogo.visible ? 39 : 9)
                         width: parent.width - x - DesktopTokens.px(14)
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.presentedMenu === "category" ? root.categoryLabel(menuButton.modelData) : root.presentedMenu === "store" ? DesktopTokens.storeLabel(menuButton.modelData) : DesktopTokens.genreLabel(menuButton.modelData)
+                        text: root.presentedMenu === "category" ? root.categoryLabel(menuButton.modelData) : root.presentedMenu === "store" ? DesktopTokens.storeLabel(menuButton.modelData) : (ShellStore.catalogGenreLabel(menuButton.modelData) || DesktopTokens.genreLabel(menuButton.modelData))
                         color: DesktopTokens.text
                         font.family: Theme.bodyFont
                         font.pixelSize: DesktopTokens.monoSize

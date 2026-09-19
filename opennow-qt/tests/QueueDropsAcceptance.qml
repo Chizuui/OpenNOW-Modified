@@ -25,6 +25,7 @@ QtObject {
         signal responseReceived(string requestId, var result)
         signal requestFailed(string requestId, string code, string message)
         signal eventReceived(string name, var payload)
+        function markUiReady() {}
         function logShellDiagnostic(message) {}
         function request(method, params, timeout) {
             const id = "drop-fixture-" + (calls.length + 1)
@@ -46,7 +47,7 @@ QtObject {
     function run(parent) {
         ShellStore.activeSession = null
         ShellStore.streamer = {status: "stopped"}
-        ShellStore.acceptNativeCapabilities({protocolVersion: 6, supportsVideoDecode: false,
+        ShellStore.acceptNativeCapabilities({protocolVersion: 7, supportsVideoDecode: false,
             videoBackends: [{backend: "v4l2", available: false, reason: "HEVC probe failed",
                 codecs: [{codec: "h265", available: false, reason: "MEDIA_IOC_G_TOPOLOGY failed"}]}]})
         client.state = "ready"

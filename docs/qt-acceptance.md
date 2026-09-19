@@ -5,6 +5,117 @@ smoke test is not release acceptance. The legacy Electron source has been remove
 acceptance still requires every row to be executed on the named hardware, the artifacts to be
 reviewed, and the staged rollout to complete.
 
+## FSR 1 upscaling on Windows and Linux
+
+Stream settings and onboarding offer Off or FSR 1 on Windows and Linux. macOS retains
+MetalFX. FSR 1 runs AMD's EASU spatial upscaler and optional RCAS sharpening on the existing
+GPU video textures. Clarity controls sharpening; zero disables RCAS, not EASU. This does not
+change the requested stream resolution or frame rate. Noise Reduction remains MetalFX-only.
+
+FSR 1 applies only when enlarging SDR video on D3D11 or Vulkan. HDR, native-size video,
+downscaling, and unsupported resources retain normal scaling. It adds GPU work and can
+emphasize compression artifacts, so compare it with Off on the same stream before enabling
+it permanently.
+
+After building, run the settings and presenter checks:
+
+```sh
+ctest --test-dir build/opennow-qt --output-on-failure -R 'fsrupscaler|qml-upscaling|qml-onboarding|opennow-streamvideo-tests'
+cargo test --manifest-path native/opennow-core/Cargo.toml upscaling
+```
+
+On Windows D3D11 and Linux Vulkan hardware, enlarge an SDR stream and switch between Off
+and FSR 1 at Clarity 0 and 15. Check windowed and fullscreen modes, display-scale changes,
+F3 statistics, and Ctrl+G overlays. Repeat with frame generation enabled and after a session
+restart. Confirm that video and audio continue, pointer mapping follows the viewport, and
+HDR and native-size video remain unchanged. Synthetic tests do not establish live GPU cost
+or image quality on these devices.
+
+## Stream Stats V2 visual check
+
+After building the Qt application, run:
+
+```sh
+ctest --test-dir build/opennow-qt --output-on-failure -R 'stream-stats|streamtoasts|queue-drops|frame-generation-stats|fullscreen.*stats'
+bash scripts/capture-qt-stream-stats.sh build/opennow-qt/opennow-qt build/stats-v2-captures
+```
+
+The capture script renders compact, expanded, degraded, 1.5× scale, and controller/packet-loss
+toast states using synthetic telemetry, without an account or a live session. Compare them with
+OpenNOW Socket → Desktop Renew → Renew 08 and Renew 09a–c in Paper. These images verify layout,
+not network quality or hardware decode. Unsupported FEC recovery and decoder queue values are
+not populated from the design's example numbers. The bitrate bar divides measured Mbps by the
+prepared session's allocation and clamps its fill to 0–100%.
+
+## Check existing-session recovery
+
+Run the orchestration and protocol regression tests:
+
+```sh
+ctest --test-dir build/opennow-qt --output-on-failure -R 'embedded-orchestration|qml-session-resume'
+cargo test --manifest-path native/opennow-core/Cargo.toml cloudmatch::tests
+```
+
+After building the app, capture the different-game confirmation without signing in:
+
+```sh
+build/opennow-qt/opennow-qt --smoke-test --allow-multiple-instances \
+  --desktop --route inserting --reduced-motion --smoke-width 960 --smoke-height 640 \
+  --smoke-session-resume conflict --screenshot /absolute/path/session-conflict.png
+```
+
+Replace `conflict` with `unavailable` to check the session-limit retry screen, or with
+`resuming` to check the reconnect message. Repeat in console mode by replacing
+`--desktop` with `--console`. These fixtures use synthetic sessions and do not connect
+to NVIDIA or prove live resume behavior.
+
+Use `finished` or `not-found` to inject an authoritative terminal response after a
+native error and an exhausted recovery episode. Both fixtures must clear the active
+seat, return to game detail, and leave no claim pending. The recovery protocol tests
+separately verify that authentication errors and transport EOF do not count as a
+normal session end. Capture terminal cases at 960×640 and 1600×900 with the same
+`--smoke-width`, `--smoke-height`, and `--screenshot` options.
+
+With an authorized account, disconnect from a game without ending its cloud session,
+restart OpenNOW, and select Play for the same game. Check that OpenNOW reconnects
+without asking to create another session. Select a different game and verify that
+Cancel preserves the running game, Return to game reconnects to it, and End game and
+start new closes it only after you choose that action. Repeat with the session in a
+different region and while the network is unavailable. A failed lookup must offer a
+retry rather than create another session. Verify windowed and fullscreen presentation.
+
+## Alliance login and stream negotiation
+
+Run the native negotiation and Qt orchestration checks before testing an affected provider:
+
+```sh
+cargo test --manifest-path native/opennow-streamer/Cargo.toml -p opennow-streamer-core nvst_rtsp
+ctest --test-dir build/opennow-qt --output-on-failure -R 'embedded-orchestration|alliance|auth|stream-recovery'
+```
+
+Verify provider-list timeout recovery, a fresh login after an expired device challenge,
+and adding another provider account while already signed in. A failed profile switch must
+leave the original account active and show an error on the account page. Test both desktop
+and console modes; synthetic account fixtures do not prove a provider accepts login.
+
+Video SETUP tries a bounded set of control-URI and Transport forms within one request
+budget. A successful response must still supply a usable server-authored video endpoint.
+After all forms fail to supply one, `missing-video-peer` is a terminal negotiation error,
+not a reason to repeatedly reclaim the same seat. Unsupported legacy transport is also
+terminal. Transient network failures retain the existing bounded session recovery.
+
+For a partner that still cannot start, reproduce once and export diagnostics. Keep the
+`video-setup` and `video-setup-transport` lines. They describe response status, field
+presence, source/port shape, quoting and key spacing without logging raw addresses,
+credentials or Transport values. Do not add unredacted headers or SDP to bug reports.
+The field-shape diagnostics distinguish a parser incompatibility from missing server
+metadata; a SETUP `200` alone does not prove that an endpoint was negotiated.
+
+Confirm login, catalog load, launch through the first video frame, stop, and reconnect
+with the affected provider before claiming its compatibility issue is fixed. Repeat
+with an NVIDIA account to check the unchanged first SETUP request. Passing synthetic
+fallback and parser tests is not a substitute for this live check.
+
 ## Required live matrix
 
 | Platform | Architecture | Window system | Required package |
@@ -196,6 +307,25 @@ No cache invalidation is requested. Also inspect the native Store: the loaded co
 stay at 40 while idle; Load more adds one page; route re-entry retains it; category selection
 and See all remain in Store; Ctrl+K finds games outside the loaded page. Scroll through a
 short final row and confirm its posters remain the same size as those in a full row.
+
+## Desktop settings layout and screenshots
+
+Run `ctest --test-dir build/opennow-qt -R qml-settings-layout --output-on-failure`
+to check all nine settings pages at desktop width, compact width, and 1.25 interface
+scale. The checks open Advanced and reject overlapping or overflowing row content.
+
+Capture the actual Qt pages with account-free smoke data:
+
+```sh
+bash scripts/capture-qt-settings.sh build/opennow-qt/opennow-qt /absolute/path/settings-captures
+```
+
+The script captures every page, compact and scaled views, expanded conditional
+settings, statistics customization, and shortcuts. Full-page images resize the
+window to the page content, capped at 3840 pixels high; a separate bottom capture
+covers the expanded Stream page. Each image has a matching runtime log. On Linux,
+the script uses Xvfb when `DISPLAY` is unset. These fixtures never start the core
+or persist account preferences.
 
 ## Desktop settings motion
 

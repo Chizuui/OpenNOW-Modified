@@ -27,6 +27,12 @@ protected:
     }
 };
 
+static ControllerInput::SonySnapshot latestSony(const QSignalSpy &spy)
+{
+    if (spy.isEmpty()) return ControllerInput::SonySnapshot{};
+    return spy.last().at(0).value<ControllerInput::SonySnapshot>();
+}
+
 class ControllerInputTest final : public QObject
 {
     Q_OBJECT
@@ -156,6 +162,353 @@ private slots:
         QVERIFY(SDL_DetachVirtualJoystick(id));
         QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), initialCount, 2'000);
         QCoreApplication::instance()->removeEventFilter(&sink);
+    }
+
+    void sonyTouchpadContactsGuideLatchAndClaims()
+    {
+        ControllerInput input;
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        QSignalSpy claims(&input, &ControllerInput::deviceClaimsChanged);
+        QSignalSpy localActions(&input, &ControllerInput::localActionRequested);
+        SDL_VirtualJoystickTouchpadDesc touchpad{2, 0, 0, 0};
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.ntouchpads = 1;
+        descriptor.touchpads = &touchpad;
+        descriptor.button_mask = (1u << SDL_GAMEPAD_BUTTON_TOUCHPAD)
+            | (1u << SDL_GAMEPAD_BUTTON_GUIDE);
+        descriptor.name = "OpenNOW virtual Sony controller";
+        const auto id = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY2(id != 0, SDL_GetError());
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 1, 2'000);
+        QVERIFY(claims.size() >= 1);
+        const auto inventory = input.deviceClaims();
+        QCOMPARE(inventory.size(), 1);
+        QCOMPARE(inventory.at(0).slot, 0);
+        QCOMPARE(inventory.at(0).vendor, 0x054c);
+        QCOMPARE(inventory.at(0).product, 0x05c4);
+        QVERIFY(inventory.at(0).incarnation != 0);
+
+        input.setShellCaptureEnabled(false);
+        auto *joystick = SDL_GetJoystickFromID(id);
+        QVERIFY(joystick);
+
+        QVERIFY(SDL_SetJoystickVirtualTouchpad(joystick, 0, 0, true, 0.5f, 0.5f, 1.0f));
+        QVERIFY(SDL_SetJoystickVirtualTouchpad(joystick, 0, 1, true, 0.5f, 0.5f, 1.0f));
+        SDL_UpdateJoysticks();
+        auto published = snapshots.size();
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > published, 1'000);
+        published = snapshots.size();
+        QTest::qWait(50);
+        QVERIFY(snapshots.size() >= published);
+        const auto touchSnapshot = latestSony(snapshots);
+        QCOMPARE(touchSnapshot.slot, 0u);
+        QCOMPARE(touchSnapshot.incarnation, inventory.at(0).incarnation);
+        QCOMPARE(touchSnapshot.touchpadClick, false);
+        QCOMPARE(touchSnapshot.contacts[0].active, true);
+        QCOMPARE(touchSnapshot.contacts[0].x, 0.5f);
+        QCOMPARE(touchSnapshot.contacts[0].y, 0.5f);
+        QCOMPARE(touchSnapshot.contacts[1].active, true);
+        QCOMPARE(touchSnapshot.contacts[1].x, 0.5f);
+        QCOMPARE(touchSnapshot.contacts[1].y, 0.5f);
+        QVERIFY(touchSnapshot.observedAtUs > 0);
+
+        QVERIFY(SDL_SetJoystickVirtualTouchpad(joystick, 0, 1, false, 0.25f, 0.75f, 0.0f));
+        SDL_UpdateJoysticks();
+        published = snapshots.size();
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > published, 1'000);
+        const auto releasedFinger = latestSony(snapshots);
+        QCOMPARE(releasedFinger.contacts[1].active, false);
+        QCOMPARE(releasedFinger.contacts[1].x, 0.25f);
+        QCOMPARE(releasedFinger.contacts[1].y, 0.75f);
+        QCOMPARE(releasedFinger.contacts[0].active, true);
+
+        const auto pushClick = [&](bool down) {
+            SDL_Event click{};
+            click.type = down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+            click.gbutton.which = id;
+            click.gbutton.button = SDL_GAMEPAD_BUTTON_TOUCHPAD;
+            click.gbutton.down = down;
+            QVERIFY(SDL_PushEvent(&click));
+        };
+        const auto sawClick = [&](bool expected) {
+            for (const auto &record : snapshots) {
+                if (record.at(0).value<ControllerInput::SonySnapshot>().touchpadClick == expected)
+                    return true;
+            }
+            return false;
+        };
+        pushClick(true);
+        QTRY_VERIFY_WITH_TIMEOUT(sawClick(true), 1'000);
+        pushClick(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!latestSony(snapshots).touchpadClick, 1'000);
+
+        const auto pushGuide = [&](bool down) {
+            SDL_Event guide{};
+            guide.type = down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+            guide.gbutton.which = id;
+            guide.gbutton.button = SDL_GAMEPAD_BUTTON_GUIDE;
+            guide.gbutton.down = down;
+            QVERIFY(SDL_PushEvent(&guide));
+        };
+        pushGuide(true);
+        QTRY_COMPARE_WITH_TIMEOUT(localActions.size(), 1, 1'000);
+        input.setInputSuspended(true);
+        QTest::qWait(30);
+        pushGuide(false);
+        QTest::qWait(30);
+        input.setInputSuspended(false);
+        QTest::qWait(30);
+        QCOMPARE(localActions.size(), 1);
+        pushGuide(true);
+        QTRY_COMPARE_WITH_TIMEOUT(localActions.size(), 2, 1'000);
+        pushGuide(false);
+        QTest::qWait(30);
+        QCOMPARE(localActions.size(), 2);
+
+        QVERIFY(SDL_DetachVirtualJoystick(id));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+        QTRY_VERIFY_WITH_TIMEOUT(input.deviceClaims().isEmpty(), 1'000);
+    }
+
+    void sonyContactsReleaseOnSuspensionAndResampleOnResume()
+    {
+        ControllerInput input;
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        SDL_VirtualJoystickTouchpadDesc touchpad{2, 0, 0, 0};
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x0ce6;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.ntouchpads = 1;
+        descriptor.touchpads = &touchpad;
+        descriptor.name = "OpenNOW virtual DualSense";
+        const auto id = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY2(id != 0, SDL_GetError());
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 1, 2'000);
+        input.setShellCaptureEnabled(false);
+        auto *joystick = SDL_GetJoystickFromID(id);
+        QVERIFY(joystick);
+        QVERIFY(SDL_SetJoystickVirtualTouchpad(joystick, 0, 0, true, 0.75f, 0.25f, 1.0f));
+        QVERIFY(SDL_SetJoystickVirtualTouchpad(joystick, 0, 1, true, 0.25f, 0.75f, 1.0f));
+        SDL_UpdateJoysticks();
+        auto published = snapshots.size();
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > published, 1'000);
+        QTest::qWait(50);
+        const auto touched = latestSony(snapshots);
+        QCOMPARE(touched.contacts[0].active, true);
+        QCOMPARE(touched.contacts[0].x, 0.75f);
+        QCOMPARE(touched.contacts[0].y, 0.25f);
+        QCOMPARE(touched.contacts[1].active, true);
+        QCOMPARE(touched.contacts[1].x, 0.25f);
+        QCOMPARE(touched.contacts[1].y, 0.75f);
+
+        published = snapshots.size();
+        input.setInputSuspended(true);
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > published, 1'000);
+        const auto suspended = latestSony(snapshots);
+        QCOMPARE(suspended.contacts[0].active, false);
+        QCOMPARE(suspended.contacts[0].x, 0.75f);
+        QCOMPARE(suspended.contacts[1].active, false);
+        QCOMPARE(suspended.contacts[1].y, 0.75f);
+
+        published = snapshots.size();
+        input.setInputSuspended(false);
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > published, 1'000);
+        const auto resumed = latestSony(snapshots);
+        QCOMPARE(resumed.contacts[0].active, true);
+        QCOMPARE(resumed.contacts[0].x, 0.75f);
+        QCOMPARE(resumed.contacts[1].active, true);
+        QCOMPARE(resumed.contacts[1].y, 0.75f);
+
+        QVERIFY(SDL_DetachVirtualJoystick(id));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+    }
+
+    void selectionAnnouncesClaimsBeforeItsSnapshots()
+    {
+        ControllerInput input;
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        descriptor.button_mask = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
+        descriptor.name = "OpenNOW selection announcement";
+        const auto first = SDL_AttachVirtualJoystick(&descriptor);
+        const auto second = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY(first != 0 && second != 0);
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 2, 2'000);
+        input.setShellCaptureEnabled(false);
+        auto announced = input.deviceClaims();
+        bool allMatched = true;
+        QObject observer;
+        QObject::connect(&input, &ControllerInput::deviceClaimsChanged, &observer,
+                         [&] { announced = input.deviceClaims(); });
+        QObject::connect(&input, &ControllerInput::sonySnapshot, &observer,
+                         [&](const ControllerInput::SonySnapshot &snapshot) {
+            bool matches = false;
+            for (const auto &claim : announced)
+                matches |= claim.slot == snapshot.slot && claim.incarnation == snapshot.incarnation;
+            allMatched &= matches;
+        });
+        input.setInputControllerId(second);
+        QVERIFY2(allMatched, "native inventory must know each selected source before its snapshot arrives");
+        QVERIFY(SDL_DetachVirtualJoystick(first));
+        QVERIFY(SDL_DetachVirtualJoystick(second));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+    }
+
+    void sonyOrdinaryButtonPublishesCompleteSnapshotWithoutTouch()
+    {
+        ControllerInput input;
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        descriptor.button_mask = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
+        descriptor.name = "OpenNOW ordinary Sony button";
+        const auto id = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY2(id != 0, SDL_GetError());
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 1, 2'000);
+        input.setShellCaptureEnabled(false);
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        auto *joystick = SDL_GetJoystickFromID(id);
+        QVERIFY(joystick);
+        QVERIFY(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_SOUTH, true));
+        SDL_UpdateJoysticks();
+        auto *gamepad = SDL_GetGamepadFromID(id);
+        QVERIFY(gamepad);
+        QTRY_VERIFY_WITH_TIMEOUT(SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_SOUTH), 1'000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !snapshots.isEmpty()
+                && (latestSony(snapshots).buttons & 0x1000) == 0x1000,
+            1'000);
+        QCOMPARE(latestSony(snapshots).touchpadClick, false);
+        QCOMPARE(latestSony(snapshots).contacts[0].active, false);
+        QVERIFY(SDL_DetachVirtualJoystick(id));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+    }
+
+    void sonyStickYKeepsRawSdlOrientation()
+    {
+        ControllerInput input;
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        descriptor.name = "OpenNOW ordinary Sony stick";
+        const auto id = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY2(id != 0, SDL_GetError());
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 1, 2'000);
+        input.setShellCaptureEnabled(false);
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        auto *joystick = SDL_GetJoystickFromID(id);
+        QVERIFY(joystick);
+        QVERIFY(SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTY, 24'000));
+        SDL_UpdateJoysticks();
+        auto *gamepad = SDL_GetGamepadFromID(id);
+        QVERIFY(gamepad);
+        QTRY_VERIFY_WITH_TIMEOUT(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY) > 0, 1'000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !snapshots.isEmpty() && latestSony(snapshots).leftStickY > 0, 1'000);
+
+        input.setInputSuspended(true);
+        input.setInputSuspended(false);
+        QVERIFY(!snapshots.isEmpty());
+        QVERIFY2(latestSony(snapshots).leftStickY > 0,
+                 "Sony Y must not use ordinary-gamepad inversion");
+
+        QVERIFY(SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTY, -24'000));
+        SDL_UpdateJoysticks();
+        QTRY_VERIFY_WITH_TIMEOUT(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY) < 0, 1'000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !snapshots.isEmpty() && latestSony(snapshots).leftStickY < 0, 1'000);
+
+        QVERIFY(SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTY, -32'767));
+        SDL_UpdateJoysticks();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !snapshots.isEmpty() && latestSony(snapshots).leftStickY < 0, 1'000);
+        QVERIFY(SDL_DetachVirtualJoystick(id));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+    }
+
+    void selectedSonySnapshotMatchesItsClaim()
+    {
+        ControllerInput input;
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        descriptor.name = "OpenNOW selected Sony controller";
+        const auto first = SDL_AttachVirtualJoystick(&descriptor);
+        const auto second = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY(first != 0 && second != 0);
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 2, 2'000);
+        input.setShellCaptureEnabled(false);
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        QSignalSpy claimsChanged(&input, &ControllerInput::deviceClaimsChanged);
+        const auto claimsBefore = claimsChanged.size();
+        input.setInputControllerId(second);
+        QTRY_VERIFY_WITH_TIMEOUT(claimsChanged.size() > claimsBefore, 1'000);
+        QTRY_VERIFY_WITH_TIMEOUT(!snapshots.isEmpty(), 1'000);
+        const auto snapshot = latestSony(snapshots);
+        const auto claims = input.deviceClaims();
+        QCOMPARE(claims.size(), 1);
+        QCOMPARE(claims.at(0).slot, snapshot.slot);
+        QCOMPARE(claims.at(0).incarnation, snapshot.incarnation);
+        QCOMPARE(snapshot.slot, 0u);
+        QVERIFY(SDL_DetachVirtualJoystick(first));
+        QVERIFY(SDL_DetachVirtualJoystick(second));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
+    }
+
+    void sonyKeepalivePublishesSnapshotsWithoutEvents()
+    {
+        ControllerInput input;
+        SDL_VirtualJoystickDesc descriptor{};
+        SDL_INIT_INTERFACE(&descriptor);
+        descriptor.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        descriptor.vendor_id = 0x054c;
+        descriptor.product_id = 0x05c4;
+        descriptor.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        descriptor.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        descriptor.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        descriptor.name = "OpenNOW keepalive Sony controller";
+        const auto id = SDL_AttachVirtualJoystick(&descriptor);
+        QVERIFY2(id != 0, SDL_GetError());
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 1, 2'000);
+        input.setShellCaptureEnabled(false);
+        QSignalSpy snapshots(&input, &ControllerInput::sonySnapshot);
+        QTRY_VERIFY_WITH_TIMEOUT(!snapshots.isEmpty(), 1'000);
+        const auto before = snapshots.size();
+        QTRY_VERIFY_WITH_TIMEOUT(snapshots.size() > before, 1'000);
+        QCOMPARE(latestSony(snapshots).slot, 0u);
+        QVERIFY(SDL_DetachVirtualJoystick(id));
+        QTRY_COMPARE_WITH_TIMEOUT(input.controllerCount(), 0, 2'000);
     }
 
     void publishesFullSnapshotsKeepaliveAndNeutralOwnershipTransition()

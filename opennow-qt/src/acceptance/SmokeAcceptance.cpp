@@ -4,6 +4,7 @@
 #include "acceptance/MotionAcceptance.h"
 
 #include <QGuiApplication>
+#include <QKeyEvent>
 #include <QDeadlineTimer>
 #include <QQmlComponent>
 #include <QFileInfo>
@@ -24,6 +25,49 @@ using namespace Qt::StringLiterals;
 int AcceptanceSession::startSmokeWorkload()
 {
     const auto screenshotIndex = m_arguments.indexOf(u"--screenshot"_s);
+    const auto resumeIndex = m_arguments.indexOf(u"--smoke-session-resume"_s);
+    if (m_smokeTest && resumeIndex >= 0 && resumeIndex + 1 < m_arguments.size()) {
+        const auto mode = m_arguments.at(resumeIndex + 1);
+        QTimer::singleShot(350, this, [this, mode] {
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            auto *window = m_engine.rootObjects().isEmpty() ? nullptr
+                : qobject_cast<QQuickWindow *>(m_engine.rootObjects().first());
+            auto *host = window ? window->findChild<QQuickItem *>(u"fallbackOverlayHost"_s) : nullptr;
+            auto *dialog = window ? window->findChild<QQuickItem *>(u"sessionConflictDialog"_s) : nullptr;
+            const bool terminal = mode == u"finished"_s || mode == u"not-found"_s;
+            const auto expectedState = terminal ? u"idle"_s : mode == u"unavailable"_s ? u"error"_s : mode;
+            if (!store || store->property("streamState").toString() != expectedState
+                    || m_controller.route() != (terminal ? u"game-detail"_s : u"inserting"_s)
+                    || (terminal && (!store->property("activeSession").isNull()
+                        || store->property("sessionRecoveryPending").toBool()
+                        || !store->property("sessionClaimRequestId").toString().isEmpty()))
+                    || (mode == u"conflict"_s && m_controller.overlay() != u"session-conflict"_s)) {
+                qCritical("Session resume fixture did not reach its expected screen");
+                m_application.exit(EXIT_FAILURE);
+            }
+            if (mode == u"conflict"_s && (!host || !host->isVisible() || host->opacity() <= 0
+                    || !dialog || !dialog->isVisible() || dialog->width() <= 0 || dialog->height() <= 0
+                    || (m_arguments.contains(u"--desktop"_s) && host->scale() != 1))) {
+                qCritical("Session conflict dialog is hidden or incorrectly scaled");
+                m_application.exit(EXIT_FAILURE);
+                return;
+            }
+            if (mode == u"conflict"_s && !m_arguments.contains(u"--screenshot"_s)) {
+                QKeyEvent press(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+                QGuiApplication::sendEvent(window, &press);
+                QKeyEvent release(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier);
+                QGuiApplication::sendEvent(window, &release);
+                if (!m_controller.overlay().isEmpty() || m_controller.route() == u"inserting"_s
+                        || !store->property("pendingLaunchParams").isNull()
+                        || store->property("remoteSessions").toList().size() != 1) {
+                    qCritical("Cancelling the session conflict did not preserve the running game");
+                    m_application.exit(EXIT_FAILURE);
+                }
+            }
+        });
+    }
+    if (m_smokeTest && m_arguments.contains(u"--smoke-gpu-count"_s))
+        return startGpuSettingsWorkload();
     if (m_smokeTest && m_arguments.contains(u"--smoke-theme-settings"_s))
         return startThemeSettingsWorkload();
     if (m_smokeTest && m_arguments.contains(u"--smoke-session-launch"_s))
@@ -34,20 +78,47 @@ int AcceptanceSession::startSmokeWorkload()
         return startStreamExitWorkload();
     if (m_smokeTest && m_arguments.contains(u"--smoke-frame-generation-stats"_s))
         return startFrameGenerationStatsWorkload();
-    if (m_smokeTest && (m_arguments.contains(u"--smoke-frame-generation"_s)
+    if (m_smokeTest && (m_arguments.contains(u"--smoke-language-settings"_s)
+                       || m_arguments.contains(u"--smoke-frame-rate-settings"_s)
+                       || m_arguments.contains(u"--smoke-frame-generation"_s)
+                       || m_arguments.contains(u"--smoke-ten-bit-warning"_s)
+                       || m_arguments.contains(u"--smoke-onboarding"_s)
                        || m_arguments.contains(u"--smoke-upscaling"_s)
                        || m_arguments.contains(u"--smoke-stream-stats"_s)
+                       || m_arguments.contains(u"--smoke-stream-stats-v2"_s)
                        || m_arguments.contains(u"--smoke-controller-metadata"_s)
                        || m_arguments.contains(u"--smoke-custom-background"_s))) {
         const bool controllerMetadata = m_arguments.contains(u"--smoke-controller-metadata"_s);
+        const bool languageSettings = m_arguments.contains(u"--smoke-language-settings"_s);
+        const bool frameRateSettings = m_arguments.contains(u"--smoke-frame-rate-settings"_s);
+        const bool onboarding = m_arguments.contains(u"--smoke-onboarding"_s);
+        const bool tenBitWarning = m_arguments.contains(u"--smoke-ten-bit-warning"_s);
         const bool customBackground = m_arguments.contains(u"--smoke-custom-background"_s);
         const bool streamStats = m_arguments.contains(u"--smoke-stream-stats"_s);
-        QQmlComponent component(&m_engine, QUrl(controllerMetadata
+        QQmlComponent component(&m_engine, QUrl(languageSettings
+            ? u"qrc:/acceptance/LanguageSettingsAcceptance.qml"_s
+            : frameRateSettings
+            ? u"qrc:/acceptance/FrameRateSettingsAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-onboarding"_s)
+            ? m_arguments.contains(u"--onboarding-replay-check"_s)
+                ? u"qrc:/acceptance/OnboardingReplayAcceptance.qml"_s
+                : m_arguments.contains(u"--onboarding-ui-check"_s)
+                ? u"qrc:/acceptance/OnboardingUiAcceptance.qml"_s
+                : m_arguments.contains(u"--onboarding-awdl-check"_s)
+                ? u"qrc:/acceptance/OnboardingAwdlAcceptance.qml"_s
+                : m_arguments.contains(u"--onboarding-scroll-check"_s)
+                ? u"qrc:/acceptance/OnboardingScrollAcceptance.qml"_s
+                : u"qrc:/acceptance/OnboardingAcceptance.qml"_s
+            : controllerMetadata
             ? u"qrc:/acceptance/ControllerMetadataAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-ten-bit-warning"_s)
+            ? u"qrc:/acceptance/TenBitWarningAcceptance.qml"_s
             : customBackground
             ? u"qrc:/acceptance/CustomBackgroundAcceptance.qml"_s
             : streamStats
             ? u"qrc:/acceptance/StreamStatsAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-stream-stats-v2"_s)
+            ? u"qrc:/acceptance/StreamStatsV2Acceptance.qml"_s
             : m_arguments.contains(u"--smoke-upscaling"_s)
             ? u"qrc:/acceptance/UpscalingAcceptance.qml"_s
             : u"qrc:/acceptance/FrameGenerationAcceptance.qml"_s));
@@ -56,6 +127,8 @@ int AcceptanceSession::startSmokeWorkload()
         fixture->setParent(&m_engine);
         if (controllerMetadata)
             m_engine.rootContext()->setContextProperty(u"ControllerInput"_s, fixture->property("input").value<QObject *>());
+        if (languageSettings && m_arguments.contains(u"--language-hdr-invalidation"_s))
+            m_engine.rootContext()->setContextProperty(u"HdrOutput"_s, fixture->property("hdrOutput").value<QObject *>());
         if (customBackground) {
             QFile image(u":/qt/qml/OpenNOW/res/brand/desktop-renew.jpg"_s);
             auto *localImage = new QTemporaryFile(&m_engine);
@@ -65,14 +138,24 @@ int AcceptanceSession::startSmokeWorkload()
             fixture->setProperty("imageUrl", QUrl::fromLocalFile(localImage->fileName()).toString());
             localImage->close();
         }
-        QTimer::singleShot(150, this, [this, fixture, customBackground] {
+        QTimer::singleShot(150, this, [this, fixture, customBackground, onboarding, tenBitWarning, languageSettings, frameRateSettings] {
             auto *window = qobject_cast<QQuickWindow *>(m_engine.rootObjects().first());
             QVariant passed;
             const bool ok = window && QMetaObject::invokeMethod(fixture, "run", Q_RETURN_ARG(QVariant, passed),
                 Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) && passed.toBool() && !m_qmlWarningOccurred;
             if (!ok) { m_application.exit(EXIT_FAILURE); return; }
-            const auto finish = [this, window, fixture, customBackground] {
-                if (customBackground) {
+            const auto finish = [this, window, fixture, customBackground, onboarding, tenBitWarning, languageSettings, frameRateSettings] {
+                if (languageSettings) {
+                    const QList<int> keys = m_arguments.contains(u"--language-keyboard-selection"_s)
+                        ? QList<int>{Qt::Key_Tab, Qt::Key_Return} : QList<int>{Qt::Key_Escape};
+                    for (const auto key : keys) {
+                        QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+                        QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+                        QGuiApplication::sendEvent(window, &press);
+                        QGuiApplication::sendEvent(window, &release);
+                    }
+                }
+                if (customBackground || onboarding || tenBitWarning || languageSettings || frameRateSettings) {
                     QVariant verified;
                     if (!QMetaObject::invokeMethod(fixture, "verify", Q_RETURN_ARG(QVariant, verified))
                         || !verified.toBool() || m_qmlWarningOccurred) {
@@ -80,7 +163,7 @@ int AcceptanceSession::startSmokeWorkload()
                         return;
                     }
                 }
-                QTimer::singleShot(150, this, [this, window] {
+                QTimer::singleShot(languageSettings && m_arguments.contains(u"--language-preview"_s) ? 60000 : 150, this, [this, window] {
                     const auto shot = m_arguments.indexOf(u"--screenshot"_s);
                     const bool saved = shot < 0 || (shot + 1 < m_arguments.size()
                         && window->grabWindow().save(m_arguments.at(shot + 1)));
@@ -141,26 +224,62 @@ int AcceptanceSession::startSmokeWorkload()
             });
         });
     } else if (m_smokeTest && (m_arguments.contains(u"--smoke-backend-availability"_s)
+                     || m_arguments.contains(u"--smoke-queue-selector"_s)
+                     || m_arguments.contains(u"--smoke-command-search"_s)
+                     || m_arguments.contains(u"--smoke-game-details-layout"_s)
+                     || m_arguments.contains(u"--smoke-ownership"_s)
+                     || m_arguments.contains(u"--smoke-catalog-sync"_s)
+                     || m_arguments.contains(u"--smoke-push-invalidation"_s)
                      || m_arguments.contains(u"--smoke-microphone"_s)
                      || m_arguments.contains(u"--smoke-audio-output"_s)
+                     || m_arguments.contains(u"--smoke-background-stream"_s)
                      || m_arguments.contains(u"--smoke-recording"_s)
                      || m_arguments.contains(u"--smoke-collections"_s)
                      || m_arguments.contains(u"--smoke-steam-big-picture"_s)
+                     || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
+                     || m_arguments.contains(u"--smoke-save-bandwidth"_s)
+                     || m_arguments.contains(u"--smoke-store-launch"_s)
+                     || m_arguments.contains(u"--smoke-network-test"_s)
                      || m_arguments.contains(u"--smoke-idle-mode"_s)
                      || m_arguments.contains(u"--smoke-queue-drops"_s)
+                     || m_arguments.contains(u"--smoke-color-format"_s)
                      || m_arguments.contains(u"--smoke-stream-recovery"_s))) {
-        QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-queue-drops"_s)
+        QQmlComponent component(&m_engine, QUrl(m_arguments.contains(u"--smoke-command-search"_s)
+            ? u"qrc:/acceptance/CommandSearchAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-queue-selector"_s)
+            ? u"qrc:/acceptance/QueueSelectorAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-game-details-layout"_s)
+            ? u"qrc:/acceptance/GameDetailsLayoutAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-color-format"_s)
+            ? u"qrc:/acceptance/ColorFormatAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-ownership"_s)
+            ? u"qrc:/acceptance/OwnershipAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-catalog-sync"_s)
+            ? u"qrc:/acceptance/CatalogSyncAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-push-invalidation"_s)
+            ? u"qrc:/acceptance/PushInvalidationAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-queue-drops"_s)
             ? u"qrc:/acceptance/QueueDropsAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-microphone"_s)
             ? u"qrc:/acceptance/MicrophoneAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-audio-output"_s)
             ? u"qrc:/acceptance/AudioOutputAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-background-stream"_s)
+            ? u"qrc:/acceptance/BackgroundStreamAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-recording"_s)
             ? u"qrc:/acceptance/RecordingAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-collections"_s)
             ? u"qrc:/acceptance/CollectionsAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-steam-big-picture"_s)
             ? u"qrc:/acceptance/SteamBigPictureAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
+            ? u"qrc:/acceptance/PersistentInGameSettingsAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-save-bandwidth"_s)
+            ? u"qrc:/acceptance/SaveBandwidthAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-store-launch"_s)
+            ? u"qrc:/acceptance/StoreLaunchAcceptance.qml"_s
+            : m_arguments.contains(u"--smoke-network-test"_s)
+            ? u"qrc:/acceptance/NetworkTestAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-idle-mode"_s)
             ? u"qrc:/acceptance/IdleModeAcceptance.qml"_s
             : m_arguments.contains(u"--smoke-stream-recovery"_s)
@@ -177,29 +296,106 @@ int AcceptanceSession::startSmokeWorkload()
             m_engine.rootContext()->setContextProperty(u"NativeStreamRuntime"_s, runtime);
         }
         if (m_arguments.contains(u"--smoke-stream-recovery"_s)
+            || m_arguments.contains(u"--smoke-queue-selector"_s)
+            || m_arguments.contains(u"--smoke-command-search"_s)
+            || m_arguments.contains(u"--smoke-game-details-layout"_s)
+            || m_arguments.contains(u"--smoke-ownership"_s)
+            || m_arguments.contains(u"--smoke-catalog-sync"_s)
+            || m_arguments.contains(u"--smoke-push-invalidation"_s)
             || m_arguments.contains(u"--smoke-recording"_s)
             || m_arguments.contains(u"--smoke-queue-drops"_s)
             || m_arguments.contains(u"--smoke-collections"_s)
-            || m_arguments.contains(u"--smoke-steam-big-picture"_s)) {
+            || m_arguments.contains(u"--smoke-steam-big-picture"_s)
+            || m_arguments.contains(u"--smoke-persistent-in-game-settings"_s)
+            || m_arguments.contains(u"--smoke-save-bandwidth"_s)
+            || m_arguments.contains(u"--smoke-store-launch"_s)
+            || m_arguments.contains(u"--smoke-network-test"_s)) {
             auto *client = fixture->property("client").value<QObject *>();
             if (!client) return EXIT_FAILURE;
             m_engine.rootContext()->setContextProperty(u"CoreClient"_s, client);
         }
         QTimer::singleShot(150, this, [this, fixture] {
             auto *window = qobject_cast<QQuickWindow *>(m_engine.rootObjects().first());
+            if (window && (m_arguments.contains(u"--smoke-color-format-fullscreen"_s)
+                    || m_arguments.contains(u"--smoke-store-launch-fullscreen"_s)))
+                window->showFullScreen();
             QVariant passed;
             const bool ok = window && QMetaObject::invokeMethod(fixture, "run", Q_RETURN_ARG(QVariant, passed),
                 Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) && passed.toBool() && !m_qmlWarningOccurred;
+            if (ok && m_arguments.contains(u"--smoke-color-format"_s)) {
+                QTimer::singleShot(150, this, [this, window, fixture] {
+                    QVariant notified;
+                    if (!QMetaObject::invokeMethod(fixture, "notify", Q_RETURN_ARG(QVariant, notified),
+                            Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) || !notified.toBool())
+                        m_application.exit(EXIT_FAILURE);
+                });
+            }
+            if (ok && (m_arguments.contains(u"--smoke-command-search"_s)
+                       || m_arguments.contains(u"--smoke-game-details-layout"_s))) {
+                if (m_arguments.contains(u"--smoke-game-details-layout"_s)
+                    && m_arguments.contains(u"--details-interactive"_s))
+                    return;
+                auto *timer = new QTimer(this);
+                timer->setInterval(25);
+                connect(timer, &QTimer::timeout, this, [this, fixture, window, timer, deadline = QDeadlineTimer(15000)] {
+                    const auto key = fixture->property("key").toInt();
+                    if (key != 0) {
+                        fixture->setProperty("key", 0);
+                        const auto modifiers = Qt::KeyboardModifiers(fixture->property("modifiers").toInt());
+                        QKeyEvent press(QEvent::KeyPress, key, modifiers);
+                        QKeyEvent release(QEvent::KeyRelease, key, modifiers);
+                        QGuiApplication::sendEvent(window, &press);
+                        QGuiApplication::sendEvent(window, &release);
+                    }
+                    QVariant state;
+                    const bool advanced = QMetaObject::invokeMethod(fixture, "advance", Q_RETURN_ARG(QVariant, state));
+                    if (advanced && state.toInt() == 0 && !m_qmlWarningOccurred && !deadline.hasExpired()) return;
+                    timer->stop();
+                    bool success = advanced && state.toInt() == 1 && !m_qmlWarningOccurred;
+                    const auto shot = m_arguments.indexOf(u"--screenshot"_s);
+                    if (success && shot >= 0)
+                        success = shot + 1 < m_arguments.size() && QFileInfo(m_arguments.at(shot + 1)).isAbsolute()
+                            && window->grabWindow().save(m_arguments.at(shot + 1));
+                    if (!success) qCritical("Interactive shell acceptance failed");
+                    m_application.exit(success ? EXIT_SUCCESS : EXIT_FAILURE);
+                });
+                timer->start();
+                return;
+            }
             if (ok && (m_arguments.contains(u"--smoke-collections"_s)
-                       || m_arguments.contains(u"--smoke-queue-drops"_s))) {
-                QTimer::singleShot(250, this, [this, window] {
+                       || m_arguments.contains(u"--smoke-queue-selector"_s)
+                       || m_arguments.contains(u"--smoke-ownership"_s)
+                       || m_arguments.contains(u"--smoke-push-invalidation"_s)
+                       || m_arguments.contains(u"--smoke-catalog-sync"_s)
+                       || m_arguments.contains(u"--smoke-color-format"_s)
+                       || m_arguments.contains(u"--smoke-backend-availability"_s)
+                       || m_arguments.contains(u"--smoke-queue-drops"_s)
+                       || m_arguments.contains(u"--smoke-store-launch"_s))) {
+                QTimer::singleShot(250, this, [this, window, fixture] {
+                    if (m_arguments.contains(u"--smoke-ownership"_s)
+                        || m_arguments.contains(u"--smoke-queue-selector"_s)
+                        || m_arguments.contains(u"--smoke-color-format"_s)
+                        || m_arguments.contains(u"--smoke-store-launch"_s)
+                        || m_arguments.contains(u"--smoke-push-invalidation"_s)) {
+                        QVariant verified;
+                        if (!QMetaObject::invokeMethod(fixture, "verifyRendered", Q_RETURN_ARG(QVariant, verified),
+                                Q_ARG(QVariant, QVariant::fromValue(window->contentItem()))) || !verified.toBool()) {
+                            m_application.exit(EXIT_FAILURE);
+                            return;
+                        }
+                    }
                     const auto shot = m_arguments.indexOf(u"--screenshot"_s);
                     const bool saved = shot < 0 || (shot + 1 < m_arguments.size()
                         && window->grabWindow().save(m_arguments.at(shot + 1)));
                     m_application.exit(saved && !m_qmlWarningOccurred ? EXIT_SUCCESS : EXIT_FAILURE);
                 });
             } else {
-                m_application.exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+                const auto shot = m_arguments.indexOf(u"--screenshot"_s);
+                const bool saved = shot < 0
+                    || (shot + 1 < m_arguments.size()
+                        && QFileInfo(m_arguments.at(shot + 1)).isAbsolute()
+                        && window->grabWindow().save(m_arguments.at(shot + 1)));
+                m_application.exit(ok && saved ? EXIT_SUCCESS : EXIT_FAILURE);
             }
         });
     } else if (m_smokeTest && (m_arguments.contains(u"--smoke-region-ping"_s) || m_arguments.contains(u"--smoke-store-paging"_s))) {
@@ -394,6 +590,11 @@ int AcceptanceSession::startSmokeWorkload()
             m_application.exit(EXIT_FAILURE);
         });
     } else if (m_arguments.contains(u"--smoke-release-notes"_s)) {
+        if (!m_engine.rootObjects().isEmpty()) {
+            auto *window = m_engine.rootObjects().first();
+            if (auto *about = window->findChild<QObject *>(u"desktopAboutSettings"_s))
+                about->setProperty("releaseNotesOpen", true);
+        }
         auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
         store->setProperty("updaterState", QVariantMap{
             {u"status"_s, u"available"_s}, {u"currentVersion"_s, QGuiApplication::applicationVersion()},

@@ -76,7 +76,13 @@ pub fn fetch_bounded_page(
     let mut count = limit.clamp(1, 100);
     loop {
         crate::requests::check()?;
-        let page = fetch(count)?;
+        let page = match fetch(count) {
+            Err(error) if error.code == "catalog_response_too_large" && count > 1 => {
+                count = (count / 2).max(1);
+                continue;
+            }
+            result => result?,
+        };
         crate::requests::check()?;
         if encoded_size(&page)? <= RESULT_BUDGET {
             return Ok(page);
@@ -111,7 +117,7 @@ pub fn page_result(
         ));
     }
     Ok(json!({
-        "count":games.len(), "totalCount":info["totalCount"].as_u64().unwrap_or(games.len() as u64),
+        "count":games.len(), "totalCount":info["totalCount"].as_u64(),
         "games":games, "hasNextPage":has_more, "nextCursor":if has_more {next} else {""},
         "source":"store-browse", "fetchedAt":fetched_at
     }))

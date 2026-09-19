@@ -14,6 +14,7 @@ QtObject {
         signal responseReceived(string requestId, var result)
         signal requestFailed(string requestId, string code, string message)
         signal eventReceived(string name, var payload)
+        function markUiReady() {}
         function logShellDiagnostic(message) {} // No filesystem writes from the isolated mock.
         function request(method, params, timeout) {
             const id = "region-test-" + (++sequence)
@@ -47,8 +48,8 @@ QtObject {
         invokePing(button)
         check(row.description.indexOf("Sign in") >= 0 && !ShellStore.regionPingBusy, "signed-out feedback")
 
-        ShellStore.authSession = {user: {id: "region-fixture", userId: "region-fixture", displayName: "Region Test"}}
-        ShellStore.settings = {region: ""}
+        ShellStore.authSession = {user: {id: "region-fixture", userId: "region-fixture", displayName: "Region Test"}, provider: {idpId:"region-alliance", code:"ALLIANCE"}}
+        ShellStore.settings = {region: "", regionProviderIdpId:"region-alliance"}
         invokePing(button)
         const discovery = ShellStore.regionsRequestId
         check(discovery !== "" && ShellStore.regionPingPending && !button.enabled, "queued discovery")
@@ -69,7 +70,7 @@ QtObject {
         check(row.description.indexOf("EU West") >= 0 && row.value === "Best: 0 ms", "automatic best result including zero")
         check(picker.items.find(item => item.value === regions[2].url).detail === "No response", "failed region feedback")
         check(ShellStore.settings.region === "", "ping changed preferred region")
-        ShellStore.settings = {region: regions[1].url}
+        ShellStore.settings = {region: regions[1].url, regionProviderIdpId:"region-alliance"}
         check(row.value === "21 ms", "explicit region latency")
 
         invokePing(button)
@@ -100,8 +101,21 @@ QtObject {
         client.responseReceived(cancelled, {results: [{url: regions[0].url, pingMs: 9}]})
         check(!ShellStore.regionPingBusy && Object.keys(ShellStore.regionPingResults).length === 0, "cancelled result was reapplied")
 
+        ShellStore.regions = []
+        ShellStore.refreshRegions()
+        const oldRegions = ShellStore.regionsRequestId
+        ShellStore.subscriptionRequestId = client.request("account.subscription.get", {})
+        const oldSubscription = ShellStore.subscriptionRequestId
+        const generation = ShellStore.authGeneration + 1
+        check(ShellStore.acceptAuthEnvelope({generation:generation, session:{user:{userId:"second-account",displayName:"Second account"},provider:{idpId:"second-alliance",code:"ALLIANCE"}}}), "new provider scope was rejected")
+        client.responseReceived(oldRegions, {regions:[{name:"Wrong provider",url:"https://wrong.example.invalid"}],vpcId:"wrong-provider"})
+        client.responseReceived(oldSubscription, {subscription:{membershipTier:"wrong-provider"}})
+        check(ShellStore.regions.length === 0 && ShellStore.subscription === null, "old account callbacks crossed the provider boundary")
+        check(ShellStore.regionsRequestId !== oldRegions && ShellStore.subscriptionRequestId !== oldSubscription, "old account request ownership survived switching")
+        ShellStore.regions = regions
+
         // Leave a complete visible result for screenshot/layout acceptance.
-        ShellStore.settings = {region: "", themePack: "aurora"}
+        ShellStore.settings = {region: "", regionProviderIdpId:"second-alliance", themePack: "aurora"}
         invokePing(button)
         client.responseReceived(ShellStore.regionPingRequestId, {results: [
             {url: regions[0].url, pingMs: 9}, {url: regions[1].url, pingMs: 21},

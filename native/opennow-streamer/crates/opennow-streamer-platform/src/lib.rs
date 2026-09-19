@@ -32,10 +32,10 @@ pub use graphics::{
     GraphicsRuntimeError, GraphicsTextureFormat, RenderThreadGraphics,
 };
 pub use media::{
-    CapturedInput, CapturedInputQueue, CapturedInputSample, EncodedFrame, EncodedRecordingReceiver,
-    MediaCodec, MediaColorQuality, MediaControl, MediaFeedback, MediaSession, MediaSink,
-    MediaStreamConfig, MediaVideoCodec, PushOutcome, ShortcutChord, StreamShortcutAction,
-    StreamShortcutBindings,
+    CapturedInput, CapturedInputQueue, CapturedInputSample, DecodeStageTimings,
+    DecodeTimingsReport, EncodedFrame, EncodedRecordingReceiver, MediaCodec, MediaColorQuality,
+    MediaControl, MediaFeedback, MediaSession, MediaSink, MediaStreamConfig, MediaVideoCodec,
+    PushOutcome, ShortcutChord, StreamShortcutAction, StreamShortcutBindings,
 };
 pub use microphone::{
     EncodedMicrophoneFrame, MICROPHONE_FRAME_SAMPLES, MICROPHONE_SAMPLE_RATE, MicrophoneReceiver,
@@ -51,16 +51,18 @@ pub enum SharedVulkanDevice {}
 pub use opennow_streamer_platform_macos::{
     AdoptedMetalContext, EmbeddedFrameProducer, MetalFrame, MetalRecordedFrame,
 };
+pub use opennow_streamer_platform_windows::WindowsAdapterLuid;
 #[cfg(target_os = "windows")]
 pub use opennow_streamer_platform_windows::{
     AdoptedD3d11Context, D3d11Frame, D3d11FrameProducer, D3d11FrameSubmitter, D3d11RecordedFrame,
-    D3d11TextureFormat,
+    D3d11TextureFormat, d3d11_adapter_luid,
 };
 pub use recording::{RecordingSummary, record_matroska, record_replay_matroska};
 pub use replay::ReplaySnapshot;
 pub use runtime::{
-    MainThreadHost, MediaRuntime, MediaRuntimeControl, create_embedded_runtime,
-    create_embedded_runtime_with_input, create_embedded_runtime_with_vulkan_device, create_runtime,
+    EmbeddedRuntimeConfig, MainThreadHost, MediaRuntime, MediaRuntimeControl,
+    create_embedded_runtime, create_embedded_runtime_with_config,
+    create_embedded_runtime_with_input, create_runtime,
 };
 #[cfg(feature = "test-runtime")]
 pub use runtime::{TestMediaRuntimeHost, create_test_runtime};
@@ -78,8 +80,20 @@ pub fn video_backends() -> Vec<VideoBackendCapability> {
     let mut backends = {
         use opennow_streamer_platform_windows::WindowsGraphicsApi;
         vec![
-            windows_hardware_backend(WindowsGraphicsApi::D3d12, "d3d12", "d3d11on12-nv12"),
-            windows_hardware_backend(WindowsGraphicsApi::D3d11, "d3d11", "d3d11-nv12"),
+            windows_hardware_backend(
+                WindowsGraphicsApi::D3d12,
+                "d3d12",
+                "d3d11on12-nv12",
+                None,
+                WindowsOutputMode::Standalone,
+            ),
+            windows_hardware_backend(
+                WindowsGraphicsApi::D3d11,
+                "d3d11",
+                "d3d11-nv12",
+                None,
+                WindowsOutputMode::Standalone,
+            ),
             software_backend(),
         ]
     };
@@ -95,11 +109,12 @@ pub fn video_backends() -> Vec<VideoBackendCapability> {
 }
 
 pub fn embedded_video_backends() -> Vec<VideoBackendCapability> {
-    embedded_video_backends_with_device(None)
+    embedded_video_backends_with_config(None, None)
 }
 
-pub(crate) fn embedded_video_backends_with_device(
+pub(crate) fn embedded_video_backends_with_config(
     _device: Option<&SharedVulkanDevice>,
+    _windows_adapter_luid: Option<WindowsAdapterLuid>,
 ) -> Vec<VideoBackendCapability> {
     #[cfg(target_os = "linux")]
     let mut backends = linux_backend::video_backends();
@@ -153,8 +168,8 @@ pub(crate) fn embedded_video_backends_with_device(
                         "av1" => opennow_streamer_platform_linux::VideoCodec::Av1,
                         _ => opennow_streamer_platform_linux::VideoCodec::H264,
                     };
-                    if opennow_streamer_platform_linux::supports_vaapi_ten_bit(profile) {
-                        colors.push("10bit_420");
+                    let support = opennow_streamer_platform_linux::vaapi_color_support(profile);
+                    if apply_vaapi_color_support(&mut colors, support) {
                         codec.available = true;
                         codec.reason = None;
                     }
@@ -207,6 +222,8 @@ pub(crate) fn embedded_video_backends_with_device(
             WindowsGraphicsApi::D3d11,
             "d3d11",
             "d3d11-nv12",
+            _windows_adapter_luid,
+            WindowsOutputMode::Embedded,
         )]
     };
     #[cfg(target_os = "macos")]
@@ -257,6 +274,20 @@ pub(crate) fn embedded_video_backends_with_device(
     backends
 }
 
+#[cfg(target_os = "linux")]
+fn apply_vaapi_color_support(
+    colors: &mut Vec<&'static str>,
+    support: opennow_streamer_platform_linux::VaapiColorSupport,
+) -> bool {
+    if support.eight_bit_420 {
+        colors.push("8bit_420");
+    }
+    if support.ten_bit_420 {
+        colors.push("10bit_420");
+    }
+    support.eight_bit_420 || support.ten_bit_420
+}
+
 fn apply_backend_policy(backends: &mut [VideoBackendCapability], requested: Option<&str>) {
     let requested = requested
         .map(str::trim)
@@ -301,14 +332,21 @@ pub const fn supports_audio_output() -> bool {
     true
 }
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy)]
+enum WindowsOutputMode {
+    Embedded,
+    Standalone,
+}
+
 #[cfg(target_os = "windows")]
 fn windows_hardware_backend(
     api: opennow_streamer_platform_windows::WindowsGraphicsApi,
     backend: &'static str,
     zero_copy_mode: &'static str,
+    adapter_luid: Option<WindowsAdapterLuid>,
+    output_mode: WindowsOutputMode,
 ) -> VideoBackendCapability {
-    use opennow_streamer_platform_windows::{VideoCodec, VideoPixelFormat};
-
     if !runtime::backend_preference_allows(backend) {
         return unavailable_backend(
             backend,
@@ -316,9 +354,23 @@ fn windows_hardware_backend(
             "Direct3D hardware decode was disabled by configuration",
         );
     }
-    let probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(api);
-    let available = probe.bundled_backend_available();
-    let media_output_available = probe.d3d11_presentation && probe.wasapi_render;
+    let probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(api, adapter_luid);
+    windows_hardware_capability(&probe, backend, zero_copy_mode, output_mode)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_hardware_capability(
+    probe: &opennow_streamer_platform_windows::CapabilityProbe,
+    backend: &'static str,
+    zero_copy_mode: &'static str,
+    output_mode: WindowsOutputMode,
+) -> VideoBackendCapability {
+    use opennow_streamer_platform_windows::{VideoCodec, VideoPixelFormat};
+
+    let media_output_available = probe.d3d11_presentation
+        && (matches!(output_mode, WindowsOutputMode::Embedded) || probe.wasapi_render);
+    let available = media_output_available
+        && (probe.h264_hardware_decode || probe.h265_hardware_decode || probe.av1_hardware_decode);
     let color_qualities = |codec| {
         [
             ("8bit_420", VideoPixelFormat::Nv12),
@@ -346,7 +398,14 @@ fn windows_hardware_backend(
     let reason = if available {
         None
     } else {
-        Some("Direct3D hardware decode, presentation, or WASAPI output is unavailable")
+        Some(match output_mode {
+            WindowsOutputMode::Embedded => {
+                "Direct3D hardware decode or presentation is unavailable"
+            }
+            WindowsOutputMode::Standalone => {
+                "Direct3D hardware decode, presentation, or WASAPI output is unavailable"
+            }
+        })
     };
     VideoBackendCapability {
         backend,
@@ -455,6 +514,7 @@ fn software_backend() -> VideoBackendCapability {
     {
         let probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(
             opennow_streamer_platform_windows::WindowsGraphicsApi::D3d11,
+            None,
         );
         let media_output_available = probe.d3d11_presentation && probe.wasapi_render;
         // OpenH264 is bundled for the guaranteed H.264 path. HEVC and AV1 can
@@ -604,6 +664,95 @@ mod tests {
     }
 
     #[test]
+    fn windows_embedded_video_capabilities_do_not_require_standalone_audio() {
+        use opennow_streamer_platform_windows::CapabilityProbe;
+
+        let mut probe = CapabilityProbe {
+            available: false,
+            h264_hardware_decode: true,
+            h265_hardware_decode: false,
+            av1_hardware_decode: false,
+            h265_hdr: false,
+            av1_hdr: false,
+            h265_10bit: false,
+            av1_10bit: false,
+            h265_444: false,
+            h265_10bit_444: false,
+            h265_hdr_444: false,
+            h264_software_decode: true,
+            h265_software_decode: false,
+            av1_software_decode: false,
+            d3d11_presentation: true,
+            wasapi_render: false,
+            reason: Some("WASAPI failed to start".to_owned()),
+        };
+        let capability = |probe: &CapabilityProbe, mode| {
+            windows_hardware_capability(probe, "d3d11", "d3d11-nv12", mode)
+        };
+
+        let embedded = capability(&probe, WindowsOutputMode::Embedded);
+        assert!(embedded.available);
+        assert_eq!(embedded.reason, None);
+        assert_eq!(embedded.zero_copy_modes, vec!["d3d11-nv12"]);
+        assert!(embedded.codecs[0].available);
+        assert_eq!(embedded.codecs[0].reason, None);
+        assert_eq!(embedded.codecs[0].color_qualities, Some(vec!["8bit_420"]));
+        assert!(embedded.codecs[1..].iter().all(|codec| !codec.available));
+
+        let standalone = capability(&probe, WindowsOutputMode::Standalone);
+        assert!(!standalone.available);
+        assert!(standalone.zero_copy_modes.is_empty());
+        assert!(standalone.codecs.iter().all(|codec| !codec.available));
+
+        probe.wasapi_render = true;
+        assert_eq!(
+            serde_json::to_value(capability(&probe, WindowsOutputMode::Embedded)).unwrap(),
+            serde_json::to_value(embedded).unwrap(),
+        );
+        assert!(capability(&probe, WindowsOutputMode::Standalone).available);
+
+        probe.wasapi_render = false;
+        probe.h265_hardware_decode = true;
+        probe.h265_10bit = true;
+        probe.h265_hdr = true;
+        let hdr = capability(&probe, WindowsOutputMode::Embedded);
+        assert!(hdr.codecs[1].available);
+        assert_eq!(hdr.codecs[1].hdr_supported, Some(true));
+        assert_eq!(
+            hdr.codecs[1].color_qualities,
+            Some(vec!["8bit_420", "10bit_420"])
+        );
+        assert_eq!(hdr.codecs[1].hdr_color_qualities, Some(vec!["10bit_420"]));
+        assert!(!hdr.codecs[2].available);
+
+        probe.d3d11_presentation = false;
+        for mode in [WindowsOutputMode::Embedded, WindowsOutputMode::Standalone] {
+            let unavailable = capability(&probe, mode);
+            assert!(!unavailable.available);
+            assert!(unavailable.reason.is_some());
+            assert!(unavailable.zero_copy_modes.is_empty());
+            for codec in unavailable.codecs {
+                assert!(!codec.available);
+                assert_eq!(codec.hdr_supported, Some(false));
+                assert_eq!(codec.color_qualities, Some(vec![]));
+                assert_eq!(codec.hdr_color_qualities, Some(vec![]));
+            }
+        }
+
+        probe.d3d11_presentation = true;
+        probe.h264_hardware_decode = false;
+        probe.h265_hardware_decode = false;
+        probe.h265_10bit = false;
+        probe.h265_hdr = false;
+        assert!(!capability(&probe, WindowsOutputMode::Embedded).available);
+        probe.av1_hardware_decode = true;
+        let av1 = capability(&probe, WindowsOutputMode::Embedded);
+        assert!(av1.available);
+        assert!(!av1.codecs[0].available);
+        assert!(av1.codecs[2].available);
+    }
+
+    #[test]
     fn advertises_only_the_linked_software_codec() {
         let backends = video_backends();
         let software = backends
@@ -639,6 +788,7 @@ mod tests {
             use opennow_streamer_platform_windows::WindowsGraphicsApi;
             let software_probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(
                 WindowsGraphicsApi::D3d11,
+                None,
             );
             assert_eq!(
                 software
@@ -670,7 +820,7 @@ mod tests {
                     .iter()
                     .find(|backend| backend.backend == backend_name)
                     .expect("Direct3D backend");
-                let probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(api);
+                let probe = opennow_streamer_platform_windows::WindowsBackend::probe_for(api, None);
                 assert_eq!(hardware.available, probe.bundled_backend_available());
                 assert_eq!(
                     hardware
@@ -759,7 +909,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn embedded_linux_hdr_requires_an_available_ten_bit_output_path() {
-        for backend in embedded_video_backends_with_device(None) {
+        for backend in embedded_video_backends_with_config(None, None) {
             for codec in backend.codecs {
                 assert_eq!(
                     codec.hdr_supported,
@@ -784,7 +934,7 @@ mod tests {
         use opennow_streamer_platform_windows::{
             VideoCodec, VideoPixelFormat, WindowsBackend, WindowsGraphicsApi,
         };
-        let probe = WindowsBackend::probe_for(WindowsGraphicsApi::D3d11);
+        let probe = WindowsBackend::probe_for(WindowsGraphicsApi::D3d11, None);
         for backend in embedded_video_backends() {
             for codec in backend.codecs {
                 let profile = match codec.codec {
@@ -813,19 +963,68 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn embedded_linux_reports_explicit_color_profiles_without_claiming_zero_copy() {
-        for backend in embedded_video_backends_with_device(None) {
+        for backend in embedded_video_backends_with_config(None, None) {
             for codec in backend.codecs {
                 let colors = codec
                     .color_qualities
                     .expect("embedded Linux color profiles");
-                if backend.backend == "vulkan" {
-                    assert!(colors.is_empty());
-                    assert!(backend.zero_copy_modes.is_empty());
-                } else {
-                    assert!(colors.iter().all(|color| *color == "8bit_420"));
+                match backend.backend {
+                    "vulkan" => {
+                        assert!(colors.is_empty());
+                        assert!(backend.zero_copy_modes.is_empty());
+                    }
+                    "vaapi" => {
+                        for color in &colors {
+                            assert!(
+                                matches!(*color, "8bit_420" | "10bit_420"),
+                                "{} {color}",
+                                codec.codec
+                            );
+                            if *color == "10bit_420" {
+                                assert!(
+                                    matches!(codec.codec, "h265" | "av1"),
+                                    "{} {color}",
+                                    codec.codec
+                                );
+                            }
+                        }
+                    }
+                    _ => assert!(
+                        colors.iter().all(|color| *color == "8bit_420"),
+                        "{} {colors:?}",
+                        backend.backend
+                    ),
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_color_support_extends_the_advertised_profiles_in_wire_order() {
+        use opennow_streamer_platform_linux::VaapiColorSupport;
+        let support = |eight_bit_420, ten_bit_420| VaapiColorSupport {
+            eight_bit_420,
+            ten_bit_420,
+        };
+
+        let mut colors = Vec::new();
+        assert!(!apply_vaapi_color_support(
+            &mut colors,
+            support(false, false)
+        ));
+        assert!(colors.is_empty());
+
+        assert!(apply_vaapi_color_support(&mut colors, support(true, false)));
+        assert_eq!(colors, ["8bit_420"]);
+
+        let mut colors = Vec::new();
+        assert!(apply_vaapi_color_support(&mut colors, support(false, true)));
+        assert_eq!(colors, ["10bit_420"]);
+
+        let mut colors = Vec::new();
+        assert!(apply_vaapi_color_support(&mut colors, support(true, true)));
+        assert_eq!(colors, ["8bit_420", "10bit_420"]);
     }
 
     #[cfg(target_os = "macos")]

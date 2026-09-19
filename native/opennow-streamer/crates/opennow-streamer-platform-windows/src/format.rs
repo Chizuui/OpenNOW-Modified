@@ -34,6 +34,16 @@ impl VideoPixelFormat {
             Self::P010 | Self::Y410 => 10,
         }
     }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn supports_decoded_output(self, output: Self) -> bool {
+        match self {
+            Self::Nv12 => true,
+            Self::P010 => matches!(output, Self::P010 | Self::Y410),
+            Self::Ayuv => matches!(output, Self::Ayuv | Self::Y410 | Self::Nv12),
+            Self::Y410 => matches!(output, Self::Y410 | Self::P010),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +107,9 @@ impl VideoFormat {
             )));
         }
         let fps = self.frame_rate_numerator.get() as f64 / self.frame_rate_denominator.get() as f64;
-        if !(1.0..=240.0).contains(&fps) {
+        if !(1.0..=360.0).contains(&fps) {
             return Err(BackendError::InvalidConfig(
-                "video frame rate must be between 1 and 240 fps".to_owned(),
+                "video frame rate must be between 1 and 360 fps".to_owned(),
             ));
         }
         if self.average_bitrate == 0 {
@@ -367,6 +377,35 @@ mod tests {
     }
 
     #[test]
+    fn decoded_chroma_fallback_preserves_negotiated_bit_depth() {
+        for (requested, output) in [
+            (VideoPixelFormat::Ayuv, VideoPixelFormat::Nv12),
+            (VideoPixelFormat::Y410, VideoPixelFormat::P010),
+        ] {
+            assert!(requested.supports_decoded_output(output));
+            assert_eq!(requested.bit_depth(), output.bit_depth());
+        }
+        assert!(!VideoPixelFormat::Ayuv.supports_decoded_output(VideoPixelFormat::P010));
+    }
+
+    #[test]
+    fn decoded_output_never_reduces_negotiated_bit_depth() {
+        for requested in [VideoPixelFormat::P010, VideoPixelFormat::Y410] {
+            for output in [VideoPixelFormat::Nv12, VideoPixelFormat::Ayuv] {
+                assert!(!requested.supports_decoded_output(output));
+            }
+        }
+        for pixel_format in [
+            VideoPixelFormat::Nv12,
+            VideoPixelFormat::P010,
+            VideoPixelFormat::Ayuv,
+            VideoPixelFormat::Y410,
+        ] {
+            assert!(pixel_format.supports_decoded_output(pixel_format));
+        }
+    }
+
+    #[test]
     fn ten_bit_sdr_is_not_hdr() {
         for pixel_format in [VideoPixelFormat::P010, VideoPixelFormat::Y410] {
             let format = VideoFormat {
@@ -506,6 +545,22 @@ mod tests {
         assert!(
             VideoFormat {
                 average_bitrate: 0,
+                ..video_format()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            VideoFormat {
+                frame_rate_numerator: NonZeroU32::new(360).unwrap(),
+                ..video_format()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            VideoFormat {
+                frame_rate_numerator: NonZeroU32::new(480).unwrap(),
                 ..video_format()
             }
             .validate()

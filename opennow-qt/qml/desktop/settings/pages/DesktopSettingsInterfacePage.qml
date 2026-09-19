@@ -12,24 +12,14 @@ DesktopSettingsPanel {
     DesktopSettingsSection { text: qsTr("INTERFACE") }
     DesktopSettingsChoice {
         objectName: "renewLanguageChoice"
-        width: parent.width; glyph: "globe"; title: qsTr("Language"); description: qsTr("Community translated through Crowdin")
-        items: [{label:qsTr("System"),value:"system"},{label:"Deutsch",value:"de"},{label:"English",value:"en"},{label:"Español",value:"es"},{label:"Français",value:"fr"},{label:qsTr("Japanese"),value:"ja"},{label:qsTr("Korean"),value:"ko"},{label:"Nederlands",value:"nl"},{label:"Polski",value:"pl"},{label:"Română",value:"ro"},{label:"Русский",value:"ru"},{label:"Türkçe",value:"tr"},{label:qsTr("Chinese"),value:"zh"}]
-        value: page.settingsScreen.valueSetting("appLanguage","en")
+        width: parent.width; glyph: "globe"; title: qsTr("Interface language")
+        description: ShellStore.settingsOwnerState.interfaceLanguageDescription
+        items: ShellStore.settingsOwnerState.interfaceLanguageItems
+        value: page.settingsScreen.valueSetting("appLanguage","system")
         onSelected: value => page.settingsScreen.setChoice("appLanguage",value)
     }
     DesktopSettingsRow {
-        width: parent.width; paperStyle: true; glyph: "sidebar"; title: qsTr("Collapsed sidebar")
-        description: qsTr("Show icons only · Ctrl B toggles")
-        DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("desktopRailCollapsed",true); onValueChangedByUser: value => page.settingsScreen.setSetting("desktopRailCollapsed",value) }
-    }
-    DesktopSettingsRow {
-        width: parent.width; paperStyle: true; glyph: "wave"; title: qsTr("Reduce motion")
-        description: qsTr("Cuts parallax and cover animations · follows your OS by default")
-        DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("reducedMotion",false); onValueChangedByUser: value => page.settingsScreen.setSetting("reducedMotion",value) }
-    }
-    DesktopSettingsRow {
-        width: parent.width; paperStyle: true; glyph: "sun"; title: qsTr("Translucent interface")
-        description: qsTr("Use translucent shell surfaces when supported"); showDivider: false
-        DesktopSettingsToggle { checked: page.settingsScreen.boolSetting("translucentUI",false); onValueChangedByUser: value => page.settingsScreen.setSetting("translucentUI",value) }
+        width: parent.width; paperStyle: true; glyph: "grid"; title: qsTr("Interface scale"); showDivider: false
+        DesktopSettingsSlider { from: 0.85; to: 1.25; stepSize: 0.05; decimals: 2; suffix: "×"; value: Number(page.settingsScreen.valueSetting("desktopUiScale",1)); onCommitted: value => page.settingsScreen.setSetting("desktopUiScale",value) }
     }
 }

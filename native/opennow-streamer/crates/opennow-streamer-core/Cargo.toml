@@ -9,6 +9,7 @@ rust-version.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 opennow-streamer-platform = { path = "../opennow-streamer-platform" }
+opennow-streamer-hid = { path = "../opennow-streamer-hid" }
 opennow-streamer-protocol = { path = "../opennow-streamer-protocol" }
 opennow-streamer-transport = { path = "../opennow-streamer-transport" }
 rustls.workspace = true

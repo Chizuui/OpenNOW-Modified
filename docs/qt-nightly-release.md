@@ -1,32 +1,49 @@
-# Unsigned Qt nightly releases
+# Qt nightly releases
 
-Use `qt-ci` on `dev` for the current Qt/native application. The old release workflows on `main`
-do not build this product. A nightly needs no Windows signing certificate, protected signing
-environment, or self-hosted update signer.
+Use `qt-ci` on `dev` for the current Qt/native application. Nightly applications have no Windows
+Authenticode certificate or Apple Developer ID signature and are not notarized. This workflow
+supports no-key artifact-only builds, but public nightlies require a pinned Ed25519 public key
+and manifests signed by the protected isolated signer. Configure the environment, runner, and
+key described in [`update-signing-setup.md`](update-signing-setup.md) before publishing.
+
+**Known issue: Alliance Partners are not working correctly in this build.**
 
 ## Build and publish
 
 After the release changes are merged into `dev`, run:
 
 ```sh
-gh workflow run qt-ci --repo OpenCloudGaming/OpenNOW --ref dev -f publish_nightly=false
+gh workflow run qt-ci --repo OpenCloudGaming/OpenNOW --ref dev -f publish_nightly=false -f public_key=
 ```
 
-This builds and tests all four targets without publishing anything. Download the four unsigned
+Explicitly set `public_key` empty for this no-key artifact-only path. The default is the
+production public key, which enables verified updates in the built application even when
+the artifacts themselves are not published. The no-key path requires no signing environment,
+does not create updater manifests, and cannot download updates in the application.
+This builds all five targets without publishing anything. Download the five unsigned
 artifact groups from that workflow run and perform the relevant checks in
 [`qt-acceptance.md`](qt-acceptance.md), especially Windows ARM64, which is cross-compiled and
 cannot run its application tests on the x64 CI worker.
 
-To publish a nightly from the selected branch after all CI jobs pass:
+To publish, retain the default production public key from
+`opennow-qt/packaging/update-public-key.base64`, never the private seed. Run:
 
 ```sh
-gh workflow run qt-ci --repo OpenCloudGaming/OpenNOW --ref dev -f publish_nightly=true
+gh workflow run qt-ci --repo OpenCloudGaming/OpenNOW --ref dev \
+  -f publish_nightly=true
 ```
+
+An empty, malformed, or different production key fails preflight. After checks and package builds pass, approve the
+exact source/workflow revision in the protected `qt-update-signing` environment. Its isolated
+signer verifies the complete nine-package inventory and two AppImage sidecars, signs each asset's sibling manifest,
+and uploads `opennow-qt-<version>-complete-update-signed`. The publisher independently verifies
+that finalized set before uploading it. Missing signing configuration blocks publication; it
+does not fall back to an unsigned public update.
 
 Use the registered `qt-ci` workflow name and an explicit `--ref dev`. The Actions web UI may not
 show the dispatch control until this workflow is also present on the default branch. Do not use
-the legacy `release` workflow instead. Publishing is opt-in: pushes, pull requests, and a manual
-run with the default input only upload validation artifacts.
+the legacy `release` workflow instead. Publishing is opt-in: pushes and pull requests run checks,
+and a manual run with the default inputs uploads validation artifacts without publishing.
 Manual runs have their own concurrency group, so a later branch push cannot cancel a publication.
 
 The version comes from `project(OpenNOWQt VERSION ...)` and the workflow run identity:
@@ -40,36 +57,113 @@ an existing tag or asset. Remove abandoned drafts separately if needed.
 
 ## Download formats
 
-Each release contains six packages with distinct version/platform/architecture filenames:
+Each release contains nine packages with distinct version/platform/architecture filenames:
 
 - `OpenNOW-Qt-<version>-Windows-x64.zip` and `...-Windows-arm64.zip` are unsigned portable builds.
   Extract the entire archive, then launch `bin/OpenNOW.exe`. Windows may display SmartScreen or
-  unknown-publisher warnings. These nightlies do not include MSI installers.
+  unknown-publisher warnings.
+- `OpenNOW-Qt-<version>-Windows-x64.msi` and `...-Windows-arm64.msi` install **OpenNOW Nightly**
+  into a separate **OpenNOW Nightly** directory. They do not replace a stable OpenNOW installation.
+  Newer runs and retries upgrade the nightly installation; older nightlies are rejected.
 - `OpenNOW-Qt-<version>-Linux-x64.AppImage` and `...-Linux-arm64.AppImage` are the recommended
   portable Linux downloads. Make the downloaded file executable before starting it.
-- `OpenNOW-Qt-<version>-Linux-x64.deb` and `...-Linux-arm64.deb` require distribution-provided
-  Qt 6.8+ and SDL3. Stock Ubuntu 24.04 does not provide those versions; use the AppImage there.
+- `OpenNOW-Qt-<version>-Linux-x64.deb` and `...-Linux-arm64.deb` bundle the AppImage's deployed
+  Qt, QML plugins, SDL3, and media runtime privately under `/opt/opennow`. Ubuntu 24.04 and
+  Linux Mint 22.x do not need a Qt upgrade or third-party repositories. Install the downloaded
+  package with `sudo apt install ./OpenNOW-Qt-<version>-Linux-x64.deb` so APT installs the
+  remaining system dependencies. The desktop entry and `opennow-qt` command use that private runtime.
   The internal Debian version uses `1.0.0~nightly.<run>.<attempt>` so a later stable `1.0.0`
   correctly supersedes it.
+- `OpenNOW-Qt-<version>-Darwin-arm64.dmg` contains the Apple Silicon application for macOS 13+.
+  Open the disk image and drag OpenNOW into Applications. There is no Intel or universal download.
+  Gatekeeper can block this non-notarized application. After checking the release and download,
+  use the explicit **Open Anyway** confirmation in **System Settings → Privacy & Security** if
+  macOS offers it. Do not disable Gatekeeper globally. CI also retains a separate macOS ZIP for
+  validation; that ZIP is not a public release asset.
 
-macOS is currently disabled. `SHA256SUMS` covers the six packages and `RELEASE-INFO.json`.
+The public signed set contains 24 files: nine packages, two `.AppImage.zsync` sidecars,
+eleven `<asset>.manifest.json` siblings, `RELEASE-INFO.json`, and `SHA256SUMS`.
+Its checksums cover all 23 other files. The no-key
+artifact-only inventory has no manifests; its checksums cover the packages and release metadata.
 Checksums detect corruption; they do not replace a publisher signature. The inventory rejects
 missing platforms, duplicate basenames, wrong versions, empty files, and unexpected assets
 before any release upload.
 AppImage smoke tests use the packaged offscreen plugin with host Qt plugin, QML, and library
 search paths removed, so the installed CI toolkit cannot hide missing bundled dependencies.
+Release DEBs are assembled from that same deployed AppDir, then installed in a clean Ubuntu 24.04
+container on each native architecture. Checks reject distribution Qt/SDL3 dependencies, check
+library resolution before adding test tools, run offscreen and X11 smoke tests and native capability
+probes, and exercise reinstall/removal. Run `bash opennow-qt/packaging/verify_bundled_deb.sh <package.deb>`
+to repeat these checks locally with Docker. Direct developer CPack builds without the
+`LinuxBundledDeb.cmake` project configuration still require distribution Qt 6.8+ and SDL3.
+macOS checks mount the actual DMG, copy the app out, detach the image, and smoke both that app
+and the validation ZIP with development Qt, SDL3, and build directories hidden. Windows checks
+extract MSI and ZIP payloads and compare every binary in the
+[Windows release list](../opennow-qt/packaging/windows-release-binaries.txt) against the deployment
+copies, including the update helper. Native Windows x64 installer fixtures exercise run upgrades,
+retry upgrades, downgrade rejection, and stable/nightly isolation. Windows ARM64 still requires
+runtime testing on hardware.
+
+The MSI version is independent of the full application SemVer. For nightly run `R` and attempt
+`A`, Windows Installer receives `floor(R / 256).(R % 256).A`. Both values must be in `1..65535`;
+configuration fails instead of wrapping or truncating an exhausted counter. Retries order within
+a run, and every new run orders after every attempt of the preceding run. A changed workflow that
+resets its run numbers needs an explicit installer migration. Stable packages keep their existing
+upgrade family and numeric version; supporter packages use a third family and directory.
 
 ## Updates and signed candidates
 
-These nightlies deliberately have no pinned Ed25519 update-signing key. Users download updates
-manually; the client does not bypass signature verification to install unsigned update payloads.
-The updater compares complete semantic versions, so nightly runs order numerically and stable
-`1.0.0` sorts after its nightlies when signed updates are configured in future builds.
+### AppImage delta updates
 
-Authenticode signing and Ed25519 update signing are different mechanisms. Adding an update key
-later does not require buying a Windows certificate, but it does require a separately reviewed
-key-management and manifest-signing setup. Never distribute the private key in a build.
+Both Linux architectures embed `gh-releases-zsync` update information during packaging.
+Stable and numeric release-candidate AppImages use GitHub's `latest` selector, which
+excludes prereleases. Nightlies use `latest-pre` and an architecture-specific
+`OpenNOW-Qt-*-nightly.*-Linux-<arch>.AppImage.zsync` pattern. Files retain their full
+versioned names; no mutable release tag or unversioned package alias is needed.
+Supporter artifact builds use a supporter-specific pattern and are not public releases.
+`latest-pre` examines the latest prerelease, not all matching historical prereleases;
+publishing another prerelease channel there can make external nightly checks report no
+matching asset rather than crossing channels.
+
+The pinned AppImage tooling generates each sidecar after embedding the update metadata.
+Packaging verifies the actual runtime's update information and the sidecar's filename,
+relative download URL, length, and SHA-1 against the completed AppImage before upload.
+Inventories, Ed25519 manifests, and release checksums include both sidecars. Consumers
+must keep the `.zsync` and AppImage siblings together on the GitHub release.
+
+AppImageUpdate and compatible external tools can use these sidecars for delta downloads.
+OpenNOW's built-in updater still downloads the complete AppImage and verifies its pinned
+Ed25519 manifest; this change does not add in-app delta downloads. External tools do not
+automatically verify OpenNOW's Ed25519 manifests. Their transport/integrity checks are a
+separate trust boundary and do not replace the built-in updater's authentication policy.
+
+### Built-in updates
+
+Public nightlies embed the supplied Ed25519 public key in both the core and apply helper.
+Their manifests authenticate each exact package before download completion and again before
+installation. Installation requires confirmation and no active or recovering streaming session;
+the helper applies the replacement and waits for the restarted Qt application and core to
+acknowledge startup. Automatic downloading is a separate opt-in and never authorizes shutdown.
+
+An earlier nightly without a pinned key requires **one manual upgrade** to an update-enabled
+build. It cannot securely learn a trust key from release metadata. Artifact-only builds still
+default to that no-key, manual-update behavior. The client never bypasses signature verification.
+See the [signing setup and bootstrap instructions](update-signing-setup.md) before the first
+public update-enabled release.
+
+The updater compares complete semantic versions, so nightly runs order numerically and stable
+`1.0.0` sorts after its nightlies. A stable MSI installs separately from the nightly MSI family
+rather than replacing it. Portable Windows replacement requires persistent ACL support;
+FAT/exFAT installations are refused before shutdown and require manual updating.
+macOS nightly ad-hoc signatures also differ from stable Developer ID signatures. Install
+the selected channel manually once when switching between these signing identities;
+automatic updates must not bypass the helper's identity checks.
+
+Authenticode and Apple Developer ID signatures authenticate platform applications. Ed25519
+manifests authenticate the exact updater payload bytes; they do not remove SmartScreen or
+Gatekeeper warnings. Apple Silicon ad-hoc executable signatures are not Developer ID signatures
+or notarization. Keep the Ed25519 private key on the isolated signer, never on platform build workers.
 
 The separate [`qt-release-candidate`](qt-release-candidate.md) workflow remains a signed,
 numeric-version production-candidate path. It still requires its documented certificates,
-environments, and isolated signer. It is not the unsigned nightly publishing workflow.
+environments, and isolated signer. It remains separate from nightly update-manifest signing.

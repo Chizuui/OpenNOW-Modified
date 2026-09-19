@@ -114,25 +114,45 @@ pub struct MediaRuntime {
 #[derive(Clone)]
 enum MediaRuntimeMode {
     Standalone,
-    Embedded(
-        GraphicsFramePublisher,
-        Option<Arc<crate::SharedVulkanDevice>>,
-    ),
+    Embedded {
+        frames: GraphicsFramePublisher,
+        config: EmbeddedRuntimeConfig,
+    },
     #[cfg(feature = "test-runtime")]
     Test,
 }
 
+#[derive(Clone, Default)]
+pub struct EmbeddedRuntimeConfig {
+    pub vulkan_device: Option<Arc<crate::SharedVulkanDevice>>,
+    pub windows_adapter_luid: Option<crate::WindowsAdapterLuid>,
+}
+
 impl MediaRuntime {
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.output.audio_muted.store(muted, Ordering::Release);
+    }
+
     pub const fn is_embedded(&self) -> bool {
-        matches!(self.mode, MediaRuntimeMode::Embedded(..))
+        matches!(self.mode, MediaRuntimeMode::Embedded { .. })
     }
 
     pub fn video_backends(&self) -> Vec<opennow_streamer_protocol::VideoBackendCapability> {
         match &self.mode {
-            MediaRuntimeMode::Embedded(_, device) => {
-                crate::embedded_video_backends_with_device(device.as_deref())
+            MediaRuntimeMode::Embedded { config, .. } => {
+                crate::embedded_video_backends_with_config(
+                    config.vulkan_device.as_deref(),
+                    self.windows_adapter_luid(),
+                )
             }
             _ => crate::video_backends(),
+        }
+    }
+
+    fn windows_adapter_luid(&self) -> Option<crate::WindowsAdapterLuid> {
+        match &self.mode {
+            MediaRuntimeMode::Embedded { config, .. } => config.windows_adapter_luid,
+            _ => None,
         }
     }
 
@@ -193,12 +213,13 @@ impl MediaRuntime {
         let supported = matches!(requested, "auto" | "videotoolbox");
         #[cfg(target_os = "linux")]
         let supported = requested == "auto"
-            || (matches!(requested, "vulkan" | "cuda" | "nvdec" | "vaapi" | "v4l2")
-                && self.video_backends().iter().any(|backend| {
-                    backend.available
-                        && (backend.backend == requested
-                            || (requested == "nvdec" && backend.backend == "cuda"))
-                }));
+            || self.video_backends().iter().any(|backend| {
+                backend.available
+                    && (backend.backend == requested
+                        || (requested == "nvdec" && backend.backend == "cuda")
+                        || (matches!(requested, "software" | "ffmpeg")
+                            && backend.backend == "ffmpeg"))
+            });
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         let supported = requested == "auto";
         if supported {
@@ -270,7 +291,11 @@ impl MediaRuntime {
         }
         self.output.stop_microphone();
         self.output.reset_microphone_clock();
-        if let MediaRuntimeMode::Embedded(frames, _device) = &self.mode {
+        if let MediaRuntimeMode::Embedded {
+            frames,
+            config: _config,
+        } = &self.mode
+        {
             #[cfg(target_os = "macos")]
             if let Some(id) = audio_device.device_name() {
                 if self
@@ -310,11 +335,11 @@ impl MediaRuntime {
                 #[cfg(target_os = "linux")]
                 crate::linux_backend::select_embedded_video_path(
                     requested,
-                    _device.as_deref(),
+                    _config.vulkan_device.as_deref(),
                     stream,
                 ),
                 #[cfg(target_os = "linux")]
-                _device.clone(),
+                _config.vulkan_device.clone(),
             )
             .inspect_err(|_| {
                 let _ = self.commands.send(HostCommand::Stop);
@@ -398,13 +423,17 @@ impl MediaRuntime {
         #[cfg(target_os = "windows")]
         {
             use opennow_streamer_platform_windows::{VideoCodec, VideoPixelFormat, WindowsBackend};
-            WindowsBackend::probe().supports_format(VideoCodec::H265, VideoPixelFormat::Y410, true)
+            WindowsBackend::probe_for(
+                opennow_streamer_platform_windows::WindowsGraphicsApi::D3d11,
+                self.windows_adapter_luid(),
+            )
+            .supports_format(VideoCodec::H265, VideoPixelFormat::Y410, true)
         }
         #[cfg(target_os = "linux")]
         {
             use opennow_streamer_platform_linux::{PixelFormat, VideoCodec};
-            matches!(&self.mode, MediaRuntimeMode::Embedded(_, Some(device))
-                if device.supports_format(VideoCodec::H265, PixelFormat::P410, stream.width, stream.height))
+            matches!(&self.mode, MediaRuntimeMode::Embedded { config, .. }
+                if config.vulkan_device.as_ref().is_some_and(|device| device.supports_format(VideoCodec::H265, PixelFormat::P410, stream.width, stream.height)))
         }
         #[cfg(target_os = "macos")]
         {
@@ -1131,14 +1160,19 @@ pub fn create_embedded_runtime_with_input(
     captured_input: Arc<crate::CapturedInputQueue>,
     cursor_update: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 ) -> MediaRuntime {
-    create_embedded_runtime_with_vulkan_device(frames, captured_input, cursor_update, None)
+    create_embedded_runtime_with_config(
+        frames,
+        captured_input,
+        cursor_update,
+        EmbeddedRuntimeConfig::default(),
+    )
 }
 
-pub fn create_embedded_runtime_with_vulkan_device(
+pub fn create_embedded_runtime_with_config(
     frames: GraphicsFramePublisher,
     captured_input: Arc<crate::CapturedInputQueue>,
     cursor_update: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-    vulkan_device: Option<Arc<crate::SharedVulkanDevice>>,
+    config: EmbeddedRuntimeConfig,
 ) -> MediaRuntime {
     let (commands, receiver) = mpsc::channel();
     let output = Arc::new(OutputBuffers::with_captured_input(captured_input));
@@ -1288,7 +1322,7 @@ pub fn create_embedded_runtime_with_vulkan_device(
         linux_selection,
         #[cfg(target_os = "linux")]
         linux_software_fallback: Arc::new(AtomicBool::new(false)),
-        mode: MediaRuntimeMode::Embedded(frames, vulkan_device),
+        mode: MediaRuntimeMode::Embedded { frames, config },
     }
 }
 
@@ -1491,6 +1525,26 @@ fn ensure_macos_main_thread() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_runtime_snapshots_windows_adapter_selection() {
+        let (_graphics, frames) = crate::RenderThreadGraphics::new(|| {});
+        let luid = crate::WindowsAdapterLuid::new(0xffff_fffe_1122_3344).expect("non-zero LUID");
+        let runtime = super::create_embedded_runtime_with_config(
+            frames,
+            std::sync::Arc::new(crate::CapturedInputQueue::default()),
+            None,
+            super::EmbeddedRuntimeConfig {
+                vulkan_device: None,
+                windows_adapter_luid: Some(luid),
+            },
+        );
+        let super::MediaRuntimeMode::Embedded { config, .. } = &runtime.mode else {
+            panic!("embedded runtime mode")
+        };
+        assert_eq!(config.windows_adapter_luid, Some(luid));
+        assert_eq!(runtime.windows_adapter_luid(), Some(luid));
+    }
+
     #[test]
     #[ignore = "requires SDL_AUDIODRIVER=dummy in an isolated test process"]
     fn embedded_host_shares_sdl_playback_capture_and_enumeration_lifetimes() {
@@ -1823,6 +1877,38 @@ mod tests {
 
     #[cfg(feature = "test-runtime")]
     #[test]
+    fn audio_mute_survives_session_restart_without_pausing_media_or_microphone() {
+        use std::sync::atomic::Ordering;
+
+        let (host, runtime) = super::create_test_runtime();
+        runtime.set_audio_muted(true);
+        for _ in 0..2 {
+            let (feedback, _) = std::sync::mpsc::channel();
+            let media = runtime
+                .start(feedback, crate::MediaStreamConfig::default())
+                .unwrap();
+            assert!(runtime.output.audio_muted.load(Ordering::Acquire));
+            assert!(!runtime.paused.load(Ordering::Acquire));
+            let shared = crate::microphone::MicrophoneShared::new();
+            let microphone = crate::MicrophoneSession::from_shared(std::sync::Arc::clone(&shared));
+            runtime.output.set_microphone(&shared);
+            let clock = runtime.output.microphone_clock();
+            for muted in [false, true] {
+                runtime.set_audio_muted(muted);
+                assert_eq!(runtime.output.audio_muted.load(Ordering::Acquire), muted);
+                assert!(!runtime.paused.load(Ordering::Acquire));
+                assert!(microphone.receiver().status().enabled);
+                assert_eq!(runtime.output.microphone_clock(), clock);
+            }
+            media.stop();
+            assert!(runtime.output.audio_muted.load(Ordering::Acquire));
+        }
+        runtime.shutdown();
+        host.join().unwrap();
+    }
+
+    #[cfg(feature = "test-runtime")]
+    #[test]
     fn audio_device_start_resets_microphone_but_enumeration_does_not() {
         let (host, runtime) = super::create_test_runtime();
         let shared = crate::microphone::MicrophoneShared::new();
@@ -1901,6 +1987,31 @@ mod tests {
         runtime.shutdown();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_runtime_accepts_software_only_when_the_cpu_decoder_is_available() {
+        let (_graphics, frames) = crate::RenderThreadGraphics::new(|| {});
+        let runtime = super::create_embedded_runtime(frames);
+        let software_available = runtime
+            .video_backends()
+            .iter()
+            .any(|backend| backend.backend == "ffmpeg" && backend.available);
+        for requested in ["software", "ffmpeg"] {
+            assert_eq!(
+                runtime.validate_backend(requested).is_ok(),
+                software_available,
+                "{requested}"
+            );
+        }
+        for unsupported in ["hardware", "d3d12", "videotoolbox", "invalid"] {
+            assert!(
+                runtime.validate_backend(unsupported).is_err(),
+                "{unsupported}"
+            );
+        }
+        runtime.shutdown();
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn embedded_windows_rejects_unimplemented_backend_overrides() {
@@ -1955,6 +2066,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Queued
         );

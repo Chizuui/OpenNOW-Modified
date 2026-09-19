@@ -12,48 +12,129 @@ FocusScope {
     property string scopeFilter: "all"
     property int currentIndex: 0
     property string searchRequestId: ""
-    property var localGames: []
+    property var remoteGames: []
     property string searchError: ""
-    property bool searching: false
+    property string searchState: "idle"
+    readonly property bool searching: searchState === "loading"
+    property bool searchHasMore: false
+    property int queryRevision: 0
+    property var searchIntent: null
+    readonly property string normalizedQuery: query.trim().replace(/\s+/g, " ")
+    readonly property bool gamesQuery: normalizedQuery !== "" && scopeFilter !== "actions"
+    readonly property string searchContext: JSON.stringify([ShellStore.catalogOwnerState.authScope,
+        ShellStore.catalogOwnerState.catalogContext, ShellStore.catalogOwnerState.catalogRevision])
+    readonly property string searchStatus: {
+        if (!gamesQuery) return ""
+        if (!ShellStore.signedIn) return qsTr("Sign in to search games.")
+        if (!ShellStore.ready) return qsTr("Game search is unavailable while OpenNOW reconnects.")
+        if (searchState === "waiting") return qsTr("Waiting to search… Press Enter to search now.")
+        if (searching) return qsTr("Searching GeForce NOW…")
+        if (searchState === "error") return searchError
+        if (searchState !== "ready") return ""
+        if (remoteGames.length > 0 && gameList.length === 0)
+            return searchHasMore ? qsTr("This result page contains only hidden games. More matches are available; refine your search.")
+                : qsTr("All matching games are hidden.")
+        if (searchHasMore) return qsTr("More matches are available. Refine your search to narrow the results.")
+        return gameList.length === 0 ? qsTr("No games match “%1”.").arg(normalizedQuery) : ""
+    }
     function cancelSearch() {
         searchDelay.stop()
         const id = searchRequestId
         searchRequestId = ""
-        searching = false
+        searchIntent = null
+        searchState = "idle"
         if (id !== "") CoreClient.cancel(id)
     }
     function requestGames() {
-        cancelSearch()
-        if (!opened || scopeFilter === "actions" || !query.trim() || !ShellStore.ready || !ShellStore.signedIn) return
-        searching = true
-        searchRequestId = CoreClient.request("catalog.store.local", {searchQuery:query.trim(),cursor:"",limit:6}, 30000)
-        if (!searchRequestId) searching = false
+        if (searchRequestId !== "" || !opened || !gamesQuery || !ShellStore.ready || !ShellStore.signedIn) return
+        searchDelay.stop()
+        searchError = ""
+        searchState = "loading"
+        searchIntent = {revision:queryRevision, query:normalizedQuery, context:searchContext}
+        searchRequestId = CoreClient.request("catalog.store.list", {searchQuery:normalizedQuery,limit:6,cursor:"",revalidate:true}, 30000)
+        if (!searchRequestId) {
+            searchIntent = null
+            searchState = "error"
+            searchError = qsTr("Game search could not start. Press Enter to retry.")
+        }
     }
     function scheduleSearch() {
+        queryRevision++
         cancelSearch()
-        searching = opened && scopeFilter !== "actions" && query.trim() !== "" && ShellStore.ready && ShellStore.signedIn
-        if (searching) searchDelay.restart()
+        remoteGames = []
+        searchError = ""
+        searchHasMore = false
+        currentIndex = 0
+        if (opened && query.trim() !== "" && scopeFilter !== "actions" && ShellStore.ready && ShellStore.signedIn) {
+            searchState = "waiting"
+            searchDelay.start()
+        }
     }
-    Timer { id: searchDelay; interval: 180; onTriggered: root.requestGames() }
+    function acceptsSearch(id) {
+        return id !== "" && id === searchRequestId && searchIntent !== null
+            && searchIntent.revision === queryRevision && searchIntent.query === normalizedQuery
+            && searchIntent.context === searchContext && opened && gamesQuery
+            && ShellStore.ready && ShellStore.signedIn
+    }
+    function acceptCurrent() {
+        if (gamesQuery && ShellStore.ready && ShellStore.signedIn && searchState !== "ready") {
+            requestGames()
+            return
+        }
+        activateAt(currentIndex)
+    }
+    NativeTimer {
+        id: searchDelay
+        objectName: "commandSearchDelay"
+        interval: 2000
+        singleShot: true
+        timerType: Qt.PreciseTimer
+        onTimeout: root.requestGames()
+    }
     Connections {
         target: CoreClient
         function onResponseReceived(id, result) {
-            if (!root.searchRequestId || id !== root.searchRequestId) return
+            if (!root.acceptsSearch(id)) return
             root.searchRequestId = ""
-            root.searching = false
-            root.localGames = result.games || []
+            root.searchIntent = null
+            if (!result.scope || !ShellStore.matchesAuthScope(result.scope)
+                    || !Number.isSafeInteger(result.catalogRevision) || result.catalogRevision < 0
+                    || (ShellStore.catalogOwnerState.catalogRevision !== null
+                        && result.catalogRevision < ShellStore.catalogOwnerState.catalogRevision)) {
+                root.remoteGames = []
+                root.searchHasMore = false
+                root.searchState = "error"
+                root.searchError = qsTr("Game search returned an invalid or outdated response. Press Enter to retry.")
+                return
+            }
+            const selectedActionIndex = root.currentIndex - root.gameList.length
+            const preserveAction = selectedActionIndex >= 0 && selectedActionIndex < root.actionList.length
+            root.remoteGames = result.games || []
+            if (preserveAction)
+                root.currentIndex = root.gameList.length + selectedActionIndex
+            root.searchHasMore = result.hasNextPage === true
+            root.searchState = "ready"
+            root.scheduleCurrentVisibility()
         }
         function onRequestFailed(id, code, message) {
-            if (!root.searchRequestId || id !== root.searchRequestId) return
+            if (!root.acceptsSearch(id)) return
             root.searchRequestId = ""
-            root.searching = false
-            root.searchError = message
+            root.searchIntent = null
+            root.searchState = "error"
+            root.searchError = message || qsTr("Game search failed. Press Enter to retry.")
         }
     }
     Connections {
         target: ShellStore
-        function onAuthSessionChanged() { root.localGames = []; root.searchError = ""; root.scheduleSearch() }
+        function onReadyChanged() { root.scheduleSearch() }
+        function onSignedInChanged() { root.scheduleSearch() }
+        function onStoreSessionReset() { root.scheduleSearch() }
     }
+    Connections {
+        target: ShellStore.catalogOwnerState
+        function onRequestContextKeyChanged() { root.scheduleSearch() }
+    }
+    onSearchContextChanged: root.scheduleSearch()
     Component.onDestruction: root.cancelSearch()
     signal closeRequested()
     signal routeRequested(string route)
@@ -67,7 +148,7 @@ FocusScope {
             field.text = ""
             field.forceActiveFocus()
             root.scheduleCurrentVisibility()
-        } else root.cancelSearch()
+        } else root.scheduleSearch()
     }
 
     readonly property var actions: [
@@ -80,22 +161,14 @@ FocusScope {
         { icon: "desktop-play-stroke.svg", name: qsTr("Start last game"), detail: qsTr("Resume your previous session"), route: "game-detail", key: "Enter" }
     ]
 
-    function gameMatches(game) {
-        const q = root.query.trim().toLocaleLowerCase()
-        if (q === "")
-            return true
-        const hay = String(game.searchText || (game.title || "")).toLocaleLowerCase()
-        return hay.indexOf(q) >= 0
-    }
-
     function matchedGames() {
-        if (root.query.trim() && ShellStore.signedIn)
-            return root.localGames.filter(game => !ShellStore.isHidden(game))
+        if (root.normalizedQuery !== "")
+            return root.remoteGames.filter(game => !ShellStore.isHidden(game))
         const source = ShellStore.catalogGames || []
         const result = []
         for (let index = 0; index < source.length && result.length < 6; ++index) {
             const game = source[index]
-            if (!ShellStore.isHidden(game) && root.gameMatches(game))
+            if (!ShellStore.isHidden(game))
                 result.push(game)
         }
         return result
@@ -184,7 +257,7 @@ FocusScope {
         root.closeRequested()
     }
 
-    onQueryChanged: { root.currentIndex = 0; root.localGames = []; root.searchError = ""; root.scheduleSearch() }
+    onQueryChanged: root.scheduleSearch()
     onScopeFilterChanged: { root.currentIndex = 0; root.scheduleSearch() }
     onFlatCountChanged: { root.clampCurrent(); root.scheduleCurrentVisibility() }
 
@@ -203,9 +276,9 @@ FocusScope {
         width: root.panelWidth
         height: root.panelHeight
         radius: 18
-        color: Theme.lightMode ? Theme.shell : "#FA0A0E15"
+        color: DesktopTokens.shell
         border.width: 1
-        border.color: "#2EFFFFFF"
+        border.color: DesktopTokens.seam
         TapHandler { }
 
         Item {
@@ -213,6 +286,7 @@ FocusScope {
             DesktopGlyph { x: 18; anchors.verticalCenter: parent.verticalCenter; width: 17; height: 17; icon: "desktop-search.svg" }
             TextField {
                 id: field
+                objectName: "commandSearchField"
                 x: 47; y: 12; width: parent.width - 47 - 90; height: 34
                 leftPadding: 0; rightPadding: 0
                 placeholderText: qsTr("Search games, commands and settings…")
@@ -223,7 +297,7 @@ FocusScope {
                 font.weight: Font.DemiBold
                 background: Item {}
                 onTextChanged: root.query = text
-                onAccepted: root.activateAt(root.currentIndex)
+                onAccepted: root.acceptCurrent()
                 Keys.onTabPressed: event => { root.cycleScope(); event.accepted = true }
             }
             KeyboardGlyph {
@@ -246,11 +320,30 @@ FocusScope {
                 id: resultsColumn
                 width: parent.width
                 spacing: 2
+                Item {
+                    visible: statusText.text !== ""
+                    width: parent.width
+                    height: Math.max(56, statusText.implicitHeight + 16)
+                    Text {
+                        id: statusText
+                        objectName: "commandSearchStatus"
+                        x: 8; width: parent.width - 16
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.searchStatus
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        color: DesktopTokens.textMuted
+                        font.family: DesktopTokens.bodyFont
+                        font.pixelSize: DesktopTokens.captionSize
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+                }
                 Text {
                     visible: root.gameList.length > 0
                     height: 26; leftPadding: 8
                     text: qsTr("GAMES")
-                    color: "#66FFFFFF"
+                    color: DesktopTokens.textMuted
                     font.family: DesktopTokens.monoFont
                     font.pixelSize: DesktopTokens.tinySize
                     font.weight: Font.DemiBold
@@ -270,9 +363,9 @@ FocusScope {
                         padding: 0
                         background: Rectangle {
                             radius: 11
-                            color: gameRow.current ? "#1AFFFFFF" : (gameRow.hovered ? "#0DFFFFFF" : "transparent")
+                            color: gameRow.current ? DesktopTokens.raisedStrong : (gameRow.hovered ? DesktopTokens.raised : "transparent")
                             border.width: gameRow.current ? 1 : 0
-                            border.color: "#2EFFFFFF"
+                            border.color: DesktopTokens.seam
                         }
                         contentItem: Item {
                             RoundedArtwork {
@@ -331,7 +424,7 @@ FocusScope {
                     visible: root.actionList.length > 0
                     height: 26; leftPadding: 8
                     text: qsTr("ACTIONS")
-                    color: "#66FFFFFF"
+                    color: DesktopTokens.textMuted
                     font.family: DesktopTokens.monoFont
                     font.pixelSize: DesktopTokens.tinySize
                     font.weight: Font.DemiBold
@@ -352,14 +445,14 @@ FocusScope {
                         padding: 0
                         background: Rectangle {
                             radius: 11
-                            color: command.current ? "#1AFFFFFF" : (command.hovered ? "#0DFFFFFF" : "transparent")
+                            color: command.current ? DesktopTokens.raisedStrong : (command.hovered ? DesktopTokens.raised : "transparent")
                             border.width: command.current ? 1 : 0
-                            border.color: "#2EFFFFFF"
+                            border.color: DesktopTokens.seam
                         }
                         contentItem: Item {
                             Rectangle {
                                 x: 8; anchors.verticalCenter: parent.verticalCenter
-                                width: 20; height: 20; radius: 7; color: "#0FFFFFFF"
+                                width: 20; height: 20; radius: 7; color: DesktopTokens.raised
                                 DesktopGlyph { anchors.centerIn: parent; width: 13; height: 13; icon: command.modelData.icon }
                             }
                             Text {
@@ -382,12 +475,12 @@ FocusScope {
                     }
                 }
                 Text {
-                    visible: root.flatCount === 0
+                    visible: root.flatCount === 0 && root.searchStatus === ""
                     width: parent.width
                     height: 56
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
-                    text: root.searching ? qsTr("Searching…") : root.searchError || qsTr("No matches for “%1”").arg(root.query)
+                    text: qsTr("No matches for “%1”").arg(root.query)
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     color: DesktopTokens.textMuted
@@ -422,8 +515,8 @@ FocusScope {
     }
     Keys.onUpPressed: root.moveCurrent(-1)
     Keys.onDownPressed: root.moveCurrent(1)
-    Keys.onReturnPressed: root.activateAt(root.currentIndex)
-    Keys.onEnterPressed: root.activateAt(root.currentIndex)
+    Keys.onReturnPressed: root.acceptCurrent()
+    Keys.onEnterPressed: root.acceptCurrent()
     Keys.onTabPressed: root.cycleScope()
     Keys.onEscapePressed: root.closeRequested()
 }

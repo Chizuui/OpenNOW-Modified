@@ -15,6 +15,11 @@ mod embedded;
 mod graphics;
 mod y410;
 
+pub(crate) unsafe fn d3d11_adapter_luid(
+    device: *mut std::ffi::c_void,
+) -> Result<crate::WindowsAdapterLuid, String> {
+    unsafe { embedded::d3d11_adapter_luid(device) }
+}
 pub use embedded::{
     AdoptedD3d11Context, D3d11ColorSpace, D3d11Frame, D3d11FrameProducer, D3d11FrameSubmitter,
     D3d11RecordedFrame, D3d11TextureFormat,
@@ -300,7 +305,10 @@ impl Drop for MediaRuntime {
     }
 }
 
-pub(super) fn probe(api: WindowsGraphicsApi) -> CapabilityProbe {
+pub(super) fn probe(
+    api: WindowsGraphicsApi,
+    adapter_luid: Option<crate::WindowsAdapterLuid>,
+) -> CapabilityProbe {
     let _runtime = match MediaRuntime::initialize() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -326,7 +334,7 @@ pub(super) fn probe(api: WindowsGraphicsApi) -> CapabilityProbe {
         }
     };
 
-    let graphics = Graphics::probe(api);
+    let graphics = Graphics::probe(api, adapter_luid);
     let h264_decoder = graphics
         .as_ref()
         .map_err(Clone::clone)
@@ -422,6 +430,9 @@ pub(super) fn probe(api: WindowsGraphicsApi) -> CapabilityProbe {
     let av1_software_decode = av1_software_decoder.is_ok();
     let d3d11_presentation = graphics.is_ok();
     let wasapi_render = audio.is_ok();
+    if let Err(error) = &audio {
+        video_log!("Windows standalone WASAPI output probe failed: {error}");
+    }
     let mut probe = CapabilityProbe {
         available: false,
         h264_hardware_decode,
@@ -530,7 +541,7 @@ impl Worker {
         controls: mpsc::Receiver<Control>,
     ) -> Result<Self, BackendError> {
         let runtime = MediaRuntime::initialize()?;
-        let graphics = Graphics::new(api, config.surface, config.video)
+        let graphics = Graphics::new(api, None, config.surface, config.video)
             .map_err(|error| BackendError::Startup(format!("{api:?} presentation: {error}")))?;
         let decoder = Decoder::new(&graphics, config.video, decoder_mode).map_err(|error| {
             BackendError::Startup(format!(
@@ -782,7 +793,7 @@ impl Worker {
             let audio_result = self
                 .audio
                 .as_mut()
-                .map(|audio| audio.render(&self.shared.audio));
+                .map(|audio| audio.render(&self.shared.audio, &self.shared.audio_muted));
             match audio_result {
                 Some(Ok(true)) => {
                     did_work = true;
@@ -862,7 +873,7 @@ impl Worker {
                 .surface
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            match Graphics::new(self.api, self.config.surface, self.config.video).and_then(
+            match Graphics::new(self.api, None, self.config.surface, self.config.video).and_then(
                 |graphics| {
                     Decoder::new(&graphics, self.config.video, self.decoder_mode)
                         .map(|decoder| (graphics, decoder))

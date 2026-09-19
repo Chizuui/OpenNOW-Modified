@@ -325,6 +325,15 @@ pub enum MediaColorQuality {
 }
 
 impl MediaColorQuality {
+    pub const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::EightBit420 => "8bit_420",
+            Self::EightBit444 => "8bit_444",
+            Self::TenBit420 => "10bit_420",
+            Self::TenBit444 => "10bit_444",
+        }
+    }
+
     pub const fn bit_depth(self) -> u8 {
         match self {
             Self::EightBit420 | Self::EightBit444 => 8,
@@ -344,6 +353,20 @@ impl MediaColorQuality {
             Self::EightBit444 => PixelFormat::Nv24,
             Self::TenBit420 => PixelFormat::P010,
             Self::TenBit444 => PixelFormat::P410,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_linux_pixel_format(
+        format: opennow_streamer_platform_linux::PixelFormat,
+    ) -> Option<Self> {
+        use opennow_streamer_platform_linux::PixelFormat;
+        match format {
+            PixelFormat::Nv12 | PixelFormat::I420 => Some(Self::EightBit420),
+            PixelFormat::Nv24 => Some(Self::EightBit444),
+            PixelFormat::P010 => Some(Self::TenBit420),
+            PixelFormat::P410 => Some(Self::TenBit444),
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => None,
         }
     }
 
@@ -444,6 +467,7 @@ pub struct EncodedFrame {
     pub clock_rate_hz: u32,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +669,32 @@ impl CapturedInputQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeStageTimings {
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTimingsReport {
+    pub call: Option<DecodeStageTimings>,
+    pub residence: Option<DecodeStageTimings>,
+    pub call_window_samples: usize,
+    pub residence_window_samples: usize,
+    pub submissions_total: u64,
+    pub outputs_total: u64,
+    pub output_calls_total: u64,
+    pub last_submission_at: Option<Instant>,
+    pub last_output_at: Option<Instant>,
+    pub in_flight: usize,
+    pub oldest_in_flight_at: Option<Instant>,
+    pub epoch: u64,
+    pub epoch_started_at: Option<Instant>,
+    pub unmatched_outputs: u64,
+    pub unmatched_submissions: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFeedback {
     VideoFrameAccepted {
@@ -661,6 +711,10 @@ pub enum MediaFeedback {
         to: &'static str,
         reason: String,
     },
+    ColorFormatChanged {
+        requested: MediaColorQuality,
+        actual: MediaColorQuality,
+    },
     RequestKeyframe {
         mid: String,
         reason: String,
@@ -668,6 +722,15 @@ pub enum MediaFeedback {
     DecoderError {
         codec: &'static str,
         message: String,
+    },
+    AudioDecoderError {
+        message: String,
+        consecutive: u32,
+    },
+    AudioUnavailable {
+        backend: &'static str,
+        reason: String,
+        rejected: u64,
     },
     QueueDropped {
         media: &'static str,
@@ -681,6 +744,7 @@ pub enum MediaFeedback {
         recovered: bool,
         message: Option<String>,
     },
+    DecodeTimings(DecodeTimingsReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,6 +1229,13 @@ impl MediaSession {
                 "embedded Linux output requires a native NV12 decoder".to_owned()
             }));
         };
+        if decoder_preference == opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly
+            && (stream.hdr || stream.color_quality != crate::MediaColorQuality::EightBit420)
+        {
+            return Err(
+                "Software decoding presents 8-bit 4:2:0 SDR only. Select 8-bit 4:2:0, or disable HDR, or select a hardware backend.".to_owned(),
+            );
+        }
         let format = opennow_streamer_platform_linux::StreamFormat::video_default(
             stream.width,
             stream.height,
@@ -1188,6 +1259,7 @@ impl MediaSession {
                 opennow_streamer_platform_linux::ColorMatrix::Bt2020;
         }
         if let Some(audio) = config.audio.as_mut() {
+            audio.muted = Arc::clone(&output.audio_muted);
             audio.output_device = audio_device.device_name().unwrap_or_default().to_owned();
         }
         if stream.color_quality.is_444()
@@ -1264,10 +1336,12 @@ impl MediaSession {
         let producer = crate::LinuxGpuFrameProducer::new(8).map_err(|error| error.to_string())?;
         let embedded_frames = frames.clone();
         let monitor_shared = Arc::clone(&shared);
+        let monitor_label = linux_embedded_backend_label(decoder_preference);
         let linux_monitor = match thread::Builder::new()
             .name("opennow-embedded-linux-frame-publisher".to_owned())
-            .spawn(move || run_embedded_linux_monitor(monitor_shared, frames, producer))
-        {
+            .spawn(move || {
+                run_embedded_linux_monitor(monitor_shared, frames, producer, monitor_label)
+            }) {
             Ok(worker) => worker,
             Err(error) => {
                 shared.video.close();
@@ -1325,6 +1399,7 @@ impl MediaSession {
             mac_software_fallback: AtomicBool::new(false),
         });
         let audio_output_device = audio_device.device_name().map(str::to_owned);
+        let audio_muted = Arc::clone(&shared.output.audio_muted);
         let (host_commands, host_receiver) = std::sync::mpsc::channel();
         let embedded_frames = frames.clone();
         let embedded_host_worker = thread::Builder::new()
@@ -1342,6 +1417,7 @@ impl MediaSession {
                         let publisher = frames.clone();
                         MacOsBackend::start_embedded_with_publisher(
                             EmbeddedBackendConfig {
+                                audio_muted: Arc::clone(&audio_muted),
                                 video,
                                 audio: AudioFormat::OPUS_STEREO_48KHZ,
                                 audio_output_device: audio_output_device.clone(),
@@ -1841,6 +1917,7 @@ struct EmbeddedD3d11State {
     frame_ready: Arc<dyn Fn() + Send + Sync>,
     keyframe_required: bool,
     first_frame_recorded: bool,
+    reported_pixel_format: Option<opennow_streamer_platform_windows::VideoPixelFormat>,
 }
 
 #[cfg(target_os = "windows")]
@@ -1914,6 +1991,7 @@ impl EmbeddedD3d11State {
             frame_ready: Arc::new(|| {}),
             keyframe_required: false,
             first_frame_recorded: false,
+            reported_pixel_format: None,
         }
     }
 
@@ -1938,7 +2016,8 @@ impl EmbeddedD3d11State {
         &mut self,
         context: crate::GraphicsContext,
         command: crate::GraphicsRecordCommand,
-    ) -> Result<crate::GraphicsRecordedFrame, crate::GraphicsFrameError> {
+    ) -> Result<(crate::GraphicsRecordedFrame, Option<MediaFeedback>), crate::GraphicsFrameError>
+    {
         use opennow_streamer_platform_windows::{
             AdoptedD3d11Context, D3d11FrameProducer, WindowsDecoderMode,
         };
@@ -2000,6 +2079,7 @@ impl EmbeddedD3d11State {
             .acquire_latest()
             .map_err(|error| error.to_string())?
             .ok_or(crate::GraphicsFrameError::NotReady)?;
+        let actual_format = frame.format();
         let recorded = unsafe {
             frame.record(
                 AdoptedD3d11Context {
@@ -2010,24 +2090,43 @@ impl EmbeddedD3d11State {
             )
         }
         .map_err(|error| error.to_string())?;
-        Ok(crate::GraphicsRecordedFrame {
-            resource: recorded.texture as usize as u64,
-            resource_view: 0,
-            color_space: recorded.color_space.into(),
-            texture_format: match recorded.texture_format {
-                opennow_streamer_platform_windows::D3d11TextureFormat::Rgba8 => {
-                    crate::GraphicsTextureFormat::Rgba8
-                }
-                opennow_streamer_platform_windows::D3d11TextureFormat::Rgb10A2 => {
-                    crate::GraphicsTextureFormat::Rgb10A2
-                }
+        let color_change = if self.reported_pixel_format != Some(actual_format.pixel_format) {
+            use opennow_streamer_platform_windows::VideoPixelFormat;
+            let quality = |format| match format {
+                VideoPixelFormat::Nv12 => MediaColorQuality::EightBit420,
+                VideoPixelFormat::P010 => MediaColorQuality::TenBit420,
+                VideoPixelFormat::Ayuv => MediaColorQuality::EightBit444,
+                VideoPixelFormat::Y410 => MediaColorQuality::TenBit444,
+            };
+            self.reported_pixel_format = Some(actual_format.pixel_format);
+            Some(MediaFeedback::ColorFormatChanged {
+                requested: quality(self.format.pixel_format),
+                actual: quality(actual_format.pixel_format),
+            })
+        } else {
+            None
+        };
+        Ok((
+            crate::GraphicsRecordedFrame {
+                resource: recorded.texture as usize as u64,
+                resource_view: 0,
+                color_space: recorded.color_space.into(),
+                texture_format: match recorded.texture_format {
+                    opennow_streamer_platform_windows::D3d11TextureFormat::Rgba8 => {
+                        crate::GraphicsTextureFormat::Rgba8
+                    }
+                    opennow_streamer_platform_windows::D3d11TextureFormat::Rgb10A2 => {
+                        crate::GraphicsTextureFormat::Rgb10A2
+                    }
+                },
+                width: recorded.width,
+                height: recorded.height,
+                frame_slot: recorded.frame_slot,
+                generation: recorded.generation,
+                presentation_time_ns: recorded.presentation_time_ns,
             },
-            width: recorded.width,
-            height: recorded.height,
-            frame_slot: recorded.frame_slot,
-            generation: recorded.generation,
-            presentation_time_ns: recorded.presentation_time_ns,
-        })
+            color_change,
+        ))
     }
 }
 
@@ -2207,9 +2306,23 @@ struct PendingD3d11Frame {
 }
 
 #[cfg(target_os = "windows")]
+impl crate::GraphicsRenderResources for Mutex<EmbeddedD3d11State> {
+    fn retire(&self) -> Result<(), String> {
+        let mut state = self.lock().unwrap_or_else(|error| error.into_inner());
+        state.reset();
+        state.keyframe_required = true;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl crate::GraphicsFrame for PendingD3d11Frame {
     fn info(&self) -> crate::GraphicsFrameInfo {
         self.info
+    }
+
+    fn render_resources(&self) -> Option<Arc<dyn crate::GraphicsRenderResources>> {
+        Some(self.state.clone())
     }
 
     fn record(
@@ -2218,7 +2331,11 @@ impl crate::GraphicsFrame for PendingD3d11Frame {
         command: crate::GraphicsRecordCommand,
     ) -> Result<crate::GraphicsRecordedFrame, crate::GraphicsFrameError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let result = state.record(context, command);
+        let mut color_change = None;
+        let result = state.record(context, command).map(|(frame, change)| {
+            color_change = change;
+            frame
+        });
         let first_frame = state.take_first_recorded_frame(result.is_ok());
         let keyframe_required = state.take_keyframe_required();
         drop(state);
@@ -2226,6 +2343,9 @@ impl crate::GraphicsFrame for PendingD3d11Frame {
             let _ = self.shared.feedback.send(MediaFeedback::PlaybackStarted {
                 backend: "D3D11/Qt",
             });
+        }
+        if let Some(change) = color_change {
+            let _ = self.shared.feedback.send(change);
         }
         if keyframe_required {
             invalidate_embedded_video(
@@ -2820,6 +2940,9 @@ fn run_linux_video(shared: Arc<SharedPipeline>, host_commands: Sender<HostComman
                 }
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(reason) => trigger_linux_fallback(
                 &shared,
                 &host_commands,
@@ -2878,6 +3001,9 @@ fn run_embedded_linux_video(shared: Arc<SharedPipeline>) {
                 request_linux_keyframe(&shared, "embedded Linux decoder queue overflow");
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: shared.linux_codec.label(),
@@ -2898,9 +3024,27 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
         let MediaCodec::Opus { .. } = frame.codec else {
             continue;
         };
+        let Some(ssrc) = frame.ssrc else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries no sender source identifier"
+                    .to_owned(),
+            });
+            continue;
+        };
+        let Ok(rtp_timestamp) = u32::try_from(frame.timestamp) else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries an out-of-range RTP timestamp"
+                    .to_owned(),
+            });
+            continue;
+        };
         let packet = match opennow_streamer_platform_linux::AudioPacket::new(
             Arc::clone(&frame.data),
-            media_timestamp_us(frame.timestamp, frame.clock_rate_hz),
+            rtp_timestamp,
+            frame.clock_rate_hz,
+            ssrc,
         ) {
             Ok(packet) => packet,
             Err(error) => {
@@ -2930,7 +3074,8 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
                 });
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Queued)
-            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused)
+            | Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {}
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "opus",
@@ -2946,12 +3091,16 @@ fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
     producer: crate::LinuxGpuFrameProducer,
+    backend_label: &'static str,
 ) {
     use std::time::Duration;
 
     let mut playback_started = false;
+    let mut last_decode_timings_report = Instant::now();
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
-        let (frames, events) = {
+        let report_decode_timings = last_decode_timings_report.elapsed() >= Duration::from_secs(1);
+        let (frames, events, decode_timings) = {
             let session = shared
                 .linux_session
                 .lock()
@@ -2967,8 +3116,40 @@ fn run_embedded_linux_monitor(
             while let Some(event) = session.try_recv_event() {
                 events.push(event);
             }
-            (decoded, events)
+            let decode_timings = report_decode_timings.then(|| session.decode_timings());
+            (decoded, events, decode_timings)
         };
+        if let Some(timings) = decode_timings {
+            last_decode_timings_report = Instant::now();
+            if timings.has_observable_state() {
+                let stage = |stage: opennow_streamer_platform_linux::DecodeStagePercentiles| {
+                    DecodeStageTimings {
+                        p50_us: stage.p50_us,
+                        p95_us: stage.p95_us,
+                        max_us: stage.max_us,
+                    }
+                };
+                let _ = shared
+                    .feedback
+                    .send(MediaFeedback::DecodeTimings(DecodeTimingsReport {
+                        call: timings.call.map(stage),
+                        residence: timings.residence.map(stage),
+                        call_window_samples: timings.call_window_samples,
+                        residence_window_samples: timings.residence_window_samples,
+                        submissions_total: timings.submissions_total,
+                        outputs_total: timings.outputs_total,
+                        output_calls_total: timings.output_calls_total,
+                        last_submission_at: timings.last_submission_at,
+                        last_output_at: timings.last_output_at,
+                        in_flight: timings.in_flight,
+                        oldest_in_flight_at: timings.oldest_in_flight_at,
+                        epoch: timings.epoch,
+                        epoch_started_at: timings.epoch_started_at,
+                        unmatched_outputs: timings.unmatched_outputs,
+                        unmatched_submissions: timings.unmatched_submissions,
+                    }));
+            }
+        }
         if !shared.paused.load(Ordering::Acquire) {
             for decoded in frames {
                 let Some(lease) = publisher.context() else {
@@ -2985,7 +3166,7 @@ fn run_embedded_linux_monitor(
                     Ok(_) if !playback_started => {
                         playback_started = true;
                         let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
-                            backend: "Linux decoder/embedded Vulkan",
+                            backend: backend_label,
                         });
                     }
                     Ok(_) => {}
@@ -3048,10 +3229,40 @@ fn run_embedded_linux_monitor(
                     stop_linux_session(&shared);
                     return;
                 }
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3063,6 +3274,7 @@ fn run_embedded_linux_monitor(
 fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostCommand>) {
     use std::time::Duration;
 
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         if shared.linux_software_fallback.load(Ordering::Acquire) {
             request_linux_keyframe(&shared, "Linux decoder fallback requires a fresh keyframe");
@@ -3140,10 +3352,40 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                     &host_commands,
                     "Linux hardware media session failed".to_owned(),
                 ),
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3205,6 +3447,25 @@ fn stop_linux_session(shared: &SharedPipeline) {
 }
 
 #[cfg(target_os = "linux")]
+fn report_linux_color_format_change(
+    shared: &SharedPipeline,
+    reported: &mut Option<MediaColorQuality>,
+    format: opennow_streamer_platform_linux::StreamFormat,
+) {
+    let Some(actual) = MediaColorQuality::from_linux_pixel_format(format.pixel_format) else {
+        return;
+    };
+    if *reported == Some(actual) {
+        return;
+    }
+    *reported = Some(actual);
+    let _ = shared.feedback.send(MediaFeedback::ColorFormatChanged {
+        requested: shared.stream.color_quality,
+        actual,
+    });
+}
+
+#[cfg(target_os = "linux")]
 const fn linux_decoder_name(
     backend: opennow_streamer_platform_linux::DecoderBackend,
 ) -> &'static str {
@@ -3215,6 +3476,58 @@ const fn linux_decoder_name(
         opennow_streamer_platform_linux::DecoderBackend::V4l2 => "V4L2/Vulkan",
         opennow_streamer_platform_linux::DecoderBackend::Ffmpeg => "FFmpeg software/Vulkan",
     }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_embedded_backend_label(
+    preference: opennow_streamer_platform_linux::DecoderPreference,
+) -> &'static str {
+    match preference {
+        opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly => {
+            linux_decoder_name(opennow_streamer_platform_linux::DecoderBackend::Ffmpeg)
+        }
+        _ => "Linux decoder/embedded Vulkan",
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_audio_backend_name(
+    backend: opennow_streamer_platform_linux::AudioBackend,
+) -> &'static str {
+    match backend {
+        opennow_streamer_platform_linux::AudioBackend::PipeWire => "PipeWire",
+        opennow_streamer_platform_linux::AudioBackend::Alsa => "ALSA",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_loss(
+    shared: &SharedPipeline,
+    backend: opennow_streamer_platform_linux::AudioBackend,
+    message: String,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(backend),
+        recovered: false,
+        message: Some(message),
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_recovery(
+    shared: &SharedPipeline,
+    from: opennow_streamer_platform_linux::AudioBackend,
+    to: opennow_streamer_platform_linux::AudioBackend,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(from),
+        recovered: true,
+        message: Some(format!(
+            "{} accepted audio output after the {} sink failed",
+            linux_audio_backend_name(to),
+            linux_audio_backend_name(from)
+        )),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -3972,7 +4285,92 @@ mod tests {
             (MediaColorQuality::TenBit444, PixelFormat::P410),
         ] {
             assert_eq!(color.linux_pixel_format(), format);
+            assert_eq!(
+                MediaColorQuality::from_linux_pixel_format(format),
+                Some(color)
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decoded_formats_without_a_color_class_are_not_guessed() {
+        use opennow_streamer_platform_linux::PixelFormat;
+        assert_eq!(
+            MediaColorQuality::from_linux_pixel_format(PixelFormat::I420),
+            Some(MediaColorQuality::EightBit420)
+        );
+        for format in [PixelFormat::Bgra8, PixelFormat::Rgba8] {
+            assert_eq!(MediaColorQuality::from_linux_pixel_format(format), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_format_change_reports_the_decoded_color_class_once_per_change() {
+        use opennow_streamer_platform_linux::{ColorTransfer, PixelFormat, StreamFormat};
+
+        let (feedback, receiver) = std::sync::mpsc::channel();
+        let stream = MediaStreamConfig {
+            codec: MediaVideoCodec::H265,
+            color_quality: MediaColorQuality::TenBit420,
+            ..MediaStreamConfig::default()
+        };
+        let shared = SharedPipeline {
+            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
+            output: Arc::new(OutputBuffers::new()),
+            feedback,
+            paused: AtomicBool::new(false),
+            video_desynced: AtomicBool::new(false),
+            keyframe_requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            recording_tap: RecordingTap::default(),
+            replay_tap: crate::replay::ReplayTap::default(),
+            stream,
+            linux_session: Mutex::new(None),
+            linux_software_fallback: Arc::new(AtomicBool::new(false)),
+            linux_video_mid: Mutex::new(String::new()),
+            linux_codec: stream.codec,
+        };
+        let format = |pixel_format| StreamFormat {
+            pixel_format,
+            color_transfer: ColorTransfer::Sdr,
+            ..StreamFormat::video_default(1920, 1080).expect("valid default format")
+        };
+
+        let mut reported = None;
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert_eq!(
+            receiver.try_recv().expect("downgrade report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::EightBit420,
+            }
+        );
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(
+            &shared,
+            &mut reported,
+            StreamFormat {
+                width: 1280,
+                height: 720,
+                ..format(PixelFormat::Nv12)
+            },
+        );
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::P010));
+        assert_eq!(
+            receiver.try_recv().expect("restored format report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::TenBit420,
+            }
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -4005,6 +4403,21 @@ mod tests {
                 DecoderPreference::VulkanOnly,
                 "attached shared device",
             ),
+            (
+                MediaColorQuality::TenBit420,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::EightBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::TenBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
         ] {
             let (feedback, _feedback_receiver) = std::sync::mpsc::channel();
             let (commands, _command_receiver) = std::sync::mpsc::channel();
@@ -4030,6 +4443,83 @@ mod tests {
             );
             assert!(result.err().is_some_and(|error| error.contains(expected)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn device_lost_feedback(
+        receiver: &Receiver<MediaFeedback>,
+    ) -> (&'static str, bool, Option<String>) {
+        match receiver
+            .try_recv()
+            .expect("a device state feedback for every audio output event")
+        {
+            MediaFeedback::DeviceLost {
+                subsystem,
+                recovered,
+                message,
+            } => (subsystem, recovered, message),
+            other => panic!("expected a device state feedback, saw {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_feedback_pairs_loss_and_recovery_without_touching_video() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::PipeWire, "Broken pipe".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::PipeWire, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        assert_eq!(loss.0, "PipeWire");
+        assert!(!loss.1);
+        assert_eq!(loss.2.as_deref(), Some("Broken pipe"));
+
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(
+            recovery.0, "PipeWire",
+            "recovery must clear the audio subsystem that lost output"
+        );
+        assert!(recovery.1);
+        assert!(
+            recovery
+                .2
+                .as_deref()
+                .is_some_and(|message| message.contains("ALSA") && message.contains("PipeWire")),
+            "recovery must name the sink that accepted output, saw {:?}",
+            recovery.2
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "one loss and one recovery only"
+        );
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.video_desynced.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_recovery_pairs_a_backend_that_recovered_itself() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::Alsa, "Device lost".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::Alsa, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(loss, ("ALSA", false, Some("Device lost".to_owned())));
+        assert_eq!(
+            recovery.0, loss.0,
+            "a backend that accepted output again clears its own loss"
+        );
+        assert!(recovery.1);
+        assert!(receiver.try_recv().is_err());
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
     }
 
     #[cfg(target_os = "windows")]
@@ -4062,6 +4552,58 @@ mod tests {
             duration_100ns: 166_667,
             key_frame,
             reset_decoder: key_frame,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn embedded_d3d11_retirement_rearms_graphics_and_reference_recovery() {
+        use crate::GraphicsFrame;
+
+        let submission = Arc::new(Mutex::new(EmbeddedD3d11Submission::new()));
+        let state = Arc::new(Mutex::new(EmbeddedD3d11State::new(
+            MediaStreamConfig::default(),
+            Arc::clone(&submission),
+        )));
+        state.lock().unwrap().first_frame_recorded = true;
+        let (shared, _feedback) = software_test_pipeline();
+        let frame = PendingD3d11Frame {
+            state: Arc::clone(&state),
+            shared,
+            mid: "video".to_owned(),
+            info: crate::GraphicsFrameInfo {
+                width: 1920,
+                height: 1080,
+                sequence: 1,
+                presentation_time_ns: 0,
+            },
+        };
+        let resources = frame.render_resources().expect("D3D11 render resources");
+        assert!(Arc::ptr_eq(&resources, &frame.render_resources().unwrap()));
+
+        for cycle in 0..3 {
+            submission
+                .lock()
+                .unwrap()
+                .push(embedded_h264_frame(cycle, true))
+                .unwrap();
+            resources.retire().unwrap();
+            resources.retire().unwrap();
+
+            let mut state = state.lock().unwrap();
+            assert!(state.producer.is_none());
+            assert!(state.take_keyframe_required());
+            assert!(!state.take_keyframe_required());
+            assert!(!state.take_first_recorded_frame(true));
+            drop(state);
+
+            let mut submission = submission.lock().unwrap();
+            assert!(submission.pending.is_empty());
+            assert!(submission.submitter.is_none());
+            let outcome = submission
+                .push(embedded_h264_frame(cycle + 1, false))
+                .unwrap();
+            assert!(outcome.queued && outcome.needs_graphics);
         }
     }
 
@@ -4228,6 +4770,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         recording.publish(&frame);
         replay.publish(&frame);
@@ -4282,6 +4825,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         for _ in 0..=RECORDING_TAP_QUEUE_CAPACITY {
             tap.publish(&frame);
@@ -4454,6 +4998,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("decoded pending frame");
@@ -4494,6 +5039,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("recovered IDR");
@@ -4539,6 +5085,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         assert!(shared.video_desynced.load(Ordering::Acquire));
@@ -4626,6 +5173,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Paused
         );
@@ -4640,6 +5188,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Closed
         );
@@ -4677,6 +5226,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::DroppedOldest
         );

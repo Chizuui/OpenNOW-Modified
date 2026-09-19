@@ -15,8 +15,10 @@ The backend uses only Windows system APIs:
 - A D3D11 video processor and a two-buffer flip-model DXGI swap chain for NV12 conversion, aspect-correct scaling, and presentation. The swap chain can target a caller-owned HWND, or the backend can create and own a child or top-level HWND.
 - WASAPI shared-mode rendering for interleaved IEEE-float PCM. Windows performs endpoint format conversion when the active mix format differs.
 
-`WindowsBackend::probe_for` creates a hidden presentation path using either D3D11 or a D3D12-backed
-D3D11-on-12 device, independently probes adapter-matched hardware transforms and registered
+`WindowsBackend::probe_for` accepts an explicit `Option<WindowsAdapterLuid>` and creates a hidden
+presentation path using either D3D11 or a D3D12-backed D3D11-on-12 device. `None` preserves the
+system default; `Some` resolves that exact DXGI adapter and fails without a default-adapter retry
+when it is unavailable. The probe independently checks adapter-matched hardware transforms and registered
 software transforms for H.264, HEVC and AV1, and starts a 48 kHz stereo WASAPI client. A codec
 capability is reported only when its selected decoder class and the complete presentation/audio
 operation succeed. `WindowsBackend::probe` remains the D3D11 compatibility entry point.
@@ -31,14 +33,16 @@ then execute the embedded converter: `VideoProcessorBlt` for P010/HDR and a UINT
 SDR Y410. Both paths produce the actual RGB10A2 texture used by Qt.
 An exposed media subtype or provisional startup format alone is not a successful probe.
 The fixtures and their generation/verification commands are in `fixtures/probe/`.
-These checks use the default adapter selected by `probe_for`;
+These checks use the exact optional adapter passed to `probe_for`;
 the Qt-adopted device is checked independently when its decoder and converter are created.
 The capability probe does not establish that a monitor or the Qt swapchain supports HDR.
 Decoded-output polling is bounded to 500 ms per advanced profile, at most three seconds per
 graphics API, excluding Windows API call latency. Results are reused for the same adapter LUID
 and D3D API; device removal or an adapter change invalidates them. Timeouts are not cached.
-Presentation and audio are always checked again. Live session creation independently validates
-the adopted Qt device and actual output, so cached capabilities cannot authorize a downgraded frame.
+Presentation and audio are always checked again. Live playback independently validates the adopted
+Qt device and actual output. It permits AYUV-to-NV12 and Y410-to-P010 chroma-only fallback at unchanged
+bit depth; capability probes still require the exact requested output format. The parent shell
+notifies the user using the validated actual format exposed by the acquired `D3d11Frame`.
 Installing a different decoder requires restarting the process to refresh cached MFT failures.
 
 ## Embedded HDR color contract
@@ -59,6 +63,9 @@ sample positions. The converter selects an available DXGI siting label without r
 4:2:0 still requires its exact negotiated siting.
 The standalone HWND presenter explicitly rejects HDR; HDR presentation belongs to the embedded
 Qt path, which must preserve the recorded texture's color interpretation through scan-out.
+When the host configured an explicit adapter LUID, the FFI verifies that the borrowed Qt D3D11
+device reports the same DXGI adapter before installing the graphics context. A mismatch fails
+explicitly; it cannot authorize decode using capabilities from a different default adapter.
 ## Embedded Qt SDR conversion
 
 The embedded frame producer converts NV12/AYUV to RGBA8 and P010/Y410 to RGB10A2,
@@ -73,9 +80,10 @@ with RGBA8 or rely on legacy driver color defaults. Format, range, and extent ch
 invalidate the processor, cached input views, and frame slots before conversion resumes.
 
 Media Foundation may temporarily negotiate a lower-precision output type before reading
-the first sequence header. That startup compatibility does not permit downgraded frames:
+the first sequence header. That startup compatibility does not permit lower-bit-depth frames:
 each decoded surface must match its output media type and preserve at least the negotiated
-bit depth and chroma before entering the decoded queue.
+bit depth before entering the decoded queue. Chroma loss is limited to the two same-depth
+fallbacks above, and conversion uses the validated actual format and color metadata.
 Provisional startup metadata is not validated as an actual HDR frame before the sequence header
 arrives. The first actual sample and every output-type change undergo strict validation, including
 HDR color metadata; lower-precision frames never reach conversion.

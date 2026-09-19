@@ -11,7 +11,7 @@ FocusScope {
     readonly property int footerHeight: DesktopTokens.px(40)
     property string title: qsTr("Home")
     property string subtitle: qsTr("Your library")
-    property bool searchVisible: route !== "settings" && route.indexOf("settings-") !== 0 && route !== "friends"
+    property bool searchVisible: route !== "settings" && route.indexOf("settings-") !== 0 && route !== "friends" && route !== "updates"
     property string searchText: ""
     readonly property bool railCollapsed: ShellStore.settings.desktopRailCollapsed !== false
     // A pinned sidebar reserves space; only transient hover expansion overlays.
@@ -29,7 +29,7 @@ FocusScope {
     }
 
     function regionStatusText() {
-        const selected = String(ShellStore.settings.region || "")
+        const selected = String(ShellStore.selectedRegion || "")
         if (selected === "")
             return qsTr("AUTO REGION")
         const regions = ShellStore.regions || []

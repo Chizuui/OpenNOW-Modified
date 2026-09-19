@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use opennow_streamer_platform::MediaStreamConfig;
 use opennow_streamer_protocol::SessionContext;
 use opennow_streamer_transport::nvst::MAX_NVST_VIDEO_PEER_PORTS;
 use opennow_streamer_transport::{ReservedNvstBundle, nvst_video_packet_size};
@@ -15,8 +16,11 @@ use tungstenite::http::{HeaderValue, Uri};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
+#[path = "nvst_rtsp_color.rs"]
+mod color;
 #[path = "nvst_rtsp_transport_diagnostics.rs"]
 mod transport_diagnostics;
+use color::NvstColorNegotiation;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -30,7 +34,12 @@ const MAX_STREAM_BITRATE_MBPS: u64 = 200;
 // video[0].sendFrameTimeoutMs=7000. Waiting sixty seconds left a dead Mjolnir media leg on screen
 // while audio/control remained alive; use the official receiver timeout so the existing bounded
 // transport recovery runs promptly.
-const VIDEO_TIMEOUT_MS: u64 = 8_000;
+pub(crate) const VIDEO_TIMEOUT_MS: u64 = 8_000;
+const VIDEO_STARTUP_TIMEOUT_MS: u64 = if cfg!(windows) {
+    60_000
+} else {
+    VIDEO_TIMEOUT_MS
+};
 
 #[derive(Debug)]
 pub struct NvstRtspError {
@@ -196,28 +205,7 @@ impl RtspClient {
     }
 
     fn connect(endpoint: &str, session_id: &str) -> Result<(Self, String), NvstRtspError> {
-        let translated = endpoint
-            .replacen("rtsps://", "https://", 1)
-            .replacen("rtsp://", "http://", 1);
-        let parsed = translated
-            .parse::<Uri>()
-            .map_err(|_| NvstRtspError::new("invalid-rtsps-endpoint", "Invalid RTSPS endpoint"))?;
-        let host = parsed.host().ok_or_else(|| {
-            NvstRtspError::new("invalid-rtsps-endpoint", "RTSPS endpoint has no host")
-        })?;
-        if !trusted_nvst_host(host) {
-            return Err(NvstRtspError::new(
-                "untrusted-rtsps-endpoint",
-                "Refusing an untrusted RTSPS endpoint",
-            ));
-        }
-        let port = parsed.port_u16().unwrap_or(322);
-        let authority_host = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        };
-        let wss = format!("wss://{authority_host}:{port}/rtsp");
+        let (wss, target) = rtsp_endpoint_urls(endpoint)?;
         let mut request = wss
             .into_client_request()
             .map_err(|error| NvstRtspError::new("nvst-connect-failed", error.to_string()))?;
@@ -242,7 +230,7 @@ impl RtspClient {
                 cseq: 0,
                 buffer: String::new(),
             },
-            format!("rtsps://{host}:{port}"),
+            target,
         ))
     }
 
@@ -411,6 +399,7 @@ pub struct PreparedNvstRtspSession {
     announced: bool,
     owns_session: bool,
     pub handoff: Value,
+    pub media_config: MediaStreamConfig,
 }
 
 impl PreparedNvstRtspSession {
@@ -679,6 +668,20 @@ pub fn prepare_owned_nvst(
     describe_headers.push(("x-nv-abtesting", "2".to_owned()));
     let describe = client.request("DESCRIBE", &target, &describe_headers, "")?;
     ensure_rtsp_ok("DESCRIBE", &describe)?;
+    let requested_stream = super::media_stream_config(context);
+    let color = NvstColorNegotiation::resolve(requested_stream, &describe.body)?;
+    opennow_streamer_protocol::log::log_line(
+        "INFO",
+        "nvst-color",
+        &format!(
+            "requested={} requested_hdr={} effective={} effective_hdr={} announce={:?}",
+            requested_stream.color_quality.protocol_name(),
+            requested_stream.hdr,
+            color.stream.color_quality.protocol_name(),
+            color.stream.hdr,
+            color.announce_lines(),
+        ),
+    );
 
     let rtsp_session = header_value(&describe, "session")
         .and_then(|value| value.split(';').next())
@@ -712,6 +715,10 @@ pub fn prepare_owned_nvst(
         ));
     }
     let rtcp_on_sctp = sdp_attribute(&describe.body, "general.rtcpOnSctp").as_deref() == Some("1");
+    let hid_device_mask = sdp_attribute(&describe.body, "ri.hidDeviceMask")
+        .as_deref()
+        .map(parse_hid_device_mask)
+        .unwrap_or(0);
     let microphone_available = negotiate_microphone(context, &describe.body);
 
     let mut setup_headers = common_headers.clone();
@@ -747,10 +754,15 @@ pub fn prepare_owned_nvst(
                 format!("Could not select the local route to the NVST media peer: {error}"),
             )
         })?;
-    let video_packet_size = nvst_video_packet_size(video_peer_ip.parse().map_err(|_| {
+    let video_peer_ip_parsed = video_peer_ip.parse().map_err(|_| {
         NvstRtspError::new("invalid-media-peer", "NVST video peer is not an IP address")
-    })?)
-    .map_err(|error| NvstRtspError::new("nvst-video-mtu-invalid", error.to_string()))?;
+    })?;
+    let video_packet_size = nvst_video_packet_size(video_peer_ip_parsed)
+        .map_err(|error| NvstRtspError::new("nvst-video-mtu-invalid", error.to_string()))?;
+    let video_packet_size = measured_path_packet_size(context, video_peer_ip_parsed)
+        .map_or(video_packet_size, |measured| {
+            video_packet_size.min(measured)
+        });
     opennow_streamer_protocol::log::log_line(
         "INFO",
         "transport",
@@ -815,10 +827,12 @@ pub fn prepare_owned_nvst(
         "localDtlsFingerprint":identity.dtls_fingerprint,
         "remoteDtlsFingerprint":remote_fingerprint,
         "rtcpOnSctp":rtcp_on_sctp,
+        "hidDeviceMask":hid_device_mask,
         "microphoneOnBundle":microphone_available,
         "codec":codec,
         "audioTrack":{"payloadType":111,"codec":"opus","clockRateHz":48000,"channels":2,"mid":"0"},
-        "timeoutMs":VIDEO_TIMEOUT_MS
+        "timeoutMs":VIDEO_TIMEOUT_MS,
+        "startupTimeoutMs":VIDEO_STARTUP_TIMEOUT_MS
     });
     if let Some(media) = context.session.media_connection_info.as_ref() {
         handoff["bundlePeerIp"] = json!(media.ip);
@@ -830,7 +844,7 @@ pub fn prepare_owned_nvst(
         "INFO",
         "nvst-handoff",
         &format!(
-            "video_local_port={mjolnir_port} bundle_local_port={client_port} video_peer_port={video_peer_port} video_peer_port_end={video_peer_port_end} bundle_peer_port={} same_peer_host={} ping_version={ping_version} ping_bytes={} legacy_ping_payload={} srtp_profile={srtp_profile} rtcp_on_sctp={rtcp_on_sctp} sockets_retained=true reachability=unverified",
+            "video_local_port={mjolnir_port} bundle_local_port={client_port} video_peer_port={video_peer_port} video_peer_port_end={video_peer_port_end} bundle_peer_port={} same_peer_host={} ping_version={ping_version} ping_bytes={} legacy_ping_payload={} srtp_profile={srtp_profile} rtcp_on_sctp={rtcp_on_sctp} sockets_retained=true reachability=unverified video_startup_timeout_ms={VIDEO_STARTUP_TIMEOUT_MS} video_idle_timeout_ms={VIDEO_TIMEOUT_MS}",
             context
                 .session
                 .media_connection_info
@@ -849,6 +863,7 @@ pub fn prepare_owned_nvst(
     let announce_body = build_announce(
         context,
         AnnounceParams {
+            color: &color,
             key: handoff["srtpAesKeyHex"].as_str().unwrap_or_default(),
             key_id,
             port: client_port,
@@ -875,6 +890,7 @@ pub fn prepare_owned_nvst(
         announced: false,
         owns_session: true,
         handoff,
+        media_config: color.stream,
     })
 }
 
@@ -892,6 +908,7 @@ fn ensure_tls_crypto_provider() -> Result<(), NvstRtspError> {
 }
 
 struct AnnounceParams<'a> {
+    color: &'a NvstColorNegotiation,
     key: &'a str,
     key_id: u32,
     port: u16,
@@ -932,7 +949,8 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
     } else {
         0
     };
-    let (bit_depth, chroma_format) = negotiated_color_format(context, &codec);
+    let dynamic_streaming_mode = negotiated_dynamic_streaming_mode(context);
+    let adjust_res_and_fps = negotiated_adjustment_enabled(dynamic_streaming_mode);
     let mut lines = vec![
         "v=0".to_owned(),
         "o=unknown 0 14 IN IPv4 127.0.0.1".to_owned(),
@@ -959,12 +977,6 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-video[0].adaptiveQuantization.perfAdjEnablement:1".to_owned(),
         "a=x-nv-video[0].enableAv1RcPrecisionFactor:1".to_owned(),
         "a=x-nv-video[0].maxNumReferenceFrames:0".to_owned(),
-        format!(
-            "a=x-nv-video[0].dynamicRangeMode:{}",
-            u8::from(super::media_stream_config(context).hdr)
-        ),
-        format!("a=x-nv-video[0].bitDepth:{bit_depth}"),
-        format!("a=x-nv-video[0].chromaFormat:{chroma_format}"),
         "a=x-nv-video[0].prefilterParams.prefilterMode:0".to_owned(),
         "a=x-nv-video[0].prefilterParams.prefilterModel:4".to_owned(),
         "a=x-nv-video[0].prefilterParams.denoiseLevel:0".to_owned(),
@@ -985,13 +997,13 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-vqos[0].bllFec.enable:0".to_owned(),
         "a=x-nv-vqos[0].grc.enable:7".to_owned(),
         "a=x-nv-vqos[0].drc.enable:0".to_owned(),
-        "a=x-nv-vqos[0].dfc.adjustResAndFps:0".to_owned(),
+        format!("a=x-nv-vqos[0].dfc.adjustResAndFps:{adjust_res_and_fps}"),
         "a=x-nv-vqos[0].calculateAvgVideoStreamingBitrate:1".to_owned(),
         format!("a=x-nv-vqos[0].bw.maximumBitrateKbps:{bitrate}"),
         "a=x-nv-vqos[0].bw.minimumBitrateKbps:1000".to_owned(),
         "a=x-nv-vqos[0].drc.bitrateIirFilterFactor:128".to_owned(),
         "a=x-nv-vqos[0].resControl.bitrateIirFilterFactor:128".to_owned(),
-        "a=x-nv-vqos[0].dynamicStreamingMode:0".to_owned(),
+        format!("a=x-nv-vqos[0].dynamicStreamingMode:{dynamic_streaming_mode}"),
         "a=x-nv-packetPacing.version:3".to_owned(),
         "a=x-nv-packetPacing.mode:1".to_owned(),
         "a=x-nv-packetPacing.numGroups:5".to_owned(),
@@ -1066,6 +1078,7 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         lines.push("a=x-nv-general.rtcMicOnNativeBundle:1".to_owned());
         lines.push("a=x-nv-mic.micSsrcConfig.senderSsrc:1".to_owned());
     }
+    lines.extend(params.color.announce_lines());
     lines.extend([
         "t=0 0".to_owned(),
         format!("m=video {}", params.video_port),
@@ -1074,30 +1087,6 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         String::new(),
     ]);
     lines.join("\r\n")
-}
-
-fn negotiated_color_format(context: &SessionContext, codec: &str) -> (u8, u8) {
-    if codec.eq_ignore_ascii_case("H264") {
-        return (8, 1);
-    }
-    let quality = context
-        .session
-        .extra
-        .get("negotiatedStreamProfile")
-        .and_then(|profile| profile.get("colorQuality"))
-        .and_then(Value::as_str)
-        .or_else(|| context.settings.get("colorQuality").and_then(Value::as_str))
-        .unwrap_or("8bit_420")
-        .to_ascii_lowercase();
-    let bit_depth = if quality.starts_with("10bit") { 10 } else { 8 };
-    let chroma_format = if codec.eq_ignore_ascii_case("AV1") {
-        1
-    } else if quality.ends_with("444") {
-        3
-    } else {
-        1
-    };
-    (bit_depth, chroma_format)
 }
 
 fn resolution(context: &SessionContext) -> (u64, u64) {
@@ -1124,7 +1113,17 @@ fn negotiated_fps(context: &SessionContext) -> u64 {
         .and_then(Value::as_u64)
         .or_else(|| context.settings.get("fps").and_then(Value::as_u64))
         .unwrap_or(60)
-        .clamp(30, 240)
+        .clamp(30, u64::from(super::MAX_STREAM_FPS))
+}
+
+fn measured_path_packet_size(context: &SessionContext, peer: IpAddr) -> Option<usize> {
+    let datagram = context
+        .session
+        .extra
+        .get("networkTest")?
+        .get("measuredDatagramBytes")?
+        .as_u64()?;
+    opennow_streamer_transport::measured_video_packet_size(usize::try_from(datagram).ok()?, peer)
 }
 
 fn negotiated_codec(context: &SessionContext) -> String {
@@ -1137,6 +1136,22 @@ fn negotiated_codec(context: &SessionContext) -> String {
         .or_else(|| context.settings.get("codec").and_then(Value::as_str))
         .unwrap_or("H264")
         .to_ascii_uppercase()
+}
+
+fn negotiated_dynamic_streaming_mode(context: &SessionContext) -> u8 {
+    context
+        .session
+        .extra
+        .get("negotiatedStreamProfile")
+        .and_then(|profile| profile.get("dynamicStreamingMode"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= 3)
+        .unwrap_or(0)
+}
+
+fn negotiated_adjustment_enabled(policy: u8) -> u8 {
+    u8::from(policy != 0)
 }
 
 fn advertised_srtp_profile<'a>(response: &'a RtspResponse, sdp: &'a str) -> Option<&'a str> {
@@ -1310,16 +1325,54 @@ fn take_rtsp_response(
     }))
 }
 
+fn rtsp_endpoint_urls(endpoint: &str) -> Result<(String, String), NvstRtspError> {
+    let translated = endpoint
+        .replacen("rtsps://", "https://", 1)
+        .replacen("rtsp://", "http://", 1);
+    let parsed = translated
+        .parse::<Uri>()
+        .map_err(|_| NvstRtspError::new("invalid-rtsps-endpoint", "Invalid RTSPS endpoint"))?;
+    let host = parsed.host().ok_or_else(|| {
+        NvstRtspError::new("invalid-rtsps-endpoint", "RTSPS endpoint has no host")
+    })?;
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .filter(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host);
+    if !trusted_nvst_host(address_host) {
+        return Err(NvstRtspError::new(
+            "untrusted-rtsps-endpoint",
+            "Refusing an untrusted RTSPS endpoint",
+        ));
+    }
+    let port = parsed.port_u16().unwrap_or(322);
+    Ok((
+        format!("wss://{host}:{port}/rtsp"),
+        format!("rtsps://{host}:{port}"),
+    ))
+}
+
 fn trusted_nvst_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if host == "nvidiagrid.net" || host.ends_with(".nvidiagrid.net") {
         return true;
     }
+    let trusted_ipv4 = |ip: std::net::Ipv4Addr| {
+        !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+    };
     host.parse::<IpAddr>().is_ok_and(|ip| match ip {
-        IpAddr::V4(ip) => {
-            !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unicast_link_local() && !ip.is_unspecified(),
+        IpAddr::V4(ip) => trusted_ipv4(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+            || {
+                !ip.is_loopback()
+                    && !ip.is_unicast_link_local()
+                    && !ip.is_unspecified()
+                    && !ip.is_unique_local()
+                    && !ip.is_multicast()
+            },
+            trusted_ipv4,
+        ),
     })
 }
 
@@ -1337,6 +1390,27 @@ fn media_control(sdp: &str, kind: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_hid_device_mask(value: &str) -> u32 {
+    let trimmed = value.trim();
+    let (radix, digits) = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (16, hex)
+    } else if trimmed
+        .chars()
+        .any(|character| character.is_ascii_hexdigit())
+        && trimmed
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+    {
+        (16, trimmed)
+    } else {
+        (10, trimmed)
+    };
+    u32::from_str_radix(digits, radix).unwrap_or(0)
 }
 
 fn sdp_attribute(sdp: &str, name: &str) -> Option<String> {
@@ -1520,6 +1594,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn color(context: &SessionContext) -> NvstColorNegotiation {
+        NvstColorNegotiation::resolve(super::super::media_stream_config(context), "").unwrap()
+    }
+
+    fn announce_color_format(context: &SessionContext) -> (u8, u8) {
+        let stream = color(context).stream;
+        (
+            stream.color_quality.bit_depth(),
+            u8::from(stream.color_quality.is_444()),
+        )
+    }
+
     #[test]
     fn video_setup_retains_only_bounded_advertised_port_ranges() {
         for (ports, expected) in [
@@ -1612,11 +1698,59 @@ mod tests {
     }
 
     #[test]
+    fn announce_carries_the_documented_top_tier_frame_rate() {
+        let mut value = context();
+        value.session.extra["negotiatedStreamProfile"] = json!({"codec":"AV1", "fps":360});
+        let sdp = build_announce(
+            &value,
+            AnnounceParams {
+                color: &color(&value),
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: 1280,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
+        assert!(sdp.contains("a=x-nv-packetPacing.maxDelayUs:4000"));
+
+        let mut runaway = context();
+        runaway.session.extra["negotiatedStreamProfile"] = json!({"codec":"AV1", "fps":600});
+        let sdp = build_announce(
+            &runaway,
+            AnnounceParams {
+                color: &color(&runaway),
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: 1280,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert!(sdp.contains("a=x-nv-video[0].maxFPS:360"));
+        assert!(!sdp.contains("a=x-nv-video[0].maxFPS:600"));
+    }
+
+    #[test]
     fn owned_announce_matches_current_official_bundle_baseline() {
         let value = context();
         let sdp = build_announce(
             &value,
             AnnounceParams {
+                color: &color(&value),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1632,7 +1766,7 @@ mod tests {
         );
         assert!(sdp.contains("a=x-nv-video[0].maxFPS:120"));
         assert!(sdp.contains("a=x-nv-video[0].bitDepth:10"));
-        assert!(sdp.contains("a=x-nv-video[0].chromaFormat:1"));
+        assert!(sdp.contains("a=x-nv-video[0].chromaFormat:0"));
         assert!(sdp.contains("a=x-nv-video[0].encoderCscMode:2"));
         assert!(sdp.contains("a=x-nv-vqos[0].bitStreamFormat:2"));
         assert!(sdp.contains("a=x-nv-general.clientBundlePort:49006"));
@@ -1647,6 +1781,7 @@ mod tests {
             let sdp = build_announce(
                 &context(),
                 AnnounceParams {
+                    color: &color(&context()),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -1668,6 +1803,99 @@ mod tests {
     }
 
     #[test]
+    fn announce_uses_the_measured_authenticated_path_when_it_is_tighter() {
+        let mut context = context();
+        context.session.extra.insert(
+            "networkTest".to_owned(),
+            json!({"sessionId":"nt-1", "measuredDatagramBytes":1_200}),
+        );
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let packet_size = measured_path_packet_size(&context, peer).expect("measured packet size");
+        assert_eq!(packet_size, 1_168);
+        assert!(packet_size < nvst_video_packet_size(peer).unwrap());
+
+        let sdp = build_announce(
+            &context,
+            AnnounceParams {
+                color: &color(&context),
+                key: &"01".repeat(32),
+                key_id: 7,
+                port: 49006,
+                address: "192.0.2.10",
+                ufrag: "abcd",
+                password: "abcdefghijklmnopqrstuv",
+                fingerprint: "AA:BB",
+                video_port: 5004,
+                video_packet_size: packet_size,
+                rtcp_on_sctp: true,
+                microphone_available: false,
+            },
+        );
+        assert_eq!(
+            sdp_attribute(&sdp, "video[0].packetSize"),
+            Some(packet_size.to_string())
+        );
+    }
+
+    #[test]
+    fn announce_ignores_an_absent_or_unusable_measurement() {
+        let base = context();
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(measured_path_packet_size(&base, peer), None);
+
+        for measured in [0_u64, 1, 12] {
+            let mut context = context();
+            context.session.extra.insert(
+                "networkTest".to_owned(),
+                json!({"measuredDatagramBytes":measured}),
+            );
+            assert_eq!(
+                measured_path_packet_size(&context, peer),
+                None,
+                "{measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn announce_uses_the_negotiated_dynamic_quality_policy_not_the_saved_preference() {
+        for (profile, policy, adjust) in [
+            (None, 0, 0),
+            (Some(1), 1, 1),
+            (Some(2), 2, 1),
+            (Some(3), 3, 1),
+            (Some(7), 0, 0),
+        ] {
+            let mut value = context();
+            value.settings["saveBandwidth"] = json!(true);
+            if let Some(profile) = profile {
+                value.session.extra["negotiatedStreamProfile"]["dynamicStreamingMode"] =
+                    json!(profile);
+            }
+            let sdp = build_announce(
+                &value,
+                AnnounceParams {
+                    color: &color(&value),
+                    key: &"01".repeat(32),
+                    key_id: 7,
+                    port: 49006,
+                    address: "192.0.2.10",
+                    ufrag: "abcd",
+                    password: "abcdefghijklmnopqrstuv",
+                    fingerprint: "AA:BB",
+                    video_port: 5004,
+                    video_packet_size: 1280,
+                    rtcp_on_sctp: true,
+                    microphone_available: false,
+                },
+            );
+            assert!(sdp.contains(&format!("a=x-nv-vqos[0].dynamicStreamingMode:{policy}\r\n")));
+            assert!(sdp.contains(&format!("a=x-nv-vqos[0].dfc.adjustResAndFps:{adjust}\r\n")));
+            assert!(sdp.contains("a=x-nv-vqos[0].drc.enable:0\r\n"));
+        }
+    }
+
+    #[test]
     fn announce_dynamic_range_follows_accepted_hdr_not_saved_intent() {
         for (accepted, requested, mode) in [
             (json!(true), false, 1),
@@ -1682,6 +1910,7 @@ mod tests {
             let sdp = build_announce(
                 &value,
                 AnnounceParams {
+                    color: &color(&value),
                     key: &"01".repeat(32),
                     key_id: 7,
                     port: 49006,
@@ -1697,7 +1926,7 @@ mod tests {
             );
             assert!(sdp.contains(&format!("a=x-nv-video[0].dynamicRangeMode:{mode}\r\n")));
             assert!(sdp.contains("a=x-nv-video[0].bitDepth:10\r\n"));
-            assert!(sdp.contains("a=x-nv-video[0].chromaFormat:1\r\n"));
+            assert!(sdp.contains("a=x-nv-video[0].chromaFormat:0\r\n"));
         }
     }
 
@@ -1708,6 +1937,7 @@ mod tests {
         let sdp = build_announce(
             &value,
             AnnounceParams {
+                color: &color(&value),
                 key: &"01".repeat(32),
                 key_id: 7,
                 port: 49006,
@@ -1745,6 +1975,7 @@ mod tests {
                 let sdp = build_announce(
                     &value,
                     AnnounceParams {
+                        color: &color(&value),
                         key: &"01".repeat(32),
                         key_id: 7,
                         port: 49006,
@@ -1777,14 +2008,30 @@ mod tests {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H264");
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(negotiated_color_format(&value, "H264"), (8, 1));
+        assert_eq!(announce_color_format(&value), (8, 0));
     }
 
     #[test]
     fn av1_announce_stays_420_but_preserves_ten_bit_depth() {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(negotiated_color_format(&value, "AV1"), (10, 1));
+        assert_eq!(announce_color_format(&value), (10, 0));
+    }
+
+    #[test]
+    fn accepted_hevc_color_preserves_nvst_depth_and_chroma_enum_space() {
+        for (color, format) in [
+            ("8bit_420", (8, 0)),
+            ("8bit_444", (8, 1)),
+            ("10bit_420", (10, 0)),
+            ("10bit_444", (10, 1)),
+        ] {
+            let mut value = context();
+            value.settings["colorQuality"] = json!("8bit_420");
+            value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
+            value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!(color);
+            assert_eq!(announce_color_format(&value), format);
+        }
     }
 
     #[test]
@@ -1792,7 +2039,70 @@ mod tests {
         let mut value = context();
         value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
         value.session.extra["negotiatedStreamProfile"]["colorQuality"] = json!("10bit_444");
-        assert_eq!(negotiated_color_format(&value, "H265"), (10, 3));
+        assert_eq!(announce_color_format(&value), (10, 1));
+    }
+
+    #[test]
+    fn full_announce_uses_resolved_color_without_reintroducing_requested_values() {
+        for (suffix, expected_color, expected_hdr, expected_depth, expected_chroma) in [
+            (
+                "a=x-nv-video[0].bitDepth:8\r\na=x-nv-video[0].chromaFormat:0\r\na=x-nv-video[0].dynamicRangeMode:0\r\n",
+                opennow_streamer_platform::MediaColorQuality::EightBit420,
+                false,
+                None,
+                None,
+            ),
+            (
+                "a=x-nv-video[0].bitDepth:10\r\na=x-nv-video[0].chromaFormat:1\r\na=x-nv-video[0].dynamicRangeMode:1\r\n",
+                opennow_streamer_platform::MediaColorQuality::TenBit444,
+                true,
+                Some("10".to_owned()),
+                Some("1".to_owned()),
+            ),
+        ] {
+            let mut value = context();
+            value.session.extra["negotiatedStreamProfile"]["codec"] = json!("H265");
+            let resolved = NvstColorNegotiation::resolve(
+                super::super::media_stream_config(&value),
+                &format!("a=x-nv-general.nativeRtcOnBundlePort:1\r\n;;{suffix}"),
+            )
+            .unwrap();
+            let sdp = build_announce(
+                &value,
+                AnnounceParams {
+                    color: &resolved,
+                    key: &"01".repeat(32),
+                    key_id: 7,
+                    port: 49006,
+                    address: "192.0.2.10",
+                    ufrag: "abcd",
+                    password: "abcdefghijklmnopqrstuv",
+                    fingerprint: "AA:BB",
+                    video_port: 5004,
+                    video_packet_size: 1280,
+                    rtcp_on_sctp: true,
+                    microphone_available: false,
+                },
+            );
+            assert_eq!(resolved.stream.color_quality, expected_color);
+            assert_eq!(resolved.stream.hdr, expected_hdr);
+            assert_eq!(sdp_attribute(&sdp, "video[0].bitDepth"), expected_depth);
+            assert_eq!(
+                sdp_attribute(&sdp, "video[0].chromaFormat"),
+                expected_chroma
+            );
+            assert_eq!(
+                sdp_attribute(&sdp, "video[0].dynamicRangeMode"),
+                expected_hdr.then(|| "1".to_owned())
+            );
+            for field in ["bitDepth", "chromaFormat", "dynamicRangeMode"] {
+                assert!(sdp.matches(&format!("a=x-nv-video[0].{field}:")).count() <= 1);
+            }
+            assert_eq!(
+                value.session.extra["negotiatedStreamProfile"]["colorQuality"],
+                "10bit_444"
+            );
+        }
     }
 
     #[test]
@@ -1842,6 +2152,80 @@ mod tests {
         assert!(!trusted_nvst_host("localhost"));
         assert!(!trusted_nvst_host("127.0.0.1"));
         assert!(!trusted_nvst_host("10.0.0.8"));
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_one_ipv6_bracket_pair_and_the_selected_port() {
+        for (endpoint, port) in [
+            ("rtsps://[2001:4860:4860::8888]:48322/session", 48322),
+            ("rtsps://[2001:4860:4860::8888]/session", 322),
+            ("rtsp://[2001:4860:4860::8888]:48322/session", 48322),
+        ] {
+            let (wss, target) = rtsp_endpoint_urls(endpoint).unwrap();
+            let authority = format!("[2001:4860:4860::8888]:{port}");
+            assert_eq!(wss, format!("wss://{authority}/rtsp"));
+            assert_eq!(target, format!("rtsps://{authority}"));
+            let request = wss.into_client_request().unwrap();
+            assert_eq!(request.headers()["host"], authority);
+            assert_eq!(request.uri().host(), Some("[2001:4860:4860::8888]"));
+            assert_eq!(request.uri().port_u16(), Some(port));
+            let target = target.parse::<Uri>().unwrap();
+            assert_eq!(target.authority().unwrap().as_str(), authority);
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_dns_and_ipv4_behavior() {
+        for (endpoint, authority) in [
+            (
+                "rtsps://seat.nvidiagrid.net/session",
+                "seat.nvidiagrid.net:322",
+            ),
+            ("rtsps://8.8.8.8:48322/session", "8.8.8.8:48322"),
+        ] {
+            assert_eq!(
+                rtsp_endpoint_urls(endpoint).unwrap(),
+                (
+                    format!("wss://{authority}/rtsp"),
+                    format!("rtsps://{authority}"),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_preserve_host_policy_for_ipv6_and_bracketed_non_ipv6() {
+        for endpoint in [
+            "rtsps://[::1]:322",
+            "rtsps://[::]:322",
+            "rtsps://[fe80::1]:322",
+            "rtsps://[fc00::1]:322",
+            "rtsps://[fd00::1]:322",
+            "rtsps://[ff02::1]:322",
+            "rtsps://[::ffff:127.0.0.1]:322",
+            "rtsps://[::ffff:10.0.0.1]:322",
+            "rtsps://[::ffff:169.254.1.1]:322",
+            "rtsps://[::ffff:0.0.0.0]:322",
+            "rtsps://[seat.nvidiagrid.net]:322",
+            "rtsps://[8.8.8.8]:322",
+            "rtsps://[[2001:4860:4860::8888]]:322",
+            "rtsps://partner.example:322",
+            "rtsps://127.0.0.1:322",
+            "rtsps://10.0.0.8:322",
+        ] {
+            assert!(rtsp_endpoint_urls(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_accept_ipv4_mapped_public_addresses() {
+        assert_eq!(
+            rtsp_endpoint_urls("rtsps://[::ffff:8.8.8.8]:48322/session").unwrap(),
+            (
+                "wss://[::ffff:8.8.8.8]:48322/rtsp".to_owned(),
+                "rtsps://[::ffff:8.8.8.8]:48322".to_owned(),
+            )
+        );
     }
 
     #[test]

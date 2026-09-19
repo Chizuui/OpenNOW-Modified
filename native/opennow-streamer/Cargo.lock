@@ -1661,6 +1661,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
+ "opennow-streamer-hid",
  "opennow-streamer-platform",
  "opennow-streamer-protocol",
  "opennow-streamer-transport",
@@ -1675,10 +1676,15 @@ name = "opennow-streamer-ffi"
 version = "0.2.0"
 dependencies = [
  "opennow-streamer-core",
+ "opennow-streamer-hid",
  "opennow-streamer-platform",
  "opennow-streamer-protocol",
  "serde_json",
 ]
+
+[[package]]
+name = "opennow-streamer-hid"
+version = "0.2.0"
 
 [[package]]
 name = "opennow-streamer-platform"
@@ -1718,6 +1724,7 @@ dependencies = [
  "ffmpeg-sys-next",
  "libc",
  "libloading",
+ "opus",
  "raw-window-handle",
  "serde_json",
  "static_assertions",
@@ -1774,6 +1781,7 @@ dependencies = [
  "ghash",
  "hmac",
  "mtu",
+ "opennow-streamer-hid",
  "opennow-streamer-protocol",
  "serde_json",
  "sha1",

@@ -2,6 +2,7 @@
 #include "app/AppController.h"
 
 #include <QGuiApplication>
+#include <QHash>
 #include <QJSValue>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -9,6 +10,7 @@
 #include <QQuickWindow>
 #include <QTimer>
 #include <QVariantMap>
+#include <QtMath>
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +32,86 @@ int AcceptanceSession::prepareWindow()
         };
         if (window) window->resize(dimension(u"--smoke-width"_s, 1600),
                                    dimension(u"--smoke-height"_s, 900));
+        if (m_arguments.contains(u"--smoke-alliance-routing"_s)) {
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            const QVariantMap nvidia{{u"idpId"_s, u"nvidia-fixture"_s}, {u"displayName"_s, u"NVIDIA"_s}, {u"code"_s, u"NVIDIA"_s}};
+            const QVariantMap alliance{{u"idpId"_s, u"alliance-fixture"_s}, {u"displayName"_s, u"Alliance fixture"_s}, {u"code"_s, u"ALLIANCE"_s}};
+            store->setProperty("providers", QVariantList{nvidia, alliance});
+            store->setProperty("selectedProviderIdpId", u"alliance-fixture"_s);
+            const auto selected = store->property("selectedProvider").value<QJSValue>();
+            if (selected.property(u"idpId"_s).toString() != u"alliance-fixture"_s) return EXIT_FAILURE;
+            store->setProperty("providers", QVariantList{alliance, nvidia});
+            if (store->property("selectedProvider").value<QJSValue>().property(u"idpId"_s).toString() != u"alliance-fixture"_s) return EXIT_FAILURE;
+            store->setProperty("providerDiscoveryDegraded", true);
+            store->setProperty("authRestorePending", false);
+            store->setProperty("authSession", QVariant());
+            store->setProperty("authState", u"idle"_s);
+            m_controller.navigate(u"sign-in"_s);
+        }
+        const auto persistenceIndex = m_arguments.indexOf(u"--smoke-auth-persistence"_s);
+        if (persistenceIndex >= 0) {
+            if (persistenceIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            const auto persistence = m_arguments.at(persistenceIndex + 1);
+            if (persistence != u"memory-only"_s && persistence != u"migration-pending"_s
+                    && persistence != u"unavailable"_s) return EXIT_FAILURE;
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            store->setProperty("authRestorePending", false);
+            store->setProperty("authSession", QVariant());
+            store->setProperty("sessionPersistence", persistence);
+            m_controller.navigate(u"sign-in"_s);
+            if (store->property("sessionPersistenceMessage").toString().isEmpty()) return EXIT_FAILURE;
+        }
+        const auto resumeIndex = m_arguments.indexOf(u"--smoke-session-resume"_s);
+        if (resumeIndex >= 0) {
+            if (resumeIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            const auto mode = m_arguments.at(resumeIndex + 1);
+            if (mode != u"conflict"_s && mode != u"unavailable"_s && mode != u"resuming"_s
+                    && mode != u"finished"_s && mode != u"not-found"_s)
+                return EXIT_FAILURE;
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            const QVariantMap selected{{u"launchAppId"_s, u"123"_s},
+                {u"title"_s, u"Zenless Zone Zero"_s},
+                {u"heroImageUrl"_s, u"qrc:/qt/qml/OpenNOW/res/brand/desktop-renew.jpg"_s}};
+            store->setProperty("selectedGame", selected);
+            store->setProperty("pendingLaunchParams", QVariantMap{
+                {u"appId"_s, u"123"_s}, {u"title"_s, u"Zenless Zone Zero"_s}});
+            store->setProperty("catalogGames", QVariantList{selected, QVariantMap{
+                {u"launchAppId"_s, u"456"_s}, {u"title"_s, u"Genshin Impact"_s}}});
+            m_controller.navigate(u"inserting"_s);
+            if (mode == u"conflict"_s) {
+                const QVariant sessions = QVariantMap{
+                    {u"sessions"_s, QVariantList{QVariantMap{
+                        {u"sessionId"_s, u"resume-visual-fixture"_s},
+                        {u"appId"_s, u"456"_s}, {u"status"_s, 4}}}}};
+                if (!QMetaObject::invokeMethod(store, "inspectRemoteSessions", Q_ARG(QVariant, sessions)))
+                    return EXIT_FAILURE;
+            } else if (mode == u"unavailable"_s) {
+                store->setProperty("launchConflictDetected", true);
+                const QVariant sessions = QVariantMap{{u"sessions"_s, QVariantList{}}};
+                if (!QMetaObject::invokeMethod(store, "inspectRemoteSessions", Q_ARG(QVariant, sessions)))
+                    return EXIT_FAILURE;
+            } else if (mode == u"finished"_s || mode == u"not-found"_s) {
+                store->setProperty("activeSession", QVariantMap{{u"sessionId"_s, u"terminal-fixture"_s},
+                    {u"status"_s, 3}, {u"appId"_s, u"123"_s}});
+                store->setProperty("streamer", QVariantMap{{u"status"_s, u"error"_s}});
+                store->setProperty("sessionRecoveryPending", true);
+                store->setProperty("recoverySessionId", u"terminal-fixture"_s);
+                store->setProperty("streamerRecoveryExhausted", true);
+                m_controller.navigate(u"stream"_s);
+                const QVariant result = mode == u"finished"_s
+                    ? QVariantMap{{u"session"_s, QVariantMap{{u"sessionId"_s, u"terminal-fixture"_s}, {u"status"_s, 7}}}}
+                    : QVariantMap{{u"termination"_s, QVariantMap{{u"source"_s, u"cloudmatch-http"_s},
+                        {u"httpStatus"_s, 404}, {u"sessionId"_s, u"terminal-fixture"_s}, {u"resumable"_s, false}}}};
+                if (!QMetaObject::invokeMethod(store, "acceptRecoverySessions", Q_ARG(QVariant, result)))
+                    return EXIT_FAILURE;
+            } else {
+                store->setProperty("streamState", u"resuming"_s);
+                store->setProperty("streamMessage", tr("Reconnecting to your running game. You don't need to start again."));
+            }
+        }
         if (m_arguments.contains(u"--smoke-microphone-supported"_s)
                 || m_arguments.contains(u"--smoke-microphone-muted"_s)) {
             auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
@@ -39,7 +121,7 @@ int AcceptanceSession::prepareWindow()
             store->setProperty("streamInputPauseRequestId", u"microphone-visual-fixture"_s);
             store->setProperty("nativeRuntimeReady", true);
             store->setProperty("nativeRuntimeCapabilities", QVariantMap{
-                {u"protocolVersion"_s, 6}, {u"supportsMicrophone"_s, true}});
+                {u"protocolVersion"_s, 7}, {u"supportsMicrophone"_s, true}});
             store->setProperty("settings", QVariantMap{
                 {u"microphoneMode"_s, muted ? u"voice-activity"_s : u"disabled"_s}});
             if (muted) {
@@ -102,6 +184,132 @@ int AcceptanceSession::prepareWindow()
             auto *settings = window ? window->findChild<QObject *>(u"desktopSettingsScreen"_s) : nullptr;
             if (settings) settings->setProperty("advancedOpen", true);
         }
+        const auto settingsPageIndex = m_arguments.indexOf(u"--smoke-settings-page"_s);
+        if (settingsPageIndex >= 0) {
+            if (settingsPageIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            const QHash<QString, int> pages{{u"account"_s, 0}, {u"stream"_s, 3},
+                {u"audio"_s, 4}, {u"controls"_s, 5}, {u"network"_s, 6},
+                {u"appearance"_s, 8}, {u"console"_s, 9}, {u"shortcuts"_s, 10},
+                {u"about"_s, 11}, {u"recording"_s, 12}};
+            auto *settings = window ? window->findChild<QObject *>(u"desktopSettingsScreen"_s) : nullptr;
+            const auto page = pages.constFind(m_arguments.at(settingsPageIndex + 1));
+            if (!settings || page == pages.cend()) return EXIT_FAILURE;
+            settings->setProperty("selectedSection", page.value());
+            if (m_arguments.contains(u"--smoke-settings-advanced"_s))
+                settings->setProperty("advancedOpen", true);
+            if (page.value() == 0 && m_arguments.contains(u"--smoke-paper-design"_s)) {
+                auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+                if (!store) return EXIT_FAILURE;
+                store->setProperty("authSession", QVariantMap{{u"user"_s, QVariantMap{
+                    {u"displayName"_s, u"Demo player"_s}, {u"email"_s, u"player@example.invalid"_s}}}});
+                store->setProperty("subscription", QVariantMap{{u"membershipTier"_s, u"ULTIMATE"_s},
+                    {u"remainingHours"_s, 42}, {u"entitledResolutions"_s, QVariantList{
+                        QVariantMap{{u"width"_s, 3840}, {u"height"_s, 2160}, {u"fps"_s, 120}}}}});
+            }
+        }
+        const auto settingsScaleIndex = m_arguments.indexOf(u"--smoke-settings-scale"_s);
+        if (settingsScaleIndex >= 0) {
+            if (settingsScaleIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            bool ok = false;
+            const auto scale = m_arguments.at(settingsScaleIndex + 1).toDouble(&ok);
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!ok || scale < 0.85 || scale > 1.25 || !store) return EXIT_FAILURE;
+            if (!QMetaObject::invokeMethod(store, "applySetting", Q_ARG(QVariant, QVariant(u"desktopUiScale"_s)),
+                    Q_ARG(QVariant, QVariant(scale)))) return EXIT_FAILURE;
+        }
+        if (m_arguments.contains(u"--smoke-settings-details"_s)) {
+            auto *store = m_engine.singletonInstance<QObject *>(u"OpenNOW"_s, u"ShellStore"_s);
+            if (!store) return EXIT_FAILURE;
+            const QVariantMap values{{u"replayBufferEnabled"_s, true}, {u"sessionProxyEnabled"_s, true},
+                {u"upscaling"_s, QGuiApplication::platformName() == u"cocoa"_s ? u"metalfx"_s : u"fsr1"_s},
+                {u"desktopBackground"_s, u"custom"_s},
+                {u"desktopBackgroundImage"_s, u"qrc:/qt/qml/OpenNOW/res/brand/desktop-renew.jpg"_s}};
+            for (auto it = values.cbegin(); it != values.cend(); ++it)
+                if (!QMetaObject::invokeMethod(store, "applySetting", Q_ARG(QVariant, QVariant(it.key())),
+                        Q_ARG(QVariant, it.value()))) return EXIT_FAILURE;
+            QTimer::singleShot(150, this, [window] {
+                if (!window) return;
+                if (auto *settings = window->findChild<QObject *>(u"desktopSettingsScreen"_s))
+                    settings->setProperty("advancedOpen", true);
+                if (auto *stream = window->findChild<QObject *>(u"desktopStreamSettings"_s))
+                    stream->setProperty("statisticsOpen", true);
+                if (auto *stats = window->findChild<QObject *>(u"desktopStatsSettings"_s))
+                    stats->setProperty("metricsOpen", true);
+                if (auto *about = window->findChild<QObject *>(u"desktopAboutSettings"_s))
+                    about->setProperty("releaseNotesOpen", true);
+            });
+        }
+        const auto settingsScrollIndex = m_arguments.indexOf(u"--smoke-settings-scroll"_s);
+        if (settingsScrollIndex >= 0) {
+            if (settingsScrollIndex + 1 >= m_arguments.size()) return EXIT_FAILURE;
+            bool ok = false;
+            const auto fraction = m_arguments.at(settingsScrollIndex + 1).toDouble(&ok);
+            if (!ok || fraction < 0 || fraction > 1) return EXIT_FAILURE;
+            QTimer::singleShot(700, this, [this, window, fraction] {
+                auto *content = window ? window->findChild<QQuickItem *>(u"desktopSettingsContent"_s) : nullptr;
+                if (!content) {
+                    m_application.exit(EXIT_FAILURE);
+                    return;
+                }
+                content->setProperty("contentY", qMax(0.0, content->property("contentHeight").toDouble()
+                    - content->height()) * fraction);
+            });
+        }
+        if (m_arguments.contains(u"--smoke-settings-full-page"_s)) {
+            QTimer::singleShot(500, this, [this, window] {
+                auto *content = window ? window->findChild<QQuickItem *>(u"desktopSettingsContent"_s) : nullptr;
+                if (!window || !content) {
+                    m_application.exit(EXIT_FAILURE);
+                    return;
+                }
+                const auto height = qCeil(content->property("contentHeight").toDouble()
+                    + window->height() - content->height());
+                window->resize(window->width(), qBound(900, height, 3840));
+            });
+        }
+        if (m_arguments.contains(u"--smoke-settings-layout"_s)) {
+            QTimer::singleShot(400, this, [this, window] {
+                int rows = 0;
+                const auto verify = [&rows](auto &&self, QQuickItem *item) -> bool {
+                    if (!item || !item->isVisible()) return true;
+                    if (item->objectName() == u"desktopStreamSettings"_s) {
+                        auto *codec = item->findChild<QQuickItem *>(u"codecSettingsRow"_s);
+                        if (!codec || !codec->isVisible()) {
+                            qCritical("Codec must be visible without opening Advanced");
+                            return false;
+                        }
+                    }
+                    if (item->objectName() == u"settingsButtonLabel"_s) {
+                        auto *button = item->parentItem()->parentItem()->parentItem();
+                        if (!button->property("menu").toBool() && button->width() >= button->implicitWidth()
+                                && item->property("truncated").toBool()) {
+                            qCritical("Settings button label truncated: %s", qPrintable(button->property("text").toString()));
+                            return false;
+                        }
+                    }
+                    if (item->objectName() == u"settingsRowLabels"_s) {
+                        auto *row = item->parentItem();
+                        auto *controls = row->findChild<QQuickItem *>(u"settingsRowControls"_s);
+                        if (!controls || item->width() <= 0 || item->x() < 0
+                                || item->x() + item->width() > row->width() + 1
+                                || item->y() + item->height() > row->height() + 1
+                                || controls->x() < 0 || controls->x() + controls->width() > row->width() + 1
+                                || controls->y() + controls->height() > row->height() + 1
+                                || (!row->property("stacked").toBool()
+                                    && item->x() + item->width() > controls->x() + 1)) {
+                            qCritical("Settings row layout overflow: %s", qPrintable(row->property("title").toString()));
+                            return false;
+                        }
+                        ++rows;
+                    }
+                    for (auto *child : item->childItems())
+                        if (!self(self, child)) return false;
+                    return true;
+                };
+                if (!window || !verify(verify, window->contentItem()) || rows == 0)
+                    m_application.exit(EXIT_FAILURE);
+            });
+        }
         const auto panelIndex = m_arguments.indexOf(u"--smoke-settings-panel"_s);
         if (panelIndex >= 0 && panelIndex + 1 < m_arguments.size()) {
             const auto panel = m_arguments.at(panelIndex + 1);
@@ -163,6 +371,8 @@ int AcceptanceSession::prepareWindow()
                 exercised = true;
                 if (!QMetaObject::invokeMethod(region, "selected", Q_ARG(QVariant, QVariant(u"https://central.example.invalid"_s)))
                     || setting(u"region"_s).toString() != u"https://central.example.invalid"_s) return EXIT_FAILURE;
+                auto *settings = findControl(u"desktopSettingsScreen"_s);
+                if (!settings || !settings->setProperty("advancedOpen", true)) return EXIT_FAILURE;
                 auto *field = window->findChild<QObject *>(u"renewProxyAddress"_s);
                 auto *toggle = window->findChild<QObject *>(u"renewProxyEnabled"_s);
                 if (!field || !toggle) return EXIT_FAILURE;
@@ -178,10 +388,12 @@ int AcceptanceSession::prepareWindow()
                         Q_ARG(QVariant,QVariant(QVariantMap{{u"label"_s,u"Nightly"_s},{u"value"_s,u"nightly"_s}})))
                     || setting(u"updateChannel"_s).toString() != u"nightly"_s) return EXIT_FAILURE;
             }
-            if (auto *fps = findControl(u"renew-statsShowFps"_s)) {
+            if (auto *stats = findControl(u"desktopStatsSettings"_s)) {
+                if (!stats->setProperty("metricsOpen", true)) return EXIT_FAILURE;
+                auto *fps = findControl(u"renew-statsShowFps"_s);
                 exercised = true;
                 auto *region = findControl(u"renew-statsShowRegion"_s);
-                if (!region || !QMetaObject::invokeMethod(fps,"valueChangedByUser",Q_ARG(bool,false))
+                if (!fps || !region || !QMetaObject::invokeMethod(fps,"valueChangedByUser",Q_ARG(bool,false))
                     || !QMetaObject::invokeMethod(region,"valueChangedByUser",Q_ARG(bool,false))
                     || !setting(u"statsShowFps"_s).isValid() || !setting(u"statsShowRegion"_s).isValid()
                     || setting(u"statsShowFps"_s).toBool() || setting(u"statsShowRegion"_s).toBool()) return EXIT_FAILURE;
