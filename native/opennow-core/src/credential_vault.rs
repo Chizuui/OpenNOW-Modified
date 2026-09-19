@@ -2,12 +2,16 @@ use crate::gfn::AuthSession;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SERVICE_NAME: &str = "app.opennow.auth";
+const CHUNK_MANIFEST_PREFIX: &str = "opennow-credential-chunks-v1:";
+const CHUNK_CHARS: usize = 900;
+const MAX_CREDENTIAL_CHUNKS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,25 +61,127 @@ struct OsSecretStore;
 
 impl SecretStore for OsSecretStore {
     fn get(&self, user_id: &str) -> Result<Option<String>, String> {
-        match credential(user_id)?.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("OS credential store is unavailable or locked".into()),
+        let Some(value) = read_credential(user_id)? else {
+            return Ok(None);
+        };
+        let Some((count, checksum)) = parse_chunk_manifest(&value) else {
+            return Ok(Some(value));
+        };
+        let mut joined = String::new();
+        for index in 0..count {
+            let Some(chunk) = read_credential(&credential_chunk_account(user_id, index))? else {
+                return Err("OS credential store has an incomplete saved session".into());
+            };
+            joined.push_str(&chunk);
         }
+        if credential_checksum(&joined) != checksum {
+            return Err("OS credential store saved-session verification failed".into());
+        }
+        Ok(Some(joined))
     }
 
     fn set(&self, user_id: &str, encoded: &str) -> Result<(), String> {
-        credential(user_id)?
-            .set_password(encoded)
-            .map_err(|_| "OS credential store could not save the session".into())
+        let old_chunk_count = read_credential(user_id)?
+            .as_deref()
+            .and_then(parse_chunk_manifest)
+            .map(|(count, _)| count)
+            .unwrap_or(0);
+        let chunks = split_credential_chunks(encoded);
+        if chunks.len() == 1 {
+            write_credential(user_id, encoded)?;
+            delete_credential_chunks(user_id, 0, old_chunk_count)?;
+            return Ok(());
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            write_credential(&credential_chunk_account(user_id, index), chunk)?;
+        }
+        write_credential(user_id, &chunk_manifest(chunks.len(), encoded))?;
+        delete_credential_chunks(user_id, chunks.len(), old_chunk_count)?;
+        Ok(())
     }
 
     fn delete(&self, user_id: &str) -> Result<(), String> {
-        match credential(user_id)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("OS credential store could not remove the session".into()),
+        let chunk_count = read_credential(user_id)?
+            .as_deref()
+            .and_then(parse_chunk_manifest)
+            .map(|(count, _)| count)
+            .unwrap_or(0);
+        delete_credential(user_id)?;
+        delete_credential_chunks(user_id, 0, chunk_count)
+    }
+}
+
+fn read_credential(account: &str) -> Result<Option<String>, String> {
+    match credential(account)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "OS credential store is unavailable or locked: {error}"
+        )),
+    }
+}
+
+fn write_credential(account: &str, value: &str) -> Result<(), String> {
+    credential(account)?
+        .set_password(value)
+        .map_err(|error| format!("OS credential store could not save the session: {error}"))
+}
+
+fn delete_credential(account: &str) -> Result<(), String> {
+    match credential(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "OS credential store could not remove the session: {error}"
+        )),
+    }
+}
+
+fn credential_chunk_account(user_id: &str, index: usize) -> String {
+    format!("{user_id}:chunk:{index}")
+}
+
+fn delete_credential_chunks(user_id: &str, start: usize, end: usize) -> Result<(), String> {
+    for index in start..end {
+        delete_credential(&credential_chunk_account(user_id, index))?;
+    }
+    Ok(())
+}
+
+fn split_credential_chunks(value: &str) -> Vec<String> {
+    if value.chars().count() <= CHUNK_CHARS {
+        return vec![value.to_owned()];
+    }
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    for character in value.chars() {
+        chunk.push(character);
+        if chunk.chars().count() == CHUNK_CHARS {
+            chunks.push(std::mem::take(&mut chunk));
         }
     }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+fn credential_checksum(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn chunk_manifest(count: usize, value: &str) -> String {
+    format!(
+        "{CHUNK_MANIFEST_PREFIX}{count}:{}",
+        credential_checksum(value)
+    )
+}
+
+fn parse_chunk_manifest(value: &str) -> Option<(usize, String)> {
+    let body = value.strip_prefix(CHUNK_MANIFEST_PREFIX)?;
+    let (count, checksum) = body.split_once(':')?;
+    let count = count.parse::<usize>().ok()?;
+    (1 < count && count <= MAX_CREDENTIAL_CHUNKS && checksum.len() == 64)
+        .then(|| (count, checksum.to_owned()))
 }
 
 impl CredentialVault {
@@ -729,6 +835,32 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chunk_manifest_round_trips_a_credential_larger_than_windows_allows() {
+        let encoded = "token".repeat(1_000);
+        let chunks = split_credential_chunks(&encoded);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= CHUNK_CHARS)
+        );
+        assert_eq!(chunks.concat(), encoded);
+
+        let manifest = chunk_manifest(chunks.len(), &encoded);
+        assert_eq!(
+            parse_chunk_manifest(&manifest),
+            Some((chunks.len(), credential_checksum(&encoded)))
+        );
+    }
+
+    #[test]
+    fn chunk_manifest_rejects_unbounded_or_malformed_values() {
+        assert!(parse_chunk_manifest("opennow-credential-chunks-v1:0:abc").is_none());
+        assert!(parse_chunk_manifest("opennow-credential-chunks-v1:65:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_none());
+        assert!(parse_chunk_manifest("opennow-credential-chunks-v1:2:short").is_none());
+    }
 
     #[test]
     fn secure_restore_survives_failed_legacy_cleanup_and_retries() {
