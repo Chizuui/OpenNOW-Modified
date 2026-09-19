@@ -2023,7 +2023,7 @@ fn select_device(
             (index, device, score)
         })
         .collect();
-    ranked.sort_by(|a, b| b.2.cmp(&a.2));
+    ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
 
     for (_index, device, _score) in ranked {
         if !supports_swapchain(instance, device)

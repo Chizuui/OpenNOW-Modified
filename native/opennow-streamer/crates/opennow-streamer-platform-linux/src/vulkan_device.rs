@@ -134,46 +134,81 @@ fn format_profile_index(codec: VideoCodec, pixel_format: PixelFormat) -> Option<
 }
 
 #[cfg(feature = "vulkan")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct VulkanDevicePreferences {
+    device_index: Option<usize>,
+    vendor_id: Option<u32>,
+    nv_prime: bool,
+    dri_prime: bool,
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanDevicePreferences {
+    fn from_env() -> Self {
+        let device_index = std::env::var("OPENNOW_VK_DEVICE_INDEX")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let vendor_id = std::env::var("OPENNOW_VK_VENDOR_ID")
+            .ok()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                    u32::from_str_radix(&trimmed[2..], 16).ok()
+                } else {
+                    trimmed.parse::<u32>().ok()
+                }
+            });
+        let nv_prime = std::env::var("__NV_PRIME_RENDER_OFFLOAD")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        let dri_prime = std::env::var("DRI_PRIME")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        Self {
+            device_index,
+            vendor_id,
+            nv_prime,
+            dri_prime,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
 pub(crate) fn score_physical_device(
     index: usize,
     properties: &ash::vk::PhysicalDeviceProperties,
     queue_families: &[ash::vk::QueueFamilyProperties],
 ) -> i64 {
+    score_physical_device_with_preferences(
+        index,
+        properties,
+        queue_families,
+        &VulkanDevicePreferences::from_env(),
+    )
+}
+
+#[cfg(feature = "vulkan")]
+pub(crate) fn score_physical_device_with_preferences(
+    index: usize,
+    properties: &ash::vk::PhysicalDeviceProperties,
+    queue_families: &[ash::vk::QueueFamilyProperties],
+    preferences: &VulkanDevicePreferences,
+) -> i64 {
     let mut score = 0i64;
 
     // 1. Explicit user overrides (highest priority)
-    if let Ok(override_index) = std::env::var("OPENNOW_VK_DEVICE_INDEX") {
-        if let Ok(parsed) = override_index.trim().parse::<usize>() {
-            if parsed == index {
-                score += 100_000;
-            }
-        }
+    if preferences.device_index == Some(index) {
+        score += 100_000;
     }
-
-    if let Ok(override_vendor) = std::env::var("OPENNOW_VK_VENDOR_ID") {
-        let trimmed = override_vendor.trim();
-        let parsed = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-            u32::from_str_radix(&trimmed[2..], 16).ok()
-        } else {
-            trimmed.parse::<u32>().ok()
-        };
-        if parsed == Some(properties.vendor_id) {
-            score += 50_000;
-        }
+    if preferences.vendor_id == Some(properties.vendor_id) {
+        score += 50_000;
     }
 
     // 2. PRIME / offload environment variables
-    let nv_prime = std::env::var("__NV_PRIME_RENDER_OFFLOAD")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
-    if nv_prime && properties.vendor_id == 0x10de {
+    if preferences.nv_prime && properties.vendor_id == 0x10de {
         score += 20_000;
     }
-
-    let dri_prime = std::env::var("DRI_PRIME")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
-    if dri_prime
+    if preferences.dri_prime
         && (properties.device_type == ash::vk::PhysicalDeviceType::DISCRETE_GPU
             || properties.vendor_id != 0x8086)
     {
@@ -198,9 +233,10 @@ pub(crate) fn score_physical_device(
         return score;
     }
 
-    let has_video_decode = queue_families
-        .iter()
-        .any(|q| q.queue_flags.contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR));
+    let has_video_decode = queue_families.iter().any(|q| {
+        q.queue_flags
+            .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
+    });
     if has_video_decode {
         score += 1_500;
     }
@@ -221,9 +257,10 @@ pub(crate) fn score_physical_device(
     // Isolation check:
     // Either the graphics queue family has count > 1 (can split Qt queue from native),
     // or if count == 1, there must be separate compute and decode queue families.
-    let can_isolate = queue_families.iter().any(|q| {
-        q.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS) && q.queue_count > 1
-    }) || (has_compute && has_video_decode);
+    let can_isolate = queue_families
+        .iter()
+        .any(|q| q.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS) && q.queue_count > 1)
+        || (has_compute && has_video_decode);
 
     if can_isolate {
         score += 2_000;
@@ -309,7 +346,9 @@ mod implementation {
             if let Ok(devices) = unsafe { temp_instance.enumerate_physical_devices() } {
                 for (index, &device) in devices.iter().enumerate() {
                     let props = unsafe { temp_instance.get_physical_device_properties(device) };
-                    let queues = unsafe { temp_instance.get_physical_device_queue_family_properties(device) };
+                    let queues = unsafe {
+                        temp_instance.get_physical_device_queue_family_properties(device)
+                    };
                     let adapter = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
                         .to_string_lossy()
                         .into_owned();
@@ -319,24 +358,30 @@ mod implementation {
             }
             unsafe { temp_instance.destroy_instance(None) };
         }
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
 
         let candidate_indices: Vec<(Option<usize>, String)> = if candidates.is_empty() {
             vec![(None, "default".to_string())]
         } else {
             candidates
                 .into_iter()
-                .map(|(idx, name, score)| (Some(idx), format!("{name} (index {idx}, score {score})")))
+                .map(|(idx, name, score)| {
+                    (Some(idx), format!("{name} (index {idx}, score {score})"))
+                })
                 .collect()
         };
 
         let mut last_error = None;
         for (candidate_idx, candidate_name) in candidate_indices {
             let mut device = ptr::null_mut();
-            let mut options = unsafe { build_options(hdr_colorspace) };
+            let mut options = build_options(hdr_colorspace);
 
-            let device_param = candidate_idx.map(|idx| std::ffi::CString::new(idx.to_string()).unwrap());
-            let device_param_ptr = device_param.as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null());
+            let device_param =
+                candidate_idx.and_then(|idx| std::ffi::CString::new(idx.to_string()).ok());
+            let device_param_ptr = device_param
+                .as_ref()
+                .map(|s| s.as_ptr())
+                .unwrap_or(ptr::null());
 
             let result = unsafe {
                 ffi::av_hwdevice_ctx_create(
@@ -368,8 +413,14 @@ mod implementation {
                         let context = &mut *((*device).data.cast::<ffi::AVHWDeviceContext>());
                         let vulkan = &mut *context.hwctx.cast::<ffi::AVVulkanDeviceContext>();
                         if !vulkan.act_dev.is_null() && !vulkan.inst.is_null() {
-                            let inst = ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(vulkan.inst as u64));
-                            let log_dev = ash::Device::load(inst.fp_v1_0(), vk::Device::from_raw(vulkan.act_dev as u64));
+                            let inst = ash::Instance::load(
+                                entry.static_fn(),
+                                vk::Instance::from_raw(vulkan.inst as u64),
+                            );
+                            let log_dev = ash::Device::load(
+                                inst.fp_v1_0(),
+                                vk::Device::from_raw(vulkan.act_dev as u64),
+                            );
                             let _ = log_dev.device_wait_idle();
                         }
                         ffi::av_buffer_unref(&mut device);
@@ -1054,8 +1105,11 @@ mod tests {
             },
         ];
 
-        let intel_score = score_physical_device(0, &intel_props, &intel_queues);
-        let nvidia_score = score_physical_device(1, &nvidia_props, &nvidia_queues);
+        let preferences = VulkanDevicePreferences::default();
+        let intel_score =
+            score_physical_device_with_preferences(0, &intel_props, &intel_queues, &preferences);
+        let nvidia_score =
+            score_physical_device_with_preferences(1, &nvidia_props, &nvidia_queues, &preferences);
         assert!(nvidia_score > intel_score);
         assert!(intel_score < 0);
         assert!(nvidia_score > 0);
@@ -1075,17 +1129,28 @@ mod tests {
             ..Default::default()
         }];
 
-        // Test vendor override
-        unsafe { std::env::set_var("OPENNOW_VK_VENDOR_ID", "0x8086") };
-        let score_with_vendor = score_physical_device(0, &intel_props, &intel_queues);
-        unsafe { std::env::remove_var("OPENNOW_VK_VENDOR_ID") };
-        let score_without_vendor = score_physical_device(0, &intel_props, &intel_queues);
+        let baseline = VulkanDevicePreferences::default();
+        let score_without_vendor =
+            score_physical_device_with_preferences(0, &intel_props, &intel_queues, &baseline);
+
+        let vendor_override = VulkanDevicePreferences {
+            vendor_id: Some(0x8086),
+            ..Default::default()
+        };
+        let score_with_vendor = score_physical_device_with_preferences(
+            0,
+            &intel_props,
+            &intel_queues,
+            &vendor_override,
+        );
         assert!(score_with_vendor >= score_without_vendor + 50_000);
 
-        // Test index override
-        unsafe { std::env::set_var("OPENNOW_VK_DEVICE_INDEX", "0") };
-        let score_with_index = score_physical_device(0, &intel_props, &intel_queues);
-        unsafe { std::env::remove_var("OPENNOW_VK_DEVICE_INDEX") };
+        let index_override = VulkanDevicePreferences {
+            device_index: Some(0),
+            ..Default::default()
+        };
+        let score_with_index =
+            score_physical_device_with_preferences(0, &intel_props, &intel_queues, &index_override);
         assert!(score_with_index >= score_without_vendor + 100_000);
     }
 }
