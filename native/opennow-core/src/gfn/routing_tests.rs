@@ -1113,3 +1113,42 @@ fn delayed_poll_fences_ordinary_results_but_preserves_exact_seat_termination() {
         }
     }
 }
+
+#[test]
+fn digevo_stale_discovery_endpoint_falls_back_to_latam_west() {
+    let stale = LoginProvider {
+        idp_id: DIGEVO_IDP_ID.to_owned(),
+        code: "DIG".to_owned(),
+        display_name: "Digevo".to_owned(),
+        streaming_service_url: "https://prod.DIG.geforcenow.nvidiagrid.net/".to_owned(),
+        priority: 10,
+    };
+    assert_eq!(
+        effective_provider_url(&stale),
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+    let base = provider_streaming_base(&stale).unwrap();
+    assert_eq!(
+        base.as_str(),
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+    // Normalization at discovery time also repairs the stored provider.
+    assert_eq!(
+        stale.clone().normalize().streaming_service_url,
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+    // Non-Digevo providers and already-correct Digevo URLs are untouched.
+    let nvidia = LoginProvider::default_nvidia();
+    assert_eq!(
+        effective_provider_url(&nvidia),
+        "https://prod.cloudmatchbeta.nvidiagrid.net/"
+    );
+    let current = LoginProvider {
+        streaming_service_url: "https://latam-west.dig.geforcenow.nvidiagrid.net/".to_owned(),
+        ..stale
+    };
+    assert_eq!(
+        effective_provider_url(&current),
+        "https://latam-west.dig.geforcenow.nvidiagrid.net/"
+    );
+}
