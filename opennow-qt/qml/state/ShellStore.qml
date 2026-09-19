@@ -1079,7 +1079,7 @@ QtObject {
     }
 
     function codecDisabledByProfile(codec) {
-        return settingsOwner.codecDisabledByProfile(code)
+        return settingsOwner.codecDisabledByProfile(codec)
     }
 
     function codecsDisabledByProfile() {
