@@ -2055,8 +2055,7 @@ mod tests {
             for choice in choices {
                 let mut candidate = settings.clone();
                 candidate["codec"] = choice["value"].clone();
-                let result =
-                    StreamerService::embedded_session_settings(&candidate, &caps);
+                let result = StreamerService::embedded_session_settings(&candidate, &caps);
                 assert_eq!(choice["disabled"], result.is_err(), "{color}");
                 let value = choice["value"].as_str().unwrap();
                 assert_eq!(

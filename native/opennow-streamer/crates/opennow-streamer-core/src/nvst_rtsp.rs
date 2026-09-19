@@ -2021,10 +2021,7 @@ mod tests {
                 },
             );
             // HDR carries an explicit :1; SDR omits the line, like the official client.
-            assert_eq!(
-                sdp.contains("a=x-nv-video[0].dynamicRangeMode:1\r\n"),
-                hdr
-            );
+            assert_eq!(sdp.contains("a=x-nv-video[0].dynamicRangeMode:1\r\n"), hdr);
             assert!(!sdp.contains("a=x-nv-video[0].dynamicRangeMode:0"));
             assert!(sdp.contains("a=x-nv-video[0].bitDepth:10\r\n"));
             assert!(sdp.contains("a=x-nv-video[0].chromaFormat:1\r\n"));

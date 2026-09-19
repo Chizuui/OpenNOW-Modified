@@ -159,10 +159,8 @@ impl SettingsStore {
             // which clamps them to Auto.
             if let Some(codec) = value.as_str() {
                 let name = codec.trim().to_ascii_lowercase();
-                let known_explicit = matches!(
-                    name.as_str(),
-                    "h264" | "avc" | "h265" | "hevc" | "av1"
-                );
+                let known_explicit =
+                    matches!(name.as_str(), "h264" | "avc" | "h265" | "hevc" | "av1");
                 if known_explicit {
                     let color = self.values["colorQuality"].as_str().unwrap_or("8bit_420");
                     if !crate::streamer::codec_supports_color_quality(&name, color) {

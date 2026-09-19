@@ -1248,13 +1248,13 @@ impl GfnService {
         write: impl FnOnce() -> Result<T, ServiceError>,
     ) -> Result<T, ServiceError> {
         let _operation = crate::store_requests::lock(&self.auth_operation)?;
-        if !self
+        if self
             .state
             .lock()
             .expect("GFN state poisoned")
             .session
             .as_ref()
-            .is_some_and(|session| session.provider.idp_id == provider)
+            .is_none_or(|session| session.provider.idp_id != provider)
         {
             return Err(ServiceError {
                 code: "stale_account",

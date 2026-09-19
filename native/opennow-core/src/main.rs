@@ -450,10 +450,7 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
                     changes.insert("codec".to_owned(), current["codec"].clone());
                 }
                 if current["fallbackCodec"] != fallback_before {
-                    changes.insert(
-                        "fallbackCodec".to_owned(),
-                        current["fallbackCodec"].clone(),
-                    );
+                    changes.insert("fallbackCodec".to_owned(), current["fallbackCodec"].clone());
                 }
                 if !changes.is_empty() {
                     event["changes"] = Value::Object(changes);
