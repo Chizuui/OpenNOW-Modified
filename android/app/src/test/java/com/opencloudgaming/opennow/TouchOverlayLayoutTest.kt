@@ -1,6 +1,8 @@
 package com.opencloudgaming.opennow
 
+import androidx.compose.ui.geometry.Offset
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -40,6 +42,31 @@ class TouchOverlayLayoutTest {
     fun touchJoystickDeadZoneRescalesInputBeyondCenter() {
         assertEquals(0.5f, applyTouchJoystickDeadZone(0.54f, 0.08f), 0.0001f)
         assertEquals(-0.5f, applyTouchJoystickDeadZone(-0.54f, 0.08f), 0.0001f)
+    }
+
+    @Test
+    fun zeroConfiguredDeadZoneKeepsSmallVirtualStickMovements() {
+        val smallMove = touchStickValue(deltaX = 4f, deltaY = 0f, maxTravel = 72f, deadZone = 0f)
+
+        assertTrue(virtualStickAxis(smallMove.x) > 0f)
+        assertEquals(smallMove.x, virtualStickAxis(smallMove.x), 0.0001f)
+        assertEquals(0f, virtualStickAxis(Float.NaN), 0.0001f)
+    }
+
+    @Test
+    fun fixedStickCalibratesNearCenterPressForOneGesture() {
+        val center = Offset(56f, 56f)
+        val down = Offset(70f, 52f)
+        val gestureCenter = touchStickGestureCenter(center, down, 38f, TouchJoystickMode.Fixed)
+
+        assertEquals(down, gestureCenter)
+        assertEquals(Offset.Zero, touchStickValue(0f, 0f, 38f, 0.05f))
+        assertEquals(Offset.Zero, touchStickValue(1f, 0f, 38f, 0.05f))
+        assertTrue(touchStickValue(4f, 0f, 38f, 0.05f).x > 0f)
+        assertEquals(Offset(78.8f, 56f), touchStickGestureCenter(center, Offset(90f, 56f), 38f, TouchJoystickMode.Fixed))
+        val justPastLimit = touchStickGestureCenter(center, Offset(79f, 56f), 38f, TouchJoystickMode.Fixed)
+        assertTrue(touchStickValue(79f - justPastLimit.x, 0f, 38f, 0.05f).x < 0.01f)
+        assertEquals(Offset(90f, 56f), touchStickGestureCenter(center, Offset(90f, 56f), 38f, TouchJoystickMode.Dynamic))
     }
 
     @Test
@@ -106,13 +133,77 @@ class TouchOverlayLayoutTest {
     @Test
     fun programmableSlotsAreFixedWidthAndCycleThroughOff() {
         val customized = AndroidTouchSettings()
-            .withExtraButtonAction(3, TouchExtraButtonAction.RightTrigger)
+            .withExtraButtonAction(7, TouchExtraButtonAction.RightBumperAndRightTrigger)
 
-        assertEquals(TouchExtraButtonAction.RightTrigger, customized.extraButtonAction(3))
-        assertEquals(TouchExtraButtonAction.None, nextTouchExtraButtonAction(TouchExtraButtonAction.Select))
+        assertEquals(TouchExtraButtonAction.RightBumperAndRightTrigger, customized.extraButtonAction(7))
+        assertEquals(TouchExtraButtonAction.None, nextTouchExtraButtonAction(TouchExtraButtonAction.LeftAndRightTriggers))
         assertEquals(
-            TouchExtraButtonAction.RightTrigger,
-            customized.withExtraButtonAction(9, TouchExtraButtonAction.A).extraButtonAction(3),
+            TouchExtraButtonAction.RightBumperAndRightTrigger,
+            customized.withExtraButtonAction(9, TouchExtraButtonAction.A).extraButtonAction(7),
         )
+    }
+
+    @Test
+    fun rightBumperAndTriggerComboDispatchesBothControls() {
+        val binding = touchExtraButtonBinding(TouchExtraButtonAction.RightBumperAndRightTrigger)
+
+        assertEquals(listOf(GamepadButtonMapping.RIGHT_SHOULDER), binding.buttonMasks)
+        assertEquals(false, binding.leftTrigger)
+        assertTrue(binding.rightTrigger)
+    }
+
+    @Test
+    fun racingSteeringAndKeyboardBindingsStayExplicit() {
+        assertEquals(-1f, touchExtraButtonBinding(TouchExtraButtonAction.LeftStickLeft).leftStickX)
+        assertEquals(1f, touchExtraButtonBinding(TouchExtraButtonAction.LeftStickRight).leftStickX)
+        assertEquals(android.view.KeyEvent.KEYCODE_A, touchExtraButtonBinding(TouchExtraButtonAction.KeyboardA).keyboardKeyCode)
+        assertEquals(android.view.KeyEvent.KEYCODE_D, touchExtraButtonBinding(TouchExtraButtonAction.KeyboardD).keyboardKeyCode)
+    }
+
+    @Test
+    fun freelyConfiguredComboDispatchesEverySelectedInputType() {
+        val actions = listOf(
+            TouchExtraButtonAction.A,
+            TouchExtraButtonAction.RightBumper,
+            TouchExtraButtonAction.LeftTrigger,
+            TouchExtraButtonAction.LeftStickLeft,
+            TouchExtraButtonAction.KeyboardD,
+        )
+        val settings = AndroidTouchSettings().withExtraButtonCombo(2, actions)
+        val binding = touchExtraButtonBinding(settings.extraButtonCombo(2))
+
+        assertEquals(actions, settings.extraButtonCombo(2))
+        assertEquals(listOf(GamepadButtonMapping.A, GamepadButtonMapping.RIGHT_SHOULDER), binding.buttonMasks)
+        assertTrue(binding.leftTrigger)
+        assertEquals(false, binding.rightTrigger)
+        assertEquals(-1f, binding.leftStickX)
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_D), binding.keyboardKeyCodes)
+    }
+
+    @Test
+    fun quickAssignmentReplacesCustomComboAndLegacyCombosRemainCompatible() {
+        val custom = AndroidTouchSettings().withExtraButtonCombo(
+            0,
+            listOf(TouchExtraButtonAction.A, TouchExtraButtonAction.RightTrigger),
+        )
+        val quick = custom.withExtraButtonAction(0, TouchExtraButtonAction.LeftBumperAndLeftTrigger)
+
+        assertTrue("1" in custom.extraButtonCombos)
+        assertFalse("1" in quick.extraButtonCombos)
+        assertEquals(
+            listOf(TouchExtraButtonAction.LeftBumper, TouchExtraButtonAction.LeftTrigger),
+            quick.extraButtonCombo(0),
+        )
+    }
+
+    @Test
+    fun customShoulderShapeShrinksLayoutAndHitboxToVisibleCap() {
+        val circle = touchShoulderFaceSize(72f, 32f, TouchButtonShape.Circle)
+        val trigger = touchShoulderFaceSize(72f, 32f, TouchButtonShape.Trigger)
+
+        assertEquals(32f, circle.width, 0.001f)
+        assertEquals(32f, circle.height, 0.001f)
+        assertEquals(72f, trigger.width, 0.001f)
+        assertEquals(32f, trigger.height, 0.001f)
     }
 }

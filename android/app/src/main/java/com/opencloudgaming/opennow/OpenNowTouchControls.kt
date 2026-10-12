@@ -1,11 +1,21 @@
 package com.opencloudgaming.opennow
 
+import android.content.res.Configuration
+import android.view.KeyEvent
 import androidx.compose.foundation.Canvas
+import androidx.compose.animation.core.animateOffsetAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.absoluteOffset
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -18,14 +28,29 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,13 +73,25 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.window.DialogProperties
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+internal val LocalTouchButtonEdit = staticCompositionLocalOf<((String) -> Unit)?> { null }
+
+@Composable
+internal fun Modifier.editTouchButtonOnTap(button: String): Modifier {
+    val onEdit = LocalTouchButtonEdit.current ?: return this
+    return clickable(onClickLabel = stringResource(R.string.touch_button_edit, button)) { onEdit(button) }
+}
+
+private val LocalTouchInputEnabled = staticCompositionLocalOf { true }
 
 @Composable
 internal fun TouchOverlay(
@@ -63,8 +100,20 @@ internal fun TouchOverlay(
     onButtonTone: () -> Unit,
     layoutEditing: Boolean,
     onSaveAllOffsets: (Map<String, TouchOffset>) -> Unit,
+    onButtonAppearanceChange: (String, TouchButtonAppearance) -> Unit,
+    onKeyboardButtonAdd: (String) -> Unit = {},
+    onKeyboardButtonRemove: (String) -> Unit = {},
+    inputResetKey: Any = Unit,
     modifier: Modifier = Modifier,
 ) {
+    var editingButton by remember(layoutEditing) { mutableStateOf<String?>(null) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var foreground by remember(lifecycle) { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, _ -> foreground = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     val opacity = touch.opacity
     val layoutScale = touch.scale
     val buttonScale = touch.buttonScale
@@ -118,82 +167,408 @@ internal fun TouchOverlay(
         LocalTouchSkin provides skin,
         LocalTouchSkinForm provides skinForm,
         LocalTouchButtonLabels provides touch.touchButtonLabels,
+        LocalTouchButtonAppearances provides touch.buttonAppearances,
+        LocalTouchButtonEdit provides if (layoutEditing) ({ button: String -> editingButton = button }) else null,
         LocalTouchStickKnobScale provides touch.stickKnobScale,
+        LocalTouchInputEnabled provides (!layoutEditing && foreground),
     ) {
-        BoxWithConstraints(
-            modifier
-                .fillMaxSize()
-                .padding(
-                    start = touch.edgePaddingDp.dp,
-                    top = 10.dp,
-                    end = touch.edgePaddingDp.dp,
-                    bottom = touch.bottomPaddingDp.dp,
-                ),
-        ) {
-            if (touch.enabled) {
-                val landscape = maxWidth > maxHeight
-                val suffix = if (landscape) "_landscape" else "_portrait"
-                val getOrientationLocalOffset = { key: String -> getLocalOffset(key + suffix) }
-                val onOrientationLocalOffsetChange = { key: String, x: Float, y: Float ->
-                    onLocalOffsetChange(key + suffix, x, y)
-                }
+        key(client, touch, layoutEditing, inputResetKey) {
+            BoxWithConstraints(
+                modifier
+                    .fillMaxSize()
+                    .padding(
+                        start = touch.edgePaddingDp.dp,
+                        top = 10.dp,
+                        end = touch.edgePaddingDp.dp,
+                        bottom = touch.bottomPaddingDp.dp,
+                    ),
+            ) {
+                if (touch.enabled) {
+                    val landscape = maxWidth > maxHeight
+                    val suffix = if (landscape) "_landscape" else "_portrait"
+                    val getOrientationLocalOffset = { key: String -> getLocalOffset(key + suffix) }
+                    val onOrientationLocalOffsetChange = { key: String, x: Float, y: Float ->
+                        onLocalOffsetChange(key + suffix, x, y)
+                    }
 
-                if (landscape) {
-                    LandscapeTouchControls(
-                        client = client,
-                        opacity = opacity,
-                        layoutScale = layoutScale,
-                        buttonScale = buttonScale,
-                        stickScale = stickScale,
-                        faceButtonScale = touch.faceButtonScale,
-                        dpadScale = touch.dpadScale,
-                        shoulderButtonScale = touch.shoulderButtonScale,
-                        centerButtonScale = touch.centerButtonScale,
-                        leftStickScale = touch.leftStickScale,
-                        rightStickScale = touch.rightStickScale,
-                        visibleControlGroups = touch.visibleControlGroups,
-                        extraButtonActions = List(TOUCH_EXTRA_BUTTON_COUNT, touch::extraButtonAction),
-                        extraButtonScale = touch.extraButtonScale,
-                        joystickMode = touch.joystickMode,
-                        aimMode = touch.aimMode,
-                        aimZoneScale = touch.aimZoneScale,
-                        aimZoneSensitivity = touch.aimZoneSensitivity,
-                        joystickDeadZone = touch.joystickDeadZone,
-                        viewportHeight = maxHeight,
-                        layoutEditing = layoutEditing,
-                        getLocalOffset = getOrientationLocalOffset,
-                        onLocalOffsetChange = onOrientationLocalOffsetChange,
-                        onButtonTone = onButtonTone,
-                    )
-                } else {
-                    PortraitTouchControls(
-                        client = client,
-                        opacity = opacity,
-                        layoutScale = layoutScale,
-                        buttonScale = buttonScale,
-                        stickScale = stickScale,
-                        faceButtonScale = touch.faceButtonScale,
-                        dpadScale = touch.dpadScale,
-                        shoulderButtonScale = touch.shoulderButtonScale,
-                        centerButtonScale = touch.centerButtonScale,
-                        leftStickScale = touch.leftStickScale,
-                        rightStickScale = touch.rightStickScale,
-                        visibleControlGroups = touch.visibleControlGroups,
-                        extraButtonActions = List(TOUCH_EXTRA_BUTTON_COUNT, touch::extraButtonAction),
-                        extraButtonScale = touch.extraButtonScale,
-                        joystickMode = touch.joystickMode,
-                        aimMode = touch.aimMode,
-                        aimZoneScale = touch.aimZoneScale,
-                        aimZoneSensitivity = touch.aimZoneSensitivity,
-                        joystickDeadZone = touch.joystickDeadZone,
-                        layoutEditing = layoutEditing,
-                        getLocalOffset = getOrientationLocalOffset,
-                        onLocalOffsetChange = onOrientationLocalOffsetChange,
-                        onButtonTone = onButtonTone,
-                    )
+                    if (touch.keyboardModeEnabled) {
+                        KeyboardTouchControls(
+                            client = client,
+                            layoutScale = layoutScale,
+                            buttonScale = buttonScale,
+                            stickScale = stickScale,
+                            leftStickScale = touch.leftStickScale,
+                            joystickMode = touch.joystickMode,
+                            joystickDeadZone = touch.joystickDeadZone,
+                            landscape = landscape,
+                            layoutEditing = layoutEditing,
+                            buttons = touch.keyboardButtons,
+                            getLocalOffset = getOrientationLocalOffset,
+                            getStoredOffset = { key -> localOffsets[key + suffix] },
+                            onLocalOffsetChange = onOrientationLocalOffsetChange,
+                            onButtonTone = onButtonTone,
+                            onKeyboardButtonAdd = onKeyboardButtonAdd,
+                            onKeyboardButtonRemove = onKeyboardButtonRemove,
+                        )
+                    } else if (landscape) {
+                        LandscapeTouchControls(
+                            client = client,
+                            opacity = opacity,
+                            layoutScale = layoutScale,
+                            buttonScale = buttonScale,
+                            stickScale = stickScale,
+                            faceButtonScale = touch.faceButtonScale,
+                            dpadScale = touch.dpadScale,
+                            shoulderButtonScale = touch.shoulderButtonScale,
+                            centerButtonScale = touch.centerButtonScale,
+                            leftStickScale = touch.leftStickScale,
+                            rightStickScale = touch.rightStickScale,
+                            visibleControlGroups = touch.visibleControlGroups,
+                            extraButtonCombos = List(TOUCH_EXTRA_BUTTON_COUNT, touch::extraButtonCombo),
+                            extraButtonScale = touch.extraButtonScale,
+                            joystickMode = touch.joystickMode,
+                            aimMode = touch.aimMode,
+                            aimZoneScale = touch.aimZoneScale,
+                            aimZoneSensitivity = touch.aimZoneSensitivity,
+                            joystickDeadZone = touch.joystickDeadZone,
+                            viewportHeight = maxHeight,
+                            layoutEditing = layoutEditing,
+                            getLocalOffset = getOrientationLocalOffset,
+                            onLocalOffsetChange = onOrientationLocalOffsetChange,
+                            onButtonTone = onButtonTone,
+                        )
+                    } else {
+                        PortraitTouchControls(
+                            client = client,
+                            opacity = opacity,
+                            layoutScale = layoutScale,
+                            buttonScale = buttonScale,
+                            stickScale = stickScale,
+                            faceButtonScale = touch.faceButtonScale,
+                            dpadScale = touch.dpadScale,
+                            shoulderButtonScale = touch.shoulderButtonScale,
+                            centerButtonScale = touch.centerButtonScale,
+                            leftStickScale = touch.leftStickScale,
+                            rightStickScale = touch.rightStickScale,
+                            visibleControlGroups = touch.visibleControlGroups,
+                            extraButtonCombos = List(TOUCH_EXTRA_BUTTON_COUNT, touch::extraButtonCombo),
+                            extraButtonScale = touch.extraButtonScale,
+                            joystickMode = touch.joystickMode,
+                            aimMode = touch.aimMode,
+                            aimZoneScale = touch.aimZoneScale,
+                            aimZoneSensitivity = touch.aimZoneSensitivity,
+                            joystickDeadZone = touch.joystickDeadZone,
+                            layoutEditing = layoutEditing,
+                            getLocalOffset = getOrientationLocalOffset,
+                            onLocalOffsetChange = onOrientationLocalOffsetChange,
+                            onButtonTone = onButtonTone,
+                        )
+                    }
                 }
             }
         }
+    }
+    if (layoutEditing) editingButton?.let { button ->
+        TouchButtonAppearanceDialog(button, touch,
+            onChange = { updated ->
+                onButtonAppearanceChange(button, updated.buttonAppearances[button] ?: TouchButtonAppearance())
+            },
+            onDismiss = { editingButton = null },
+            wideLayout = true,
+        )
+    }
+}
+
+internal fun keyboardStickKeyCodes(x: Float, y: Float): Set<Int> {
+    if (!x.isFinite() || !y.isFinite()) return emptySet()
+    val horizontal = x.coerceIn(-1f, 1f)
+    val vertical = y.coerceIn(-1f, 1f)
+    val threshold = 0.35f
+    return buildSet {
+        if (horizontal < -threshold) add(KeyEvent.KEYCODE_A)
+        if (horizontal > threshold) add(KeyEvent.KEYCODE_D)
+        if (vertical < -threshold) add(KeyEvent.KEYCODE_W)
+        if (vertical > threshold) add(KeyEvent.KEYCODE_S)
+    }
+}
+
+@Composable
+private fun BoxScope.KeyboardTouchControls(
+    client: NativeStreamClient,
+    layoutScale: Float,
+    buttonScale: Float,
+    stickScale: Float,
+    leftStickScale: Float,
+    joystickMode: TouchJoystickMode,
+    joystickDeadZone: Float,
+    landscape: Boolean,
+    layoutEditing: Boolean,
+    buttons: List<KeyboardOverlayButton>,
+    getLocalOffset: (String) -> TouchOffset,
+    getStoredOffset: (String) -> TouchOffset?,
+    onLocalOffsetChange: (String, Float, Float) -> Unit,
+    onButtonTone: () -> Unit,
+    onKeyboardButtonAdd: (String) -> Unit,
+    onKeyboardButtonRemove: (String) -> Unit,
+) {
+    val orientation = if (landscape) "landscape" else "portrait"
+    val stickDiameter = (if (landscape) 148.dp else 128.dp) * layoutScale * stickScale * leftStickScale
+    val buttonSize = 48.dp * layoutScale * buttonScale
+    val gap = 7.dp * layoutScale
+    var showButtonPicker by rememberSaveable { mutableStateOf(false) }
+    TouchControlGroup(
+        id = "keyboard-$orientation-stick",
+        layoutEditing = layoutEditing,
+        offsetX = getLocalOffset("keyboard_stick").x.dp,
+        offsetY = getLocalOffset("keyboard_stick").y.dp,
+        onOffsetChange = { x, y -> onLocalOffsetChange("keyboard_stick", x, y) },
+        modifier = Modifier.align(Alignment.BottomStart),
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "WASD",
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+            KeyboardWASDStick(client, stickDiameter, joystickMode, joystickDeadZone)
+        }
+    }
+    buttons.forEachIndexed { index, button ->
+        val option = keyboardButtonOption(button.actionId)
+        if (option != null) key(button.id) {
+            val positionKey = button.positionKey()
+            val layoutIndex = button.layoutIndex.takeIf { it >= 0 } ?: index
+            val offset = getStoredOffset(positionKey) ?: keyboardButtonDefaultOffset(
+                index = layoutIndex,
+                spacingDp = buttonSize.value + gap.value,
+                migratedGroupOffset = if (layoutIndex < 7) getLocalOffset("keyboard_buttons") else TouchOffset(),
+            )
+            TouchControlGroup(
+                id = "keyboard-button-${button.id}-$orientation",
+                layoutEditing = layoutEditing,
+                offsetX = offset.x.dp,
+                offsetY = offset.y.dp,
+                onOffsetChange = { x, y -> onLocalOffsetChange(positionKey, x, y) },
+                onRemove = { onKeyboardButtonRemove(button.id) },
+                modifier = Modifier.align(Alignment.BottomEnd),
+            ) {
+                KeyboardCatalogButton(button, option, client, buttonSize, onButtonTone)
+            }
+        }
+    }
+    if (layoutEditing && buttons.size < MAX_KEYBOARD_OVERLAY_BUTTONS) {
+        Surface(
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp)
+                .clickable { showButtonPicker = true },
+            color = MaterialTheme.colorScheme.primaryContainer,
+            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            shape = RoundedCornerShape(999.dp),
+            shadowElevation = 6.dp,
+        ) {
+            Text(
+                text = stringResource(R.string.keyboard_overlay_add_button),
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 11.dp),
+            )
+        }
+    }
+    if (showButtonPicker) {
+        KeyboardButtonPickerDialog(
+            onDismiss = { showButtonPicker = false },
+            onSelect = { actionId ->
+                showButtonPicker = false
+                onKeyboardButtonAdd(actionId)
+            },
+        )
+    }
+}
+
+@Composable
+private fun KeyboardCatalogButton(
+    button: KeyboardOverlayButton,
+    option: KeyboardButtonOption,
+    client: NativeStreamClient,
+    size: Dp,
+    onPressTone: () -> Unit,
+) {
+    val appearanceKey = button.appearanceKey()
+    val sourceId = "keyboard-custom-${button.id}"
+    val currentOnPressTone by rememberUpdatedState(onPressTone)
+    var pressed by remember(sourceId, button.actionId) { mutableStateOf(false) }
+    fun dispatch(down: Boolean) {
+        option.keyCode?.let { client.setVirtualKeyboardKeyFromSource(it, sourceId, down) }
+        option.mouseButton?.let { client.setVirtualMouseButtonFromSource(it, sourceId, down) }
+    }
+    val currentOnPressedChange = rememberUpdatedState<(Boolean) -> Unit> { down ->
+        if (down != pressed) {
+            dispatch(down)
+            pressed = down
+            if (down) currentOnPressTone()
+        }
+    }
+    Box(
+        Modifier
+            .editTouchButtonOnTap(appearanceKey)
+            .virtualPressInput(
+                client,
+                "$sourceId-${button.actionId}",
+                currentOnPressedChange,
+                LocalTouchButtonAppearances.current[appearanceKey]?.toggle == true,
+                LocalTouchInputEnabled.current,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        TouchCapFace(option.capLabel, pressed, size, appearanceKey = appearanceKey)
+    }
+    DisposableEffect(client, sourceId, button.actionId) {
+        onDispose { dispatch(false) }
+    }
+}
+
+@Composable
+private fun KeyboardButtonPickerDialog(
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit,
+) {
+    val configuration = LocalConfiguration.current
+    val landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    var query by rememberSaveable { mutableStateOf("") }
+    var selectedCategory by rememberSaveable { mutableStateOf<KeyboardButtonCategory?>(null) }
+    val filteredOptions = remember(query, selectedCategory) {
+        val normalizedQuery = query.trim().lowercase()
+        keyboardButtonCatalog.filter { option ->
+            (selectedCategory == null || option.category == selectedCategory) &&
+                (normalizedQuery.isBlank() || option.label.lowercase().contains(normalizedQuery) ||
+                    option.capLabel.lowercase().contains(normalizedQuery) || option.id.contains(normalizedQuery))
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = if (landscape) Modifier.fillMaxWidth(0.94f).widthIn(max = 960.dp) else Modifier,
+        properties = DialogProperties(usePlatformDefaultWidth = !landscape),
+        title = { Text(stringResource(R.string.keyboard_overlay_picker_title)) },
+        text = {
+            val categoryChoices: List<KeyboardButtonCategory?> = listOf(null) + KeyboardButtonCategory.entries
+            val categoryLabel: @Composable (KeyboardButtonCategory?) -> String = { category ->
+                stringResource(category?.let(::keyboardButtonCategoryLabelRes) ?: R.string.keyboard_overlay_category_all)
+            }
+            val pickerHeight = (configuration.screenHeightDp * if (landscape) 0.58f else 0.62f).dp
+            val filterWidth = (configuration.screenWidthDp * 0.28f).coerceIn(160f, 220f).dp
+            if (landscape) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(pickerHeight),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Column(Modifier.width(filterWidth).fillMaxHeight()) {
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            label = { Text(stringResource(R.string.keyboard_overlay_search)) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                            categoryChoices.forEach { category ->
+                                FilterChip(
+                                    selected = selectedCategory == category,
+                                    onClick = { selectedCategory = category },
+                                    label = { Text(categoryLabel(category)) },
+                                )
+                            }
+                        }
+                    }
+                    KeyboardPickerOptions(filteredOptions, onSelect, Modifier.weight(1f).fillMaxHeight())
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth().height(pickerHeight),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        label = { Text(stringResource(R.string.keyboard_overlay_search)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        categoryChoices.forEach { category ->
+                            FilterChip(
+                                selected = selectedCategory == category,
+                                onClick = { selectedCategory = category },
+                                label = { Text(categoryLabel(category)) },
+                            )
+                        }
+                    }
+                    KeyboardPickerOptions(filteredOptions, onSelect, Modifier.weight(1f).fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_close)) } },
+    )
+}
+
+@Composable
+private fun KeyboardPickerOptions(
+    options: List<KeyboardButtonOption>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier,
+) {
+    if (options.isEmpty()) {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text(stringResource(R.string.keyboard_overlay_no_results), style = MaterialTheme.typography.bodyMedium)
+        }
+    } else {
+        LazyColumn(modifier) {
+            items(options, key = KeyboardButtonOption::id) { option ->
+                TextButton(onClick = { onSelect(option.id) }, modifier = Modifier.fillMaxWidth()) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Text(option.capLabel, style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                        }
+                        Text(option.label, modifier = Modifier.weight(1f).padding(start = 12.dp))
+                        Text(stringResource(keyboardButtonCategoryLabelRes(option.category)),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun KeyboardWASDStick(
+    client: NativeStreamClient,
+    diameter: Dp,
+    mode: TouchJoystickMode,
+    deadZone: Float,
+) {
+    val sourceId = "touch-keyboard-wasd"
+    var pressedKeyCodes by remember(client, sourceId) { mutableStateOf(emptySet<Int>()) }
+    val updateKeys: (Float, Float) -> Unit = { x, y ->
+        val nextKeys = keyboardStickKeyCodes(x, y)
+        val previousKeys = pressedKeyCodes
+        (previousKeys - nextKeys).forEach { client.setVirtualKeyboardKeyFromSource(it, sourceId, false) }
+        (nextKeys - previousKeys).forEach { client.setVirtualKeyboardKeyFromSource(it, sourceId, true) }
+        if (nextKeys != previousKeys) pressedKeyCodes = nextKeys
+    }
+    VirtualStick(
+        label = "WASD",
+        client = client,
+        diameter = diameter,
+        mode = mode,
+        deadZone = deadZone,
+        onChange = updateKeys,
+    )
+    DisposableEffect(client, sourceId) {
+        onDispose { pressedKeyCodes.forEach { client.setVirtualKeyboardKeyFromSource(it, sourceId, false) } }
     }
 }
 
@@ -211,7 +586,7 @@ private fun PortraitTouchControls(
     leftStickScale: Float,
     rightStickScale: Float,
     visibleControlGroups: Set<TouchControlGroup>,
-    extraButtonActions: List<TouchExtraButtonAction>,
+    extraButtonCombos: List<List<TouchExtraButtonAction>>,
     extraButtonScale: Float,
     joystickMode: TouchJoystickMode,
     aimMode: TouchAimMode,
@@ -234,18 +609,27 @@ private fun PortraitTouchControls(
         Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 24.dp)
     ) {
         if (aimMode == TouchAimMode.LockZone && TouchControlGroup.RightStick in visibleControlGroups) {
-            LockZoneAimSurface(
-                id = "portrait-aim-zone",
-                client = client,
-                opacity = opacity,
-                deadZone = joystickDeadZone,
-                sensitivity = aimZoneSensitivity,
-                enabled = !layoutEditing,
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
+            val aimOffset = getLocalOffset("aimzone")
+            TouchControlGroup(
+                id = "portrait-aim-zone-group",
+                layoutEditing = layoutEditing,
+                offsetX = aimOffset.x.dp,
+                offsetY = aimOffset.y.dp,
+                onOffsetChange = { x, y -> onLocalOffsetChange("aimzone", x, y) },
+                modifier = Modifier.align(Alignment.BottomEnd)
                     .fillMaxWidth(scaledAimZoneFraction(0.54f, aimZoneScale))
                     .fillMaxHeight(scaledAimZoneFraction(0.48f, aimZoneScale)),
-            )
+            ) {
+                LockZoneAimSurface(
+                    id = "portrait-aim-zone",
+                    client = client,
+                    opacity = opacity,
+                    deadZone = joystickDeadZone,
+                    sensitivity = aimZoneSensitivity,
+                    enabled = !layoutEditing,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
         val shoulderScale = buttonScale * shoulderButtonScale * layoutScale
         val triggerWidth = 64.dp * shoulderScale
@@ -254,7 +638,7 @@ private fun PortraitTouchControls(
 
         ExtraTouchButtons(
             orientation = "portrait",
-            actions = extraButtonActions,
+            combos = extraButtonCombos,
             scale = buttonScale * extraButtonScale * layoutScale,
             client = client,
             layoutEditing = layoutEditing,
@@ -462,7 +846,7 @@ private fun BoxScope.LandscapeTouchControls(
     leftStickScale: Float,
     rightStickScale: Float,
     visibleControlGroups: Set<TouchControlGroup>,
-    extraButtonActions: List<TouchExtraButtonAction>,
+    extraButtonCombos: List<List<TouchExtraButtonAction>>,
     extraButtonScale: Float,
     joystickMode: TouchJoystickMode,
     aimMode: TouchAimMode,
@@ -481,18 +865,27 @@ private fun BoxScope.LandscapeTouchControls(
     val topControlClearance = landscapeTouchTopControlClearanceDp(viewportHeight.value, shoulderScale).dp
     Box(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 24.dp)) {
         if (aimMode == TouchAimMode.LockZone && TouchControlGroup.RightStick in visibleControlGroups) {
-            LockZoneAimSurface(
-                id = "landscape-aim-zone",
-                client = client,
-                opacity = opacity,
-                deadZone = joystickDeadZone,
-                sensitivity = aimZoneSensitivity,
-                enabled = !layoutEditing,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
+            val aimOffset = getLocalOffset("aimzone")
+            TouchControlGroup(
+                id = "landscape-aim-zone-group",
+                layoutEditing = layoutEditing,
+                offsetX = aimOffset.x.dp,
+                offsetY = aimOffset.y.dp,
+                onOffsetChange = { x, y -> onLocalOffsetChange("aimzone", x, y) },
+                modifier = Modifier.align(Alignment.CenterEnd)
                     .fillMaxWidth(scaledAimZoneFraction(0.48f, aimZoneScale))
                     .fillMaxHeight(scaledAimZoneFraction(0.72f, aimZoneScale)),
-            )
+            ) {
+                LockZoneAimSurface(
+                    id = "landscape-aim-zone",
+                    client = client,
+                    opacity = opacity,
+                    deadZone = joystickDeadZone,
+                    sensitivity = aimZoneSensitivity,
+                    enabled = !layoutEditing,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
         val triggerWidth = 76.dp * shoulderScale
         val bumperHeight = 36.dp * shoulderScale
@@ -500,7 +893,7 @@ private fun BoxScope.LandscapeTouchControls(
 
         ExtraTouchButtons(
             orientation = "landscape",
-            actions = extraButtonActions,
+            combos = extraButtonCombos,
             scale = controlScale * extraButtonScale,
             client = client,
             layoutEditing = layoutEditing,
@@ -732,6 +1125,19 @@ internal fun touchExtraButtonActionLabel(action: TouchExtraButtonAction): String
     TouchExtraButtonAction.RightStickClick -> "R3 / RS"
     TouchExtraButtonAction.Start -> "Start"
     TouchExtraButtonAction.Select -> "Select"
+    TouchExtraButtonAction.LeftStickLeft -> "Left stick left (A)"
+    TouchExtraButtonAction.LeftStickRight -> "Left stick right (D)"
+    TouchExtraButtonAction.KeyboardA -> "Keyboard A"
+    TouchExtraButtonAction.KeyboardD -> "Keyboard D"
+    TouchExtraButtonAction.LeftBumperAndLeftTrigger -> "LB + LT / L1 + L2"
+    TouchExtraButtonAction.RightBumperAndRightTrigger -> "RB + RT / R1 + R2"
+    TouchExtraButtonAction.LeftAndRightBumpers -> "LB + RB / L1 + R1"
+    TouchExtraButtonAction.LeftAndRightTriggers -> "LT + RT / L2 + R2"
+}
+
+internal fun touchExtraButtonComboLabel(actions: List<TouchExtraButtonAction>): String {
+    val normalized = normalizeTouchExtraButtonCombo(actions)
+    return if (normalized.isEmpty()) "Off" else normalized.joinToString(" + ", transform = ::touchExtraButtonActionLabel)
 }
 
 internal fun touchControlGroupLabelRes(group: TouchControlGroup): Int = when (group) {
@@ -764,35 +1170,84 @@ private fun touchExtraButtonCapLabel(action: TouchExtraButtonAction): String = w
     TouchExtraButtonAction.RightStickClick -> "RS"
     TouchExtraButtonAction.Start -> "▶"
     TouchExtraButtonAction.Select -> "◀"
+    TouchExtraButtonAction.LeftStickLeft -> "LS←"
+    TouchExtraButtonAction.LeftStickRight -> "LS→"
+    TouchExtraButtonAction.KeyboardA -> "A⌨"
+    TouchExtraButtonAction.KeyboardD -> "D⌨"
+    TouchExtraButtonAction.LeftBumperAndLeftTrigger -> "L1+L2"
+    TouchExtraButtonAction.RightBumperAndRightTrigger -> "R1+R2"
+    TouchExtraButtonAction.LeftAndRightBumpers -> "L1+R1"
+    TouchExtraButtonAction.LeftAndRightTriggers -> "L2+R2"
     else -> action.name
 }
 
-private fun touchExtraButtonMask(action: TouchExtraButtonAction): Int? = when (action) {
-    TouchExtraButtonAction.Guide -> GamepadButtonMapping.GUIDE
-    TouchExtraButtonAction.A -> GamepadButtonMapping.A
-    TouchExtraButtonAction.B -> GamepadButtonMapping.B
-    TouchExtraButtonAction.X -> GamepadButtonMapping.X
-    TouchExtraButtonAction.Y -> GamepadButtonMapping.Y
-    TouchExtraButtonAction.DpadUp -> GamepadButtonMapping.DPAD_UP
-    TouchExtraButtonAction.DpadDown -> GamepadButtonMapping.DPAD_DOWN
-    TouchExtraButtonAction.DpadLeft -> GamepadButtonMapping.DPAD_LEFT
-    TouchExtraButtonAction.DpadRight -> GamepadButtonMapping.DPAD_RIGHT
-    TouchExtraButtonAction.LeftBumper -> GamepadButtonMapping.LEFT_SHOULDER
-    TouchExtraButtonAction.RightBumper -> GamepadButtonMapping.RIGHT_SHOULDER
-    TouchExtraButtonAction.LeftStickClick -> GamepadButtonMapping.LEFT_THUMB
-    TouchExtraButtonAction.RightStickClick -> GamepadButtonMapping.RIGHT_THUMB
-    TouchExtraButtonAction.Start -> GamepadButtonMapping.START
-    TouchExtraButtonAction.Select -> GamepadButtonMapping.BACK
+private fun touchExtraButtonCapLabel(actions: List<TouchExtraButtonAction>): String {
+    val labels = normalizeTouchExtraButtonCombo(actions).map(::touchExtraButtonCapLabel)
+    return when {
+        labels.size <= 3 -> labels.joinToString("+")
+        else -> "${labels.first()}+${labels.size - 1}"
+    }
+}
+
+internal data class TouchExtraButtonBinding(
+    val buttonMasks: List<Int> = emptyList(),
+    val leftTrigger: Boolean = false,
+    val rightTrigger: Boolean = false,
+    val leftStickX: Float? = null,
+    val keyboardKeyCodes: List<Int> = emptyList(),
+) {
+    val keyboardKeyCode: Int? get() = keyboardKeyCodes.singleOrNull()
+}
+
+private fun atomicTouchExtraButtonBinding(action: TouchExtraButtonAction): TouchExtraButtonBinding = when (action) {
+    TouchExtraButtonAction.Guide -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.GUIDE))
+    TouchExtraButtonAction.A -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.A))
+    TouchExtraButtonAction.B -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.B))
+    TouchExtraButtonAction.X -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.X))
+    TouchExtraButtonAction.Y -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.Y))
+    TouchExtraButtonAction.DpadUp -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.DPAD_UP))
+    TouchExtraButtonAction.DpadDown -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.DPAD_DOWN))
+    TouchExtraButtonAction.DpadLeft -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.DPAD_LEFT))
+    TouchExtraButtonAction.DpadRight -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.DPAD_RIGHT))
+    TouchExtraButtonAction.LeftBumper -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.LEFT_SHOULDER))
+    TouchExtraButtonAction.RightBumper -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.RIGHT_SHOULDER))
+    TouchExtraButtonAction.LeftTrigger -> TouchExtraButtonBinding(leftTrigger = true)
+    TouchExtraButtonAction.RightTrigger -> TouchExtraButtonBinding(rightTrigger = true)
+    TouchExtraButtonAction.LeftStickClick -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.LEFT_THUMB))
+    TouchExtraButtonAction.RightStickClick -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.RIGHT_THUMB))
+    TouchExtraButtonAction.Start -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.START))
+    TouchExtraButtonAction.Select -> TouchExtraButtonBinding(listOf(GamepadButtonMapping.BACK))
+    TouchExtraButtonAction.LeftStickLeft -> TouchExtraButtonBinding(leftStickX = -1f)
+    TouchExtraButtonAction.LeftStickRight -> TouchExtraButtonBinding(leftStickX = 1f)
+    TouchExtraButtonAction.KeyboardA -> TouchExtraButtonBinding(keyboardKeyCodes = listOf(KeyEvent.KEYCODE_A))
+    TouchExtraButtonAction.KeyboardD -> TouchExtraButtonBinding(keyboardKeyCodes = listOf(KeyEvent.KEYCODE_D))
+    TouchExtraButtonAction.LeftBumperAndLeftTrigger,
+    TouchExtraButtonAction.RightBumperAndRightTrigger,
+    TouchExtraButtonAction.LeftAndRightBumpers,
+    TouchExtraButtonAction.LeftAndRightTriggers,
     TouchExtraButtonAction.None,
-    TouchExtraButtonAction.LeftTrigger,
-    TouchExtraButtonAction.RightTrigger,
-    -> null
+    -> TouchExtraButtonBinding()
+}
+
+internal fun touchExtraButtonBinding(action: TouchExtraButtonAction): TouchExtraButtonBinding =
+    touchExtraButtonBinding(listOf(action))
+
+internal fun touchExtraButtonBinding(actions: List<TouchExtraButtonAction>): TouchExtraButtonBinding {
+    val bindings = normalizeTouchExtraButtonCombo(actions).map(::atomicTouchExtraButtonBinding)
+    val stickValues = bindings.mapNotNull(TouchExtraButtonBinding::leftStickX)
+    return TouchExtraButtonBinding(
+        buttonMasks = bindings.flatMap(TouchExtraButtonBinding::buttonMasks).distinct(),
+        leftTrigger = bindings.any(TouchExtraButtonBinding::leftTrigger),
+        rightTrigger = bindings.any(TouchExtraButtonBinding::rightTrigger),
+        leftStickX = stickValues.takeIf { it.isNotEmpty() }?.sum()?.coerceIn(-1f, 1f),
+        keyboardKeyCodes = bindings.flatMap(TouchExtraButtonBinding::keyboardKeyCodes).distinct(),
+    )
 }
 
 @Composable
 private fun BoxScope.ExtraTouchButtons(
     orientation: String,
-    actions: List<TouchExtraButtonAction>,
+    combos: List<List<TouchExtraButtonAction>>,
     scale: Float,
     client: NativeStreamClient,
     layoutEditing: Boolean,
@@ -801,10 +1256,10 @@ private fun BoxScope.ExtraTouchButtons(
     onButtonTone: () -> Unit,
     modifier: Modifier,
 ) {
-    actions.take(TOUCH_EXTRA_BUTTON_COUNT).forEachIndexed { index, action ->
-        if (action == TouchExtraButtonAction.None) return@forEachIndexed
+    combos.take(TOUCH_EXTRA_BUTTON_COUNT).forEachIndexed { index, actions ->
+        if (actions.isEmpty()) return@forEachIndexed
         val controlKey = "extra${index + 1}"
-        key("$orientation-$controlKey", action) {
+        key("$orientation-$controlKey", actions) {
             TouchControlGroup(
                 id = "$orientation-$controlKey",
                 layoutEditing = layoutEditing,
@@ -814,7 +1269,8 @@ private fun BoxScope.ExtraTouchButtons(
                 modifier = modifier,
             ) {
                 GamepadActionButton(
-                    action = action,
+                    actions = actions,
+                    appearanceKey = controlKey,
                     sourceId = "touch-$orientation-$controlKey",
                     client = client,
                     size = 44.dp * scale,
@@ -826,12 +1282,13 @@ private fun BoxScope.ExtraTouchButtons(
 }
 
 @Composable
-private fun TouchControlGroup(
+internal fun TouchControlGroup(
     id: String,
     layoutEditing: Boolean,
     offsetX: Dp,
     offsetY: Dp,
     onOffsetChange: (Float, Float) -> Unit,
+    onRemove: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -839,10 +1296,40 @@ private fun TouchControlGroup(
     val currentOffsetX by rememberUpdatedState(offsetX)
     val currentOffsetY by rememberUpdatedState(offsetY)
     val currentOnOffsetChange by rememberUpdatedState(onOffsetChange)
+    var controlBounds by remember { mutableStateOf(Rect.Zero) }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
     Box(
         modifier
-            .offset(x = offsetX, y = offsetY)
+            .absoluteOffset(x = offsetX, y = offsetY)
+            .pointerInput(layoutEditing) {
+                if (!layoutEditing) return@pointerInput
+                var start = TouchOffset()
+                var bounds = Rect.Zero
+                var viewport = IntSize.Zero
+                var travel = Offset.Zero
+                detectDragGestures(onDragStart = {
+                    start = TouchOffset(currentOffsetX.value, currentOffsetY.value)
+                    bounds = controlBounds
+                    viewport = viewportSize
+                    travel = Offset.Zero
+                }) { change, dragAmount ->
+                    change.consume()
+                    travel += dragAmount
+                    with(density) {
+                        currentOnOffsetChange(
+                            draggedTouchOffset(start.x, travel.x.toDp().value,
+                                bounds.left.toDp().value, bounds.right.toDp().value, viewport.width.toDp().value),
+                            draggedTouchOffset(start.y, travel.y.toDp().value,
+                                bounds.top.toDp().value, bounds.bottom.toDp().value, viewport.height.toDp().value),
+                        )
+                    }
+                }
+            }
             .onGloballyPositioned { coordinates ->
+                controlBounds = Rect(coordinates.positionInRoot(), androidx.compose.ui.geometry.Size(
+                    coordinates.size.width.toFloat(), coordinates.size.height.toFloat(),
+                ))
+                viewportSize = coordinates.findRootCoordinates().size
                 val bounds = coordinates.boundsInRoot()
                 NativeStreamInputRouter.setTouchControllerPassthroughBound(
                     id,
@@ -856,29 +1343,32 @@ private fun TouchControlGroup(
     ) {
         content()
         if (layoutEditing) {
+            if (onRemove != null) {
+                Surface(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).clickable(
+                        onClickLabel = stringResource(R.string.keyboard_overlay_remove_button),
+                        onClick = onRemove,
+                    ),
+                    shape = RoundedCornerShape(999.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    shadowElevation = 2.dp,
+                ) {
+                    Text("−", style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp))
+                }
+            }
             Box(
                 Modifier
                     .matchParentSize()
                     .clip(RoundedCornerShape(18.dp))
                     .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
-                    .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.72f), RoundedCornerShape(18.dp))
-                    .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            val deltaXDp = with(density) { dragAmount.x.toDp().value }
-                            val deltaYDp = with(density) { dragAmount.y.toDp().value }
-                            currentOnOffsetChange(
-                                (currentOffsetX.value + deltaXDp).coerceIn(-280f, 280f),
-                                (currentOffsetY.value + deltaYDp).coerceIn(-280f, 280f),
-                            )
-                        }
-                    },
+                    .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.72f), RoundedCornerShape(18.dp)),
                 contentAlignment = Alignment.TopCenter,
             ) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.9f),
-                    shape = RoundedCornerShape(999.dp),
-                    modifier = Modifier.padding(top = 4.dp),
+                Box(
+                    modifier = Modifier.padding(top = 4.dp).clip(RoundedCornerShape(999.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.9f)),
                 ) {
                     Text(
                         stringResource(R.string.touch_drag_label),
@@ -942,6 +1432,18 @@ internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
     if (magnitude <= clampedDeadZone) return 0f
     val adjusted = (magnitude - clampedDeadZone) / (1f - clampedDeadZone)
     return if (clampedValue < 0f) -adjusted else adjusted
+}
+
+/** Offset the fixed origin toward the finger without a response jump at the calibration limit. */
+internal fun touchStickGestureCenter(
+    fixedCenter: Offset,
+    downPosition: Offset,
+    maxRadius: Float,
+    mode: TouchJoystickMode,
+): Offset {
+    if (mode == TouchJoystickMode.Dynamic) return downPosition
+    val offset = downPosition - fixedCenter
+    return fixedCenter + clampStickOffset(offset, maxRadius * 0.6f)
 }
 
 @Composable
@@ -1088,9 +1590,16 @@ private fun VirtualStick(
     deadZone: Float,
     onChange: (Float, Float) -> Unit,
 ) {
+    val inputEnabled = LocalTouchInputEnabled.current
     val currentOnChange by rememberUpdatedState(onChange)
     var knobOffset by remember { mutableStateOf(Offset.Zero) }
     var baseOffset by remember { mutableStateOf(Offset.Zero) }
+    var pressed by remember { mutableStateOf(false) }
+    val displayedBaseOffset = animateOffsetAsState(
+        targetValue = baseOffset,
+        animationSpec = tween(durationMillis = if (pressed) 0 else 120),
+        label = "Touch stick recenter",
+    )
 
     DisposableEffect(client) {
         onDispose {
@@ -1101,18 +1610,24 @@ private fun VirtualStick(
     Box(
         Modifier
             .size(diameter)
-            .pointerInput(client, mode, deadZone) {
+            .pointerInput(client, mode, deadZone, inputEnabled) {
+                if (!inputEnabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                     val fixedCenter = Offset(size.width / 2f, size.height / 2f)
-                    val gestureCenter = if (mode == TouchJoystickMode.Dynamic) down.position else fixedCenter
                     val maxRadius = min(size.width, size.height) * 0.34f
+                    val gestureCenter = touchStickGestureCenter(fixedCenter, down.position, maxRadius, mode)
+                    pressed = true
                     baseOffset = gestureCenter - fixedCenter
+                    var lastValue = Offset.Zero
 
                     fun updateStick(position: Offset) {
                         val clamped = clampStickOffset(position - gestureCenter, maxRadius)
                         val value = touchStickValue(clamped.x, clamped.y, maxRadius, deadZone)
-                        currentOnChange(value.x, value.y)
+                        if (value != lastValue) {
+                            currentOnChange(value.x, value.y)
+                            lastValue = value
+                        }
                         knobOffset = clamped
                     }
 
@@ -1133,12 +1648,13 @@ private fun VirtualStick(
                         currentOnChange(0f, 0f)
                         knobOffset = Offset.Zero
                         baseOffset = Offset.Zero
+                        pressed = false
                     }
                 }
             },
         contentAlignment = Alignment.Center,
     ) {
-        TouchStickFace(diameter = diameter, base = { baseOffset }, knob = { knobOffset })
+        TouchStickFace(diameter = diameter, base = { displayedBaseOffset.value }, knob = { knobOffset })
     }
 }
 
@@ -1147,8 +1663,12 @@ private const val LOCK_ZONE_MAX_TRAVEL_DP = 72f
 @Composable
 private fun FaceButtonCluster(client: NativeStreamClient, scale: Float, onButtonTone: () -> Unit) {
     val buttonSize = 54.dp * scale
-    val distance = buttonSize * 1.05f
-    val boxSize = distance * 2 + buttonSize
+    val appearances = LocalTouchButtonAppearances.current
+    val largestButton = listOf("A", "B", "X", "Y").maxOf { button ->
+        (buttonSize * (appearances[button]?.effectiveSizeScale() ?: 1f)).coerceAtLeast(48.dp)
+    }
+    val distance = maxOf(buttonSize, largestButton) * 1.05f
+    val boxSize = distance * 2 + largestButton
     Box(Modifier.size(boxSize)) {
         Box(Modifier.align(Alignment.Center).offset(y = -distance)) {
             GamepadButton("Y", 0x8000, client, buttonSize, onButtonTone)
@@ -1167,6 +1687,7 @@ private fun FaceButtonCluster(client: NativeStreamClient, scale: Float, onButton
 
 @Composable
 private fun DpadCluster(client: NativeStreamClient, scale: Float, onButtonTone: () -> Unit) {
+    val inputEnabled = LocalTouchInputEnabled.current
     val currentOnButtonTone by rememberUpdatedState(onButtonTone)
     val buttonSize = 54.dp * scale
     val boxSize = touchDpadBoxSize(buttonSize)
@@ -1188,7 +1709,8 @@ private fun DpadCluster(client: NativeStreamClient, scale: Float, onButtonTone: 
     Box(
         Modifier
             .size(boxSize)
-            .pointerInput(client) {
+            .pointerInput(client, inputEnabled) {
+                if (!inputEnabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
 
@@ -1257,28 +1779,38 @@ private fun DpadCluster(client: NativeStreamClient, scale: Float, onButtonTone: 
     }
 }
 
-private fun Modifier.virtualPressInput(
-    client: NativeStreamClient,
+internal fun Modifier.virtualPressInput(
+    inputOwner: Any,
     controlKey: Any,
     onPressedChange: State<(Boolean) -> Unit>,
-): Modifier = pointerInput(client, controlKey) {
-    awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-        onPressedChange.value(true)
-        try {
-            down.consume()
-            while (true) {
-                val event = awaitPointerEvent(PointerEventPass.Initial)
-                val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                if (!change.pressed) {
+    toggle: Boolean,
+    enabled: Boolean,
+): Modifier = pointerInput(inputOwner, controlKey, toggle, enabled) {
+    if (!enabled) return@pointerInput
+    val press = TouchButtonPressState(toggle)
+    try {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            onPressedChange.value(press.down())
+            var completed = false
+            try {
+                down.consume()
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
                     change.consume()
-                    break
+                    if (!change.pressed) {
+                        completed = true
+                        break
+                    }
                 }
-                change.consume()
+            } finally {
+                onPressedChange.value(if (completed) press.up() else press.cancel())
             }
-        } finally {
-            onPressedChange.value(false)
         }
+    } finally {
+        // Disposal, editing, backgrounding and configuration changes release latched inputs too.
+        onPressedChange.value(press.cancel())
     }
 }
 
@@ -1301,9 +1833,9 @@ private fun GamepadTriggerButton(
     }
     Box(
         Modifier
-            .width(width)
-            .heightIn(min = 48.dp)
-            .virtualPressInput(client, left, currentOnPressedChange),
+            .editTouchButtonOnTap(label)
+            .virtualPressInput(client, left, currentOnPressedChange,
+                LocalTouchButtonAppearances.current[label]?.toggle == true, LocalTouchInputEnabled.current),
         contentAlignment = Alignment.TopCenter,
     ) {
         TouchShoulderFace(label = label, pressed = pressed, width = width, height = height)
@@ -1334,9 +1866,9 @@ private fun GamepadBumperButton(
     }
     Box(
         Modifier
-            .width(width)
-            .height(height)
-            .virtualPressInput(client, mask, currentOnPressedChange),
+            .editTouchButtonOnTap(label)
+            .virtualPressInput(client, mask, currentOnPressedChange,
+                LocalTouchButtonAppearances.current[label]?.toggle == true, LocalTouchInputEnabled.current),
         contentAlignment = Alignment.Center,
     ) {
         TouchShoulderFace(label = label, pressed = pressed, width = width, height = height)
@@ -1350,23 +1882,23 @@ private fun GamepadBumperButton(
 
 @Composable
 private fun GamepadActionButton(
-    action: TouchExtraButtonAction,
+    actions: List<TouchExtraButtonAction>,
+    appearanceKey: String,
     sourceId: String,
     client: NativeStreamClient,
     size: Dp,
     onPressTone: () -> Unit,
 ) {
     val currentOnPressTone by rememberUpdatedState(onPressTone)
-    var pressed by remember(action, sourceId) { mutableStateOf(false) }
+    var pressed by remember(actions, sourceId) { mutableStateOf(false) }
 
     fun dispatch(down: Boolean) {
-        when (action) {
-            TouchExtraButtonAction.LeftTrigger -> client.setVirtualTriggerFromSource(true, sourceId, down)
-            TouchExtraButtonAction.RightTrigger -> client.setVirtualTriggerFromSource(false, sourceId, down)
-            else -> touchExtraButtonMask(action)?.let { mask ->
-                client.setVirtualButtonFromSource(mask, sourceId, down)
-            }
-        }
+        val binding = touchExtraButtonBinding(actions)
+        binding.buttonMasks.forEach { mask -> client.setVirtualButtonFromSource(mask, sourceId, down) }
+        if (binding.leftTrigger) client.setVirtualTriggerFromSource(true, sourceId, down)
+        if (binding.rightTrigger) client.setVirtualTriggerFromSource(false, sourceId, down)
+        binding.leftStickX?.let { x -> client.setVirtualLeftStickFromSource(sourceId, if (down) x else 0f, 0f) }
+        binding.keyboardKeyCodes.forEach { keyCode -> client.setVirtualKeyboardKeyFromSource(keyCode, sourceId, down) }
     }
 
     val currentOnPressedChange = rememberUpdatedState<(Boolean) -> Unit> { down ->
@@ -1378,13 +1910,14 @@ private fun GamepadActionButton(
     }
     Box(
         Modifier
-            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
-            .virtualPressInput(client, "$sourceId-${action.name}", currentOnPressedChange),
+            .editTouchButtonOnTap(appearanceKey)
+            .virtualPressInput(client, "$sourceId-${actions.joinToString("-") { it.name }}", currentOnPressedChange,
+                LocalTouchButtonAppearances.current[appearanceKey]?.toggle == true, LocalTouchInputEnabled.current),
         contentAlignment = Alignment.Center,
     ) {
-        TouchCapFace(label = touchExtraButtonCapLabel(action), pressed = pressed, diameter = size)
+        TouchCapFace(label = touchExtraButtonCapLabel(actions), pressed = pressed, diameter = size, appearanceKey = appearanceKey)
     }
-    DisposableEffect(client, action, sourceId) {
+    DisposableEffect(client, actions, sourceId) {
         onDispose { dispatch(false) }
     }
 }
@@ -1408,8 +1941,9 @@ private fun GamepadButton(
     }
     Box(
         Modifier
-            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
-            .virtualPressInput(client, mask, currentOnPressedChange),
+            .editTouchButtonOnTap(label)
+            .virtualPressInput(client, mask, currentOnPressedChange,
+                LocalTouchButtonAppearances.current[label]?.toggle == true, LocalTouchInputEnabled.current),
         contentAlignment = Alignment.Center,
     ) {
         TouchCapFace(label = label, pressed = pressed, diameter = size)
@@ -1441,9 +1975,9 @@ private fun GamepadPillButton(
     }
     Box(
         Modifier
-            .width(width)
-            .height(height)
-            .virtualPressInput(client, mask, currentOnPressedChange),
+            .editTouchButtonOnTap(label)
+            .virtualPressInput(client, mask, currentOnPressedChange,
+                LocalTouchButtonAppearances.current[label]?.toggle == true, LocalTouchInputEnabled.current),
         contentAlignment = Alignment.Center,
     ) {
         TouchShoulderFace(label = label, pressed = pressed, width = width, height = height)

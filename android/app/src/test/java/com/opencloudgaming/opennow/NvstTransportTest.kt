@@ -1,17 +1,41 @@
 package com.opencloudgaming.opennow
 
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Test
 
 class NvstTransportTest {
+    @Test fun nvstHdrDoesNotRequestAiHdrConversion() {
+        val settings = StreamSettings(experimentalNvst = true, codec = VideoCodec.H265,
+            colorQuality = ColorQuality.TenBit420, hdrEnabled = true)
+        val request = buildMinimalClaimRequestBody("123", "device", settings)["sessionRequestData"]!!.jsonObject
+        assertFalse(request["requestedStreamingFeatures"]!!.jsonObject["trueHdr"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test fun endpointSelectionUsesSessionOrderAndIpBeforeResourceAndIgnoresMedia() {
+        val connections = OpenNowJson.parseToJsonElement("""[
+          {"usage":15,"appLevelProtocol":6,"resourcePath":"rtsps://media.example:322"},
+          {"usage":14,"appLevelProtocol":6,"ip":"seat.partner.example","resourcePath":"rtsps://stale.example:322","port":48322},
+          {"usage":14,"appLevelProtocol":6,"ip":"","resourcePath":"rtsps://seat.partner.example:322","port":0},
+          {"usage":16,"ip":"backup.partner.example","port":0},
+          {"usage":14,"appLevelProtocol":4,"ip":"webrtc.example","port":443},
+          {"usage":16,"resourcePath":"rtsps://user:password@invalid.example:322"},
+          {"usage":16,"resourcePath":"/nvst/"}
+        ]""").jsonArray
+        assertEquals(listOf("rtsps://seat.partner.example:48322", "rtsps://seat.partner.example:322",
+            "rtsps://backup.partner.example:322"), nvstRtspEndpoints(connections))
+    }
+
     @Test fun networkMetricsKeepMeasuredRttIndependentOfVideoArrival() {
         assertEquals(NvstNetworkMetrics(null, null, 23), parseNvstNetworkMetrics(",,22.6"))
         assertEquals(NvstNetworkMetrics(0.4, 0.0, 15), parseNvstNetworkMetrics("0.4,0,15.2"))
         assertEquals(NvstNetworkMetrics(0.4, 0.0, null), parseNvstNetworkMetrics("0.4,0,"))
         assertEquals(NvstNetworkMetrics(null, null, null), parseNvstNetworkMetrics("NaN,101,Infinity"))
         assertEquals(NvstNetworkMetrics(null, null, null), parseNvstNetworkMetrics("-1,-1,-1"))
+        assertEquals(NvstNetworkMetrics(0.4, 0.0, 3407, 12), parseNvstNetworkMetrics("0.4,0,3407,12"))
+        assertEquals(NvstNetworkMetrics(null, null, 23), parseNvstNetworkMetrics(",,23,-1"))
     }
 
     @Test fun newAndLegacyProfilesDefaultOff() {
@@ -86,7 +110,40 @@ class NvstTransportTest {
             val streamer = request["metaData"]!!.jsonArray.firstOrNull { it.jsonObject["key"]?.jsonPrimitive?.content == "GSStreamerType" }
             assertEquals(!nvst, streamer != null)
             assertEquals(nvst, settings.requiresNativeDesktopCloudMatchMode())
+            if (nvst) {
+                val features = request["requestedStreamingFeatures"]!!.jsonObject
+                assertEquals(0, features["dynamicStreamingMode"]!!.jsonPrimitive.int)
+            }
         }
+    }
+
+    @Test fun experimentalDynamicAdjustmentIsPersistedAndConsistentAcrossNativeRequests() {
+        val settings = StreamSettings(
+            experimentalNvst = true,
+            experimentalDynamicNetworkAdjustment = true,
+            experimentalDynamicMinimumBitrateMbps = 2,
+        )
+        val restored = OpenNowJson.decodeFromString<StreamSettings>(OpenNowJson.encodeToString(settings))
+        assertTrue(restored.experimentalDynamicNetworkAdjustment)
+        assertEquals(2, restored.experimentalDynamicMinimumBitrateMbps)
+        assertFalse(OpenNowJson.decodeFromString<StreamSettings>("{}").experimentalDynamicNetworkAdjustment)
+
+        val request = buildMinimalClaimRequestBody("123", "device", restored)["sessionRequestData"]!!.jsonObject
+        val features = request["requestedStreamingFeatures"]!!.jsonObject
+        assertEquals(1, features["dynamicStreamingMode"]!!.jsonPrimitive.int)
+
+        val session = SessionInfo("id", 3, serverIp = "", signalingServer = "", signalingUrl = "")
+        val context = OpenNowJson.parseToJsonElement(nvstSessionContext(session, restored)).jsonObject
+        val adaptation = context["settings"]!!.jsonObject["networkAdaptation"]!!.jsonObject
+        assertEquals(1, adaptation["dynamicStreamingMode"]!!.jsonPrimitive.int)
+        assertEquals(2_000, adaptation["minimumBitrateKbps"]!!.jsonPrimitive.int)
+        val preserved = StreamSettings().withUserStreamOptionsFrom(restored)
+        assertTrue(preserved.experimentalDynamicNetworkAdjustment)
+        assertEquals(2, preserved.experimentalDynamicMinimumBitrateMbps)
+        assertFalse(restored.loweredSessionLaunchProfile().experimentalDynamicNetworkAdjustment)
+        assertTrue(streamSettingsSessionSignature(restored).contains("dynamic=1"))
+        assertTrue(streamSettingsSessionSignature(restored).contains("minBitrate=2"))
+        assertFalse(streamSettingsSessionSignature(StreamSettings()).contains("dynamic="))
     }
 
     @Test fun deviceRecommendationsPreserveTransportChoice() {
@@ -102,6 +159,8 @@ class NvstTransportTest {
         ]""").jsonArray.map { it.jsonObject }
         assertEquals(2, nvstRtspEndpoints(JsonArray(connections)).size)
         assertTrue(webRtcMediaFallbackConnections(connections).isEmpty())
+        val rawRtsp = OpenNowJson.parseToJsonElement("""{"usage":14,"appLevelProtocol":1,"ip":"8.8.8.8","port":48010}""").jsonObject
+        assertTrue(webRtcMediaFallbackConnections(listOf(rawRtsp)).isEmpty())
         val webRtc = OpenNowJson.parseToJsonElement("""{"usage":14,"ip":"8.8.8.8","port":49003,"resourcePath":"/nvst/"}""").jsonObject
         assertEquals(listOf(webRtc), webRtcMediaFallbackConnections(connections + webRtc))
         // Some responses identify RTSP only by resourcePath or by application protocol.
@@ -135,6 +194,10 @@ class NvstTransportTest {
         assertEquals(49003, context["session"]!!.jsonObject["mediaConnectionInfo"]!!.jsonObject["port"]!!.jsonPrimitive.int)
         assertEquals(360, context["settings"]!!.jsonObject["fps"]!!.jsonPrimitive.int)
         assertEquals("10bit_420", context["settings"]!!.jsonObject["colorQuality"]!!.jsonPrimitive.content)
+        val adaptation = context["settings"]!!.jsonObject["networkAdaptation"]!!.jsonObject
+        assertEquals(0, adaptation["dynamicStreamingMode"]!!.jsonPrimitive.int)
+        assertEquals(5000, adaptation["minimumBitrateKbps"]!!.jsonPrimitive.int)
+        assertEquals(18750, adaptation["initialBitrateKbps"]!!.jsonPrimitive.int)
         assertEquals(session.rtspsEndpoints.first(), context["session"]!!.jsonObject["rtspsEndpoints"]!!.jsonArray.first().jsonPrimitive.content)
     }
 }

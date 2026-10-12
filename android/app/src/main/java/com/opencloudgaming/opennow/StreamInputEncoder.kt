@@ -319,7 +319,14 @@ class InputEncoder {
             timestampUs: Long = timestampUs(),
         ): KeyboardPayload? {
             val vk = virtualKey(keyCode, unicode)
-            val resolvedScanCode = if (scanCode > 0) scanCode else fallbackScanCode(keyCode)
+            // Escape and Space have fixed physical positions in the host protocol. Some Android
+            // keyboard drivers attach OEM scan codes to these normalized key codes; forwarding
+            // those vendor codes can make the cloud host miss an otherwise valid press.
+            val resolvedScanCode = if (keyCode == KeyEvent.KEYCODE_ESCAPE || keyCode == KeyEvent.KEYCODE_SPACE) {
+                fallbackScanCode(keyCode)
+            } else {
+                scanCode.takeIf { it > 0 } ?: fallbackScanCode(keyCode)
+            }
             if (vk == null || resolvedScanCode == null) return null
             var modifiers = 0
             if (shift) modifiers = modifiers or 0x01
@@ -350,8 +357,10 @@ class InputEncoder {
             } else unicodeChar
             if (resolved < 0x20 || resolved == 0x7f || resolved > Char.MAX_VALUE.code) return null
             val char = resolved.toChar()
-            val symbol = char in textBaseKeyCodes || char in textShiftedKeyCodes
-            return char.takeIf { !mapped || symbol || (altGraph && resolved != baseUnicodeChar) }
+            // Mapped physical keys must retain their down/up semantics for gameplay and ordinary
+            // typing. Unicode is only the fallback for keys with no usable mapping or for an
+            // AltGr composition whose committed character differs from the physical base key.
+            return char.takeIf { !mapped || (altGraph && resolved != baseUnicodeChar) }
         }
 
         internal fun mapTextCharToKeySpec(char: Char): TextKeySpec? {
@@ -463,6 +472,20 @@ class InputEncoder {
                 KeyEvent.KEYCODE_CAPS_LOCK -> 0x14
                 KeyEvent.KEYCODE_NUM_LOCK -> 0x90
                 KeyEvent.KEYCODE_SCROLL_LOCK -> 0x91
+                KeyEvent.KEYCODE_META_LEFT -> 0x5b
+                KeyEvent.KEYCODE_META_RIGHT -> 0x5c
+                KeyEvent.KEYCODE_MENU -> 0x5d
+                KeyEvent.KEYCODE_SYSRQ -> 0x2c
+                KeyEvent.KEYCODE_BREAK -> 0x13
+                KeyEvent.KEYCODE_CLEAR -> 0x0c
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> 0x0d
+                KeyEvent.KEYCODE_NUMPAD_ADD -> 0x6b
+                KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> 0x6d
+                KeyEvent.KEYCODE_NUMPAD_MULTIPLY -> 0x6a
+                KeyEvent.KEYCODE_NUMPAD_DIVIDE -> 0x6f
+                KeyEvent.KEYCODE_NUMPAD_DOT -> 0x6e
+                KeyEvent.KEYCODE_NUMPAD_COMMA -> 0x6c
+                KeyEvent.KEYCODE_NUMPAD_EQUALS -> 0xbb
                 KeyEvent.KEYCODE_MINUS -> 0xbd
                 KeyEvent.KEYCODE_EQUALS -> 0xbb
                 KeyEvent.KEYCODE_LEFT_BRACKET -> 0xdb
@@ -554,6 +577,22 @@ class InputEncoder {
                 KeyEvent.KEYCODE_CAPS_LOCK -> 0x003a
                 KeyEvent.KEYCODE_NUM_LOCK -> 0x0145
                 KeyEvent.KEYCODE_SCROLL_LOCK -> 0x0046
+                KeyEvent.KEYCODE_META_LEFT -> 0x015b
+                KeyEvent.KEYCODE_META_RIGHT -> 0x015c
+                KeyEvent.KEYCODE_MENU -> 0x015d
+                KeyEvent.KEYCODE_SYSRQ -> 0x0137
+                KeyEvent.KEYCODE_BREAK -> 0x0146
+                KeyEvent.KEYCODE_CLEAR -> 0x004c
+                KeyEvent.KEYCODE_NUMPAD_DIVIDE -> 0x0135
+                KeyEvent.KEYCODE_NUMPAD_MULTIPLY -> 0x0037
+                KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> 0x004a
+                KeyEvent.KEYCODE_NUMPAD_ADD -> 0x004e
+                KeyEvent.KEYCODE_NUMPAD_DOT -> 0x0053
+                KeyEvent.KEYCODE_NUMPAD_COMMA -> 0x007e
+                KeyEvent.KEYCODE_NUMPAD_EQUALS -> 0x0059
+                in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F10 -> 0x003b + (keyCode - KeyEvent.KEYCODE_F1)
+                KeyEvent.KEYCODE_F11 -> 0x0057
+                KeyEvent.KEYCODE_F12 -> 0x0058
                 KeyEvent.KEYCODE_MINUS -> 0x000c
                 KeyEvent.KEYCODE_EQUALS -> 0x000d
                 KeyEvent.KEYCODE_LEFT_BRACKET -> 0x001a
@@ -602,17 +641,6 @@ internal fun restampProtocolV3OuterTimestamp(packet: ByteArray, nowUs: Long = ti
     ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN).putLong(1, nowUs.coerceAtLeast(0L))
     return true
 }
-
-/**
- * Low-latency AudioTrack is enabled on handheld/tablet devices for minimal audio delay. TV
- * devices keep the stable buffering path: some Android TV builds expose a low-latency AudioTrack
- * that does not actually reduce latency, and the aggressive buffer it requests can cause audio
- * dropouts. The WebRTC low-latency teardown race that previously forced this off for all devices
- * is now safe because teardown runs strictly ordered on the single-threaded lifecycle executor
- * (peer connection close, factory dispose, audio device module release), so playout stops before
- * the module is released.
- */
-internal fun shouldUseLowLatencyStreamAudio(androidTvProfile: Boolean): Boolean = !androidTvProfile
 
 internal fun shouldRunControllerMouseLoop(
     controllerMouseAssistActive: Boolean,

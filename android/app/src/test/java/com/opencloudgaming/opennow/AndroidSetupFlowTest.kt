@@ -40,9 +40,17 @@ class AndroidSetupFlowTest {
 
     @Test
     fun `raising the flow version brings existing installs back through setup`() {
-        val completedOnAnOlderRelease = AppSettings(setupFlowCompletedVersion = SETUP_FLOW_VERSION - 1)
-
-        assertTrue(shouldShowSetupFlow(completedOnAnOlderRelease))
+        (1 until SETUP_FLOW_VERSION).forEach { oldVersion ->
+            val completedOnAnOlderRelease = AppSettings(setupFlowCompletedVersion = oldVersion)
+            assertTrue(shouldShowSetupFlow(completedOnAnOlderRelease))
+            assertTrue(isSetupUpgradeNotice(completedOnAnOlderRelease))
+            assertEquals(listOf(SetupStep.GeForceNow), setupStepsFor(completedOnAnOlderRelease))
+            assertEquals(SetupStep.GeForceNow, initialSetupStep(completedOnAnOlderRelease))
+            assertFalse(isSetupUpgradeNotice(completedOnAnOlderRelease.completingSetupFlow()))
+            assertFalse(shouldShowSetupFlow(completedOnAnOlderRelease.completingSetupFlow()))
+        }
+        assertFalse(isSetupUpgradeNotice(AppSettings()))
+        assertEquals(SetupStep.Welcome, initialSetupStep(AppSettings()))
     }
 
     @Test
@@ -68,12 +76,14 @@ class AndroidSetupFlowTest {
                 SetupStep.Streaming,
                 SetupStep.Play,
                 SetupStep.Ready,
+                SetupStep.GeForceNow,
             ),
             setupSteps(),
         )
         assertNull(setupStepBefore(SetupStep.Welcome))
-        assertNull(setupStepAfter(SetupStep.Ready))
-        assertTrue(isFinalSetupStep(SetupStep.Ready))
+        assertNull(setupStepAfter(SetupStep.GeForceNow))
+        assertTrue(isFinalSetupStep(SetupStep.GeForceNow))
+        assertFalse(isFinalSetupStep(SetupStep.Ready))
         assertFalse(isFinalSetupStep(SetupStep.Play))
 
         var step = SetupStep.Welcome
@@ -83,7 +93,35 @@ class AndroidSetupFlowTest {
             walked += step
         }
         assertEquals(setupSteps(), walked)
-        assertEquals(SetupStep.Play, setupStepBefore(SetupStep.Ready))
+        assertEquals(SetupStep.Ready, setupStepBefore(SetupStep.GeForceNow))
+    }
+
+    @Test
+    fun `final setup check trusts gameplay entitlement instead of the tier label`() {
+        assertEquals(
+            SetupGfnMembershipStatus.Checking,
+            setupGfnMembershipStatus(null),
+        )
+        assertEquals(
+            SetupGfnMembershipStatus.Playable,
+            setupGfnMembershipStatus(
+                SubscriptionInfo(membershipTier = "FREE", isGamePlayAllowed = true),
+            ),
+        )
+        assertEquals(
+            SetupGfnMembershipStatus.Missing,
+            setupGfnMembershipStatus(
+                SubscriptionInfo(membershipTier = "FREE", isGamePlayAllowed = false),
+            ),
+        )
+        assertEquals(
+            SetupGfnMembershipStatus.Unverified,
+            setupGfnMembershipStatus(SubscriptionInfo(membershipTier = "FREE")),
+        )
+        assertEquals(
+            SetupGfnMembershipStatus.Unverified,
+            setupGfnMembershipStatus(SubscriptionInfo(membershipTier = "")),
+        )
     }
 
     @Test
@@ -176,6 +214,8 @@ class AndroidSetupFlowTest {
                 StreamStatusItem.Ping,
                 StreamStatusItem.Bitrate,
                 StreamStatusItem.Battery,
+                StreamStatusItem.SessionBattery,
+                StreamStatusItem.Playtime,
                 StreamStatusItem.Connection,
                 StreamStatusItem.Resolution,
                 StreamStatusItem.Codec,

@@ -2,6 +2,7 @@ package com.opencloudgaming.opennow
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -25,6 +26,7 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -196,6 +198,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.staticCompositionLocalOf
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -290,6 +294,7 @@ import com.opencloudgaming.opennow.ui.controls.ControlSwitchRow
 import com.opencloudgaming.opennow.ui.controls.LocalControlRowStyle
 import com.opencloudgaming.opennow.ui.controls.LocalControlSectionStyle
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
+import com.opencloudgaming.opennow.ui.theme.LocalReduceControllerFocusMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
@@ -378,11 +383,11 @@ internal val NavigationSelectionColor = Color.White
 
 /**
  * Absolute Cinema is an explicit animation toggle, not a color override. The everywhere suboption
- * broadens the same treatment to additional hovered and focused surfaces. The user's selected
- * accent remains the color owner.
+ * broadens the same treatment to additional hovered and focused surfaces. These colors provide
+ * the theme fallback; ControllerFocusFrame applies optional independent effect colors.
  *
- * [ActiveSelectionEffectStyle.tintColor] splits flat selection from animated energy. Both use the
- * selected color; enabling Cinema never changes the Material palette.
+ * [ActiveSelectionEffectStyle.tintColor] owns flat selection. Enabling Cinema or choosing custom
+ * effect colors never changes the Material palette or static artwork borders.
  */
 internal fun AppSettings.activeSelectionEffectStyle(): ActiveSelectionEffectStyle {
     val cinemaEverywhere = absoluteCinemaEffects && absoluteCinemaEverywhere
@@ -428,6 +433,8 @@ internal val LocalAbsoluteCinemaEffects = staticCompositionLocalOf { false }
 internal val LocalAbsoluteCinemaEverywhere = staticCompositionLocalOf { false }
 /** Selects the classic blue/orange palette only inside animated Absolute Cinema frames. */
 internal val LocalAbsoluteCinemaPalette = staticCompositionLocalOf { false }
+/** Custom energy colors never override static artwork borders or interface tints. */
+internal val LocalSelectionEffectColors = staticCompositionLocalOf<SelectionEffectColors?> { null }
 internal val LocalVibrationEnabled = staticCompositionLocalOf { true }
 // Leave a full control-height runway below the last item so mobile focus/hover frames do not
 // collide with the viewport edge in Settings, Library, or Store.
@@ -446,6 +453,7 @@ internal fun shouldShowAppWallpaper(
 fun OpenNowTheme(
     settings: AppSettings,
     physicalControllerConnected: Boolean,
+    runtimeCodecReport: RuntimeCodecReport? = null,
     content: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
@@ -475,9 +483,18 @@ fun OpenNowTheme(
     } else {
         fallbackScheme
     }
-    // Honour both the system-wide animation switch and the in-app toggle. Infinite transitions
-    // (shimmer, focus energy, carousel auto-advance) read this and stop entirely.
-    val reduceMotion = remember(settings.controllerBackgroundAnimations, context) {
+    val lowRamDevice = remember(context) {
+        (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)?.isLowRamDevice == true
+    }
+    val automaticallyReduceMotion = shouldAutomaticallyReduceUiMotion(
+        lowPowerGpuProfile = runtimeCodecReport?.lowPowerGpuProfile == true,
+        constrainedRuntimeProfile = runtimeCodecReport?.constrainedRuntimeProfile == true,
+        lowRamDevice = lowRamDevice,
+    )
+    // Honour the system switch, the app preference, and the existing runtime capability probe.
+    // This uses the same calm rendering path for constrained devices instead of maintaining a
+    // second set of animation predicates that can drift apart.
+    val userOrSystemReduceMotion = remember(settings.controllerBackgroundAnimations, context) {
         val systemScale = runCatching {
             Settings.Global.getFloat(
                 context.contentResolver,
@@ -485,8 +502,9 @@ fun OpenNowTheme(
                 1f,
             )
         }.getOrDefault(1f)
-        systemScale == 0f || !settings.controllerBackgroundAnimations
+        shouldReduceControllerFocusMotion(systemScale, settings.controllerBackgroundAnimations)
     }
+    val reduceMotion = userOrSystemReduceMotion || automaticallyReduceMotion
     val selectionEffectStyle = settings.activeSelectionEffectStyle()
     val gamingHandheld = remember { isGamingHandheldDevice() }
     val openNowHaptics = rememberOpenNowHaptics(
@@ -496,6 +514,7 @@ fun OpenNowTheme(
     )
     CompositionLocalProvider(
         LocalReduceMotion provides reduceMotion,
+        LocalReduceControllerFocusMotion provides userOrSystemReduceMotion,
         LocalOpenNowHaptics provides openNowHaptics,
         LocalActiveSelectionColor provides selectionEffectStyle.color,
         LocalActiveSelectionSecondaryColor provides selectionEffectStyle.secondaryColor,
@@ -505,6 +524,7 @@ fun OpenNowTheme(
         LocalAbsoluteCinemaEffects provides selectionEffectStyle.absoluteCinemaActive,
         LocalAbsoluteCinemaEverywhere provides selectionEffectStyle.absoluteCinemaEverywhere,
         LocalAbsoluteCinemaPalette provides (settings.uiAccent == UiAccent.AbsoluteCinema),
+        LocalSelectionEffectColors provides settings.selectionEffectColors,
         LocalVibrationEnabled provides settings.vibrationEnabled,
     ) {
         MaterialTheme(
@@ -515,6 +535,17 @@ fun OpenNowTheme(
         )
     }
 }
+
+internal fun shouldAutomaticallyReduceUiMotion(
+    lowPowerGpuProfile: Boolean,
+    constrainedRuntimeProfile: Boolean,
+    lowRamDevice: Boolean,
+): Boolean = lowPowerGpuProfile || constrainedRuntimeProfile || lowRamDevice
+
+internal fun shouldReduceControllerFocusMotion(
+    systemAnimatorScale: Float,
+    controllerBackgroundAnimations: Boolean,
+): Boolean = systemAnimatorScale == 0f || !controllerBackgroundAnimations
 
 @Composable
 fun OpenNowApp(
@@ -549,6 +580,13 @@ fun OpenNowApp(
     var queuedForStartCue by remember { mutableStateOf(false) }
     var lastStartCueSessionId by remember { mutableStateOf<String?>(null) }
     var hiddenUpdatePromptKey by remember { mutableStateOf<String?>(null) }
+    val changelogRepository = remember(context) { ChangelogRepository(context) }
+    var pendingChangelogs by remember(context) { mutableStateOf(emptyList<ChangelogEntry>()) }
+    LaunchedEffect(changelogRepository) {
+        pendingChangelogs = withContext(Dispatchers.IO) {
+            changelogRepository.pendingPlayUpdate(state.androidUpdate.installSource)
+        }
+    }
     var completedSessionBugReportOpen by rememberSaveable { mutableStateOf(false) }
     val updatePromptKey = state.androidUpdate.visibleNoticeKey(state.dismissedAndroidUpdateNoticeKey)
     // After sign-in, not before: the appearance step previews the user's own box art, and there is
@@ -569,6 +607,32 @@ fun OpenNowApp(
         !showCompletedSessionBugReport &&
         !diagnosticDialogVisible &&
         state.androidUpdate.status in setOf(AndroidUpdateStatus.Available, AndroidUpdateStatus.Downloaded)
+    val showChangelogPrompt = pendingChangelogs.isNotEmpty() &&
+        !streamActive &&
+        !state.initializing &&
+        !showSetupFlow &&
+        !showUpdatePrompt &&
+        !showSessionReport &&
+        !showCompletedSessionBugReport &&
+        !diagnosticDialogVisible &&
+        state.deviceLoginPrompt == null &&
+        state.pendingStoreChoiceGame == null &&
+        state.pendingMembershipNotice == null &&
+        state.pendingPrintedWasteGame == null &&
+        !state.pendingGfnMembershipActivation &&
+        state.pendingBatteryOptimizationLaunch == null &&
+        state.pendingLaunchRecovery == null &&
+        state.error == null && !state.loginToolsVisible
+
+    val messageCheckBlocked = streamActive || state.isAndroidUpdateCheckBlockedByStream()
+    LaunchedEffect(lifecycleOwner, messageCheckBlocked) {
+        if (!messageCheckBlocked) lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (true) {
+                viewModel.checkAppMessage()
+                delay(APP_MESSAGE_CHECK_INTERVAL_MS)
+            }
+        }
+    }
 
     DisposableEffect(launchAudioController) {
         onDispose {
@@ -686,6 +750,7 @@ fun OpenNowApp(
     OpenNowTheme(
         settings = state.settings,
         physicalControllerConnected = physicalControllerConnected,
+        runtimeCodecReport = state.codecReport,
     ) {
         val primaryColor = MaterialTheme.colorScheme.primary
         CompositionLocalProvider(
@@ -730,6 +795,24 @@ fun OpenNowApp(
                         else -> LoginScreen(state, viewModel)
                     }
                 }
+                if (state.awaitingLaunchInputModeChoice) {
+                    StreamLaunchInputModeDialog(
+                        keyboardMouseConnected = connectedPhysicalKeyboardMouse().connected,
+                        onNativeTouch = { viewModel.chooseLaunchInputMode(StreamInputMode.NativeTouch) },
+                        onController = { viewModel.chooseLaunchInputMode(StreamInputMode.KeyboardMouse) },
+                        onDismiss = viewModel::cancelLaunchInputModeChoice,
+                    )
+                }
+                if (state.pendingGfnMembershipActivation) {
+                    GfnMembershipActivationDialog(
+                        onOpenMemberships = {
+                            if (openExternalUrl(context, GFN_MEMBERSHIP_URL)) {
+                                viewModel.dismissGfnMembershipActivation()
+                            }
+                        },
+                        onDismiss = viewModel::dismissGfnMembershipActivation,
+                    )
+                }
                 state.sessionReport?.takeIf { showSessionReport }?.let { report ->
                     SessionReportDialog(
                         report = report,
@@ -757,8 +840,9 @@ fun OpenNowApp(
                         submission = state.bugReportSubmission,
                         versionCheck = state.bugReportVersionCheck,
                         update = state.androidUpdate,
-                        onSubmit = { title, description, knownIssueOverrideKey ->
-                            viewModel.submitBugReport(title, description, knownIssueOverrideKey)
+                        experimentalNvstEnabled = state.settings.stream.experimentalNvst,
+                        onSubmit = { title, description, knownIssueOverrideKey, details, files ->
+                            viewModel.submitBugReport(title, description, knownIssueOverrideKey, details, files)
                         },
                         onReset = viewModel::resetBugReportSubmission,
                         onVersionCheck = viewModel::verifyBugReportVersion,
@@ -806,6 +890,41 @@ fun OpenNowApp(
                         onDismiss = viewModel::dismissAndroidUpdateNotice,
                     )
                 }
+                if (showChangelogPrompt) {
+                    ChangelogDialog(pendingChangelogs) {
+                        changelogRepository.markSeen()
+                        pendingChangelogs = emptyList()
+                    }
+                }
+                if (!messageCheckBlocked && !showSetupFlow && !showUpdatePrompt && !showChangelogPrompt && !showSessionReport &&
+                    !showCompletedSessionBugReport && !diagnosticDialogVisible &&
+                    state.deviceLoginPrompt == null && state.pendingStoreChoiceGame == null &&
+                    state.pendingMembershipNotice == null && state.pendingPrintedWasteGame == null &&
+                    !state.pendingGfnMembershipActivation &&
+                    state.pendingBatteryOptimizationLaunch == null && state.pendingLaunchRecovery == null &&
+                    state.error == null && !state.loginToolsVisible) {
+                    state.appMessage?.let { message ->
+                        AlertDialog(
+                            onDismissRequest = {},
+                            title = { Text(message.title) },
+                            text = {
+                                Text(
+                                    formattedAppMessageBody(
+                                        message.body,
+                                        linkColor = MaterialTheme.colorScheme.primary,
+                                        redColor = MaterialTheme.colorScheme.error,
+                                    ),
+                                    Modifier.verticalScroll(rememberScrollState()),
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { viewModel.acknowledgeAppMessage(message) }) {
+                                    Text(stringResource(android.R.string.ok))
+                                }
+                            },
+                        )
+                    }
+                }
                 UselessMascotOverlay(
                     settings = state.settings,
                     allowed = !showSetupFlow && state.authSession != null &&
@@ -833,7 +952,10 @@ private fun MainShell(
     val streamingActive = inStream && state.streamStatus != "idle"
     val modalPickerOpen = state.pendingPrintedWasteGame != null ||
         state.pendingStoreChoiceGame != null ||
-        state.pendingMembershipNotice != null
+        state.pendingMembershipNotice != null ||
+        state.pendingGfnMembershipActivation ||
+        state.pendingBatteryOptimizationLaunch != null ||
+        state.pendingLaunchRecovery != null
     val tvProfile = state.androidTvProfile
     val physicalControllerConnected = rememberPhysicalControllerConnected(enabled = !inStream)
     val navAudioController = remember(context) { AndroidNerdAudioController(context.applicationContext) }
@@ -959,7 +1081,7 @@ private fun MainShell(
                             MinimizedQueueDock(
                                 state = state,
                                 onRestore = viewModel::restoreStreamLaunch,
-                                onCancel = viewModel::stopStream,
+                                onCancel = { viewModel.stopStream(StreamStopOrigin.MinimizedQueueCancel) },
                             )
                         }
                         NavigationBar(
@@ -998,6 +1120,7 @@ private fun MainShell(
                                 },
                                 iconRes = R.drawable.ic_tab_settings,
                                 label = stringResource(R.string.nav_settings),
+                                showNotificationDot = state.appMessage != null,
                             )
                         }
                     }
@@ -1138,57 +1261,66 @@ private fun MainShell(
                                 .fillMaxWidth(),
                         ) {
                             CompositionLocalProvider(LocalSelectedCatalogGameId provides state.selectedGame?.id) {
-                                when (state.page) {
-                                    AppPage.Home -> HomeScreen(
-                                        state = state,
-                                        viewModel = viewModel,
-                                        tvProfile = tvProfile,
-                                        hideChromeWhenScrolled = phoneLandscapeChrome,
-                                        controlsInTopBar = storeControlsInTopBar,
-                                        topBarFocusRequester = catalogFilterFocusRequester.takeIf {
-                                            storeControlsInTopBar
-                                        },
-                                        searchRequested = visibleSearchTarget == SearchTarget.Store,
-                                        onSearchDismissed = {
-                                            if (visibleSearchTarget == SearchTarget.Store) visibleSearchTarget = null
-                                        },
-                                        onScrollChromeHiddenChange = { phoneLandscapeScrollChromeHidden = it },
-                                    )
-                                    AppPage.Library -> LibraryScreen(
-                                        state = state,
-                                        viewModel = viewModel,
-                                        tvProfile = tvProfile,
-                                        hideChromeWhenScrolled = phoneLandscapeChrome,
-                                        controlsInTopBar = libraryControlsInTopBar,
-                                        topBarFocusRequester = catalogFilterFocusRequester.takeIf {
-                                            libraryControlsInTopBar
-                                        },
-                                        searchRequested = visibleSearchTarget == SearchTarget.Library,
-                                        onSearchDismissed = {
-                                            if (visibleSearchTarget == SearchTarget.Library) visibleSearchTarget = null
-                                        },
-                                        onScrollChromeHiddenChange = { phoneLandscapeScrollChromeHidden = it },
-                                    )
-                                    AppPage.Settings -> SettingsScreen(
-                                        state = state,
-                                        viewModel = viewModel,
-                                        tvProfile = tvProfile,
-                                        searchRequested = visibleSearchTarget == SearchTarget.Settings,
-                                        searchQuery = settingsSearchQuery,
-                                        backRequestToken = settingsBackRequestToken,
-                                        onSearchQueryChange = { next ->
-                                            settingsSearchQuery = next
-                                            if (next.isBlank() && visibleSearchTarget == SearchTarget.Settings) {
-                                                visibleSearchTarget = null
-                                            }
-                                        },
-                                        onDetailRouteChange = { settingsDetailRouteOpen = it },
-                                    )
-                                    AppPage.Stream -> StreamScreen(
-                                        state = state,
-                                        viewModel = viewModel,
-                                        onMicrophoneCaptureActiveChange = onMicrophoneCaptureActiveChange,
-                                    )
+                                AppPageMotionContent(
+                                    targetState = state.page,
+                                    modifier = Modifier.fillMaxSize(),
+                                ) { page ->
+                                    when (page) {
+                                        AppPage.Home -> HomeScreen(
+                                            state = state,
+                                            viewModel = viewModel,
+                                            tvProfile = tvProfile,
+                                            hideChromeWhenScrolled = phoneLandscapeChrome,
+                                            controlsInTopBar = storeControlsInTopBar,
+                                            topBarFocusRequester = catalogFilterFocusRequester.takeIf {
+                                                storeControlsInTopBar
+                                            },
+                                            searchRequested = visibleSearchTarget == SearchTarget.Store,
+                                            onSearchDismissed = {
+                                                if (visibleSearchTarget == SearchTarget.Store) {
+                                                    visibleSearchTarget = null
+                                                }
+                                            },
+                                            onScrollChromeHiddenChange = { phoneLandscapeScrollChromeHidden = it },
+                                        )
+                                        AppPage.Library -> LibraryScreen(
+                                            state = state,
+                                            viewModel = viewModel,
+                                            tvProfile = tvProfile,
+                                            hideChromeWhenScrolled = phoneLandscapeChrome,
+                                            controlsInTopBar = libraryControlsInTopBar,
+                                            topBarFocusRequester = catalogFilterFocusRequester.takeIf {
+                                                libraryControlsInTopBar
+                                            },
+                                            searchRequested = visibleSearchTarget == SearchTarget.Library,
+                                            onSearchDismissed = {
+                                                if (visibleSearchTarget == SearchTarget.Library) {
+                                                    visibleSearchTarget = null
+                                                }
+                                            },
+                                            onScrollChromeHiddenChange = { phoneLandscapeScrollChromeHidden = it },
+                                        )
+                                        AppPage.Settings -> SettingsScreen(
+                                            state = state,
+                                            viewModel = viewModel,
+                                            tvProfile = tvProfile,
+                                            searchRequested = visibleSearchTarget == SearchTarget.Settings,
+                                            searchQuery = settingsSearchQuery,
+                                            backRequestToken = settingsBackRequestToken,
+                                            onSearchQueryChange = { next ->
+                                                settingsSearchQuery = next
+                                                if (next.isBlank() && visibleSearchTarget == SearchTarget.Settings) {
+                                                    visibleSearchTarget = null
+                                                }
+                                            },
+                                            onDetailRouteChange = { settingsDetailRouteOpen = it },
+                                        )
+                                        AppPage.Stream -> StreamScreen(
+                                            state = state,
+                                            viewModel = viewModel,
+                                            onMicrophoneCaptureActiveChange = onMicrophoneCaptureActiveChange,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1196,12 +1328,46 @@ private fun MainShell(
                             MinimizedQueueDock(
                                 state = state,
                                 onRestore = viewModel::restoreStreamLaunch,
-                                onCancel = viewModel::stopStream,
+                                onCancel = { viewModel.stopStream(StreamStopOrigin.MinimizedQueueCancel) },
                             )
                         }
                     }
                 }
                 state.selectedGame?.takeIf { !inStream && !modalPickerOpen }?.let { game ->
+                    val libraryVariants = game.variants.filter(::isOwnedGameVariant)
+                    val libraryRemoval = state.page == AppPage.Library &&
+                        state.libraryGames.any { gameTrackingKey(it) == gameTrackingKey(game) } &&
+                        libraryVariants.isNotEmpty()
+                    val removeLabel = when (state.selectedGameRail) {
+                        StorePersonalRail.ContinuePlaying -> stringResource(
+                            R.string.store_remove_from_continue_playing,
+                            game.title,
+                        )
+                        StorePersonalRail.InQueue -> stringResource(R.string.store_remove_from_queue, game.title)
+                        null -> if (libraryRemoval) stringResource(R.string.library_remove_gfn_game, game.title) else null
+                    }
+                    val removeConfirmationText = if (libraryRemoval) {
+                        stringResource(
+                            R.string.library_remove_gfn_game_body,
+                            game.title,
+                            libraryVariants.map { gameStoreDisplayName(it.store) }.distinct().joinToString(", "),
+                        )
+                    } else null
+                    val onRemove = when (state.selectedGameRail) {
+                        StorePersonalRail.ContinuePlaying -> {
+                            {
+                                viewModel.dismissContinuePlaying(game)
+                                viewModel.clearSelectedGame()
+                            }
+                        }
+                        StorePersonalRail.InQueue -> {
+                            {
+                                viewModel.removeQueuedGame(game)
+                                viewModel.clearSelectedGame()
+                            }
+                        }
+                        null -> if (libraryRemoval) ({ viewModel.removeLibraryGame(game) }) else null
+                    }
                     ControllerModalOverlay(onDismissRequest = viewModel::clearSelectedGame) {
                         // Keep details in the app's window so the activated artwork and destination
                         // banner share coordinates and the first visible frame follows the haptic.
@@ -1216,6 +1382,10 @@ private fun MainShell(
                             onFavorite = viewModel::updateFavorites,
                             connectedTvName = state.localTvConnector.connectedTvName,
                             onPlayOnTv = viewModel::playOnLocalTv,
+                            removeLabel = removeLabel,
+                            removeConfirmationText = removeConfirmationText,
+                            removeEnabled = state.removingLibraryGameId == null,
+                            onRemove = onRemove,
                             onDismiss = viewModel::clearSelectedGame,
                         )
                     }
@@ -1233,6 +1403,28 @@ private fun MainShell(
                             notice = notice,
                             onCancel = viewModel::dismissMembershipNotice,
                             onContinue = viewModel::continuePastMembershipNotice,
+                        )
+                    }
+                }
+                state.pendingBatteryOptimizationLaunch?.let { pending ->
+                    ControllerModalDialog(onDismissRequest = viewModel::dismissBatteryOptimizationPrompt) {
+                        BatteryOptimizationQueueDialog(
+                            gameTitle = pending.game.title,
+                            onAllow = {
+                                openBatteryOptimizationSettings(context)
+                                viewModel.dismissBatteryOptimizationPrompt()
+                            },
+                            onContinueWithout = viewModel::continueWithoutBatteryOptimization,
+                            onCancel = viewModel::dismissBatteryOptimizationPrompt,
+                        )
+                    }
+                }
+                state.pendingLaunchRecovery?.let { recovery ->
+                    ControllerModalDialog(onDismissRequest = viewModel::dismissLaunchRecovery) {
+                        LaunchRecoveryDialog(
+                            recovery = recovery,
+                            onRetryLower = viewModel::retryLaunchWithLowerSettings,
+                            onDismiss = viewModel::dismissLaunchRecovery,
                         )
                     }
                 }
@@ -1326,82 +1518,90 @@ private fun AppNavigationRail(
     onSettingsBack: () -> Unit,
     streamReturnFocusRequester: FocusRequester,
 ) {
-    val bonanzaActive = LocalAbsoluteCinemaEverywhere.current
+    val staticOutlines = LocalGameCardBordersEnabled.current
     Box(
         modifier = Modifier
             .width(APP_NAV_RAIL_WIDTH)
             .fillMaxHeight()
             .padding(start = 6.dp, top = 8.dp, end = 6.dp, bottom = 8.dp),
+        contentAlignment = if (showSettingsBack) Alignment.BottomCenter else Alignment.Center,
     ) {
         Surface(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(26.dp),
-            color = if (bonanzaActive) Color.Transparent else navigationRailScrim(darkenForCatalogBackground),
-            border = if (bonanzaActive) BorderStroke(1.dp, Color.White.copy(alpha = 0.88f)) else null,
+            color = navigationRailScrim(
+                darkenForCatalogBackground = darkenForCatalogBackground,
+                staticOutlines = staticOutlines,
+                tvProfile = state.androidTvProfile,
+                customOpacity = state.settings.navigationRailBackgroundOpacity,
+            ),
+            border = if (staticOutlines) {
+                BorderStroke(1.dp, Color.White.copy(alpha = 0.62f))
+            } else {
+                null
+            },
             tonalElevation = 0.dp,
             shadowElevation = 0.dp,
         ) {
-            Box(Modifier.fillMaxSize()) {
-                Column(
-                    modifier = Modifier
-                        .align(if (showSettingsBack) Alignment.BottomCenter else Alignment.Center)
-                        .fillMaxWidth()
-                        .padding(bottom = if (showSettingsBack) 8.dp else 0.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    AppNavigationRailItem(
-                        selected = state.page == AppPage.Home,
-                        onClick = { onNavigate(AppPage.Home) },
-                        iconRes = R.drawable.ic_tab_store,
-                        label = stringResource(R.string.nav_store),
-                        iconSize = if (largeIcons) 30.dp else 24.dp,
-                        focusRequester = streamReturnFocusRequester,
-                    )
-                    AppNavigationRailItem(
-                        // See the bottom bar: search is a mode, not a destination.
-                        selected = false,
-                        onClick = {
-                            onSearch(
-                                when (state.page) {
-                                    AppPage.Library -> SearchTarget.Library
-                                    AppPage.Settings -> SearchTarget.Settings
-                                    else -> SearchTarget.Store
-                                },
-                            )
-                        },
-                        iconRes = R.drawable.ic_search,
-                        label = stringResource(R.string.nav_search),
-                        iconSize = if (largeIcons) 30.dp else 24.dp,
-                    )
-                    AppNavigationRailItem(
-                        selected = state.page == AppPage.Library,
-                        onClick = { onNavigate(AppPage.Library) },
-                        iconRes = R.drawable.ic_tab_library,
-                        label = stringResource(R.string.nav_library),
-                        iconSize = if (largeIcons) 30.dp else 24.dp,
-                    )
-                    AppNavigationRailItem(
-                        selected = state.page == AppPage.Settings,
-                        onClick = { onNavigate(AppPage.Settings) },
-                        iconRes = R.drawable.ic_tab_settings,
-                        label = stringResource(R.string.nav_settings),
-                        iconSize = if (largeIcons) 30.dp else 24.dp,
-                        showConnectionDot = shouldShowLocalTvConnectionDot(
-                            tvProfile = state.androidTvProfile,
-                            pairedDeviceName = state.localTvConnector.pairedDeviceName,
-                        ),
-                    )
-                    AnimatedVisibility(visible = showSettingsBack) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Spacer(Modifier.height(6.dp))
-                            AppNavigationRailItem(
-                                selected = false,
-                                onClick = onSettingsBack,
-                                iconRes = R.drawable.ic_arrow_back,
-                                label = stringResource(R.string.action_back),
-                                iconSize = if (largeIcons) 30.dp else 24.dp,
-                            )
-                        }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                AppNavigationRailItem(
+                    selected = state.page == AppPage.Home,
+                    onClick = { onNavigate(AppPage.Home) },
+                    iconRes = R.drawable.ic_tab_store,
+                    label = stringResource(R.string.nav_store),
+                    iconSize = if (largeIcons) 30.dp else 24.dp,
+                    focusRequester = streamReturnFocusRequester,
+                )
+                AppNavigationRailItem(
+                    // See the bottom bar: search is a mode, not a destination.
+                    selected = false,
+                    onClick = {
+                        onSearch(
+                            when (state.page) {
+                                AppPage.Library -> SearchTarget.Library
+                                AppPage.Settings -> SearchTarget.Settings
+                                else -> SearchTarget.Store
+                            },
+                        )
+                    },
+                    iconRes = R.drawable.ic_search,
+                    label = stringResource(R.string.nav_search),
+                    iconSize = if (largeIcons) 30.dp else 24.dp,
+                )
+                AppNavigationRailItem(
+                    selected = state.page == AppPage.Library,
+                    onClick = { onNavigate(AppPage.Library) },
+                    iconRes = R.drawable.ic_tab_library,
+                    label = stringResource(R.string.nav_library),
+                    iconSize = if (largeIcons) 30.dp else 24.dp,
+                )
+                AppNavigationRailItem(
+                    selected = state.page == AppPage.Settings,
+                    onClick = { onNavigate(AppPage.Settings) },
+                    iconRes = R.drawable.ic_tab_settings,
+                    label = stringResource(R.string.nav_settings),
+                    iconSize = if (largeIcons) 30.dp else 24.dp,
+                    showNotificationDot = state.appMessage != null,
+                    showConnectionDot = shouldShowLocalTvConnectionDot(
+                        tvProfile = state.androidTvProfile,
+                        pairedDeviceName = state.localTvConnector.pairedDeviceName,
+                    ),
+                )
+                AnimatedVisibility(visible = showSettingsBack) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Spacer(Modifier.height(6.dp))
+                        AppNavigationRailItem(
+                            selected = false,
+                            onClick = onSettingsBack,
+                            iconRes = R.drawable.ic_arrow_back,
+                            label = stringResource(R.string.action_back),
+                            iconSize = if (largeIcons) 30.dp else 24.dp,
+                        )
                     }
                 }
             }
@@ -1409,8 +1609,21 @@ private fun AppNavigationRail(
     }
 }
 
-internal fun navigationRailScrim(darkenForCatalogBackground: Boolean): Color =
-    if (darkenForCatalogBackground) Color.Black.copy(alpha = 0.76f) else ChromeScrim
+internal fun navigationRailScrim(
+    darkenForCatalogBackground: Boolean,
+    staticOutlines: Boolean = false,
+    tvProfile: Boolean = false,
+    customOpacity: Float? = null,
+): Color {
+    val baseAlpha = when {
+        darkenForCatalogBackground && staticOutlines -> 0.68f
+        darkenForCatalogBackground -> 0.58f
+        staticOutlines -> 0.18f
+        else -> 0.10f
+    }
+    val automaticAlpha = baseAlpha + if (tvProfile) 0.05f else 0f
+    return Color.Black.copy(alpha = customOpacity?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: automaticAlpha)
+}
 
 internal fun shouldShowLocalTvConnectionDot(tvProfile: Boolean, pairedDeviceName: String?): Boolean =
     tvProfile && !pairedDeviceName.isNullOrBlank()
@@ -1420,6 +1633,9 @@ internal fun shouldShowLocalAppsProfileAction(
     @Suppress("UNUSED_PARAMETER")
     localAppsEnabled: Boolean,
 ): Boolean = localAppLauncherSupported
+
+internal fun shouldShowProfileMenuDivider(gameBordersEnabled: Boolean): Boolean =
+    gameBordersEnabled
 
 internal fun shouldAnimateOpenNowAppIcon(
     codecReport: RuntimeCodecReport?,
@@ -1465,6 +1681,7 @@ private fun AppNavigationRailItem(
     modifier: Modifier = Modifier,
     iconSize: Dp = 24.dp,
     focusRequester: FocusRequester? = null,
+    showNotificationDot: Boolean = false,
     showConnectionDot: Boolean = false,
 ) {
     var focused by remember { mutableStateOf(false) }
@@ -1472,11 +1689,40 @@ private fun AppNavigationRailItem(
     // Flat rail chrome is fixed; only the animated frame around it follows the accent.
     val navTint = NavigationSelectionColor
     val showActiveFrame = selected || focused
-    val contentColor = when {
-        focused -> Color.White
-        selected -> navTint
-        else -> TextMuted
-    }
+    val reduceMotion = LocalReduceMotion.current
+    val motionDuration = if (reduceMotion) 0 else OpenNowMotion.DurationStandard
+    val contentColor by animateColorAsState(
+        targetValue = when {
+            focused -> Color.White
+            selected -> navTint
+            else -> TextMuted
+        },
+        animationSpec = tween(
+            durationMillis = motionDuration,
+            easing = OpenNowMotion.EasingStandard,
+        ),
+        label = "navigation-rail-content-color",
+    )
+    val containerColor by animateColorAsState(
+        targetValue = if (selected && !focused) navTint.copy(alpha = 0.12f) else Color.Transparent,
+        animationSpec = tween(
+            durationMillis = motionDuration,
+            easing = OpenNowMotion.EasingStandard,
+        ),
+        label = "navigation-rail-container-color",
+    )
+    val iconScale by animateFloatAsState(
+        targetValue = when {
+            focused -> 1.14f
+            selected -> 1.10f
+            else -> 1f
+        },
+        animationSpec = tween(
+            durationMillis = motionDuration,
+            easing = OpenNowMotion.EasingEmphasizedDecel,
+        ),
+        label = "navigation-rail-icon-scale",
+    )
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -1493,7 +1739,7 @@ private fun AppNavigationRailItem(
                 .focusMoveHaptics()
                 .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier),
             shape = RoundedCornerShape(18.dp),
-            color = if (selected && !focused) navTint.copy(alpha = 0.12f) else Color.Transparent,
+            color = containerColor,
             border = null,
             tonalElevation = 0.dp,
             shadowElevation = 0.dp,
@@ -1506,12 +1752,25 @@ private fun AppNavigationRailItem(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
-                Icon(
-                    painter = painterResource(iconRes),
-                    contentDescription = label,
-                    tint = contentColor,
-                    modifier = Modifier.size(if (selected) iconSize + 2.dp else iconSize),
-                )
+                Box(
+                    modifier = Modifier.size(width = iconSize + 10.dp, height = iconSize),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painter = painterResource(iconRes),
+                        contentDescription = label,
+                        tint = contentColor,
+                        modifier = Modifier
+                            .size(iconSize)
+                            .graphicsLayer {
+                                scaleX = iconScale
+                                scaleY = iconScale
+                            },
+                    )
+                    if (showNotificationDot) {
+                        NavigationNotificationDot(Modifier.align(Alignment.TopEnd))
+                    }
+                }
                 if (showConnectionDot) {
                     Spacer(Modifier.height(2.dp))
                     Box(
@@ -1553,10 +1812,20 @@ private fun RowScope.BottomNavItem(
     onClick: () -> Unit,
     iconRes: Int,
     label: String,
+    showNotificationDot: Boolean = false,
 ) {
     val haptics = LocalOpenNowHaptics.current
     // See AppNavigationRailItem: the tab bar is the rail rotated, and keeps the same fixed tint.
     val navTint = NavigationSelectionColor
+    val reduceMotion = LocalReduceMotion.current
+    val iconScale by animateFloatAsState(
+        targetValue = if (selected) 1.14f else 1f,
+        animationSpec = tween(
+            durationMillis = if (reduceMotion) 0 else OpenNowMotion.DurationStandard,
+            easing = OpenNowMotion.EasingEmphasizedDecel,
+        ),
+        label = "bottom-navigation-icon-scale",
+    )
     NavigationBarItem(
         selected = selected,
         onClick = {
@@ -1578,8 +1847,20 @@ private fun RowScope.BottomNavItem(
                 Icon(
                     painter = painterResource(iconRes),
                     contentDescription = null,
-                    modifier = Modifier.size(if (selected) 27.dp else 24.dp),
+                    modifier = Modifier
+                        .size(24.dp)
+                        .graphicsLayer {
+                            scaleX = iconScale
+                            scaleY = iconScale
+                        },
                 )
+                if (showNotificationDot) {
+                    NavigationNotificationDot(
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 3.dp, end = 5.dp),
+                    )
+                }
             }
         },
         label = {
@@ -1590,6 +1871,16 @@ private fun RowScope.BottomNavItem(
                 overflow = TextOverflow.Ellipsis,
             )
         },
+    )
+}
+
+@Composable
+private fun NavigationNotificationDot(modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .size(8.dp)
+            .clip(CircleShape)
+            .background(OpenNowPalette.AccentSwitchRed),
     )
 }
 
@@ -1722,6 +2013,7 @@ private fun TopBarProfileMenu(
     onOpenSettings: () -> Unit,
     onOpenLocalApps: () -> Unit,
 ) {
+    val activity = LocalContext.current as? Activity
     var expanded by remember { mutableStateOf(false) }
     BackHandler(enabled = expanded) { expanded = false }
     var focused by remember { mutableStateOf(false) }
@@ -1842,7 +2134,9 @@ private fun TopBarProfileMenu(
                     )
                 }
             }
-            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            if (shouldShowProfileMenuDivider(LocalGameCardBordersEnabled.current)) {
+                HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            }
             ProfileDropdownMenuItem(
                 text = {
                     Text(
@@ -1855,6 +2149,16 @@ private fun TopBarProfileMenu(
                     expanded = false
                     haptics?.play(HapticCue.Activate)
                     onOpenSettings()
+                },
+            )
+            ProfileDropdownMenuItem(
+                text = {
+                    Text(stringResource(R.string.action_close_opennow), fontWeight = FontWeight.SemiBold)
+                },
+                onClick = {
+                    expanded = false
+                    haptics?.play(HapticCue.Activate)
+                    activity?.finishAndRemoveTask()
                 },
             )
         }
@@ -2016,8 +2320,10 @@ internal fun NativeSearchField(
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
     onOpen: (() -> Unit)? = null,
+    gamepadImeMode: Boolean = false,
 ) {
     val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val speechLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             val spoken = result.data
@@ -2060,8 +2366,19 @@ internal fun NativeSearchField(
                 modifier = Modifier
                     .weight(1f)
                     .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
-                    .onFocusChanged { if (it.isFocused) onOpen?.invoke() }
-                    .onPreviewKeyEvent { handleDpadFocusMove(it, focusManager) },
+                    .onFocusChanged {
+                        if (it.isFocused) {
+                            onOpen?.invoke()
+                            if (gamepadImeMode) keyboardController?.show()
+                        }
+                    }
+                    .then(
+                        if (shouldMoveFocusFromSearchField(gamepadImeMode)) {
+                            Modifier.onPreviewKeyEvent { handleDpadFocusMove(it, focusManager) }
+                        } else {
+                            Modifier
+                        },
+                    ),
                 decorationBox = { innerTextField ->
                     Box(Modifier.fillMaxWidth()) {
                         if (query.isBlank()) {
@@ -2112,6 +2429,9 @@ internal fun NativeSearchField(
         }
     }
 }
+
+/** D-pad events belong to the system IME while a TV/gamepad search field is being edited. */
+internal fun shouldMoveFocusFromSearchField(gamepadImeMode: Boolean): Boolean = !gamepadImeMode
 
 internal fun handleDpadFocusMove(event: androidx.compose.ui.input.key.KeyEvent, focusManager: FocusManager): Boolean {
     if (event.type != KeyEventType.KeyDown) return false

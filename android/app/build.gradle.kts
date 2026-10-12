@@ -1,7 +1,21 @@
+import com.android.build.api.instrumentation.FramesComputationMode
+import com.android.build.api.instrumentation.InstrumentationScope
+import com.opencloudgaming.buildlogic.WebRtcAudioGuardFactory
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
+}
+
+androidComponents.onVariants { variant ->
+    variant.instrumentation.transformClassesWith(
+        WebRtcAudioGuardFactory::class.java,
+        InstrumentationScope.ALL,
+    ) {}
+    variant.instrumentation.setAsmFramesComputationMode(
+        FramesComputationMode.COMPUTE_FRAMES_FOR_INSTRUMENTED_METHODS,
+    )
 }
 
 val buildingPlayReleaseBundle =
@@ -20,8 +34,8 @@ android {
         // Android 17 target changes are audited; LAN access is permission-gated at its feature boundary.
         //noinspection EditedTargetSdkVersion
         targetSdk = 37
-        versionCode = 121
-        versionName = "1.6.5"
+        versionCode = 161
+        versionName = "2.0.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("boolean", "APK_UPDATES_SUPPORTED", "true")
@@ -95,8 +109,41 @@ android {
     }
 }
 
+// New Android copy stays in the shared English source; Android XML is generated.
+val touchButtonResources = layout.buildDirectory.dir("generated/touchButtonResources")
+val touchButtonEnglishSource = rootProject.file("../locales/en.json")
+val generateTouchButtonResources = tasks.register("generateTouchButtonResources") {
+    inputs.file(touchButtonEnglishSource)
+    outputs.dir(touchButtonResources)
+    doLast {
+        val source = groovy.json.JsonSlurper().parse(inputs.files.singleFile) as Map<*, *>
+        val strings = (source["androidTouchButtons"] as Map<*, *>) +
+            (source["androidStreamInput"] as Map<*, *>) +
+            (source["androidStreamVideo"] as Map<*, *>) +
+            (source["androidSetup"] as Map<*, *>)
+        fun xml(value: String) = value.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace("\"", "\\\"").replace("'", "\\'")
+        val output = outputs.files.singleFile.resolve("values/touch_buttons.xml")
+        output.parentFile.mkdirs()
+        output.writeText("<resources>\n" + strings.entries.joinToString("\n") { (key, value) ->
+            "    <string name=\"$key\">${xml(value as String)}</string>"
+        } + "\n</resources>\n")
+    }
+}
+android.sourceSets.getByName("main").res.directories.add(touchButtonResources.get().asFile.absolutePath)
+tasks.named("preBuild").configure { dependsOn(generateTouchButtonResources) }
+
+// Keep the editable changelog at the Android project root while packaging it as an app asset.
+val changelogAssets = layout.buildDirectory.dir("generated/changelogAssets")
+val packageChangelog = tasks.register<Copy>("packageChangelog") {
+    from(rootProject.file("changelogs.json"))
+    into(changelogAssets)
+}
+android.sourceSets.getByName("main").assets.directories.add(changelogAssets.get().asFile.absolutePath)
+tasks.named("preBuild").configure { dependsOn(packageChangelog) }
+
 val nvstJniOutput = layout.buildDirectory.dir("generated/nvstJniLibs")
-val buildNvst by tasks.registering(Exec::class) {
+val buildNvst = tasks.register<Exec>("buildNvst") {
     inputs.files(fileTree(rootProject.file("nvst")) { exclude("target/**") })
     inputs.file(rootProject.file("scripts/build_nvst.py"))
     outputs.dir(nvstJniOutput)
@@ -108,7 +155,7 @@ val buildNvst by tasks.registering(Exec::class) {
         nvstJniOutput.get().asFile.absolutePath,
     )
 }
-android.sourceSets.getByName("main").jniLibs.srcDir(nvstJniOutput.get().asFile)
+android.sourceSets.getByName("main").jniLibs.directories.add(nvstJniOutput.get().asFile.absolutePath)
 tasks.named("preBuild").configure { dependsOn(buildNvst) }
 
 kotlin {
@@ -157,6 +204,7 @@ dependencies {
     implementation("io.github.webrtc-sdk:android:144.7559.14")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.snakeyaml:snakeyaml-engine:3.1.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

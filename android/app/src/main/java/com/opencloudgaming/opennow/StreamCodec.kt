@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
+import android.media.MediaFormat
 import android.os.Build
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
@@ -14,6 +15,7 @@ import org.webrtc.HardwareVideoDecoderFactory
 import org.webrtc.IceCandidate
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.PlatformSoftwareVideoDecoderFactory
 import org.webrtc.Predicate
 import org.webrtc.RtpCapabilities
 import org.webrtc.VideoCodecInfo
@@ -251,6 +253,12 @@ object CodecProbe {
         val name = info.name.lowercase(Locale.US)
         if (name.contains("software") || name.contains(".sw.") || name.startsWith("omx.google.")) return false
         if (name.contains("exynos")) {
+            // Exynos publishes separate AVC and HEVC decoder components. The HEVC profile gate
+            // must not reject the hardware AVC component merely because that component does not
+            // advertise video/hevc.
+            if (info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) }) {
+                return true
+            }
             val hevcProfiles = runCatching {
                 info.getCapabilitiesForType(HEVC_MIME_TYPE)
                     .profileLevels
@@ -349,24 +357,36 @@ internal class OpenNowVideoDecoderFactory(
     private val nativeLowLatencyDecoderEnabled: Boolean = false,
     private val requestedFps: () -> Int = { 60 },
     private val hdrEnabled: () -> Boolean = { false },
-    private val hdrSurface: () -> HdrSurfaceTarget? = { null },
+    private val decoderSurface: () -> DecoderSurfaceTarget? = { null },
+    private val directJavaDecode: Boolean = false,
+    private val directSdrEnabled: () -> Boolean = { false },
+    private val requestTextureOutput: (String) -> Unit = {},
 ) : VideoDecoderFactory {
     private val defaultFactory = DefaultVideoDecoderFactory(sharedContext)
     private val hardwareFactory = openNowHardwareVideoDecoderFactory(sharedContext)
+    private val platformSoftwareFactory = PlatformSoftwareVideoDecoderFactory(sharedContext)
 
     override fun createDecoder(info: VideoCodecInfo): VideoDecoder? {
         val codec = info.name.toOpenNowVideoCodec()
         if (hdrEnabled()) {
             // Never let an HDR session fall through an 8-bit texture or software decoder.
-            return if (codec == VideoCodec.H265) HdrSurfaceVideoDecoder(requestedFps(), hdrSurface) else null
+            return if (codec == VideoCodec.H265) hdrSurfaceDecoder(requestedFps(), decoderSurface) else null
         }
         val hardwareDecoder = if (codec != null) hardwareFactory.createDecoder(info) else null
+        // DefaultVideoDecoderFactory can return VideoDecoderFallback, a native-only wrapper whose
+        // Java initDecode/decode methods throw UnsupportedOperationException. NVST invokes the
+        // decoder directly from Kotlin, so its fallback must be a concrete Java decoder.
+        fun fallbackDecoder(): VideoDecoder? = if (directJavaDecode) {
+            platformSoftwareFactory.createDecoder(info)
+        } else {
+            defaultFactory.createDecoder(info)
+        }
         val decoder = when (codec) {
-            VideoCodec.H264 -> hardwareDecoder ?: defaultFactory.createDecoder(info)
+            VideoCodec.H264 -> hardwareDecoder ?: fallbackDecoder()
             VideoCodec.H265,
             VideoCodec.AV1,
             -> hardwareDecoder
-            null -> defaultFactory.createDecoder(info)
+            null -> fallbackDecoder()
         }
         val exactRequestedFps = requestedFps().coerceAtLeast(1)
         val hardwareDecoderImplementation = hardwareDecoder?.getImplementationName()
@@ -412,7 +432,7 @@ internal class OpenNowVideoDecoderFactory(
                     "reason=non-approved-hardware-decoder",
             )
         }
-        return if (decoder != null && tuneSelectedDecoder) {
+        val textureDecoder = if (decoder != null && tuneSelectedDecoder) {
             LowLatencyVideoDecoder(
                 delegate = decoder,
                 requestedFps = exactRequestedFps,
@@ -422,6 +442,17 @@ internal class OpenNowVideoDecoderFactory(
         } else {
             decoder
         }
+        if (!directSdrEnabled()) return textureDecoder
+        if (codec == null || hardwareDecoder == null || textureDecoder == null || hardwareDecoderImplementation == null) {
+            requestTextureOutput("no approved hardware surface decoder")
+            return textureDecoder
+        }
+        val surfaceDecoder = MediaCodecSurfaceVideoDecoder(exactRequestedFps, decoderSurface, hdr = false) { width, height, rate ->
+            sdrSurfaceDecoderConfiguration(codec, hardwareDecoderImplementation, width, height, rate,
+                tuneSelectedDecoder, nativeLowLatencyDecoderEnabled, standardLowLatencyEnabled)
+        }
+        return SurfaceOrTextureVideoDecoder(surfaceDecoder, textureDecoder, directSdrEnabled,
+            surfaceFailure = { surfaceDecoder.failureReason }, requestTexture = requestTextureOutput)
     }
 
     override fun getSupportedCodecs(): Array<VideoCodecInfo> {
@@ -450,7 +481,7 @@ private fun String.toOpenNowVideoCodec(): VideoCodec? =
         else -> null
     }
 
-private fun VideoCodec.mediaMimeType(): String = when (this) {
+internal fun VideoCodec.mediaMimeType(): String = when (this) {
     VideoCodec.H264 -> "video/avc"
     VideoCodec.H265 -> "video/hevc"
     VideoCodec.AV1 -> "video/av01"
@@ -534,9 +565,8 @@ internal fun RtpCapabilities.CodecCapability.preferenceKey(): String =
     "${openNowCodecName().orEmpty()}:${parameters.orEmpty().toSortedMap()}"
 
 internal fun StreamSettings.prefersTenBitVideo(): Boolean =
-    hdrEnabled ||
-        colorQuality == ColorQuality.TenBit420 ||
-        colorQuality == ColorQuality.TenBit444
+    !hdrEnabled &&
+        (colorQuality == ColorQuality.TenBit420 || colorQuality == ColorQuality.TenBit444)
 
 internal val WEBRTC_AUXILIARY_VIDEO_CODECS = setOf("RTX", "RED", "ULPFEC", "FLEXFEC-03")
 

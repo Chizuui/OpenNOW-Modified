@@ -10,6 +10,15 @@ class BugReportsTest {
     private val reporterId = androidBugReportReporterId("test-gfn-device-id")
 
     @Test
+    fun nvstWarningIsShownOnlyForTheExperimentalTransport() {
+        assertEquals(ANDROID_BUG_REPORT_NVST_WARNING, androidBugReportNvstWarning(true))
+        assertEquals(null, androidBugReportNvstWarning(false))
+        assertTrue(ANDROID_BUG_REPORT_NVST_WARNING.contains("bugs are expected"))
+        assertTrue(ANDROID_BUG_REPORT_NVST_WARNING.contains("rude"))
+        assertTrue(ANDROID_BUG_REPORT_NVST_WARNING.contains("will be ignored"))
+    }
+
+    @Test
     fun buildsPrintedWasteMultipartReportWithRedactedLogAttachment() {
         val request = buildAndroidBugReportRequest(
             AndroidBugReport(
@@ -27,6 +36,12 @@ class BugReportsTest {
                         contentType = "text/plain; charset=utf-8",
                         bytes = "sessionId=[redacted]".toByteArray(),
                     ),
+                ),
+                details = AndroidBugReportDetails(
+                    kind = AndroidBugReportKind.Suggestion,
+                    area = AndroidBugReportArea.Input,
+                    frequency = AndroidBugReportFrequency.Always,
+                    impact = AndroidBugReportImpact.High,
                 ),
             ),
         )
@@ -46,7 +61,13 @@ class BugReportsTest {
         assertTrue(multipart.contains("name=\"versionName\"\r\n\r\n0.9.0"))
         assertTrue(multipart.contains("name=\"versionCode\"\r\n\r\n45"))
         assertTrue(multipart.contains("name=\"platform\"\r\n\r\nandroid"))
+        assertTrue(multipart.contains("name=\"kind\"\r\n\r\nsuggestion"))
+        assertTrue(multipart.contains("name=\"area\"\r\n\r\ninput"))
+        assertTrue(multipart.contains("name=\"frequency\"\r\n\r\nalways"))
+        assertTrue(multipart.contains("name=\"impact\"\r\n\r\nhigh"))
         assertTrue(multipart.contains("name=\"reporterId\"\r\n\r\n$reporterId"))
+        assertTrue(multipart.contains("name=\"termsAccepted\"\r\n\r\ntrue"))
+        assertTrue(multipart.contains("name=\"termsVersion\"\r\n\r\n$ANDROID_BUG_REPORT_TERMS_VERSION"))
         assertTrue(multipart.contains("name=\"files\"; filename=\"opennow.log\""))
         assertTrue(multipart.contains("sessionId=[redacted]"))
     }
@@ -399,7 +420,7 @@ class BugReportsTest {
     @Test
     fun androidAppLanguageSelectionSupportsEveryBundledLocale() {
         assertTrue(androidAppLanguageSelectionIsSupported(""))
-        listOf("en", "ar", "de", "es", "fr", "ja", "ko", "nl", "pl", "pt", "ro", "ru", "tr", "zh-Hans")
+        listOf("en", "ar", "de", "es", "fr", "id", "ja", "ko", "nl", "pl", "pt", "ro", "ru", "tr", "zh-Hans")
             .forEach { languageTag ->
                 assertTrue(languageTag, androidAppLanguageSelectionIsSupported(languageTag))
             }

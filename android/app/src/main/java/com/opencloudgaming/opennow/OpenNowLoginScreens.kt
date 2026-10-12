@@ -275,7 +275,7 @@ internal fun LoginScreen(state: OpenNowUiState, viewModel: OpenNowViewModel) {
                         enabled = !logExportInProgress,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(if (tvLogin) "Export logs with QR" else "Export logs")
+                        Text(stringResource(if (tvLogin) R.string.login_export_logs_qr else R.string.settings_export_logs))
                     }
                 }
             },

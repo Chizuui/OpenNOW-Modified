@@ -677,111 +677,6 @@ internal data class TouchPointerSample(
 )
 
 /**
- * Keeps the native-touch tap guard continuous.
- *
- * A conventional touch-slop check drops early MOVE events and then forwards the finger's full
- * displacement once it crosses the threshold. On a remote absolute-touch surface that appears as
- * a short freeze followed by a visible jump. This tracker instead removes the guarded distance
- * from the displacement, so the first forwarded MOVE begins just beyond the DOWN position.
- *
- * The same mapping is used for UP. Otherwise a non-default movement scale makes the host snap from
- * the transformed drag position back to the physical finger position as it is released.
- */
-internal class NativeTouchMotionTracker {
-    private data class Gesture(
-        val downX: Float,
-        val downY: Float,
-        var committed: Boolean = false,
-    )
-
-    private val gestures = mutableMapOf<Int, Gesture>()
-
-    fun begin(pointerId: Int, x: Float, y: Float): TouchPointerSample {
-        gestures[pointerId] = Gesture(downX = x, downY = y)
-        return TouchPointerSample(pointerId = pointerId, x = x, y = y)
-    }
-
-    fun move(
-        pointerId: Int,
-        x: Float,
-        y: Float,
-        movementScale: Float,
-        jitterThresholdPx: Float,
-    ): TouchPointerSample? {
-        val gesture = gestures[pointerId]
-            ?: return TouchPointerSample(pointerId = pointerId, x = x, y = y)
-        return transformedSample(
-            pointerId = pointerId,
-            x = x,
-            y = y,
-            gesture = gesture,
-            movementScale = movementScale,
-            jitterThresholdPx = jitterThresholdPx,
-            allowUncommitted = false,
-        )
-    }
-
-    fun end(
-        pointerId: Int,
-        x: Float,
-        y: Float,
-        movementScale: Float,
-        jitterThresholdPx: Float,
-    ): TouchPointerSample {
-        val gesture = gestures.remove(pointerId)
-            ?: return TouchPointerSample(pointerId = pointerId, x = x, y = y)
-        return transformedSample(
-            pointerId = pointerId,
-            x = x,
-            y = y,
-            gesture = gesture,
-            movementScale = movementScale,
-            jitterThresholdPx = jitterThresholdPx,
-            allowUncommitted = true,
-        ) ?: TouchPointerSample(pointerId = pointerId, x = gesture.downX, y = gesture.downY)
-    }
-
-    fun clear() {
-        gestures.clear()
-    }
-
-    private fun transformedSample(
-        pointerId: Int,
-        x: Float,
-        y: Float,
-        gesture: Gesture,
-        movementScale: Float,
-        jitterThresholdPx: Float,
-        allowUncommitted: Boolean,
-    ): TouchPointerSample? {
-        val dx = x - gesture.downX
-        val dy = y - gesture.downY
-        val distance = kotlin.math.sqrt(dx * dx + dy * dy)
-        val threshold = jitterThresholdPx.coerceAtLeast(0f)
-        if (!gesture.committed && distance <= threshold) {
-            return if (allowUncommitted) {
-                TouchPointerSample(pointerId = pointerId, x = gesture.downX, y = gesture.downY)
-            } else {
-                null
-            }
-        }
-        gesture.committed = true
-
-        if (distance == 0f) {
-            return TouchPointerSample(pointerId = pointerId, x = gesture.downX, y = gesture.downY)
-        }
-        val scale = movementScale.coerceIn(0.25f, 2f)
-        val adjustedDistance = (distance - threshold).coerceAtLeast(0f) * scale
-        val displacementScale = adjustedDistance / distance
-        return TouchPointerSample(
-            pointerId = pointerId,
-            x = gesture.downX + dx * displacementScale,
-            y = gesture.downY + dy * displacementScale,
-        )
-    }
-}
-
-/**
  * Turns one input event's fingers into the records for a single packet.
  *
  * Holds every rule that is easy to get subtly wrong — slot allocation, normalising to the video
@@ -1197,22 +1092,28 @@ internal class TouchMouseState {
                     if (activePointerId >= 0) {
                         val index = event.findPointerIndex(activePointerId)
                         if (index >= 0) {
-                            moveVirtualCursorTo(
-                                streamPointForTouch(
-                                    touchX = event.getX(index),
-                                    touchY = event.getY(index),
-                                    viewWidth = width,
-                                    viewHeight = height,
-                                    streamWidth = streamWidth,
-                                    streamHeight = streamHeight,
-                                    stretchToFit = stretchToFit,
-                                    renderingAspectRatio = renderingAspectRatio,
-                                    presentationZoomScale = presentationZoomScale,
-                                    presentationTranslationX = presentationTranslationX,
-                                    presentationTranslationY = presentationTranslationY,
-                                ),
-                                client,
-                            )
+                            fun moveTo(x: Float, y: Float) {
+                                moveVirtualCursorTo(
+                                    streamPointForTouch(
+                                        touchX = x,
+                                        touchY = y,
+                                        viewWidth = width,
+                                        viewHeight = height,
+                                        streamWidth = streamWidth,
+                                        streamHeight = streamHeight,
+                                        stretchToFit = stretchToFit,
+                                        renderingAspectRatio = renderingAspectRatio,
+                                        presentationZoomScale = presentationZoomScale,
+                                        presentationTranslationX = presentationTranslationX,
+                                        presentationTranslationY = presentationTranslationY,
+                                    ),
+                                    client,
+                                )
+                            }
+                            for (historyIndex in 0 until event.historySize) {
+                                moveTo(event.getHistoricalX(index, historyIndex), event.getHistoricalY(index, historyIndex))
+                            }
+                            moveTo(event.getX(index), event.getY(index))
                         }
                     }
                     return true
@@ -1316,24 +1217,17 @@ internal class TouchMouseState {
                 }
                 val index = event.findPointerIndex(activePointerId)
                 if (index < 0) return true
-                val x = event.getX(index)
-                val y = event.getY(index)
-                val dx = x - lastX
-                val dy = y - lastY
-                if (
-                    doubleTapDragCandidate &&
-                    !selecting &&
-                    (abs(x - downX) > TOUCH_MOUSE_DRAG_START_SLOP_PX || abs(y - downY) > TOUCH_MOUSE_DRAG_START_SLOP_PX)
-                ) {
-                    selecting = client.setTouchMouseButton(true)
-                    doubleTapDragCandidate = false
-                    if (selecting) {
-                        NativeInputDiagnostics.add("touch double tap drag start")
-                    }
+                // Android may batch several positions into one MOVE. Use them in order so the
+                // cursor follows the finger instead of jumping straight to the newest position.
+                for (historyIndex in 0 until event.historySize) {
+                    processMove(
+                        event.getHistoricalX(index, historyIndex),
+                        event.getHistoricalY(index, historyIndex),
+                        event.getHistoricalEventTime(historyIndex),
+                        client,
+                    )
                 }
-                sendMouseDelta(dx, dy, event.eventTime, client)
-                lastX = x
-                lastY = y
+                processMove(event.getX(index), event.getY(index), event.eventTime, client)
                 return true
             }
             MotionEvent.ACTION_POINTER_UP -> {
@@ -1378,6 +1272,20 @@ internal class TouchMouseState {
         if (doubleTapDragCandidate) {
             lastTapTimeMs = Long.MIN_VALUE
         }
+    }
+
+    private fun processMove(x: Float, y: Float, eventTimeMs: Long, client: NativeStreamClient) {
+        if (
+            doubleTapDragCandidate && !selecting &&
+            (abs(x - downX) > TOUCH_MOUSE_DRAG_START_SLOP_PX || abs(y - downY) > TOUCH_MOUSE_DRAG_START_SLOP_PX)
+        ) {
+            selecting = client.setTouchMouseButton(true)
+            doubleTapDragCandidate = false
+            if (selecting) NativeInputDiagnostics.add("touch double tap drag start")
+        }
+        sendMouseDelta(x - lastX, y - lastY, eventTimeMs, client)
+        lastX = x
+        lastY = y
     }
 
     private fun finishPointer(event: MotionEvent, index: Int, client: NativeStreamClient) {

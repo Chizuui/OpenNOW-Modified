@@ -17,7 +17,11 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.hideStreamButtons)
         assertFalse(settings.streamKeyboardClearConfirmationDisabled)
         assertTrue(settings.externalMousePointerLock)
+        assertEquals(DEFAULT_ANDROID_STREAM_MENU_SHORTCUT, settings.streamMenuShortcut)
+        assertFalse(settings.compactGameCards)
+        assertFalse(settings.showCardTitles)
         assertFalse(settings.showFavoriteIconOnGameCards)
+        assertTrue(settings.showPremiumMarker)
         assertFalse(settings.liveSelectedOutlines)
         assertFalse(settings.absoluteCinemaEffects)
         assertFalse(settings.absoluteCinemaEverywhere)
@@ -25,10 +29,14 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.stretchStreamToFit)
         assertTrue(settings.ambientBackgroundEnabled)
         assertFalse(settings.systemWallpaperBackground)
+        assertNull(settings.navigationRailBackgroundOpacity)
         assertTrue(settings.localAppPackageNames.isEmpty())
         // The shelf opens on first sight; folding it is a choice the reader makes and keeps.
         assertFalse(settings.localAppsCollapsed)
         assertTrue(settings.landscapeNewGamesHero)
+        assertFalse(settings.landscapeNewGamesHeroCollapsed)
+        assertFalse(settings.higherPingWarningDismissed)
+        assertFalse(settings.batteryOptimizationPromptDismissed)
         // Rumble routing stays automatic until someone's hardware proves it needs forcing.
         assertEquals(HapticsOutputPreference.Auto, settings.hapticsOutput)
         assertEquals(TouchControllerStyle.V1, settings.androidTouch.touchControllerStyle)
@@ -46,10 +54,14 @@ class AppSettingsDefaultsTest {
         // Developer options are a hidden gesture, never a shipped or migrated-in default.
         assertFalse(settings.developerOptionsUnlocked)
         assertEquals(StreamKeyboardButtonPosition(), settings.streamKeyboardButtonPosition)
+        assertTrue(settings.streamStatsBackgroundEnabled)
+        assertEquals(0.52f, settings.streamStatsBackgroundAlpha(), 0.0001f)
         assertTrue(metrics.fps)
         assertTrue(metrics.ping)
         assertFalse(metrics.bitrate)
         assertTrue(metrics.battery)
+        assertFalse(metrics.sessionBattery)
+        assertFalse(metrics.playtime)
         assertTrue(metrics.connection)
         assertFalse(metrics.resolution)
         assertFalse(metrics.codec)
@@ -64,14 +76,21 @@ class AppSettingsDefaultsTest {
         val settings = OpenNowJson.decodeFromString<AppSettings>("{}")
 
         assertEquals(StreamStatsMetrics(), settings.streamStatsMetrics)
+        assertTrue(settings.streamStatsBackgroundEnabled)
+        assertEquals(0.52f, settings.streamStatsBackgroundAlpha(), 0.0001f)
         assertTrue(settings.showStatsOnLaunch)
         assertFalse(settings.hideStreamButtons)
         assertFalse(settings.streamKeyboardClearConfirmationDisabled)
         assertTrue(settings.externalMousePointerLock)
+        assertEquals(DEFAULT_ANDROID_STREAM_MENU_SHORTCUT, settings.streamMenuShortcut)
         assertEquals(StreamKeyboardButtonPosition(), settings.streamKeyboardButtonPosition)
         assertEquals(CatalogBackgroundPreset.ColorfulAbstract, settings.catalogBackgroundPreset)
         assertFalse(settings.systemWallpaperBackground)
+        assertNull(settings.navigationRailBackgroundOpacity)
+        assertFalse(settings.compactGameCards)
+        assertFalse(settings.showCardTitles)
         assertFalse(settings.showFavoriteIconOnGameCards)
+        assertTrue(settings.showPremiumMarker)
         assertFalse(settings.liveSelectedOutlines)
         assertFalse(settings.absoluteCinemaEffects)
         assertFalse(settings.absoluteCinemaEverywhere)
@@ -79,14 +98,81 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.stretchStreamToFit)
         assertTrue(settings.localAppPackageNames.isEmpty())
         assertTrue(settings.landscapeNewGamesHero)
+        assertFalse(settings.landscapeNewGamesHeroCollapsed)
+        assertFalse(settings.higherPingWarningDismissed)
+        assertFalse(settings.batteryOptimizationPromptDismissed)
         // Developer options are a hidden gesture, never a shipped or migrated-in default.
         assertFalse(settings.developerOptionsUnlocked)
-        assertFalse(settings.showSessionReportAfterStream)
+        assertTrue(settings.showSessionReportAfterStream)
         assertEquals(TouchJoystickMode.Fixed, settings.androidTouch.joystickMode)
         assertEquals(TouchAimMode.LockJoystick, settings.androidTouch.aimMode)
-        assertEquals(0f, settings.androidTouch.joystickDeadZone, 0.0001f)
+        assertEquals(0.05f, settings.androidTouch.joystickDeadZone, 0.0001f)
         assertEquals(TouchControlGroup.entries.toSet(), settings.androidTouch.visibleControlGroups)
         assertEquals(TouchExtraButtonAction.Guide, settings.androidTouch.extraButtonAction(0))
+    }
+
+    @Test
+    fun oldTouchStickDefaultMovesToFivePercentOnlyOnce() {
+        val legacy = AppSettings(androidTouch = AndroidTouchSettings(joystickDeadZone = 0f))
+        val upgraded = legacy.normalizedForAndroid()
+
+        assertEquals(0.05f, upgraded.androidTouch.joystickDeadZone, 0.0001f)
+        assertEquals(1, upgraded.touchJoystickDefaultVersion)
+        assertEquals(0.05f, upgraded.normalizedForAndroid().androidTouch.joystickDeadZone, 0.0001f)
+        assertEquals(0f, upgraded.copy(androidTouch = upgraded.androidTouch.copy(joystickDeadZone = 0f))
+            .normalizedForAndroid().androidTouch.joystickDeadZone, 0.0001f)
+        assertEquals(0.12f, legacy.copy(androidTouch = legacy.androidTouch.copy(joystickDeadZone = 0.12f))
+            .normalizedForAndroid().androidTouch.joystickDeadZone, 0.0001f)
+    }
+
+    @Test
+    fun statusBarBackgroundCanBeHiddenWithoutChangingItsSavedOpacity() {
+        val settings = AppSettings(streamStatsBackgroundOpacity = 0.8f)
+
+        assertEquals(0.8f, settings.streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(0f, settings.copy(streamStatsBackgroundEnabled = false).streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(0f, settings.copy(streamStatsBackgroundOpacity = 0f).streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(0.8f, settings.copy(streamStatsBackgroundEnabled = false)
+            .copy(streamStatsBackgroundEnabled = true).streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(1f, settings.copy(streamStatsBackgroundOpacity = 2f)
+            .normalizedForAndroid().streamStatsBackgroundAlpha(), 0.0001f)
+    }
+
+    @Test
+    fun draggedStatusPositionIsClampedAndInvalidValuesAreDiscarded() {
+        val normalized = AppSettings(streamStatsCustomX = 1.5f, streamStatsCustomY = Float.NaN)
+            .normalizedForAndroid()
+        assertEquals(1f, normalized.streamStatsCustomX ?: -1f, 0.0001f)
+        assertEquals(null, normalized.streamStatsCustomY)
+    }
+
+    @Test
+    fun customNavigationBackgroundOpacitySurvivesSettingsNormalization() {
+        assertEquals(0.85f, AppSettings(navigationRailBackgroundOpacity = 0.85f)
+            .normalizedForAndroid().navigationRailBackgroundOpacity ?: -1f, 0.0001f)
+        assertEquals(1f, AppSettings(navigationRailBackgroundOpacity = 2f)
+            .normalizedForAndroid().navigationRailBackgroundOpacity ?: -1f, 0.0001f)
+        assertNull(AppSettings().normalizedForAndroid().navigationRailBackgroundOpacity)
+    }
+
+    @Test
+    fun higherPingWarningDefaultsOnAndPreservesDismissal() {
+        val defaulted = OpenNowJson.decodeFromString<AppSettings>("{}")
+        val dismissed = OpenNowJson.decodeFromString<AppSettings>(
+            """{"higherPingWarningDismissed":true}""",
+        )
+
+        assertFalse(defaulted.higherPingWarningDismissed)
+        assertTrue(dismissed.higherPingWarningDismissed)
+    }
+
+    @Test
+    fun removedNativeTouchMotionOverridesDoNotBreakExistingSettings() {
+        val restored = OpenNowJson.decodeFromString<AppSettings>(
+            """{"androidTouch":{"nativeTouchMode":"Always","nativeTouchScrollScale":0.5,"nativeTouchJitterThresholdDp":24.0}}""",
+        )
+
+        assertEquals(NativeTouchMode.Always, restored.androidTouch.nativeTouchMode)
     }
 
     @Test
@@ -112,6 +198,30 @@ class AppSettingsDefaultsTest {
     }
 
     @Test
+    fun premiumMarkerDefaultsOnAndPreservesExplicitOptOut() {
+        val defaulted = OpenNowJson.decodeFromString<AppSettings>("{}")
+        val optedOut = OpenNowJson.decodeFromString<AppSettings>(
+            """{"showPremiumMarker":false}""",
+        )
+
+        assertTrue(defaulted.showPremiumMarker)
+        assertFalse(optedOut.showPremiumMarker)
+    }
+
+    @Test
+    fun gameCardLayoutDefaultsOffAndPreservesExplicitOptIn() {
+        val defaulted = OpenNowJson.decodeFromString<AppSettings>("{}")
+        val optedIn = OpenNowJson.decodeFromString<AppSettings>(
+            """{"compactGameCards":true,"showCardTitles":true}""",
+        )
+
+        assertFalse(defaulted.compactGameCards)
+        assertFalse(defaulted.showCardTitles)
+        assertTrue(optedIn.compactGameCards)
+        assertTrue(optedIn.showCardTitles)
+    }
+
+    @Test
     fun liveSelectedOutlinesDefaultOffAndPreserveOptIn() {
         val defaulted = OpenNowJson.decodeFromString<AppSettings>("{}")
         val optedIn = OpenNowJson.decodeFromString<AppSettings>(
@@ -120,6 +230,19 @@ class AppSettingsDefaultsTest {
 
         assertFalse(defaulted.liveSelectedOutlines)
         assertTrue(optedIn.liveSelectedOutlines)
+    }
+
+    @Test
+    fun legacyGameBordersAreDisabledOnceAndLaterOptInSurvives() {
+        val migrated = OpenNowJson.decodeFromString<AppSettings>(
+            """{"liveSelectedOutlines":true}""",
+        ).normalizedForAndroid()
+        val optedInAgain = migrated.copy(liveSelectedOutlines = true).normalizedForAndroid()
+
+        assertFalse(migrated.liveSelectedOutlines)
+        assertEquals(GAME_BORDERS_DEFAULT_VERSION, migrated.gameBordersDefaultVersion)
+        assertTrue(optedInAgain.liveSelectedOutlines)
+        assertEquals(GAME_BORDERS_DEFAULT_VERSION, optedInAgain.gameBordersDefaultVersion)
     }
 
     @Test
@@ -250,7 +373,7 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.streamIntroMusic)
         assertEquals(IntroMusicStartMode.Muted, settings.streamIntroStartMode)
         assertFalse(settings.queueReadyMusic)
-        assertFalse(settings.showSessionReportAfterStream)
+        assertTrue(settings.showSessionReportAfterStream)
         assertFalse(settings.stream.streamSharpeningEnabled)
     }
 
@@ -347,13 +470,28 @@ class AppSettingsDefaultsTest {
     }
 
     @Test
-    fun legacySessionReportOptInIsMigratedOffOnce() {
+    fun legacySessionReportIsEnabledOnce() {
         val migrated = OpenNowJson.decodeFromString<AppSettings>(
             """{"showSessionReportAfterStream":true}""",
         ).normalizedForAndroid()
 
-        assertFalse(migrated.showSessionReportAfterStream)
+        assertTrue(migrated.showSessionReportAfterStream)
         assertEquals(SESSION_REPORT_DEFAULT_VERSION, migrated.sessionReportDefaultVersion)
+    }
+
+    @Test
+    fun currentSessionReportOptOutRemainsOffAfterNormalization() {
+        val settings = AppSettings(showSessionReportAfterStream = false,
+            sessionReportDefaultVersion = SESSION_REPORT_DEFAULT_VERSION).normalizedForAndroid()
+        assertFalse(settings.showSessionReportAfterStream)
+        assertFalse(settings.normalizedForAndroid().showSessionReportAfterStream)
+    }
+
+    @Test
+    fun previousDefaultOffIsEnabledOnUpgrade() {
+        val settings = AppSettings(showSessionReportAfterStream = false,
+            sessionReportDefaultVersion = 1).normalizedForAndroid()
+        assertTrue(settings.showSessionReportAfterStream)
     }
 
     @Test
@@ -366,7 +504,7 @@ class AppSettingsDefaultsTest {
     }
 
     @Test
-    fun legacyPortalStreamModeMigratesToProviderTwentyOneByNineGeometry() {
+    fun persistedPortalStreamModePreservesSelectedGeometry() {
         val normalized = AppSettings(
             stream = StreamSettings(
                 resolution = "1376x640",
@@ -375,8 +513,8 @@ class AppSettingsDefaultsTest {
             ),
         ).normalizedForAndroid()
 
-        assertEquals("1376x590", normalized.stream.resolution)
-        assertEquals("21:9", normalized.stream.aspectRatio)
+        assertEquals("1376x640", normalized.stream.resolution)
+        assertEquals("19.5:9", normalized.stream.aspectRatio)
         assertEquals(120, normalized.stream.fps)
     }
 
@@ -391,8 +529,6 @@ class AppSettingsDefaultsTest {
             tvSafeAreaPaddingDp = Float.NEGATIVE_INFINITY,
             androidTouch = AndroidTouchSettings(
                 opacity = Float.NaN,
-                nativeTouchScrollScale = Float.POSITIVE_INFINITY,
-                nativeTouchJitterThresholdDp = Float.NaN,
                 offsets = mapOf("bad" to TouchOffset(Float.NaN, Float.POSITIVE_INFINITY)),
             ),
         ).normalizedForAndroid()
@@ -402,8 +538,6 @@ class AppSettingsDefaultsTest {
         assertEquals(1f, normalized.posterSizeScale, 0f)
         assertEquals(16f, normalized.tvSafeAreaPaddingDp, 0f)
         assertEquals(AndroidTouchSettings().opacity, normalized.androidTouch.opacity, 0f)
-        assertEquals(1f, normalized.androidTouch.nativeTouchScrollScale, 0f)
-        assertEquals(8f, normalized.androidTouch.nativeTouchJitterThresholdDp, 0f)
         assertEquals(TouchOffset(), normalized.androidTouch.offsets["bad"])
     }
 

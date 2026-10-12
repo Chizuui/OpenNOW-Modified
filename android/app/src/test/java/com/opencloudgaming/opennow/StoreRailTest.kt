@@ -8,6 +8,65 @@ import org.junit.Test
 
 class StoreRailTest {
     @Test
+    fun dismissedContinuePlayingRecordIsHiddenFromPersonalRails() {
+        val lastPlayed = "2026-09-20T12:00:00Z"
+        val game = GameInfo(id = "recent", title = "Recent", lastPlayed = lastPlayed)
+
+        val rails = storeStartRailGroups(
+            games = listOf(game),
+            libraryGames = emptyList(),
+            favoriteIds = emptyList(),
+            queuedGameKeys = listOf(gameTrackingKey(game)),
+            dismissedContinuePlaying = mapOf(gameTrackingKey(game) to lastPlayed),
+        )
+
+        assertTrue(rails.continuePlaying.isEmpty())
+        assertTrue(rails.inQueue.isEmpty())
+    }
+
+    @Test
+    fun playingDismissedGameAgainReturnsItToContinuePlaying() {
+        val game = GameInfo(
+            id = "recent",
+            title = "Recent",
+            lastPlayed = "2026-09-21T12:00:00Z",
+        )
+
+        val rails = storeStartRailGroups(
+            games = listOf(game),
+            libraryGames = emptyList(),
+            favoriteIds = emptyList(),
+            queuedGameKeys = emptyList(),
+            dismissedContinuePlaying = mapOf(
+                gameTrackingKey(game) to "2026-09-20T12:00:00Z",
+            ),
+        )
+
+        assertEquals(listOf(game), rails.continuePlaying)
+    }
+
+    @Test
+    fun removingQueueKeyRemovesGameFromQueueRail() {
+        val game = GameInfo(id = "queued", title = "Queued")
+
+        val before = storeStartRailGroups(
+            games = listOf(game),
+            libraryGames = emptyList(),
+            favoriteIds = emptyList(),
+            queuedGameKeys = listOf(gameTrackingKey(game)),
+        )
+        val after = storeStartRailGroups(
+            games = listOf(game),
+            libraryGames = emptyList(),
+            favoriteIds = emptyList(),
+            queuedGameKeys = emptyList(),
+        )
+
+        assertEquals(listOf(game), before.inQueue)
+        assertTrue(after.inQueue.isEmpty())
+    }
+
+    @Test
     fun loadingStoreUsesTheKnownPersonalRailCount() {
         val game = GameInfo(id = "game", title = "Game")
 
@@ -79,13 +138,17 @@ class StoreRailTest {
     }
 
     @Test
-    fun storeHeroUsesEveryDeviceLayoutAndHonorsHandheldLandscapeOptOut() {
+    fun storeHeroUsesEveryDeviceLayoutAndHonorsHorizontalDeviceOptOut() {
         assertTrue(shouldShowStoreHero(tvProfile = false, landscape = false))
         assertTrue(shouldShowStoreHero(tvProfile = false, landscape = true))
         assertFalse(shouldShowStoreHero(tvProfile = false, landscape = true, landscapeEnabled = false))
         assertTrue(shouldShowStoreHero(tvProfile = true, landscape = false))
         assertTrue(shouldShowStoreHero(tvProfile = true, landscape = true))
-        assertTrue(shouldShowStoreHero(tvProfile = true, landscape = true, landscapeEnabled = false))
+        assertFalse(shouldShowStoreHero(tvProfile = true, landscape = true, landscapeEnabled = false))
+        assertFalse(shouldShowStoreHero(tvProfile = true, landscape = false, landscapeEnabled = false))
+        assertFalse(shouldOfferStoreHeroCollapse(tvProfile = false, landscape = false))
+        assertTrue(shouldOfferStoreHeroCollapse(tvProfile = false, landscape = true))
+        assertTrue(shouldOfferStoreHeroCollapse(tvProfile = true, landscape = true))
     }
 
     @Test
@@ -143,10 +206,10 @@ class StoreRailTest {
     }
 
     @Test
-    fun catalogImageRequestsWaitDuringScrollUnlessTheImageIsAlreadyVisible() {
-        assertFalse(shouldStartCatalogImageRequest(requestsPaused = true, imageAlreadyLoaded = false))
-        assertTrue(shouldStartCatalogImageRequest(requestsPaused = true, imageAlreadyLoaded = true))
-        assertTrue(shouldStartCatalogImageRequest(requestsPaused = false, imageAlreadyLoaded = false))
+    fun catalogShimmerRunsWheneverArtworkIsLoadingUnlessReducedMotionIsActive() {
+        assertTrue(shouldAnimateCatalogLoading(loadingImageCount = 1, reduceMotion = false))
+        assertFalse(shouldAnimateCatalogLoading(loadingImageCount = 0, reduceMotion = false))
+        assertFalse(shouldAnimateCatalogLoading(loadingImageCount = 1, reduceMotion = true))
     }
 
     @Test

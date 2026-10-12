@@ -505,11 +505,12 @@ internal fun PrintedWasteSelector(
     modifier: Modifier = Modifier,
 ) {
     BackHandler(onBack = viewModel::dismissPrintedWasteSelector)
-    val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings) {
+    val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings, state.regions) {
         state.printedWasteQueue
             .filter { (zoneId, _) -> isStandardPrintedWasteZone(zoneId) && state.printedWasteMapping[zoneId]?.nuked != true }
-            .map { (zoneId, zone) ->
-                val routingUrl = printedWasteZoneUrl(zoneId)
+            .mapNotNull { (zoneId, zone) ->
+                val routingUrl = printedWasteRegionalUrl(zoneId, state.printedWasteMapping, state.regions)
+                    ?: return@mapNotNull null
                 PrintedWasteZoneOption(
                     zoneId = zoneId,
                     zone = zone,
@@ -547,9 +548,14 @@ internal fun PrintedWasteSelector(
     var pendingHigherPingLaunch by remember(game.id) {
         mutableStateOf<PrintedWasteZoneOption?>(null)
     }
+    var dismissHigherPingWarning by remember(game.id) { mutableStateOf(false) }
     val launchSelectedZone: () -> Unit = {
         selectedZone?.let { zone ->
-            if (hasHigherPingThanClosestPrintedWasteZone(zone, selectableZones)) {
+            if (
+                !state.settings.higherPingWarningDismissed &&
+                hasHigherPingThanClosestPrintedWasteZone(zone, selectableZones)
+            ) {
+                dismissHigherPingWarning = false
                 pendingHigherPingLaunch = zone
             } else {
                 viewModel.launchWithPrintedWaste(zone.routingUrl)
@@ -656,17 +662,46 @@ internal fun PrintedWasteSelector(
 
     pendingHigherPingLaunch?.let { zone ->
         AlertDialog(
-            onDismissRequest = { pendingHigherPingLaunch = null },
+            onDismissRequest = {
+                dismissHigherPingWarning = false
+                pendingHigherPingLaunch = null
+            },
             text = {
-                Text(
-                    stringResource(R.string.queue_higher_ping_warning),
-                    color = Color(0xffff8d8d),
-                    fontWeight = FontWeight.Bold,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        stringResource(R.string.queue_higher_ping_warning),
+                        color = Color(0xffff8d8d),
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { dismissHigherPingWarning = !dismissHigherPingWarning }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Checkbox(
+                            checked = dismissHigherPingWarning,
+                            onCheckedChange = { dismissHigherPingWarning = it },
+                        )
+                        Text(
+                            stringResource(R.string.queue_higher_ping_dont_show_again),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
             },
             confirmButton = {
                 Button(
                     onClick = {
+                        if (dismissHigherPingWarning) {
+                            viewModel.updateSettings(
+                                state.settings.copy(higherPingWarningDismissed = true),
+                            )
+                        }
+                        dismissHigherPingWarning = false
                         pendingHigherPingLaunch = null
                         viewModel.launchWithPrintedWaste(zone.routingUrl)
                     },
@@ -675,7 +710,12 @@ internal fun PrintedWasteSelector(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { pendingHigherPingLaunch = null }) {
+                TextButton(
+                    onClick = {
+                        dismissHigherPingWarning = false
+                        pendingHigherPingLaunch = null
+                    },
+                ) {
                     Text(stringResource(R.string.action_cancel))
                 }
             },
@@ -1137,7 +1177,6 @@ internal fun UrlImage(
     }
     val loadingTracker = LocalImageLoadingTracker.current
     val loading = imageState == UrlImageState.Loading
-    val imageRequestsPaused = LocalCatalogImageRequestsPaused.current
     DisposableEffect(loadingTracker, loading) {
         if (loading) loadingTracker?.invoke(1)
         onDispose {
@@ -1158,7 +1197,10 @@ internal fun UrlImage(
         }
     }
     Box(modifier.background(OpenNowPalette.ImagePlaceholder), contentAlignment = Alignment.Center) {
-        if (imageData != null && shouldStartCatalogImageRequest(imageRequestsPaused, imageState == UrlImageState.Loaded)) {
+        // Always mount the request. Coil serves memory hits immediately and bounds cache misses in
+        // the application ImageLoader; skipping composition during a fling made recycled cards
+        // appear to reload when the user reversed direction.
+        if (imageData != null) {
             key(activeSource) {
                 AsyncImage(
                     model = imageData,
@@ -1194,7 +1236,12 @@ internal fun LoadingShimmer(modifier: Modifier = Modifier) {
     // individual image placeholder is actually composed.
     // Using nullable avoids treating 0f (a valid animation start value) as "not provided".
     val animateLoading = LocalImageLoadingAnimationsEnabled.current && !LocalReduceMotion.current
-    val sharedPulse = LocalTvLoadingPulse.current
+    val baseColor = OpenNowPalette.ShimmerBase
+    if (!animateLoading) {
+        Spacer(modifier = modifier.background(baseColor))
+        return
+    }
+    val sharedPulse = LocalTvLoadingPulse.current.takeIf { animateLoading }
     val localPulse = if (animateLoading && LocalTvLoadingProfile.current && sharedPulse == null) {
         val transition = rememberInfiniteTransition(label = "loading-pulse-local")
         val pulse = transition.animateFloat(
@@ -1212,7 +1259,8 @@ internal fun LoadingShimmer(modifier: Modifier = Modifier) {
     }
     val pulse = sharedPulse ?: localPulse
     // Same rule as the shared driver above: no perpetual sweep under reduced motion.
-    val shimmer = LocalShimmerOffset.current ?: if (pulse == null && animateLoading) run {
+    val sharedShimmer = LocalShimmerOffset.current.takeIf { animateLoading }
+    val shimmer = sharedShimmer ?: if (pulse == null && animateLoading) run {
         val transition = rememberInfiniteTransition(label = "shimmer-local")
         val localOffset = transition.animateFloat(
             initialValue = 0f,
@@ -1224,7 +1272,6 @@ internal fun LoadingShimmer(modifier: Modifier = Modifier) {
         )
         localOffset
     } else null
-    val baseColor = OpenNowPalette.ShimmerBase
     val highlightColor1 = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.32f)
     val highlightColor2 = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
 

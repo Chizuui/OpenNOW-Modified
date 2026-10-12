@@ -7,6 +7,7 @@ import android.util.Log
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
+import coil3.memoryCacheMaxSizePercentWhileInBackground
 import coil3.disk.DiskCache
 import coil3.disk.directory
 import coil3.memory.MemoryCache
@@ -24,6 +25,7 @@ import kotlinx.coroutines.withContext
 class OpenNowApplication : Application(), SingletonImageLoader.Factory {
     private val startupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val startupDataReady = CompletableDeferred<Unit>()
+    @Volatile private var artworkImageLoader: ImageLoader? = null
     internal val httpClient by lazy(::defaultHttpClient)
     internal val authStore by lazy { AuthStore(this) }
     internal val authRepository by lazy { GfnAuthRepository(this, authStore, httpClient) }
@@ -72,16 +74,30 @@ class OpenNowApplication : Application(), SingletonImageLoader.Factory {
                     .maxSizePercent(context, IMAGE_MEMORY_CACHE_FRACTION)
                     .build()
             }
+            // TV processes can stay cached after the UI closes. Release decoded artwork as soon
+            // as the UI is hidden so the system has more room to keep the process alive.
+            .memoryCacheMaxSizePercentWhileInBackground(if (isTelevisionDevice()) 0.0 else 1.0)
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDir.resolve(IMAGE_DISK_CACHE_DIR).toOkioPath())
                     .maxSizeBytes(IMAGE_DISK_CACHE_BYTES)
                     .build()
             }
+            // Keep visible artwork requestable during a fling, but bound the work behind it. The
+            // old UI-side pause replaced every newly composed card with shimmer until scrolling
+            // stopped. A small fetch pool and an even smaller decode pool protect low-end devices
+            // without unmounting cached images as they move in and out of the Lazy grid window.
+            .fetcherCoroutineContext(Dispatchers.IO.limitedParallelism(IMAGE_FETCH_PARALLELISM))
+            .decoderCoroutineContext(Dispatchers.IO.limitedParallelism(IMAGE_DECODE_PARALLELISM))
             // Artwork that is already in memory should appear instantly; a fade on every cell makes
             // a fast grid look slower than it is.
             .crossfade(false)
             .build()
+            .also { artworkImageLoader = it }
+
+    internal fun releaseCachedArtworkForStream() {
+        artworkImageLoader?.memoryCache?.clear()
+    }
 
     internal suspend fun awaitStartupData() {
         startupDataReady.await()
@@ -105,5 +121,7 @@ class OpenNowApplication : Application(), SingletonImageLoader.Factory {
         const val IMAGE_MEMORY_CACHE_FRACTION = 0.25
         const val IMAGE_DISK_CACHE_DIR = "image_cache"
         const val IMAGE_DISK_CACHE_BYTES = 256L * 1024 * 1024
+        const val IMAGE_FETCH_PARALLELISM = 4
+        const val IMAGE_DECODE_PARALLELISM = 2
     }
 }

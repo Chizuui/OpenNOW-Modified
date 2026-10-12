@@ -28,14 +28,47 @@ internal fun normalizeLaunchErrorMessage(error: Throwable, gameTitle: String? = 
     val terminalSession = error.terminalSessionStatusException()
     return when {
         terminalSession != null ->
-            "The cloud provider ended this session (status ${terminalSession.status}). " +
-                "OpenNOW did not stop it or start a replacement queue."
-        cloudMatchFailure?.isFreeTierEntitlementError() == true ->
-            "Your GeForce NOW account is on the Free tier. This game requires a Priority or Ultimate membership."
+            "The cloud session is no longer available (status ${terminalSession.status}). " +
+                "Start the game again to open a new session."
+        cloudMatchFailure?.isEntitlementError() == true ->
+            "GeForce NOW rejected this launch because it could not verify a playable membership for the signed-in account. If Free is active, confirm you signed in with the same NVIDIA account, then sign out and back in."
         cloudMatchFailure?.isLimitedModeStreamingError() == true -> limitedModeStreamingMessage(gameTitle)
+        cloudMatchFailure?.isQueueAbandoned() == true ->
+            "The cloud provider ended this queue request. Start the game again to join a new queue."
         text.contains("patch", ignoreCase = true) || text.contains("maintenance", ignoreCase = true) ->
             "Game is patching or under maintenance. Try again when NVIDIA finishes updating it."
         else -> text
+    }
+}
+
+internal fun isMissingGfnPlanError(error: Throwable): Boolean =
+    error.cloudMatchRequestStatusException()?.isEntitlementError() == true
+
+internal fun isAbandonedQueueError(error: Throwable): Boolean =
+    error.cloudMatchRequestStatusException()?.isQueueAbandoned() == true
+
+internal fun shouldForgetActiveSessionAfterResumeFailure(error: Throwable): Boolean =
+    error.terminalSessionStatusException() != null
+
+internal fun shouldOfferLowerSettingsRetry(
+    error: Throwable,
+    requestedSettings: StreamSettings,
+): Boolean {
+    if (requestedSettings == requestedSettings.loweredSessionLaunchProfile()) return false
+    val cloudMatchFailure = error.cloudMatchRequestStatusException()
+    return cloudMatchFailure?.isInternalServerError() == true ||
+        error.causeChainMessages().any { message ->
+            message.contains("internal server error", ignoreCase = true) ||
+                message.contains("INTERNAL_ERROR_STATUS", ignoreCase = true) ||
+                message.contains("8A8C0000", ignoreCase = true)
+        }
+}
+
+private fun Throwable.causeChainMessages(): Sequence<String> = sequence {
+    var current: Throwable? = this@causeChainMessages
+    while (current != null) {
+        current.message?.let { yield(it) }
+        current = current.cause?.takeUnless { it === current }
     }
 }
 
@@ -57,13 +90,23 @@ private fun Throwable.cloudMatchRequestStatusException(): CloudMatchRequestStatu
     return null
 }
 
-private fun CloudMatchRequestStatusException.isFreeTierEntitlementError(): Boolean =
-    statusDescriptionToken().equals("ENTITLEMENT_FAILURE_STATUS", ignoreCase = true) ||
+private fun CloudMatchRequestStatusException.isEntitlementError(): Boolean =
+    statusCode == 18 ||
+        statusDescriptionToken().equals("ENTITLEMENT_FAILURE_STATUS", ignoreCase = true) ||
         normalizedUnifiedErrorCode() == "8A910006"
 
 private fun CloudMatchRequestStatusException.isLimitedModeStreamingError(): Boolean =
     statusDescriptionToken().equals("STREAMING_NOT_ALLOWED_IN_LIMITED_MODE", ignoreCase = true) ||
         normalizedUnifiedErrorCode() == "8A91000D"
+
+private fun CloudMatchRequestStatusException.isQueueAbandoned(): Boolean =
+    statusCode == 69 ||
+        statusDescriptionToken().equals("SESSION_REQUEST_IN_QUEUE_ABANDONED", ignoreCase = true) ||
+        normalizedUnifiedErrorCode() == "4A8C300F"
+
+private fun CloudMatchRequestStatusException.isInternalServerError(): Boolean =
+    statusDescriptionToken().equals("INTERNAL_ERROR_STATUS", ignoreCase = true) ||
+        normalizedUnifiedErrorCode() == "8A8C0000"
 
 private fun CloudMatchRequestStatusException.statusDescriptionToken(): String? =
     statusDescription

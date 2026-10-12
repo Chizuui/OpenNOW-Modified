@@ -9,10 +9,10 @@ package com.opencloudgaming.opennow
  */
 
 /**
- * Bump when a step is added that existing installs should be shown. Installs whose
- * [AppSettings.setupFlowCompletedVersion] is lower run the flow again.
+ * Bump when new or revised setup content should be shown to existing installs. Installs whose
+ * [AppSettings.setupFlowCompletedVersion] is lower return for the final service notice.
  */
-internal const val SETUP_FLOW_VERSION = 2
+internal const val SETUP_FLOW_VERSION = 4
 
 internal enum class SetupStep {
     /** What OpenNOW is, and what the next few screens will ask. */
@@ -29,7 +29,33 @@ internal enum class SetupStep {
 
     /** Recap of the choices, and where to change them later. */
     Ready,
+
+    /** GFN ownership boundaries and an authoritative playable-membership check. */
+    GeForceNow,
 }
+
+internal enum class SetupGfnMembershipStatus {
+    Checking,
+    Playable,
+    Missing,
+    Unverified,
+}
+
+/**
+ * MES owns the decision about whether this account may start gameplay. A tier label alone is not
+ * enough: newly created NVIDIA accounts can report a user identity before the user has selected
+ * even the Free GFN membership.
+ */
+internal fun setupGfnMembershipStatus(subscription: SubscriptionInfo?): SetupGfnMembershipStatus =
+    when (subscription?.isGamePlayAllowed) {
+        null -> if (subscription == null) {
+            SetupGfnMembershipStatus.Checking
+        } else {
+            SetupGfnMembershipStatus.Unverified
+        }
+        true -> SetupGfnMembershipStatus.Playable
+        false -> SetupGfnMembershipStatus.Missing
+    }
 
 internal enum class SetupStreamingChoice {
     /** Whatever `recommendedAndroidStreamProfile` measured for this device. */
@@ -60,6 +86,15 @@ internal fun setupSteps(): List<SetupStep> = SetupStep.entries.toList()
 
 internal fun shouldShowSetupFlow(settings: AppSettings): Boolean =
     settings.setupFlowCompletedVersion < SETUP_FLOW_VERSION
+
+/** Returning users only need to see the revised service notice, not redo their preferences. */
+internal fun isSetupUpgradeNotice(settings: AppSettings): Boolean =
+    settings.setupFlowCompletedVersion in 1 until SETUP_FLOW_VERSION
+
+internal fun setupStepsFor(settings: AppSettings): List<SetupStep> =
+    if (isSetupUpgradeNotice(settings)) listOf(SetupStep.GeForceNow) else setupSteps()
+
+internal fun initialSetupStep(settings: AppSettings): SetupStep = setupStepsFor(settings).first()
 
 internal fun setupStepIndex(step: SetupStep): Int = setupSteps().indexOf(step)
 

@@ -81,10 +81,10 @@ private const val GFN_ANDROID_TOUCH_USER_AGENT =
 // User-Agent used by the official GeForce NOW Android client for TV sessions.
 private const val GFN_ANDROID_TV_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-TV 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
-private const val GFN_CLIENT_VERSION = "2.0.80.173"
+private const val GFN_CLIENT_VERSION = "2.0.88.129"
 private const val GFN_BROWSER_USER_AGENT =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
-private const val GFN_BROWSER_CLIENT_VERSION = "2.0.86.124"
+private const val GFN_BROWSER_CLIENT_VERSION = GFN_CLIENT_VERSION
 private const val LCARS_CLIENT_ID = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
 private const val GFN_PLAY_ORIGIN = "https://play.geforcenow.com"
 private const val GFN_PLAY_REFERER = "https://play.geforcenow.com/"
@@ -133,6 +133,12 @@ private val NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = false,
 )
 
+private fun isNvidiaCloudMatchHost(host: String): Boolean =
+    host == "cloudmatchbeta.nvidiagrid.net" ||
+        host.endsWith(".cloudmatchbeta.nvidiagrid.net") ||
+        host == "cloudmatch.nvidiagrid.net" ||
+        host.endsWith(".cloudmatch.nvidiagrid.net")
+
 private val NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     platformName = "windows",
     persistGameSettings = true,
@@ -163,6 +169,14 @@ private val NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = true,
 )
 
+// Portal-sized gamepad sessions require the native Android mode matrix as well, while
+// keeping controller provisioning independent from the selected resolution.
+private val NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY = NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY.copy(
+    platformName = "android",
+    deviceType = "PHONE",
+    userAgent = GFN_USER_AGENT,
+)
+
 // Default high-quality allocation for Android TVs other than an explicitly detected SHIELD.
 private val NVIDIA_NATIVE_TV_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     platformName = "android",
@@ -189,18 +203,17 @@ private val ALLIANCE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
 )
 
 // NVIDIA's Browser/WebRTC identity preserves the standard mobile allocation, but CloudMatch limits
-// its mode matrix and rejects HDR requests from that client class. Use the internally consistent
-// desktop-native identity only for explicit gamepad launches that need the high-quality mode
-// matrix. SHIELD and the third-generation Fire TV Cube are the known TV exceptions whose
-// Android/native allocations silently provisioned 1080p for higher-resolution requests. Other
-// Android TVs retain the Android/native identity. Generic follow-up requests stay on the browser
-// identity so they cannot change an existing allocation.
+// its mode matrix and rejects HDR requests from that client class. Explicit gamepad launches that
+// need the high-quality mode matrix use the desktop-native identity on every Android TV. The
+// Android/native TV allocation has provisioned 1080p for requested higher-resolution profiles.
+// Generic follow-up requests stay on the browser identity so they cannot change an allocation.
 private fun cloudMatchClientIdentity(
     streamingBaseUrl: String?,
     appLaunchMode: Int? = null,
     preferNativeDesktopMode: Boolean = false,
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
+    preferNativeAndroidMode: Boolean = false,
 ): CloudMatchClientIdentity {
     // Touch sessions use the desktop-native CloudMatch identity (NVIDIA-CLASSIC / NATIVE)
     // with Android os + TABLET device type, so the server allocates the full desktop
@@ -208,6 +221,9 @@ private fun cloudMatchClientIdentity(
     // native touch digitizer on the host.
     if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) {
         return NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY
+    }
+    if (appLaunchMode != null && preferNativeAndroidMode) {
+        return if (isAndroidTv) NVIDIA_NATIVE_TV_CLOUD_MATCH_IDENTITY else NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
     }
     val requestedNativeIdentity = when {
         appLaunchMode == null || !preferNativeDesktopMode -> null
@@ -220,11 +236,7 @@ private fun cloudMatchClientIdentity(
     }
     val host = streamingBaseUrl.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
         ?: return ALLIANCE_CLOUD_MATCH_IDENTITY
-    val isNvidiaCloudMatch = host == "cloudmatchbeta.nvidiagrid.net" ||
-        host.endsWith(".cloudmatchbeta.nvidiagrid.net") ||
-        host == "cloudmatch.nvidiagrid.net" ||
-        host.endsWith(".cloudmatch.nvidiagrid.net")
-    if (!isNvidiaCloudMatch) return ALLIANCE_CLOUD_MATCH_IDENTITY
+    if (!isNvidiaCloudMatchHost(host)) return ALLIANCE_CLOUD_MATCH_IDENTITY
     return requestedNativeIdentity ?: NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
 }
 
@@ -236,23 +248,6 @@ internal fun isNvidiaShieldTvDevice(
     androidTvProfile &&
         manufacturer?.trim()?.equals("NVIDIA", ignoreCase = true) == true &&
         model?.contains("SHIELD", ignoreCase = true) == true
-
-internal fun isThirdGenerationFireTvCubeDevice(
-    androidTvProfile: Boolean,
-    manufacturer: String?,
-    model: String?,
-): Boolean =
-    androidTvProfile &&
-        manufacturer?.trim()?.equals("Amazon", ignoreCase = true) == true &&
-        model?.trim()?.equals("AFTGAZL", ignoreCase = true) == true
-
-internal fun usesDesktopNativeTvCloudMatchIdentity(
-    androidTvProfile: Boolean,
-    manufacturer: String?,
-    model: String?,
-): Boolean =
-    isNvidiaShieldTvDevice(androidTvProfile, manufacturer, model) ||
-        isThirdGenerationFireTvCubeDevice(androidTvProfile, manufacturer, model)
 
 /**
  * Server-side values, chosen when the session is created. They decide which virtual input devices
@@ -269,6 +264,7 @@ internal object GfnAppLaunchMode {
 }
 
 private const val DEFAULT_REMOTE_CONTROLLERS_BITMAP = 1
+private const val MULTI_CONTROLLER_BITMAP = 0b1111
 private const val DEFAULT_SUPPORTED_CONTROLLER_TYPE = 2
 
 private data class GfnControllerCapabilities(
@@ -281,12 +277,12 @@ private data class GfnControllerCapabilities(
  * exclusive to non-touch launches so virtual/physical gamepad packets have a host device without
  * changing touch-friendly sessions back into controller mode.
  */
-private fun gfnControllerCapabilities(appLaunchMode: Int): GfnControllerCapabilities =
+private fun gfnControllerCapabilities(appLaunchMode: Int, multiControllerEnabled: Boolean): GfnControllerCapabilities =
     if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) {
         GfnControllerCapabilities(remoteControllersBitmap = 0, supportedControllerTypes = emptyList())
     } else {
         GfnControllerCapabilities(
-            remoteControllersBitmap = DEFAULT_REMOTE_CONTROLLERS_BITMAP,
+            remoteControllersBitmap = if (multiControllerEnabled) MULTI_CONTROLLER_BITMAP else DEFAULT_REMOTE_CONTROLLERS_BITMAP,
             supportedControllerTypes = listOf(DEFAULT_SUPPORTED_CONTROLLER_TYPE),
         )
     }
@@ -301,6 +297,7 @@ internal fun gfnLocaleForAndroidLanguageTag(languageTag: String): String {
         "de" -> "de_DE"
         "es" -> "es_ES"
         "fr" -> "fr_FR"
+        "id" -> "id_ID"
         "ja" -> "ja_JP"
         "ko" -> "ko_KR"
         "nl" -> "nl_NL"
@@ -356,6 +353,13 @@ private val AUTH_RESTORE_MUTEX = Mutex()
 private val READY_SESSION_STATUSES = setOf(2, 3)
 internal fun shouldResumeClaimedSession(status: Int?, recoveryMode: Boolean): Boolean =
     status != 1 && !(recoveryMode && status != null && status in READY_SESSION_STATUSES)
+
+/** A failed validation cannot authorize RESUME or a minute of polling the same broken endpoint. */
+internal fun sessionClaimResponseFailure(httpStatus: Int, requestStatus: Int?, operation: String = "validation"): String? = when {
+    httpStatus !in 200..299 -> "Cloud session $operation failed (HTTP $httpStatus)."
+    requestStatus != 1 -> "Cloud session $operation failed (provider status ${requestStatus ?: "missing"})."
+    else -> null
+}
 private const val INVALID_SESSION_PROXY_MESSAGE =
     "Invalid session proxy URL. Use http://host:port, https://host:port, socks4://host:port, or socks5://host:port."
 
@@ -439,7 +443,7 @@ private fun StreamSettings.requestProfile(): StreamRequestProfile {
         height = height,
         hdrEnabled = hdrEnabled,
         hdrDisplay = compatible.hdrDisplay,
-        bitDepth = if (hdrEnabled || compatible.colorQuality.name.startsWith("TenBit")) 10 else 0,
+        bitDepth = if (compatible.usesTenBitStreamProfile()) 10 else 0,
         chroma = if (compatible.colorQuality == ColorQuality.EightBit444 || compatible.colorQuality == ColorQuality.TenBit444) 2 else 0,
     )
 }
@@ -475,7 +479,9 @@ private fun requestedStreamingFeatures(settings: StreamSettings, profile: Stream
         // default so the request shape CloudMatch validates against is unchanged.
         put("cloudGsync", false)
         put("enabledL4S", settings.enableL4S)
-        put("trueHdr", profile.hdrEnabled)
+        // NVST trueHdr enables the server's AI SDR-to-HDR filter. Native HDR10
+        // is requested independently through sdrHdrMode and the display profile.
+        put("trueHdr", profile.hdrEnabled && !settings.experimentalNvst)
         put("mouseMovementFlags", 0)
         put("supportedHidDevices", 0)
         put("profile", 0)
@@ -499,7 +505,7 @@ private fun requestedStreamingFeatures(settings: StreamSettings, profile: Stream
             put("audioChannelCount", 2)
             put("qosPolicy", 0)
             put("touchSupport", true)
-            put("dynamicStreamingMode", 0)
+            put("dynamicStreamingMode", StreamNetworkAdaptation.dynamicStreamingMode(settings))
         }
     }
 
@@ -516,11 +522,28 @@ private fun JsonObjectBuilder.putStreamTransportRequest(settings: StreamSettings
     }
 }
 
-private fun baseWebRtcSessionMetadata(): JsonArray = buildJsonArray {
+private fun cloudMatchLatencyMetadataHost(streamingBaseUrl: String?): String? {
+    val host = streamingBaseUrl
+        ?.toHttpUrlOrNull()
+        ?.host
+        ?.lowercase(Locale.US)
+        ?: return null
+    return host.takeIf {
+        isNvidiaCloudMatchHost(it) &&
+            it != "cloudmatchbeta.nvidiagrid.net" &&
+            it != "cloudmatch.nvidiagrid.net" &&
+            !it.startsWith("prod.")
+    }
+}
+
+private fun baseWebRtcSessionMetadata(streamingBaseUrl: String? = null): JsonArray = buildJsonArray {
     add(metadataEntry("SubSessionId", UUID.randomUUID().toString()))
     add(metadataEntry("wssignaling", "1"))
     add(metadataEntry("GSStreamerType", "WebRTC"))
     add(metadataEntry("networkType", "Unknown"))
+    cloudMatchLatencyMetadataHost(streamingBaseUrl)?.let { host ->
+        add(metadataEntry("latency@$host", "3"))
+    }
     add(metadataEntry("ClientImeSupport", "0"))
     add(metadataEntry("surroundAudioInfo", "2"))
 }
@@ -529,8 +552,9 @@ private fun streamSessionMetadata(
     settings: StreamSettings,
     profile: StreamRequestProfile,
     physicalDisplayResolution: Pair<Int, Int>? = null,
+    streamingBaseUrl: String? = null,
 ): JsonArray = buildJsonArray {
-    baseWebRtcSessionMetadata().forEach { entry ->
+    baseWebRtcSessionMetadata(streamingBaseUrl).forEach { entry ->
         if (!settings.experimentalNvst || entry.jsonObject["key"]?.jsonPrimitive?.content != "GSStreamerType") add(entry)
     }
     val requestedResolution = profile.width to profile.height
@@ -626,11 +650,12 @@ internal fun buildMinimalClaimRequestBody(
         streamingBaseUrl = streamingBaseUrl,
         appLaunchMode = appLaunchMode,
         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings?.requiresNativeDesktopCloudMatchMode() == true,
+        preferNativeAndroidMode = settings?.requiresNativeAndroidCloudMatchMode() == true,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
     val profile = settings?.requestProfile()
-    val controllerCapabilities = gfnControllerCapabilities(appLaunchMode)
+    val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings?.multiControllerEnabled == true)
     return buildJsonObject {
         put("action", 2)
         put("data", "RESUME")
@@ -655,9 +680,9 @@ internal fun buildMinimalClaimRequestBody(
             put(
                 "metaData",
                 if (settings != null && profile != null) {
-                    streamSessionMetadata(settings, profile, physicalDisplayResolution)
+                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl)
                 } else {
-                    baseWebRtcSessionMetadata()
+                    baseWebRtcSessionMetadata(streamingBaseUrl)
                 },
             )
             put("surroundAudioInfo", 0)
@@ -842,6 +867,7 @@ private suspend fun OkHttpClient.awaitText(request: Request): Pair<Int, String> 
                     requestBody = requestBody,
                     statusCode = response.code,
                     responseBody = text,
+                    responseHeaders = response.headers,
                     elapsedMs = SystemClock.elapsedRealtime() - startedAtMs,
                 )
                 response.code to text
@@ -858,6 +884,30 @@ private suspend fun OkHttpClient.awaitText(request: Request): Pair<Int, String> 
             throw error
         }
     }
+
+internal fun gfnGraphQlAppsFallbackUrl(
+    primaryUrl: HttpUrl,
+    statusCode: Int,
+    responseBody: String,
+): HttpUrl? {
+    if (primaryUrl.host != "games.geforce.com" || statusCode != 403) return null
+    val cloudFrontRejection = responseBody.contains("Generated by cloudfront", ignoreCase = true) ||
+        responseBody.contains("The request could not be satisfied", ignoreCase = true)
+    if (!cloudFrontRejection) return null
+    return primaryUrl.newBuilder()
+        .host(GFN_APPS_GRAPHQL_URL.toHttpUrl().host)
+        .build()
+}
+
+private suspend fun OkHttpClient.awaitGfnGraphQlText(request: Request): Pair<Int, String> {
+    val primary = awaitText(request)
+    val fallbackUrl = gfnGraphQlAppsFallbackUrl(
+        primaryUrl = request.url,
+        statusCode = primary.first,
+        responseBody = primary.second,
+    ) ?: return primary
+    return awaitText(request.newBuilder().url(fallbackUrl).build())
+}
 
 private fun bearerAuthorization(token: String): String = "Bearer $token"
 private fun gfnJwtAuthorization(token: String): String = "GFNJWT $token"
@@ -913,11 +963,13 @@ internal fun cloudMatchHeaders(
     preferNativeDesktopMode: Boolean = false,
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
+    preferNativeAndroidMode: Boolean = false,
 ): Headers {
     val identity = cloudMatchClientIdentity(
         streamingBaseUrl = streamingBaseUrl,
         appLaunchMode = appLaunchMode,
         preferNativeDesktopMode = preferNativeDesktopMode,
+        preferNativeAndroidMode = preferNativeAndroidMode,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
@@ -955,7 +1007,7 @@ internal fun cloudMatchHeaders(
         .build()
 }
 
-private fun normalizeStreamingServiceUrl(value: String): String? {
+internal fun normalizeStreamingServiceUrl(value: String): String? {
     val url = value.trim().toHttpUrlOrNull() ?: return null
     if (url.scheme != "https") return null
     val host = url.host
@@ -1915,13 +1967,15 @@ internal fun catalogScreenshotUrls(images: JsonObject?): List<String> =
 internal fun catalogGameDescription(app: JsonObject): String? =
     app.string("description") ?: app.string("shortDescription")
 
-internal fun gameStoreFromVariant(variant: JsonObject): String {
-    variant.string("appStore")?.trim()?.takeIf(String::isNotBlank)?.let { return it }
+internal fun gameStoreFromVariant(variant: JsonObject, publisherNameFallback: String? = null): String {
+    variant.string("appStore")?.trim()
+        ?.takeUnless { it.isBlank() || it.equals("Unknown", ignoreCase = true) || it.equals("None", ignoreCase = true) }
+        ?.let { return it }
 
     val storeUrl = variant.string("storeUrl")?.trim().orEmpty()
     val host = storeUrl.toHttpUrlOrNull()?.host?.lowercase(Locale.US).orEmpty()
     val shortName = variant.string("shortName")?.lowercase(Locale.US).orEmpty().removeSuffix("_gfn_pc")
-    val publisher = variant.string("publisherName")?.lowercase(Locale.US).orEmpty()
+    val publisher = (variant.string("publisherName") ?: publisherNameFallback)?.lowercase(Locale.US).orEmpty()
     return when {
         host == "store.steampowered.com" -> "STEAM"
         host == "epicgames.com" || host.endsWith(".epicgames.com") -> "EPIC"
@@ -1933,6 +1987,10 @@ internal fun gameStoreFromVariant(variant: JsonObject): String {
         host == "ea.com" || host.endsWith(".ea.com") -> "EA"
         host == "rockstargames.com" || host.endsWith(".rockstargames.com") -> "ROCKSTAR"
         host == "play.google.com" -> "GOOGLE_PLAY"
+        host == "hoyoverse.com" || host.endsWith(".hoyoverse.com") ||
+            host == "hoyolab.com" || host.endsWith(".hoyolab.com") ||
+            host == "hsr.hoyoverse.com" ||
+            shortName.endsWith("_hoyoverse") || shortName.endsWith("_hoyoplay") -> "HOYOVERSE"
         host == "guildwars2.com" || host.endsWith(".guildwars2.com") ||
             host == "ncsoft.com" || host.endsWith(".ncsoft.com") ||
             host == "plaync.com" || host.endsWith(".plaync.com") ||
@@ -1946,6 +2004,8 @@ internal fun gameStoreFromVariant(variant: JsonObject): String {
         shortName.endsWith("_origin") || shortName.endsWith("_ea_app") -> "EA"
         shortName.endsWith("_battlenet") || shortName.endsWith("_battle_net") -> "BATTLENET"
         shortName.endsWith("_ncsoft") || shortName.endsWith("_purple") -> "NCSOFT"
+        host.isBlank() && (publisher.contains("hoyoverse") || publisher.contains("cognosphere") ||
+            publisher.contains("mihoyo")) -> "HOYOVERSE"
         else -> "Unknown"
     }
 }
@@ -2410,6 +2470,29 @@ class GfnCatalogRepository(
         return confirmedVariantId
     }
 
+    suspend fun removeOwnedVariant(token: String, variantId: String): String {
+        val query = """
+            mutation RemoveOwnedVariant(${'$'}cmsId: String!, ${'$'}locale: String!) {
+              removeOwnedVariant(language: ${'$'}locale, variantId: ${'$'}cmsId) { app { id } }
+            }
+        """.trimIndent()
+        val payload = postGraphQl(
+            query = query,
+            variables = buildJsonObject {
+                put("cmsId", variantId)
+                put("locale", requestLocale())
+            },
+            token = token,
+            endpoint = GFN_APPS_GRAPHQL_URL,
+        ).checkGraphQlErrors("Remove game from library")
+        val confirmedVariantId = payload.obj("data")?.obj("removeOwnedVariant")?.obj("app")?.string("id")
+            ?: error("GFN did not confirm that the game was removed from the library")
+        check(confirmedVariantId == variantId) {
+            "GFN confirmed a different removed variant ($confirmedVariantId instead of $variantId)"
+        }
+        return confirmedVariantId
+    }
+
     suspend fun resolveLaunchAppId(token: String, appIdOrUuid: String, providerStreamingBaseUrl: String): String? {
         if (appIdOrUuid.all(Char::isDigit)) return appIdOrUuid
         val vpcId = getVpcId(token, providerStreamingBaseUrl)
@@ -2477,7 +2560,7 @@ class GfnCatalogRepository(
             .headers(desktopGraphQlHeaders(token).newBuilder().set("Content-Type", "application/graphql").build())
             .get()
             .build()
-        val (code, text) = http.awaitText(request)
+        val (code, text) = http.awaitGfnGraphQlText(request)
         check(code in 200..299) { "Games GraphQL failed ($code): ${text.take(400)}" }
         return OpenNowJson.parseToJsonElement(text).jsonObject
     }
@@ -2540,7 +2623,7 @@ class GfnCatalogRepository(
             val variantPaymentModels = obj.arr("paymentModels")
             GameVariant(
                 id = obj.string("id") ?: return@mapNotNull null,
-                store = gameStoreFromVariant(obj),
+                store = gameStoreFromVariant(obj, app.string("publisherName")),
                 storeUrl = obj.string("storeUrl"),
                 supportedControls = obj.arr("supportedControls")?.mapNotNull { it.asString() }.orEmpty(),
                 librarySelected = library?.boolean("selected"),
@@ -2680,7 +2763,7 @@ class GfnCatalogRepository(
             .headers(desktopGraphQlHeaders(token))
             .post(body)
             .build()
-        val (code, text) = http.awaitText(request)
+        val (code, text) = http.awaitGfnGraphQlText(request)
         check(code in 200..299) { "GFN GraphQL failed ($code): ${text.take(400)}" }
         return OpenNowJson.parseToJsonElement(text).jsonObject
     }
@@ -2791,7 +2874,9 @@ class GfnSubscriptionRepository(
             .headers(Headers.Builder().putDesktopLcars(token).build())
             .build()
         val (code, text) = http.awaitText(request)
-        if (code !in 200..299) return SubscriptionInfo()
+        // Do not turn a failed entitlement request into a confirmed Free membership. The setup
+        // flow must be able to distinguish "Free and playable" from "not verified".
+        if (code !in 200..299) return SubscriptionInfo(membershipTier = "")
         val data = OpenNowJson.parseToJsonElement(text).jsonObject
         val allotted = data.double("allottedTimeInMinutes") ?: 0.0
         val purchased = data.double("purchasedTimeInMinutes") ?: 0.0
@@ -2812,7 +2897,7 @@ class GfnSubscriptionRepository(
             ?.firstOrNull(::isActivePersistentStorageAddon)
             ?.let(::parseStorageAddon)
         return SubscriptionInfo(
-            membershipTier = data.string("membershipTier") ?: "FREE",
+            membershipTier = data.string("membershipTier").orEmpty(),
             subscriptionType = data.string("type"),
             subscriptionSubType = data.string("subType"),
             allottedHours = allotted / 60.0,
@@ -2990,7 +3075,7 @@ class GfnAccountConnectorRepository(
             .headers(desktopGraphQlHeaders(token))
             .post(body)
             .build()
-        val (code, text) = http.awaitText(request)
+        val (code, text) = http.awaitGfnGraphQlText(request)
         check(code in 200..299) { "Account connectors failed ($code): ${text.take(400)}" }
         return OpenNowJson.parseToJsonElement(text).jsonObject
     }
@@ -3145,11 +3230,7 @@ class GfnSessionRepository(
     private val physicalDisplayResolutionProvider: () -> Pair<Int, Int>? = { null },
     private val diagnosticsSink: (GfnSessionDiagnosticResponse) -> Unit = {},
     private val isAndroidTv: Boolean = false,
-    private val useDesktopNativeTvIdentity: Boolean = usesDesktopNativeTvCloudMatchIdentity(
-        androidTvProfile = isAndroidTv,
-        manufacturer = Build.MANUFACTURER,
-        model = Build.MODEL,
-    ),
+    private val useDesktopNativeTvIdentity: Boolean = isAndroidTv,
 ) {
     suspend fun createSession(
         token: String,
@@ -3191,6 +3272,7 @@ class GfnSessionRepository(
                     streamingBaseUrl = base,
                     appLaunchMode = appLaunchMode,
                     preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
+                    preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                     isAndroidTv = isAndroidTv,
                     useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                 ),
@@ -3350,6 +3432,8 @@ class GfnSessionRepository(
         val (validationCode, validationText) = http.awaitText(validationRequest)
         recordDiagnosticResponse("session.claim.validation", validationRequest, validationCode, validationText)
         val validation = runCatching { OpenNowJson.parseToJsonElement(validationText).jsonObject }.getOrNull()
+        sessionClaimResponseFailure(validationCode, validation?.obj("requestStatus")?.int("statusCode"))
+            ?.let { throw IllegalStateException(it) }
         val status = validation?.obj("session")?.int("status")
         if (status != null && isTerminalSessionStatus(status)) {
             val latestSession = runCatching {
@@ -3379,6 +3463,7 @@ class GfnSessionRepository(
                         streamingBaseUrl = active.streamingBaseUrl,
                         appLaunchMode = appLaunchMode,
                         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
+                        preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                         isAndroidTv = isAndroidTv,
                         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                     ),
@@ -3389,6 +3474,7 @@ class GfnSessionRepository(
             recordDiagnosticResponse("session.claim.put", claimRequest, claimCode, claimText)
         }
         var latestSession: SessionInfo? = null
+        var consecutivePollFailures = 0
         repeat(60) { attempt ->
             if (attempt > 0) delay(1000)
             val poll = Request.Builder()
@@ -3397,8 +3483,16 @@ class GfnSessionRepository(
                 .build()
             val (code, text) = http.awaitText(poll)
             recordDiagnosticResponse("session.claim.poll", poll, code, text)
-            if (code in 200..299) {
-                val payload = OpenNowJson.parseToJsonElement(text).jsonObject
+            val payload = if (code in 200..299) {
+                runCatching { OpenNowJson.parseToJsonElement(text).jsonObject }.getOrNull()
+            } else null
+            val failure = sessionClaimResponseFailure(code, payload?.obj("requestStatus")?.int("statusCode"), "poll")
+            if (failure != null) {
+                consecutivePollFailures += 1
+                if (consecutivePollFailures >= 3) throw IllegalStateException(failure)
+            } else {
+                consecutivePollFailures = 0
+                checkNotNull(payload)
                 val pollStatus = payload.obj("session")?.int("status")
                 val polledSession = toSessionInfo("", sessionBase, payload, clientId, deviceId)
                 latestSession = polledSession
@@ -3489,7 +3583,8 @@ class GfnSessionRepository(
                     method = request.method,
                     url = request.url.toString(),
                     statusCode = statusCode,
-                    requestBody = OpenNowHttpDiagnostics.captureRequestBody(request),
+                    // The HTTP diagnostics owner already captured the request once.
+                    requestBody = "",
                     responseBody = responseBody,
                 ),
             )
@@ -3510,11 +3605,12 @@ class GfnSessionRepository(
             streamingBaseUrl = streamingBaseUrl,
             appLaunchMode = appLaunchMode,
             preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
+            preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
             isAndroidTv = isAndroidTv,
             useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
         )
         val profile = settings.requestProfile()
-        val controllerCapabilities = gfnControllerCapabilities(appLaunchMode)
+        val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings.multiControllerEnabled)
         return buildJsonObject {
             putJsonObject("sessionRequestData") {
                 put("appId", appId)
@@ -3534,7 +3630,7 @@ class GfnSessionRepository(
                 }
                 put("useOps", true)
                 put("audioMode", 2)
-                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution))
+                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl))
                 put("sdrHdrMode", if (profile.hdrEnabled) 1 else 0)
                 put("clientDisplayHdrCapabilities", if (profile.hdrEnabled) hdrCapabilitiesJson() else JsonNull)
                 put("surroundAudioInfo", 0)
@@ -3596,6 +3692,10 @@ class GfnSessionRepository(
             zone = payload.obj("requestStatus")?.string("serverId")?.takeIf { it.isNotBlank() } ?: zone,
             assignedZone = assignedSessionZoneFromControlHost(session.obj("sessionControlInfo")?.string("ip")),
             streamingBaseUrl = base,
+            sessionControlBaseUrl = standardCloudMatchSessionControlBaseUrl(
+                session.obj("sessionControlInfo")?.string("ip"),
+                session.obj("sessionControlInfo")?.int("port"),
+            ),
             serverIp = signaling?.serverIp.orEmpty(),
             signalingServer = signaling?.signalingServer.orEmpty(),
             signalingUrl = signaling?.signalingUrl.orEmpty(),
@@ -3907,7 +4007,10 @@ suspend fun fetchDynamicRegions(
             if (key == "gfn-regions" || key.startsWith("gfn-")) null else StreamRegion(key, regionUrl)
         }?.sortedBy { it.name }.orEmpty()
         regions to vpcId
-    }.getOrDefault(emptyList<StreamRegion>() to null)
+    }.getOrElse { error ->
+        if (error is CancellationException) throw error
+        emptyList<StreamRegion>() to null
+    }
 }
 
 private val NON_ALNUM_RUN = Regex("[^a-z0-9]+")

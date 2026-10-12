@@ -11,6 +11,7 @@ import kotlinx.serialization.json.*
 import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.net.URI
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -18,13 +19,21 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
-internal data class NvstNetworkMetrics(val jitterMs: Double?, val lossPct: Double?, val pingMs: Int?)
+internal data class NvstNetworkMetrics(
+    val jitterMs: Double?,
+    val lossPct: Double?,
+    val pingMs: Int?,
+    val duplicateStunResponses: Long? = null,
+)
 
 internal fun parseNvstNetworkMetrics(detail: String): NvstNetworkMetrics {
     val values = detail.split(',')
     fun value(index: Int) = values.getOrNull(index)?.toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0 }
-    return NvstNetworkMetrics(value(0), value(1)?.takeIf { it <= 100 },
-        value(2)?.takeIf { it <= Int.MAX_VALUE }?.roundToInt())
+    return NvstNetworkMetrics(
+        value(0), value(1)?.takeIf { it <= 100 },
+        value(2)?.takeIf { it <= Int.MAX_VALUE }?.roundToInt(),
+        values.getOrNull(3)?.toLongOrNull()?.takeIf { it >= 0 },
+    )
 }
 
 internal const val NVST_OPT_IN_VERSION = 1
@@ -41,7 +50,7 @@ internal fun JsonObject.isRtspSessionConnection(): Boolean {
     val resource = (get("resourcePath") as? JsonPrimitive)?.contentOrNull.orEmpty()
     return resource.startsWith("rtsps://") || resource.startsWith("rtsp://") ||
         (get("usage") as? JsonPrimitive)?.contentOrNull == "16" ||
-        (get("appLevelProtocol") as? JsonPrimitive)?.contentOrNull == "6"
+        (get("appLevelProtocol") as? JsonPrimitive)?.contentOrNull in listOf("1", "6")
 }
 
 internal fun webRtcMediaFallbackConnections(connections: List<JsonObject>): List<JsonObject> =
@@ -52,13 +61,25 @@ internal fun webRtcMediaFallbackConnections(connections: List<JsonObject>): List
 internal fun nvstRtspEndpoints(connections: JsonArray?): List<String> = connections.orEmpty().mapNotNull { raw ->
     val item = raw as? JsonObject ?: return@mapNotNull null
     fun value(key: String) = (item[key] as? JsonPrimitive)?.contentOrNull
-    val resource = value("resourcePath").orEmpty()
-    if (resource.startsWith("rtsps://") || resource.startsWith("rtsp://")) return@mapNotNull resource
-    if (!item.isRtspSessionConnection()) return@mapNotNull null
-    val host = value("ip")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-    val port = value("port")?.toIntOrNull()?.takeIf { it in 1..65535 } ?: 322
-    "rtsps://${if (':' in host && !host.startsWith("[")) "[$host]" else host}:$port"
-}.distinct()
+    val usage = value("usage")?.toIntOrNull()
+    val protocol = value("appLevelProtocol")?.toIntOrNull()
+    // Keep the provider's order and exclude media even when its resource looks
+    // like a signalling URL. Older responses may omit usage altogether.
+    if (usage != null && usage != 16 && !(usage == 14 && protocol in listOf(1, 6))) return@mapNotNull null
+    if (usage == null && !item.isRtspSessionConnection()) return@mapNotNull null
+    val address = value("ip")?.trim()?.takeIf { it.isNotEmpty() }
+        ?: value("resourcePath")?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+    val scheme = if (protocol == 1) "rtsp" else "rtsps"
+    val endpoint = runCatching { URI(if ("://" in address) address else {
+        val host = if (address.count { it == ':' } > 1 && !address.startsWith("[")) "[$address]" else address
+        "$scheme://$host"
+    }) }.getOrNull() ?: return@mapNotNull null
+    if (endpoint.scheme !in listOf("rtsp", "rtsps") || endpoint.rawUserInfo != null || endpoint.rawQuery != null || endpoint.rawFragment != null) return@mapNotNull null
+    val host = endpoint.host?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+    val port = value("port")?.toIntOrNull()?.takeIf { it in 1..65535 }
+        ?: endpoint.port.takeIf { it in 1..65535 } ?: 322
+    "${endpoint.scheme}://${if (':' in host && !host.startsWith("[")) "[$host]" else host}:$port"
+}.distinct().take(20)
 
 internal fun nvstSessionContext(session: SessionInfo, settings: StreamSettings): String = buildJsonObject {
     put("session", buildJsonObject {
@@ -73,6 +94,12 @@ internal fun nvstSessionContext(session: SessionInfo, settings: StreamSettings):
         put("codec", settings.codec.name)
         put("colorQuality", OpenNowJson.encodeToJsonElement(settings.colorQuality))
         put("maxBitrateMbps", settings.maxBitrateMbps)
+        put("networkAdaptation", buildJsonObject {
+            val bitrate = StreamNetworkAdaptation.bitrateRange(settings)
+            put("dynamicStreamingMode", StreamNetworkAdaptation.dynamicStreamingMode(settings))
+            put("minimumBitrateKbps", bitrate.minimumKbps)
+            put("initialBitrateKbps", bitrate.initialKbps)
+        })
         put("hdrEnabled", settings.hdrEnabled)
     })
     put("shortcuts", JsonObject(emptyMap()))
@@ -123,11 +150,13 @@ internal class NvstTransport(
     context: android.content.Context,
     private val session: SessionInfo,
     private val settings: StreamSettings,
+    private val lowLatencyGameAudio: Boolean,
     private val decoderFactory: VideoDecoderFactory,
     private val sink: () -> VideoSink?,
     private val event: (String, String) -> Unit,
     private val stats: (StreamRuntimeStats) -> Unit,
     private val rumble: (GamepadRumbleCommand) -> Unit,
+    private val recordingAudio: (ByteBuffer) -> Unit = {},
 ) {
     private val handle = NvstBridge.create()
     private val wifiPerformance = StreamWifiPerformanceLock(context)
@@ -236,6 +265,12 @@ internal class NvstTransport(
             }
             val seconds = ((now - statsAt) / 1000.0).coerceAtLeast(0.001)
             val network = parseNvstNetworkMetrics(detail)
+            network.duplicateStunResponses?.let { duplicates ->
+                NativeInputDiagnostics.retain(
+                    "nvst.rtt",
+                    "NVST ping source=ice-first-response duplicateResponsesIgnored=$duplicates",
+                )
+            }
             val decodedFps = (decodedFrames.getAndSet(0) / seconds).toInt()
             stats(StreamRuntimeStats(
                 codec = codecName,
@@ -256,7 +291,7 @@ internal class NvstTransport(
     @Keep fun onNativeMedia(codec: String, bytes: ByteBuffer, timestampNs: Long, keyframe: Boolean, contiguous: Boolean): Boolean {
         if (stopped) return false
         if (codec.equals("opus", true)) {
-            val output = audio ?: NvstAudioOutput().also { audio = it }
+            val output = audio ?: NvstAudioOutput(lowLatencyGameAudio, recordingAudio).also { audio = it }
             output.feed(bytes, timestampNs / 1000, muted)
             return true
         }
@@ -300,7 +335,10 @@ internal class NvstTransport(
 }
 
 /** Android's Opus decoder; partial writes retain PCM within a bounded 100 ms queue. */
-private class NvstAudioOutput {
+private class NvstAudioOutput(
+    private val lowLatencyGameAudio: Boolean,
+    private val recordingAudio: (ByteBuffer) -> Unit,
+) {
     private val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
     private val track: AudioTrack
     private val info = MediaCodec.BufferInfo()
@@ -319,11 +357,15 @@ private class NvstAudioOutput {
             codec.configure(format, null, null, 0)
             codec.start()
             openedTrack = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                .setAudioAttributes(AudioAttributes.Builder().setUsage(streamAudioUsage(lowLatencyGameAudio)).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
                 .setAudioFormat(AudioFormat.Builder().setSampleRate(48000).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
                 .setBufferSizeInBytes(maxOf(3840, AudioTrack.getMinBufferSize(48000, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)))
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .apply { if (android.os.Build.VERSION.SDK_INT >= 26) setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY) }
+                .apply {
+                    if (shouldUseLowLatencyStreamAudio(android.os.Build.VERSION.SDK_INT, lowLatencyGameAudio)) {
+                        setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    }
+                }
                 .build()
             check(openedTrack.state == AudioTrack.STATE_INITIALIZED) { "NVST audio output unavailable" }
             openedTrack.play()
@@ -351,6 +393,14 @@ private class NvstAudioOutput {
                 codec.getOutputBuffer(output)?.let { pcm ->
                     pcm.position(info.offset)
                     pcm.limit(info.offset + info.size)
+                    if (pcm.hasRemaining()) {
+                        runCatching {
+                            recordingAudio(pcm.duplicate().apply {
+                                position(info.offset)
+                                limit(info.offset + info.size)
+                            })
+                        }
+                    }
                     if (pending.isEmpty()) track.write(pcm, pcm.remaining(), AudioTrack.WRITE_NON_BLOCKING)
                     if (pcm.hasRemaining()) {
                         // A stalled output cannot retain unbounded audio or block the video worker.

@@ -8,6 +8,20 @@ import org.junit.Test
 
 class InputEncoderKeyboardTest {
     @Test
+    fun mapsPhysicalSpaceToCanonicalHostKeyDespiteOemScanCode() {
+        val space = InputEncoder.mapKeyboardPayload(
+            keyCode = KeyEvent.KEYCODE_SPACE,
+            unicode = ' '.code,
+            scanCode = 0x123,
+            timestampUs = 0L,
+        )
+
+        assertNotNull(space)
+        assertEquals(0x20, space?.keycode)
+        assertEquals(0x0039, space?.scancode)
+    }
+
+    @Test
     fun mapsNumberRowKeysWhenAndroidReportsNoScanCode() {
         val one = InputEncoder.mapKeyboardPayload(keyCode = KeyEvent.KEYCODE_1, unicode = 0, scanCode = 0, timestampUs = 0L)
         val zero = InputEncoder.mapKeyboardPayload(keyCode = KeyEvent.KEYCODE_0, unicode = 0, scanCode = 0, timestampUs = 0L)
@@ -39,6 +53,20 @@ class InputEncoderKeyboardTest {
             keyCode = KeyEvent.KEYCODE_ESCAPE,
             unicode = 0,
             scanCode = 0,
+            timestampUs = 0L,
+        )
+
+        assertNotNull(escape)
+        assertEquals(0x1b, escape?.keycode)
+        assertEquals(0x0001, escape?.scancode)
+    }
+
+    @Test
+    fun mapsPhysicalEscapeToCanonicalHostKeyDespiteOemScanCode() {
+        val escape = InputEncoder.mapKeyboardPayload(
+            keyCode = KeyEvent.KEYCODE_ESCAPE,
+            unicode = 0,
+            scanCode = 0x123,
             timestampUs = 0L,
         )
 

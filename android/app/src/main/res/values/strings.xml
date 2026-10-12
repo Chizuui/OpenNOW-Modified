@@ -8,6 +8,7 @@
     <string name="profile_identity">%1$s • %2$s</string>
     <string name="profile_not_available">Not available</string>
     <string name="app_name">OpenNOW Chizui</string>
+    <string name="action_close_opennow">Close OpenNOW</string>
     <string name="status_starting_opennow">Starting OpenNOW</string>
     <string name="login_with_provider">Sign in with %1$s</string>
     <string name="login_tv_start">Sign in on another device with %1$s</string>
@@ -52,6 +53,7 @@
     <string name="app_language_german" translatable="false">Deutsch</string>
     <string name="app_language_spanish" translatable="false">Español</string>
     <string name="app_language_french" translatable="false">Français</string>
+    <string name="app_language_indonesian" translatable="false">Bahasa Indonesia</string>
     <string name="app_language_japanese" translatable="false">日本語</string>
     <string name="app_language_korean" translatable="false">한국어</string>
     <string name="app_language_dutch" translatable="false">Nederlands</string>
@@ -100,6 +102,8 @@
     <string name="dev_reset_stream_guide_desc">Reappears the next time a stream starts</string>
     <string name="dev_reset_controller_prompt">Show the controller prompt again</string>
     <string name="dev_reset_controller_prompt_desc">Reappears the next time a controller connects</string>
+    <string name="settings_show_controller_prompt_again">Show controller prompt again</string>
+    <string name="settings_show_controller_prompt_again_desc">Reopens the touch-control prompt on the next stream. Controller input is unaffected.</string>
     <string name="dev_reset_analytics_consent">Ask for analytics consent again</string>
     <string name="dev_reset_analytics_consent_desc">Opts out until the question is answered again</string>
     <string name="dev_reset_migrations">Replay upgrade migrations</string>
@@ -190,6 +194,13 @@
     <string name="store_coming_next_subtitle">Latest additions to GeForce NOW</string>
     <string name="store_continue_playing">Continue playing</string>
     <string name="store_in_queue">In queue</string>
+    <string name="store_remove_from_continue_playing">Remove %1$s from Continue playing</string>
+    <string name="store_remove_from_queue">Remove %1$s from In queue</string>
+    <string name="store_remove_confirm_title">Confirm removal</string>
+    <string name="library_remove_gfn_game">Remove %1$s from GeForce NOW Library</string>
+    <string name="library_remove_gfn_game_body">Remove %1$s from your GeForce NOW Library? Store entries: %2$s.</string>
+    <string name="library_remove_gfn_game_failed">Could not remove this game from your GeForce NOW Library.</string>
+    <string name="library_remove_gfn_game_partial">Removed %1$d of %2$d store entries. Refreshing your library.</string>
     <string name="store_favorites">Favorites</string>
     <string name="store_recommendations">Recommendations</string>
     <string name="store_results">Results</string>
@@ -208,7 +219,7 @@
     <string name="queue_starting_stream">Starting stream</string>
     <string name="queue_position">Queue position %1$d</string>
     <string name="queue_waiting_for_rig">Waiting for a rig</string>
-    <string name="queue_connecting_stream">Connecting stream</string>
+    <string name="queue_connecting_stream">Connecting...</string>
     <string name="queue_resuming_session">Resuming session</string>
     <string name="queue_setting_up_rig">Setting up rig</string>
     <string name="queue_starting_session">Starting session</string>
@@ -217,6 +228,7 @@
     <string name="queue_ready_body">Your GFN queue is done. Tap to return to the app.</string>
     <string name="stream_background_notification">Streaming continues while the screen is off</string>
     <string name="catalog_not_owned">Not owned</string>
+    <string name="catalog_owned">Owned</string>
     <string name="catalog_unknown_publisher">Unknown publisher</string>
     <string name="catalog_resume_cloud_session">Resume cloud session</string>
     <string name="catalog_app_id">App %1$s</string>
@@ -239,6 +251,7 @@
     <string name="queue_checking">Checking</string>
     <string name="queue_best_route">Best available route</string>
     <string name="queue_higher_ping_warning">You have selected a server that has less queue but more ping. The amount of complaints I get about lag is because of this. Press default if you want the server closest to you.</string>
+    <string name="queue_higher_ping_dont_show_again">I understand, don\'t show me again</string>
     <string name="queue_metric_ahead">Ahead</string>
     <string name="queue_metric_wait">Wait</string>
     <string name="session_timer">Session timer</string>
@@ -262,6 +275,7 @@
     <string name="stream_guide_press_done">Press Done</string>
     <string name="stream_controller_detected">Controller detected</string>
     <string name="stream_controller_hidden">The on-screen controller was hidden because a physical controller is connected.</string>
+    <string name="stream_controller_show_touch_controls">Show touch controls</string>
     <string name="stream_keyboard_mouse_detected">Keyboard or mouse detected</string>
     <string name="stream_keyboard_mouse_detected_body">You’re using native touch. Switch to keyboard and mouse for this stream?</string>
     <string name="stream_keyboard_mouse_disconnected">Keyboard and mouse disconnected</string>
@@ -271,9 +285,8 @@
     <string name="stream_input_switch_native_touch">Switch to native touch</string>
     <string name="stream_input_keep_keyboard_mouse">Keep keyboard &amp; mouse</string>
     <string name="common_dont_show_again">Don\'t show again</string>
-    <string name="store_landscape_new_games_hide">Hide New games added in landscape</string>
-    <string name="store_landscape_new_games_hide_title">Hide this landscape hero?</string>
-    <string name="store_landscape_new_games_hide_body">New games added will stay hidden when this device is horizontal. You can turn it back on in Interface settings.</string>
+    <string name="store_landscape_new_games_hide">Collapse New games added hero</string>
+    <string name="store_landscape_new_games_show">Expand New games added hero</string>
 
     <!-- Reusable state words. One pair each, so the same boolean stops reading "On/Off" in one
          row and "Visible/Hidden" in the next for no reason. -->
@@ -289,7 +302,15 @@
     <!-- In-stream controls panel -->
     <string name="stream_panel_title">Stream Controls</string>
     <string name="stream_panel_exit">Exit</string>
+    <string name="stream_panel_keyboard">Keyboard</string>
     <string name="stream_panel_done">Done</string>
+    <string name="stream_panel_expand">Expand stream controls</string>
+    <string name="stream_panel_collapse">Shrink stream controls</string>
+    <string name="stream_panel_more_controls">More controls</string>
+    <string name="stream_panel_less_controls">Fewer controls</string>
+    <string name="stream_statusbar_custom_position">Custom</string>
+    <string name="stream_statusbar_drag_hint">Turn on drag mode, then drag the status bar to place it. Tap Done when finished. Choose a position here to return to a preset.</string>
+    <string name="stream_statusbar_drag_mode">Status bar drag mode</string>
     <string name="stream_panel_cd_keyboard">Open keyboard sender</string>
     <string name="stream_panel_section_display">Display</string>
     <string name="stream_panel_section_input">Input</string>
@@ -317,11 +338,18 @@
     <string name="stream_keyboard_clear_confirm_title">Clear stream text?</string>
     <string name="stream_keyboard_clear_confirm_body">This clears the focused text field in the streamed game.</string>
     <string name="stream_keyboard_clear_never_ask_again">Never, ever ask me again</string>
-    <string name="stream_panel_controller_mouse">Controller mouse</string>
-    <string name="stream_panel_controller_mouse_summary">Right stick · A click · B right-click</string>
+    <string name="stream_panel_controller_mouse">Launcher cursor (right stick)</string>
+    <string name="stream_panel_controller_mouse_summary">A clicks · B right-clicks · left stick resumes gamepad</string>
+    <string name="stream_panel_controller_mouse_description">Use for launcher dialogs. Clicks keep the cursor active, including clicks on empty space.</string>
+    <string name="settings_tv_controller_mouse_auto_arm">Launcher cursor on TV at stream start</string>
+    <string name="settings_tv_controller_mouse_auto_arm_description">Use the right stick as a mouse when a TV stream starts. Turning this off keeps both sticks available for games.</string>
+    <string name="settings_multi_controller">Multiple controllers</string>
+    <string name="settings_multi_controller_description">Request four separate controller slots from GeForce NOW. Start a new session after changing this setting.</string>
     <string name="stream_panel_finger_mouse">Finger mouse</string>
     <string name="stream_panel_direct_click">Direct click</string>
     <string name="stream_panel_touch_controller">Touch controller</string>
+    <string name="stream_touch_controller_requires_new_session">This session uses native touch. To use the on-screen controller, set Native touch to Off and start a new session.</string>
+    <string name="settings_native_touch_mode_desc">Native touch sends fingers directly to the streamed game. For OpenNOW’s on-screen controller, choose Off before starting a session.</string>
     <string name="stream_touch_builtin_title">Built-in game touch detected</string>
     <string name="stream_touch_builtin_available">This game supports built-in touch controls. You can still turn on OpenNOW’s touch controller below if you prefer.</string>
     <string name="stream_touch_builtin_overridden">This game supports built-in touch controls. OpenNOW’s touch controller is enabled for this session.</string>
@@ -340,10 +368,10 @@
     <string name="settings_haptics_output_device">Phone</string>
     <!-- Kept as the source-language fallback until generated translations drop the old key. -->
     <string name="stream_panel_phone_rumble">Phone rumble fallback</string>
-    <string name="stream_panel_mouse_mode">Controller mouse mode</string>
-    <string name="stream_panel_mouse_mode_summary">L stick moves · R stick scrolls · A clicks · B right-clicks</string>
-    <string name="stream_mouse_mode_title">Mouse mode</string>
-    <string name="stream_mouse_mode_subtitle">Configure mouse emulation</string>
+    <string name="stream_panel_mouse_mode">Full gamepad mouse mode</string>
+    <string name="stream_panel_mouse_mode_summary">Left stick moves · right stick scrolls · A/B click</string>
+    <string name="stream_mouse_mode_title">Full gamepad mouse mode</string>
+    <string name="stream_mouse_mode_subtitle">Both sticks control the mouse until you turn this mode off</string>
     <string name="stream_touch_controls_title">Touch controls</string>
     <string name="stream_touch_controls_subtitle">Controller layout, joysticks, and rumble</string>
     <string name="stream_report_problem_title">Report a problem</string>
@@ -380,12 +408,16 @@
     <string name="stream_statusbar_title">Status bar</string>
     <string name="stream_statusbar_subtitle">Choose its layout and information</string>
     <string name="stream_statusbar_appearance">Appearance</string>
+    <string name="stream_statusbar_background">Status bar background</string>
+    <string name="stream_statusbar_background_opacity">Background opacity</string>
     <string name="stream_statusbar_position">Position</string>
     <string name="stream_statusbar_items">Items</string>
     <string name="stream_statusbar_metric_fps">FPS</string>
     <string name="stream_statusbar_metric_ping">Ping</string>
     <string name="stream_statusbar_metric_bitrate">Bitrate</string>
     <string name="stream_statusbar_metric_battery">Battery</string>
+    <string name="stream_statusbar_metric_session_battery">Session battery</string>
+    <string name="stream_statusbar_metric_playtime">Playtime</string>
     <string name="stream_statusbar_metric_connection">Connection</string>
     <string name="stream_statusbar_metric_resolution">Resolution</string>
     <string name="stream_statusbar_metric_codec">Codec</string>
@@ -453,6 +485,9 @@
     <string name="stream_quality_poor">poor</string>
 
     <string name="action_dismiss">Dismiss</string>
+    <string name="catalog_upgrade_to_play">Upgrade to play</string>
+    <string name="catalog_membership_upgrade_required">⚠️ This game requires a Priority or Ultimate GeForce NOW membership.</string>
+    <string name="catalog_upgrade_page_unavailable">Could not open the GeForce NOW upgrade page</string>
     <string name="action_play_on_tv">Play on %1$s</string>
     <string name="action_clear_filters">Clear filters</string>
     <string name="catalog_sort_filter">Sort and filter</string>
@@ -461,6 +496,15 @@
     <string name="catalog_sort_popular">Popular</string>
     <string name="catalog_sort_new_games">New games added</string>
     <string name="catalog_sort_last_played">Last played</string>
+    <string name="catalog_last_played_at">Last played %1$s</string>
+    <string name="catalog_last_played_at_relative">Last played %1$s (%2$s)</string>
+    <string name="catalog_last_played_just_now">just now</string>
+    <plurals name="catalog_last_played_minutes_ago"><item quantity="one">%d minute ago</item><item quantity="other">%d minutes ago</item></plurals>
+    <plurals name="catalog_last_played_hours_ago"><item quantity="one">%d hour ago</item><item quantity="other">%d hours ago</item></plurals>
+    <plurals name="catalog_last_played_days_ago"><item quantity="one">%d day ago</item><item quantity="other">%d days ago</item></plurals>
+    <plurals name="catalog_last_played_weeks_ago"><item quantity="one">%d week ago</item><item quantity="other">%d weeks ago</item></plurals>
+    <plurals name="catalog_last_played_months_ago"><item quantity="one">%d month ago</item><item quantity="other">%d months ago</item></plurals>
+    <plurals name="catalog_last_played_years_ago"><item quantity="one">%d year ago</item><item quantity="other">%d years ago</item></plurals>
     <string name="catalog_filter_section">Filters</string>
     <string name="catalog_filter_controls_group">Controls</string>
     <string name="catalog_filter_touch_controls">Mobile touch controls</string>
@@ -482,6 +526,8 @@
     <string name="settings_section_stream_video">Video</string>
     <string name="settings_section_stream_connection">Connection</string>
     <string name="settings_section_audio_keyboard">Audio and keyboard</string>
+    <string name="settings_low_latency_game_audio">Low latency game audio</string>
+    <string name="settings_low_latency_game_audio_desc">On requests low latency Android game audio when supported. Off uses standard media audio; try it if streams sound too quiet. Applies to the next stream.</string>
     <string name="settings_keyboard_layout">Keyboard layout</string>
     <string name="settings_game_language">Game language</string>
     <string name="settings_clipboard_paste">Clipboard paste</string>
@@ -489,7 +535,23 @@
     <string name="settings_mouse_lock">Mouse lock</string>
     <string name="settings_mouse_lock_desc">Keep an external mouse captured inside the game while streaming. Opening Stream Controls releases it.</string>
     <string name="settings_section_controller_touch">Controller and touch</string>
+    <string name="settings_section_physical_input">Physical controller and keyboard</string>
+    <string name="settings_physical_input_description">Applies to Bluetooth and USB input in the next cloud stream. Touch controls keep their own settings.</string>
+    <string name="settings_physical_stick_dead_zone">Controller stick dead zone</string>
+    <string name="settings_physical_trigger_dead_zone">Controller trigger dead zone</string>
+    <string name="settings_physical_stick_sensitivity">Controller stick sensitivity</string>
+    <string name="settings_physical_invert_stick_x">Invert controller stick X axis</string>
+    <string name="settings_physical_invert_stick_y">Invert controller stick Y axis</string>
+    <string name="settings_physical_invert_mouse_x">Invert physical mouse X axis</string>
+    <string name="settings_physical_invert_mouse_y">Invert physical mouse Y axis</string>
+    <string name="settings_physical_swap_ab">Swap controller A and B</string>
+    <string name="settings_physical_swap_xy">Swap controller X and Y</string>
+    <string name="settings_physical_swap_movement_keys">Swap keyboard WASD and arrow keys</string>
+    <string name="settings_physical_reset">Reset physical input settings</string>
     <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_custom_navigation_background">Custom navigation background</string>
+    <string name="settings_custom_navigation_background_desc">Set the darkness behind the side navigation buttons. Off adapts to the background automatically.</string>
+    <string name="settings_navigation_background_opacity">Navigation background opacity</string>
     <string name="settings_section_library_navigation">Library and navigation</string>
     <string name="settings_section_status_bar">Status bar</string>
     <string name="settings_section_sounds_sessions">Sounds and sessions</string>
@@ -540,6 +602,23 @@
     <string name="settings_session_proxy_warning_enable">Enable proxy</string>
     <string name="settings_experimental_streaming">Experimental streaming</string>
     <string name="settings_experimental_streaming_warning">May cause session launch failures.</string>
+    <string name="settings_dynamic_network_adjustment">Adjust for network conditions</string>
+    <string name="settings_network_adjustment_fixed">Fixed resolution and FPS</string>
+    <string name="settings_network_adjustment_custom">Custom (Experimental)</string>
+    <string name="settings_dynamic_network_adjustment_desc">Custom lets the server lower stream resolution when the connection degrades. Your selected FPS remains the target. This mode previously caused unstable resolution and frame delivery on some devices. Applies to new sessions.</string>
+    <string name="settings_dynamic_minimum_bitrate">Requested minimum bitrate</string>
+    <string name="settings_dynamic_minimum_bitrate_desc">Lower values allow more bitrate reduction during congestion; higher values favour detail but may increase stutter. The selected Stream bitrate remains the maximum. The server may choose its own rate.</string>
+    <string name="settings_hdr_ten_bit_badge">Unavailable with HDR</string>
+    <string name="settings_hdr_ten_bit_warning">GFN servers cannot process 10-bit color while HDR is enabled. OpenNOW forces 8-bit 4:2:0 for HDR sessions.</string>
+    <string name="settings_advanced_controller_customization">Advanced controller customization</string>
+    <string name="settings_advanced_controller_customization_desc">Show button mapping, visibility, gyro, size, opacity, and layout controls.</string>
+    <string name="settings_battery_optimization_title">Battery optimization</string>
+    <string name="battery_queue_prompt_title">Allow background streaming?</string>
+    <string name="battery_queue_prompt_body">Battery optimization can interrupt %1$s while you queue or stream. Allow OpenNOW to run without battery restrictions before continuing?</string>
+    <string name="battery_queue_prompt_continue">No, continue</string>
+    <string name="launch_recovery_title">Session couldn’t start</string>
+    <string name="launch_recovery_lower_settings_body">GFN rejected this stream profile before gameplay began. You can retry once with 1080p, 60 FPS, H.264, 8-bit SDR, and experimental transport features off.</string>
+    <string name="launch_recovery_try_lower">Try lower settings</string>
     <string name="settings_l4s">L4S</string>
     <string name="settings_l4s_desc">Requests NVIDIA\'s low-latency, low-loss transport path when the server and network support it. Leave off if your network gets unstable.</string>
     <string name="settings_microphone">Microphone</string>
@@ -637,6 +716,10 @@
     <string name="settings_compact_cards">Compact game cards</string>
     <string name="settings_show_favorite_icon">Show favorite icon on game cards</string>
     <string name="settings_show_favorite_icon_desc">Shows a favorite button on mobile, handheld, and TV game cards.</string>
+    <string name="settings_show_premium_marker">Show premium marker</string>
+    <string name="settings_show_premium_marker_desc">Marks games that require a paid GeForce NOW membership. This does not indicate game ownership.</string>
+    <string name="catalog_premium_marker">PREMIUM</string>
+    <string name="catalog_premium_membership_required">Premium GeForce NOW membership required</string>
     <string name="settings_card_size">Game card size</string>
     <string name="settings_card_size_desc">Changes card size across Store, Continue playing, and Library.</string>
     <string name="settings_hide_stream_buttons">Hide stream buttons</string>
@@ -767,6 +850,16 @@
     <string name="setup_play_metric_ping_preview">Ping 24ms</string>
     <string name="setup_play_metric_bitrate_preview">35 Mbps</string>
     <string name="setup_play_metric_battery_preview">Battery 82%%</string>
+    <string name="setup_play_metric_session_battery_preview">Used 5%%</string>
+    <string name="setup_play_metric_playtime_preview">Played 1:23</string>
+    <string name="stream_stats_playtime">Played %1$s</string>
+    <string name="stream_stats_playtime_cd">Elapsed playtime %1$s</string>
+    <string name="stream_stats_session_battery_used">Used %1$d%%</string>
+    <string name="stream_stats_session_battery_charged">Charged %1$d%%</string>
+    <string name="stream_stats_session_battery_unknown">Used --</string>
+    <string name="stream_stats_session_battery_cd_used">Battery level dropped %1$d percentage points since this session started</string>
+    <string name="stream_stats_session_battery_cd_charged">Battery level rose %1$d percentage points since this session started</string>
+    <string name="stream_stats_session_battery_cd_unknown">Session battery change unavailable</string>
     <string name="setup_play_metric_connection_preview">Wi-Fi</string>
     <string name="setup_play_metric_resolution_preview">1920×1080</string>
     <string name="setup_play_metric_codec_preview">HEVC</string>
@@ -795,6 +888,16 @@
     <string name="setup_summary_off">Off</string>
 
     <string name="settings_section_setup">Setup</string>
+    <string name="settings_backup_description">Save app settings and touch controller layouts to a file before switching builds. Sign-in and app files are not included. Keep the file private if you use a session proxy.</string>
+    <string name="settings_backup_create">Create settings backup</string>
+    <string name="settings_backup_restore">Restore settings backup</string>
+    <string name="settings_backup_restore_title">Restore app settings?</string>
+    <string name="settings_backup_restore_confirm">This replaces your current settings, including touch controller layouts and presets. Your sign-in stays as it is.</string>
+    <string name="settings_backup_saved">Settings backup saved</string>
+    <string name="settings_backup_save_failed">Could not save settings backup</string>
+    <string name="settings_backup_invalid">This backup is invalid or incompatible with this app version</string>
+    <string name="settings_backup_restored">Settings restored</string>
+    <string name="settings_backup_restore_failed">Could not restore settings</string>
     <string name="settings_run_setup_again">Run setup again</string>
     <string name="settings_run_setup_again_desc">Revisit appearance, stream quality, play controls, status, and bug reporting</string>
 
@@ -913,6 +1016,11 @@
     <string name="settings_clear_cache_title">Clear game cache?</string>
     <string name="settings_connection_help">Connection help</string>
     <string name="settings_debug_logs_desc">Exports launch state, queue state, stream updates, recovery events, settings, codec capabilities, and recent sanitized CloudMatch JSON responses.</string>
+    <string name="settings_copy_logs">Copy logs</string>
+    <string name="settings_copied_logs">Copied logs</string>
+    <string name="settings_export_logs">Export logs</string>
+    <string name="settings_exported_logs">Exported</string>
+    <string name="login_export_logs_qr">Export logs with QR</string>
     <string name="settings_developer_label">Developer</string>
     <string name="settings_no_storage_addon">No persistent storage add-on is active for this account.</string>
     <string name="settings_release_notes">Release notes</string>
@@ -950,4 +1058,52 @@
     <string name="mascot_discord">find us on Discord!</string>
     <string name="mascot_zortos">keep kalm, blame Zortos!</string>
     <string name="mascot_hobbits">we are taking the hobbits to Isengard!</string>
+    <string name="stream_panel_keyboard_overlay">Keyboard &amp; mouse overlay</string>
+    <string name="stream_panel_keyboard_overlay_summary">Replaces the on-screen gamepad with a WASD joystick and customizable keyboard and mouse buttons. Add and position buttons separately. Native game touch is disabled in this mode.</string>
+    <string name="keyboard_overlay_add_button">Add button</string>
+    <string name="keyboard_overlay_picker_title">Choose a key or mouse button</string>
+    <string name="keyboard_overlay_search">Search keys</string>
+    <string name="keyboard_overlay_category_all">All</string>
+    <string name="keyboard_overlay_category_mouse">Mouse</string>
+    <string name="keyboard_overlay_category_letters">Letters</string>
+    <string name="keyboard_overlay_category_numbers">Numbers</string>
+    <string name="keyboard_overlay_category_functions">Function keys</string>
+    <string name="keyboard_overlay_category_navigation">Navigation</string>
+    <string name="keyboard_overlay_category_modifiers">Modifiers</string>
+    <string name="keyboard_overlay_category_symbols">Symbols</string>
+    <string name="keyboard_overlay_category_numpad">Numpad</string>
+    <string name="keyboard_overlay_no_results">No matching keys.</string>
+    <string name="keyboard_overlay_remove_button">Remove button</string>
+    <string name="settings_category_recording">Recording</string>
+    <string name="settings_category_recording_summary">Video bitrate, frame rate, and sharpness</string>
+    <string name="stream_record_start">Record</string>
+    <string name="stream_record_stop">Stop</string>
+    <string name="stream_record_starting">Starting…</string>
+    <string name="stream_record_saving">Saving…</string>
+    <string name="stream_record_unavailable">Recording is available after the first SDR frame; HDR streams are not supported yet.</string>
+    <string name="stream_record_failed">Could not start or save the stream recording.</string>
+    <string name="stream_record_folder_failed">Could not save to the recording folder. Choose a writable folder in Recording settings.</string>
+    <string name="stream_record_folder_permission_failed">Could not keep access to that folder. Choose another folder.</string>
+    <string name="stream_record_active">REC</string>
+    <string name="settings_recording_folder">Save recordings to</string>
+    <string name="settings_recording_folder_choose">Choose folder</string>
+    <string name="settings_recording_folder_not_set">Choose once to save future recordings automatically</string>
+    <string name="settings_recording_folder_selected">Selected folder</string>
+    <string name="settings_section_recording_output">Recorded video</string>
+    <string name="settings_recording_next_session_hint">These options apply to the next recording. The recording keeps the stream resolution.</string>
+    <string name="settings_recording_auto_bitrate">Automatic bitrate</string>
+    <string name="settings_recording_auto_bitrate_desc">Choose a bitrate based on the stream resolution and recording FPS.</string>
+    <string name="settings_recording_bitrate">Recording bitrate</string>
+    <string name="settings_recording_bitrate_unit">Mbps</string>
+    <string name="settings_recording_bitrate_desc">Higher values can improve detail but create larger files.</string>
+    <string name="settings_recording_fps">Recording frame rate</string>
+    <string name="settings_recording_fps_desc">The output cannot exceed the stream frame rate; no frames are interpolated.</string>
+    <string name="settings_recording_fps_auto">Automatic (up to 60 FPS)</string>
+    <string name="settings_recording_fps_24">24 FPS</string>
+    <string name="settings_recording_fps_30">30 FPS</string>
+    <string name="settings_recording_fps_60">60 FPS</string>
+    <string name="settings_recording_sharpness">Recorded video sharpness</string>
+    <string name="settings_recording_sharpness_desc">Apply the stream sharpness filter to the saved video only; this does not increase its resolution.</string>
+    <string name="settings_recording_sharpness_amount">Sharpness amount</string>
+    <string name="settings_recording_sharpness_amount_desc">Use a subtle value to avoid halos around edges.</string>
 </resources>

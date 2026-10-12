@@ -114,6 +114,8 @@ data class StreamStatsMetrics(
     val ping: Boolean = true,
     val bitrate: Boolean = false,
     val battery: Boolean = true,
+    val sessionBattery: Boolean = false,
+    val playtime: Boolean = false,
     val connection: Boolean = true,
     val resolution: Boolean = false,
     val codec: Boolean = false,
@@ -121,7 +123,7 @@ data class StreamStatsMetrics(
     val latency: Boolean = false,
     val packetLoss: Boolean = false,
 ) {
-    fun enabledCount(): Int = listOf(fps, ping, bitrate, battery, connection, resolution, codec, location, latency, packetLoss).count { it }
+    fun enabledCount(): Int = listOf(fps, ping, bitrate, battery, sessionBattery, playtime, connection, resolution, codec, location, latency, packetLoss).count { it }
 }
 
 @Serializable
@@ -191,6 +193,13 @@ internal fun sessionWarningThresholdCrossed(previousRemainingSeconds: Int?, rema
 }
 
 @Serializable
+enum class StreamVideoOutput {
+    Default,
+    MediaCodecSurface,
+    WebRtcTexture,
+}
+
+@Serializable
 data class StreamSettings(
     val resolution: String = "1920x1080",
     val aspectRatio: String = "16:9",
@@ -203,24 +212,43 @@ data class StreamSettings(
     val region: String = "",
     val keyboardLayout: String = "en-US",
     val gameLanguage: String = "en_US",
+    /** Advertise all four host gamepad slots when local multiplayer is enabled. */
+    val multiControllerEnabled: Boolean = false,
     val sessionProxyEnabled: Boolean = false,
     val sessionProxyUrl: String = "",
     val enableL4S: Boolean = false,
     val experimentalNvst: Boolean = false,
+    val experimentalDynamicNetworkAdjustment: Boolean = false,
+    val experimentalDynamicMinimumBitrateMbps: Int = 5,
     val mouseSensitivity: Float = 1f,
     val mouseAcceleration: Int = 1,
     val streamSharpeningEnabled: Boolean = false,
+    /** Default follows the APK/Play profile; explicit choices survive updates and presets. */
+    val videoOutput: StreamVideoOutput = StreamVideoOutput.Default,
     val streamSharpeningAmount: Float = 0.25f,
     val microphoneMode: MicrophoneMode = MicrophoneMode.Disabled,
     val microphoneDeviceId: String = "",
     val mouseScrollSensitivity: Int = 30,
+    /** 0 selects the recorder's resolution/FPS-based automatic bitrate. */
+    val recordingBitrateMbps: Int = 0,
+    /** 0 follows the source up to 60 FPS; explicit values are bounded by source FPS. */
+    val recordingFps: Int = 0,
+    val recordingSharpeningEnabled: Boolean = false,
+    val recordingSharpeningAmount: Float = 0.25f,
 )
 
 internal fun StreamSettings.withUserStreamOptionsFrom(source: StreamSettings): StreamSettings =
     copy(
         microphoneMode = source.microphoneMode,
+        videoOutput = source.videoOutput,
         microphoneDeviceId = source.microphoneDeviceId,
         experimentalNvst = source.experimentalNvst,
+        experimentalDynamicNetworkAdjustment = source.experimentalDynamicNetworkAdjustment,
+        experimentalDynamicMinimumBitrateMbps = source.experimentalDynamicMinimumBitrateMbps,
+        recordingBitrateMbps = source.recordingBitrateMbps,
+        recordingFps = source.recordingFps,
+        recordingSharpeningEnabled = source.recordingSharpeningEnabled,
+        recordingSharpeningAmount = source.recordingSharpeningAmount,
     )
 
 /**
@@ -297,11 +325,11 @@ enum class TouchControlGroup {
 }
 
 /**
- * Actions available to the four movable accessibility buttons.
+ * Actions available to the movable accessibility buttons.
  *
- * These are deliberately single, momentary gamepad actions rather than macros. A duplicate action
- * is useful when a player cannot comfortably reach the original control, while avoiding recorded
- * sequences keeps releases predictable when a stream reconnects or the overlay is removed.
+ * Combo entries press their listed controls simultaneously. They are deliberately not recorded or
+ * timed macros: every member is released together, which keeps reconnect and overlay teardown
+ * behavior predictable.
  */
 @Serializable
 enum class TouchExtraButtonAction {
@@ -323,10 +351,48 @@ enum class TouchExtraButtonAction {
     RightStickClick,
     Start,
     Select,
+    LeftStickLeft,
+    LeftStickRight,
+    KeyboardA,
+    KeyboardD,
+    LeftBumperAndLeftTrigger,
+    RightBumperAndRightTrigger,
+    LeftAndRightBumpers,
+    LeftAndRightTriggers,
+}
+
+/**
+ * A user-defined set of controls pressed and released as one extra button.
+ *
+ * This intentionally models simultaneous input only. Timed macros would make release and
+ * reconnect behavior ambiguous, so they are not part of the preset contract.
+ */
+@Serializable
+data class TouchExtraButtonCombo(
+    val actions: List<TouchExtraButtonAction> = emptyList(),
+)
+
+/** Broad starter category. Custom keeps imported and user-created layouts future-compatible. */
+@Serializable
+enum class TouchPresetGenre {
+    Racing,
+    Survival,
+    Horror,
+    Action,
+    Custom,
 }
 
 @Serializable
 data class TouchOffset(val x: Float = 0f, val y: Float = 0f)
+
+/** A user-added, independently positioned keyboard or mouse input in the PC-style touch overlay. */
+@Serializable
+data class KeyboardOverlayButton(
+    val id: String,
+    val actionId: String,
+    /** Stable initial grid slot; moving the button stores an orientation-specific offset instead. */
+    val layoutIndex: Int = -1,
+)
 
 /**
  * Whether fingers are forwarded to the host as real touch rather than turned into a cursor.
@@ -345,6 +411,10 @@ enum class NativeTouchMode {
 data class AndroidTouchSettings(
     val enabled: Boolean = true,
     val mousePad: Boolean = true,
+    /** Replaces the virtual gamepad with a WASD stick and independently configurable keyboard/mouse buttons. */
+    val keyboardModeEnabled: Boolean = false,
+    /** Individually movable keyboard/mouse buttons; not limited by the gamepad's extra-button count. */
+    val keyboardButtons: List<KeyboardOverlayButton> = defaultKeyboardOverlayButtons(),
     val opacity: Float = 0.82f,
     val scale: Float = 1f,
     val buttonScale: Float = 1.102468f,
@@ -360,13 +430,19 @@ data class AndroidTouchSettings(
     val stickKnobScale: Float = 0.44f,
     /** Built-in clusters can be removed without giving up the rest of the overlay. */
     val visibleControlGroups: Set<TouchControlGroup> = TouchControlGroup.entries.toSet(),
-    /** Up to four independently mapped and positioned accessibility buttons. */
+    /** Independently mapped and positioned accessibility buttons. */
     val extraButtonActions: List<TouchExtraButtonAction> = listOf(
         TouchExtraButtonAction.Guide,
         TouchExtraButtonAction.None,
         TouchExtraButtonAction.None,
         TouchExtraButtonAction.None,
+        TouchExtraButtonAction.None,
+        TouchExtraButtonAction.None,
+        TouchExtraButtonAction.None,
+        TouchExtraButtonAction.None,
     ),
+    /** Sparse overrides for freely configurable simultaneous-action extra buttons. */
+    val extraButtonCombos: Map<String, TouchExtraButtonCombo> = emptyMap(),
     val extraButtonScale: Float = 1f,
     val joystickMode: TouchJoystickMode = TouchJoystickMode.Fixed,
     val aimMode: TouchAimMode = TouchAimMode.LockJoystick,
@@ -374,7 +450,7 @@ data class AndroidTouchSettings(
     val aimZoneScale: Float = 1f,
     /** Multiplies Lock Zone right-stick response without changing the zone footprint. */
     val aimZoneSensitivity: Float = 1f,
-    val joystickDeadZone: Float = 0f,
+    val joystickDeadZone: Float = DEFAULT_TOUCH_JOYSTICK_DEAD_ZONE,
     /** Opt-in motion aiming. Kept off for compatibility and to avoid unexpected camera motion. */
     val gyroscopeEnabled: Boolean = false,
     val gyroscopeSensitivity: Float = 1f,
@@ -395,17 +471,6 @@ data class AndroidTouchSettings(
      * the default and only activates for catalog variants that advertise TOUCHSCREEN support.
      */
     val nativeTouchOptedIn: Boolean = true,
-    /**
-     * Scales the velocity of touch movement in native touch mode. Values below 1.0 slow down
-     * scroll/swipe gestures; values above 1.0 speed them up. Default 1.0 = no scaling.
-     */
-    val nativeTouchScrollScale: Float = 1.0f,
-    /**
-     * Minimum movement in dp before a MOVE event is forwarded in native touch mode.
-     * Suppresses small sensor jitter that can look like a micro-swipe instead of a tap.
-     * Default 8dp matches ViewConfiguration.getScaledTouchSlop() on most devices.
-     */
-    val nativeTouchJitterThresholdDp: Float = 8f,
     val offsets: Map<String, TouchOffset> = mapOf(
         "lstick_landscape" to TouchOffset(-67.02336f, 1.4236208f),
         "l3_landscape" to TouchOffset(-159.65048f, 119.79623f),
@@ -421,16 +486,29 @@ data class AndroidTouchSettings(
         "extra2_landscape" to TouchOffset(-28f, 0f),
         "extra3_landscape" to TouchOffset(28f, 0f),
         "extra4_landscape" to TouchOffset(84f, 0f),
+        "extra5_landscape" to TouchOffset(-84f, 56f),
+        "extra6_landscape" to TouchOffset(-28f, 56f),
+        "extra7_landscape" to TouchOffset(28f, 56f),
+        "extra8_landscape" to TouchOffset(84f, 56f),
         "extra1_portrait" to TouchOffset(-84f, 0f),
         "extra2_portrait" to TouchOffset(-28f, 0f),
         "extra3_portrait" to TouchOffset(28f, 0f),
         "extra4_portrait" to TouchOffset(84f, 0f),
+        "extra5_portrait" to TouchOffset(-84f, 56f),
+        "extra6_portrait" to TouchOffset(-28f, 56f),
+        "extra7_portrait" to TouchOffset(28f, 56f),
+        "extra8_portrait" to TouchOffset(84f, 56f),
+        "keyboard_stick_landscape" to TouchOffset(),
+        "keyboard_buttons_landscape" to TouchOffset(),
+        "keyboard_stick_portrait" to TouchOffset(),
+        "keyboard_buttons_portrait" to TouchOffset(),
     ),
     val touchControllerStyle: TouchControllerStyle = TouchControllerStyle.V1,
     /** Overrides the skin's own accent. Null keeps whatever the chosen skin ships with. */
     val touchSkinTint: ControllerThemeRgb? = null,
     /** Off leaves the caps blank — the layout is muscle memory once it is learned. */
     val touchButtonLabels: Boolean = true,
+    val buttonAppearances: Map<String, TouchButtonAppearance> = emptyMap(),
 ) {
     fun getOffset(key: String): TouchOffset = offsets[key] ?: TouchOffset()
 
@@ -449,11 +527,29 @@ data class AndroidTouchSettings(
     fun extraButtonAction(index: Int): TouchExtraButtonAction =
         extraButtonActions.getOrNull(index) ?: TouchExtraButtonAction.None
 
+    fun extraButtonCombo(index: Int): List<TouchExtraButtonAction> =
+        extraButtonCombos[extraButtonComboKey(index)]?.actions?.let(::normalizeTouchExtraButtonCombo)
+            ?: expandedTouchExtraButtonActions(extraButtonAction(index))
+
     fun withExtraButtonAction(index: Int, action: TouchExtraButtonAction): AndroidTouchSettings {
         if (index !in 0 until TOUCH_EXTRA_BUTTON_COUNT) return this
         val actions = List(TOUCH_EXTRA_BUTTON_COUNT) { extraButtonAction(it) }.toMutableList()
         actions[index] = action
-        return copy(extraButtonActions = actions)
+        return copy(
+            extraButtonActions = actions,
+            extraButtonCombos = extraButtonCombos - extraButtonComboKey(index),
+        )
+    }
+
+    fun withExtraButtonCombo(index: Int, actions: List<TouchExtraButtonAction>): AndroidTouchSettings {
+        if (index !in 0 until TOUCH_EXTRA_BUTTON_COUNT) return this
+        val normalized = normalizeTouchExtraButtonCombo(actions)
+        val fallbacks = List(TOUCH_EXTRA_BUTTON_COUNT) { extraButtonAction(it) }.toMutableList()
+        fallbacks[index] = normalized.firstOrNull() ?: TouchExtraButtonAction.None
+        return copy(
+            extraButtonActions = fallbacks,
+            extraButtonCombos = extraButtonCombos + (extraButtonComboKey(index) to TouchExtraButtonCombo(normalized)),
+        )
     }
 
     fun withResetOffsets(): AndroidTouchSettings {
@@ -482,18 +578,22 @@ data class AndroidTouchSettings(
     }
 }
 
-internal const val TOUCH_EXTRA_BUTTON_COUNT = 4
+internal const val TOUCH_EXTRA_BUTTON_COUNT = 8
+internal const val DEFAULT_TOUCH_JOYSTICK_DEAD_ZONE = 0.05f
 
 internal const val DEFAULT_CATALOG_SORT_ID = "most_popular"
 internal const val NEWLY_ADDED_CATALOG_SORT_ID = "last_added"
 internal const val CATALOG_SORT_DEFAULT_VERSION = 1
+internal const val GAME_BORDERS_DEFAULT_VERSION = 1
 
 @Serializable
 data class AppSettings(
     val stream: StreamSettings = StreamSettings(),
+    /** Persisted SAF tree URI used for subsequent stream recordings. */
+    val recordingDirectoryUri: String? = null,
     val streamPreset: StreamPreset = StreamPreset.Recommended,
     val posterSizeScale: Float = 1f,
-    val compactGameCards: Boolean = true,
+    val compactGameCards: Boolean = false,
     val handheldLandscapeFourColumnGrid: Boolean = false,
     val handheldLandscapeSquareCards: Boolean = false,
     val nerdCatalogBackground: Boolean = false,
@@ -501,22 +601,30 @@ data class AppSettings(
     val ambientBackgroundEnabled: Boolean = true,
     /** Reveals the device's static or live wallpaper behind OpenNOW's non-stream UI. */
     val systemWallpaperBackground: Boolean = false,
+    /** Null keeps the existing wallpaper-aware navigation rail tint. */
+    val navigationRailBackgroundOpacity: Float? = null,
     val catalogBackgroundPreset: CatalogBackgroundPreset = CatalogBackgroundPreset.ColorfulAbstract,
     val nerdCatalogBackgroundUri: String? = null,
     val tvSafeAreaPaddingDp: Float = 16f,
     val tvLayoutProfileVersion: Int = 0,
     val localTvRemoteEnabled: Boolean = false,
     /** Game titles under the poster in the catalog grid. Off makes the grid pure box art. */
-    val showCardTitles: Boolean = true,
+    val showCardTitles: Boolean = false,
     /** Optional favorite affordance over catalogue artwork on mobile, handheld, and TV layouts. */
     val showFavoriteIconOnGameCards: Boolean = false,
+    /** Shows a catalog marker when NVIDIA names a paid minimum streaming membership. */
+    val showPremiumMarker: Boolean = true,
     val expressiveUi: Boolean = true,
     val uselessMascotEnabled: Boolean = false,
     val uselessMascotDelaySeconds: Int = 5,
     /** Static outlines around game artwork, independent from optional animated border effects. */
     val liveSelectedOutlines: Boolean = false,
-    /** Animated focus energy using the selected interface accent; never changes the accent itself. */
+    /** One-time migration disabling game borders; later explicit opt-ins remain untouched. */
+    val gameBordersDefaultVersion: Int = 0,
+    /** Animated focus energy; never changes the interface accent itself. */
     val absoluteCinemaEffects: Boolean = false,
+    /** Optional independent colors for animated selection effects. Null follows the theme. */
+    val selectionEffectColors: SelectionEffectColors? = null,
     /** Extends Absolute Cinema to pointer hover and non-controller focus surfaces throughout the UI. */
     val absoluteCinemaEverywhere: Boolean = false,
     val dynamicColor: Boolean = false,
@@ -532,8 +640,10 @@ data class AppSettings(
      * the cloud catalogue most of the time wants that fold to survive leaving the Library.
      */
     val localAppsCollapsed: Boolean = false,
-    /** The New games added hero in handheld landscape; dismissible from the hero header. */
+    /** Whether the New games added hero exists at all in handheld landscape. */
     val landscapeNewGamesHero: Boolean = true,
+    /** Folded hero state, kept separately so Interface settings remain the permanent off switch. */
+    val landscapeNewGamesHeroCollapsed: Boolean = false,
     /** Catalogue presentation is user preference, not disposable screen state. */
     val catalogSortId: String = DEFAULT_CATALOG_SORT_ID,
     /** Lets the old relevance default migrate once without overriding a later explicit choice. */
@@ -550,17 +660,30 @@ data class AppSettings(
     val showStatsOnLaunch: Boolean = true,
     val streamStatsStyle: StreamStatsStyle = StreamStatsStyle.Compact,
     val streamStatsPosition: StreamStatsPosition = StreamStatsPosition.Right,
+    /** Normalized top-left status position; null keeps the selected left/center/right preset. */
+    val streamStatsCustomX: Float? = null,
+    val streamStatsCustomY: Float? = null,
     val streamStatsMetrics: StreamStatsMetrics = StreamStatsMetrics(),
+    val streamStatsBackgroundEnabled: Boolean = true,
+    val streamStatsBackgroundOpacity: Float = DEFAULT_STREAM_STATS_BACKGROUND_OPACITY,
     /** Controller rumble when available, with device haptics as the fallback output. */
     @SerialName("phoneRumbleFallback")
     val vibrationEnabled: Boolean = true,
     val hapticsOutput: HapticsOutputPreference = HapticsOutputPreference.Auto,
     val hideServerSelector: Boolean = false,
+    /** The user acknowledged that choosing a shorter queue can increase stream latency. */
+    val higherPingWarningDismissed: Boolean = false,
+    /** The user declined the pre-queue background-unlimited prompt. */
+    val batteryOptimizationPromptDismissed: Boolean = false,
     val controllerMode: Boolean = false,
     val controllerUiSounds: Boolean = true,
     val controllerMouseEmulation: Boolean = false,
+    /** Automatically enable the right-stick launcher cursor at the start of TV streams. */
+    val controllerMouseAutoArmOnTv: Boolean = true,
     /** Capture an external mouse during gameplay so Android system edges cannot steal it. */
     val externalMousePointerLock: Boolean = true,
+    /** Physical-keyboard shortcut used to open Stream Controls during a session. */
+    val streamMenuShortcut: String = DEFAULT_ANDROID_STREAM_MENU_SHORTCUT,
     val controllerBackgroundAnimations: Boolean = true,
     val controllerThemeStyle: String = "aurora",
     val controllerThemeColor: ControllerThemeRgb = ControllerThemeRgb(),
@@ -584,21 +707,27 @@ data class AppSettings(
     val favoriteGameIds: List<String> = emptyList(),
     val defaultGameVariantIds: Map<String, String> = emptyMap(),
     val sessionCounterEnabled: Boolean = true,
-    val showSessionReportAfterStream: Boolean = false,
-    /** One-time migration that makes post-stream reports opt-in instead of upgrade-persistent. */
+    val showSessionReportAfterStream: Boolean = true,
+    /** One-time migration enabling the score report; subsequent user opt-outs are preserved. */
     val sessionReportDefaultVersion: Int = 0,
     /** 1.6.4 resets the previously automatic NVST opt-in once, including APK upgrades. */
     val nvstOptInVersion: Int = 0,
     val sessionClockShowEveryMinutes: Int = 60,
     val sessionClockShowDurationSeconds: Int = 30,
     val clipboardPaste: Boolean = true,
+    val physicalInput: PhysicalInputSettings = PhysicalInputSettings(),
     val androidTouch: AndroidTouchSettings = AndroidTouchSettings(),
+    /** One-time upgrade from the old 0% touch-stick default; later explicit choices are retained. */
+    val touchJoystickDefaultVersion: Int = 0,
+    val touchControlPresets: List<TouchControlPreset> = emptyList(),
     val androidStreamGuideDismissed: Boolean = false,
     val androidPhysicalControllerPromptDismissed: Boolean = false,
     val discordRichPresence: Boolean = false,
     val autoCheckForUpdates: Boolean = true,
     val allowEscapeToExitFullscreen: Boolean = false,
     val nativeLowLatencyDecoder: Boolean = false,
+    /** Playback route for new streams; false uses Android's standard media output path. */
+    val lowLatencyGameAudio: Boolean = true,
     /**
      * Keeps resolution, FPS, and bitrate exactly as configured for the whole session.
      *
@@ -621,13 +750,13 @@ data class AppSettings(
      * `AndroidDeveloperOptions.kt`.
      */
     val developerOptionsUnlocked: Boolean = false,
-    val chizuiLoginUrl: String = "https://gfn.chizui.dev",
+    val chizuiLoginUrl: String = "https://gfn.chizuui.com",
 )
 
 internal const val MIN_GAME_CARD_SCALE = 0.75f
 internal const val MAX_GAME_CARD_SCALE = 1.4f
 internal const val STREAM_PRESENTATION_PROFILE_VERSION = 3
-internal const val SESSION_REPORT_DEFAULT_VERSION = 1
+internal const val SESSION_REPORT_DEFAULT_VERSION = 2
 
 /**
  * Re-asserts the stream presentation defaults once per profile version.
@@ -650,6 +779,9 @@ internal fun streamResolutionPixels(settings: StreamSettings): Pair<Int, Int> {
     }
     return parseResolutionPixels(normalizeStreamResolutionForAspect(settings.resolution, settings.aspectRatio))
 }
+
+internal fun StreamSettings.requiresNativeAndroidCloudMatchMode(): Boolean =
+    streamResolutionPixels(this) == parseResolutionPixels(PORTAL_STREAM_RESOLUTION)
 
 internal fun StreamSettings.requiresNativeDesktopCloudMatchMode(): Boolean {
     val (width, height) = streamResolutionPixels(this)
@@ -863,7 +995,16 @@ internal fun streamSettingsSessionSignature(settings: StreamSettings): String {
         "l4s=${if (compatible.enableL4S) 1 else 0}",
         "keyboard=${compatible.keyboardLayout.trim()}",
         "language=${compatible.gameLanguage.trim()}",
-    ).joinToString(";").let { if (settings.experimentalNvst) "$it;transport=nvst" else it }
+    ).joinToString(";").let { signature ->
+        val withControllers = if (settings.multiControllerEnabled) "$signature;controllers=4" else signature
+        val withTransport = if (settings.experimentalNvst) "$withControllers;transport=nvst" else withControllers
+        if (settings.experimentalDynamicNetworkAdjustment) {
+            val minimumMbps = StreamNetworkAdaptation.bitrateRange(compatible).minimumKbps / 1000
+            "$withTransport;dynamic=1;minBitrate=$minimumMbps"
+        } else {
+            withTransport
+        }
+    }
 }
 
 internal data class StreamResolutionOption(
@@ -996,12 +1137,21 @@ internal fun monthlyHoursRemainingFor(subscriptionInfo: SubscriptionInfo?, fallb
     return (limit - (subscriptionInfo?.usedHours ?: 0.0)).coerceAtLeast(0.0)
 }
 
+/** Temporary Android-wide kill switch. Keep the HDR implementation dormant until it is safe to
+ * re-enable after device validation. */
+internal const val ANDROID_HDR_STREAMING_ENABLED = false
+
 internal fun StreamSettings.withHdrAllowed(subscriptionInfo: SubscriptionInfo?, fallbackMembershipTier: String?): StreamSettings =
-    if (hdrEnabled && !hasHdrStreamingPlan(subscriptionInfo, fallbackMembershipTier)) copy(hdrEnabled = false).withCodecColorCompatibility() else withCodecColorCompatibility()
+    if (hdrEnabled && (!ANDROID_HDR_STREAMING_ENABLED || !hasHdrStreamingPlan(subscriptionInfo, fallbackMembershipTier))) {
+        copy(hdrEnabled = false, hdrDisplay = null).withCodecColorCompatibility()
+    } else {
+        withCodecColorCompatibility()
+    }
 
 /** Transport envelope; the actual HDR10 display and decoder are checked at launch. */
 @Suppress("UNUSED_PARAMETER")
 internal fun StreamSettings.hdrAvailableForAndroid(androidTvProfile: Boolean): Boolean {
+    if (!ANDROID_HDR_STREAMING_ENABLED) return false
     val (width, height) = streamResolutionPixels(this)
     return codec == VideoCodec.H265 && fps <= 60 && width <= 3840 && height <= 2160
 }
@@ -1025,42 +1175,32 @@ internal fun ColorQuality.availableForCodec(codec: VideoCodec): Boolean =
         (codec != VideoCodec.AV1 || !isTenBit())
 
 internal fun StreamSettings.withAndroidSettingsAvailability(): StreamSettings {
-    val providerCompatible = withProviderCompatibleUltrawideGeometry()
-    val availableCodec = if (providerCompatible.codec.availableForAndroidSettings()) providerCompatible.codec else VideoCodec.H264
-    val normalized = if (availableCodec == providerCompatible.codec) providerCompatible else providerCompatible.copy(codec = availableCodec)
+    val availableCodec = if (codec.availableForAndroidSettings()) codec else VideoCodec.H264
+    val normalized = if (availableCodec == codec) this else copy(codec = availableCodec)
     return normalized.withCodecColorCompatibility()
 }
 
-/**
- * The old Portal-sized option used the panel's 1376x640 dimensions, but GFN does not expose that
- * low 19.5:9 mode. CloudMatch selected 1680x720 and the cloud streamer then cropped it to 1376x590.
- * Treat the observed 21:9 mode as the user's requested geometry so launch, negotiation, decoding,
- * input mapping, and profile-change reporting all describe the same stream.
- */
-private fun StreamSettings.withProviderCompatibleUltrawideGeometry(): StreamSettings =
-    if (resolution == LEGACY_PORTAL_STREAM_RESOLUTION && aspectRatio == LEGACY_PORTAL_STREAM_ASPECT) {
-        copy(resolution = LOW_ULTRAWIDE_STREAM_RESOLUTION, aspectRatio = "21:9")
-    } else {
-        this
-    }
-
 internal fun StreamSettings.withCodecColorCompatibility(): StreamSettings {
-    val compatibleHdr = hdrEnabled && codec != VideoCodec.AV1
+    val compatibleHdr = ANDROID_HDR_STREAMING_ENABLED && hdrEnabled && codec != VideoCodec.AV1
+    val compatibleHdrDisplay = hdrDisplay.takeIf { compatibleHdr }
     val compatibleColor = when {
         codec == VideoCodec.AV1 -> ColorQuality.EightBit420
+        compatibleHdr -> ColorQuality.EightBit420
         colorQuality.isChroma444() -> colorQuality.asChroma420()
-        compatibleHdr && !colorQuality.isTenBit() -> ColorQuality.TenBit420
         else -> colorQuality
     }
-    return if (compatibleColor == colorQuality && compatibleHdr == hdrEnabled) {
+    return if (compatibleColor == colorQuality && compatibleHdr == hdrEnabled && compatibleHdrDisplay == hdrDisplay) {
         this
     } else {
-        copy(colorQuality = compatibleColor, hdrEnabled = compatibleHdr)
+        copy(colorQuality = compatibleColor, hdrEnabled = compatibleHdr, hdrDisplay = compatibleHdrDisplay)
     }
 }
 
+/** When the HDR kill switch is enabled again, HDR must use a ten-bit HEVC profile. The separate
+ * color-quality selector remains available for ten-bit SDR while HDR is disabled. */
 internal fun StreamSettings.usesTenBitStreamProfile(): Boolean =
-    hdrEnabled || colorQuality.isTenBit()
+    (ANDROID_HDR_STREAMING_ENABLED && hdrEnabled && codec == VideoCodec.H265) ||
+        ((!ANDROID_HDR_STREAMING_ENABLED || !hdrEnabled) && colorQuality.isTenBit())
 
 internal fun StreamSettings.applyingStreamPreset(preset: StreamPreset): StreamSettings {
     if (preset == StreamPreset.Custom) return this
@@ -1080,10 +1220,6 @@ internal fun StreamSettings.withoutExperimentalTransportRequests(): StreamSettin
     if (!enableL4S) this else copy(enableL4S = false)
 
 internal fun StreamSettings.withResolutionAllowed(subscriptionInfo: SubscriptionInfo?, fallbackMembershipTier: String?): StreamSettings {
-    val providerCompatible = withProviderCompatibleUltrawideGeometry()
-    if (providerCompatible != this) {
-        return providerCompatible.withResolutionAllowed(subscriptionInfo, fallbackMembershipTier)
-    }
     val customResolution = customStreamResolutionOrNull(resolution)
     if (customResolution != null && customResolutionAllowedForPlan(customResolution, subscriptionInfo, fallbackMembershipTier)) {
         val normalizedResolution = "${customResolution.first}x${customResolution.second}"
@@ -1120,7 +1256,6 @@ private fun customStreamResolutionOrNull(resolution: String): Pair<Int, Int>? =
     }
 
 private val UNSUPPORTED_LEGACY_STREAM_RESOLUTIONS = setOf(
-    "1376x640",
     "1600x720",
     "2400x1080",
     "3200x1440",
@@ -1144,6 +1279,8 @@ private fun customResolutionAllowedForPlan(
         pixels <= availableChoices.maxOf { it.width * it.height }
 }
 
+private const val PORTAL_STREAM_RESOLUTION = "1376x640"
+
 internal val STREAM_RESOLUTION_OPTIONS = listOf(
     StreamResolutionOption("1280x720", "16:9", "720"),
     StreamResolutionOption("1366x768", "16:9", "768"),
@@ -1157,6 +1294,7 @@ internal val STREAM_RESOLUTION_OPTIONS = listOf(
     StreamResolutionOption("1112x834", "4:3", "834"),
     StreamResolutionOption("1600x1200", "4:3", "1080"),
     StreamResolutionOption("1280x1024", "5:4", "1050"),
+    StreamResolutionOption(PORTAL_STREAM_RESOLUTION, "19.5:9", "720"),
     StreamResolutionOption("1376x590", "21:9", "720"),
     StreamResolutionOption("1680x720", "21:9", "720"),
     StreamResolutionOption("2340x1080", "19.5:9", "1080", StreamResolutionPlan.Priority),
@@ -1174,7 +1312,7 @@ internal val STREAM_RESOLUTION_OPTIONS = listOf(
 )
 
 private val PREFERRED_RESOLUTION_BY_TIER_AND_ASPECT = mapOf(
-    "720" to mapOf("16:9" to "1280x720", "16:10" to "1280x800", "4:3" to "1024x768", "21:9" to "1680x720"),
+    "720" to mapOf("16:9" to "1280x720", "16:10" to "1280x800", "4:3" to "1024x768", "19.5:9" to PORTAL_STREAM_RESOLUTION, "21:9" to "1680x720"),
     "768" to mapOf("16:9" to "1366x768", "4:3" to "1024x768"),
     "834" to mapOf("4:3" to "1112x834"),
     "900" to mapOf("16:9" to "1600x900", "16:10" to "1440x900"),
@@ -1283,8 +1421,19 @@ internal fun gameMembershipRequirement(
     )
 }
 
+/** A catalog property, independent of whether this account already has the required plan. */
+internal fun GameInfo.hasPremiumMembershipMarker(): Boolean =
+    membershipTierLabel?.let { label ->
+        val normalized = normalizeMembershipTier(label)
+        normalized.contains("PREMIUM") ||
+            streamResolutionPlanRank(planForMembershipTier(label)) > streamResolutionPlanRank(StreamResolutionPlan.Free)
+    } == true
+
+private fun normalizeMembershipTier(membershipTier: String?): String =
+    membershipTier.orEmpty().uppercase(Locale.US).replace(NON_ALNUM_UPPER_RUN, "")
+
 private fun planForMembershipTier(membershipTier: String?): StreamResolutionPlan {
-    val normalized = membershipTier.orEmpty().uppercase(Locale.US).replace(NON_ALNUM_UPPER_RUN, "")
+    val normalized = normalizeMembershipTier(membershipTier)
     return when {
         normalized.contains("ULTIMATE") || normalized.contains("RTX3080") -> StreamResolutionPlan.Ultimate
         normalized.contains("PRIORITY") || normalized.contains("PERFORMANCE") || normalized.contains("FOUNDERS") -> StreamResolutionPlan.Priority
@@ -1589,6 +1738,7 @@ internal fun gameStoreDisplayName(store: String): String {
             "STEAM" -> "Steam"
             "XBOX", "XBOX_GAME_PASS" -> "Xbox"
             "MICROSOFT", "MICROSOFT_STORE" -> "Microsoft Store"
+            "HOYOVERSE", "HOYOPLAY", "MIHOYO" -> "HoYoverse"
             else -> part.replace('_', ' ').lowercase(Locale.US)
                 .split(WHITESPACE_RUN)
                 .filter { it.isNotBlank() }
@@ -1628,25 +1778,29 @@ internal fun displayStoresForVariants(variants: List<GameVariant>): List<String>
         .distinctBy { normalizeGameStore(it) }
 
 internal fun libraryStoreDisplayNames(game: GameInfo): List<String> {
+    val eligibleVariants = game.variants.filterNot { it.libraryStatus == "NOT_OWNED" }
     val variants = when {
         game.variants.any(::isOwnedGameVariant) -> game.variants.filter(::isOwnedGameVariant)
-        game.isInLibrary -> listOfNotNull(game.variants.firstOrNull { it.librarySelected == true })
-            .ifEmpty { listOfNotNull(game.variants.getOrNull(game.selectedVariantIndex)) }
-            .ifEmpty { game.variants.take(1) }
+        game.isInLibrary -> listOfNotNull(eligibleVariants.firstOrNull { it.librarySelected == true })
+            .ifEmpty { listOfNotNull(game.variants.getOrNull(game.selectedVariantIndex)?.takeIf { it in eligibleVariants }) }
+            .ifEmpty { eligibleVariants.take(1) }
         else -> emptyList()
     }
     val variantStores = variants
         .flatMap { variant -> gameStoreDisplayName(variant.store).split(" / ") }
         .map { it.trim() }
-        .filter { it.isNotBlank() }
+        .filter { it.isNotBlank() && !it.equals("Unknown", ignoreCase = true) && !it.equals("None", ignoreCase = true) }
         .distinctBy { normalizeGameStore(it) }
     if (variantStores.isNotEmpty()) return variantStores
     if (!game.isInLibrary) return emptyList()
+    if (eligibleVariants.isEmpty() && game.variants.isNotEmpty()) return emptyList()
     return game.availableStores
-        .map(::gameStoreDisplayName)
+        .flatMap { gameStoreDisplayName(it).split(" / ") }
         .map { it.trim() }
-        .filter { it.isNotBlank() }
+        .filter { it.isNotBlank() && !it.equals("Unknown", ignoreCase = true) && !it.equals("None", ignoreCase = true) }
         .distinctBy { normalizeGameStore(it) }
+        .takeIf { it.size == 1 }
+        .orEmpty()
 }
 
 internal fun mergeGameInfo(left: GameInfo, right: GameInfo): GameInfo {
@@ -1870,6 +2024,7 @@ data class SessionInfo(
     val zone: String = "",
     val assignedZone: String? = null,
     val streamingBaseUrl: String? = null,
+    val sessionControlBaseUrl: String? = null,
     val serverIp: String,
     val signalingServer: String,
     val signalingUrl: String,
@@ -1993,6 +2148,7 @@ internal fun parseResolutionPixelsOrNull(value: String?): Pair<Int, Int>? {
     return if (width != null && height != null && width > 0 && height > 0) width to height else null
 }
 
+@Serializable
 data class CodecCapability(
     val codec: VideoCodec,
     val decoderAvailable: Boolean,
@@ -2011,6 +2167,7 @@ data class CodecCapability(
     val maxSupportedHeight: Int? = null,
 )
 
+@Serializable
 data class RuntimeCodecReport(
     val capabilities: List<CodecCapability>,
     val nativeRuntimeSummary: String,
@@ -2019,6 +2176,7 @@ data class RuntimeCodecReport(
     val constrainedRuntimeProfile: Boolean = false,
 )
 
+@Serializable
 data class StreamRuntimeStats(
     val bitrateKbps: Int? = null,
     val availableIncomingBitrateKbps: Int? = null,
@@ -2197,14 +2355,25 @@ internal fun StreamSettings.androidSafeVideoFallback(): StreamSettings =
         streamSharpeningEnabled = false,
     )
 
+/** Conservative one-shot retry after CloudMatch rejects a demanding launch profile. */
+internal fun StreamSettings.loweredSessionLaunchProfile(): StreamSettings =
+    copy(
+        resolution = "1920x1080",
+        aspectRatio = "16:9",
+        fps = minOf(fps, 60),
+        maxBitrateMbps = minOf(maxBitrateMbps, 75),
+        codec = VideoCodec.H264,
+        colorQuality = ColorQuality.EightBit420,
+        hdrEnabled = false,
+        enableL4S = false,
+        experimentalNvst = false,
+        experimentalDynamicNetworkAdjustment = false,
+        streamSharpeningEnabled = false,
+    ).withCodecColorCompatibility()
+
 private fun StreamSettings.androidWebRtcColorQuality(): ColorQuality {
     val compatible = withCodecColorCompatibility()
-    if (compatible.hdrEnabled) return when (compatible.colorQuality) {
-        ColorQuality.TenBit420,
-        ColorQuality.TenBit444,
-        -> compatible.colorQuality
-        else -> ColorQuality.TenBit420
-    }
+    if (compatible.hdrEnabled) return ColorQuality.EightBit420
     return when (compatible.colorQuality) {
         ColorQuality.EightBit420,
         ColorQuality.EightBit444,
@@ -2215,8 +2384,7 @@ private fun StreamSettings.androidWebRtcColorQuality(): ColorQuality {
 
 private fun StreamSettings.withStableAndroidCloudMatchProfile(): StreamSettings {
     val normalizedResolution = normalizeStreamResolutionForAspect(resolution, aspectRatio)
-    // The provider's low 21:9 mode was observed at 60 FPS. Requesting the retired 1376x640 panel
-    // geometry at high refresh made CloudMatch select 1680x720 before the streamer cropped it.
+    // Keep the observed low 21:9 mode at its supported 60 FPS profile.
     val geometryCompatibleFps = if (normalizedResolution == LOW_ULTRAWIDE_STREAM_RESOLUTION) {
         LOW_ULTRAWIDE_STREAM_MAX_FPS
     } else {
@@ -2260,8 +2428,6 @@ private fun StreamResolutionOption.pixelCount(): Int {
 }
 
 private const val LOW_POWER_TV_FPS_CAP = 60
-private const val LEGACY_PORTAL_STREAM_RESOLUTION = "1376x640"
-private const val LEGACY_PORTAL_STREAM_ASPECT = "19.5:9"
 private const val LOW_ULTRAWIDE_STREAM_RESOLUTION = "1376x590"
 private const val LOW_ULTRAWIDE_STREAM_MAX_FPS = 60
 private const val MAX_STANDARD_STREAM_FPS = 60

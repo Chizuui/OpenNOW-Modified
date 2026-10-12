@@ -43,6 +43,8 @@ class SettingsPersistenceTest {
         val latest = AppSettings(
             favoriteGameIds = listOf("a", "b"),
             localAppsCollapsed = true,
+            landscapeNewGamesHeroCollapsed = true,
+            batteryOptimizationPromptDismissed = true,
             hapticsOutput = HapticsOutputPreference.Device,
             androidTouch = AndroidTouchSettings(
                 touchControllerStyle = TouchControllerStyle.Neon,
@@ -61,10 +63,22 @@ class SettingsPersistenceTest {
                 gyroscopeEnabled = true,
                 gyroscopeSensitivity = 1.4f,
                 gyroscopeInvertVertical = true,
+            ).withExtraButtonCombo(
+                1,
+                listOf(TouchExtraButtonAction.RightTrigger, TouchExtraButtonAction.KeyboardD),
             ),
         )
         val decoded = OpenNowJson.decodeFromString<AppSettings>(OpenNowJson.encodeToString(latest))
         assertEquals(latest, decoded)
+    }
+
+    @Test
+    fun standardMediaAudioChoiceSurvivesSettingsReload() {
+        val saved = AppSettings(lowLatencyGameAudio = false)
+        val restored = OpenNowJson.decodeFromString<AppSettings>(OpenNowJson.encodeToString(saved))
+
+        assertFalse(restored.normalizedForAndroid().lowLatencyGameAudio)
+        assertTrue(OpenNowJson.decodeFromString<AppSettings>("{}").lowLatencyGameAudio)
     }
 
     @Test
@@ -76,17 +90,28 @@ class SettingsPersistenceTest {
     }
 
     @Test
-    fun programmableButtonsNormalizeToFourSafeSlots() {
+    fun programmableButtonsNormalizeToEightSafeSlots() {
         val normalized = AppSettings(
             androidTouch = AndroidTouchSettings(
                 extraButtonActions = listOf(TouchExtraButtonAction.A),
                 extraButtonScale = Float.POSITIVE_INFINITY,
+                extraButtonCombos = mapOf(
+                    "1" to TouchExtraButtonCombo(
+                        List(MAX_TOUCH_EXTRA_BUTTON_COMBO_ACTIONS + 3) { TouchExtraButtonAction.entries[it + 1] },
+                    ),
+                    "99" to TouchExtraButtonCombo(listOf(TouchExtraButtonAction.B)),
+                ),
+                offsets = mapOf("extra1_landscape" to TouchOffset(9f, 11f)),
             ),
         ).normalizedForAndroid().androidTouch
 
         assertEquals(TOUCH_EXTRA_BUTTON_COUNT, normalized.extraButtonActions.size)
         assertEquals(TouchExtraButtonAction.A, normalized.extraButtonAction(0))
-        assertEquals(TouchExtraButtonAction.None, normalized.extraButtonAction(3))
+        assertEquals(TouchExtraButtonAction.None, normalized.extraButtonAction(7))
+        assertEquals(MAX_TOUCH_EXTRA_BUTTON_COMBO_ACTIONS, normalized.extraButtonCombo(0).size)
+        assertFalse("99" in normalized.extraButtonCombos)
         assertEquals(AndroidTouchSettings().extraButtonScale, normalized.extraButtonScale, 0.0001f)
+        assertEquals(TouchOffset(9f, 11f), normalized.getOffset("extra1_landscape"))
+        assertEquals(AndroidTouchSettings().getOffset("extra8_landscape"), normalized.getOffset("extra8_landscape"))
     }
 }

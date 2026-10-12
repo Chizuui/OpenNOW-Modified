@@ -17,6 +17,12 @@ class AndroidTvUiBehaviorTest {
     }
 
     @Test
+    fun profileMenuDividerFollowsGameBorderToggle() {
+        assertFalse(shouldShowProfileMenuDivider(gameBordersEnabled = false))
+        assertTrue(shouldShowProfileMenuDivider(gameBordersEnabled = true))
+    }
+
+    @Test
     fun chosenWallpaperAlsoBacksSettingsButNeverTheStream() {
         val wallpaper = AppSettings(nerdCatalogBackground = true)
 
@@ -250,9 +256,77 @@ class AndroidTvUiBehaviorTest {
     }
 
     @Test
-    fun catalogueWallpaperMakesTheHorizontalRailSubstantiallyDarker() {
-        assertEquals(OpenNowPalette.ChromeScrim, navigationRailScrim(darkenForCatalogBackground = false))
-        assertEquals(Color.Black.copy(alpha = 0.76f), navigationRailScrim(darkenForCatalogBackground = true))
+    fun horizontalRailUsesStaticOutlinesAndAQuieterOutlineFreeGlass() {
+        assertEquals(
+            Color.Black.copy(alpha = 0.10f),
+            navigationRailScrim(darkenForCatalogBackground = false, staticOutlines = false),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.18f),
+            navigationRailScrim(darkenForCatalogBackground = false, staticOutlines = true),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.58f),
+            navigationRailScrim(darkenForCatalogBackground = true, staticOutlines = false),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.68f),
+            navigationRailScrim(darkenForCatalogBackground = true, staticOutlines = true),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.15f),
+            navigationRailScrim(
+                darkenForCatalogBackground = false,
+                staticOutlines = false,
+                tvProfile = true,
+            ),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.63f),
+            navigationRailScrim(
+                darkenForCatalogBackground = true,
+                staticOutlines = false,
+                tvProfile = true,
+            ),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0.85f),
+            navigationRailScrim(
+                darkenForCatalogBackground = true,
+                tvProfile = true,
+                customOpacity = 0.85f,
+            ),
+        )
+        assertEquals(
+            Color.Black.copy(alpha = 0f),
+            navigationRailScrim(darkenForCatalogBackground = true, customOpacity = 0f),
+        )
+    }
+
+    @Test
+    fun lowPowerRuntimeProfilesAutomaticallyUseReducedUiMotion() {
+        assertFalse(shouldAutomaticallyReduceUiMotion(false, false, false))
+        assertTrue(shouldAutomaticallyReduceUiMotion(true, false, false))
+        assertTrue(shouldAutomaticallyReduceUiMotion(false, true, false))
+        assertTrue(shouldAutomaticallyReduceUiMotion(false, false, true))
+    }
+
+    @Test
+    fun capabilityThrottlingDoesNotDisableAnExplicitlyEnabledControllerEffect() {
+        assertFalse(
+            shouldReduceControllerFocusMotion(
+                systemAnimatorScale = 1f,
+                controllerBackgroundAnimations = true,
+            ),
+        )
+        assertTrue(shouldReduceControllerFocusMotion(0f, controllerBackgroundAnimations = true))
+        assertTrue(shouldReduceControllerFocusMotion(1f, controllerBackgroundAnimations = false))
+    }
+
+    @Test
+    fun tvSearchLeavesDpadEventsForTheSystemKeyboard() {
+        assertFalse(shouldMoveFocusFromSearchField(gamepadImeMode = true))
+        assertTrue(shouldMoveFocusFromSearchField(gamepadImeMode = false))
     }
 
     @Test
@@ -529,12 +603,6 @@ class AndroidTvUiBehaviorTest {
                 allowWithPhysicalMouse = true,
             ),
         )
-    }
-
-    @Test
-    fun handheldDevicesUseLowLatencyAudioBuffering() {
-        assertFalse(shouldUseLowLatencyStreamAudio(androidTvProfile = true))
-        assertTrue(shouldUseLowLatencyStreamAudio(androidTvProfile = false))
     }
 
     @Test

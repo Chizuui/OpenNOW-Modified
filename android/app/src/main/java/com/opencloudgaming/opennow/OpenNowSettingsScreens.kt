@@ -40,8 +40,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.annotation.StringRes
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.DeveloperMode
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Person
@@ -49,6 +51,7 @@ import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Tv
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -65,6 +68,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -207,11 +211,18 @@ private enum class SettingsCategory(
 ) {
     General(R.string.settings_category_general, R.string.settings_category_general_summary, Icons.Outlined.Tune),
     Stream(R.string.settings_category_stream, R.string.settings_category_stream_summary, Icons.Outlined.Monitor),
+    Recording(R.string.settings_category_recording, R.string.settings_category_recording_summary, Icons.Outlined.Movie),
     Input(R.string.settings_category_input, R.string.settings_category_input_summary, Icons.Outlined.SportsEsports),
     Interface(R.string.settings_category_interface, R.string.settings_category_interface_summary, Icons.Outlined.Palette),
     Account(R.string.settings_category_account, R.string.settings_category_account_summary, Icons.Outlined.Person),
+    BugReports(
+        R.string.settings_category_bug_reports,
+        R.string.settings_category_bug_reports_summary,
+        Icons.Outlined.BugReport,
+    ),
     TvPairing(R.string.tv_pair_settings_title, R.string.tv_pair_settings_summary, Icons.Outlined.Tv),
     Advanced(R.string.settings_category_advanced, R.string.settings_category_advanced_summary, Icons.Outlined.Science),
+    Changelogs(R.string.changelog_title, R.string.changelog_summary, Icons.Outlined.History),
     About(R.string.settings_category_about, R.string.settings_category_about_summary, Icons.Outlined.Info),
 
     /** Hidden until the About build-number gesture unlocks it. See `AndroidDeveloperOptions.kt`. */
@@ -445,6 +456,7 @@ internal fun SettingsScreen(
                             onQueryChange = onSearchQueryChange,
                             placeholder = stringResource(R.string.search_settings),
                             focusRequester = searchFocusRequester,
+                            gamepadImeMode = tvProfile,
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
@@ -461,7 +473,10 @@ internal fun SettingsScreen(
                             selectedCategory = category,
                             categories = categories,
                             detailFocusRequester = detailFocusRequester,
-                            onSelectCategory = { selectedCategory = it },
+                            onSelectCategory = {
+                                onSearchQueryChange("")
+                                selectedCategory = it
+                            },
                             onBack = { selectedCategory = settingsCategoryParent(selectedCategory) },
                             showSessionProxyWarning = { showSessionProxyWarning = true },
                         )
@@ -493,6 +508,7 @@ internal fun SettingsScreen(
                                 onQueryChange = onSearchQueryChange,
                                 placeholder = stringResource(R.string.search_settings),
                                 focusRequester = searchFocusRequester,
+                                gamepadImeMode = tvProfile,
                                 modifier = Modifier.fillMaxWidth(),
                             )
                         }
@@ -511,7 +527,10 @@ internal fun SettingsScreen(
                                 selectedCategory = category,
                                 categories = categories,
                                 detailFocusRequester = detailFocusRequester,
-                                onSelectCategory = { selectedCategory = it },
+                                onSelectCategory = {
+                                    onSearchQueryChange("")
+                                    selectedCategory = it
+                                },
                                 onBack = { selectedCategory = settingsCategoryParent(selectedCategory) },
                                 showSessionProxyWarning = { showSessionProxyWarning = true },
                             )
@@ -653,10 +672,36 @@ private fun SettingsContent(
 ) {
     val settings = state.settings
     val context = LocalContext.current
+    val changelogs by produceState(emptyList<ChangelogEntry>(), context) {
+        value = withContext(Dispatchers.IO) { ChangelogRepository(context).entries }
+    }
+    if (selectedCategory == SettingsCategory.Changelogs && searchQuery.isBlank()) {
+        ChangelogSettingsContent(changelogs)
+        return
+    }
     val gyroscopeAvailable = remember(context) { hasMobileGyroscope(context) }
     val deviceHasBattery = rememberDeviceHasBattery()
     val fallbackMembershipTier = state.authSession?.user?.membershipTier
     var pendingMicrophoneMode by remember { mutableStateOf<MicrophoneMode?>(null) }
+    var showStreamMenuShortcutDialog by remember { mutableStateOf(false) }
+    var showBugReportDialog by rememberSaveable { mutableStateOf(false) }
+    var showAdvancedControllerSettings by rememberSaveable { mutableStateOf(false) }
+    val recordingFolderName by produceState<String?>(null, context, settings.recordingDirectoryUri) {
+        value = settings.recordingDirectoryUri?.let { folder ->
+            withContext(Dispatchers.IO) { RecordingDestination.folderName(context, folder) }
+        }
+    }
+    val recordingFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) {
+            if (RecordingDestination.rememberFolder(context, uri)) {
+                viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = uri.toString()))
+            } else {
+                Toast.makeText(context, R.string.stream_record_folder_permission_failed, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
     val microphonePermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -676,7 +721,68 @@ private fun SettingsContent(
             ).show()
         }
     }
+    if (showStreamMenuShortcutDialog) {
+        AndroidStreamMenuShortcutDialog(
+            currentShortcut = settings.streamMenuShortcut,
+            onShortcutChange = { shortcut ->
+                viewModel.updateSettings(settings.copy(streamMenuShortcut = shortcut))
+                showStreamMenuShortcutDialog = false
+            },
+            onDismiss = { showStreamMenuShortcutDialog = false },
+        )
+    }
+    if (showBugReportDialog) {
+        CompletedSessionBugReportDialog(
+            submission = state.bugReportSubmission,
+            versionCheck = state.bugReportVersionCheck,
+            update = state.androidUpdate,
+            experimentalNvstEnabled = state.settings.stream.experimentalNvst,
+            onSubmit = { title, description, knownIssueOverrideKey, details, files ->
+                viewModel.submitBugReport(title, description, knownIssueOverrideKey, details, files)
+            },
+            onReset = viewModel::resetBugReportSubmission,
+            onVersionCheck = viewModel::verifyBugReportVersion,
+            onOpenUpdate = viewModel::performAndroidUpdatePrimaryAction,
+            preflightProvider = {
+                buildBugReportPreflightDeck(
+                    BugReportPreflightEvidence(
+                        requestedSettings = state.settings.stream,
+                        recommendedSettings = state.recommendedStreamSettings,
+                        nativeLowLatencyDecoderEnabled = state.settings.nativeLowLatencyDecoder,
+                        runtimeDiagnostics = AndroidRuntimeDiagnostics.snapshot(context),
+                        sessionReport = state.sessionReport,
+                        codecReport = state.codecReport,
+                        androidTvProfile = state.androidTvProfile,
+                        serverZone = state.streamSession?.zone,
+                        manuallySelectedServer = state.manuallySelectedServerForReport,
+                        inputDiagnostics = NativeInputDiagnostics.snapshot(),
+                    ),
+                )
+            },
+            descriptionRes = R.string.bug_report_describe_english_from_settings,
+            onDismiss = {
+                if (!state.bugReportSubmission.uploading) {
+                    val submitted = state.bugReportSubmission.submitted
+                    showBugReportDialog = false
+                    viewModel.resetBugReportSubmission()
+                    if (submitted) viewModel.refreshBugReportThreads()
+                }
+            },
+        )
+    }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    if (selectedCategory == SettingsCategory.Stream && settings.stream.shouldWarnAboutHighSettings()) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.errorContainer,
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(stringResource(R.string.settings_high_settings_warning_title), style = MaterialTheme.typography.titleSmall)
+                Text(stringResource(R.string.settings_high_settings_warning_body), style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
     CategorySettingsSection(selectedCategory, SettingsCategory.General, searchQuery, "App updates", "update", "updates", "disable update checking", "checking", "check", "download", "install", "apk") {
                 if (state.androidUpdate.apkUpdatesAllowed) {
                     SettingSwitch(stringResource(R.string.settings_disable_update_checking), !settings.autoCheckForUpdates) { disabled ->
@@ -695,6 +801,7 @@ private fun SettingsContent(
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_GERMAN, stringResource(R.string.app_language_german)),
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_SPANISH, stringResource(R.string.app_language_spanish)),
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_FRENCH, stringResource(R.string.app_language_french)),
+                    ChoiceMenuOption(ANDROID_APP_LANGUAGE_INDONESIAN, stringResource(R.string.app_language_indonesian)),
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_JAPANESE, stringResource(R.string.app_language_japanese)),
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_KOREAN, stringResource(R.string.app_language_korean)),
                     ChoiceMenuOption(ANDROID_APP_LANGUAGE_DUTCH, stringResource(R.string.app_language_dutch)),
@@ -847,7 +954,28 @@ private fun SettingsContent(
                     viewModel.updateSettings(settings.copy(lockStreamProfile = locked))
                 }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Stream, searchQuery, stringResource(R.string.settings_section_stream_video), "stream", "video", "codec", "color", "hdr", "sharpening", "native streamer", "low latency", "native decoder", "decoder") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Stream, searchQuery, stringResource(R.string.settings_section_stream_video), "stream", "video", "codec", "color", "hdr", "sharpening", "native streamer", "low latency", "native decoder", "decoder", "video output", "surface", "webrtc", "texture") {
+                val defaultVideoOutputLabel = stringResource(when (defaultStreamVideoOutput(BuildConfig.PLAY_STORE_RELEASE)) {
+                    StreamVideoOutput.MediaCodecSurface -> R.string.settings_video_output_default_surface
+                    StreamVideoOutput.WebRtcTexture -> R.string.settings_video_output_default_texture
+                    StreamVideoOutput.Default -> R.string.settings_video_output_default
+                })
+                val videoOutputOptions = listOf(
+                    SettingsChoiceOption(StreamVideoOutput.Default.name, defaultVideoOutputLabel),
+                    SettingsChoiceOption(StreamVideoOutput.MediaCodecSurface.name, stringResource(R.string.settings_video_output_surface)),
+                    SettingsChoiceOption(StreamVideoOutput.WebRtcTexture.name, stringResource(R.string.settings_video_output_texture)),
+                )
+                ChoiceOptionRow(
+                    stringResource(R.string.settings_video_output),
+                    videoOutputOptions,
+                    settings.stream.videoOutput.name,
+                    description = stringResource(R.string.settings_video_output_desc),
+                    selectedDisplayLabel = stringResource(when (settings.stream.videoOutput) {
+                        StreamVideoOutput.Default -> R.string.settings_video_output_default
+                        StreamVideoOutput.MediaCodecSurface -> R.string.settings_video_output_direct_short
+                        StreamVideoOutput.WebRtcTexture -> R.string.settings_video_output_textures_short
+                    }),
+                ) { output -> viewModel.updateVideoOutput(StreamVideoOutput.valueOf(output)) }
                 val comingSoonLabel = stringResource(R.string.option_coming_soon)
                 val unavailableLabel = stringResource(R.string.common_unavailable)
                 val h264H265OnlyLabel = stringResource(R.string.settings_av1_ten_bit_badge)
@@ -882,13 +1010,15 @@ private fun SettingsContent(
                 ChoiceMenuRow(
                     label = stringResource(R.string.settings_color),
                     options = ColorQuality.entries.map { quality ->
-                        val available = quality.availableForCodec(settingsAvailableStream.codec)
+                        val available = quality.availableForCodec(settingsAvailableStream.codec) &&
+                            !(settingsAvailableStream.hdrEnabled && quality.isTenBit())
                         ChoiceMenuOption(
                             value = quality.name,
                             label = quality.label,
                             enabled = available,
                             badge = when {
                                 available -> null
+                                settingsAvailableStream.hdrEnabled && quality.isTenBit() -> stringResource(R.string.settings_hdr_ten_bit_badge)
                                 settingsAvailableStream.codec == VideoCodec.AV1 && quality == ColorQuality.TenBit420 -> h264H265OnlyLabel
                                 else -> comingSoonLabel
                             },
@@ -928,9 +1058,16 @@ private fun SettingsContent(
                     viewModel.updateStreamSettings { s ->
                         s.copy(
                             hdrEnabled = enabled,
-                            colorQuality = if (enabled && !s.colorQuality.name.startsWith("TenBit")) ColorQuality.TenBit420 else s.colorQuality,
+                            colorQuality = if (enabled) ColorQuality.EightBit420 else s.colorQuality,
                         ).withCodecColorCompatibility()
                     }
+                }
+                if (settingsAvailableStream.hdrEnabled) {
+                    Text(
+                        stringResource(R.string.settings_hdr_ten_bit_warning),
+                        color = Color(0xffffb74d),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
                 if (!hdrDeviceAvailable) {
                     Text(
@@ -998,7 +1135,80 @@ private fun SettingsContent(
                     )
                 }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Recording, searchQuery, stringResource(R.string.settings_section_recording_output), "recording", "recordings", "video", "mp4", "bitrate", "fps", "sharpness", "nitidez", "gravação", "upscale") {
+                ControlActionRow(
+                    label = stringResource(R.string.settings_recording_folder),
+                    actionLabel = stringResource(R.string.settings_recording_folder_choose),
+                    value = recordingFolderName
+                        ?: stringResource(if (settings.recordingDirectoryUri == null) {
+                            R.string.settings_recording_folder_not_set
+                        } else {
+                            R.string.settings_recording_folder_selected
+                        }),
+                    onClick = { recordingFolderLauncher.launch(null) },
+                )
+                Text(
+                    stringResource(R.string.settings_recording_next_session_hint),
+                    color = SettingsTextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                SettingSwitch(
+                    label = stringResource(R.string.settings_recording_auto_bitrate),
+                    checked = settings.stream.recordingBitrateMbps == 0,
+                    description = stringResource(R.string.settings_recording_auto_bitrate_desc),
+                ) { automatic ->
+                    viewModel.updateRecordingSettings { stream ->
+                        stream.copy(recordingBitrateMbps = if (automatic) 0 else stream.recordingBitrateMbps.takeIf { it in 2..50 } ?: 12)
+                    }
+                }
+                if (settings.stream.recordingBitrateMbps > 0) {
+                    NumberSlider(
+                        label = stringResource(R.string.settings_recording_bitrate),
+                        value = settings.stream.recordingBitrateMbps.coerceIn(2, 50).toFloat(),
+                        min = 2f,
+                        max = 50f,
+                        step = 1f,
+                        unit = stringResource(R.string.settings_recording_bitrate_unit),
+                        description = stringResource(R.string.settings_recording_bitrate_desc),
+                    ) { bitrate -> viewModel.updateRecordingSettings { it.copy(recordingBitrateMbps = bitrate.roundToInt()) } }
+                }
+                val recordingFpsOptions = listOf(
+                    ChoiceMenuOption("0", stringResource(R.string.settings_recording_fps_auto)),
+                    ChoiceMenuOption("24", stringResource(R.string.settings_recording_fps_24)),
+                    ChoiceMenuOption("30", stringResource(R.string.settings_recording_fps_30)),
+                    ChoiceMenuOption("60", stringResource(R.string.settings_recording_fps_60)),
+                )
+                ChoiceMenuRow(
+                    label = stringResource(R.string.settings_recording_fps),
+                    options = recordingFpsOptions,
+                    selectedLabel = if (settings.stream.recordingFps == 0) stringResource(R.string.option_auto)
+                        else "${settings.stream.recordingFps} FPS",
+                    description = stringResource(R.string.settings_recording_fps_desc),
+                ) { value -> viewModel.updateRecordingSettings { it.copy(recordingFps = value.toIntOrNull() ?: 0) } }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_recording_sharpness),
+                    checked = settings.stream.recordingSharpeningEnabled,
+                    description = stringResource(R.string.settings_recording_sharpness_desc),
+                ) { enabled -> viewModel.updateRecordingSettings { it.copy(recordingSharpeningEnabled = enabled) } }
+                if (settings.stream.recordingSharpeningEnabled) {
+                    NumberSlider(
+                        label = stringResource(R.string.settings_recording_sharpness_amount),
+                        value = settings.stream.recordingSharpeningAmount,
+                        min = 0f,
+                        max = 1f,
+                        step = 0.05f,
+                        description = stringResource(R.string.settings_recording_sharpness_amount_desc),
+                    ) { amount -> viewModel.updateRecordingSettings { it.copy(recordingSharpeningAmount = amount) } }
+                }
+            }
+        CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste") {
+                SettingSwitch(
+                    label = stringResource(R.string.settings_low_latency_game_audio),
+                    checked = settings.lowLatencyGameAudio,
+                    description = stringResource(R.string.settings_low_latency_game_audio_desc),
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(lowLatencyGameAudio = enabled))
+                }
                 SettingSwitch(
                     label = stringResource(R.string.settings_microphone),
                     checked = settings.stream.microphoneMode != MicrophoneMode.Disabled,
@@ -1027,10 +1237,117 @@ private fun SettingsContent(
                 ChoiceOptionRow(stringResource(R.string.settings_keyboard_layout), keyboardLayoutOptions, settings.stream.keyboardLayout) {
                     viewModel.updateStreamSettings { s -> s.copy(keyboardLayout = it) }
                 }
+                ControlActionRow(
+                    label = stringResource(R.string.stream_menu_shortcut),
+                    actionLabel = stringResource(R.string.stream_menu_shortcut_configure),
+                    value = if (settings.streamMenuShortcut.equals(
+                            DISABLED_ANDROID_STREAM_MENU_SHORTCUT,
+                            ignoreCase = true,
+                        )
+                    ) {
+                        stringResource(R.string.stream_menu_shortcut_disabled)
+                    } else {
+                        androidKeyboardShortcutDisplay(settings.streamMenuShortcut)
+                    },
+                    onClick = { showStreamMenuShortcutDialog = true },
+                )
+                Text(
+                    text = stringResource(R.string.stream_menu_shortcut_description),
+                    color = SettingsTextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 ChoiceOptionRow(stringResource(R.string.settings_game_language), gameLanguageOptions, settings.stream.gameLanguage) {
                     viewModel.updateStreamSettings { s -> s.copy(gameLanguage = it) }
                 }
                 SettingSwitch(stringResource(R.string.settings_clipboard_paste), settings.clipboardPaste) { enabled -> viewModel.updateSettings(settings.copy(clipboardPaste = enabled)) }
+            }
+    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_physical_input), "input", "physical", "bluetooth", "controller", "gamepad", "keyboard", "dead zone", "swap", "wasd", "arrows") {
+                Text(
+                    stringResource(R.string.settings_physical_input_description),
+                    color = SettingsTextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (state.androidTvProfile) {
+                    SettingSwitch(
+                        label = stringResource(R.string.settings_tv_controller_mouse_auto_arm),
+                        checked = settings.controllerMouseAutoArmOnTv,
+                        description = stringResource(R.string.settings_tv_controller_mouse_auto_arm_description),
+                    ) { enabled ->
+                        viewModel.updateSettings(settings.copy(controllerMouseAutoArmOnTv = enabled))
+                    }
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_multi_controller),
+                    checked = settings.stream.multiControllerEnabled,
+                    description = stringResource(R.string.settings_multi_controller_description),
+                ) { enabled ->
+                    viewModel.updateStreamSettings { stream -> stream.copy(multiControllerEnabled = enabled) }
+                }
+                NumberSlider(
+                    label = stringResource(R.string.settings_physical_stick_dead_zone),
+                    value = settings.physicalInput.stickDeadZone,
+                    min = 0f,
+                    max = 0.4f,
+                    step = 0.01f,
+                    valueFormatter = { "${(it * 100).roundToInt()}%" },
+                ) { value ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(stickDeadZone = value)))
+                }
+                NumberSlider(
+                    label = stringResource(R.string.settings_physical_trigger_dead_zone),
+                    value = settings.physicalInput.triggerDeadZone,
+                    min = 0f,
+                    max = 0.4f,
+                    step = 0.01f,
+                    valueFormatter = { "${(it * 100).roundToInt()}%" },
+                ) { value ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(triggerDeadZone = value)))
+                }
+                NumberSlider(
+                    label = stringResource(R.string.settings_physical_stick_sensitivity),
+                    value = settings.physicalInput.stickSensitivity,
+                    min = 0.5f,
+                    max = 2f,
+                    step = 0.05f,
+                    valueFormatter = { "%.2fx".format(it) },
+                ) { value ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(stickSensitivity = value)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_invert_stick_x),
+                    checked = settings.physicalInput.invertStickX,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(invertStickX = enabled)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_invert_stick_y),
+                    checked = settings.physicalInput.invertStickY,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(invertStickY = enabled)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_swap_ab),
+                    checked = settings.physicalInput.swapAB,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(swapAB = enabled)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_swap_xy),
+                    checked = settings.physicalInput.swapXY,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(swapXY = enabled)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_swap_movement_keys),
+                    checked = settings.physicalInput.swapWASDAndArrows,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(swapWASDAndArrows = enabled)))
+                }
+                ControlActionRow(
+                    label = stringResource(R.string.settings_physical_reset),
+                    actionLabel = stringResource(R.string.action_reset),
+                    onClick = { viewModel.updateSettings(settings.copy(physicalInput = PhysicalInputSettings())) },
+                )
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_pointer_input), "input", "pointer", "mouse", "lock", "grab", "capture", "fullscreen", "sensitivity", "acceleration", "scroll", "controller mouse", "mode", "native touch", "tap", "stability", "finger", "direct click") {
                 SettingSwitch(
@@ -1042,6 +1359,18 @@ private fun SettingsContent(
                 }
                 NumberSlider("Mouse sensitivity", settings.stream.mouseSensitivity, 0.25f, 3f, 0.05f, valueFormatter = { "%.2fx".format(it) }) {
                     viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = it) }
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_invert_mouse_x),
+                    checked = settings.physicalInput.invertMouseX,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(invertMouseX = enabled)))
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_physical_invert_mouse_y),
+                    checked = settings.physicalInput.invertMouseY,
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(physicalInput = settings.physicalInput.copy(invertMouseY = enabled)))
                 }
                 NumberSlider("Mouse acceleration", settings.stream.mouseAcceleration.toFloat(), 1f, 150f, 1f) {
                     viewModel.updateStreamSettings { s -> s.copy(mouseAcceleration = it.roundToInt()) }
@@ -1079,6 +1408,7 @@ private fun SettingsContent(
                             ChoiceMenuOption(value = mode.name, label = nativeTouchModeLabel(mode))
                         },
                         selectedLabel = nativeTouchModeLabel(effectiveNativeTouchMode),
+                        description = stringResource(R.string.settings_native_touch_mode_desc),
                     ) { value ->
                         val mode = NativeTouchMode.entries.firstOrNull { it.name == value } ?: NativeTouchMode.Off
                         viewModel.updateSettings(
@@ -1095,39 +1425,6 @@ private fun SettingsContent(
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
-                    if (effectiveNativeTouchMode != NativeTouchMode.Off) {
-                        Box(Modifier.padding(start = 24.dp)) {
-                            Column {
-                                val scrollSpeedLabel = when {
-                                    settings.androidTouch.nativeTouchScrollScale <= 0.5f -> "Very slow"
-                                    settings.androidTouch.nativeTouchScrollScale <= 0.8f -> "Slow"
-                                    settings.androidTouch.nativeTouchScrollScale <= 1.2f -> "Normal"
-                                    settings.androidTouch.nativeTouchScrollScale <= 1.6f -> "Fast"
-                                    else -> "Very fast"
-                                }
-                                NumberSlider(
-                                    label = "Native touch scroll speed",
-                                    value = settings.androidTouch.nativeTouchScrollScale,
-                                    min = 0.25f,
-                                    max = 2.0f,
-                                    step = 0.05f,
-                                    unit = " ($scrollSpeedLabel)",
-                                ) { value ->
-                                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(nativeTouchScrollScale = value)))
-                                }
-                                NumberSlider(
-                                    label = "Native touch tap stability",
-                                    value = settings.androidTouch.nativeTouchJitterThresholdDp,
-                                    min = 0f,
-                                    max = 24f,
-                                    step = 1f,
-                                    unit = "dp",
-                                ) { value ->
-                                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(nativeTouchJitterThresholdDp = value)))
-                                }
-                            }
-                        }
-                    }
                 }
                 SettingSwitch(stringResource(R.string.stream_panel_finger_mouse), settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {
@@ -1137,6 +1434,14 @@ private fun SettingsContent(
                 }
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_controller_touch), "input", "rumble", "touch", "controller", "style", "skin", "theme", "colour", "color", "labels", "layout", "scale", "size", "opacity", "edge", "padding", "offset", "horizontal", "vertical", "controls", "visible", "hide", "programmable", "extra", "accessibility", "guide", "home", "stick", "joystick", "analog", "dynamic", "dead zone", "button") {
+                if (settings.androidPhysicalControllerPromptDismissed) {
+                    ControlActionRow(
+                        label = stringResource(R.string.settings_show_controller_prompt_again),
+                        actionLabel = stringResource(R.string.action_reset),
+                        value = stringResource(R.string.settings_show_controller_prompt_again_desc),
+                        onClick = { viewModel.updateSettings(settings.resettingControllerPrompt()) },
+                    )
+                }
                 SettingSwitch(
                     label = stringResource(R.string.stream_panel_vibration),
                     checked = settings.vibrationEnabled,
@@ -1190,6 +1495,12 @@ private fun SettingsContent(
                     showLabels = settings.androidTouch.touchButtonLabels,
                     modifier = Modifier.padding(vertical = 8.dp),
                 )
+                SettingSwitch(
+                    label = stringResource(R.string.settings_advanced_controller_customization),
+                    checked = showAdvancedControllerSettings,
+                    description = stringResource(R.string.settings_advanced_controller_customization_desc),
+                ) { showAdvancedControllerSettings = it }
+                if (showAdvancedControllerSettings || searchQuery.isNotBlank()) {
                 val touchTintOptions = TOUCH_SKIN_TINTS.map { SettingsChoiceOption(it.id, it.label) }
                 ChoiceOptionRow(
                     stringResource(R.string.settings_touch_skin_tint),
@@ -1210,6 +1521,15 @@ private fun SettingsContent(
                     viewModel.updateSettings(
                         settings.copy(androidTouch = settings.androidTouch.copy(touchButtonLabels = enabled)),
                     )
+                }
+                TouchControlPresetEditor(
+                    touch = settings.androidTouch,
+                    presets = settings.touchControlPresets,
+                    onTouchChange = { viewModel.updateSettings(settings.copy(androidTouch = it)) },
+                    onPresetsChange = { viewModel.updateSettings(settings.copy(touchControlPresets = it)) },
+                )
+                TouchButtonAppearanceEditor(settings.androidTouch) { touch ->
+                    viewModel.updateSettings(settings.copy(androidTouch = touch))
                 }
                 Text(
                     text = stringResource(R.string.settings_touch_visible_controls),
@@ -1245,16 +1565,35 @@ private fun SettingsContent(
                     SettingsChoiceOption(action.name, touchExtraButtonActionLabel(action))
                 }
                 repeat(TOUCH_EXTRA_BUTTON_COUNT) { index ->
+                    val customCombo = extraButtonComboKey(index) in settings.androidTouch.extraButtonCombos
+                    val customValue = "custom-combo-$index"
+                    val options = if (customCombo) {
+                        listOf(
+                            SettingsChoiceOption(
+                                customValue,
+                                stringResource(
+                                    R.string.touch_extra_combo_custom_value,
+                                    touchExtraButtonComboLabel(settings.androidTouch.extraButtonCombo(index)),
+                                ),
+                            ),
+                        ) + extraButtonOptions
+                    } else {
+                        extraButtonOptions
+                    }
                     ChoiceOptionRow(
                         label = stringResource(R.string.settings_touch_extra_button, index + 1),
-                        options = extraButtonOptions,
-                        selectedValue = settings.androidTouch.extraButtonAction(index).name,
+                        options = options,
+                        selectedValue = if (customCombo) customValue else settings.androidTouch.extraButtonAction(index).name,
                     ) { actionName ->
+                        if (actionName == customValue) return@ChoiceOptionRow
                         val action = TouchExtraButtonAction.valueOf(actionName)
                         viewModel.updateSettings(
                             settings.copy(androidTouch = settings.androidTouch.withExtraButtonAction(index, action)),
                         )
                     }
+                }
+                TouchExtraButtonComboEditor(settings.androidTouch) { touch ->
+                    viewModel.updateSettings(settings.copy(androidTouch = touch))
                 }
                 NumberSlider(
                     stringResource(R.string.settings_touch_extra_button_size),
@@ -1361,10 +1700,27 @@ private fun SettingsContent(
                 NumberSlider("Left controls vertical offset", settings.androidTouch.leftOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftOffsetYDp = value))) }
                 NumberSlider("Right controls horizontal offset", settings.androidTouch.rightOffsetXDp, -220f, 220f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetXDp = value))) }
                 NumberSlider("Right controls vertical offset", settings.androidTouch.rightOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetYDp = value))) }
+                }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "navigation", "sidebar", "opacity", "transparency", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
                 val accentOptions = selectableUiAccents().map { it to uiAccentLabel(it) }
                 SettingSwitch(stringResource(R.string.settings_dynamic_color), settings.dynamicColor) { viewModel.updateSettings(settings.copy(dynamicColor = it)) }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_custom_navigation_background),
+                    checked = settings.navigationRailBackgroundOpacity != null,
+                    description = stringResource(R.string.settings_custom_navigation_background_desc),
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(navigationRailBackgroundOpacity = if (enabled) 0.75f else null))
+                }
+                settings.navigationRailBackgroundOpacity?.let { opacity ->
+                    NumberSlider(
+                        label = stringResource(R.string.settings_navigation_background_opacity),
+                        value = opacity,
+                        min = 0f,
+                        max = 1f,
+                        step = 0.01f,
+                    ) { value -> viewModel.updateSettings(settings.copy(navigationRailBackgroundOpacity = value)) }
+                }
                 ChoiceRow(
                     label = stringResource(R.string.settings_accent),
                     options = accentOptions.map { it.second },
@@ -1377,9 +1733,9 @@ private fun SettingsContent(
                     }
                 }
                 SettingSwitch(
-                    label = stringResource(R.string.settings_live_selected_outlines),
+                    label = stringResource(R.string.settings_static_outlines),
                     checked = settings.liveSelectedOutlines,
-                    description = stringResource(R.string.settings_live_selected_outlines_desc),
+                    description = stringResource(R.string.settings_static_outlines_desc),
                 ) { enabled ->
                     viewModel.updateSettings(settings.copy(liveSelectedOutlines = enabled))
                 }
@@ -1394,6 +1750,9 @@ private fun SettingsContent(
                             absoluteCinemaEverywhere = settings.absoluteCinemaEverywhere && enabled,
                         ),
                     )
+                }
+                SelectionEffectColorSetting(settings) { colors ->
+                    viewModel.updateSettings(settings.copy(selectionEffectColors = colors))
                 }
                 SettingSwitch(
                     label = stringResource(R.string.settings_im_crazy),
@@ -1446,13 +1805,18 @@ private fun SettingsContent(
                 }
                 CatalogBackgroundSettings(settings = settings, viewModel = viewModel)
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_library_navigation), "interface", "launch page", "default page", "store", "library", "compact", "cards", "titles", "favorites", "favourites", "save", "icon", "game card size", "server selector", "hero", "banner", "featured", "landscape", "new games") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_library_navigation), "interface", "launch page", "default page", "store", "library", "compact", "cards", "titles", "favorites", "favourites", "save", "icon", "premium", "marker", "game card size", "server selector", "hero", "banner", "featured", "landscape", "new games") {
                 SettingSwitch(
                     label = stringResource(R.string.settings_landscape_new_games),
                     checked = settings.landscapeNewGamesHero,
                     description = stringResource(R.string.settings_landscape_new_games_desc),
                 ) { enabled ->
-                    viewModel.updateSettings(settings.copy(landscapeNewGamesHero = enabled))
+                    viewModel.updateSettings(
+                        settings.copy(
+                            landscapeNewGamesHero = enabled,
+                            landscapeNewGamesHeroCollapsed = if (enabled) false else settings.landscapeNewGamesHeroCollapsed,
+                        ),
+                    )
                 }
                 val launchPageOptions = AppLaunchPage.entries.map { page -> page to appLaunchPageLabel(page) }
                 ChoiceRow(
@@ -1473,6 +1837,13 @@ private fun SettingsContent(
                 ) { enabled ->
                     viewModel.updateSettings(settings.copy(showFavoriteIconOnGameCards = enabled))
                 }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_show_premium_marker),
+                    checked = settings.showPremiumMarker,
+                    description = stringResource(R.string.settings_show_premium_marker_desc),
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(showPremiumMarker = enabled))
+                }
                 NumberSlider(
                     label = stringResource(R.string.settings_card_size),
                     value = settings.posterSizeScale,
@@ -1485,7 +1856,7 @@ private fun SettingsContent(
                 }
                 SettingSwitch(stringResource(R.string.settings_hide_server_selector), settings.hideServerSelector) { viewModel.updateSettings(settings.copy(hideServerSelector = it)) }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_status_bar), "interface", "stats", "status bar", "position", "fps", "ping", "bitrate", "keyboard", "button") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_status_bar), "interface", "stats", "status bar", "position", "fps", "ping", "bitrate", "keyboard", "button", "background", "opacity", "transparent") {
                 SettingSwitch(stringResource(R.string.settings_show_stats), settings.showStatsOnLaunch) { viewModel.updateSettings(settings.copy(showStatsOnLaunch = it)) }
                 SettingSwitch(
                     label = stringResource(R.string.settings_stream_keyboard_button),
@@ -1498,9 +1869,20 @@ private fun SettingsContent(
                         viewModel.updateSettings(settings.copy(streamStatsStyle = style))
                     }
                 }
-                ChoiceRow(stringResource(R.string.settings_stats_position), StreamStatsPosition.entries.map { it.label }, settings.streamStatsPosition.label) { label ->
+                SettingSwitch(stringResource(R.string.stream_statusbar_background), settings.streamStatsBackgroundEnabled) { enabled ->
+                    viewModel.updateSettings(settings.copy(streamStatsBackgroundEnabled = enabled))
+                }
+                if (settings.streamStatsBackgroundEnabled) {
+                    NumberSlider(
+                        stringResource(R.string.stream_statusbar_background_opacity),
+                        settings.streamStatsBackgroundOpacity,
+                        0f, 1f, 0.01f,
+                    ) { opacity -> viewModel.updateSettings(settings.copy(streamStatsBackgroundOpacity = opacity)) }
+                }
+                ChoiceRow(stringResource(R.string.settings_stats_position), StreamStatsPosition.entries.map { it.label },
+                    if (settings.streamStatsCustomX != null) stringResource(R.string.stream_statusbar_custom_position) else settings.streamStatsPosition.label) { label ->
                     StreamStatsPosition.entries.firstOrNull { it.label == label }?.let { position ->
-                        viewModel.updateSettings(settings.copy(streamStatsPosition = position))
+                        viewModel.updateSettings(settings.copy(streamStatsPosition = position, streamStatsCustomX = null, streamStatsCustomY = null))
                     }
                 }
             }
@@ -1549,7 +1931,7 @@ private fun SettingsContent(
                     onClick = { viewModel.updateSettings(settings.restartingSetupFlow()) },
                 )
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.General, searchQuery, "App Data", "app data", "data", "cache", "clear", "reset", "settings", "tutorial", "guide", "wipe", "relaunch", "fresh install") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.General, searchQuery, "App Data", "app data", "data", "cache", "clear", "reset", "settings", "backup", "restore", "controller layout", "tutorial", "guide", "wipe", "relaunch", "fresh install") {
                 AppDataSettingsPanel(viewModel = viewModel)
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Account, searchQuery, stringResource(R.string.settings_category_account), "account", "login", "logout", "sign in", "saved", "provider", "membership", "subscription", "tv", "pair", "phone", "qr") {
@@ -1560,6 +1942,19 @@ private fun SettingsContent(
                     searchMode = searchQuery.isNotBlank(),
                 )
             }
+    CategorySettingsSection(selectedCategory, SettingsCategory.BugReports, searchQuery, stringResource(R.string.bug_report_inbox_title), "bug", "report", "issue", "status", "reply", "comment", "support") {
+                BugReportThreadsSettings(
+                    state = state.bugReportThreads,
+                    onRefresh = viewModel::refreshBugReportThreads,
+                    onNewReport = {
+                        viewModel.resetBugReportSubmission()
+                        showBugReportDialog = true
+                    },
+                    onComment = viewModel::commentOnBugReport,
+                    onClose = viewModel::closeBugReport,
+                    onDelete = viewModel::deleteBugReport,
+                )
+            }
     CategorySettingsSection(selectedCategory, SettingsCategory.TvPairing, searchQuery, stringResource(R.string.tv_pair_settings_title), "tv", "pair", "phone", "qr", "code", "network") {
                 LocalTvSettingsPanel(
                     state = state,
@@ -1567,7 +1962,7 @@ private fun SettingsContent(
                     showTitle = false,
                 )
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, stringResource(R.string.settings_experimental_streaming), "experimental", "stream", "nvst", "l4s", "session", "launch", "failure") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, stringResource(R.string.settings_experimental_streaming), "experimental", "stream", "network", "dynamic", "adjustment", "nvst", "l4s", "session", "launch", "failure", "battery", "optimization", "background", "allow", "run") {
                 Text(
                     stringResource(R.string.settings_experimental_streaming_warning),
                     color = SettingsTextMuted,
@@ -1580,12 +1975,47 @@ private fun SettingsContent(
                 ) {
                     viewModel.updateStreamSettings { s -> s.copy(experimentalNvst = it) }
                 }
+                ChoiceMenuRow(
+                    label = stringResource(R.string.settings_dynamic_network_adjustment),
+                    options = listOf(
+                        ChoiceMenuOption("fixed", stringResource(R.string.settings_network_adjustment_fixed)),
+                        ChoiceMenuOption("custom", stringResource(R.string.settings_network_adjustment_custom)),
+                    ),
+                    selectedLabel = stringResource(
+                        if (settings.stream.experimentalDynamicNetworkAdjustment) R.string.settings_network_adjustment_custom
+                        else R.string.settings_network_adjustment_fixed,
+                    ),
+                    description = stringResource(R.string.settings_dynamic_network_adjustment_desc),
+                ) { choice ->
+                    viewModel.updateDynamicNetworkAdjustment(choice == "custom")
+                }
+                if (settings.stream.experimentalDynamicNetworkAdjustment && settings.stream.maxBitrateMbps > 1) {
+                    NumberSlider(
+                        label = stringResource(R.string.settings_dynamic_minimum_bitrate),
+                        value = settings.stream.experimentalDynamicMinimumBitrateMbps.coerceIn(1, settings.stream.maxBitrateMbps).toFloat(),
+                        min = 1f,
+                        max = settings.stream.maxBitrateMbps.toFloat(),
+                        step = 1f,
+                        unit = "Mbps",
+                        description = stringResource(R.string.settings_dynamic_minimum_bitrate_desc),
+                    ) { mbps ->
+                        viewModel.updateDynamicMinimumBitrate(mbps.roundToInt())
+                    }
+                }
                 SettingSwitch(
                     label = stringResource(R.string.settings_l4s),
                     checked = settings.stream.enableL4S,
                     description = stringResource(R.string.settings_l4s_desc),
                 ) {
                     viewModel.updateStreamSettings { s -> s.copy(enableL4S = it) }
+                }
+                if (deviceHasBattery) {
+                    Text(
+                        text = stringResource(R.string.settings_battery_optimization_title),
+                        color = SettingsText,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    BatteryOptimizationPanel()
                 }
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, "Codec Diagnostics", "codec", "diagnostics", "probe", "av1", "h264", "h265", "hevc", "decode") {
@@ -1594,16 +2024,21 @@ private fun SettingsContent(
     CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, "Debug Logs", "debug", "logs", "logcat", "events", "export", "json", "cloudmatch", "queue", "stream") {
                     DebugLogsPanel(state = state, viewModel = viewModel)
                 }
-    if (deviceHasBattery) {
-        CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, "Battery Optimization", "battery", "optimization", "background", "activity", "ignore", "allow", "run") {
-                    BatteryOptimizationPanel()
-                }
-    }
     CategorySettingsSection(selectedCategory, SettingsCategory.About, searchQuery, stringResource(R.string.settings_category_about), "about", "version", "build", "app", "github", "developer", "kiefer", "zortos", "opennow", "repository") {
                 AppVersionPanel(settings = settings, onSettingsChange = viewModel::updateSettings)
                 OpenNowGitHubPanel()
                 DeveloperPanel()
             }
+    if (searchQuery.isNotBlank()) {
+        CategorySettingsSection(selectedCategory, SettingsCategory.Changelogs, searchQuery, stringResource(R.string.changelog_title), "changelog", "release", "notes", "what's new", "update") {
+                ControlActionRow(
+                    label = stringResource(R.string.changelog_history),
+                    actionLabel = stringResource(R.string.changelog_open),
+                    value = changelogs.firstOrNull()?.let { "${it.version} · ${it.versionCode}" },
+                    onClick = { onSelectCategory(SettingsCategory.Changelogs) },
+                )
+        }
+    }
     CategorySettingsSection(selectedCategory, SettingsCategory.About, searchQuery, stringResource(R.string.settings_section_thanks), "thanks", "credits", "contributors", "darkevilpt", "discord", "community", "support", "donate", "paypal", "printedwaste") {
                 ThanksPanel()
             }

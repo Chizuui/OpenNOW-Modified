@@ -7,6 +7,37 @@ import org.junit.Test
 
 class StreamResolutionTest {
     @Test
+    fun androidTvResolutionMenuListsEveryAspectAndResolution() {
+        assertEquals(
+            listOf("1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160", "5120x2880"),
+            streamResolutionOptionsForAspect("16:9"),
+        )
+        assertTrue("21:9" in streamAspectRatioOptions())
+        assertTrue("2560x1080" in streamResolutionOptionsForAspect("21:9"))
+    }
+
+    @Test
+    fun androidTvLaunchPreservesEntitledHighResolutionSelection() {
+        val performance = StreamSettings(resolution = "2560x1440", aspectRatio = "16:9")
+            .eligibleForAndroidLaunch(
+                subscriptionInfo = SubscriptionInfo(membershipTier = "PERFORMANCE"),
+                fallbackMembershipTier = null,
+                androidTvProfile = true,
+            )
+        assertEquals("2560x1440", performance.resolution)
+        assertEquals(
+            "3840x2160",
+            StreamSettings(resolution = "3840x2160", aspectRatio = "16:9")
+                .eligibleForAndroidLaunch(
+                    subscriptionInfo = SubscriptionInfo(membershipTier = "ULTIMATE"),
+                    fallbackMembershipTier = null,
+                    androidTvProfile = true,
+                )
+                .resolution,
+        )
+    }
+
+    @Test
     fun smartSessionLimitsMatchMembershipTier() {
         val free = smartSessionLimitFor(SubscriptionInfo(membershipTier = "FREE"), null)
         val performance = smartSessionLimitFor(SubscriptionInfo(membershipTier = "PERFORMANCE"), null)
@@ -444,10 +475,21 @@ class StreamResolutionTest {
         assertEquals("1680x720", selectedWhd.resolution)
         assertEquals("21:9", selectedWhd.aspectRatio)
 
-        val selectedLegacyPortalMode = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9")
+        val selectedPortalMode = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9")
             .withResolutionAllowed(freeSubscription, null)
-        assertEquals("1376x590", selectedLegacyPortalMode.resolution)
-        assertEquals("21:9", selectedLegacyPortalMode.aspectRatio)
+        assertEquals("1376x640", selectedPortalMode.resolution)
+        assertEquals("19.5:9", selectedPortalMode.aspectRatio)
+    }
+
+    @Test
+    fun freePlanPhoneResolutionFallbackPreservesAspectAndUsesAndroidIdentity() {
+        val adjusted = StreamSettings(resolution = "2340x1080", aspectRatio = "19.5:9", fps = 120)
+            .eligibleForAndroidLaunch(SubscriptionInfo(membershipTier = "FREE"), null, androidTvProfile = false)
+
+        assertEquals("1376x640", adjusted.resolution)
+        assertEquals("19.5:9", adjusted.aspectRatio)
+        assertEquals(60, adjusted.fps)
+        assertTrue(adjusted.requiresNativeAndroidCloudMatchMode())
     }
 
     @Test
@@ -513,13 +555,13 @@ class StreamResolutionTest {
     }
 
     @Test
-    fun legacyPortalGeometryMigratesToProviderCompatibleTwentyOneByNineMode() {
+    fun portalGeometrySurvivesAndroidSettingsNormalization() {
         val settings = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9")
 
-        val migrated = settings.withAndroidSettingsAvailability()
-        assertEquals("1376x590", migrated.resolution)
-        assertEquals("21:9", migrated.aspectRatio)
-        assertEquals(1376 to 590, streamResolutionPixels(migrated))
+        val normalized = settings.withAndroidSettingsAvailability()
+        assertEquals("1376x640", normalized.resolution)
+        assertEquals("19.5:9", normalized.aspectRatio)
+        assertEquals(1376 to 640, streamResolutionPixels(normalized))
     }
 
     @Test
@@ -530,7 +572,7 @@ class StreamResolutionTest {
         )
         assertEquals(listOf("1024x768", "1112x834", "1600x1200"), streamResolutionOptionsForAspect("4:3"))
         assertEquals(listOf("1280x1024"), streamResolutionOptionsForAspect("5:4"))
-        assertEquals(listOf("2340x1080"), streamResolutionOptionsForAspect("19.5:9"))
+        assertEquals(listOf("1376x640", "2340x1080"), streamResolutionOptionsForAspect("19.5:9"))
         assertEquals(emptyList<String>(), streamResolutionOptionsForAspect("20:9"))
         assertEquals(listOf("1376x590", "1680x720", "2560x1080", "3440x1440", "5120x2160"), streamResolutionOptionsForAspect("21:9"))
         assertEquals(listOf("3840x1080", "5120x1440"), streamResolutionOptionsForAspect("32:9"))
@@ -549,7 +591,9 @@ class StreamResolutionTest {
         val prioritySubscription = SubscriptionInfo(membershipTier = "PRIORITY")
         val ultimateSubscription = SubscriptionInfo(membershipTier = "ULTIMATE")
         val fhd = streamResolutionChoicesForAspect("16:9").first { it.value == "1920x1080" }
-        val phoneFhd = streamResolutionChoicesForAspect("19.5:9").single()
+        val phoneFhd = streamResolutionChoicesForAspect("19.5:9").first { it.value == "2340x1080" }
+        val portal = streamResolutionChoicesForAspect("19.5:9").first { it.value == "1376x640" }
+        assertTrue(portal.isAvailableFor(freeSubscription, null))
         val lowUltrawide = streamResolutionChoicesForAspect("21:9").first { it.value == "1376x590" }
         val whd = streamResolutionChoicesForAspect("21:9").first { it.value == "1680x720" }
         val wfhd = streamResolutionChoicesForAspect("21:9").first { it.value == "2560x1080" }
@@ -629,18 +673,18 @@ class StreamResolutionTest {
     }
 
     @Test
-    fun hdrIsAvailableForPerformanceAndUltimatePlans() {
+    fun hdrKillSwitchOverridesPlanEligibility() {
         val requested = StreamSettings(codec = VideoCodec.H265, hdrEnabled = true)
 
         assertEquals(false, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "FREE"), null).hdrEnabled)
-        assertEquals(true, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "PERFORMANCE"), null).hdrEnabled)
-        assertEquals(true, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "PRIORITY"), null).hdrEnabled)
-        assertEquals(true, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "ULTIMATE"), null).hdrEnabled)
+        assertEquals(false, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "PERFORMANCE"), null).hdrEnabled)
+        assertEquals(false, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "PRIORITY"), null).hdrEnabled)
+        assertEquals(false, requested.withHdrAllowed(SubscriptionInfo(membershipTier = "ULTIMATE"), null).hdrEnabled)
         assertEquals(true, hasHdrStreamingPlan(null, "PERFORMANCE"))
     }
 
     @Test
-    fun handheldHdrTransportIsEligiblePendingDisplayAndDecoderProbe() {
+    fun handheldHdrTransportIsDisabled() {
         val adjusted = StreamSettings(
             resolution = "1920x1080",
             fps = 60,
@@ -649,12 +693,12 @@ class StreamResolutionTest {
             hdrEnabled = true,
         ).withAndroidHdrCompatibility(androidTvProfile = false)
 
-        assertEquals(true, adjusted.hdrEnabled)
+        assertEquals(false, adjusted.hdrEnabled)
         assertEquals(ColorQuality.TenBit420, adjusted.colorQuality)
     }
 
     @Test
-    fun androidTvHdrRequiresShieldClassH265Mode() {
+    fun androidTvHdrTransportIsDisabledForEveryProfile() {
         val supported = StreamSettings(
             resolution = "3840x2160",
             fps = 60,
@@ -663,7 +707,7 @@ class StreamResolutionTest {
             hdrEnabled = true,
         )
 
-        assertEquals(true, supported.hdrAvailableForAndroid(androidTvProfile = true))
+        assertEquals(false, supported.hdrAvailableForAndroid(androidTvProfile = true))
         assertEquals(false, supported.copy(fps = 120).hdrAvailableForAndroid(androidTvProfile = true))
         assertEquals(false, supported.copy(resolution = "5120x2880").hdrAvailableForAndroid(androidTvProfile = true))
         assertEquals(false, supported.copy(codec = VideoCodec.H264).hdrAvailableForAndroid(androidTvProfile = true))

@@ -3,6 +3,9 @@ package com.opencloudgaming.opennow
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.os.Handler
+import android.os.Looper
+import android.view.ViewConfiguration
 import kotlinx.coroutines.cancel
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -170,7 +173,41 @@ internal fun shouldConsumeNativeUiTransitionTouch(
     hasOwnedPointer: Boolean,
 ): Boolean = streamUiActive && hasOwnedPointer
 
+internal fun hasExternalMouseSource(eventSource: Int, deviceSources: Int): Boolean {
+    val combinedSources = eventSource or deviceSources
+    return (combinedSources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE ||
+        (combinedSources and InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE ||
+        (combinedSources and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD
+}
+
 object NativeStreamInputRouter {
+    /**
+     * Some Android mouse drivers report a secondary click as KEYCODE_BUTTON_B. A controller key
+     * code is not sufficient evidence by itself; the source device must also be a controller.
+     */
+    internal fun shouldRouteKeyAsGamepad(controllerInputDevice: Boolean, keyCode: Int): Boolean =
+        controllerInputDevice &&
+            (GamepadButtonMapping.maskForKeyCode(keyCode, controllerActivation = true) != null ||
+                AndroidControllerInput.isPrimaryActivationKey(keyCode) ||
+                keyCode == KeyEvent.KEYCODE_BUTTON_L2 ||
+                keyCode == KeyEvent.KEYCODE_BUTTON_R2 ||
+                GamepadButtonMapping.isControllerButtonKeyCode(keyCode))
+
+    /**
+     * Cheap Android TV mouse drivers can expose the secondary button as a key instead of a
+     * MotionEvent. Keep source identity authoritative: the same codes remain Back/B on remotes
+     * and controllers, while a mouse receives a protocol mouse-button edge. Known controllers
+     * retain precedence when an integrated touchpad also advertises pointer capability.
+     */
+    internal fun shouldRouteKeyAsExternalMouseSecondary(
+        keyCode: Int,
+        externalMouseInputDevice: Boolean,
+        controllerInputDevice: Boolean,
+    ): Boolean =
+        externalMouseInputDevice &&
+            !controllerInputDevice &&
+            (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_BUTTON_B)
+
     private data class PresentationTransform(
         val zoomScale: Float = 1f,
         val translationX: Float = 0f,
@@ -183,6 +220,12 @@ object NativeStreamInputRouter {
     private var androidTvProfile = false
     fun setAndroidTvProfile(enabled: Boolean) {
         androidTvProfile = enabled
+    }
+    @Volatile
+    private var streamMenuShortcut = DEFAULT_ANDROID_STREAM_MENU_SHORTCUT
+
+    fun setStreamMenuShortcut(shortcut: String) {
+        streamMenuShortcut = shortcut
     }
     @Volatile
     private var externalMousePointerCaptureEnabled = false
@@ -210,6 +253,24 @@ object NativeStreamInputRouter {
     private var captureAllTouch = false
     @Volatile
     private var systemMenuHandler: (() -> Unit)? = null
+    private val controllerMenuHoldHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var controllerMenuHold: Runnable? = null
+    private var controllerMenuHoldDownEvent: KeyEvent? = null
+    private var controllerMenuHoldDeviceId: Int? = null
+    private var consumedControllerMenuHoldDeviceId: Int? = null
+
+    private fun cancelControllerMenuHold(releaseForwardedStart: Boolean = false) {
+        controllerMenuHold?.let(controllerMenuHoldHandler::removeCallbacks)
+        if (releaseForwardedStart) {
+            controllerMenuHoldDownEvent?.let { down ->
+                client?.dispatchKey(KeyEvent.changeAction(down, KeyEvent.ACTION_UP))
+                consumedControllerMenuHoldDeviceId = down.deviceId
+            }
+        }
+        controllerMenuHold = null
+        controllerMenuHoldDownEvent = null
+        controllerMenuHoldDeviceId = null
+    }
 
     @Volatile
     private var systemBackHandler: (() -> Unit)? = null
@@ -226,10 +287,6 @@ object NativeStreamInputRouter {
     @Volatile
     private var nativeTouchEnabled = false
     private val touchSlots = TouchSlotAllocator()
-    private val nativeTouchMotionTracker = NativeTouchMotionTracker()
-    /** Native touch settings synced from [AndroidTouchSettings]. */
-    @Volatile private var nativeTouchScrollScale: Float = 1.0f
-    @Volatile private var nativeTouchJitterThresholdPx: Float = 0f
 
     fun attach(next: NativeStreamClient) {
         client = next
@@ -242,6 +299,7 @@ object NativeStreamInputRouter {
     fun detach(next: NativeStreamClient) {
         if (client === next) {
             releaseInputForLifecycle("stream-detached")
+            consumedControllerMenuHoldDeviceId = null
             client = null
             touchMouseState.forgetCursorPosition()
             decodedStreamResolution = 0 to 0
@@ -251,6 +309,7 @@ object NativeStreamInputRouter {
 
     /** Releases held touch, mouse, and keyboard input when focus or lifecycle changes. */
     fun releaseInputForLifecycle(reason: String) {
+        cancelControllerMenuHold(releaseForwardedStart = true)
         client?.releasePhysicalInputForLifecycle(reason)
         touchMouseState.reset(client)
         releaseAllNativeTouches()
@@ -276,12 +335,6 @@ object NativeStreamInputRouter {
         releaseAllNativeTouches()
         nativeUiTouchRouting.endPointerGesture()
         touchMouseState.reset(client)
-    }
-
-    fun setNativeTouchSettings(scrollScale: Float, jitterThresholdDp: Float) {
-        val density = android.content.res.Resources.getSystem().displayMetrics.density
-        nativeTouchScrollScale = scrollScale
-        nativeTouchJitterThresholdPx = jitterThresholdDp * density
     }
 
     fun setStretchToFit(enabled: Boolean) {
@@ -359,6 +412,7 @@ object NativeStreamInputRouter {
 
     fun setStreamUiActive(active: Boolean) {
         if (active && !streamUiActive) {
+            cancelControllerMenuHold(releaseForwardedStart = true)
             // A system/menu action can open app UI while a native game touch is still held. The
             // host will not receive that finger's eventual UP once UI routing takes over, so cancel
             // it at the transition instead of leaving a stuck press in the game.
@@ -373,7 +427,8 @@ object NativeStreamInputRouter {
         if (!streamUiActive) return null
         return when (event.keyCode) {
             KeyEvent.KEYCODE_BUTTON_A -> KeyEvent.KEYCODE_DPAD_CENTER
-            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BUTTON_B ->
+                KeyEvent.KEYCODE_BACK.takeIf { event.isControllerInputDevice() }
             KeyEvent.KEYCODE_BUTTON_SELECT -> KeyEvent.KEYCODE_BACK
             else -> null
         }
@@ -400,7 +455,7 @@ object NativeStreamInputRouter {
 
     fun isControllerAppBackKey(keyCode: Int, controllerSource: Boolean, streamUiActive: Boolean): Boolean =
         !streamUiActive &&
-            (keyCode == KeyEvent.KEYCODE_BUTTON_B ||
+            ((keyCode == KeyEvent.KEYCODE_BUTTON_B && controllerSource) ||
                 (keyCode == KeyEvent.KEYCODE_BACK && controllerSource))
 
     fun setUiTouchPassthroughBounds(left: Int, top: Int, right: Int, bottom: Int) {
@@ -559,70 +614,65 @@ object NativeStreamInputRouter {
             index..index
         }
 
-        val scrollScale = nativeTouchScrollScale.coerceIn(0.25f, 2.0f)
-        val jitterThresholdPx = nativeTouchJitterThresholdPx.coerceAtLeast(0f)
-
-        var hasGameTouchPointer = false
-        val pointers = indices.mapNotNull { index ->
-            if (index !in 0 until event.pointerCount) return@mapNotNull null
-            val pointerId = event.getPointerId(index)
-            // Fingers on our own chrome belong to the overlay, not the game.
-            if (nativeUiTouchRouting.ownsPointer(pointerId)) return@mapNotNull null
-            hasGameTouchPointer = true
-
-            val rawX = event.getX(index)
-            val rawY = event.getY(index)
-
-            val stabilized = when (phase) {
-                TouchPhase.DOWN -> nativeTouchMotionTracker.begin(pointerId, rawX, rawY)
-                TouchPhase.MOVE -> nativeTouchMotionTracker.move(
-                    pointerId = pointerId,
-                    x = rawX,
-                    y = rawY,
-                    movementScale = scrollScale,
-                    jitterThresholdPx = jitterThresholdPx,
-                ) ?: return@mapNotNull null
-                TouchPhase.UP, TouchPhase.CANCEL -> nativeTouchMotionTracker.end(
-                    pointerId = pointerId,
-                    x = rawX,
-                    y = rawY,
-                    movementScale = scrollScale,
-                    jitterThresholdPx = jitterThresholdPx,
-                )
-                else -> return@mapNotNull null
-            }
-
-            stabilized.copy(
-                radiusX = event.getTouchMajor(index) / 2f,
-                radiusY = event.getTouchMinor(index) / 2f,
-            )
-        }
-        // A MOVE inside the tap guard deliberately emits no packet, but the native-touch path
-        // still owns that finger. Report it handled so Activity.dispatchTouchEvent does not offer
-        // the middle of an already-captured gesture to Compose and then dispatch it here again.
-        if (pointers.isEmpty()) return hasGameTouchPointer
-
         val settingsResolution = streamResolutionPixels(client.settings)
         val decodedResolution = decodedStreamResolution
         val transform = presentationTransform
         val streamWidth = decodedResolution.first.takeIf { it > 0 } ?: settingsResolution.first
         val streamHeight = decodedResolution.second.takeIf { it > 0 } ?: settingsResolution.second
-        val records = buildTouchBatch(
-            allocator = touchSlots,
-            phase = phase,
-            pointers = pointers,
-            viewWidth = width,
-            viewHeight = height,
-            streamWidth = streamWidth,
-            streamHeight = streamHeight,
-            stretchToFit = stretchToFit,
-            renderingAspectRatio = inputContentAspectRatio(decodedResolution),
-            presentationZoomScale = transform.zoomScale,
-            presentationTranslationX = transform.translationX,
-            presentationTranslationY = transform.translationY,
-        )
-        if (records.isEmpty()) return false
-        return client.sendNativeTouch(records)
+
+        fun recordsAt(historyIndex: Int?): Pair<Boolean, List<TouchRecord>> {
+            var hasGameTouchPointer = false
+            val pointers = indices.mapNotNull { index ->
+                if (index !in 0 until event.pointerCount) return@mapNotNull null
+                val pointerId = event.getPointerId(index)
+                // Fingers on our own chrome belong to the overlay, not the game.
+                if (nativeUiTouchRouting.ownsPointer(pointerId)) return@mapNotNull null
+                hasGameTouchPointer = true
+
+                TouchPointerSample(
+                    pointerId = pointerId,
+                    x = historyIndex?.let { event.getHistoricalX(index, it) } ?: event.getX(index),
+                    y = historyIndex?.let { event.getHistoricalY(index, it) } ?: event.getY(index),
+                    radiusX = (historyIndex?.let { event.getHistoricalTouchMajor(index, it) }
+                        ?: event.getTouchMajor(index)) / 2f,
+                    radiusY = (historyIndex?.let { event.getHistoricalTouchMinor(index, it) }
+                        ?: event.getTouchMinor(index)) / 2f,
+                )
+            }
+            if (pointers.isEmpty()) return hasGameTouchPointer to emptyList()
+            return hasGameTouchPointer to buildTouchBatch(
+                allocator = touchSlots,
+                phase = phase,
+                pointers = pointers,
+                viewWidth = width,
+                viewHeight = height,
+                streamWidth = streamWidth,
+                streamHeight = streamHeight,
+                stretchToFit = stretchToFit,
+                renderingAspectRatio = inputContentAspectRatio(decodedResolution),
+                presentationZoomScale = transform.zoomScale,
+                presentationTranslationX = transform.translationX,
+                presentationTranslationY = transform.translationY,
+            )
+        }
+
+        // Android batches several digitizer samples into one MOVE under load. Jumping directly to
+        // the current coordinate makes a fast drag freeze at DOWN and then teleport, while a slow
+        // drag looks fine. Feed the history oldest-first; the client's latest-state limiter sends
+        // the leading position immediately and retains only the newest trailing position.
+        val historyIndices: List<Int?> = if (phase == TouchPhase.MOVE) {
+            (0 until event.historySize).map<Int, Int?> { it } + null
+        } else {
+            listOf(null)
+        }
+        var handled = false
+        var sent = false
+        historyIndices.forEach { historyIndex ->
+            val (hasGameTouchPointer, records) = recordsAt(historyIndex)
+            handled = handled || hasGameTouchPointer
+            if (records.isNotEmpty()) sent = client.sendNativeTouch(records) || sent
+        }
+        return sent || handled
     }
 
     /**
@@ -641,7 +691,6 @@ object NativeStreamInputRouter {
             if (records.isNotEmpty()) current.sendNativeTouch(records)
         }
         touchSlots.clear()
-        nativeTouchMotionTracker.clear()
     }
 
     fun dispatchExternalMouseTouch(event: MotionEvent, width: Int, height: Int): Boolean {
@@ -653,15 +702,86 @@ object NativeStreamInputRouter {
     }
 
     fun dispatchKey(event: KeyEvent): Boolean {
+        val controllerInputDevice = event.isControllerInputDevice()
+        if (event.keyCode == KeyEvent.KEYCODE_BUTTON_START && controllerInputDevice) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0 &&
+                    shouldTrackControllerStartHold(event.keyCode, controllerInputDevice, streamUiActive)
+                ) {
+                    consumedControllerMenuHoldDeviceId = null
+                    cancelControllerMenuHold()
+                    if (!streamUiActive && systemMenuHandler != null) {
+                        val deviceId = event.deviceId
+                        val hold = Runnable {
+                            controllerMenuHold = null
+                            controllerMenuHoldDownEvent = null
+                            controllerMenuHoldDeviceId = null
+                            val openMenu = systemMenuHandler
+                            if (!streamUiActive && openMenu != null) {
+                                consumedControllerMenuHoldDeviceId = deviceId
+                                recordStreamMenuKey(event, "controller-start-hold")
+                                // The short press already reached the game. End it before local
+                                // controls take input ownership; the physical UP is consumed below.
+                                client?.dispatchKey(KeyEvent.changeAction(event, KeyEvent.ACTION_UP))
+                                setStreamUiActive(true)
+                                openMenu()
+                            }
+                        }
+                        controllerMenuHold = hold
+                        controllerMenuHoldDownEvent = event
+                        controllerMenuHoldDeviceId = deviceId
+                        controllerMenuHoldHandler.postDelayed(hold, ViewConfiguration.getLongPressTimeout().toLong())
+                    }
+                }
+                KeyEvent.ACTION_UP -> {
+                    if (controllerMenuHoldDeviceId == event.deviceId) cancelControllerMenuHold()
+                    if (consumedControllerMenuHoldDeviceId == event.deviceId) {
+                        consumedControllerMenuHoldDeviceId = null
+                        return true
+                    }
+                }
+            }
+            if (consumedControllerMenuHoldDeviceId == event.deviceId) return true
+        }
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && event.isStreamSystemMenuKey()) {
+            recordStreamMenuKey(
+                event,
+                if (androidTvProfile && event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE) "tv-guide" else "configured-shortcut",
+            )
             systemMenuHandler?.invoke()
             return systemMenuHandler != null
         }
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && event.isStreamControlsShortcutKey()) {
+            recordStreamMenuKey(event, "tv-remote-activation")
             systemMenuHandler?.invoke()
             return systemMenuHandler != null
         }
-        val streamExitShortcut = event.isStreamExitShortcutKey()
+        val externalMouseInputDevice = event.isExternalMouseInputDevice()
+        val externalMouseSecondary = shouldRouteKeyAsExternalMouseSecondary(
+            keyCode = event.keyCode,
+            externalMouseInputDevice = externalMouseInputDevice,
+            controllerInputDevice = controllerInputDevice,
+        )
+        if (externalMouseSecondary) {
+            if (streamUiActive) return true
+            val current = client ?: return false
+            current.dispatchExternalMouseSecondaryKey(event)
+            // Never let a mouse's secondary-button alias escape to Android as Back, including
+            // the short interval before the stream input channel becomes ready.
+            return true
+        }
+        val streamExitShortcut = event.isStreamExitShortcutKey(externalMouseInputDevice)
+        if (event.repeatCount == 0 &&
+            (event.keyCode == KeyEvent.KEYCODE_ESCAPE ||
+                (event.keyCode == KeyEvent.KEYCODE_BACK && event.isHardwareKeyboardSource())) &&
+            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)
+        ) {
+            NativeInputDiagnostics.retainCounted(key = "keyboard.escape.route.${event.action}") {
+                "keyboard Escape/Back route key=${event.keyCode} action=${event.action} rawScan=${event.scanCode} " +
+                    "source=${event.source} device=${event.deviceId} keyboard=${event.isHardwareKeyboardSource()} " +
+                    "controller=$controllerInputDevice streamUi=$streamUiActive back=$streamExitShortcut"
+            }
+        }
         if (
             androidTvProfile &&
             event.action == KeyEvent.ACTION_DOWN &&
@@ -670,11 +790,12 @@ object NativeStreamInputRouter {
         ) {
             NativeInputDiagnostics.add(
                 "tv back key key=${event.keyCode} source=${event.source} device=${event.deviceId}:${event.device?.name.orEmpty()} " +
-                    "controller=${event.isControllerInputDevice()} dpad=${event.isDpadSource()} " +
+                    "controller=$controllerInputDevice mouse=$externalMouseInputDevice dpad=${event.isDpadSource()} " +
                     "route=${if (streamExitShortcut) "stream_overlay" else "cloud_input"}",
             )
         }
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && streamExitShortcut) {
+            recordStreamMenuKey(event, "back")
             return dispatchSystemBack()
         }
         if (event.action == KeyEvent.ACTION_UP && streamExitShortcut) {
@@ -682,11 +803,26 @@ object NativeStreamInputRouter {
         }
         if (streamUiActive) return false
         val current = client ?: return false
+        if (event.keyCode == KeyEvent.KEYCODE_ESCAPE &&
+            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)
+        ) {
+            // Keep Escape owned by the game while a stream is attached. If input is briefly
+            // unavailable during reconnect, letting the event fall through invokes Android's
+            // Back/Home handling on some devices.
+            current.dispatchKey(event)
+            return true
+        }
         if (event.shouldConsumeAsStreamKeyboard()) {
             return current.dispatchKey(event)
         }
         return current.dispatchKey(event)
     }
+
+    internal fun shouldTrackControllerStartHold(
+        keyCode: Int,
+        controllerInputDevice: Boolean,
+        streamUiActive: Boolean,
+    ): Boolean = keyCode == KeyEvent.KEYCODE_BUTTON_START && controllerInputDevice && !streamUiActive
 
     fun dispatchMotion(event: MotionEvent): Boolean {
         if (streamUiActive && event.isExternalMousePointerEvent()) {
@@ -703,32 +839,83 @@ object NativeStreamInputRouter {
             keyCode = keyCode,
             controllerInputDevice = isControllerInputDevice(),
             androidTvProfile = androidTvProfile,
+            configuredShortcut = streamMenuShortcut,
+            ctrlPressed = isCtrlPressed,
+            altPressed = isAltPressed,
+            shiftPressed = isShiftPressed,
+            metaPressed = isMetaPressed,
         )
 
+    private fun recordStreamMenuKey(event: KeyEvent, route: String) {
+        NativeInputDiagnostics.addRetained(
+            key = "stream.controls.key",
+            message = "stream controls key route=$route key=${event.keyCode} source=${event.source} " +
+                "device=${event.deviceId} meta=${event.metaState} shortcut=$streamMenuShortcut " +
+                "tv=$androidTvProfile mouse=${event.isExternalMouseInputDevice()} " +
+                "keyboard=${event.isHardwareKeyboardSource()} controller=${event.isControllerInputDevice()}",
+        )
+    }
+
     private fun KeyEvent.isStreamControlsShortcutKey(): Boolean =
-        !streamUiActive &&
-            !isControllerInputDevice() &&
-            !isHardwareKeyboardSource() &&
-            isDpadSource() &&
+        shouldOpenStreamControlsShortcutKey(
+            keyCode = keyCode,
+            streamUiActive = streamUiActive,
+            androidTvProfile = androidTvProfile,
+            controllerInputDevice = isControllerInputDevice(),
+            hardwareKeyboardSource = isHardwareKeyboardSource(),
+            externalMouseInputDevice = isExternalMouseInputDevice(),
+            dpadSource = isDpadSource(),
+        )
+
+    internal fun shouldOpenStreamControlsShortcutKey(
+        keyCode: Int,
+        streamUiActive: Boolean,
+        androidTvProfile: Boolean,
+        controllerInputDevice: Boolean,
+        hardwareKeyboardSource: Boolean,
+        externalMouseInputDevice: Boolean,
+        dpadSource: Boolean,
+    ): Boolean =
+        // This fallback is for a TV remote's OK button only. Dock/receiver devices can also
+        // advertise DPAD and deliver mouse activation as Enter/Center; they must not bypass
+        // the configured keyboard shortcut, including when that shortcut is disabled.
+        androidTvProfile &&
+            !streamUiActive &&
+            !controllerInputDevice &&
+            !hardwareKeyboardSource &&
+            !externalMouseInputDevice &&
+            dpadSource &&
             (keyCode == KeyEvent.KEYCODE_ENTER ||
                 keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER ||
                 keyCode == KeyEvent.KEYCODE_DPAD_CENTER)
 
-    private fun KeyEvent.isStreamExitShortcutKey(): Boolean =
+    private fun KeyEvent.isStreamExitShortcutKey(externalMouseInputDevice: Boolean): Boolean =
         shouldHandleStreamExitKey(
             keyCode = keyCode,
             controllerInputDevice = isControllerInputDevice(),
-            hardwareKeyboardSource = isHardwareKeyboardSource(),
             androidTvProfile = androidTvProfile,
             dpadSource = isDpadSource(),
+            externalMouseInputDevice = externalMouseInputDevice,
         )
 
     fun shouldOpenStreamSystemMenuKey(
         keyCode: Int,
         controllerInputDevice: Boolean,
         androidTvProfile: Boolean = false,
+        configuredShortcut: String = DEFAULT_ANDROID_STREAM_MENU_SHORTCUT,
+        ctrlPressed: Boolean = false,
+        altPressed: Boolean = false,
+        shiftPressed: Boolean = false,
+        metaPressed: Boolean = false,
     ): Boolean =
-        (keyCode == KeyEvent.KEYCODE_MENU && !controllerInputDevice) ||
+        (!controllerInputDevice && matchesAndroidKeyboardShortcut(
+            keyCode = keyCode,
+            ctrlPressed = ctrlPressed,
+            altPressed = altPressed,
+            shiftPressed = shiftPressed,
+            metaPressed = metaPressed,
+            configuredShortcut = configuredShortcut,
+        )) ||
             // Android TV remotes usually have no MENU key and many are reported as controller
             // devices; the Guide button is the only dedicated "open menu" affordance there.
             (androidTvProfile && keyCode == KeyEvent.KEYCODE_BUTTON_MODE)
@@ -736,16 +923,16 @@ object NativeStreamInputRouter {
     fun shouldHandleStreamExitKey(
         keyCode: Int,
         controllerInputDevice: Boolean,
-        hardwareKeyboardSource: Boolean,
         androidTvProfile: Boolean = false,
         dpadSource: Boolean = false,
+        externalMouseInputDevice: Boolean = false,
     ): Boolean =
-        (keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice) ||
+        (keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice && !externalMouseInputDevice) ||
             (androidTvProfile &&
                 dpadSource &&
                 keyCode == KeyEvent.KEYCODE_BUTTON_B &&
-                !controllerInputDevice) ||
-            (keyCode == KeyEvent.KEYCODE_ESCAPE && !hardwareKeyboardSource)
+                !controllerInputDevice &&
+                !externalMouseInputDevice)
 
     private fun KeyEvent.isControllerInputDevice(): Boolean =
         AndroidControllerInput.isControllerEvent(source, deviceId)
@@ -757,6 +944,16 @@ object NativeStreamInputRouter {
         !isControllerInputDevice() &&
             ((source and InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD ||
                 InputDevice.getDevice(deviceId)?.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC)
+
+    private fun KeyEvent.isExternalMouseInputDevice(): Boolean {
+        // Detect pointer capability independently from controller identity. The route decision
+        // gives a known controller precedence, while unknown Android TV receivers with stray
+        // GAMEPAD/JOYSTICK bits can still deliver their right-click aliases as mouse buttons.
+        return hasExternalMouseSource(
+            eventSource = source,
+            deviceSources = InputDevice.getDevice(deviceId)?.sources ?: 0,
+        )
+    }
 
     private fun KeyEvent.shouldConsumeAsStreamKeyboard(): Boolean =
         (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) &&
@@ -1007,6 +1204,32 @@ internal fun androidGamepadConnectionBitmap(
     return connectedBit or xinputStyleBit
 }
 
+internal fun androidGamepadConnectionBitmapForSlots(
+    connectedSlots: Set<Int>,
+    controllerFamilies: Map<Int, AndroidControllerFamily>,
+    playStationRumbleCompatibility: Boolean = false,
+): Int = connectedSlots.fold(0) { bitmap, slot ->
+    bitmap or androidGamepadConnectionBitmap(
+        controllerId = slot,
+        connected = true,
+        physicalControllerFamily = controllerFamilies[slot],
+        playStationRumbleCompatibility = playStationRumbleCompatibility,
+    )
+}
+
+/**
+ * Gamepad state is a complete snapshot, so preserve the ordered reliable framing used by Android
+ * 1.7.5. NVST performs its own native low-latency routing after it decodes that wrapper; selecting
+ * the Java partial wrapper here changed the provider-facing framing on Odin after 1.7.5.
+ * The negotiated mask remains useful protocol diagnostics, but must not change Android's outer
+ * packet framing.
+ */
+internal fun shouldUsePartiallyReliableGamepadTransport(
+    @Suppress("UNUSED_PARAMETER") controllerId: Int,
+    @Suppress("UNUSED_PARAMETER") negotiatedMask: Int,
+    @Suppress("UNUSED_PARAMETER") partiallyReliableAvailable: Boolean,
+): Boolean = false
+
 internal object AndroidControllerInput {
     fun hasControllerSource(source: Int): Boolean =
         source.hasSource(InputDevice.SOURCE_GAMEPAD) ||
@@ -1021,6 +1244,11 @@ internal object AndroidControllerInput {
         // bits. Advertising those idle interfaces as an XInput pad makes games switch away from
         // mouse/keyboard even though no controller exists.
         if (!knownController && isClearlyNotController(deviceName)) return false
+        // Android TV mouse/keyboard receivers often have an idle GAMEPAD collection alongside
+        // their real pointer interface. A mouse-capable unknown device is not a controller merely
+        // because that unused collection exists. Known controller families keep precedence for
+        // devices such as DualSense, whose touch surface can expose pointer-like capabilities.
+        if (!knownController && hasExternalMouseSource(eventSource = source, deviceSources = 0)) return false
         return hasControllerSource(source) ||
             (source.hasSource(InputDevice.SOURCE_DPAD) && knownController)
     }
@@ -1028,10 +1256,21 @@ internal object AndroidControllerInput {
     fun isControllerEvent(source: Int, deviceId: Int): Boolean {
         val device = InputDevice.getDevice(deviceId)
         return if (device != null) {
-            isControllerDevice(device.sources or source, device.name)
+            isControllerEvent(source, device.sources, device.name)
         } else {
             hasControllerSource(source)
         }
+    }
+
+    internal fun isControllerEvent(source: Int, deviceSources: Int, deviceName: String?): Boolean {
+        // A composite pad can advertise a touchpad or mouse interface. Its actual gamepad
+        // event is stronger evidence than the device-wide source mask, which includes every
+        // interface. Keep mouse/keyboard events from unknown receivers on their own route.
+        if (hasControllerSource(source) &&
+            !hasExternalMouseSource(eventSource = source, deviceSources = 0) &&
+            (isKnownControllerName(deviceName) || !isClearlyNotController(deviceName))
+        ) return true
+        return isControllerDevice(deviceSources or source, deviceName)
     }
 
     fun isKnownControllerName(name: String?): Boolean {
@@ -1059,9 +1298,12 @@ internal object AndroidControllerInput {
             normalized.contains("mouse") ||
             normalized.contains("touchpad") ||
             normalized.contains("trackpad") ||
+            normalized == "logitech usb receiver" ||
             normalized.contains("uinput-goodix") ||
             normalized.contains("fingerprint") ||
-            normalized.contains("uinput-fpc")
+            normalized.contains("uinput-fpc") ||
+            normalized == "virtual-search" ||
+            normalized == "virtual-remote"
     }
 
     fun controllerFamily(device: InputDevice?): AndroidControllerFamily? =

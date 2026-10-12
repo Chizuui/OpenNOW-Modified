@@ -22,6 +22,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -39,9 +41,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.rememberScrollState
@@ -51,11 +55,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.OutlinedButton
@@ -94,6 +101,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -287,6 +295,8 @@ internal fun StreamFirstLaunchGuide(
     step: StreamGuideStep,
     controlsOpen: Boolean,
     touchControlsEnabled: Boolean,
+    controllerConnected: Boolean,
+    streamMenuShortcut: String,
     onOpenControls: () -> Unit,
     onSkip: () -> Unit,
 ) {
@@ -314,13 +324,27 @@ internal fun StreamFirstLaunchGuide(
     ) {
         val landscape = maxWidth > maxHeight
         if (step == StreamGuideStep.OpenControls) {
+            val keyboardShortcut = streamMenuShortcut.takeUnless {
+                it.equals(DISABLED_ANDROID_STREAM_MENU_SHORTCUT, ignoreCase = true)
+            }?.let(::androidKeyboardShortcutDisplay)
+            val controllerHint = if (controllerConnected) "Hold Start on your controller to open controls. " else ""
             StreamGuideEdgeCue(Modifier.align(Alignment.CenterStart))
             StreamGuideCard(
                 stepLabel = "Step 1 of 2",
                 title = "Open the stream menu",
-                body = "Press Android Back, Menu, or swipe from the left edge. That opens the menu without exiting the stream.",
+                body = if (keyboardShortcut == null) {
+                    "${controllerHint}Press Android Back or swipe from the left edge. That opens the menu without exiting the stream."
+                } else {
+                    "${controllerHint}Press Android Back, $keyboardShortcut, or swipe from the left edge. That opens the menu without exiting the stream."
+                },
                 details = listOf(
-                    "Back or the left-edge gesture opens controls.",
+                    if (keyboardShortcut == null) {
+                        if (controllerConnected) "Hold Start, press Back, or swipe from the left edge to open controls."
+                        else "Back or the left-edge gesture opens controls."
+                    } else {
+                        if (controllerConnected) "Hold Start, press Back or $keyboardShortcut, or swipe from the left edge to open controls."
+                        else "Back, $keyboardShortcut, or the left-edge gesture opens controls."
+                    },
                     if (touchControlsEnabled) {
                         "Touch controls pause while this guide is up."
                     } else {
@@ -494,7 +518,7 @@ internal fun PhysicalControllerTouchControlsDialog(
         },
         dismissButton = {
             TextButton(onClick = onUndo) {
-                Text(stringResource(R.string.action_undo))
+                Text(stringResource(R.string.stream_controller_show_touch_controls))
             }
         },
     )
@@ -505,6 +529,7 @@ internal fun StreamInputModeSwitchDialog(
     prompt: StreamInputModePrompt,
     onStay: () -> Unit,
     onSwitch: () -> Unit,
+    onDismiss: () -> Unit = onStay,
 ) {
     val title = when (prompt) {
         StreamInputModePrompt.SwitchToKeyboardMouse -> R.string.stream_keyboard_mouse_detected
@@ -523,7 +548,7 @@ internal fun StreamInputModeSwitchDialog(
         StreamInputModePrompt.SwitchToNativeTouch -> R.string.stream_input_keep_keyboard_mouse
     }
     AlertDialog(
-        onDismissRequest = onStay,
+        onDismissRequest = onDismiss,
         title = { Text(stringResource(title)) },
         text = {
             Text(
@@ -539,6 +564,41 @@ internal fun StreamInputModeSwitchDialog(
         dismissButton = {
             TextButton(onClick = onStay) {
                 Text(stringResource(stayLabel))
+            }
+        },
+    )
+}
+
+@Composable
+internal fun StreamLaunchInputModeDialog(
+    keyboardMouseConnected: Boolean,
+    onNativeTouch: () -> Unit,
+    onController: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.stream_input_choose_at_launch_title)) },
+        text = {
+            Text(
+                stringResource(
+                    if (keyboardMouseConnected) R.string.stream_input_choose_at_launch_body
+                    else R.string.stream_input_choose_at_launch_no_device_body,
+                ),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onNativeTouch) {
+                Text(stringResource(R.string.stream_input_use_native_touch))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onController) {
+                Text(stringResource(
+                    if (keyboardMouseConnected) R.string.stream_input_use_keyboard_mouse_controller
+                    else R.string.stream_input_use_controller,
+                ))
             }
         },
     )
@@ -621,7 +681,6 @@ private enum class StreamControlsPage {
 @Composable
 private fun ControlBitrateLiveHint(
     liveBitrateMbps: Int,
-    liveOverridden: Boolean,
 ) {
     Column(
         Modifier
@@ -636,12 +695,12 @@ private fun ControlBitrateLiveHint(
             Box(
                 Modifier
                     .clip(RoundedCornerShape(999.dp))
-                    .background(Green.copy(alpha = if (liveOverridden) 0.18f else 0.10f))
+                    .background(Green.copy(alpha = 0.18f))
                     .padding(horizontal = 7.dp, vertical = 2.dp),
             ) {
                 Text(
                     stringResource(R.string.stream_panel_bitrate_live_badge),
-                    color = if (liveOverridden) Green else TextMuted,
+                    color = Green,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                 )
@@ -669,6 +728,7 @@ internal fun StreamControlsPanel(
     touchControlsVisible: Boolean,
     builtInGameTouchSupported: Boolean,
     nativeTouchActive: Boolean,
+    keyboardOverlayActive: Boolean,
     gyroscopeAvailable: Boolean,
     controllerMouseAssistEnabled: Boolean,
     controllerMouseEmulationEnabled: Boolean,
@@ -681,7 +741,9 @@ internal fun StreamControlsPanel(
     microphonePermissionGranted: Boolean,
     microphoneEnabled: Boolean,
     statsVisible: Boolean,
-    liveBitrateLimitKbps: Int?,
+    statusBarDragging: Boolean,
+    receivedBitrateKbps: Int?,
+    recordingPhase: StreamRecorderPhase?,
     touchLayoutEditing: Boolean,
     bugReportSubmission: BugReportSubmissionState,
     bugReportVersionCheck: AndroidBugReportVersionCheckState,
@@ -690,13 +752,17 @@ internal fun StreamControlsPanel(
     onAudioToggle: () -> Unit,
     onMicrophoneToggle: () -> Unit,
     onStatsToggle: () -> Unit,
+    onStatusBarDraggingToggle: () -> Unit,
     onStatsStyleCycle: () -> Unit,
     onStatsPositionCycle: () -> Unit,
     onStatsMetricsChange: (StreamStatsMetrics) -> Unit,
+    onStatsBackgroundEnabledChange: (Boolean) -> Unit,
+    onStatsBackgroundOpacityChange: (Float) -> Unit,
     onKeyboardButtonToggle: () -> Unit,
     onVibrationToggle: () -> Unit,
     onTouchLayoutEditingToggle: () -> Unit,
     onKeyboardOpen: () -> Unit,
+    onRecordingToggle: () -> Unit,
     onEsc: () -> Unit,
     onEnter: () -> Unit,
     onBackspace: () -> Unit,
@@ -704,6 +770,7 @@ internal fun StreamControlsPanel(
     onControllerMouseAssistToggle: () -> Unit,
     onControllerMouseEmulationToggle: () -> Unit,
     onExit: () -> Unit,
+    onKeyboardModeToggle: (Boolean) -> Unit,
     onTouchControlsToggle: () -> Unit,
     onMousePadToggle: () -> Unit,
     onMouseDirectClickToggle: () -> Unit,
@@ -722,15 +789,15 @@ internal fun StreamControlsPanel(
     onOpacityChange: (Float) -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
-    onNativeTouchScrollScaleChange: (Float) -> Unit,
-    onNativeTouchJitterThresholdChange: (Float) -> Unit,
+    onPhysicalStickDeadZoneChange: (Float) -> Unit,
     onTouchEdgePaddingChange: (Float) -> Unit,
     onTouchBottomPaddingChange: (Float) -> Unit,
     onTouchLeftOffsetChange: (Float) -> Unit,
     onTouchRightOffsetChange: (Float) -> Unit,
     onTouchLayoutReset: () -> Unit,
     onTouchSettingsChange: (AndroidTouchSettings) -> Unit,
-    onBugReportSubmit: (String, String, String?) -> Unit,
+    onTouchPresetsChange: (List<TouchControlPreset>) -> Unit,
+    onBugReportSubmit: (String, String, String?, AndroidBugReportDetails, List<AndroidBugReportAttachment>) -> Unit,
     onBugReportReset: () -> Unit,
     onBugReportVersionCheck: () -> Unit,
     onOpenUpdate: () -> Unit,
@@ -741,6 +808,13 @@ internal fun StreamControlsPanel(
     val doneFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     var page by remember { mutableStateOf(StreamControlsPage.Main) }
+    var expandedPanel by rememberSaveable { mutableStateOf(false) }
+    var advancedControlsVisible by rememberSaveable { mutableStateOf(false) }
+    val activity = LocalContext.current as? MainActivity
+    DisposableEffect(activity, expandedPanel) {
+        activity?.setStreamPanelExpanded(expandedPanel)
+        onDispose { activity?.setStreamPanelExpanded(false) }
+    }
     val reduceMotion = LocalReduceMotion.current
     BackHandler(enabled = page != StreamControlsPage.Main) {
         page = StreamControlsPage.Main
@@ -751,25 +825,28 @@ internal fun StreamControlsPanel(
     }
     Surface(
         modifier = Modifier
-            .padding(14.dp)
-            .fillMaxWidth(0.94f)
-            .fillMaxHeight(0.72f)
+            .then(if (expandedPanel) Modifier.fillMaxSize() else Modifier.padding(14.dp).fillMaxWidth(0.94f).fillMaxHeight(0.78f))
             .streamTouchPassthrough(PASSTHROUGH_ID_PANEL),
-        shape = RoundedCornerShape(OpenNowRadius.lg + 2.dp),
-        // Firmer than the old 0.93: at that alpha TextMuted did not reliably clear 4.5:1 over
-        // bright gameplay. The hairline keeps the panel's edge visible against a light frame.
-        color = OpenNowPalette.PanelOverVideo,
-        contentColor = TextPrimary,
-        border = BorderStroke(1.dp, OpenNowPalette.PanelHairline),
-        tonalElevation = 6.dp,
+        shape = RoundedCornerShape(if (expandedPanel) 0.dp else OpenNowRadius.lg + 2.dp),
+        color = if (expandedPanel) MaterialTheme.colorScheme.background else OpenNowPalette.PanelOverVideo,
+        contentColor = if (expandedPanel) MaterialTheme.colorScheme.onBackground else TextPrimary,
+        border = if (expandedPanel) null else BorderStroke(1.dp, OpenNowPalette.PanelHairline),
+        tonalElevation = if (expandedPanel) 0.dp else 6.dp,
     ) {
-        // Every control row inside the panel picks up the denser, over-video styling — and, more
-        // importantly, becomes properly focusable. The panel's own row widgets never were.
+        // The expanded panel is a full app screen. Keep controller focus available in both styles.
         CompositionLocalProvider(
-            LocalControlRowStyle provides ControlRowStyle.stream(),
-            LocalControlSectionStyle provides ControlSectionStyle.stream(),
+            LocalControlRowStyle provides if (expandedPanel) {
+                ControlRowStyle.settings().copy(focusable = true, showFocusRing = true)
+            } else {
+                ControlRowStyle.stream()
+            },
+            LocalControlSectionStyle provides if (expandedPanel) ControlSectionStyle.settings() else ControlSectionStyle.stream(),
         ) {
-        Column(Modifier.fillMaxSize()) {
+        Column(
+            Modifier.fillMaxSize().then(
+                if (expandedPanel) Modifier.windowInsetsPadding(WindowInsets.safeDrawing) else Modifier,
+            ),
+        ) {
         // The header stays outside the scrolling area so every focused sub-page keeps navigation
         // and session actions visible while its settings scroll independently.
         StreamPanelHeader(
@@ -779,8 +856,8 @@ internal fun StreamControlsPanel(
             highlightDone = highlightDone,
             focusRequester = doneFocusRequester,
             onBack = { page = StreamControlsPage.Main },
-            onKeyboardOpen = onKeyboardOpen,
-            onExit = onExit,
+            expandedPanel = expandedPanel,
+            onExpandToggle = { expandedPanel = !expandedPanel },
             onClose = onClose,
             onButtonTone = onButtonTone,
         )
@@ -800,10 +877,14 @@ internal fun StreamControlsPanel(
                 StreamControlsPage.StatusBar -> statusBarPageItems(
                     settings = settings,
                     statsVisible = statsVisible,
+                    statusBarDragging = statusBarDragging,
                     onStatsToggle = onStatsToggle,
+                    onStatusBarDraggingToggle = onStatusBarDraggingToggle,
                     onStatsStyleCycle = onStatsStyleCycle,
                     onStatsPositionCycle = onStatsPositionCycle,
                     onStatsMetricsChange = onStatsMetricsChange,
+                    onStatsBackgroundEnabledChange = onStatsBackgroundEnabledChange,
+                    onStatsBackgroundOpacityChange = onStatsBackgroundOpacityChange,
                     onKeyboardButtonToggle = onKeyboardButtonToggle,
                     onButtonTone = onButtonTone,
                 )
@@ -828,7 +909,16 @@ internal fun StreamControlsPanel(
                                     else -> stringResource(R.string.common_hidden)
                                 },
                             )
-                            if (touchControlsVisible) {
+                            ControlSwitchRow(
+                                label = stringResource(R.string.stream_panel_drag_edit),
+                                checked = touchLayoutEditing,
+                                onCheckedChange = {
+                                    onButtonTone()
+                                    onTouchLayoutEditingToggle()
+                                },
+                                value = onOffLabel(touchLayoutEditing),
+                            )
+                            if (touchControlsVisible && !keyboardOverlayActive) {
                                 // Cycles rather than opens a menu: this row is used mid-session,
                                 // often one-handed, and each press shows its result immediately
                                 // behind the panel.
@@ -865,6 +955,16 @@ internal fun StreamControlsPanel(
                                 )
                             }
                             ControlSwitchRow(
+                                label = stringResource(R.string.stream_panel_keyboard_overlay),
+                                checked = keyboardOverlayActive,
+                                onCheckedChange = { enabled ->
+                                    onButtonTone()
+                                    onKeyboardModeToggle(enabled)
+                                },
+                                value = onOffLabel(keyboardOverlayActive),
+                                description = stringResource(R.string.stream_panel_keyboard_overlay_summary),
+                            )
+                            ControlSwitchRow(
                                 label = stringResource(R.string.stream_panel_vibration),
                                 checked = settings.vibrationEnabled,
                                 onCheckedChange = {
@@ -879,8 +979,9 @@ internal fun StreamControlsPanel(
                     item {
                         ControlSection(stringResource(R.string.stream_joysticks_title)) {
                             val dynamic = settings.androidTouch.joystickMode == TouchJoystickMode.Dynamic
-                            val lockZone = settings.androidTouch.aimMode == TouchAimMode.LockZone
-                            ControlSwitchRow(
+                            val lockZone = !keyboardOverlayActive &&
+                                settings.androidTouch.aimMode == TouchAimMode.LockZone
+                            if (!keyboardOverlayActive) ControlSwitchRow(
                                 label = stringResource(R.string.stream_joysticks_aim_mode),
                                 checked = lockZone,
                                 onCheckedChange = {
@@ -954,6 +1055,12 @@ internal fun StreamControlsPanel(
                         }
                     }
                     item {
+                        if (!keyboardOverlayActive && !touchLayoutEditing) {
+                            TouchControlPresetEditor(settings.androidTouch, settings.touchControlPresets, onTouchSettingsChange, onTouchPresetsChange)
+                        }
+                        TouchButtonAppearanceEditor(settings.androidTouch, onTouchSettingsChange)
+                    }
+                    if (!keyboardOverlayActive) item {
                         ControlSection(stringResource(R.string.settings_touch_visible_controls)) {
                             Text(
                                 text = stringResource(R.string.settings_touch_visible_controls_desc),
@@ -976,7 +1083,7 @@ internal fun StreamControlsPanel(
                             }
                         }
                     }
-                    item {
+                    if (!keyboardOverlayActive) item {
                         ControlSection(stringResource(R.string.settings_touch_extra_buttons)) {
                             Text(
                                 text = stringResource(R.string.settings_touch_extra_buttons_desc),
@@ -988,7 +1095,7 @@ internal fun StreamControlsPanel(
                                 ControlActionRow(
                                     label = stringResource(R.string.settings_touch_extra_button, index + 1),
                                     actionLabel = stringResource(R.string.common_next),
-                                    value = touchExtraButtonActionLabel(action),
+                                    value = touchExtraButtonComboLabel(settings.androidTouch.extraButtonCombo(index)),
                                     onClick = {
                                         onButtonTone()
                                         onTouchSettingsChange(
@@ -1000,6 +1107,7 @@ internal fun StreamControlsPanel(
                                     },
                                 )
                             }
+                            TouchExtraButtonComboEditor(settings.androidTouch, onTouchSettingsChange)
                             TouchLayoutSlider(
                                 R.string.settings_touch_extra_button_size,
                                 settings.androidTouch.extraButtonScale,
@@ -1014,15 +1122,6 @@ internal fun StreamControlsPanel(
                     }
                     item {
                         ControlSection(stringResource(R.string.stream_panel_section_touch_layout)) {
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_drag_edit),
-                                checked = touchLayoutEditing,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onTouchLayoutEditingToggle()
-                                },
-                                value = onOffLabel(touchLayoutEditing),
-                            )
                             ControlActionRow(
                                 label = stringResource(R.string.stream_panel_reset_layout),
                                 actionLabel = stringResource(R.string.action_reset),
@@ -1036,35 +1135,37 @@ internal fun StreamControlsPanel(
                             // against the game without leaving the stream.
                             TouchLayoutSlider(R.string.stream_panel_layout_scale, settings.androidTouch.scale, 0.6f, 1.4f, TOUCH_SCALE_SLIDER_STEP, onTouchScaleChange)
                             TouchLayoutSlider(R.string.stream_panel_button_size, settings.androidTouch.buttonScale, 0.65f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onButtonScaleChange)
-                            TouchLayoutSlider(R.string.settings_touch_face_size, settings.androidTouch.faceButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_face_size, settings.androidTouch.faceButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(faceButtonScale = value))
                             })
-                            TouchLayoutSlider(R.string.settings_touch_dpad_size, settings.androidTouch.dpadScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_dpad_size, settings.androidTouch.dpadScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(dpadScale = value))
                             })
-                            TouchLayoutSlider(R.string.settings_touch_shoulders_size, settings.androidTouch.shoulderButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_shoulders_size, settings.androidTouch.shoulderButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(shoulderButtonScale = value))
                             })
-                            TouchLayoutSlider(R.string.settings_touch_center_size, settings.androidTouch.centerButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_center_size, settings.androidTouch.centerButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(centerButtonScale = value))
                             })
                             TouchLayoutSlider(R.string.settings_touch_left_stick_size, settings.androidTouch.leftStickScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(leftStickScale = value))
                             })
-                            TouchLayoutSlider(R.string.settings_touch_right_stick_size, settings.androidTouch.rightStickScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_right_stick_size, settings.androidTouch.rightStickScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(rightStickScale = value))
                             })
-                            TouchLayoutSlider(R.string.settings_touch_stick_knob_size, settings.androidTouch.stickKnobScale, 0.28f, 0.72f, 0.02f, onChange = { value ->
+                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_stick_knob_size, settings.androidTouch.stickKnobScale, 0.28f, 0.72f, 0.02f, onChange = { value ->
                                 onTouchSettingsChange(settings.androidTouch.copy(stickKnobScale = value))
                             })
                             TouchLayoutSlider(R.string.stream_panel_opacity, settings.androidTouch.opacity, 0f, 1f, TOUCH_SCALE_SLIDER_STEP, onOpacityChange)
                             TouchLayoutSlider(R.string.stream_panel_edge_padding, settings.androidTouch.edgePaddingDp, 0f, 72f, TOUCH_DP_SLIDER_STEP, onTouchEdgePaddingChange, unit = DP_UNIT)
                             TouchLayoutSlider(R.string.stream_panel_bottom_padding, settings.androidTouch.bottomPaddingDp, 0f, 120f, TOUCH_DP_SLIDER_STEP, onTouchBottomPaddingChange, unit = DP_UNIT)
-                            TouchLayoutSlider(R.string.stream_panel_left_position, settings.androidTouch.leftOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchLeftOffsetChange, unit = DP_UNIT)
-                            TouchLayoutSlider(R.string.stream_panel_right_position, settings.androidTouch.rightOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchRightOffsetChange, unit = DP_UNIT)
+                            if (!keyboardOverlayActive) {
+                                TouchLayoutSlider(R.string.stream_panel_left_position, settings.androidTouch.leftOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchLeftOffsetChange, unit = DP_UNIT)
+                                TouchLayoutSlider(R.string.stream_panel_right_position, settings.androidTouch.rightOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchRightOffsetChange, unit = DP_UNIT)
+                            }
                         }
                     }
-                    item {
+                    if (!keyboardOverlayActive) item {
                         ControlSection(stringResource(R.string.stream_panel_section_motion_aiming)) {
                             ControlSwitchRow(
                                 label = stringResource(R.string.settings_touch_gyro),
@@ -1144,8 +1245,6 @@ internal fun StreamControlsPanel(
                     onControllerMouseEmulationToggle = onControllerMouseEmulationToggle,
                     onMouseSensitivityChange = onMouseSensitivityChange,
                     onMouseScrollSensitivityChange = onMouseScrollSensitivityChange,
-                    onNativeTouchScrollScaleChange = onNativeTouchScrollScaleChange,
-                    onNativeTouchJitterThresholdChange = onNativeTouchJitterThresholdChange,
                     onButtonTone = onButtonTone,
                 )
                 StreamControlsPage.ReportProblem -> {
@@ -1154,6 +1253,7 @@ internal fun StreamControlsPanel(
                             submission = bugReportSubmission,
                             versionCheck = bugReportVersionCheck,
                             update = update,
+                            experimentalNvstEnabled = settings.stream.experimentalNvst,
                             onSubmit = onBugReportSubmit,
                             onReset = onBugReportReset,
                             onVersionCheck = onBugReportVersionCheck,
@@ -1166,6 +1266,44 @@ internal fun StreamControlsPanel(
                     }
                 }
                 StreamControlsPage.Main -> {
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                    val recordingBusy = recordingPhase == StreamRecorderPhase.Starting || recordingPhase == StreamRecorderPhase.Finalizing
+                    val recordingLabel = when (recordingPhase) {
+                        StreamRecorderPhase.Starting -> R.string.stream_record_starting
+                        StreamRecorderPhase.Finalizing -> R.string.stream_record_saving
+                        StreamRecorderPhase.Recording -> R.string.stream_record_stop
+                        else -> R.string.stream_record_start
+                    }
+                    OutlinedButton(
+                        onClick = { onButtonTone(); onRecordingToggle() },
+                        enabled = !recordingBusy,
+                        modifier = Modifier.weight(1f),
+                    ) { Text(stringResource(recordingLabel), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    OutlinedButton(
+                        onClick = { onButtonTone(); onKeyboardOpen() },
+                        modifier = Modifier.weight(1f),
+                    ) { Text(stringResource(R.string.stream_panel_keyboard), maxLines = 1) }
+                    OutlinedButton(
+                        onClick = { onButtonTone(); onExit() },
+                        modifier = Modifier.weight(1f),
+                        border = BorderStroke(1.dp, OpenNowPalette.AccentSwitchRed),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = OpenNowPalette.AccentSwitchRed.copy(alpha = 0.10f),
+                            contentColor = OpenNowPalette.AccentSwitchRed,
+                        ),
+                    ) { Text(stringResource(R.string.stream_panel_exit), maxLines = 1) }
+                }
+            }
+            item {
+                ControlActionRow(
+                    label = if (advancedControlsVisible) stringResource(R.string.stream_panel_less_controls)
+                        else stringResource(R.string.stream_panel_more_controls),
+                    actionLabel = if (advancedControlsVisible) stringResource(R.string.action_close)
+                        else stringResource(R.string.action_open),
+                    onClick = { advancedControlsVisible = !advancedControlsVisible },
+                )
+            }
             if (showSessionTimer) {
                 item {
                     StreamSessionTimerMenuRow(
@@ -1177,15 +1315,17 @@ internal fun StreamControlsPanel(
             }
             item {
                 ControlSection(stringResource(R.string.stream_panel_section_display)) {
-                    ControlSwitchRow(
-                        label = stringResource(R.string.stream_panel_stretch_to_fit),
-                        checked = settings.stretchStreamToFit,
-                        onCheckedChange = {
-                            onButtonTone()
-                            onStretchToFitToggle()
-                        },
-                        value = onOffLabel(settings.stretchStreamToFit),
-                    )
+                    if (advancedControlsVisible) {
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_stretch_to_fit),
+                            checked = settings.stretchStreamToFit,
+                            onCheckedChange = {
+                                onButtonTone()
+                                onStretchToFitToggle()
+                            },
+                            value = onOffLabel(settings.stretchStreamToFit),
+                        )
+                    }
                     ControlSwitchRow(
                         label = stringResource(R.string.stream_panel_audio),
                         checked = !audioMuted,
@@ -1211,43 +1351,55 @@ internal fun StreamControlsPanel(
                             )
                         },
                     )
-                    ControlSwitchRow(
-                        label = stringResource(R.string.stream_panel_sharpening),
-                        checked = settings.stream.streamSharpeningEnabled,
-                        onCheckedChange = {
-                            onButtonTone()
-                            onSharpeningToggle()
-                        },
-                        value = onOffLabel(settings.stream.streamSharpeningEnabled),
-                    )
-                    if (settings.stream.streamSharpeningEnabled) {
-                        ControlSliderRow(
-                            label = stringResource(R.string.stream_panel_sharpening_amount),
-                            value = settings.stream.streamSharpeningAmount,
-                            min = 0f,
-                            max = 1f,
-                            step = SHARPENING_SLIDER_STEP,
-                            onChange = onSharpeningAmountChange,
+                    if (advancedControlsVisible) {
+                        ControlSwitchRow(
+                            label = stringResource(R.string.stream_panel_sharpening),
+                            checked = settings.stream.streamSharpeningEnabled,
+                            onCheckedChange = {
+                                onButtonTone()
+                                onSharpeningToggle()
+                            },
+                            value = onOffLabel(settings.stream.streamSharpeningEnabled),
                         )
+                        if (settings.stream.streamSharpeningEnabled) {
+                            ControlSliderRow(
+                                label = stringResource(R.string.stream_panel_sharpening_amount),
+                                value = settings.stream.streamSharpeningAmount,
+                                min = 0f,
+                                max = 1f,
+                                step = SHARPENING_SLIDER_STEP,
+                                onChange = onSharpeningAmountChange,
+                            )
+                        }
+                        ControlSliderRow(
+                            label = stringResource(R.string.settings_bitrate),
+                            value = settings.stream.maxBitrateMbps.toFloat(),
+                            min = 1f,
+                            max = 150f,
+                            step = 1f,
+                            unit = "Mbps",
+                            descriptionProvider = { mbps -> streamBitrateUsageEstimate(mbps) },
+                            onChange = { value -> onMaxBitrateChange(value.roundToInt()) },
+                        )
+                        // A requested ceiling can be queued for a later offer. Only measured
+                        // receive traffic can truthfully be shown as live in the current session.
+                        receivedBitrateKbps?.takeIf { it >= 0 }?.let { bitrate ->
+                            ControlBitrateLiveHint(liveBitrateMbps = bitrate / 1000)
+                        }
                     }
-                    ControlSliderRow(
-                        label = stringResource(R.string.settings_bitrate),
-                        value = settings.stream.maxBitrateMbps.toFloat(),
-                        min = 1f,
-                        max = 150f,
-                        step = 1f,
-                        unit = "Mbps",
-                        descriptionProvider = { mbps -> streamBitrateUsageEstimate(mbps) },
-                        onChange = { value -> onMaxBitrateChange(value.roundToInt()) },
-                    )
-                    ControlBitrateLiveHint(
-                        liveBitrateMbps = liveBitrateLimitKbps?.div(1000) ?: settings.stream.maxBitrateMbps,
-                        liveOverridden = liveBitrateLimitKbps != null,
-                    )
                 }
             }
             item {
                 ControlSection(stringResource(R.string.stream_panel_section_input)) {
+                    ControlSliderRow(
+                        label = stringResource(R.string.settings_physical_stick_dead_zone),
+                        value = settings.physicalInput.stickDeadZone * 100f,
+                        min = 0f,
+                        max = 40f,
+                        step = 1f,
+                        unit = "%",
+                        onChange = { percent -> onPhysicalStickDeadZoneChange(percent / 100f) },
+                    )
                     if (microphoneRequested) {
                         ControlSwitchRow(
                             label = stringResource(R.string.stream_panel_microphone),
@@ -1263,92 +1415,97 @@ internal fun StreamControlsPanel(
                             },
                         )
                     }
-                    ControlActionRow(
-                        label = stringResource(R.string.stream_panel_steam_menu),
-                        actionLabel = stringResource(R.string.action_open),
-                        onClick = {
-                            onButtonTone()
-                            onSteamMenuOpen()
-                        },
-                        value = stringResource(R.string.stream_panel_steam_menu_summary),
-                    )
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_esc), Modifier.weight(1f)) {
-                            onButtonTone()
-                            onEsc()
-                        }
-                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_enter), Modifier.weight(1f)) {
-                            onButtonTone()
-                            onEnter()
-                        }
-                        StreamPanelKeyButton(stringResource(R.string.stream_panel_key_backspace), Modifier.weight(1f)) {
-                            onButtonTone()
-                            onBackspace()
-                        }
-                    }
-                    if (tvProfile) {
-                        ControlSwitchRow(
-                            label = stringResource(R.string.stream_panel_controller_mouse),
-                            checked = controllerMouseAssistEnabled,
-                            onCheckedChange = {
+                    if (advancedControlsVisible) {
+                        ControlActionRow(
+                            label = stringResource(R.string.stream_panel_steam_menu),
+                            actionLabel = stringResource(R.string.action_open),
+                            onClick = {
                                 onButtonTone()
-                                onControllerMouseAssistToggle()
+                                onSteamMenuOpen()
                             },
-                            value = if (controllerMouseAssistEnabled) {
-                                stringResource(R.string.stream_panel_controller_mouse_summary)
-                            } else {
-                                onOffLabel(false)
-                            },
+                            value = stringResource(R.string.stream_panel_steam_menu_summary),
                         )
-                    } else {
-                        ControlSwitchRow(
-                            label = stringResource(R.string.stream_panel_finger_mouse),
-                            checked = settings.androidTouch.mousePad,
-                            onCheckedChange = {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            StreamPanelKeyButton(stringResource(R.string.stream_panel_key_esc), Modifier.weight(1f)) {
                                 onButtonTone()
-                                onMousePadToggle()
-                            },
-                            value = onOffLabel(settings.androidTouch.mousePad),
-                        )
-                        if (settings.androidTouch.mousePad) {
+                                onEsc()
+                            }
+                            StreamPanelKeyButton(stringResource(R.string.stream_panel_key_enter), Modifier.weight(1f)) {
+                                onButtonTone()
+                                onEnter()
+                            }
+                            StreamPanelKeyButton(stringResource(R.string.stream_panel_key_backspace), Modifier.weight(1f)) {
+                                onButtonTone()
+                                onBackspace()
+                            }
+                        }
+                        if (tvProfile) {
                             ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_direct_click),
-                                checked = settings.androidTouch.mouseDirectClick,
+                                label = stringResource(R.string.stream_panel_controller_mouse),
+                                checked = controllerMouseAssistEnabled,
                                 onCheckedChange = {
                                     onButtonTone()
-                                    onMouseDirectClickToggle()
+                                    onControllerMouseAssistToggle()
                                 },
-                                value = onOffLabel(settings.androidTouch.mouseDirectClick),
-                                // Reads as a child of Finger mouse; replaces a hand-written Box.
-                                indentLevel = 1,
+                                value = if (controllerMouseAssistEnabled) {
+                                    stringResource(R.string.stream_panel_controller_mouse_summary)
+                                } else {
+                                    onOffLabel(false)
+                                },
+                                description = stringResource(R.string.stream_panel_controller_mouse_description),
                             )
-
-                            val scrollHint = when {
-                                settings.stream.mouseScrollSensitivity <= 20 -> "Fast"
-                                settings.stream.mouseScrollSensitivity <= 40 -> "Normal"
-                                settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
-                                else -> "Slow"
-                            }
-
-                            ControlActionRow(
-                                label = "Scroll sensitivity",
-                                actionLabel = scrollHint,
-                                onClick = {
+                        } else {
+                            ControlSwitchRow(
+                                label = stringResource(R.string.stream_panel_finger_mouse),
+                                checked = settings.androidTouch.mousePad,
+                                onCheckedChange = {
                                     onButtonTone()
-                                    val next = when {
-                                        settings.stream.mouseScrollSensitivity <= 20 -> 40
-                                        settings.stream.mouseScrollSensitivity <= 40 -> 60
-                                        settings.stream.mouseScrollSensitivity <= 60 -> 80
-                                        else -> 20
-                                    }
-                                    onMouseScrollSensitivityChange(next)
+                                    onMousePadToggle()
                                 },
-                                indentLevel = 1
+                                value = onOffLabel(settings.androidTouch.mousePad),
                             )
+                            if (settings.androidTouch.mousePad) {
+                                ControlSwitchRow(
+                                    label = stringResource(R.string.stream_panel_direct_click),
+                                    checked = settings.androidTouch.mouseDirectClick,
+                                    onCheckedChange = {
+                                        onButtonTone()
+                                        onMouseDirectClickToggle()
+                                    },
+                                    value = onOffLabel(settings.androidTouch.mouseDirectClick),
+                                    // Reads as a child of Finger mouse; replaces a hand-written Box.
+                                    indentLevel = 1,
+                                )
+
+                                val scrollHint = when {
+                                    settings.stream.mouseScrollSensitivity <= 20 -> "Fast"
+                                    settings.stream.mouseScrollSensitivity <= 40 -> "Normal"
+                                    settings.stream.mouseScrollSensitivity <= 60 -> "Precise"
+                                    else -> "Slow"
+                                }
+
+                                ControlActionRow(
+                                    label = "Scroll sensitivity",
+                                    actionLabel = scrollHint,
+                                    onClick = {
+                                        onButtonTone()
+                                        val next = when {
+                                            settings.stream.mouseScrollSensitivity <= 20 -> 40
+                                            settings.stream.mouseScrollSensitivity <= 40 -> 60
+                                            settings.stream.mouseScrollSensitivity <= 60 -> 80
+                                            else -> 20
+                                        }
+                                        onMouseScrollSensitivityChange(next)
+                                    },
+                                    indentLevel = 1
+                                )
+                            }
                         }
+                    }
+                    if (!tvProfile) {
                         ControlNavigationRow(
                             label = stringResource(R.string.stream_panel_touch_controller),
                             onClick = {
@@ -1381,7 +1538,7 @@ internal fun StreamControlsPanel(
             item {
                 ControlSection(stringResource(R.string.stream_panel_section_support)) {
                     ControlNavigationRow(
-                        label = stringResource(R.string.bug_report_open_label),
+                        label = stringResource(R.string.bug_report_feedback_open),
                         onClick = {
                             onButtonTone()
                             page = StreamControlsPage.ReportProblem
@@ -1426,7 +1583,7 @@ private fun BuiltInGameTouchNotice(usingBuiltInTouch: Boolean) {
             Text(
                 stringResource(
                     if (usingBuiltInTouch) {
-                        R.string.stream_touch_builtin_available
+                        R.string.stream_touch_controller_requires_new_session
                     } else {
                         R.string.stream_touch_builtin_overridden
                     },
@@ -1524,6 +1681,109 @@ internal fun BugReportDataDisclosure(
     }
 }
 
+@Composable
+internal fun BugReportConsentGate(
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(OpenNowRadius.lg))
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Checkbox,
+                onValueChange = onCheckedChange,
+            ),
+        shape = RoundedCornerShape(OpenNowRadius.lg),
+        color = if (checked) {
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+        },
+        border = BorderStroke(
+            1.dp,
+            if (checked) MaterialTheme.colorScheme.primary.copy(alpha = 0.46f)
+            else TextMuted.copy(alpha = 0.20f),
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = OpenNowSpacing.md, vertical = OpenNowSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Checkbox(
+                checked = checked,
+                onCheckedChange = null,
+                enabled = enabled,
+            )
+            Column(
+                modifier = Modifier.padding(top = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.xs),
+            ) {
+                Text(
+                    stringResource(R.string.bug_report_consent_title),
+                    color = TextPrimary,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    stringResource(R.string.bug_report_consent_body),
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    stringResource(R.string.bug_report_terms_consent),
+                    color = if (checked) MaterialTheme.colorScheme.primary else TextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun BugReportWarningsAcknowledgementGate(
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    val warning = Color(0xffffc266)
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(OpenNowRadius.lg))
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Checkbox,
+                onValueChange = onCheckedChange,
+            ),
+        shape = RoundedCornerShape(OpenNowRadius.lg),
+        color = warning.copy(alpha = 0.09f),
+        border = BorderStroke(1.dp, warning.copy(alpha = 0.48f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = OpenNowSpacing.md, vertical = OpenNowSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+            Text(
+                stringResource(R.string.bug_report_warnings_acknowledgement),
+                modifier = Modifier.weight(1f),
+                color = warning,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
 /**
  * Shared header for the main panel and every focused settings/support page. It stays put while the
  * selected page scrolls.
@@ -1573,8 +1833,8 @@ private fun StreamPanelHeader(
     highlightDone: Boolean,
     focusRequester: FocusRequester,
     onBack: () -> Unit,
-    onKeyboardOpen: () -> Unit,
-    onExit: () -> Unit,
+    expandedPanel: Boolean,
+    onExpandToggle: () -> Unit,
     onClose: () -> Unit,
     onButtonTone: () -> Unit,
 ) {
@@ -1623,7 +1883,7 @@ private fun StreamPanelHeader(
             )
             Text(
                 when (page) {
-                    StreamControlsPage.Main -> gameTitle
+                    StreamControlsPage.Main -> if (status == null) gameTitle else "$gameTitle · $status"
                     StreamControlsPage.StatusBar -> stringResource(R.string.stream_statusbar_subtitle)
                     StreamControlsPage.TouchControls -> stringResource(R.string.stream_touch_controls_subtitle)
                     StreamControlsPage.MouseMode -> stringResource(R.string.stream_mouse_mode_subtitle)
@@ -1635,31 +1895,14 @@ private fun StreamPanelHeader(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        StreamPanelHeaderButton(onClick = onExpandToggle) {
+            Icon(
+                imageVector = if (expandedPanel) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                contentDescription = stringResource(if (expandedPanel) R.string.stream_panel_collapse else R.string.stream_panel_expand),
+                modifier = Modifier.size(20.dp),
+            )
+        }
         if (onMain) {
-            if (status != null) {
-                Text(status, color = TextMuted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
-            }
-            StreamPanelHeaderButton(
-                onClick = {
-                    onButtonTone()
-                    onKeyboardOpen()
-                },
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_keyboard),
-                    contentDescription = stringResource(R.string.stream_panel_cd_keyboard),
-                    tint = TextPrimary,
-                    modifier = Modifier.size(20.dp),
-                )
-            }
-            StreamPanelHeaderButton(
-                onClick = {
-                    onButtonTone()
-                    onExit()
-                },
-            ) {
-                Text(stringResource(R.string.stream_panel_exit), maxLines = 1)
-            }
             val doneAction = {
                 onButtonTone()
                 onClose()
@@ -1693,11 +1936,13 @@ private fun StreamPanelHeader(
 private fun StreamPanelHeaderButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
     OutlinedButton(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.onFocusChanged { focused = it.isFocused },
         border = BorderStroke(
             width = if (focused) 2.dp else 1.dp,
@@ -1738,6 +1983,34 @@ private fun BugReportSubmissionRequirements(modifier: Modifier = Modifier) {
         fontWeight = FontWeight.Bold,
         style = MaterialTheme.typography.bodyMedium,
     )
+}
+
+@Composable
+internal fun NvstBugReportWarning(
+    experimentalNvstEnabled: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val warning = androidBugReportNvstWarning(experimentalNvstEnabled) ?: return
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xffffc266).copy(alpha = 0.14f),
+        contentColor = TextPrimary,
+        border = BorderStroke(1.dp, Color(0xffffc266).copy(alpha = 0.48f)),
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text(
+                "Experimental NVST enabled",
+                color = Color(0xffffc266),
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(warning, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
 }
 
 @Composable
@@ -1878,9 +2151,14 @@ internal fun BugReportVersionGateCard(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BugReportPreflightDeckView(
+internal fun BugReportPreflightDeckView(
     deck: BugReportPreflightDeck,
     page: Int,
+    additionalWarning: Boolean,
+    consentChecked: Boolean,
+    warningsAcknowledged: Boolean,
+    onConsentChange: (Boolean) -> Unit,
+    onWarningsAcknowledgedChange: (Boolean) -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onRefresh: () -> Unit,
@@ -2041,6 +2319,22 @@ private fun BugReportPreflightDeckView(
             style = MaterialTheme.typography.labelSmall,
         )
 
+        if (page == deck.cards.lastIndex) {
+            BugReportDataDisclosure(includeTypedTextWarning = true)
+            BugReportConsentGate(
+                checked = consentChecked,
+                enabled = true,
+                onCheckedChange = onConsentChange,
+            )
+            if (deck.hasWarnings(additionalWarning)) {
+                BugReportWarningsAcknowledgementGate(
+                    checked = warningsAcknowledged,
+                    enabled = true,
+                    onCheckedChange = onWarningsAcknowledgedChange,
+                )
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2053,8 +2347,12 @@ private fun BugReportPreflightDeckView(
             OutlinedButton(onClick = if (page == 0) onCancel else onPrevious) {
                 Text(if (page == 0) stringResource(R.string.action_cancel) else stringResource(R.string.action_back))
             }
-            Button(onClick = onNext) {
-                Text(if (page == deck.cards.lastIndex) stringResource(R.string.action_continue) else stringResource(R.string.action_next))
+            Button(
+                onClick = onNext,
+                enabled = page != deck.cards.lastIndex ||
+                    canContinueBugReportPreflight(deck, consentChecked, warningsAcknowledged, additionalWarning),
+            ) {
+                Text(stringResource(R.string.action_next))
             }
         }
     }
@@ -2064,13 +2362,16 @@ private fun BugReportPreflightDeckView(
 internal fun BugReportFormInputs(
     title: String,
     description: String,
+    details: AndroidBugReportDetails,
+    attachments: List<AndroidBugReportAttachment>,
     consentChecked: Boolean,
     knownIssueBlock: BugReportKnownIssueBlock?,
     acknowledgedKnownIssueKey: String?,
     submission: BugReportSubmissionState,
     onTitleChange: (String) -> Unit,
     onDescriptionChange: (String) -> Unit,
-    onConsentChange: (Boolean) -> Unit,
+    onDetailsChange: (AndroidBugReportDetails) -> Unit,
+    onAttachmentsChange: (List<AndroidBugReportAttachment>) -> Unit,
     onKnownIssueAcknowledgementChange: (String?) -> Unit,
     onConfirm: () -> Unit,
     modifier: Modifier = Modifier,
@@ -2115,28 +2416,13 @@ internal fun BugReportFormInputs(
             description = description,
             error = descriptionError,
         )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .clickable(enabled = !submission.uploading) {
-                    onConsentChange(!consentChecked)
-                }
-                .padding(vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Checkbox(
-                checked = consentChecked,
-                onCheckedChange = onConsentChange,
-                enabled = !submission.uploading,
-            )
-            Text(
-                stringResource(R.string.bug_report_consent_upload),
-                modifier = Modifier.weight(1f),
-                color = TextMuted,
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
+        BugReportOptions(
+            details = details,
+            attachments = attachments,
+            enabled = !submission.uploading,
+            onDetailsChange = onDetailsChange,
+            onAttachmentsChange = onAttachmentsChange,
+        )
         knownIssueBlock?.let { block ->
             BugReportKnownIssueOverride(
                 block = block,
@@ -2179,7 +2465,7 @@ internal fun BugReportFormInputs(
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.bug_report_uploading))
             } else {
-                Text(if (knownIssueBlock == null) "Send bug report" else "Send anyway")
+                Text(if (knownIssueBlock == null) stringResource(R.string.bug_report_feedback_send) else "Send anyway")
             }
         }
     }
@@ -2229,7 +2515,8 @@ private fun StreamBugReporter(
     submission: BugReportSubmissionState,
     versionCheck: AndroidBugReportVersionCheckState,
     update: AndroidUpdateState,
-    onSubmit: (String, String, String?) -> Unit,
+    experimentalNvstEnabled: Boolean,
+    onSubmit: (String, String, String?, AndroidBugReportDetails, List<AndroidBugReportAttachment>) -> Unit,
     onReset: () -> Unit,
     onVersionCheck: () -> Unit,
     onOpenUpdate: () -> Unit,
@@ -2244,20 +2531,28 @@ private fun StreamBugReporter(
     var title by rememberSaveable { mutableStateOf("") }
     var description by rememberSaveable { mutableStateOf("") }
     var consentChecked by rememberSaveable { mutableStateOf(false) }
+    var warningsAcknowledged by rememberSaveable { mutableStateOf(false) }
     var confirmationOpen by rememberSaveable { mutableStateOf(false) }
     var preflightReviewed by rememberSaveable { mutableStateOf(false) }
     var preflightPage by rememberSaveable { mutableStateOf(0) }
     var preflightDeck by remember { mutableStateOf<BugReportPreflightDeck?>(null) }
     var acknowledgedKnownIssueKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var details by rememberSaveable { mutableStateOf(AndroidBugReportDetails()) }
+    var attachments by remember { mutableStateOf(emptyList<AndroidBugReportAttachment>()) }
     val knownIssueBlock = preflightDeck?.let { deck ->
         bugReportKnownIssueBlock(title, description, deck)
     }
+    val preflightComplete = preflightDeck?.let { deck ->
+        preflightReviewed && canContinueBugReportPreflight(
+            deck, consentChecked, warningsAcknowledged, experimentalNvstEnabled,
+        )
+    } == true
 
     LaunchedEffect(expanded, update.installSource.isGooglePlay) {
         if (expanded && update.installSource.isGooglePlay) {
             onVersionCheck()
         }
-        if (expanded && !preflightReviewed && preflightDeck == null) {
+        if (expanded && preflightDeck == null) {
             preflightDeck = preflightProvider()
         }
     }
@@ -2265,12 +2560,13 @@ private fun StreamBugReporter(
     ControlSection(stringResource(R.string.bug_report_section)) {
         if (!expanded) {
             ControlActionRow(
-                label = stringResource(R.string.bug_report_open_label),
+                label = stringResource(R.string.bug_report_feedback_open),
                 actionLabel = stringResource(R.string.action_open),
                 onClick = {
                     onButtonTone()
                     preflightReviewed = false
                     preflightPage = 0
+                    warningsAcknowledged = false
                     preflightDeck = preflightProvider()
                     expanded = true
                 },
@@ -2300,7 +2596,7 @@ private fun StreamBugReporter(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Icon(Icons.Rounded.Check, contentDescription = null, tint = Green)
-                        Text(stringResource(R.string.bug_report_sent), fontWeight = FontWeight.Bold)
+                        Text(stringResource(R.string.bug_report_feedback_sent), fontWeight = FontWeight.Bold)
                     }
                     submission.reference?.let { reportId ->
                         CopyableBugReportId(reportId)
@@ -2312,6 +2608,9 @@ private fun StreamBugReporter(
                                 title = ""
                                 description = ""
                                 consentChecked = false
+                                warningsAcknowledged = false
+                                details = AndroidBugReportDetails()
+                                attachments = emptyList()
                                 acknowledgedKnownIssueKey = null
                                 confirmationOpen = false
                                 preflightReviewed = false
@@ -2355,7 +2654,9 @@ private fun StreamBugReporter(
             return@ControlSection
         }
 
-        if (!preflightReviewed) {
+        NvstBugReportWarning(experimentalNvstEnabled)
+
+        if (!preflightComplete) {
             val deck = preflightDeck
             if (deck == null) {
                 Row(
@@ -2371,6 +2672,11 @@ private fun StreamBugReporter(
                 BugReportPreflightDeckView(
                     deck = deck,
                     page = preflightPage.coerceIn(deck.cards.indices),
+                    additionalWarning = experimentalNvstEnabled,
+                    consentChecked = consentChecked,
+                    warningsAcknowledged = warningsAcknowledged,
+                    onConsentChange = { consentChecked = it },
+                    onWarningsAcknowledgedChange = { warningsAcknowledged = it },
                     onPrevious = {
                         onButtonTone()
                         preflightPage = (preflightPage - 1).coerceAtLeast(0)
@@ -2379,19 +2685,23 @@ private fun StreamBugReporter(
                         onButtonTone()
                         if (preflightPage < deck.cards.lastIndex) {
                             preflightPage += 1
-                        } else {
+                        } else if (canContinueBugReportPreflight(
+                                deck, consentChecked, warningsAcknowledged, experimentalNvstEnabled,
+                            )) {
                             preflightReviewed = true
                         }
                     },
                     onRefresh = {
                         onButtonTone()
                         preflightPage = 0
+                        warningsAcknowledged = false
                         preflightDeck = preflightProvider()
                     },
                     onCancel = {
                         onButtonTone()
                         preflightReviewed = false
                         preflightPage = 0
+                        warningsAcknowledged = false
                         preflightDeck = null
                         expanded = false
                         onExpandedClose()
@@ -2408,7 +2718,7 @@ private fun StreamBugReporter(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(stringResource(R.string.bug_report_open_label), fontWeight = FontWeight.Bold)
+                    Text(stringResource(R.string.bug_report_feedback_open), fontWeight = FontWeight.Bold)
                     Text(
                         stringResource(R.string.bug_report_inline_subtitle),
                         color = TextMuted,
@@ -2421,6 +2731,7 @@ private fun StreamBugReporter(
                         onButtonTone()
                         preflightReviewed = false
                         preflightPage = 0
+                        warningsAcknowledged = false
                         preflightDeck = preflightProvider()
                     },
                 ) {
@@ -2432,6 +2743,7 @@ private fun StreamBugReporter(
                         onButtonTone()
                         preflightReviewed = false
                         preflightPage = 0
+                        warningsAcknowledged = false
                         preflightDeck = null
                         expanded = false
                         onExpandedClose()
@@ -2452,11 +2764,12 @@ private fun StreamBugReporter(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         BugReportSubmissionRequirements()
-                        BugReportDataDisclosure(includeTypedTextWarning = true)
                     }
                     BugReportFormInputs(
                         title = title,
                         description = description,
+                        details = details,
+                        attachments = attachments,
                         consentChecked = consentChecked,
                         knownIssueBlock = knownIssueBlock,
                         acknowledgedKnownIssueKey = acknowledgedKnownIssueKey,
@@ -2469,7 +2782,8 @@ private fun StreamBugReporter(
                             description = value
                             if (submission.error != null) onReset()
                         },
-                        onConsentChange = { consentChecked = it },
+                        onDetailsChange = { details = it },
+                        onAttachmentsChange = { attachments = it },
                         onKnownIssueAcknowledgementChange = { acknowledgedKnownIssueKey = it },
                         onConfirm = {
                             onButtonTone()
@@ -2480,10 +2794,11 @@ private fun StreamBugReporter(
                 }
             } else {
                 BugReportSubmissionRequirements()
-                BugReportDataDisclosure(includeTypedTextWarning = true)
                 BugReportFormInputs(
                     title = title,
                     description = description,
+                    details = details,
+                    attachments = attachments,
                     consentChecked = consentChecked,
                     knownIssueBlock = knownIssueBlock,
                     acknowledgedKnownIssueKey = acknowledgedKnownIssueKey,
@@ -2496,7 +2811,8 @@ private fun StreamBugReporter(
                         description = value
                         if (submission.error != null) onReset()
                     },
-                    onConsentChange = { consentChecked = it },
+                    onDetailsChange = { details = it },
+                    onAttachmentsChange = { attachments = it },
                     onKnownIssueAcknowledgementChange = { acknowledgedKnownIssueKey = it },
                     onConfirm = {
                         onButtonTone()
@@ -2523,6 +2839,7 @@ private fun StreamBugReporter(
                         Text(block.title, color = Color(0xffffc266), fontWeight = FontWeight.Bold)
                         Text(block.action, color = TextMuted, style = MaterialTheme.typography.bodySmall)
                     }
+                    NvstBugReportWarning(experimentalNvstEnabled)
                     BugReportSubmissionRequirements()
                     BugReportDataDisclosure(includeTypedTextWarning = true)
                 }
@@ -2536,6 +2853,8 @@ private fun StreamBugReporter(
                             title,
                             description,
                             knownIssueBlock?.key?.takeIf { it == acknowledgedKnownIssueKey },
+                            details,
+                            attachments,
                         )
                     },
                 ) {
@@ -2562,8 +2881,6 @@ private fun LazyListScope.mouseModePageItems(
     onControllerMouseEmulationToggle: () -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
-    onNativeTouchScrollScaleChange: (Float) -> Unit,
-    onNativeTouchJitterThresholdChange: (Float) -> Unit,
     onButtonTone: () -> Unit,
 ) {
     item {
@@ -2607,37 +2924,6 @@ private fun LazyListScope.mouseModePageItems(
             )
         }
     }
-    if (settings.androidTouch.effectiveNativeTouchMode() != NativeTouchMode.Off) {
-        item {
-            val scrollSpeedLabel = when {
-                settings.androidTouch.nativeTouchScrollScale <= 0.5f -> "Very slow"
-                settings.androidTouch.nativeTouchScrollScale <= 0.8f -> "Slow"
-                settings.androidTouch.nativeTouchScrollScale <= 1.2f -> "Normal"
-                settings.androidTouch.nativeTouchScrollScale <= 1.6f -> "Fast"
-                else -> "Very fast"
-            }
-            ControlSliderRow(
-                label = "Touch scroll speed",
-                value = settings.androidTouch.nativeTouchScrollScale,
-                min = 0.25f,
-                max = 2.0f,
-                step = 0.05f,
-                onChange = onNativeTouchScrollScaleChange,
-                descriptionProvider = { scrollSpeedLabel }
-            )
-        }
-        item {
-            ControlSliderRow(
-                label = "Touch tap stability",
-                value = settings.androidTouch.nativeTouchJitterThresholdDp,
-                min = 0f,
-                max = 24f,
-                step = 1f,
-                onChange = onNativeTouchJitterThresholdChange,
-                valueFormatter = { "${it.toInt()}dp" }
-            )
-        }
-    }
 }
 
 
@@ -2645,10 +2931,14 @@ private fun LazyListScope.mouseModePageItems(
 private fun LazyListScope.statusBarPageItems(
     settings: AppSettings,
     statsVisible: Boolean,
+    statusBarDragging: Boolean,
     onStatsToggle: () -> Unit,
+    onStatusBarDraggingToggle: () -> Unit,
     onStatsStyleCycle: () -> Unit,
     onStatsPositionCycle: () -> Unit,
     onStatsMetricsChange: (StreamStatsMetrics) -> Unit,
+    onStatsBackgroundEnabledChange: (Boolean) -> Unit,
+    onStatsBackgroundOpacityChange: (Float) -> Unit,
     onKeyboardButtonToggle: () -> Unit,
     onButtonTone: () -> Unit,
 ) {
@@ -2676,12 +2966,56 @@ private fun LazyListScope.statusBarPageItems(
             )
             ControlActionRow(
                 label = stringResource(R.string.stream_statusbar_position),
-                actionLabel = settings.streamStatsPosition.label,
+                actionLabel = if (settings.streamStatsCustomX != null) stringResource(R.string.stream_statusbar_custom_position)
+                    else settings.streamStatsPosition.label,
                 onClick = {
                     onButtonTone()
                     onStatsPositionCycle()
                 },
                 modifier = Modifier.weight(1f),
+            )
+        }
+    }
+    item {
+        Text(
+            stringResource(R.string.stream_statusbar_drag_hint),
+            color = TextMuted,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
+    }
+    item {
+        ControlSwitchRow(
+            label = stringResource(R.string.stream_statusbar_drag_mode),
+            checked = statusBarDragging,
+            onCheckedChange = {
+                onButtonTone()
+                onStatusBarDraggingToggle()
+            },
+            value = onOffLabel(statusBarDragging),
+            enabled = statsVisible && (settings.streamStatsMetrics.enabledCount() > 0 || !settings.hideStreamButtons),
+        )
+    }
+    item {
+        ControlSwitchRow(
+            label = stringResource(R.string.stream_statusbar_background),
+            checked = settings.streamStatsBackgroundEnabled,
+            onCheckedChange = { enabled ->
+                onButtonTone()
+                onStatsBackgroundEnabledChange(enabled)
+            },
+            value = onOffLabel(settings.streamStatsBackgroundEnabled),
+        )
+    }
+    if (settings.streamStatsBackgroundEnabled) {
+        item {
+            ControlSliderRow(
+                label = stringResource(R.string.stream_statusbar_background_opacity),
+                value = settings.streamStatsBackgroundOpacity,
+                min = 0f,
+                max = 1f,
+                step = 0.01f,
+                onChange = onStatsBackgroundOpacityChange,
             )
         }
     }

@@ -75,6 +75,24 @@ class SdpToolsTest {
     }
 
     @Test
+    fun nvstGamepadTransportUsesTheMaskAdvertisedByTheNativeSdp() {
+        assertEquals(
+            PARTIALLY_RELIABLE_GAMEPAD_MASK_ALL,
+            effectivePartiallyReliableGamepadMask(
+                webRtcNegotiatedMask = 0,
+                nvstTransportActive = true,
+            ),
+        )
+        assertEquals(
+            0x03,
+            effectivePartiallyReliableGamepadMask(
+                webRtcNegotiatedMask = 0x03,
+                nvstTransportActive = false,
+            ),
+        )
+    }
+
+    @Test
     fun prefersEightBitH265ProfileForNonHdrAndroidStream() {
         val munged = SdpTools.preferCodec(h265Offer(), StreamSettings(codec = VideoCodec.H265, colorQuality = ColorQuality.EightBit420))
 
@@ -82,7 +100,7 @@ class SdpToolsTest {
     }
 
     @Test
-    fun prefersTenBitH265ProfileForHdrAndroidStream() {
+    fun prefersMain10H265ProfileForHdrAndroidStream() {
         val munged = SdpTools.preferCodec(
             h265Offer(),
             StreamSettings(codec = VideoCodec.H265, colorQuality = ColorQuality.TenBit420, hdrEnabled = true),
@@ -247,7 +265,31 @@ class SdpToolsTest {
     }
 
     @Test
-    fun nvstSdpHonorsConfiguredBitrateBelowTheNormalFourMbpsFloor() {
+    fun experimentalDynamicAdjustmentChangesOnlyTheOptInAdaptationPolicy() {
+        val settings = StreamSettings(
+            resolution = "1680x720",
+            aspectRatio = "21:9",
+            fps = 60,
+            maxBitrateMbps = 35,
+            experimentalDynamicNetworkAdjustment = true,
+            experimentalDynamicMinimumBitrateMbps = 2,
+        )
+        val sdp = SdpTools.buildNvstSdp("", settings, "")
+
+        assertTrue(sdp.contains("a=vqos.dynamicStreamingMode:1"))
+        assertTrue(sdp.contains("a=vqos.drc.enable:1"))
+        assertTrue(sdp.contains("a=vqos.dfc.enable:0"))
+        assertFalse(sdp.contains("a=vqos.resControl.cpmRtc.minResolutionPercent:100"))
+        assertFalse(sdp.contains("a=vqos.resControl.cpmRtc.resolutionChangeHoldonMs:999999"))
+        assertTrue(sdp.contains("a=video.clientViewportWd:1680"))
+        assertTrue(sdp.contains("a=video.clientViewportHt:720"))
+        assertTrue(sdp.contains("a=video.maxFPS:60"))
+        assertTrue(sdp.contains("a=vqos.bw.maximumBitrateKbps:35000"))
+        assertTrue(sdp.contains("a=vqos.bw.minimumBitrateKbps:2000"))
+    }
+
+    @Test
+    fun nvstSdpHonorsConfiguredBitrateBelowTheRecommendedFiveMbpsFloor() {
         val nvst = buildNvstSdp(StreamSettings(maxBitrateMbps = 1))
 
         assertTrue(nvst.contains("a=video.initialBitrateKbps:1000"))
@@ -259,22 +301,95 @@ class SdpToolsTest {
     }
 
     @Test
-    fun nvstSdpKeepsTheNormalFourMbpsMinimumForHigherBitrateProfiles() {
-        val nvst = buildNvstSdp(StreamSettings(maxBitrateMbps = 18))
-
-        assertTrue(nvst.contains("a=vqos.bw.maximumBitrateKbps:18000"))
-        assertTrue(nvst.contains("a=vqos.bw.minimumBitrateKbps:4000"))
+    fun everyBitrateCeilingHasTheNormalFloorAndABoundedStartupRate() {
+        for (mbps in 1..200) {
+            val range = StreamNetworkAdaptation.bitrateRange(mbps)
+            assertEquals(mbps * 1000, range.maximumKbps)
+            assertEquals(minOf(5_000, range.maximumKbps), range.minimumKbps)
+            assertTrue("$mbps Mbps startup out of bounds", range.initialKbps in range.minimumKbps..range.maximumKbps)
+        }
+        assertEquals(1000, StreamNetworkAdaptation.bitrateRange(Int.MIN_VALUE).maximumKbps)
+        assertEquals(200000, StreamNetworkAdaptation.bitrateRange(Int.MAX_VALUE).maximumKbps)
     }
 
     @Test
-    fun everyResolutionCodecAndSupportedFpsProducesFixedGeometrySdp() {
+    fun customDynamicBitrateFloorCannotExceedTheSelectedCeiling() {
+        val settings = StreamSettings(
+            maxBitrateMbps = 3,
+            experimentalDynamicNetworkAdjustment = true,
+            experimentalDynamicMinimumBitrateMbps = 20,
+        )
+        val range = StreamNetworkAdaptation.bitrateRange(settings)
+        assertEquals(3000, range.minimumKbps)
+        assertEquals(3000, range.initialKbps)
+        assertEquals(3000, range.maximumKbps)
+        assertEquals(StreamNetworkAdaptation.bitrateRange(3), StreamNetworkAdaptation.bitrateRange(settings.copy(experimentalDynamicNetworkAdjustment = false)))
+    }
+
+    @Test
+    fun fourMbpsProfileStartsAndStaysAtTheSelectedRate() {
+        val range = StreamNetworkAdaptation.bitrateRange(4)
+
+        assertEquals(4_000, range.minimumKbps)
+        assertEquals(4_000, range.initialKbps)
+        assertEquals(4_000, range.maximumKbps)
+    }
+
+    @Test
+    fun tenMbpsRecommendedProfileKeepsItsCeilingAndCanBackOffToFive() {
+        val range = StreamNetworkAdaptation.bitrateRange(10)
+
+        assertEquals(5_000, range.minimumKbps)
+        assertEquals(5_000, range.initialKbps)
+        assertEquals(10_000, range.maximumKbps)
+    }
+
+    @Test
+    fun affectedReportProfilesUseTheRestoredBitrateFloor() {
+        val threeMbps = StreamNetworkAdaptation.bitrateRange(3)
+        assertEquals(3_000, threeMbps.minimumKbps)
+        assertEquals(3_000, threeMbps.initialKbps)
+        assertEquals(3_000, threeMbps.maximumKbps)
+
+        val fiveMbps = StreamNetworkAdaptation.bitrateRange(5)
+        assertEquals(5_000, fiveMbps.minimumKbps)
+        assertEquals(5_000, fiveMbps.initialKbps)
+        assertEquals(5_000, fiveMbps.maximumKbps)
+
+        val sevenMbps = StreamNetworkAdaptation.bitrateRange(7)
+        assertEquals(5_000, sevenMbps.minimumKbps)
+        assertEquals(5_000, sevenMbps.initialKbps)
+        assertEquals(7_000, sevenMbps.maximumKbps)
+    }
+
+    @Test
+    fun threeMbpsReportProfileKeepsItsExplicitCeiling() {
+        val settings = StreamSettings(resolution = "1280x720", fps = 30, maxBitrateMbps = 3)
+        val nvst = buildNvstSdp(settings)
+        assertTrue(nvst.lineSequence().contains("a=vqos.bw.minimumBitrateKbps:3000"))
+        assertTrue(nvst.lineSequence().contains("a=vqos.bw.maximumBitrateKbps:3000"))
+        assertTrue(nvst.lineSequence().contains("a=video.maxFPS:30"))
+        assertEquals(3, settings.maxBitrateMbps)
+        assertEquals("1280x720", settings.resolution)
+    }
+
+    @Test
+    fun nvstSdpAllowsHigherBitrateProfilesToBackOffDuringCongestion() {
+        val nvst = buildNvstSdp(StreamSettings(maxBitrateMbps = 18))
+
+        assertTrue(nvst.contains("a=vqos.bw.maximumBitrateKbps:18000"))
+        assertTrue(nvst.contains("a=vqos.bw.minimumBitrateKbps:5000"))
+    }
+
+    @Test
+    fun everyResolutionCodecAndSupportedFpsKeepsTheRequestedProfileStable() {
         val modes = STREAM_RESOLUTION_OPTIONS.map { option ->
             Triple(option.value, option.aspectRatio, parseResolutionPixels(option.value))
         }
 
         for ((resolution, aspectRatio, pixels) in modes) {
             for (codec in VideoCodec.entries) {
-                for (fps in listOf(60, 120, 240, 360)) {
+                for (fps in listOf(30, 60, 90, 120, 240, 360)) {
                     val settings = StreamSettings(
                         resolution = resolution,
                         aspectRatio = aspectRatio,
@@ -298,6 +413,9 @@ class SdpToolsTest {
                     assertTrue("$case width missing", nvst.contains("a=video.clientViewportWd:${pixels.first}"))
                     assertTrue("$case height missing", nvst.contains("a=video.clientViewportHt:${pixels.second}"))
                     assertTrue("$case fps missing", nvst.contains("a=video.maxFPS:$fps"))
+                    assertTrue("$case must disable dynamic streaming", nvst.contains("a=vqos.dynamicStreamingMode:0"))
+                    assertTrue("$case must keep resolution fixed", nvst.contains("a=vqos.drc.enable:0"))
+                    assertTrue("$case must not reduce FPS", nvst.contains("a=vqos.dfc.enable:0"))
                     if (fps > 60) {
                         assertTrue("$case FPS estimate missing", nvst.contains("a=vqos.maxStreamFpsEstimate:$fps"))
                     }
@@ -317,11 +435,12 @@ class SdpToolsTest {
     }
 
     @Test
-    fun nvstSdpEnablesHdrOnlyForHdrStream() {
+    fun nvstSdpDisablesHdrWhileAndroidKillSwitchIsActive() {
         val nvst = buildNvstSdp(StreamSettings(codec = VideoCodec.H265, hdrEnabled = true))
 
-        assertTrue(nvst.contains("a=video.dx9EnableHdr:1"))
-        assertFalse(nvst.contains("a=video.dx9EnableHdr:0"))
+        assertFalse(nvst.contains("a=video.dx9EnableHdr:1"))
+        assertTrue(nvst.contains("a=video.dx9EnableHdr:0"))
+        assertTrue(nvst.contains("a=video.bitDepth:10"))
     }
 
     @Test

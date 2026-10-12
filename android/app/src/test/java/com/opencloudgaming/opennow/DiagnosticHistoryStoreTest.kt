@@ -2,6 +2,9 @@ package com.opencloudgaming.opennow
 
 import java.io.File
 import java.nio.file.Files
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -9,6 +12,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DiagnosticHistoryStoreTest {
+    @Test
+    fun lastMeasuredStreamSurvivesNewSnapshotsAndAppRuns() {
+        val directory = Files.createTempDirectory("diagnostic-last-stream").toFile()
+        val store = DiagnosticHistoryStore(directory) { 2000L }
+        val stream = buildJsonObject {
+            put("game", "Previous game")
+            put("totalSamples", 3)
+        }
+
+        store.beginAppRun()
+        store.saveLastStream(1000L, stream)
+        store.saveCurrent("new launch stayed in queue")
+        store.beginAppRun()
+
+        assertEquals("Previous game", store.lastStreamSnapshot()?.get("game")?.jsonPrimitive?.content)
+        assertEquals(stream, DiagnosticHistoryStore(directory).lastStreamSnapshot())
+        store.saveLastStream(900L, buildJsonObject { put("game", "stale write") })
+        assertEquals(stream, store.lastStreamSnapshot())
+    }
+
     @Test
     fun currentProcessSnapshotBecomesPreviousOnNextAppRun() {
         val directory = Files.createTempDirectory("diagnostic-history").toFile()
@@ -82,6 +105,19 @@ class DiagnosticHistoryStoreTest {
         assertTrue(bounded.endsWith("-latest"))
         assertTrue(bounded.contains("persisted diagnostic snapshot truncated"))
         assertTrue(bounded.length <= 256)
+    }
+
+    @Test
+    fun persistenceLimitNeverCutsThroughParserJsonOrChangesApiIndexes() {
+        val original = "Header\n<parser>\n" +
+            """{"schemaVersion":2,"api":[{"statusCode":500,"response":{"detail":"${"x".repeat(10_000)}"}}]}""" + "\n</parser>"
+        val bounded = boundDiagnosticSnapshot(original, 2048)
+        val parser = OpenNowJson.parseToJsonElement(bounded.substringAfter("<parser>\n").substringBefore("\n</parser>"))
+        val data = parser as kotlinx.serialization.json.JsonObject
+        val api = data.getValue("api") as kotlinx.serialization.json.JsonArray
+        assertTrue(api[0].toString().contains("500"))
+        assertTrue(api[0].toString().contains("persisted_snapshot_limit"))
+        assertTrue(bounded.length <= 2048)
     }
 
     @Test

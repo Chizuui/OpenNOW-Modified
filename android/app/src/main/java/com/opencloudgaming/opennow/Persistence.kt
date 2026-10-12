@@ -15,6 +15,7 @@ import java.io.FileInputStream
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
@@ -29,6 +30,7 @@ private const val KEY_DEVICE_ID = "gfn_device_id"
 private const val KEY_CATALOG_CACHE_PREFIX = "catalog_cache_"
 private const val KEY_ANDROID_UPDATE_DISMISSED_NOTICE = "android_update_dismissed_notice"
 private const val KEY_QUEUED_GAME_KEYS = "queued_game_keys"
+private const val KEY_CONTINUE_PLAYING_DISMISSALS = "continue_playing_dismissals"
 private const val CATALOG_CACHE_TTL_MS = 12L * 60L * 60L * 1000L
 
 /**
@@ -37,6 +39,7 @@ private const val CATALOG_CACHE_TTL_MS = 12L * 60L * 60L * 1000L
  * This is both a storage bound and a decompression-memory guard. See `CatalogCacheStore.save`.
  */
 private const val MAX_COMPRESSED_CATALOG_CACHE_BYTES = 768 * 1024
+private const val MAX_CATALOG_CACHE_FILES = 32
 private const val CATALOG_CACHE_DIRECTORY_NAME = "catalog-cache-v2"
 
 /**
@@ -51,6 +54,7 @@ private const val CATALOG_CACHE_DIRECTORY_NAME = "catalog-cache-v2"
  */
 private const val MAX_CACHED_CATALOG_GAMES = 400
 private const val QUEUED_GAME_LIMIT = 24
+private const val CONTINUE_PLAYING_DISMISSAL_LIMIT = 48
 // Keys that must never be written to the external (potentially world-readable) file.
 private val SENSITIVE_KEYS = setOf(KEY_AUTH, KEY_DEVICE_ID)
 private val AUTH_STORE_LOCK = Any()
@@ -280,6 +284,13 @@ class ExternalPrefs private constructor(context: Context, val name: String) {
             val success = writeToFile(primaryFile, snapshot)
             if (!success) writeToFile(fallbackFile, snapshot) else true
         }
+
+        /** Waits behind pending apply() writes so a restored backup is durable before success is shown. */
+        suspend fun commitOrdered(): Boolean {
+            val result = CompletableDeferred<Boolean>()
+            writeScope.launch { result.complete(commit()) }
+            return result.await()
+        }
     }
 }
 
@@ -288,12 +299,12 @@ private fun Float.finiteIn(minimum: Float, maximum: Float, fallback: Float): Flo
 
 internal fun AppSettings.normalizedForAndroid(): AppSettings {
     val streamDefaults = StreamSettings()
-    val touchDefaults = AndroidTouchSettings()
     val compatibleStream = stream.withAndroidSettingsAvailability()
     val lowPowerSafe = compatibleStream.copy(
         codec = compatibleStream.codec,
         sessionProxyUrl = stream.sessionProxyUrl.trim(),
         maxBitrateMbps = compatibleStream.maxBitrateMbps.coerceIn(1, 150),
+        experimentalDynamicMinimumBitrateMbps = compatibleStream.experimentalDynamicMinimumBitrateMbps.coerceIn(1, 150),
         fps = compatibleStream.fps.coerceIn(30, 360),
         mouseSensitivity = compatibleStream.mouseSensitivity.finiteIn(0.25f, 3f, streamDefaults.mouseSensitivity),
         mouseAcceleration = compatibleStream.mouseAcceleration.coerceIn(1, 150),
@@ -302,6 +313,16 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
             0f,
             1f,
             streamDefaults.streamSharpeningAmount,
+        ),
+        recordingBitrateMbps = when {
+            compatibleStream.recordingBitrateMbps <= 0 -> 0
+            else -> compatibleStream.recordingBitrateMbps.coerceIn(2, 50)
+        },
+        recordingFps = compatibleStream.recordingFps.takeIf { it in setOf(0, 24, 30, 60) } ?: 0,
+        recordingSharpeningAmount = compatibleStream.recordingSharpeningAmount.finiteIn(
+            0f,
+            1f,
+            streamDefaults.recordingSharpeningAmount,
         ),
     )
     val normalizedCatalogSortId = catalogSortId.trim().ifBlank { DEFAULT_CATALOG_SORT_ID }
@@ -314,68 +335,50 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
         normalizedCatalogSortId
     }
     return copy(
+        recordingDirectoryUri = recordingDirectoryUri?.takeIf { it.isNotBlank() },
         uiAccent = if (uiAccent == UiAccent.LegacyOrange) UiAccent.Violet else uiAccent,
+        selectionEffectColors = selectionEffectColors?.normalized(),
         stream = lowPowerSafe,
         posterSizeScale = posterSizeScale.finiteIn(MIN_GAME_CARD_SCALE, MAX_GAME_CARD_SCALE, 1f),
+        navigationRailBackgroundOpacity = navigationRailBackgroundOpacity?.finiteIn(0f, 1f, 0.75f),
         uselessMascotDelaySeconds = normalizeMascotDelaySeconds(uselessMascotDelaySeconds),
+        liveSelectedOutlines =
+            if (gameBordersDefaultVersion < GAME_BORDERS_DEFAULT_VERSION) false
+            else liveSelectedOutlines,
+        gameBordersDefaultVersion = GAME_BORDERS_DEFAULT_VERSION,
+        streamMenuShortcut = androidKeyboardShortcutDisplay(streamMenuShortcut),
         streamKeyboardButtonPosition = streamKeyboardButtonPosition.normalized(),
-        androidTouch = androidTouch.copy(
-            touchSkinTint = androidTouch.touchSkinTint.withoutRemovedWarmTint(),
-            opacity = androidTouch.opacity.finiteIn(0f, 1f, touchDefaults.opacity),
-            scale = androidTouch.scale.finiteIn(0.6f, 1.4f, touchDefaults.scale),
-            buttonScale = androidTouch.buttonScale.finiteIn(0.65f, 1.5f, touchDefaults.buttonScale),
-            stickScale = androidTouch.stickScale.finiteIn(0.65f, 1.5f, touchDefaults.stickScale),
-            faceButtonScale = androidTouch.faceButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.faceButtonScale),
-            dpadScale = androidTouch.dpadScale.finiteIn(0.6f, 1.5f, touchDefaults.dpadScale),
-            shoulderButtonScale = androidTouch.shoulderButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.shoulderButtonScale),
-            centerButtonScale = androidTouch.centerButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.centerButtonScale),
-            leftStickScale = androidTouch.leftStickScale.finiteIn(0.6f, 1.5f, touchDefaults.leftStickScale),
-            rightStickScale = androidTouch.rightStickScale.finiteIn(0.6f, 1.5f, touchDefaults.rightStickScale),
-            stickKnobScale = androidTouch.stickKnobScale.finiteIn(0.28f, 0.72f, touchDefaults.stickKnobScale),
-            extraButtonActions = List(TOUCH_EXTRA_BUTTON_COUNT) { index ->
-                androidTouch.extraButtonAction(index)
-            },
-            extraButtonScale = androidTouch.extraButtonScale.finiteIn(0.6f, 1.6f, touchDefaults.extraButtonScale),
-            aimZoneScale = androidTouch.aimZoneScale.finiteIn(0.5f, 1.5f, touchDefaults.aimZoneScale),
-            aimZoneSensitivity = androidTouch.aimZoneSensitivity.finiteIn(
-                0.25f,
-                3f,
-                touchDefaults.aimZoneSensitivity,
-            ),
-            joystickDeadZone = androidTouch.joystickDeadZone.finiteIn(0f, 0.3f, touchDefaults.joystickDeadZone),
-            gyroscopeSensitivity = androidTouch.gyroscopeSensitivity.finiteIn(0.25f, 3f, touchDefaults.gyroscopeSensitivity),
-            gyroscopeDeadZone = androidTouch.gyroscopeDeadZone.finiteIn(0f, 0.2f, touchDefaults.gyroscopeDeadZone),
-            gyroscopeSmoothing = androidTouch.gyroscopeSmoothing.finiteIn(0f, 0.9f, touchDefaults.gyroscopeSmoothing),
-            edgePaddingDp = androidTouch.edgePaddingDp.finiteIn(0f, 72f, touchDefaults.edgePaddingDp),
-            bottomPaddingDp = androidTouch.bottomPaddingDp.finiteIn(0f, 120f, touchDefaults.bottomPaddingDp),
-            leftOffsetXDp = androidTouch.leftOffsetXDp.finiteIn(-220f, 220f, touchDefaults.leftOffsetXDp),
-            leftOffsetYDp = androidTouch.leftOffsetYDp.finiteIn(-160f, 160f, touchDefaults.leftOffsetYDp),
-            rightOffsetXDp = androidTouch.rightOffsetXDp.finiteIn(-220f, 220f, touchDefaults.rightOffsetXDp),
-            rightOffsetYDp = androidTouch.rightOffsetYDp.finiteIn(-160f, 160f, touchDefaults.rightOffsetYDp),
-            nativeTouchScrollScale = androidTouch.nativeTouchScrollScale.finiteIn(
-                0.25f,
-                2f,
-                touchDefaults.nativeTouchScrollScale,
-            ),
-            nativeTouchJitterThresholdDp = androidTouch.nativeTouchJitterThresholdDp.finiteIn(
-                0f,
-                24f,
-                touchDefaults.nativeTouchJitterThresholdDp,
-            ),
-            offsets = androidTouch.offsets.mapValues { (_, offset) ->
-                TouchOffset(
-                    x = offset.x.finiteIn(-320f, 320f, 0f),
-                    y = offset.y.finiteIn(-320f, 320f, 0f),
-                )
-            },
+        streamStatsBackgroundOpacity = streamStatsBackgroundOpacity.finiteIn(
+            0f, 1f, DEFAULT_STREAM_STATS_BACKGROUND_OPACITY,
         ),
+        streamStatsCustomX = streamStatsCustomX?.takeIf { it.isFinite() }?.coerceIn(0f, 1f),
+        streamStatsCustomY = streamStatsCustomY?.takeIf { it.isFinite() }?.coerceIn(0f, 1f),
+        physicalInput = physicalInput.normalized(),
+        touchControlPresets = touchControlPresets.take(MAX_TOUCH_PRESETS)
+            .distinctBy { it.id }
+            .map {
+                it.copy(
+                    name = it.name.filterNot(Char::isISOControl).trim().take(64),
+                    description = it.description.filterNot(Char::isISOControl).trim().take(240),
+                    controls = it.controls.normalizedPresetControls(),
+                )
+            }
+            .filter { it.id.isNotBlank() && it.name.isNotBlank() },
+        androidTouch = androidTouch.copy(
+            joystickDeadZone = if (touchJoystickDefaultVersion == 0 && androidTouch.joystickDeadZone == 0f) {
+                DEFAULT_TOUCH_JOYSTICK_DEAD_ZONE
+            } else {
+                androidTouch.joystickDeadZone
+            },
+        ).normalizedTouchControls(),
+        touchJoystickDefaultVersion = 1,
         streamIntroMusic = streamIntroMusic,
         queueReadyMusic = queueReadyMusic,
         legacyCropStreamToFill = false,
         stretchStreamToFit = stretchStreamToFit,
         streamPresentationProfileVersion = streamPresentationProfileVersion.coerceAtLeast(STREAM_PRESENTATION_PROFILE_VERSION),
         showSessionReportAfterStream =
-            if (sessionReportDefaultVersion < SESSION_REPORT_DEFAULT_VERSION) false
+            if (sessionReportDefaultVersion < SESSION_REPORT_DEFAULT_VERSION) true
             else showSessionReportAfterStream,
         sessionReportDefaultVersion = SESSION_REPORT_DEFAULT_VERSION,
         nerdCatalogBackground = nerdCatalogBackground && !systemWallpaperBackground,
@@ -398,13 +401,26 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
     )
 }
 
+internal fun loadAndroidSettings(
+    raw: String?,
+    playStoreRelease: Boolean,
+    persistInitialOrMigration: (AppSettings) -> Unit = {},
+): AppSettings {
+    if (raw == null) {
+        val initial = firstInstallSettings(playStoreRelease)
+            .withCurrentStreamPresentationDefaults()
+            .normalizedForAndroid()
+        persistInitialOrMigration(initial)
+        return initial
+    }
+    return loadSettingsWithNvstDefault(raw, persistInitialOrMigration)
+        .withCurrentStreamPresentationDefaults()
+        .normalizedForAndroid()
+}
+
 class SettingsStore(context: Context) {
     private val prefs = ExternalPrefs.get(context, STORE_NAME)
-    private val _settings = MutableStateFlow(
-        load()
-            .withCurrentStreamPresentationDefaults()
-            .normalizedForAndroid(),
-    )
+    private val _settings = MutableStateFlow(load())
     val settings: StateFlow<AppSettings> = _settings
 
     /**
@@ -433,10 +449,10 @@ class SettingsStore(context: Context) {
 
     private fun load(): AppSettings {
         val raw = prefs.getString(KEY_SETTINGS, null)
-        // Persist the migration even if no setting is changed this launch. The regular writer
-        // deliberately skips the initial StateFlow value, so it cannot save this reset for us.
-        return loadSettingsWithNvstDefault(raw) { migrated ->
-            prefs.edit().putString(KEY_SETTINGS, OpenNowJson.encodeToString(migrated)).apply()
+        // Persist the selected first-install profile or an existing-settings migration. The
+        // regular writer skips the initial StateFlow value, so it cannot save these for us.
+        return loadAndroidSettings(raw, BuildConfig.PLAY_STORE_RELEASE) { initialOrMigrated ->
+            prefs.edit().putString(KEY_SETTINGS, OpenNowJson.encodeToString(initialOrMigrated)).apply()
         }
     }
 
@@ -452,8 +468,16 @@ class SettingsStore(context: Context) {
             .normalizedForAndroid()
     }
 
+    suspend fun restore(next: AppSettings): Boolean {
+        val normalized = next.withCurrentStreamPresentationDefaults().normalizedForAndroid()
+        val encoded = OpenNowJson.encodeToString(normalized)
+        if (!prefs.edit().putString(KEY_SETTINGS, encoded).commitOrdered()) return false
+        _settings.value = normalized
+        return true
+    }
+
     fun reset() {
-        replace(loadSettingsWithNvstDefault(null))
+        replace(firstInstallSettings(BuildConfig.PLAY_STORE_RELEASE))
     }
 }
 
@@ -741,6 +765,20 @@ class CatalogCacheStore private constructor(
             return
         }
         replaceCacheFile(staged, target)
+        if (target.isFile) pruneCacheFiles(target)
+    }
+
+    private fun pruneCacheFiles(keep: File) {
+        val cacheFiles = cacheDirectory.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(KEY_CATALOG_CACHE_PREFIX) && it.name.endsWith(".json.gz") }
+            .orEmpty()
+        val oldestUsefulWrite = System.currentTimeMillis() - CATALOG_CACHE_TTL_MS
+        cacheFiles.filter { it != keep && it.lastModified() < oldestUsefulWrite }.forEach(File::delete)
+        cacheFiles.asSequence()
+            .filter { it.isFile && it != keep }
+            .sortedByDescending(File::lastModified)
+            .drop(MAX_CATALOG_CACHE_FILES - 1)
+            .forEach(File::delete)
     }
 
     private fun key(vararg parts: String): String =
@@ -801,6 +839,95 @@ class QueuedGameStore(context: Context) {
         prefs.edit().putString(KEY_QUEUED_GAME_KEYS, OpenNowJson.encodeToString(next)).apply()
         return next
     }
+
+    fun remove(gameKey: String): List<String> {
+        val normalized = gameKey.trim()
+        if (normalized.isBlank()) return load()
+        val next = load().filterNot { it == normalized }
+        prefs.edit().putString(KEY_QUEUED_GAME_KEYS, OpenNowJson.encodeToString(next)).apply()
+        return next
+    }
+
+    fun removeAll(gameKeys: Collection<String>): List<String> {
+        val normalized = gameKeys.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (normalized.isEmpty()) return load()
+        val next = load().filterNot { it in normalized }
+        prefs.edit().putString(KEY_QUEUED_GAME_KEYS, OpenNowJson.encodeToString(next)).apply()
+        return next
+    }
+}
+
+/**
+ * Remembers which exact provider play record the player dismissed from Continue playing.
+ *
+ * The timestamp is intentional: when GFN reports a newer play for the same game, the old dismissal
+ * no longer matches and the game naturally returns to the rail. This is presentation state only;
+ * it never mutates the user's GFN library or provider history.
+ */
+class ContinuePlayingDismissalStore(context: Context) {
+    private val prefs = ExternalPrefs.get(context, STORE_NAME)
+
+    fun load(): Map<String, String> {
+        val raw = prefs.getString(KEY_CONTINUE_PLAYING_DISMISSALS, null) ?: return emptyMap()
+        return runCatching { OpenNowJson.decodeFromString<Map<String, String>>(raw) }
+            .getOrElse { emptyMap() }
+            .asSequence()
+            .map { (gameKey, lastPlayed) -> gameKey.trim() to lastPlayed.trim() }
+            .filter { (gameKey, lastPlayed) -> gameKey.isNotBlank() && lastPlayed.isNotBlank() }
+            .distinctBy { (gameKey, _) -> gameKey }
+            .take(CONTINUE_PLAYING_DISMISSAL_LIMIT)
+            .toMap(LinkedHashMap())
+    }
+
+    fun dismiss(gameKey: String, lastPlayed: String): Map<String, String> {
+        val normalizedKey = gameKey.trim()
+        val normalizedLastPlayed = lastPlayed.trim()
+        if (normalizedKey.isBlank() || normalizedLastPlayed.isBlank()) return load()
+        val next = linkedMapOf(normalizedKey to normalizedLastPlayed).apply {
+            load().forEach { (savedKey, savedLastPlayed) ->
+                if (savedKey != normalizedKey && size < CONTINUE_PLAYING_DISMISSAL_LIMIT) {
+                    put(savedKey, savedLastPlayed)
+                }
+            }
+        }
+        prefs.edit().putString(KEY_CONTINUE_PLAYING_DISMISSALS, OpenNowJson.encodeToString(next)).apply()
+        return next
+    }
+
+    fun dismissAll(records: Collection<Pair<String, String>>): Map<String, String> {
+        val normalized = linkedMapOf<String, String>()
+        records.forEach { (gameKey, lastPlayed) ->
+            val normalizedKey = gameKey.trim()
+            val normalizedLastPlayed = lastPlayed.trim()
+            if (normalizedKey.isNotBlank() && normalizedLastPlayed.isNotBlank()) {
+                normalized[normalizedKey] = normalizedLastPlayed
+            }
+        }
+        if (normalized.isEmpty()) return load()
+        load().forEach { (savedKey, savedLastPlayed) ->
+            if (savedKey !in normalized && normalized.size < CONTINUE_PLAYING_DISMISSAL_LIMIT) {
+                normalized[savedKey] = savedLastPlayed
+            }
+        }
+        val next = normalized.entries
+            .take(CONTINUE_PLAYING_DISMISSAL_LIMIT)
+            .associateTo(LinkedHashMap()) { it.key to it.value }
+        prefs.edit().putString(KEY_CONTINUE_PLAYING_DISMISSALS, OpenNowJson.encodeToString(next)).apply()
+        return next
+    }
+
+    fun restore(gameKey: String): Map<String, String> {
+        val normalized = gameKey.trim()
+        if (normalized.isBlank()) return load()
+        val current = load()
+        if (normalized !in current) return current
+        val next = current.filterKeys { it != normalized }
+        prefs.edit().putString(KEY_CONTINUE_PLAYING_DISMISSALS, OpenNowJson.encodeToString(next)).apply()
+        return next
+    }
 }
 
 class AndroidUpdateNoticeStore(context: Context) {
@@ -812,4 +939,64 @@ class AndroidUpdateNoticeStore(context: Context) {
     fun dismiss(key: String) {
         prefs.edit().putString(KEY_ANDROID_UPDATE_DISMISSED_NOTICE, key).apply()
     }
+}
+
+internal fun AndroidTouchSettings.normalizedTouchControls(): AndroidTouchSettings {
+    val touchDefaults = AndroidTouchSettings()
+    val normalizedKeyboardButtons = normalizeKeyboardOverlayButtons(keyboardButtons)
+    val keyboardAppearanceKeys = normalizedKeyboardButtons.map(KeyboardOverlayButton::appearanceKey).toSet()
+    val fixedAppearanceKeys = touchButtonKeys.filterNot { it.startsWith("keyboard_") }.toSet()
+    val keyboardPositionKeys = normalizedKeyboardButtons.flatMap { button ->
+        listOf("${button.positionKey()}_landscape", "${button.positionKey()}_portrait")
+    }.toSet()
+    return copy(
+        touchSkinTint = touchSkinTint.withoutRemovedWarmTint(),
+        keyboardButtons = normalizedKeyboardButtons,
+        buttonAppearances = buttonAppearances
+            .filterKeys { it in fixedAppearanceKeys || it in keyboardAppearanceKeys }
+            .mapValues { (_, appearance) -> appearance.normalized() }
+            .filterValues { it != TouchButtonAppearance() },
+        opacity = opacity.finiteIn(0f, 1f, touchDefaults.opacity),
+        scale = scale.finiteIn(0.6f, 1.4f, touchDefaults.scale),
+        buttonScale = buttonScale.finiteIn(0.65f, 1.5f, touchDefaults.buttonScale),
+        stickScale = stickScale.finiteIn(0.65f, 1.5f, touchDefaults.stickScale),
+        faceButtonScale = faceButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.faceButtonScale),
+        dpadScale = dpadScale.finiteIn(0.6f, 1.5f, touchDefaults.dpadScale),
+        shoulderButtonScale = shoulderButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.shoulderButtonScale),
+        centerButtonScale = centerButtonScale.finiteIn(0.6f, 1.5f, touchDefaults.centerButtonScale),
+        leftStickScale = leftStickScale.finiteIn(0.6f, 1.5f, touchDefaults.leftStickScale),
+        rightStickScale = rightStickScale.finiteIn(0.6f, 1.5f, touchDefaults.rightStickScale),
+        stickKnobScale = stickKnobScale.finiteIn(0.28f, 0.72f, touchDefaults.stickKnobScale),
+        extraButtonActions = List(TOUCH_EXTRA_BUTTON_COUNT) { index ->
+            extraButtonAction(index)
+        },
+        extraButtonCombos = extraButtonCombos
+            .filterKeys { key -> key.toIntOrNull() in 1..TOUCH_EXTRA_BUTTON_COUNT }
+            .mapValues { (_, combo) -> TouchExtraButtonCombo(normalizeTouchExtraButtonCombo(combo.actions)) },
+        extraButtonScale = extraButtonScale.finiteIn(0.6f, 1.6f, touchDefaults.extraButtonScale),
+        aimZoneScale = aimZoneScale.finiteIn(0.5f, 1.5f, touchDefaults.aimZoneScale),
+        aimZoneSensitivity = aimZoneSensitivity.finiteIn(
+            0.25f,
+            3f,
+            touchDefaults.aimZoneSensitivity,
+        ),
+        joystickDeadZone = joystickDeadZone.finiteIn(0f, 0.3f, touchDefaults.joystickDeadZone),
+        gyroscopeSensitivity = gyroscopeSensitivity.finiteIn(0.25f, 3f, touchDefaults.gyroscopeSensitivity),
+        gyroscopeDeadZone = gyroscopeDeadZone.finiteIn(0f, 0.2f, touchDefaults.gyroscopeDeadZone),
+        gyroscopeSmoothing = gyroscopeSmoothing.finiteIn(0f, 0.9f, touchDefaults.gyroscopeSmoothing),
+        edgePaddingDp = edgePaddingDp.finiteIn(0f, 72f, touchDefaults.edgePaddingDp),
+        bottomPaddingDp = bottomPaddingDp.finiteIn(0f, 120f, touchDefaults.bottomPaddingDp),
+        leftOffsetXDp = leftOffsetXDp.finiteIn(-220f, 220f, touchDefaults.leftOffsetXDp),
+        leftOffsetYDp = leftOffsetYDp.finiteIn(-160f, 160f, touchDefaults.leftOffsetYDp),
+        rightOffsetXDp = rightOffsetXDp.finiteIn(-220f, 220f, touchDefaults.rightOffsetXDp),
+        rightOffsetYDp = rightOffsetYDp.finiteIn(-160f, 160f, touchDefaults.rightOffsetYDp),
+        offsets = touchDefaults.offsets + offsets
+            .filterKeys { !it.startsWith("keyboard_button_") || it in keyboardPositionKeys }
+            .mapValues { (_, offset) ->
+            TouchOffset(
+                x = offset.x.takeIf { it.isFinite() } ?: 0f,
+                y = offset.y.takeIf { it.isFinite() } ?: 0f,
+            )
+        },
+    )
 }

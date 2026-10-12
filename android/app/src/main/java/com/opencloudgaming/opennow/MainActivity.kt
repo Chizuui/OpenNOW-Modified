@@ -65,6 +65,7 @@ class MainActivity : ComponentActivity() {
     private var externalMousePointerCaptureRequestPending = false
     private var defaultRequestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
     private var phoneStreamOrientationLocked = false
+    private var streamPanelExpanded = false
     private var streamPictureInPictureReady = false
     private var streamPictureInPictureAspectRatio = Rational(16, 9)
     private var systemWallpaperWindowVisible: Boolean? = null
@@ -316,6 +317,12 @@ class MainActivity : ComponentActivity() {
         ) {
             return
         }
+        fun hasExternalMouse(): Boolean = if (deviceId != null) {
+            isPhysicalMouseDevice(InputDevice.getDevice(deviceId))
+        } else {
+            connectedPhysicalKeyboardMouse().mouseConnected
+        }
+        if (!hasExternalMouse()) return
         externalMousePointerCaptureRequestPending = true
         val requestOrigin = if (source != null && deviceId != null) {
             "source=$source device=$deviceId"
@@ -324,6 +331,7 @@ class MainActivity : ComponentActivity() {
         }
         decorView.post {
             externalMousePointerCaptureRequestPending = false
+            if (!hasExternalMouse()) return@post
             if (
                 !shouldRequestAndroidMousePointerCapture(
                     streamActive = streamSystemUiActive,
@@ -499,10 +507,11 @@ class MainActivity : ComponentActivity() {
 
     /** Reapplies only immersive bars; pointer-icon traversal and window flags are state changes. */
     private fun applyStreamSystemBars(active: Boolean) {
+        val immersive = active && !streamPanelExpanded
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowCompat.setDecorFitsSystemWindows(window, false)
             window.insetsController?.let { controller ->
-                if (active) {
+                if (immersive) {
                     controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                     controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
                 } else {
@@ -511,7 +520,7 @@ class MainActivity : ComponentActivity() {
             }
         } else {
             @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = if (active) {
+            window.decorView.systemUiVisibility = if (immersive) {
                 View.SYSTEM_UI_FLAG_FULLSCREEN or
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                     View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
@@ -582,9 +591,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyPhoneStreamOrientationLock(active: Boolean, force: Boolean = false) {
-        if (!force && phoneStreamOrientationLocked == active) return
+        if (!force && phoneStreamOrientationLocked == active && !streamPanelExpanded) return
         phoneStreamOrientationLocked = active
-        val nextOrientation = if (active) {
+        val nextOrientation = if (streamPanelExpanded) {
+            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        } else if (active) {
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         } else {
             defaultRequestedOrientation
@@ -592,6 +603,13 @@ class MainActivity : ComponentActivity() {
         if (requestedOrientation != nextOrientation) {
             requestedOrientation = nextOrientation
         }
+    }
+
+    internal fun setStreamPanelExpanded(expanded: Boolean) {
+        if (streamPanelExpanded == expanded) return
+        streamPanelExpanded = expanded
+        applyPhoneStreamOrientationLock(phoneStreamOrientationLocked, force = true)
+        applyStreamSystemBars(streamSystemUiActive)
     }
 
     private fun updateStreamSystemUiEnforcer(active: Boolean) {
@@ -612,6 +630,7 @@ class MainActivity : ComponentActivity() {
                 if (
                     shouldPeriodicallyEnforceStreamSystemUi(
                         streamActive = streamSystemUiActive,
+                        panelExpanded = streamPanelExpanded,
                         navigationBarsVisible = navigationBarsVisible,
                         pointerLockEnabled = NativeStreamInputRouter.isExternalMousePointerCaptureEnabled(),
                     )
@@ -835,9 +854,10 @@ class MainActivity : ComponentActivity() {
 
 internal fun shouldPeriodicallyEnforceStreamSystemUi(
     streamActive: Boolean,
+    panelExpanded: Boolean = false,
     navigationBarsVisible: Boolean,
     pointerLockEnabled: Boolean,
-): Boolean = streamActive && (pointerLockEnabled || !navigationBarsVisible)
+): Boolean = streamActive && !panelExpanded && (pointerLockEnabled || !navigationBarsVisible)
 
 internal fun shouldRouteCapturedAndroidMousePointer(
     streamActive: Boolean,

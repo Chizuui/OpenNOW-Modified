@@ -15,6 +15,32 @@ class BugReportPreflightTest {
     )
 
     @Test
+    fun reportFormRequiresConsentAndAcknowledgementOnlyWhenWarningsExist() {
+        val healthy = BugReportPreflightDeck(listOf(
+            BugReportPreflightCard(
+                area = BugReportPreflightArea.Connection,
+                label = "Connection",
+                title = "Healthy",
+                summary = "No warning",
+                facts = emptyList(),
+                recommendations = emptyList(),
+                tone = BugReportPreflightTone.Healthy,
+            ),
+        ))
+        val warning = BugReportPreflightDeck(healthy.cards + healthy.cards.first().copy(tone = BugReportPreflightTone.Warning))
+
+        assertFalse(healthy.hasWarnings())
+        assertFalse(canContinueBugReportPreflight(healthy, consentChecked = false, warningsAcknowledged = false))
+        assertTrue(canContinueBugReportPreflight(healthy, consentChecked = true, warningsAcknowledged = false))
+        assertTrue(warning.hasWarnings())
+        assertFalse(canContinueBugReportPreflight(warning, consentChecked = false, warningsAcknowledged = true))
+        assertFalse(canContinueBugReportPreflight(warning, consentChecked = true, warningsAcknowledged = false))
+        assertTrue(canContinueBugReportPreflight(warning, consentChecked = true, warningsAcknowledged = true))
+        assertFalse(canContinueBugReportPreflight(healthy, consentChecked = true, warningsAcknowledged = false, additionalWarning = true))
+        assertTrue(canContinueBugReportPreflight(healthy, consentChecked = true, warningsAcknowledged = true, additionalWarning = true))
+    }
+
+    @Test
     fun detectsManualServerFromSelectorOrConfiguredRegion() {
         assertFalse(manuallySelectedServerForReport(null, ""))
         assertFalse(manuallySelectedServerForReport("", ""))
@@ -349,10 +375,26 @@ class BugReportPreflightTest {
             ),
         ).cards.last()
         assertEquals(BugReportPreflightTone.Healthy, captured.tone)
-        assertTrue(captured.facts.any { it.contains("External mouse") })
+        assertTrue(captured.facts.any { it.contains("Mouse input") })
         assertTrue(captured.facts.contains("Input channels opened"))
         assertTrue(captured.facts.contains("Mouse movement sent"))
         assertTrue(captured.recommendations.isEmpty())
+    }
+
+    @Test
+    fun pointerCaptureAloneDoesNotClaimMouseInput() {
+        val input = buildBugReportPreflightDeck(
+            BugReportPreflightEvidence(
+                requestedSettings = settings,
+                inputDiagnostics = """
+                    external mouse pointer capture requested origin=window-focus
+                    external mouse pointer capture changed granted=true streamActive=true enabled=true
+                """.trimIndent(),
+            ),
+        ).cards.last()
+
+        assertFalse(input.facts.any { it.contains("Mouse input") })
+        assertEquals(BugReportPreflightTone.Notice, input.tone)
     }
 
     @Test
