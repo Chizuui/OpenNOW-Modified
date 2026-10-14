@@ -1146,7 +1146,6 @@ impl TransportWorker {
                         }
                     }
                     Ok(TransportCommand::RequestKeyframe(mid)) => {
-                        self.video.reference_ready = false;
                         self.request_keyframe(mid);
                     }
                     Ok(TransportCommand::FlushInput(acknowledge)) => {

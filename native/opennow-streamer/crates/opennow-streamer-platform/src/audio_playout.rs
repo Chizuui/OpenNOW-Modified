@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 const CHANNELS: usize = 2;
 const SAMPLE_RATE: usize = 48_000;
 const TARGET_FRAMES: usize = SAMPLE_RATE * 40 / 1_000;
-const HIGH_FRAMES: usize = SAMPLE_RATE * 90 / 1_000;
-const PERSISTENT_FRAMES: usize = SAMPLE_RATE * 200 / 1_000;
+const HIGH_FRAMES: usize = SAMPLE_RATE * 100 / 1_000;
+const PERSISTENT_FRAMES: usize = SAMPLE_RATE * 300 / 1_000;
 
 #[derive(Debug)]
 pub(crate) struct AudioPlayoutBuffer {
@@ -89,12 +89,21 @@ impl AudioPlayoutBuffer {
                 let first = position as usize;
                 let fraction = (position - first as f64) as f32;
                 for channel in 0..CHANNELS {
-                    let a = self.samples[first * CHANNELS + channel];
-                    let b = self.samples[(first + 1) * CHANNELS + channel];
+                    let a = self
+                        .samples
+                        .get(first * CHANNELS + channel)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let b = self
+                        .samples
+                        .get((first + 1) * CHANNELS + channel)
+                        .copied()
+                        .unwrap_or(a);
                     destination[frame * CHANNELS + channel] = a + (b - a) * fraction;
                 }
             }
-            self.samples.drain(..consumed * CHANNELS);
+            self.samples
+                .drain(..(consumed * CHANNELS).min(self.samples.len()));
         }
         if destination.len() % CHANNELS != 0 {
             *destination.last_mut().unwrap() = 0.0;
