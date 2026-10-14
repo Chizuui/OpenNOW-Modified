@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 const CHANNELS: usize = 2;
 const SAMPLE_RATE: usize = 48_000;
 const TARGET_FRAMES: usize = SAMPLE_RATE * 40 / 1_000;
-const HIGH_FRAMES: usize = SAMPLE_RATE * 60 / 1_000;
+const HIGH_FRAMES: usize = SAMPLE_RATE * 90 / 1_000;
 const PERSISTENT_FRAMES: usize = SAMPLE_RATE * 200 / 1_000;
 
 #[derive(Debug)]

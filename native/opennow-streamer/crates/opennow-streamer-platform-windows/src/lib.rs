@@ -40,10 +40,10 @@ pub use format::{
 };
 pub use queue::{CompressedAdmit, GapAdmit, PushOutcome, ReferenceGap, admit_compressed_frame};
 
-/// Burst allowance for adaptive video delivery. The decoded presenter uses
-/// the same bound and trims stale frames before presentation, keeping latency
-/// low without treating ordinary game-FPS fluctuations as decoder loss.
-pub const ADAPTIVE_VIDEO_QUEUE_CAPACITY: usize = 7;
+/// Burst allowance for adaptive video delivery. Sized to match the transport's
+/// 15-frame recovery allowance so WebRTC packet-arrival bursts do not overflow
+/// the queue, trigger spurious frame drops, or spam keyframe requests.
+pub const ADAPTIVE_VIDEO_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

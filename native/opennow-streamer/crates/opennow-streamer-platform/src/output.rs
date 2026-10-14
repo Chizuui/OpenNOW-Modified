@@ -38,7 +38,7 @@ use opennow_streamer_platform_windows::{
 const AUDIO_SAMPLE_RATE: i32 = 48_000;
 const AUDIO_CHANNELS: u8 = 2;
 const AUDIO_BUFFER_FRAMES: u16 = 480;
-const MAX_AUDIO_LATENCY_MS: usize = 120;
+const MAX_AUDIO_LATENCY_MS: usize = 350;
 
 pub(crate) fn audio_devices() -> Result<Vec<PlaybackDevice>, String> {
     let sdl = sdl2::init().map_err(|error| format!("SDL initialization failed: {error}"))?;
