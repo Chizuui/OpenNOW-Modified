@@ -610,10 +610,8 @@ impl AdoptedResources {
                 &processor,
                 output_color_space(self.format.transfer_function),
             );
-            if self.format.transfer_function != VideoTransferFunction::Sdr {
-                self.video_context_1
-                    .VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-            }
+            self.video_context_1
+                .VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
         }
         // QRhi owns slot reuse. Allocate only the slots it actually visits;
         // reserving the ABI maximum would waste seven 4K textures on D3D11.
