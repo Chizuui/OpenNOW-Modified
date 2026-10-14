@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use opennow_streamer_protocol::Session;
 use serde::{Deserialize, Serialize};
 use str0m::change::SdpOffer;
+use str0m::channel::{ChannelData, ChannelId};
 use str0m::format::{Codec, PayloadParams};
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
@@ -41,6 +42,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_FLUSH_TIME: Duration = Duration::from_millis(150);
 const NACK_REPAIRABLE_FRAMES: usize = 101;
+/// Bounds how many distinct server control messages one session may log.
+const MAX_LOGGED_CONTROL_MESSAGES: usize = 64;
+/// Bounds the payload echoed for a single logged control message.
+const MAX_LOGGED_CONTROL_TEXT: usize = 400;
+/// Bounds the hex prefix echoed for a non-text control message.
+const MAX_LOGGED_CONTROL_HEX_BYTES: usize = 48;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -559,6 +566,9 @@ pub fn negotiate(
                 traffic: diagnostics::Traffic::default(),
                 peer,
                 last_connection_trace: Instant::now(),
+                channel_labels: std::collections::HashMap::new(),
+                logged_control_digests: std::collections::HashSet::new(),
+                logged_control_budget: MAX_LOGGED_CONTROL_MESSAGES,
             };
             let result = runtime.run();
             runtime.trace_connection("finished");
@@ -779,6 +789,51 @@ fn transient_udp_error(error: &std::io::Error) -> bool {
     )
 }
 
+/// Cheap content digest so repeated periodic control messages are logged once.
+fn control_digest(payload: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in payload {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Render a control payload for the log.
+///
+/// The observed `control_channel` speaks JSON, so printable payloads are echoed
+/// as text to expose real field names. Binary payloads fall back to a bounded
+/// hex prefix. Either way the output is truncated and redacted of nothing else:
+/// these are server control messages, not credentials or gameplay input.
+fn describe_control_payload(payload: &[u8]) -> String {
+    if payload.is_empty() {
+        return "<empty>".to_owned();
+    }
+    let printable = payload
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\n');
+    if printable {
+        let mut text: String = payload
+            .iter()
+            .take(MAX_LOGGED_CONTROL_TEXT)
+            .map(|byte| *byte as char)
+            .collect();
+        if payload.len() > MAX_LOGGED_CONTROL_TEXT {
+            text.push_str("...");
+        }
+        return text;
+    }
+    let mut hex: String = payload
+        .iter()
+        .take(MAX_LOGGED_CONTROL_HEX_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if payload.len() > MAX_LOGGED_CONTROL_HEX_BYTES {
+        hex.push_str("...");
+    }
+    hex
+}
+
 #[derive(Default)]
 struct VideoRecovery {
     mid: Option<Mid>,
@@ -810,6 +865,16 @@ struct TransportWorker {
     traffic: diagnostics::Traffic,
     peer: IpAddr,
     last_connection_trace: Instant,
+    // Diagnostic: labels of server-opened data channels by id, so we can log
+    // unrecognized server->client messages (e.g. the cursor/control channel
+    // that drives relative-mouse lock) and learn their real channel + framing.
+    channel_labels: std::collections::HashMap<ChannelId, String>,
+    // Diagnostic: the cursor lock/hide/relative state arrives in a later
+    // control message rather than the channel's first one, so every distinct
+    // inbound control payload is logged once instead of only the first per
+    // channel. Bounded so a chatty control channel cannot flood the log.
+    logged_control_digests: std::collections::HashSet<u64>,
+    logged_control_budget: usize,
 }
 
 impl TransportWorker {
@@ -825,6 +890,43 @@ impl TransportWorker {
         self.events
             .try_send(event)
             .map_err(|_| "WebRTC event consumer is unavailable or backpressured".to_owned())
+    }
+
+    /// Diagnostic: log each distinct inbound message on a channel the input
+    /// handshake does not own.
+    ///
+    /// The observed `control_channel` carries JSON (`{"videoStreamProfile…`),
+    /// and the cursor lock/hide/relative notification arrives as a *later*
+    /// control message rather than the first one, so logging only the first
+    /// message per channel never surfaces it. Every distinct payload is logged
+    /// once within a bounded budget; these are server control metadata, never
+    /// gameplay input, and the payload is echoed verbatim so the real field
+    /// names can be read instead of guessed.
+    fn log_control_message(&mut self, data: &ChannelData) {
+        if self.logged_control_budget == 0
+            || !self
+                .logged_control_digests
+                .insert(control_digest(&data.data))
+        {
+            return;
+        }
+        self.logged_control_budget -= 1;
+        let label = self
+            .channel_labels
+            .get(&data.id)
+            .map(String::as_str)
+            .unwrap_or("<unknown>");
+        opennow_streamer_protocol::log::log_line(
+            "INFO",
+            "webrtc-control",
+            &format!(
+                "label={label} binary={} len={} remaining={} payload={}",
+                data.binary,
+                data.data.len(),
+                self.logged_control_budget,
+                describe_control_payload(&data.data),
+            ),
+        );
     }
 
     fn request_keyframe(&mut self, mid: Mid) {
@@ -960,16 +1062,28 @@ impl TransportWorker {
                     &format!("state={state:?}"),
                 );
             }
-            Event::ChannelOpen(id, _) => {
+            Event::ChannelOpen(id, label) => {
+                // Diagnostic: remember every server-opened channel label so we
+                // can attribute unrecognized inbound messages (e.g. the cursor
+                // channel) to a concrete label in the logs.
+                self.channel_labels.insert(id, label.clone());
+                opennow_streamer_protocol::log::log_line(
+                    "INFO",
+                    "webrtc-channel-open",
+                    &format!("label={label}"),
+                );
                 if let Some(version) = self.input.channel_opened(self.channels, id) {
                     self.input_ready.store(true, Ordering::Release);
                     self.emit(TransportEvent::InputReady(version))?;
                 }
             }
             Event::ChannelData(data) => {
-                if let Some(version) = self.input.channel_data(self.channels, data.id, &data.data) {
+                let recognized = self.input.channel_data(self.channels, data.id, &data.data);
+                if let Some(version) = recognized {
                     self.input_ready.store(true, Ordering::Release);
                     self.emit(TransportEvent::InputReady(version))?;
+                } else {
+                    self.log_control_message(&data);
                 }
             }
             Event::ChannelClose(id) if self.input.channel_closed(self.channels, id) => {

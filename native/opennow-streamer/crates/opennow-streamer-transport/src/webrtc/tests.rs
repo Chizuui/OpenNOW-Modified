@@ -1147,6 +1147,39 @@ fn media_section_limit_remains_bounded() {
 }
 
 #[test]
+fn control_payloads_are_logged_readable_and_each_distinct_message_once() {
+    // The observed control_channel speaks JSON, so printable payloads must be
+    // echoed as text to expose the real field names rather than as hex.
+    let json = br#"{"videoStreamProfile":{"width":1920,"height":1080}}"#;
+    assert_eq!(
+        describe_control_payload(json),
+        String::from_utf8_lossy(json)
+    );
+    // Binary payloads fall back to a bounded hex prefix.
+    assert_eq!(describe_control_payload(&[0x0f, 0x01, 0xff]), "0f01ff");
+    assert_eq!(describe_control_payload(&[]), "<empty>");
+    // Every echoed payload stays inside the documented bound.
+    let long = vec![b'a'; MAX_LOGGED_CONTROL_TEXT + 64];
+    let rendered = describe_control_payload(&long);
+    assert_eq!(
+        rendered.len(),
+        MAX_LOGGED_CONTROL_TEXT + "...".len(),
+        "an oversized text payload is truncated"
+    );
+    let binary = vec![0xff_u8; MAX_LOGGED_CONTROL_HEX_BYTES + 8];
+    assert!(describe_control_payload(&binary).ends_with("..."));
+
+    // Distinct messages get distinct digests; identical repeats collapse so a
+    // periodic control message cannot flood the log.
+    assert_eq!(
+        control_digest(json),
+        control_digest(br#"{"videoStreamProfile":{"width":1920,"height":1080}}"#)
+    );
+    assert_ne!(control_digest(json), control_digest(b"{}"));
+    assert_ne!(control_digest(json), control_digest(&[0, 1, 2, 3]));
+}
+
+#[test]
 fn hevc_profiles_negotiate_exactly_and_deliver_fragmented_reference() {
     for (codec, profile) in [
         (NegotiatedVideoCodec::H265Main, 1),

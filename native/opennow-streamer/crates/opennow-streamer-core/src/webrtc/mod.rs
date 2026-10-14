@@ -507,6 +507,7 @@ impl Worker {
                     }
                     drops.flush(&self.output, Instant::now(), false);
                 }
+                self.flush_telemetry(&mut telemetry, Instant::now());
                 if let Some(queue) = &self.captured_input {
                     if !self.input_ready.load(Ordering::Acquire) {
                         queue.clear();
@@ -731,6 +732,10 @@ impl Telemetry {
         Some(payload)
     }
 }
+
+// Accumulates WebRTC ingress stats between telemetry windows so the Qt stream
+// statistics overlay shows live FPS/bitrate/ping/jitter/loss on the WebRTC
+// transport, which has no NVST feedback channel to source them from.
 
 struct Progress {
     started: Instant,
