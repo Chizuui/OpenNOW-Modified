@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -117,6 +118,7 @@ pub struct LoginProvider {
     pub code: String,
     pub display_name: String,
     pub streaming_service_url: String,
+    #[serde(default)]
     pub priority: i64,
 }
 
@@ -181,6 +183,24 @@ pub(crate) fn provider_streaming_base(provider: &LoginProvider) -> Result<url::U
     trusted_streaming_base(&effective_provider_url(provider))
 }
 
+fn default_auth_client_id() -> String {
+    STEAM_DECK_CLIENT_ID.to_owned()
+}
+
+// Legacy ChizuiLogin/Android sessions never carried `authClientId` (the field
+// is absent, or stored as NULL in D1 and returned as JSON null), while Qt
+// sessions send a real value. Treat missing/null/empty as the default client
+// so both session formats deserialize instead of failing login outright.
+fn deserialize_auth_client_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(default_auth_client_id))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthTokens {
@@ -192,6 +212,10 @@ pub struct AuthTokens {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_expires_at: Option<u64>,
     pub expires_at: u64,
+    #[serde(
+        default = "default_auth_client_id",
+        deserialize_with = "deserialize_auth_client_id"
+    )]
     pub auth_client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_token: Option<String>,
@@ -224,6 +248,10 @@ pub struct AuthSession {
     pub provider: LoginProvider,
     pub tokens: AuthTokens,
     pub user: AuthUser,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chizui_server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chizui_jwt_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -283,6 +311,15 @@ struct DeviceAttempt {
     pending_session: Option<AuthSession>,
 }
 
+struct ChizuiAttempt {
+    server_url: String,
+    listener: TcpListener,
+    callback_port: u16,
+    expires_at: u64,
+    code: Option<String>,
+    pending_session: Option<AuthSession>,
+}
+
 #[derive(Default)]
 struct ServiceState {
     providers: Vec<LoginProvider>,
@@ -291,6 +328,7 @@ struct ServiceState {
     providers_error: Option<String>,
     providers_default: Option<String>,
     attempts: HashMap<String, DeviceAttempt>,
+    chizui_attempts: HashMap<String, ChizuiAttempt>,
     session: Option<AuthSession>,
     public_games: Vec<Value>,
     public_games_proxy_scope: String,
@@ -862,6 +900,8 @@ impl GfnService {
             provider: attempt.provider,
             tokens,
             user,
+            chizui_server_url: None,
+            chizui_jwt_token: None,
         };
         if let Some(stored) = self
             .state
@@ -964,6 +1004,211 @@ impl GfnService {
         json!({"session":session.map(AuthSession::public), "generation":state.generation,
             "persistence":state.persistence_state, "refresh":refresh, "warnings":self.vault.warnings(),
             "deviceIdentity": if self.device_identity_error.is_some() { "unavailable" } else { "durable" }})
+    }
+
+    pub fn start_chizui_login(&self, params: &Value) -> Result<Value, ServiceError> {
+        let server_url = required_param(params, "serverUrl")?
+            .trim_end_matches('/')
+            .to_owned();
+        let parsed = url::Url::parse(&server_url)
+            .map_err(|_| ServiceError::invalid("ChizuiLogin URL is invalid"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(ServiceError::invalid(
+                "ChizuiLogin URL must use HTTP or HTTPS",
+            ));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| ServiceError {
+            code: "network_error",
+            message: format!("Could not bind ChizuiLogin callback: {error}"),
+        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| ServiceError {
+                code: "network_error",
+                message: format!("Could not prepare ChizuiLogin callback: {error}"),
+            })?;
+        let callback_port = listener
+            .local_addr()
+            .map_err(|error| ServiceError {
+                code: "network_error",
+                message: format!("Could not read ChizuiLogin callback port: {error}"),
+            })?
+            .port();
+        let mut login_url = parsed;
+        login_url
+            .query_pairs_mut()
+            .append_pair("callback_port", &callback_port.to_string());
+        if params["promptSelectAccount"].as_bool().unwrap_or(false) {
+            login_url
+                .query_pairs_mut()
+                .append_pair("prompt", "select_account");
+        }
+        let attempt_id = random_attempt_id();
+        let expires_at = now_ms() + 120_000;
+        self.state
+            .lock()
+            .expect("GFN state poisoned")
+            .chizui_attempts
+            .insert(
+                attempt_id.clone(),
+                ChizuiAttempt {
+                    server_url,
+                    listener,
+                    callback_port,
+                    expires_at,
+                    code: None,
+                    pending_session: None,
+                },
+            );
+        Ok(json!({
+            "attemptId": attempt_id,
+            "loginUrl": login_url.as_str(),
+            "callbackPort": callback_port,
+            "expiresAt": expires_at,
+        }))
+    }
+
+    pub fn poll_chizui_login(&self, params: &Value) -> Result<Value, ServiceError> {
+        let attempt_id = required_param(params, "attemptId")?.to_owned();
+        let (server_url, code) = {
+            let mut state = self.state.lock().expect("GFN state poisoned");
+            let attempt = state
+                .chizui_attempts
+                .get_mut(&attempt_id)
+                .ok_or_else(|| ServiceError::invalid("ChizuiLogin is no longer active"))?;
+            if attempt.expires_at <= now_ms() {
+                state.chizui_attempts.remove(&attempt_id);
+                return Ok(json!({"status":"expired", "error":"ChizuiLogin timed out"}));
+            }
+            if attempt.pending_session.is_some() {
+                return Ok(json!({"status":"authorized"}));
+            }
+            if attempt.code.is_none() {
+                if let Ok((mut stream, _)) = attempt.listener.accept() {
+                    let mut request = [0_u8; 8192];
+                    let size = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1));
+                    if let Some(target) = target {
+                        if let Ok(callback) = url::Url::parse(&format!("http://localhost{target}"))
+                        {
+                            let code = callback.query_pairs().find_map(|(key, value)| {
+                                (key == "code").then(|| value.into_owned())
+                            });
+                            let error = callback.query_pairs().find_map(|(key, value)| {
+                                (key == "error").then(|| value.into_owned())
+                            });
+                            let body = if code.is_some() {
+                                "ChizuiLogin complete. You can close this window and return to OpenNOW."
+                            } else {
+                                "ChizuiLogin was cancelled or failed. You can close this window and return to OpenNOW."
+                            };
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            attempt.code =
+                                code.or_else(|| error.map(|value| format!("ERROR:{value}")));
+                        }
+                    }
+                }
+            }
+            (attempt.server_url.clone(), attempt.code.take())
+        };
+        let Some(code) = code else {
+            return Ok(json!({"status":"pending"}));
+        };
+        if let Some(error) = code.strip_prefix("ERROR:") {
+            self.state
+                .lock()
+                .expect("GFN state poisoned")
+                .chizui_attempts
+                .remove(&attempt_id);
+            return Ok(json!({"status":"error", "error":error}));
+        }
+        let callback_code = code.strip_prefix("CHIZUI_").unwrap_or(&code);
+        let callback_port = {
+            let state = self.state.lock().expect("GFN state poisoned");
+            state
+                .chizui_attempts
+                .get(&attempt_id)
+                .map(|attempt| attempt.callback_port)
+                .ok_or_else(|| ServiceError::invalid("ChizuiLogin is no longer active"))?
+        };
+        let jwt_token = if let Some(one_time_code) = callback_code.strip_prefix("ctc_") {
+            self.exchange_chizui_code(&server_url, one_time_code, callback_port)?
+        } else {
+            // Compatibility with the pre-exchange server that returned a
+            // directly usable JWT/session token in the callback.
+            callback_code.to_owned()
+        };
+        let session = match self.fetch_chizui_session(&server_url, &jwt_token, None) {
+            Ok(mut session) => {
+                session.chizui_server_url = Some(server_url);
+                session.chizui_jwt_token = Some(jwt_token);
+                session
+            }
+            Err(error) => {
+                self.state
+                    .lock()
+                    .expect("GFN state poisoned")
+                    .chizui_attempts
+                    .remove(&attempt_id);
+                return Err(error);
+            }
+        };
+        let mut state = self.state.lock().expect("GFN state poisoned");
+        let Some(attempt) = state.chizui_attempts.get_mut(&attempt_id) else {
+            return Ok(json!({"status":"expired", "error":"ChizuiLogin was cancelled"}));
+        };
+        attempt.pending_session = Some(session);
+        Ok(json!({"status":"authorized"}))
+    }
+
+    pub fn complete_chizui_login(&self, params: &Value) -> Result<Value, ServiceError> {
+        let attempt_id = required_param(params, "attemptId")?;
+        let mut state = self.state.lock().expect("GFN state poisoned");
+        let attempt = state
+            .chizui_attempts
+            .remove(attempt_id)
+            .ok_or_else(|| ServiceError::invalid("ChizuiLogin is no longer active"))?;
+        let session = attempt
+            .pending_session
+            .ok_or_else(|| ServiceError::invalid("ChizuiLogin has not completed yet"))?;
+        state.session = Some(session.clone());
+        drop(state);
+        let persist = params["staySignedIn"].as_bool().unwrap_or(true);
+        let persistence = if persist {
+            match self.vault.save(&session) {
+                Ok(()) => "local-store",
+                Err(error) => {
+                    eprintln!("auth: ChizuiLogin session remains memory-only: {error}");
+                    "memory-only"
+                }
+            }
+        } else {
+            "none"
+        };
+        self.state
+            .lock()
+            .expect("GFN state poisoned")
+            .persistence_state = persistence.to_owned();
+        Ok(json!({"session":session, "persistence":persistence}))
+    }
+
+    pub fn cancel_chizui_login(&self, params: &Value) -> Result<Value, ServiceError> {
+        let attempt_id = required_param(params, "attemptId")?;
+        self.state
+            .lock()
+            .expect("GFN state poisoned")
+            .chizui_attempts
+            .remove(attempt_id);
+        Ok(json!({"cancelled":true}))
     }
 
     pub fn session(&self) -> Result<Value, ServiceError> {
@@ -2677,6 +2922,80 @@ impl GfnService {
             .map_err(|_| ServiceError::invalid("Invalid provider URL"))
     }
 
+    fn fetch_chizui_session(
+        &self,
+        server_url: &str,
+        jwt_token: &str,
+        gfn_user_id: Option<&str>,
+    ) -> Result<AuthSession, ServiceError> {
+        let mut url = url::Url::parse(server_url)
+            .map_err(|_| ServiceError::invalid("ChizuiLogin URL is invalid"))?;
+        url.set_path("/api/gfn/tokens");
+        if let Some(user_id) = gfn_user_id {
+            url.query_pairs_mut().append_pair("gfn_user_id", user_id);
+        }
+        let response = self
+            .client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {jwt_token}"))
+            .send()
+            .map_err(|error| ServiceError::network("ChizuiLogin session request failed", error))?;
+        if !response.status().is_success() {
+            return Err(ServiceError::response(
+                "ChizuiLogin session request failed",
+                response,
+            ));
+        }
+        let payload = response.json::<Value>().map_err(|error| {
+            ServiceError::network("Invalid ChizuiLogin session response", error)
+        })?;
+        if payload["status"]
+            .as_str()
+            .is_some_and(|status| status != "success")
+        {
+            return Err(ServiceError::invalid(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or("ChizuiLogin session was rejected"),
+            ));
+        }
+        serde_json::from_value(payload["data"].clone()).map_err(|_| ServiceError {
+            code: "upstream_error",
+            message: "ChizuiLogin response did not contain a valid session".to_owned(),
+        })
+    }
+
+    fn exchange_chizui_code(
+        &self,
+        server_url: &str,
+        code: &str,
+        callback_port: u16,
+    ) -> Result<String, ServiceError> {
+        let mut url = url::Url::parse(server_url)
+            .map_err(|_| ServiceError::invalid("ChizuiLogin URL is invalid"))?;
+        url.set_path("/api/auth/exchange");
+        let body = json!({"code": format!("ctc_{code}"), "callbackPort": callback_port});
+        let response = self
+            .client
+            .post(url)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|error| ServiceError::network("ChizuiLogin code exchange failed", error))?;
+        if !response.status().is_success() {
+            return Err(ServiceError::response(
+                "ChizuiLogin code exchange failed",
+                response,
+            ));
+        }
+        let payload = response.json::<Value>().map_err(|error| {
+            ServiceError::network("Invalid ChizuiLogin exchange response", error)
+        })?;
+        required_string(&payload, "token")
+    }
+
     fn fetch_user_info(&self, tokens: &AuthTokens) -> Result<AuthUser, ServiceError> {
         if let Some(user) = tokens
             .id_token
@@ -2769,12 +3088,36 @@ impl GfnService {
             provider: session.provider.clone(),
             tokens,
             user: session.user.clone(),
+            chizui_server_url: session.chizui_server_url.clone(),
+            chizui_jwt_token: session.chizui_jwt_token.clone(),
         };
         self.store_refreshed_session(updated)
     }
 
     fn refresh_session(&self, session: &AuthSession) -> Result<AuthSession, ServiceError> {
         let mut errors = Vec::new();
+        if let (Some(server_url), Some(jwt_token)) = (
+            session.chizui_server_url.as_deref(),
+            session.chizui_jwt_token.as_deref(),
+        ) {
+            match self.fetch_chizui_session(server_url, jwt_token, Some(&session.user.user_id)) {
+                Ok(mut refreshed) => {
+                    refreshed.chizui_server_url = Some(server_url.to_owned());
+                    refreshed.chizui_jwt_token = Some(jwt_token.to_owned());
+                    if refreshed.user.user_id != session.user.user_id {
+                        return Err(ServiceError {
+                            code: "session_identity_mismatch",
+                            message: "ChizuiLogin returned a different account".to_owned(),
+                        });
+                    }
+                    return self.store_refreshed_session(refreshed);
+                }
+                Err(error) => errors.push(ServiceError {
+                    code: error.code,
+                    message: format!("chizui: {}", error.message),
+                }),
+            }
+        }
         if let Some(client_token) = session.tokens.client_token.as_deref().filter(|_| {
             session
                 .tokens
@@ -2914,6 +3257,8 @@ impl GfnService {
             provider: session.provider.clone(),
             tokens,
             user,
+            chizui_server_url: session.chizui_server_url.clone(),
+            chizui_jwt_token: session.chizui_jwt_token.clone(),
         })
     }
 
@@ -4205,6 +4550,41 @@ pub(crate) mod tests {
         session.tokens.expires_at = 0;
         assert_eq!(session.tokens.expiry(TokenPurpose::StarfleetAccess), 0);
         assert!(session.tokens.expiry(TokenPurpose::ServiceId) > now_ms());
+    }
+
+    #[test]
+    fn chizui_session_deserializes_legacy_and_qt_token_formats() {
+        // Qt format: authClientId present with a real value + provider.priority.
+        let qt = json!({
+            "provider": {"idpId":"idp","code":"NVIDIA","displayName":"NVIDIA","streamingServiceUrl":"https://x/","priority":3},
+            "tokens": {"accessToken":"a","expiresAt":1,"authClientId":"real-client"},
+            "user": {"userId":"u","displayName":"U","membershipTier":"FREE"}
+        });
+        let qt: AuthSession = serde_json::from_value(qt).expect("Qt session must deserialize");
+        assert_eq!(qt.tokens.auth_client_id, "real-client");
+        assert_eq!(qt.provider.priority, 3);
+
+        // Legacy format: authClientId null AND provider.priority absent — both
+        // must fall back instead of failing login ("did not contain a valid session").
+        let legacy = json!({
+            "provider": {"idpId":"idp","code":"NVIDIA","displayName":"NVIDIA","streamingServiceUrl":"https://x/"},
+            "tokens": {"accessToken":"a","expiresAt":1,"authClientId":null},
+            "user": {"userId":"u","displayName":"U","membershipTier":"FREE"}
+        });
+        let legacy: AuthSession =
+            serde_json::from_value(legacy).expect("legacy session must deserialize");
+        assert_eq!(legacy.tokens.auth_client_id, STEAM_DECK_CLIENT_ID);
+        assert_eq!(legacy.provider.priority, 0);
+
+        // Oldest format: authClientId key omitted entirely.
+        let omitted = json!({
+            "provider": {"idpId":"idp","code":"NVIDIA","displayName":"NVIDIA","streamingServiceUrl":"https://x/"},
+            "tokens": {"accessToken":"a","expiresAt":1},
+            "user": {"userId":"u","displayName":"U","membershipTier":"FREE"}
+        });
+        let omitted: AuthSession =
+            serde_json::from_value(omitted).expect("session without authClientId must deserialize");
+        assert_eq!(omitted.tokens.auth_client_id, STEAM_DECK_CLIENT_ID);
     }
 
     #[test]

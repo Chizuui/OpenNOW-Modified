@@ -1140,7 +1140,7 @@ fn defaults() -> Map<String, Value> {
         "allowEscapeToExitFullscreen":false, "lastSeenReleaseHighlightsVersion":"",
         "videoShader":{"enabled":false,"sharpen":40,"saturation":100,"contrast":100,"brightness":100,"vibrance":0,"filmGrain":0},
         "frameInterpolation":{"enabled":false,"factor":2,"quality":480},
-        "errorReportingConsent":"unset", "automaticBugReports":"unset", "telemetryInstallId":""
+        "errorReportingConsent":"unset", "automaticBugReports":"unset", "telemetryInstallId":"", "chizuiLoginUrl":"https://gfn.chizuui.com"
     })
     .as_object()
     .cloned()
