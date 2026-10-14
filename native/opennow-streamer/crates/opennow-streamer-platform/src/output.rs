@@ -2856,9 +2856,9 @@ impl WindowsOutput {
                     surface: initial_surface,
                     video_queue_capacity:
                         opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY,
-                    // 10 x 20 ms PCM packets matches the adaptive renderer's
-                    // maximum jitter-buffer target without becoming unbounded.
-                    audio_queue_capacity: 10,
+                    // 32 x 20 ms PCM packets absorbs transient network jitter and
+                    // decode stalls without dropping audio.
+                    audio_queue_capacity: 32,
                 },
                 Arc::clone(&output.audio_muted),
             )

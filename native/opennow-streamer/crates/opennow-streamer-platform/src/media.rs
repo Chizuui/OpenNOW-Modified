@@ -26,10 +26,9 @@ use crate::linux_backend::{LinuxVideoPath, LinuxVideoSelection};
 
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const VIDEO_QUEUE_MAX_CAPACITY: usize = 60;
-// Ten 20 ms Opus packets cover the official client's 200 ms adaptive ceiling.
-// The queue remains bounded and drop-oldest, so recovery cannot grow latency
-// without limit under a stalled decoder.
-const AUDIO_QUEUE_CAPACITY: usize = 10;
+// Thirty-two 20 ms Opus packets (640 ms) absorb transient network jitter and
+// brief decode recovery bursts without prematurely discarding audio.
+const AUDIO_QUEUE_CAPACITY: usize = 32;
 const OPUS_SAMPLE_RATE: u32 = 48_000;
 const MAX_OPUS_FRAME_SAMPLES_PER_CHANNEL: usize = 5_760;
 const RECORDING_TAP_QUEUE_CAPACITY: usize = 256;

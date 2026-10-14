@@ -1195,49 +1195,54 @@ fn run_decoder_worker(
                 break;
             };
             if frame.reset_decoder && submitted_any {
-                decoder.stop();
                 decoded
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                decoder_generation.fetch_add(1, Ordering::AcqRel);
-                match Decoder::new(&device, format, mode) {
-                    Ok(replacement) => {
-                        decoder = replacement;
-                        submitted_any = false;
-                        // The queued frames follow this keyframe. Clearing them
-                        // silently breaks the next P-frame's reference chain.
-                        pending_frame = Some(frame);
-                        made_progress = true;
-                        break;
-                    }
-                    Err(message) => {
-                        opennow_streamer_protocol::log::diagnostic(
-                            "WARN",
-                            "decode",
-                            &format!("Embedded D3D11 decoder reset failed: {message}"),
-                        );
-                        let _ = events.push(BackendEvent::DeviceLost {
-                            subsystem: Subsystem::VideoDecode,
-                            message,
-                        });
-                        let _ = events.push(BackendEvent::KeyFrameRequired);
-                        frame_ready();
-                        pending_frame = wait_for_recovery_keyframe(
-                            &device,
-                            format,
-                            mode,
-                            &encoded,
-                            &decoded,
-                            &events,
-                            &decoder_generation,
-                            &stopping,
-                            frame_ready.as_ref(),
-                            &mut decoder,
-                            &mut submitted_any,
-                        );
-                        made_progress = true;
-                        break;
+                if let Err(error) = decoder.flush() {
+                    opennow_streamer_protocol::log::diagnostic(
+                        "WARN",
+                        "decode",
+                        &format!("Embedded D3D11 decoder flush failed, recreating: {error}"),
+                    );
+                    decoder.stop();
+                    decoder_generation.fetch_add(1, Ordering::AcqRel);
+                    match Decoder::new(&device, format, mode) {
+                        Ok(replacement) => {
+                            decoder = replacement;
+                            submitted_any = false;
+                            pending_frame = Some(frame);
+                            made_progress = true;
+                            break;
+                        }
+                        Err(message) => {
+                            opennow_streamer_protocol::log::diagnostic(
+                                "WARN",
+                                "decode",
+                                &format!("Embedded D3D11 decoder reset failed: {message}"),
+                            );
+                            let _ = events.push(BackendEvent::DeviceLost {
+                                subsystem: Subsystem::VideoDecode,
+                                message,
+                            });
+                            let _ = events.push(BackendEvent::KeyFrameRequired);
+                            frame_ready();
+                            pending_frame = wait_for_recovery_keyframe(
+                                &device,
+                                format,
+                                mode,
+                                &encoded,
+                                &decoded,
+                                &events,
+                                &decoder_generation,
+                                &stopping,
+                                frame_ready.as_ref(),
+                                &mut decoder,
+                                &mut submitted_any,
+                            );
+                            made_progress = true;
+                            break;
+                        }
                     }
                 }
             }

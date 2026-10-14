@@ -19,7 +19,7 @@ const MIN_PREROLL_MS: u32 = 60;
 const MAX_PREROLL_MS: u32 = 200;
 const PREROLL_ADJUSTMENT_MS: u32 = 5;
 const PREROLL_STABLE_INTERVAL: Duration = Duration::from_secs(20);
-const MAX_PENDING_AUDIO_MS: usize = 200;
+const MAX_PENDING_AUDIO_MS: usize = 500;
 
 struct AdaptivePreroll {
     target_ms: u32,

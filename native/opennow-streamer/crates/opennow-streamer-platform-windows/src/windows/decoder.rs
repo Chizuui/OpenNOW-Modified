@@ -433,6 +433,21 @@ impl Decoder {
         Ok(OutputPoll::Produced)
     }
 
+    pub(super) fn flush(&mut self) -> Result<(), String> {
+        if self.stopped {
+            return Ok(());
+        }
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
+                .map_err(|error| format!("flush decoder: {error}"))?;
+        }
+        if self.events.is_none() {
+            self.input_credits = 1;
+        }
+        Ok(())
+    }
+
     pub(super) fn stop(&mut self) {
         if self.stopped {
             return;
@@ -706,8 +721,12 @@ fn enumerate_decoders(
                 attributes
                     .SetBlob(&MFT_ENUM_ADAPTER_LUID, luid_bytes)
                     .map_err(|error| error.to_string())?;
-                let hardware_flags =
-                    MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+                let hardware_flags = MFT_ENUM_FLAG(
+                    MFT_ENUM_FLAG_HARDWARE.0
+                        | MFT_ENUM_FLAG_SYNCMFT.0
+                        | MFT_ENUM_FLAG_ASYNCMFT.0
+                        | MFT_ENUM_FLAG_SORTANDFILTER.0,
+                );
                 let mut adapter_hardware =
                     enumerate_matching_decoders(hardware_flags, Some(&attributes), codec)?;
                 let mut activations = Vec::new();
