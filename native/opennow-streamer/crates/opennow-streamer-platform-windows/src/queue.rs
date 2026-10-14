@@ -22,15 +22,15 @@ pub enum CompressedAdmit {
     DiscardChain { dropped: usize },
 }
 
-/// A full queue that already holds a keyframe keeps that keyframe. An incoming
-/// keyframe still replaces the stale chain. A full queue with no keyframe is
-/// discarded, because every remaining delta depends on a frame that will not
-/// be decoded.
+/// A full queue keeps its queued frames so the decoder can continue playing the
+/// established sequence. An incoming keyframe replaces a full queue. A delta arriving
+/// at a full queue is rejected with backpressure (`PreserveQueuedKeyframe`) rather than
+/// discarding the valid reference chain already queued for decoding.
 pub fn admit_compressed_frame(
     len: usize,
     capacity: usize,
     incoming_is_keyframe: bool,
-    queue_has_keyframe: bool,
+    _queue_has_keyframe: bool,
 ) -> CompressedAdmit {
     if len < capacity {
         return CompressedAdmit::Append;
@@ -38,12 +38,7 @@ pub fn admit_compressed_frame(
     if incoming_is_keyframe {
         return CompressedAdmit::ReplaceWithKeyframe { dropped: len };
     }
-    if queue_has_keyframe {
-        return CompressedAdmit::PreserveQueuedKeyframe;
-    }
-    CompressedAdmit::DiscardChain {
-        dropped: len.saturating_add(1),
-    }
+    CompressedAdmit::PreserveQueuedKeyframe
 }
 
 /// Reference state of a compressed queue after it dropped a delta. Every later
@@ -274,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn video_overflow_discards_the_pending_reference_chain() {
+    fn video_overflow_preserves_the_pending_reference_chain() {
         let queue = BoundedQueue::new(2);
         assert_eq!(
             queue.push_or_clear_on_overflow(1, false, |_| false),
@@ -286,11 +281,11 @@ mod tests {
         );
         assert_eq!(
             queue.push_or_clear_on_overflow(3, false, |_| false),
-            Ok(PushOutcome::DroppedOldest)
+            Ok(PushOutcome::Backpressured)
         );
-        assert_eq!(queue.try_pop(), None);
+        assert_eq!(queue.try_pop(), Some(1));
+        assert_eq!(queue.try_pop(), Some(2));
     }
-
     #[test]
     fn video_overflow_retains_an_incoming_recovery_keyframe() {
         let queue = BoundedQueue::new(2);
@@ -342,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             admit_compressed_frame(7, 7, false, false),
-            CompressedAdmit::DiscardChain { dropped: 8 }
+            CompressedAdmit::PreserveQueuedKeyframe
         );
         assert_eq!(
             admit_compressed_frame(3, 7, false, false),
@@ -430,17 +425,15 @@ mod tests {
     fn discarded_chain_drops_deltas_until_a_keyframe_without_new_requests() {
         let queue = BoundedQueue::new(2);
         let mut gap = ReferenceGap::default();
-        submit(&queue, &mut gap, 1);
-        submit(&queue, &mut gap, 2);
-        assert_eq!(submit(&queue, &mut gap, 3), GapAdmit::Admit);
+        gap.record(CompressedAdmit::DiscardChain { dropped: 0 });
         assert_eq!(gap, ReferenceGap::KeyframeRequested);
+        assert_eq!(submit(&queue, &mut gap, 3), GapAdmit::Discard);
         assert_eq!(queue.try_pop(), None);
         assert_eq!(submit(&queue, &mut gap, 4), GapAdmit::Discard);
         assert_eq!(queue.try_pop(), None);
         assert_eq!(submit(&queue, &mut gap, -5), GapAdmit::Admit);
         assert_eq!(queue.try_pop(), Some(-5));
     }
-
     #[test]
     fn close_discards_values_and_rejects_writes() {
         let queue = BoundedQueue::new(2);

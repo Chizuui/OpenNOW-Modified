@@ -1873,6 +1873,10 @@ impl MediaSession {
                             .keyframe_requested
                             .swap(true, Ordering::AcqRel)
                         {
+                            video_submission
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .reset_keyframe();
                             invalidate_embedded_video(&video_shared, &frame.mid, reason);
                         }
                         continue;
@@ -2436,8 +2440,17 @@ impl EmbeddedD3d11Submission {
         }
     }
 
+    fn reset_keyframe(&self) {
+        if let Some(submitter) = self.submitter.as_ref() {
+            submitter.reset_keyframe();
+        }
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
+        if let Some(submitter) = self.submitter.as_ref() {
+            submitter.reset_keyframe();
+        }
         self.submitter = None;
     }
 
@@ -4943,7 +4956,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn embedded_d3d11_overflow_discards_the_entire_reference_chain() {
+    fn embedded_d3d11_overflow_preserves_the_pending_reference_chain() {
         let mut state = EmbeddedD3d11Submission::new();
         let capacity = opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY;
         for index in 0..capacity {
@@ -4963,18 +4976,18 @@ mod tests {
             state.push(embedded_h264_frame(capacity as i64, false)),
             Ok(EmbeddedD3d11SubmissionOutcome {
                 queued: false,
-                dropped: capacity + 1,
+                dropped: 1,
                 needs_graphics: true,
-                preserved_keyframe: false,
+                preserved_keyframe: true,
             })
         );
-        assert!(state.pending.is_empty());
+        assert_eq!(state.pending.len(), capacity);
 
         assert_eq!(
             state.push(embedded_h264_frame(100, true)),
             Ok(EmbeddedD3d11SubmissionOutcome {
                 queued: true,
-                dropped: 0,
+                dropped: capacity,
                 needs_graphics: true,
                 preserved_keyframe: false,
             })

@@ -9,9 +9,9 @@ use std::collections::VecDeque;
 
 const CHANNELS: usize = 2;
 const SAMPLE_RATE: usize = 48_000;
-const TARGET_FRAMES: usize = SAMPLE_RATE * 40 / 1_000;
-const HIGH_FRAMES: usize = SAMPLE_RATE * 100 / 1_000;
-const PERSISTENT_FRAMES: usize = SAMPLE_RATE * 300 / 1_000;
+const TARGET_FRAMES: usize = SAMPLE_RATE * 80 / 1_000;
+const HIGH_FRAMES: usize = SAMPLE_RATE * 250 / 1_000;
+const PERSISTENT_FRAMES: usize = SAMPLE_RATE * 600 / 1_000;
 
 #[derive(Debug)]
 pub(crate) struct AudioPlayoutBuffer {
@@ -74,7 +74,7 @@ impl AudioPlayoutBuffer {
             self.recovering = false;
         }
         let extra = if self.recovering {
-            (output_frames / 50).min(backlog.saturating_sub(TARGET_FRAMES))
+            (output_frames / 100).min(backlog.saturating_sub(TARGET_FRAMES))
         } else {
             0
         };
@@ -136,13 +136,13 @@ mod tests {
 
     #[test]
     fn sustained_backlog_recovers_without_underruns_or_channel_skew() {
-        let mut audio = AudioPlayoutBuffer::new(11_520);
+        let mut audio = AudioPlayoutBuffer::new(57_600);
         let packet: Vec<_> = (0..480).flat_map(|_| [0.25, -0.5]).collect();
-        for _ in 0..11 {
+        for _ in 0..27 {
             audio.push(&packet);
         }
         let mut output = [0.0; 960];
-        for _ in 0..600 {
+        for _ in 0..2_400 {
             audio.push(&packet);
             audio.fill(&mut output);
             assert!(output.chunks_exact(2).all(|v| v == [0.25, -0.5]));
@@ -153,8 +153,8 @@ mod tests {
 
     #[test]
     fn short_burst_does_not_enable_resampling_and_clear_resets_recovery() {
-        let mut audio = AudioPlayoutBuffer::new(11_520);
-        audio.push(&vec![0.5; 11_520]);
+        let mut audio = AudioPlayoutBuffer::new(57_600);
+        audio.push(&vec![0.5; 57_600]);
         let mut output = [0.0; 960];
         for _ in 0..10 {
             audio.fill(&mut output);

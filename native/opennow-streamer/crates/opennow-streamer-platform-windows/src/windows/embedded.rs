@@ -151,12 +151,16 @@ pub struct D3d11RecordedFrame {
 pub struct D3d11FrameSubmitter {
     encoded: Arc<BoundedQueue<EncodedVideoFrame>>,
     events: Arc<BoundedQueue<BackendEvent>>,
+    has_keyframe: Arc<AtomicBool>,
 }
 
 impl D3d11FrameSubmitter {
     pub fn submit_video(&self, frame: EncodedVideoFrame) -> Result<PushOutcome, BackendError> {
         frame.validate()?;
         let key_frame = frame.key_frame;
+        if key_frame {
+            self.has_keyframe.store(true, Ordering::Release);
+        }
         let outcome = self
             .encoded
             .push_or_clear_on_overflow(frame, key_frame, |queued| queued.key_frame)
@@ -174,7 +178,11 @@ impl D3d11FrameSubmitter {
     }
 
     pub fn holds_keyframe(&self) -> bool {
-        self.encoded.any(|queued| queued.key_frame)
+        self.has_keyframe.load(Ordering::Acquire) || self.encoded.any(|queued| queued.key_frame)
+    }
+
+    pub fn reset_keyframe(&self) {
+        self.has_keyframe.store(false, Ordering::Release);
     }
 }
 
@@ -919,9 +927,11 @@ impl D3d11FrameProducer {
         )));
         let decoder_generation = Arc::new(AtomicU64::new(1));
         let stopping = Arc::new(AtomicBool::new(false));
+        let has_keyframe = Arc::new(AtomicBool::new(false));
         let submitter = D3d11FrameSubmitter {
             encoded: Arc::clone(&encoded),
             events: Arc::clone(&events),
+            has_keyframe: Arc::clone(&has_keyframe),
         };
         let (startup_sender, startup_receiver) = sync_channel(1);
         let worker_encoded = Arc::clone(&encoded);
@@ -929,6 +939,7 @@ impl D3d11FrameProducer {
         let worker_events = Arc::clone(&events);
         let worker_generation = Arc::clone(&decoder_generation);
         let worker_stopping = Arc::clone(&stopping);
+        let worker_has_keyframe = Arc::clone(&has_keyframe);
         let worker_runtime = Arc::clone(&runtime);
         let decoder_worker = thread::Builder::new()
             .name("opennow-mf-video-decode".to_owned())
@@ -946,6 +957,7 @@ impl D3d11FrameProducer {
                     worker_events,
                     worker_generation,
                     worker_stopping,
+                    worker_has_keyframe,
                     frame_ready,
                     startup_sender,
                 );
@@ -1084,6 +1096,7 @@ fn run_decoder_worker(
     events: Arc<BoundedQueue<BackendEvent>>,
     decoder_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
+    has_keyframe: Arc<AtomicBool>,
     frame_ready: Arc<dyn Fn() + Send + Sync>,
     startup_sender: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
@@ -1154,6 +1167,7 @@ fn run_decoder_worker(
             }
             Err(message) => {
                 decoder.stop();
+                has_keyframe.store(false, Ordering::Release);
                 decoded
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1180,6 +1194,7 @@ fn run_decoder_worker(
                     &events,
                     &decoder_generation,
                     &stopping,
+                    &has_keyframe,
                     frame_ready.as_ref(),
                     &mut decoder,
                     &mut submitted_any,
@@ -1234,6 +1249,7 @@ fn run_decoder_worker(
                                 &events,
                                 &decoder_generation,
                                 &stopping,
+                                &has_keyframe,
                                 frame_ready.as_ref(),
                                 &mut decoder,
                                 &mut submitted_any,
@@ -1246,6 +1262,7 @@ fn run_decoder_worker(
             }
             if let Err(message) = decoder.submit(frame) {
                 decoder.stop();
+                has_keyframe.store(false, Ordering::Release);
                 decoded
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1272,6 +1289,7 @@ fn run_decoder_worker(
                     &events,
                     &decoder_generation,
                     &stopping,
+                    &has_keyframe,
                     frame_ready.as_ref(),
                     &mut decoder,
                     &mut submitted_any,
@@ -1329,6 +1347,7 @@ fn wait_for_recovery_keyframe(
     events: &BoundedQueue<BackendEvent>,
     decoder_generation: &AtomicU64,
     stopping: &AtomicBool,
+    has_keyframe: &AtomicBool,
     frame_ready: &dyn Fn(),
     decoder: &mut Decoder,
     submitted_any: &mut bool,
@@ -1349,6 +1368,7 @@ fn wait_for_recovery_keyframe(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
                 decoder_generation.fetch_add(1, Ordering::AcqRel);
+                has_keyframe.store(true, Ordering::Release);
                 let _ = events.push(BackendEvent::DeviceRecovered(Subsystem::VideoDecode));
                 frame_ready();
                 return Some(frame);
@@ -1781,9 +1801,11 @@ mod tests {
     fn full_decode_queue_retains_an_incoming_recovery_keyframe() {
         let encoded = Arc::new(BoundedQueue::new(2));
         let events = Arc::new(BoundedQueue::new(8));
+        let has_keyframe = Arc::new(AtomicBool::new(false));
         let submitter = D3d11FrameSubmitter {
             encoded: Arc::clone(&encoded),
             events: Arc::clone(&events),
+            has_keyframe,
         };
         assert_eq!(
             submitter.submit_video(encoded_frame(0, false)),
@@ -2601,9 +2623,11 @@ mod tests {
     fn full_decode_queue_reports_loss_synchronously_without_a_stale_recovery_event() {
         let encoded = Arc::new(BoundedQueue::new(2));
         let events = Arc::new(BoundedQueue::new(8));
+        let has_keyframe = Arc::new(AtomicBool::new(false));
         let submitter = D3d11FrameSubmitter {
             encoded: Arc::clone(&encoded),
             events: Arc::clone(&events),
+            has_keyframe,
         };
         assert_eq!(
             submitter.submit_video(encoded_frame(0, false)),
@@ -2615,9 +2639,10 @@ mod tests {
         );
 
         assert_eq!(
-            submitter.submit_video(encoded_frame(2, false)),
+            submitter.submit_video(encoded_frame(2, true)),
             Ok(PushOutcome::DroppedOldest)
         );
+        assert!(encoded.try_pop().is_some_and(|frame| frame.key_frame));
         assert!(encoded.try_pop().is_none());
         assert_eq!(
             events.try_pop(),
