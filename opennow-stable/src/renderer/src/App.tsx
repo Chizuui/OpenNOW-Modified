@@ -3366,6 +3366,7 @@ export function App(): JSX.Element {
               recordingBitrateMbps={settings.recordingBitrateMbps}
               recordingResolution={settings.recordingResolution}
               recordingFps={settings.recordingFps}
+              streamFps={session?.negotiatedStreamProfile?.fps ?? settings.fps}
               recordingMixMic={settings.recordingMixMic}
               instantReplayEnabled={settings.instantReplayEnabled}
               instantReplaySeconds={settings.instantReplaySeconds}

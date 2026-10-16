@@ -9,6 +9,7 @@ import {
   fitThumbnailSize,
   getShortcutConflictError,
   resolveRecordCap,
+  resolveRecordingStreamFps,
   selectRecordingMimeType,
   selectRecordingStrategy,
 } from "./streamRuntimeHelpers";
@@ -159,6 +160,30 @@ test("recording strategy uses raw track only when stream fits cap AND AVC encode
   assert.deepEqual(
     await pick(() => false, STREAM_720P30, CAP_720P30),
     { strategy: "canvas-downscale", mimeType: "video/webm", hwAccelerated: false },
+  );
+});
+
+test("recording stream fps resolves from the negotiated rate first, track estimate second", () => {
+  // Field case: a 60 fps session whose remote track reported 103.7 fps
+  // (decode catch-up burst). The negotiated rate is the authoritative bound.
+  assert.equal(resolveRecordingStreamFps(60, 103.6998012713595), 60);
+  // The live estimate is only a fallback when the session exposes none.
+  assert.equal(resolveRecordingStreamFps(null, 60), 60);
+  assert.equal(resolveRecordingStreamFps(undefined, 30), 30);
+  // Degenerate values fall through to null (unknown ≠ known-exceeding).
+  assert.equal(resolveRecordingStreamFps(0, 0), null);
+  assert.equal(resolveRecordingStreamFps(Number.NaN, Number.POSITIVE_INFINITY), null);
+  assert.equal(resolveRecordingStreamFps(undefined, undefined), null);
+});
+
+test("field case: bogus 103.7 fps track estimate no longer forces the canvas path", async () => {
+  // Stream: 720p60, cap: 1080p60 → fits. With the raw track estimate the
+  // strategy gate saw >cap fps and picked the bounded canvas re-encode; with
+  // the negotiated fps it stays on the zero-draw-loop raw track.
+  const fps = resolveRecordingStreamFps(60, 103.6998012713595);
+  assert.deepEqual(
+    await pick(() => true, { width: 1280, height: 720, fps }, { width: 1920, height: 1080, fps: 60 }),
+    { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2", hwAccelerated: true },
   );
 });
 

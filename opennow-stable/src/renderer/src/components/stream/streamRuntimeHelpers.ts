@@ -69,6 +69,31 @@ export interface StreamInfo {
 }
 
 /**
+ * Resolve the frame rate the recording-strategy gate should use.
+ *
+ * The remote track's live `getSettings().frameRate` is an estimate that can
+ * spike above the negotiated stream rate during decode catch-up bursts (field
+ * report: 103.7 on a 60 fps stream) — a bogus "exceeds cap" verdict that
+ * forced the bounded canvas re-encode path even though the stream fit the
+ * user's recording cap, adding the live capture cost the recorder must never
+ * have. The negotiated profile fps is the authoritative upper bound for the
+ * frames the stream can deliver; the live estimate is only a fallback when
+ * the session doesn't expose one.
+ */
+export function resolveRecordingStreamFps(
+  negotiatedFps: number | null | undefined,
+  trackFps: number | null | undefined,
+): number | null {
+  if (typeof negotiatedFps === "number" && Number.isFinite(negotiatedFps) && negotiatedFps > 0) {
+    return negotiatedFps;
+  }
+  if (typeof trackFps === "number" && Number.isFinite(trackFps) && trackFps > 0) {
+    return trackFps;
+  }
+  return null;
+}
+
+/**
  * Resolve the user's recordingResolution/recordingFps settings into the cap
  * every recording path is bounded by. The canvas path draws into a canvas of
  * at most this size; the raw-track path is only taken when the stream already

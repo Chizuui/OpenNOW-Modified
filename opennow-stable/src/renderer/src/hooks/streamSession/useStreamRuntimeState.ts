@@ -68,6 +68,7 @@ export function useStreamRuntimeState() {
   const nativeInputProtocolVersionRef = useRef<number | null>(null);
   const stableRecoveryResetTimerRef = useRef<number | null>(null);
   const remoteIceGraceTimerRef = useRef<number | null>(null);
+  const offerWaitTimerRef = useRef<number | null>(null);
   const remoteIceSeenForSessionRef = useRef<string | null>(null);
   const remoteIceRecoveryGenerationRef = useRef<number | null>(null);
   const awaitingRecoveryRemoteIceRef = useRef(false);
@@ -133,6 +134,7 @@ export function useStreamRuntimeState() {
     nativeInputProtocolVersionRef,
     stableRecoveryResetTimerRef,
     remoteIceGraceTimerRef,
+    offerWaitTimerRef,
     remoteIceSeenForSessionRef,
     remoteIceRecoveryGenerationRef,
     awaitingRecoveryRemoteIceRef,

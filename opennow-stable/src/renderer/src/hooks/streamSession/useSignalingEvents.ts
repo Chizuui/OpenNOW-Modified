@@ -5,6 +5,7 @@ import { dispatchStreamShortcutAction } from "../../streamShortcutActions";
 import {
   ICE_DISCONNECTED_RECOVERY_GRACE_MS,
   RECOVERABLE_STREAM_STATUSES,
+  SIGNALING_OFFER_WAIT_GRACE_MS,
   SIGNALING_REMOTE_ICE_GRACE_MS,
   isExpectedNativeSessionClose,
   readStreamClipboardText,
@@ -90,6 +91,7 @@ export function useSignalingEvents({
     nativeInputBridgeReady,
     nativeInputProtocolVersionRef,
     nativeStreamingRef,
+    offerWaitTimerRef,
     pendingControlledDisconnectsRef,
     remoteIceGraceTimerRef,
     remoteIceRecoveryGenerationRef,
@@ -304,10 +306,58 @@ export function useSignalingEvents({
       scheduleStableRecoveryReset(activeSession.sessionId);
     };
 
+    const clearOfferWaitTimer = (): void => {
+      if (offerWaitTimerRef.current !== null) {
+        window.clearTimeout(offerWaitTimerRef.current);
+        offerWaitTimerRef.current = null;
+      }
+    };
+    // A signaling connection that never delivers the server's stream offer
+    // would sit on the loading surface forever ("stuck connecting"). Give the
+    // server a fixed window to start the stream, then fail the attach with a
+    // visible error instead of hanging.
+    const armOfferWaitTimer = (sessionId: string): void => {
+      clearOfferWaitTimer();
+      offerWaitTimerRef.current = window.setTimeout(() => {
+        offerWaitTimerRef.current = null;
+        if (appUnloadingRef.current) {
+          return;
+        }
+        if (sessionRef.current?.sessionId !== sessionId) {
+          return;
+        }
+        if (hasConfirmedRemoteIceRef.current || streamStatusRef.current === "streaming") {
+          return;
+        }
+        console.warn(
+          `[Recovery] No stream offer received within ${SIGNALING_OFFER_WAIT_GRACE_MS}ms of signaling connect; aborting attach`,
+        );
+        clientRef.current?.dispose();
+        clientRef.current = null;
+        setLaunchError({
+          stage: streamStatusToLoadingStage(streamStatusRef.current),
+          title: t("errors.sessionConnectionLostTitle"),
+          description: t("errors.resumeAttachFailedDescription"),
+        });
+        resetLaunchRuntime({ keepLaunchError: true, keepStreamingContext: true });
+        void refreshNavbarActiveSession();
+        launchInFlightRef.current = false;
+      }, SIGNALING_OFFER_WAIT_GRACE_MS);
+    };
+
     const unsubscribe = window.openNow.onSignalingEvent(async (event: MainToRendererSignalingEvent) => {
       console.log(`[App] Signaling event: ${event.type}`, event.type === "offer" ? `(SDP ${event.sdp.length} chars)` : "", event.type === "remote-ice" ? event.candidate : "");
       try {
-        if (event.type === "offer") {
+        if (event.type === "connected") {
+          // Arm the no-offer watchdog for this connect attempt (the offer
+          // clears it). Reconnects during an active stream are covered by the
+          // recovery machinery, not this timer.
+          const connectedSessionId = sessionRef.current?.sessionId;
+          if (connectedSessionId) {
+            armOfferWaitTimer(connectedSessionId);
+          }
+        } else if (event.type === "offer") {
+          clearOfferWaitTimer();
           pendingControlledDisconnectsRef.current = 0;
           const activeSession = sessionRef.current;
           if (!activeSession) {
@@ -373,6 +423,12 @@ export function useSignalingEvents({
               maxBitrateKbps: settings.maxBitrateMbps * 1000,
               jitterBufferMode: settings.jitterBufferMode,
               fallbackCodec: settings.fallbackCodec,
+              // Session-start value for `vqos.dynamicStreamingMode` in the NVST
+              // SDP. Omitting it silently forced the official default (3,
+              // fully dynamic) into every web session regardless of the user's
+              // Locked / Prefer-resolution choice — the field "resolution
+              // still drops by itself" report.
+              dynamicStreamingMode: settings.dynamicStreamingMode,
               nativeTransitionDiagnostics: settings.nativeTransitionDiagnostics,
             });
             setLaunchError(null);
@@ -536,6 +592,7 @@ export function useSignalingEvents({
           }
           await clientRef.current?.addRemoteCandidate(event.candidate);
         } else if (event.type === "disconnected") {
+          clearOfferWaitTimer();
           const iceState = latestIceConnectionStateRef.current;
           const decision = decideSignalingDisconnect({
             appUnloading: appUnloadingRef.current,
@@ -636,7 +693,10 @@ export function useSignalingEvents({
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      clearOfferWaitTimer();
+      unsubscribe();
+    };
   }, [attemptSessionRecovery, diagnosticsStore, handleExpectedNativeSessionClose, handleNativeCodecDowngrade, markDiscordStreamStarted, nativeInputBridgeReady, refreshNavbarActiveSession, resetLaunchRuntime, scheduleStableRecoveryReset, settings, streamMicLevel, streamVolume, t]);
 
   // Keep the WebRTC client's stats-polling cadence in sync with the stats HUD

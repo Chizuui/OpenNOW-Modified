@@ -6,6 +6,7 @@ import {
   computeRecordingFrameShortfall,
   fitThumbnailSize,
   resolveRecordCap,
+  resolveRecordingStreamFps,
   selectRecordingStrategy,
   type RecordingStrategy,
 } from "../components/stream/streamRuntimeHelpers";
@@ -112,6 +113,14 @@ interface UseStreamRecorderOptions {
   recordingResolution: string;
   recordingFps: number;
   /**
+   * The session's negotiated stream frame rate (e.g. 60/120), or `null` when
+   * unknown. Used for the recording-strategy gate instead of the remote
+   * track's live `getSettings().frameRate`, which can spike above the stream
+   * rate during decode catch-up bursts and wrongly bulk the recording into
+   * the bounded canvas re-encode path (see resolveRecordingStreamFps).
+   */
+  streamFps: number | null;
+  /**
    * Native streamer mode: the renderer's <video> element has no frames, so
    * recording happens in the native pipeline (H.264 fragmented MP4) and its
    * chunks are streamed to the main process instead of MediaRecorder.
@@ -162,6 +171,7 @@ export function useStreamRecorder({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  streamFps,
   nativeRecordingEnabled,
   mixMic,
   onMixMicUnavailable,
@@ -1023,7 +1033,7 @@ export function useStreamRecorder({
       {
         width: video.videoWidth,
         height: video.videoHeight,
-        fps: streamVideoTrack?.getSettings().frameRate ?? null,
+        fps: resolveRecordingStreamFps(streamFps, streamVideoTrack?.getSettings().frameRate),
       },
       recordCap,
       encodedCapture !== null,

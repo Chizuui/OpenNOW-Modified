@@ -92,6 +92,8 @@ interface StreamViewProps {
   recordingBitrateMbps: number | null;
   recordingResolution: string;
   recordingFps: number;
+  /** Negotiated stream frame rate (session profile), or null when unknown. */
+  streamFps: number | null;
   recordingMixMic: boolean;
   /** Instant Replay enabled — arms the capture DVR ring. */
   instantReplayEnabled: boolean;
@@ -164,6 +166,7 @@ export function StreamView({
   recordingBitrateMbps,
   recordingResolution,
   recordingFps,
+  streamFps,
   recordingMixMic,
   instantReplayEnabled,
   instantReplaySeconds,
@@ -403,6 +406,7 @@ export function StreamView({
     recordingBitrateMbps,
     recordingResolution,
     recordingFps,
+    streamFps,
     mixMic: recordingMixMic,
     instantReplayEnabled,
     instantReplaySeconds,

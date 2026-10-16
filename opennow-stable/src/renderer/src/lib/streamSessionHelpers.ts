@@ -14,7 +14,21 @@ export const SIGNALING_RECOVERY_ATTEMPT_DELAYS_MS = [0, 3000] as const;
 export const SIGNALING_RECOVERY_STABLE_RESET_DELAY_MS = 15000;
 export const SIGNALING_REMOTE_ICE_GRACE_MS = 5000;
 export const ICE_DISCONNECTED_RECOVERY_GRACE_MS = 30000;
+/**
+ * How long a connected signaling socket may sit without the server's stream
+ * offer before the attach is declared failed. Without this the UI stays on
+ * "connecting" forever (field report: an H.264 session whose server never
+ * sent the offer).
+ */
+export const SIGNALING_OFFER_WAIT_GRACE_MS = 20000;
 
+/**
+ * Clean, server-initiated session closes (BYE, peerRemoved, a 1000 close with
+ * no reason) end the session. Closing the transport with an abnormal code
+ * (e.g. `socket closed (code 1006)`) deliberately does NOT match here — the
+ * media path may still be alive, so the disconnect decision routes it through
+ * the active-ICE / recovery checks instead of ending the session outright.
+ */
 export function isExpectedNativeSessionClose(reason: string): boolean {
   const normalized = reason.trim().toLowerCase();
   return normalized === "bye" ||

@@ -175,7 +175,7 @@ export class GfnSignalingClient {
         this.handleMessage(text);
       });
 
-      ws.on("close", (_code, reason) => {
+      ws.on("close", (code, reason) => {
         this.clearHeartbeat();
 
         if (!isCurrentSocket()) {
@@ -185,7 +185,20 @@ export class GfnSignalingClient {
         this.ws = null;
 
         const reasonText = typeof reason === "string" ? reason : reason.toString("utf8");
-        this.emit({ type: "disconnected", reason: reasonText || "socket closed" });
+        // Log the close code so an exported log can attribute server-side
+        // kicks: 1006 = abnormal transport drop (no close frame), 1000 =
+        // clean close, 4xxx = server-defined codes. The renderer-visible
+        // reason keeps its historical shape — a bare "socket closed" (what
+        // the disconnect decisions match on) for a clean close; abnormal
+        // codes ride along so they don't get classified as an expected
+        // session close and can flow through the recovery path instead.
+        console.log(
+          `[Signaling] WebSocket closed (code=${code}${reasonText ? `, reason="${reasonText}"` : ""})`,
+        );
+        this.emit({
+          type: "disconnected",
+          reason: reasonText || (code === 1000 ? "socket closed" : `socket closed (code ${code})`),
+        });
       });
     });
   }
