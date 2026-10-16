@@ -51,7 +51,7 @@ import {
 export type EncodedWorkerOutboundMessage =
   | { type: "ready" }
   | { type: "chunk"; data: ArrayBuffer }
-  | { type: "done" }
+  | { type: "done"; durationMs?: number }
   | { type: "diag"; message: string }
   | { type: "error"; message: string };
 
@@ -93,6 +93,15 @@ interface EncodedCaptureStop {
   abort?: boolean;
 }
 
+/**
+ * Save the buffered DVR ring as a standalone clip (Instant Replay) without
+ * starting a live recording: mux the ring window, finalize, emit chunks +
+ * done. The worker stays armed afterwards.
+ */
+interface EncodedCaptureSave {
+  type: "save";
+}
+
 /** Raw mic PCM captured on the main thread (48 kHz, mono, transferable). */
 interface EncodedCaptureMicPcm {
   type: "mic-pcm";
@@ -116,7 +125,12 @@ interface RtcTransformer {
   writable: WritableStream<RTCEncodedVideoFrame | RTCEncodedAudioFrame>;
 }
 
-type WorkerInbound = EncodedCaptureInit | EncodedCaptureStart | EncodedCaptureStop | EncodedCaptureMicPcm;
+type WorkerInbound =
+  | EncodedCaptureInit
+  | EncodedCaptureStart
+  | EncodedCaptureSave
+  | EncodedCaptureStop
+  | EncodedCaptureMicPcm;
 
 // Minimal worker-global typing: the DOM lib's `self` (Window) is a lie inside
 // a dedicated worker, and pulling lib.webworker into this DOM project would
@@ -215,6 +229,9 @@ let recordingPendingMuxer = false;
 let audioShiftUs = 0;
 // lastVideoTsUs at `start`: the DVR slice window (`nowUs` for sliceHead).
 let recordingStartUs = 0;
+// Head timestamp of the last DVR slice (start of the pre-roll the muxer
+// received): the Instant Replay snapshot derives its clip duration from it.
+let lastDvrHeadUs: number | null = null;
 // The codec configuration record (avcC/hvcC/av1C) + codec string, built once
 // from the first keyframe and reused for every recording in this session.
 let codecDescription: Uint8Array | null = null;
@@ -430,7 +447,7 @@ function setup(init: EncodedCaptureInit): void {
  * record exists, and from `captureVideo` when the first keyframe arrives for
  * a recording that started before any keyframe.
  */
-function beginMuxer(): void {
+function beginMuxer(forceRingAudio = false): void {
   const init = config;
   if (!init || handle || !videoConfigReady || !codecDescription) return;
   writer = new PositionalWriter(postChunk);
@@ -498,6 +515,7 @@ function beginMuxer(): void {
   // with their raw bytes; convert here (Annex-B → length-prefixed) exactly
   // once, then mux. The head is keyframe-aligned by construction.
   const head = dvrVideoRing?.sliceHead(recordingStartUs) ?? null;
+  lastDvrHeadUs = head?.headUs ?? null;
   if (head) {
     for (const frame of head.frames) {
       // Ring frames carry no metadata — the decoderConfig for the first video
@@ -505,7 +523,10 @@ function beginMuxer(): void {
       handle.video(convertSample(frame.data), frame.type, frame.tsUs);
     }
   }
-  if (init.hasAudio && !micMixActive) {
+  // `forceRingAudio` (Instant Replay snapshot) keeps the buffered game audio
+  // even when the live recording mixes the mic — a snapshot has no live mic
+  // chain to pull from.
+  if (init.hasAudio && (!micMixActive || forceRingAudio)) {
     // Trim the audio pre-roll to the video head so both tracks start at the
     // same wall-clock moment, then shift forward by the pre-roll duration so
     // the audio lands after the pre-roll video (the muxer's
@@ -520,8 +541,8 @@ function beginMuxer(): void {
 }
 
 /** Start a recording from the armed state (DVR slice + live mux). */
-function startRecording(): void {
-  if (!config || recordingActive || finalized) return;
+function startRecording(forceRingAudio = false): boolean {
+  if (!config || recordingActive || finalized) return false;
   recordingActive = true;
   recordingPendingMuxer = !videoConfigReady;
   recordingStartUs = lastVideoTsUs ?? 0;
@@ -535,7 +556,7 @@ function startRecording(): void {
   av1CPatched = false;
   audioConfigReady = false;
   if (videoConfigReady) {
-    beginMuxer();
+    beginMuxer(forceRingAudio);
     postDiag(
       `encoded recording: start (DVR pre-roll ${Math.round(audioShiftUs / 1000)}ms, ring=${dvrVideoRing?.length ?? 0} video frames)`,
     );
@@ -544,6 +565,7 @@ function startRecording(): void {
       "encoded recording: start before any keyframe — capturing from the next keyframe",
     );
   }
+  return true;
 }
 
 function captureVideo(frame: RTCEncodedVideoFrame): void {
@@ -803,13 +825,7 @@ async function finalize(): Promise<void> {
     writer?.flushAll();
     // Re-arm for the next recording: clear per-recording state (the codec
     // record and rings survive).
-    handle = null;
-    writer = null;
-    recordingActive = false;
-    recordingPendingMuxer = false;
-    audioConfigReady = false;
-    av1CPatched = false;
-    audioShiftUs = 0;
+    resetRecordingState();
     finalized = false;
     post({ type: "done" });
   } catch (error) {
@@ -817,8 +833,11 @@ async function finalize(): Promise<void> {
   }
 }
 
-/** Abort the current recording without finalizing: drop state, stay armed. */
-function abortRecording(): void {
+/**
+ * Clear the per-recording mux state (the codec record and DVR rings survive)
+ * so the worker is armed again for the next recording or snapshot.
+ */
+function resetRecordingState(): void {
   handle = null;
   writer = null;
   recordingActive = false;
@@ -826,7 +845,60 @@ function abortRecording(): void {
   audioConfigReady = false;
   av1CPatched = false;
   audioShiftUs = 0;
+}
+
+/** Abort the current recording without finalizing: drop state, stay armed. */
+function abortRecording(): void {
+  resetRecordingState();
   // Keep the rings (pre-roll continues uninterrupted for the next recording).
+}
+
+/**
+ * Instant Replay save (official client's Ctrl+0): mux the buffered DVR ring
+ * as a standalone clip and finalize it immediately. Reuses the manual
+ * recording's pre-roll path — same keyframe-aligned head, same audio slice,
+ * same zero re-encode bitstream remux — but never feeds live frames, so the
+ * saved file is exactly the ring window at the moment of the save. Runs
+ * synchronously (transform frames cannot interleave) and leaves the worker
+ * armed so the ring refills for the next save or recording.
+ */
+function saveSnapshot(): void {
+  if (!config || recordingActive || finalized) {
+    postError("Instant Replay is busy — another capture is in progress.");
+    return;
+  }
+  if (!videoConfigReady || !codecDescription) {
+    postError("Instant Replay is not ready yet — waiting for the first keyframe.");
+    return;
+  }
+  if (!dvrVideoRing || dvrVideoRing.length === 0) {
+    postError("Instant Replay buffer is still filling — try again in a few seconds.");
+    return;
+  }
+  const endedUs = lastVideoTsUs ?? 0;
+  try {
+    // Ring audio is always carried: the snapshot has no live mic mix to pull
+    // from, and the buffered game track keeps the clip's audio intact.
+    if (!startRecording(true) || !handle) {
+      resetRecordingState();
+      postError("Instant Replay could not be saved.");
+      return;
+    }
+    handle.finalize();
+    writer?.flushAll();
+    const frameUs = Math.round(1e6 / Math.max(1, config.fps));
+    const headUs = lastDvrHeadUs ?? endedUs;
+    const durationMs = Math.max(0, Math.round((endedUs + frameUs - headUs) / 1000));
+    postDiag(
+      `instant replay: snapshot saved (${durationMs}ms window, ring head ${Math.round((endedUs - headUs) / 1000)}ms before the save, zero re-encode)`,
+    );
+    resetRecordingState();
+    // durationMs lets the renderer label the clip without re-measuring the file.
+    post({ type: "done", durationMs });
+  } catch (error) {
+    resetRecordingState();
+    postError(`Instant Replay save failed: ${String(error)}`);
+  }
 }
 
 // The RTCRtpScriptTransform constructor fires this event at the worker for
@@ -864,6 +936,8 @@ self.onmessage = (event: MessageEvent<WorkerInbound>): void => {
     setup(data);
   } else if (data.type === "start") {
     startRecording();
+  } else if (data.type === "save") {
+    saveSnapshot();
   } else if (data.type === "mic-pcm") {
     // Raw mic PCM (48 kHz mono) + the real-clock capture time. The sync
     // measures the mic's actual rate from the tags; the FIFO holds the

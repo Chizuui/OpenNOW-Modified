@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Dispatch, RefObject, SetStateAction } from "react";
+import { SHORTCUT_BUILTIN_ALIASES } from "@shared/gfn";
 import { isShortcutMatch, normalizeShortcut } from "../shortcuts";
 import { addStreamShortcutActionListener } from "../streamShortcutActions";
 import { controllerButton, readControllerGamepadButtons } from "../utils/controllerGamepad";
@@ -13,6 +14,8 @@ interface UseStreamMenuNavigationOptions {
   shortcuts: {
     screenshot: string;
     recording: string;
+    instantReplaySave: string;
+    instantReplayToggle: string;
   };
   isMacClient: boolean;
   exitPromptOpen: boolean;
@@ -20,6 +23,10 @@ interface UseStreamMenuNavigationOptions {
   setSelectedScreenshotId: Dispatch<SetStateAction<string | null>>;
   captureScreenshot: () => Promise<void>;
   toggleRecording: () => Promise<void>;
+  /** Save the Instant Replay ring (official Ctrl+0 by default). */
+  saveInstantReplay: () => void;
+  /** Toggle Instant Replay on/off (official Ctrl+Shift+0 by default). */
+  toggleInstantReplay: () => void;
   onCancelExit: () => void;
   onConfirmExit: () => void;
   onBeforeOpen: () => void;
@@ -55,6 +62,8 @@ export function useStreamMenuNavigation({
   setSelectedScreenshotId,
   captureScreenshot,
   toggleRecording,
+  saveInstantReplay,
+  toggleInstantReplay,
   onCancelExit,
   onConfirmExit,
   onBeforeOpen,
@@ -260,13 +269,31 @@ export function useStreamMenuNavigation({
       }
       if (action === "toggleRecording") {
         void toggleRecording();
+        return;
+      }
+      if (action === "instantReplaySave") {
+        saveInstantReplay();
+        return;
+      }
+      if (action === "instantReplayToggle") {
+        toggleInstantReplay();
       }
     });
-  }, [captureScreenshot, handleToggleSideBar, toggleRecording]);
+  }, [captureScreenshot, handleToggleSideBar, saveInstantReplay, toggleInstantReplay, toggleRecording]);
 
   useEffect(() => {
-    const screenshotShortcut = normalizeShortcut(shortcuts.screenshot);
-    const recordingShortcut = normalizeShortcut(shortcuts.recording);
+    // The configured binding plus the official client's keys as built-in
+    // aliases (Ctrl+1 screenshot, Ctrl+9 record) — see SHORTCUT_BUILTIN_ALIASES.
+    const screenshotShortcuts = [
+      shortcuts.screenshot,
+      ...(SHORTCUT_BUILTIN_ALIASES.shortcutScreenshot ?? []),
+    ].map(normalizeShortcut);
+    const recordingShortcuts = [
+      shortcuts.recording,
+      ...(SHORTCUT_BUILTIN_ALIASES.shortcutToggleRecording ?? []),
+    ].map(normalizeShortcut);
+    const instantReplaySaveShortcuts = [shortcuts.instantReplaySave].map(normalizeShortcut);
+    const instantReplayToggleShortcuts = [shortcuts.instantReplayToggle].map(normalizeShortcut);
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (isTypingTarget(event.target)) {
@@ -281,17 +308,31 @@ export function useStreamMenuNavigation({
         return;
       }
 
-      if (isShortcutMatch(event, screenshotShortcut)) {
+      if (screenshotShortcuts.some((shortcut) => isShortcutMatch(event, shortcut))) {
         event.preventDefault();
         event.stopPropagation();
         void captureScreenshot();
         return;
       }
 
-      if (isShortcutMatch(event, recordingShortcut)) {
+      if (recordingShortcuts.some((shortcut) => isShortcutMatch(event, shortcut))) {
         event.preventDefault();
         event.stopPropagation();
         void toggleRecording();
+        return;
+      }
+
+      if (instantReplaySaveShortcuts.some((shortcut) => isShortcutMatch(event, shortcut))) {
+        event.preventDefault();
+        event.stopPropagation();
+        saveInstantReplay();
+        return;
+      }
+
+      if (instantReplayToggleShortcuts.some((shortcut) => isShortcutMatch(event, shortcut))) {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleInstantReplay();
       }
     };
 
@@ -300,8 +341,12 @@ export function useStreamMenuNavigation({
   }, [
     captureScreenshot,
     isMacClient,
+    saveInstantReplay,
+    shortcuts.instantReplaySave,
+    shortcuts.instantReplayToggle,
     shortcuts.recording,
     shortcuts.screenshot,
+    toggleInstantReplay,
     toggleRecording,
   ]);
 

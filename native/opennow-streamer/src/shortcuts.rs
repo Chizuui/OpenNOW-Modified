@@ -118,6 +118,16 @@ impl NativeShortcutMatcher {
             NativeStreamerShortcutAction::CyclePacing,
             &bindings.cycle_pacing,
         );
+        append_binding(
+            &mut parsed,
+            NativeStreamerShortcutAction::InstantReplaySave,
+            &bindings.instant_replay_save,
+        );
+        append_binding(
+            &mut parsed,
+            NativeStreamerShortcutAction::InstantReplayToggle,
+            &bindings.instant_replay_toggle,
+        );
         Self { bindings: parsed }
     }
 
@@ -297,6 +307,8 @@ mod tests {
             screenshot: "F11".to_owned(),
             toggle_recording: "F12".to_owned(),
             cycle_pacing: "Ctrl+Shift+P".to_owned(),
+            instant_replay_save: "Ctrl+0".to_owned(),
+            instant_replay_toggle: "Ctrl+Shift+0".to_owned(),
         }
     }
 
@@ -333,6 +345,27 @@ mod tests {
             matcher.match_keydown(u16::from(b'P'), 0, MODIFIER_CTRL),
             None
         );
+    }
+
+    #[test]
+    fn matches_instant_replay_digit_shortcuts() {
+        let matcher = NativeShortcutMatcher::from_bindings(&bindings());
+
+        // Ctrl+0 saves an Instant Replay clip; Ctrl+Shift+0 toggles it. The
+        // modifiers are strict, so the two digit shortcuts never collide.
+        assert_eq!(
+            matcher.match_keydown(u16::from(b'0'), 0, MODIFIER_CTRL),
+            Some(NativeStreamerShortcutAction::InstantReplaySave)
+        );
+        assert_eq!(
+            matcher.match_keydown(u16::from(b'0'), 0, MODIFIER_CTRL | MODIFIER_SHIFT),
+            Some(NativeStreamerShortcutAction::InstantReplayToggle)
+        );
+        assert_eq!(
+            matcher.match_keydown(u16::from(b'0'), 0, MODIFIER_SHIFT),
+            None
+        );
+        assert_eq!(matcher.match_keydown(u16::from(b'0'), 0, 0), None);
     }
 
     #[test]

@@ -117,14 +117,20 @@ export interface Settings {
   /** Opt-in stacked sink-native RawInput capture (mouse + keyboard bypass the Electron bridge). */
   nativeSinkInputCapture: boolean;
   /**
-   * GFN DVR pre-roll duration (seconds) shared by BOTH recorders: the native
-   * Capture/PassThrough ring and the web encoded-transform ring keep this
-   * much keyframe-aligned video before record start, so a clip can start up
-   * to N seconds before the record button was pressed. 0 disables the ring
-   * (web recordings then start at record; native falls back to its own
-   * default). Applied at session start (new sessions).
+   * Instant Replay (official capture model): while enabled, both recorders
+   * keep a keyframe-aligned ring of the last `instantReplaySeconds` seconds
+   * of encoded video — a manual recording can start up to N seconds early
+   * (DVR pre-roll) and the Instant Replay shortcut saves the recent window
+   * as a clip. Disabling it disarms the web ring entirely and gates the
+   * Instant Replay hotkeys (official client default: OFF).
    */
-  recordingDvrSeconds: number;
+  instantReplayEnabled: boolean;
+  /**
+   * Instant Replay buffer length (seconds), shared by the web
+   * encoded-transform ring and the native Capture/PassThrough ring: 5..300.
+   * Official client default: 120. Applied at session start (new sessions).
+   */
+  instantReplaySeconds: number;
   mouseSensitivity: number;
   mouseAcceleration: number;
   shortcutToggleStats: string;
@@ -135,6 +141,10 @@ export interface Settings {
   shortcutToggleMicrophone: string;
   shortcutScreenshot: string;
   shortcutToggleRecording: string;
+  /** Save the Instant Replay buffer as a clip (official client: Ctrl+0). */
+  shortcutInstantReplaySave: string;
+  /** Toggle Instant Replay on/off (official client: Ctrl+Shift+0). */
+  shortcutInstantReplayToggle: string;
   /** Cycle the native present-limiter pacing mode (auto → stream → vrr → off) while streaming. */
   shortcutCyclePacing: string;
   microphoneMode: MicrophoneMode;
@@ -213,6 +223,8 @@ export const SHORTCUT_SETTING_KEYS = [
   "shortcutToggleMicrophone",
   "shortcutScreenshot",
   "shortcutToggleRecording",
+  "shortcutInstantReplaySave",
+  "shortcutInstantReplayToggle",
   "shortcutCyclePacing",
 ] as const satisfies readonly (keyof Settings)[];
 
@@ -228,8 +240,23 @@ export const DEFAULT_SHORTCUT_SETTINGS: Readonly<ShortcutSettings> = Object.free
   shortcutToggleMicrophone: "Ctrl+Shift+M",
   shortcutScreenshot: "F11",
   shortcutToggleRecording: "F12",
+  shortcutInstantReplaySave: "Ctrl+0",
+  shortcutInstantReplayToggle: "Ctrl+Shift+0",
   shortcutCyclePacing: "Ctrl+Shift+P",
 });
+
+/**
+ * Official GeForce NOW client keys accepted as built-in ALIASES next to the
+ * user's configured binding (Ctrl+1 screenshot, Ctrl+9 record). The stream
+ * key handler accepts either binding; the stored setting stays the single
+ * source of truth, so old F11/F12 habits keep working. Instant Replay keys
+ * are not aliases — they ship as real settings above.
+ */
+export const SHORTCUT_BUILTIN_ALIASES: Partial<Record<ShortcutSettingKey, readonly string[]>> =
+  Object.freeze({
+    shortcutScreenshot: ["Ctrl+1"],
+    shortcutToggleRecording: ["Ctrl+9"],
+  });
 
 export interface PlatformShortcutDefaults {
   bindings: ShortcutSettings;
@@ -298,7 +325,8 @@ export function createDefaultSettings(platform: string): Settings {
     nativeD3dFullscreenMode: "auto",
     nativeExternalRenderer: false,
     nativeStackedRenderer: false,
-    recordingDvrSeconds: 30,
+    instantReplayEnabled: false,
+    instantReplaySeconds: 120,
     transportMode: "webrtc",
     showNativeStreamerStats: false,
     codec: DEFAULT_STREAM_PREFERENCES.codec,

@@ -1022,6 +1022,65 @@ impl DvrEsRing {
         inner.total_bytes = 0;
     }
 
+    /// Instant Replay snapshot: write the current pre-roll window into
+    /// `es_path` (the same layout `pin` writes — the buffered AUs at or after
+    /// `from_pts`, with `None` = all) and reset the ring in ONE locked step:
+    /// the ES file is the clip, and the ring immediately starts refilling a
+    /// fresh pre-roll window (exactly the web recorder's `sliceHead`
+    /// semantics). Returns the window span in ns (first → last written AU
+    /// PTS; 0 when fewer than two AUs were written) so the caller can label
+    /// the clip. Refuses while pinned (a recording owns the ES file) and
+    /// while the ring is still empty (the caller surfaces "still filling").
+    pub(crate) fn snapshot_and_reset(
+        &self,
+        es_path: &std::path::Path,
+        from_pts: Option<u64>,
+    ) -> Result<u64, String> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err("DVR ring lock poisoned at snapshot.".to_owned());
+        };
+        if inner.pinned || inner.es_file.is_some() {
+            return Err("a recording is in flight".to_owned());
+        }
+        if inner.entries.is_empty() {
+            return Err("the buffer is still filling".to_owned());
+        }
+        let mut file = std::fs::File::create(es_path).map_err(|error| {
+            format!(
+                "Failed to create DVR snapshot file {}: {error}",
+                es_path.display()
+            )
+        })?;
+        use std::io::Write;
+        let mut first_pts: Option<u64> = None;
+        let mut last_pts: Option<u64> = None;
+        for au in inner
+            .entries
+            .iter()
+            .filter(|au| from_pts.map(|from| au.pts_ns >= from).unwrap_or(true))
+        {
+            if first_pts.is_none() {
+                first_pts = Some(au.pts_ns);
+            }
+            last_pts = Some(au.pts_ns);
+            if let Err(error) = file.write_all(&au.data) {
+                drop(file);
+                let _ = std::fs::remove_file(es_path);
+                return Err(format!(
+                    "Failed to write DVR snapshot file {}: {error}",
+                    es_path.display()
+                ));
+            }
+        }
+        drop(file); // flush + close before the offline remux reads it
+        inner.entries.clear();
+        inner.total_bytes = 0;
+        Ok(last_pts
+            .zip(first_pts)
+            .map(|(last, first)| last.saturating_sub(first))
+            .unwrap_or(0))
+    }
+
     /// Whether a recording is currently pinned (ES file open). Test-only —
     /// production code checks the rings' pinned state via the ES-file slice
     /// lifecycle (pin at start, unpin at stop).
@@ -2151,6 +2210,85 @@ impl GstreamerRecordingState {
         );
         // DVR branch is never spent — it stays armed for the next recording.
         self.finish_pass_through_remux(video_es, audio_es, false)
+    }
+
+    /// Instant Replay save (GFN's Ctrl+0): snapshot the armed DVR pre-roll
+    /// window into throwaway ES files and run the SAME offline remux the
+    /// Capture/PassThrough stop uses — the clip is the buffered bitstream,
+    /// remuxed with zero re-encode (H.264 Capture) or the offline H.264
+    /// transcode (H.265/AV1 Capture). The live branch is never touched: no
+    /// valve opens, no encoder runs, and the rings keep rolling a fresh
+    /// window afterwards. Fails while a recording is pinned (its ES files
+    /// own the rings) and while the buffer is still filling.
+    fn save_dvr_snapshot(&self) -> Result<(), String> {
+        let dvr = self.mode == RecordingMode::Capture || self.mode == RecordingMode::PassThrough;
+        if !dvr {
+            return Err(
+                "Instant Replay is only available for capture/pass-through recordings.".to_owned(),
+            );
+        }
+        if self.active.load(Ordering::SeqCst) {
+            return Err("Instant Replay cannot save while a recording is in progress.".to_owned());
+        }
+        let Some(video_ring) = &self.dvr_video else {
+            return Err("Instant Replay buffer is not armed for this session.".to_owned());
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let video_es = std::env::temp_dir().join(format!(
+            "opennow-ir-{}-{stamp}-video.es",
+            std::process::id()
+        ));
+        let audio_es = std::env::temp_dir().join(format!(
+            "opennow-ir-{}-{stamp}-audio.es",
+            std::process::id()
+        ));
+        // Video first: its head PTS is the clip's wall-clock start; the audio
+        // head is cut to the same point (the pin-time alignment rule).
+        let video_front_pts = video_ring.front_pts();
+        let video_span_ns = video_ring
+            .snapshot_and_reset(&video_es, None)
+            .map_err(|error| format!("Instant Replay snapshot failed: {error}"))?;
+        let mut audio_es = Some(audio_es);
+        if let (Some(ring), Some(path)) = (&self.dvr_audio, &audio_es) {
+            if let Err(error) = ring.snapshot_and_reset(path, video_front_pts) {
+                // A silent/empty game-audio ring must not fail the clip.
+                send_log(
+                    &self.event_sender,
+                    "warn",
+                    format!("Instant Replay audio snapshot skipped: {error}"),
+                );
+                audio_es = None;
+            }
+        }
+        // One tail frame on top of the span: the last AU's PTS is its start,
+        // and the clip should cover its duration too.
+        let duration_ns = video_span_ns.saturating_add(self.measured_frame_duration_ns());
+        send_log(
+            &self.event_sender,
+            "info",
+            format!(
+                "Instant Replay save: {:.1}s of pre-roll buffered; remuxing the clip offline (the stream keeps running).",
+                duration_ns as f64 / 1_000_000_000.0
+            ),
+        );
+        // Same offline remux + delivery tail as the DVR stop; NOT spent —
+        // the DVR branch stays armed and the rings refill for the next save.
+        self.finish_pass_through_remux(Some(video_es), audio_es, false)?;
+        // The remux tail emits `recording-ready` strictly before this event
+        // (same FIFO channel), so the file is installed before the renderer
+        // finishes the recording — and the duration labels the retrospective
+        // clip, which has no live timer on the renderer side.
+        if let Some(event_sender) = &self.event_sender {
+            let _ = event_sender.send(Event::RecordingFinished {
+                thumbnail_base64: None,
+                dropped_frames: 0,
+                duration_ms: Some(duration_ns / 1_000_000),
+            });
+        }
+        Ok(())
     }
 
     /// Shared OFFLINE remux + delivery tail for the pass-through family
@@ -3979,10 +4117,32 @@ impl GstreamerPipeline {
                 let _ = event_sender.send(Event::RecordingFinished {
                     thumbnail_base64: None,
                     dropped_frames: state.dropped_frames.load(Ordering::SeqCst),
+                    duration_ms: None,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Instant Replay save (GFN's Ctrl+0): snapshot the armed DVR pre-roll
+    /// window into a standalone clip via the same offline remux the recording
+    /// stop uses. Never opens the recording valve, so the live stream path is
+    /// untouched; the rings keep rolling a fresh window afterwards.
+    pub(crate) fn save_dvr_snapshot(&self) -> Result<(), String> {
+        let state = self.recording.lock().ok().and_then(|slot| slot.clone());
+        let Some(state) = state else {
+            return Err(
+                "Instant Replay is not available: the native RTP record tap is not built (no WebRTC video session)."
+                    .to_owned(),
+            );
+        };
+        // Same bitrate hand-off the stop does: the offline Capture remux
+        // re-encodes H.265/AV1 clips at the session's negotiated max bitrate.
+        state.record_bitrate_kbps.store(
+            self.record_bitrate_kbps.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        state.save_dvr_snapshot()
     }
 
     /// Locate the offer's mic m-line transceiver and force it sendonly with
@@ -11719,5 +11879,87 @@ mod dvr_ring_tests {
         let bytes = read_file(&es_path);
         assert!(bytes.is_empty(), "empty ring → empty ES file (guard reports it)");
         let _ = std::fs::remove_file(&es_path);
+    }
+
+    /// Instant Replay snapshot: the whole buffered window lands in the ES
+    /// file, the ring resets for a FRESH pre-roll (later pushes never touch
+    /// the snapshot file), and the returned span is the first → last AU PTS.
+    #[test]
+    fn snapshot_writes_window_and_resets_for_fresh_pre_roll() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.ir.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+
+        let ring = DvrEsRing::new(1_000_000);
+        // Pre-roll window: K P P K (pts 0..4).
+        for i in 0..4u64 {
+            ring.push(i * 1_000, i % 3 == 0, vec![i as u8; 40]);
+        }
+        let span = ring.snapshot_and_reset(&es_path, None).expect("snapshot");
+        assert_eq!(span, 3_000, "span = last - first AU PTS");
+        assert_eq!(ring.len(), 0, "snapshot resets the ring (fresh window)");
+        assert_eq!(ring.total_bytes(), 0);
+        assert!(!ring.is_pinned(), "snapshot must not leave the ring pinned");
+
+        // A later push refills the ring only — the snapshot file is final.
+        ring.push(99_000, true, vec![0xFF; 40]);
+        assert_eq!(ring.len(), 1);
+        let bytes = read_file(&es_path);
+        assert_eq!(bytes.len(), 4 * 40, "snapshot holds exactly the window");
+        assert_eq!(&bytes[0..40], &[0u8; 40], "window starts with AU 0");
+        assert_eq!(&bytes[40 * 3..40 * 4], &[3u8; 40], "window ends with AU 3");
+        let _ = std::fs::remove_file(&es_path);
+    }
+
+    /// The audio snapshot head is cut to the video snapshot's start PTS (the
+    /// same alignment rule `pin(from_pts)` uses at record start).
+    #[test]
+    fn snapshot_from_pts_cuts_the_audio_head_to_the_video_start() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.ir.aac.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+
+        let ring = DvrEsRing::with_keyframe_snap(1_000_000, false);
+        for i in 0..10u64 {
+            ring.push(i * 20_000, false, vec![0xCC; 16]);
+        }
+        let span = ring
+            .snapshot_and_reset(&es_path, Some(3 * 20_000))
+            .expect("audio snapshot");
+        assert_eq!(span, 6 * 20_000, "span = AUs 3..=9");
+        let bytes = read_file(&es_path);
+        assert_eq!(bytes.len(), 7 * 16, "audio head = AUs 3..=9 (7 AUs)");
+        assert_eq!(ring.len(), 0, "audio ring resets too");
+        let _ = std::fs::remove_file(&es_path);
+    }
+
+    /// Snapshot refuses an empty ring ("still filling" — the renderer maps
+    /// this to the not-ready notice) and a pinned ring ("in flight" — the
+    /// ES file belongs to the active recording).
+    #[test]
+    fn snapshot_refuses_empty_and_pinned_rings() {
+        let dir = std::env::temp_dir();
+        let es_path = dir.join(format!("opennow-dvr-test-{}.ir-guard.es", std::process::id()));
+        let _ = std::fs::remove_file(&es_path);
+
+        let ring = DvrEsRing::new(1_000_000);
+        let error = ring.snapshot_and_reset(&es_path, None).unwrap_err();
+        assert!(
+            error.contains("still filling"),
+            "empty ring reports still filling, got: {error}"
+        );
+
+        ring.push(0, true, vec![0xAA; 40]);
+        let pin_path = dir.join(format!("opennow-dvr-test-{}.ir-guard.pin.es", std::process::id()));
+        let _ = std::fs::remove_file(&pin_path);
+        ring.pin(&pin_path, None).expect("pin");
+        let error = ring.snapshot_and_reset(&es_path, None).unwrap_err();
+        assert!(
+            error.contains("in flight"),
+            "pinned ring reports in flight, got: {error}"
+        );
+        ring.unpin();
+        let _ = std::fs::remove_file(&es_path);
+        let _ = std::fs::remove_file(&pin_path);
     }
 }

@@ -83,6 +83,12 @@ enum RecordingCommand {
         finalize: bool,
         event_sender: Option<Sender<Event>>,
     },
+    /// Instant Replay (DVR snapshot) save: remux the armed pre-roll window
+    /// into a standalone clip without touching the live recording state.
+    SaveSnapshot {
+        pipeline: Arc<GstreamerPipeline>,
+        event_sender: Option<Sender<Event>>,
+    },
     Shutdown,
 }
 
@@ -116,6 +122,19 @@ impl RecordingWorkerHandle {
                                 if let Some(sender) = &event_sender {
                                     let _ = sender.send(Event::Error {
                                         code: "recording-stop-failed".to_owned(),
+                                        message,
+                                    });
+                                }
+                            }
+                        }
+                        RecordingCommand::SaveSnapshot {
+                            pipeline,
+                            event_sender,
+                        } => {
+                            if let Err(message) = pipeline.save_dvr_snapshot() {
+                                if let Some(sender) = &event_sender {
+                                    let _ = sender.send(Event::Error {
+                                        code: "instant-replay-save-failed".to_owned(),
                                         message,
                                     });
                                 }
@@ -968,6 +987,39 @@ impl NativeStreamerBackend for GstreamerBackend {
         // `recording-chunk` (both flow through the same FIFO event channel,
         // and the worker sends it only after the muxer EOS). The command loop
         // stays responsive — input never blocks behind a slow recording stop.
+        BackendReply::response(Response::Ok { id })
+    }
+
+    /// Instant Replay (GFN's Ctrl+0): snapshot the armed DVR pre-roll window
+    /// into a standalone clip. Fire-and-forget on the recording worker (the
+    /// snapshot + offline remux can take seconds for a long window); the
+    /// `recording-ready`/`recording-finished` event pair resolves the wait,
+    /// and a failure surfaces as an `instant-replay-save-failed` error event.
+    fn save_instant_replay(&mut self, command: CommandEnvelope) -> BackendReply {
+        let id = command.id;
+        let Some(pipeline) = self.pipeline.clone() else {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "gstreamer-not-started".to_owned(),
+                message: "GStreamer pipeline is not started.".to_owned(),
+            });
+        };
+        let event_sender = self.event_sender.clone();
+        if self
+            .recording_worker
+            .tx
+            .send(RecordingCommand::SaveSnapshot {
+                pipeline,
+                event_sender,
+            })
+            .is_err()
+        {
+            return BackendReply::response(Response::Error {
+                id: Some(id),
+                code: "recording-worker-unavailable".to_owned(),
+                message: "Recording worker is not available.".to_owned(),
+            });
+        }
         BackendReply::response(Response::Ok { id })
     }
 

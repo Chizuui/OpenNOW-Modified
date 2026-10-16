@@ -28,6 +28,13 @@ import { getActiveWebRtcPeerConnection } from "../platforms/gfn/webrtcClient";
 // for MediaRecorder, regardless of which API shape the runtime ships.
 type GeneratorTrackResolver = (generator: MediaStreamTrackGenerator) => MediaStreamTrack | null;
 
+/**
+ * Outcome of an Instant Replay save, mapped by the caller to a user-facing
+ * notice. "disabled" = IR is off, "busy" = a recording/save is in flight,
+ * "unavailable" = no armed ring (or still filling), "failed" = save error.
+ */
+export type InstantReplaySaveResult = "saved" | "disabled" | "busy" | "unavailable" | "failed";
+
 // Module-level cache: the generator API cannot appear or disappear within a
 // session, so probe once and reuse. `undefined` = not probed yet, `null` =
 // unusable (recording goes straight to the captureStream fallback).
@@ -117,12 +124,15 @@ interface UseStreamRecorderOptions {
    */
   onMixMicUnavailable?: () => void;
   /**
-   * GFN-style DVR pre-roll (seconds) for web (encoded-transform) recordings:
-   * the worker is armed from session start and keeps a keyframe-aligned ring
-   * of the last N seconds, prepended to every recording. 0 disables the ring
-   * (capture starts at record, like the legacy recorder).
+   * Instant Replay (official capture model): while enabled, the encoded
+   * worker is armed from session start and keeps a keyframe-aligned ring of
+   * the last `instantReplaySeconds` seconds, prepended to every recording
+   * and saved by the Instant Replay hotkey. Disabled disarms the ring
+   * entirely (capture starts at record, like the legacy recorder).
    */
-  recordingDvrSeconds: number;
+  instantReplayEnabled: boolean;
+  /** Instant Replay buffer length (seconds) — 5..300 from the shared setting. */
+  instantReplaySeconds: number;
   /**
    * True while a stream session is live. The DVR worker arms on the session
    * start (once per peer connection) so the ring fills before the first
@@ -148,10 +158,15 @@ export function useStreamRecorder({
   nativeRecordingEnabled,
   mixMic,
   onMixMicUnavailable,
-  recordingDvrSeconds,
+  instantReplayEnabled,
+  instantReplaySeconds,
   streamActive,
   streamVideoReady,
 }: UseStreamRecorderOptions) {
+  // Effective DVR ring length for the encoded worker: the Instant Replay
+  // setting gates the ring (off = capture starts at record, like the legacy
+  // recorder).
+  const dvrSeconds = instantReplayEnabled ? instantReplaySeconds : 0;
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [recordings, setRecordings] = useState<RecordingEntry[]>([]);
@@ -163,6 +178,10 @@ export function useStreamRecorder({
   const [recordingDropNotice, setRecordingDropNotice] = useState<string | null>(null);
   const [usedMimeType, setUsedMimeType] = useState<string | null>(null);
   const [usedStrategy, setUsedStrategy] = useState<RecordingStrategy | null>(null);
+  // True while an Instant Replay save is muxing/receiving chunks: guards the
+  // save hotkey against re-entry (the ref also guards the worker route) and
+  // feeds the save toast's timing.
+  const [isSavingInstantReplay, setIsSavingInstantReplay] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartTimeRef = useRef(0);
@@ -199,6 +218,16 @@ export function useStreamRecorder({
   const encodedReceiversRef = useRef<{ video: RTCRtpReceiver; audio: RTCRtpReceiver | null } | null>(null);
   const encodedReadyRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
   const encodedDoneRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
+  // Recording id of an Instant Replay save in flight: worker chunks/done flow
+  // to this id while set (a manual recording cannot co-exist with a save —
+  // see saveInstantReplay's guards) and the promise settles on done/error.
+  // The native save path uses it as a guard sentinel only: the native IPC
+  // promise settles that operation itself (resolve/reject are no-ops there).
+  const instantReplaySaveRef = useRef<{
+    recordingId: string;
+    resolve: (durationMs: number) => void;
+    reject: (error: unknown) => void;
+  } | null>(null);
   // The peer connection the encoded worker was armed against (session id for
   // the DVR ring): a new session gets a fresh worker instead of reusing a
   // stale one.
@@ -292,6 +321,64 @@ export function useStreamRecorder({
     }
   }, []);
 
+  // Shared worker plumbing for both worker creation sites (early ARM and
+  // on-demand start). Chunk/done routing prefers an in-flight Instant Replay
+  // save (it owns its own recording id and cannot co-exist with a manual
+  // recording — see saveInstantReplay's guards), otherwise the manual
+  // recording id owns the chunks.
+  const handleEncodedWorkerMessage = useCallback(
+    (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
+      const message = event.data;
+      if (message.type === "chunk") {
+        const id = instantReplaySaveRef.current?.recordingId ?? recordingIdRef.current;
+        if (!id) return;
+        chunkSendChainRef.current = chunkSendChainRef.current
+          .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
+          .catch((error: unknown) => {
+            console.error("[StreamView] Failed to send encoded recording chunk:", error);
+          });
+      } else if (message.type === "ready") {
+        encodedReadyRef.current?.resolve();
+        encodedReadyRef.current = null;
+      } else if (message.type === "done") {
+        if (instantReplaySaveRef.current) {
+          // The snapshot's exact ring window (worker-measured): the save
+          // resolves with it instead of the manual recording's done signal.
+          instantReplaySaveRef.current.resolve(message.durationMs ?? 0);
+          instantReplaySaveRef.current = null;
+        } else {
+          encodedDoneRef.current?.resolve();
+          encodedDoneRef.current = null;
+        }
+      } else if (message.type === "diag") {
+        // One-shot worker diagnostics (first frame bytes/format, config
+        // build result) — surface them so a header-only recording pins
+        // the failing stage straight from the exported log.
+        console.info(`[StreamView] ${message.message}`);
+      } else if (message.type === "error") {
+        const error = new Error(message.message);
+        encodedReadyRef.current?.reject(error);
+        encodedReadyRef.current = null;
+        encodedDoneRef.current?.reject(error);
+        encodedDoneRef.current = null;
+        instantReplaySaveRef.current?.reject(error);
+        instantReplaySaveRef.current = null;
+        console.error("[StreamView] Encoded recording worker error:", message.message);
+      }
+    },
+    [],
+  );
+  const handleEncodedWorkerError = useCallback((event: ErrorEvent): void => {
+    const error = new Error(event.message || "Recording worker crashed");
+    encodedReadyRef.current?.reject(error);
+    encodedReadyRef.current = null;
+    encodedDoneRef.current?.reject(error);
+    encodedDoneRef.current = null;
+    instantReplaySaveRef.current?.reject(error);
+    instantReplaySaveRef.current = null;
+    console.error("[StreamView] Encoded recording worker crashed:", event);
+  }, []);
+
   // Taps the app's live mic track and streams mono 48 kHz PCM to the encoded
   // worker. Returns false when no usable mic is available (recording proceeds
   // without the mic, surfaced via a warning).
@@ -383,44 +470,8 @@ export function useStreamRecorder({
       );
       if (!encodedWorkerRef.current) {
         encodedWorkerRef.current = worker;
-        worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
-          const message = event.data;
-          if (message.type === "chunk") {
-            const id = recordingIdRef.current;
-            if (!id) return;
-            chunkSendChainRef.current = chunkSendChainRef.current
-              .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
-              .catch((error: unknown) => {
-                console.error("[StreamView] Failed to send encoded recording chunk:", error);
-              });
-          } else if (message.type === "ready") {
-            encodedReadyRef.current?.resolve();
-            encodedReadyRef.current = null;
-          } else if (message.type === "done") {
-            encodedDoneRef.current?.resolve();
-            encodedDoneRef.current = null;
-          } else if (message.type === "diag") {
-            // One-shot worker diagnostics (first frame bytes/format, config
-            // build result) — surface them so a header-only recording pins
-            // the failing stage straight from the exported log.
-            console.info(`[StreamView] ${message.message}`);
-          } else if (message.type === "error") {
-            const error = new Error(message.message);
-            encodedReadyRef.current?.reject(error);
-            encodedReadyRef.current = null;
-            encodedDoneRef.current?.reject(error);
-            encodedDoneRef.current = null;
-            console.error("[StreamView] Encoded recording worker error:", message.message);
-          }
-        };
-        worker.onerror = (event) => {
-          const error = new Error(event.message || "Recording worker crashed");
-          encodedReadyRef.current?.reject(error);
-          encodedReadyRef.current = null;
-          encodedDoneRef.current?.reject(error);
-          encodedDoneRef.current = null;
-          console.error("[StreamView] Encoded recording worker crashed:", event);
-        };
+        worker.onmessage = handleEncodedWorkerMessage;
+        worker.onerror = handleEncodedWorkerError;
       }
       try {
         // Init (the worker acks 'ready'); then start. When the worker was
@@ -437,7 +488,7 @@ export function useStreamRecorder({
           audioChannels: info.audioChannels,
           audioSampleRate: info.audioSampleRate,
           mixMic,
-          dvrSeconds: recordingDvrSeconds,
+          dvrSeconds,
         });
         await new Promise<void>((resolve, reject) => {
           encodedReadyRef.current = { resolve, reject };
@@ -483,10 +534,10 @@ export function useStreamRecorder({
         setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
       }, 500);
       console.info(
-        `[StreamView] Encoded capture started: ${info.codec} ${info.width}x${info.height}@${info.fps} → ${mimeType} (zero re-encode, DVR pre-roll ${recordingDvrSeconds}s${mixMic ? ", mic mix" : ""})`,
+        `[StreamView] Encoded capture started: ${info.codec} ${info.width}x${info.height}@${info.fps} → ${mimeType} (zero re-encode, DVR pre-roll ${dvrSeconds}s${mixMic ? ", mic mix" : ""})`,
       );
     },
-    [mixMic, recordingDvrSeconds, startEncodedMicCapture, stopEncodedMicCapture],
+    [handleEncodedWorkerError, handleEncodedWorkerMessage, mixMic, dvrSeconds, startEncodedMicCapture, stopEncodedMicCapture],
   );
 
   const stopEncodedRecording = useCallback(async (): Promise<void> => {
@@ -580,6 +631,175 @@ export function useStreamRecorder({
     }
   }, [stopEncodedMicCapture]);
 
+  // Instant Replay save (official client's Ctrl+0): mux the armed DVR ring's
+  // window into a standalone clip through the same recording pipeline as a
+  // manual recording (zero re-encode — the worker remuxes the buffered
+  // bitstream). Never runs while a manual recording or another save is in
+  // flight; the worker stays armed afterwards so the ring keeps filling.
+  const saveInstantReplay = useCallback(async (): Promise<InstantReplaySaveResult> => {
+    if (!instantReplayEnabled || !recordingApiAvailable) return "disabled";
+    if (isProcessing || recordingIdRef.current || instantReplaySaveRef.current) return "busy";
+
+    if (nativeRecordingEnabled) {
+      // Native mode has no WebRTC MediaStream to slice: the streamer's own
+      // DVR ring (armed at session start from `instantReplaySeconds`) is
+      // snapshotted natively and remuxed offline — the same zero-re-encode
+      // model, entirely inside the streamer process. The clip flows through
+      // the normal recording API (begin → native save → finish).
+      const nativeSave = window.openNow?.saveNativeInstantReplay;
+      if (typeof nativeSave !== "function") return "unavailable";
+      let recordingId: string;
+      try {
+        const result = await window.openNow.beginRecording({ mimeType: "video/mp4" });
+        recordingId = result.recordingId;
+      } catch (error) {
+        console.error("[StreamView] Instant Replay could not open a recording:", error);
+        return "failed";
+      }
+      setIsSavingInstantReplay(true);
+      // The save owns the recording id for its whole duration: toggleRecording
+      // and a second save check this ref, so a manual start cannot interleave
+      // with the native remux (same contract as the web save's worker ref).
+      instantReplaySaveRef.current = {
+        recordingId,
+        resolve: () => undefined,
+        reject: () => undefined,
+      };
+      try {
+        const result = await nativeSave(recordingId);
+        const entry = await window.openNow.finishRecording({
+          recordingId,
+          durationMs: Math.max(1_000, Math.round(result.durationMs ?? 0)),
+          gameTitle,
+          thumbnailDataUrl: result.thumbnailBase64
+            ? `data:image/jpeg;base64,${result.thumbnailBase64}`
+            : undefined,
+        });
+        setRecordings((prev) => [entry, ...prev].slice(0, 20));
+        console.info(
+          `[StreamView] Instant Replay saved (native): ${Math.round(result.durationMs ?? 0)}ms ring window`,
+        );
+        return "saved";
+      } catch (error) {
+        console.error("[StreamView] Instant Replay save failed (native):", error);
+        window.openNow.abortRecording({ recordingId }).catch(() => undefined);
+        // Readiness rejections (young ring) are not failures: the player
+        // just has to wait a moment before the next attempt.
+        if (error instanceof Error && /still filling|not ready yet/.test(error.message)) {
+          return "unavailable";
+        }
+        return "failed";
+      } finally {
+        if (instantReplaySaveRef.current?.recordingId === recordingId) {
+          instantReplaySaveRef.current = null;
+        }
+        setIsSavingInstantReplay(false);
+      }
+    }
+
+    const video = videoRef.current;
+    const stream = (video?.srcObject ?? null) as MediaStream | null;
+    const pc = getActiveWebRtcPeerConnection();
+    const worker = encodedWorkerRef.current;
+    // The armed worker + attached transforms ARE the ring: without them there
+    // is nothing to save (IR just enabled, arm failed, or a HEVC session).
+    if (!video || !stream || !pc || !worker || encodedArmedPeerConnRef.current !== pc) {
+      return "unavailable";
+    }
+    const info = inspectEncodedCapture(pc, video, stream);
+    if (!info) return "unavailable";
+
+    let recordingId: string;
+    try {
+      const result = await window.openNow.beginRecording({ mimeType: info.mimeType });
+      recordingId = result.recordingId;
+    } catch (error) {
+      console.error("[StreamView] Instant Replay could not open a recording:", error);
+      return "failed";
+    }
+
+    // Thumbnail from the current frame — same recipe as the manual stop.
+    let thumbnailDataUrl: string | undefined;
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      const { width: thumbWidth, height: thumbHeight } = fitThumbnailSize(
+        video.videoWidth,
+        video.videoHeight,
+      );
+      const canvas = document.createElement("canvas");
+      canvas.width = thumbWidth;
+      canvas.height = thumbHeight;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(video, 0, 0, thumbWidth, thumbHeight);
+        thumbnailDataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      }
+    }
+
+    setIsSavingInstantReplay(true);
+    // Set the chunk route BEFORE posting init: a setup failure rejects this
+    // promise through the shared worker error handler.
+    const donePromise = new Promise<number>((resolve, reject) => {
+      instantReplaySaveRef.current = { recordingId, resolve, reject };
+    });
+    try {
+      // Re-init so the muxer gets the live dimensions/codec params (the
+      // arm-time init carried none); the mic chain stays out of the snapshot
+      // — the ring carries the game audio track only.
+      worker.postMessage({
+        type: "init",
+        codec: info.codec,
+        container: info.container,
+        width: info.width,
+        height: info.height,
+        fps: info.fps,
+        hasAudio: info.hasAudio,
+        audioChannels: info.audioChannels,
+        audioSampleRate: info.audioSampleRate,
+        mixMic: false,
+        dvrSeconds,
+      });
+      worker.postMessage({ type: "save" });
+      const durationMs = await Promise.race([
+        donePromise,
+        new Promise<never>((_, reject) =>
+          window.setTimeout(() => reject(new Error("Instant Replay save timed out")), 10_000),
+        ),
+      ]);
+      // Chunks arrive strictly before 'done'; drain the send chain before
+      // finishing so every byte of the clip is on disk.
+      await chunkSendChainRef.current;
+      const entry = await window.openNow.finishRecording({
+        recordingId,
+        durationMs: Math.max(1_000, Math.round(durationMs)),
+        gameTitle,
+        thumbnailDataUrl,
+      });
+      setRecordings((prev) => [entry, ...prev].slice(0, 20));
+      console.info(`[StreamView] Instant Replay saved: ${Math.round(durationMs)}ms ring window`);
+      return "saved";
+    } catch (error) {
+      console.error("[StreamView] Instant Replay save failed:", error);
+      window.openNow.abortRecording({ recordingId }).catch(() => undefined);
+      // Readiness rejections (young ring, no keyframe yet) are not failures:
+      // the player just has to wait a moment before the next attempt.
+      if (error instanceof Error && /still filling|not ready yet/.test(error.message)) {
+        return "unavailable";
+      }
+      return "failed";
+    } finally {
+      instantReplaySaveRef.current = null;
+      setIsSavingInstantReplay(false);
+    }
+  }, [
+    dvrSeconds,
+    gameTitle,
+    instantReplayEnabled,
+    isProcessing,
+    nativeRecordingEnabled,
+    recordingApiAvailable,
+    videoRef,
+  ]);
+
   // Arm the DVR recorder at session start (GFN parity): spawn the encoded
   // worker, attach the transforms and let its ring buffer the last N seconds
   // of keyframe-aligned video from the moment the stream is up — long before
@@ -587,7 +807,7 @@ export function useStreamRecorder({
   // once per peer connection; the worker then lives for the session.
   const armEncodedRecorder = useCallback((): void => {
     const pc = getActiveWebRtcPeerConnection();
-    if (!pc || encodedArmedPeerConnRef.current === pc || !recordingDvrSeconds) return;
+    if (!pc || encodedArmedPeerConnRef.current === pc || !dvrSeconds) return;
     const codecOnly = inspectEncodedCodecOnly(pc);
     if (!codecOnly) return; // unsupported codec / no transform support — the
     // on-demand path falls back to the MediaRecorder recorder at record time.
@@ -608,41 +828,8 @@ export function useStreamRecorder({
         { type: "module" },
       );
       encodedWorkerRef.current = worker;
-      worker.onmessage = (event: MessageEvent<EncodedWorkerOutboundMessage>): void => {
-        const message = event.data;
-        if (message.type === "chunk") {
-          const id = recordingIdRef.current;
-          if (!id) return;
-          chunkSendChainRef.current = chunkSendChainRef.current
-            .then(() => window.openNow.sendRecordingChunk({ recordingId: id, chunk: message.data }))
-            .catch((error: unknown) => {
-              console.error("[StreamView] Failed to send encoded recording chunk:", error);
-            });
-        } else if (message.type === "ready") {
-          encodedReadyRef.current?.resolve();
-          encodedReadyRef.current = null;
-        } else if (message.type === "done") {
-          encodedDoneRef.current?.resolve();
-          encodedDoneRef.current = null;
-        } else if (message.type === "diag") {
-          console.info(`[StreamView] ${message.message}`);
-        } else if (message.type === "error") {
-          const error = new Error(message.message);
-          encodedReadyRef.current?.reject(error);
-          encodedReadyRef.current = null;
-          encodedDoneRef.current?.reject(error);
-          encodedDoneRef.current = null;
-          console.error("[StreamView] Encoded recording worker error:", message.message);
-        }
-      };
-      worker.onerror = (event) => {
-        const error = new Error(event.message || "Recording worker crashed");
-        encodedReadyRef.current?.reject(error);
-        encodedReadyRef.current = null;
-        encodedDoneRef.current?.reject(error);
-        encodedDoneRef.current = null;
-        console.error("[StreamView] Encoded recording worker crashed:", event);
-      };
+      worker.onmessage = handleEncodedWorkerMessage;
+      worker.onerror = handleEncodedWorkerError;
     }
     // Codec-only init (dimensions may not be resolvable yet — the muxer is
     // created per-recording with the full info at `start`, so this is enough
@@ -659,7 +846,7 @@ export function useStreamRecorder({
       audioChannels: codecOnly.audioChannels,
       audioSampleRate: codecOnly.audioSampleRate,
       mixMic,
-      dvrSeconds: recordingDvrSeconds,
+      dvrSeconds,
     });
     const ready = new Promise<void>((resolve, reject) => {
       encodedReadyRef.current = { resolve, reject };
@@ -673,7 +860,7 @@ export function useStreamRecorder({
         encodedArmedPeerConnRef.current = pc;
         encodedReceiversRef.current = { video: videoReceiver, audio: audioReceiver };
         console.info(
-          `[StreamView] Encoded DVR armed: ${codecOnly.codec} pre-roll ${recordingDvrSeconds}s (ring fills from session start)`,
+          `[StreamView] Encoded DVR armed: ${codecOnly.codec} pre-roll ${dvrSeconds}s (ring fills from session start)`,
         );
       })
       .catch((error: unknown) => {
@@ -683,21 +870,25 @@ export function useStreamRecorder({
         encodedWorkerRef.current = null;
         encodedReadyRef.current = null;
       });
-  }, [mixMic, recordingDvrSeconds, stopEncodedMicCapture]);
+  }, [handleEncodedWorkerError, handleEncodedWorkerMessage, mixMic, dvrSeconds, stopEncodedMicCapture]);
 
   // Arm once the session's stream is up (video element has frames and the
   // peer connection exists). Re-arms when a NEW session starts (streamActive
   // flips true again); the guard inside armEncodedRecorder makes it a no-op
   // while the same peer connection is already armed.
   useEffect(() => {
-    if (!recordingDvrSeconds || !streamActive || !streamVideoReady) return;
+    if (!dvrSeconds || !streamActive || !streamVideoReady) return;
     const pc = getActiveWebRtcPeerConnection();
     if (!pc) return;
     armEncodedRecorder();
-  }, [armEncodedRecorder, recordingDvrSeconds, streamActive, streamVideoReady]);
+  }, [armEncodedRecorder, dvrSeconds, streamActive, streamVideoReady]);
 
   const toggleRecording = useCallback(async () => {
     setRecordingError(null);
+
+    // An Instant Replay save owns the worker + its own recording id for a few
+    // hundred milliseconds; a start interleaving with it would corrupt both.
+    if (instantReplaySaveRef.current) return;
 
     if (isRecording) {
       if (nativeRecordingEnabled) {
@@ -1323,6 +1514,14 @@ export function useStreamRecorder({
         window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
         recordingIdRef.current = null;
       }
+      // An Instant Replay save in flight at teardown: settle its promise so
+      // the awaiting save exits, then drop the half-written file.
+      const instantReplayId = instantReplaySaveRef.current?.recordingId;
+      if (instantReplayId) {
+        instantReplaySaveRef.current?.reject(new Error("stream session ended"));
+        instantReplaySaveRef.current = null;
+        window.openNow.abortRecording({ recordingId: instantReplayId }).catch(() => undefined);
+      }
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
     };
@@ -1331,6 +1530,8 @@ export function useStreamRecorder({
   return {
     isRecording,
     isProcessing,
+    isSavingInstantReplay,
+    saveInstantReplay,
     recordings,
     recordingDurationMs,
     recordingError,

@@ -169,6 +169,8 @@ test("buildNativeStreamerSessionContext forwards requested/finalized streaming f
       screenshot: "F11",
       toggleRecording: "F12",
       cyclePacing: "Ctrl+Shift+P",
+      instantReplaySave: "Ctrl+0",
+      instantReplayToggle: "Ctrl+Shift+0",
     },
   );
 

@@ -177,6 +177,8 @@ const api: OpenNowApi = {
     ipcRenderer.invoke(IPC_CHANNELS.NATIVE_RECORDING_STOP),
   abortNativeRecording: () =>
     ipcRenderer.invoke(IPC_CHANNELS.NATIVE_RECORDING_ABORT),
+  saveNativeInstantReplay: (recordingId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.NATIVE_INSTANT_REPLAY_SAVE, recordingId),
   sendNativeDataChannelMessage: (label: string, payloadBase64: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.NATIVE_DATA_CHANNEL_SEND, label, payloadBase64),
   requestKeyframe: (input: KeyframeRequest) =>

@@ -15,7 +15,7 @@ import { VideoShaderPipeline } from "../platforms/gfn/videoShaderPipeline";
 import { formatShortcutForDisplay } from "../shortcuts";
 import { useScreenshotGallery } from "../hooks/useScreenshotGallery";
 import { useStreamMenuNavigation } from "../hooks/useStreamMenuNavigation";
-import { useStreamRecorder } from "../hooks/useStreamRecorder";
+import { useStreamRecorder, type InstantReplaySaveResult } from "../hooks/useStreamRecorder";
 import { formatSessionTimeRemaining, formatWarningSeconds } from "./stream/streamFormatters";
 import { AntiAfkIndicator, MicrophoneIndicator, ProcessingIndicator, RecordingIndicator } from "./stream/StreamIndicators";
 import { StreamTitleBar } from "./stream/StreamTitleBar";
@@ -30,6 +30,15 @@ import { MotionSpinner } from "./MotionSpinner";
 
 const ANTI_AFK_TOGGLE_ACK_MS = 5000;
 const CONTROLLER_SIDEBAR_SHORTCUT_DISPLAY = "View + Menu";
+// Instant Replay save outcomes → capture toast copy. Concise official-style
+// feedback; every guard explains itself instead of failing silently.
+const INSTANT_REPLAY_SAVE_NOTICES: Record<InstantReplaySaveResult, string> = {
+  saved: "Instant Replay saved",
+  disabled: "Instant Replay is off",
+  busy: "Stop the recording first",
+  unavailable: "Instant Replay is not ready yet",
+  failed: "Instant Replay could not be saved",
+};
 
 interface StreamViewProps {
   videoRef: React.Ref<HTMLVideoElement>;
@@ -50,6 +59,8 @@ interface StreamViewProps {
     toggleMicrophone?: string;
     screenshot: string;
     recording: string;
+    instantReplaySave: string;
+    instantReplayToggle: string;
   };
   hideStreamButtons?: boolean;
   serverRegion?: string;
@@ -82,12 +93,19 @@ interface StreamViewProps {
   recordingResolution: string;
   recordingFps: number;
   recordingMixMic: boolean;
-  /** GFN-style DVR pre-roll (seconds) for web encoded recordings (0 = off). */
-  recordingDvrSeconds: number;
+  /** Instant Replay enabled — arms the web encoded DVR ring. */
+  instantReplayEnabled: boolean;
+  /** Instant Replay buffer length (seconds) for web encoded recordings. */
+  instantReplaySeconds: number;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
   onRecordingMixMicChange: (value: boolean) => void;
+  /**
+   * Toggles the Instant Replay setting and returns the NEW state (feeds the
+   * capture toast copy). Lives in App because it updates persisted settings.
+   */
+  onToggleInstantReplay: () => boolean;
   platformStore?: string;
   onToggleFullscreen: () => void;
   onConfirmExit: () => void;
@@ -150,11 +168,13 @@ export function StreamView({
   recordingResolution,
   recordingFps,
   recordingMixMic,
-  recordingDvrSeconds,
+  instantReplayEnabled,
+  instantReplaySeconds,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
   onRecordingMixMicChange,
+  onToggleInstantReplay,
   platformStore,
   onToggleFullscreen,
   onConfirmExit,
@@ -386,13 +406,41 @@ export function StreamView({
     recordingResolution,
     recordingFps,
     mixMic: recordingMixMic,
-    recordingDvrSeconds,
+    instantReplayEnabled,
+    instantReplaySeconds,
     streamActive: isStreaming,
     streamVideoReady,
     // Auto-reset the setting when a recording finds no live mic — a silent
     // recording must not leave "Mix Mic" looking active.
     onMixMicUnavailable: () => onRecordingMixMicChange(false),
   });
+
+  // Capture toasts (Instant Replay save/toggle feedback): a fresh object per
+  // notice so repeating the same text still restarts the auto-dismiss timer.
+  const [captureNotice, setCaptureNotice] = useState<{ text: string } | null>(null);
+  useEffect(() => {
+    if (!captureNotice) return;
+    const timer = window.setTimeout(() => setCaptureNotice(null), 2_800);
+    return () => window.clearTimeout(timer);
+  }, [captureNotice]);
+  const handleSaveInstantReplay = useCallback((): void => {
+    void streamRecorder
+      .saveInstantReplay()
+      .then((result) => {
+        setCaptureNotice({ text: INSTANT_REPLAY_SAVE_NOTICES[result] });
+      })
+      .catch((error: unknown) => {
+        // The save handles its own failures; this guards the unexpected
+        // (inspection/API throws) so a save never dies without feedback.
+        console.error("[StreamView] Instant Replay save crashed:", error);
+        setCaptureNotice({ text: INSTANT_REPLAY_SAVE_NOTICES.failed });
+      });
+  }, [streamRecorder.saveInstantReplay]);
+  const handleToggleInstantReplay = useCallback((): void => {
+    const next = onToggleInstantReplay();
+    setCaptureNotice({ text: next ? "Instant Replay is on" : "Instant Replay is off" });
+  }, [onToggleInstantReplay]);
+
   const releasePointerLockForMenu = useCallback(() => {
     if (document.pointerLockElement) {
       if (onReleasePointerLock) {
@@ -416,6 +464,8 @@ export function StreamView({
     setSelectedScreenshotId: screenshotGallery.setSelectedScreenshotId,
     captureScreenshot: screenshotGallery.captureScreenshot,
     toggleRecording: streamRecorder.toggleRecording,
+    saveInstantReplay: handleSaveInstantReplay,
+    toggleInstantReplay: handleToggleInstantReplay,
     onCancelExit,
     onConfirmExit,
     onBeforeOpen: releasePointerLockForMenu,
@@ -988,6 +1038,13 @@ export function StreamView({
           hideStreamButtons={hideStreamButtons}
           isConnecting={isConnecting}
         />
+      )}
+
+      {/* Capture toast: Instant Replay save/toggle feedback, auto-dismissed. */}
+      {captureNotice && (
+        <div className="sv-capture-toast" role="status" aria-live="polite">
+          {captureNotice.text}
+        </div>
       )}
 
       {exitPrompt.open && !isConnecting && typeof document !== "undefined" && createPortal(

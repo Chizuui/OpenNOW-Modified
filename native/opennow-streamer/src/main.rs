@@ -137,6 +137,9 @@ fn handle_command(
         "stop-recording" => {
             return write_reply(backend.stop_recording(command));
         }
+        "save-instant-replay" => {
+            return write_reply(backend.save_instant_replay(command));
+        }
         "send-data-channel-message" => {
             return write_reply(backend.send_data_channel_message(command));
         }

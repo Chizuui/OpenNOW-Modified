@@ -29,7 +29,9 @@ export type NativeStreamerShortcutAction =
   | "toggleMicrophone"
   | "screenshot"
   | "toggleRecording"
-  | "cyclePacing";
+  | "cyclePacing"
+  | "instantReplaySave"
+  | "instantReplayToggle";
 
 export interface NativeStreamerShortcutBindings {
   toggleStats: string;
@@ -41,6 +43,10 @@ export interface NativeStreamerShortcutBindings {
   screenshot: string;
   toggleRecording: string;
   cyclePacing: string;
+  /** Instant Replay save (the official client's Ctrl+0). */
+  instantReplaySave: string;
+  /** Instant Replay on/off (the official client's Ctrl+Shift+0). */
+  instantReplayToggle: string;
 }
 
 export interface NativeStreamerSessionContext {

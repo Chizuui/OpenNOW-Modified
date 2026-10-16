@@ -10,7 +10,7 @@ import type {
   SendAnswerRequest,
 } from "./gfn";
 
-export const NATIVE_STREAMER_PROTOCOL_VERSION = 4;
+export const NATIVE_STREAMER_PROTOCOL_VERSION = 5;
 
 export type { NativeStreamerBackend };
 
@@ -106,6 +106,10 @@ export type NativeStreamerCommand =
       id: string;
       type: "stop-recording";
       finalize: boolean;
+    }
+  | {
+      id: string;
+      type: "save-instant-replay";
     }
   | {
       id: string;
@@ -242,6 +246,11 @@ export type NativeStreamerEvent =
        * explained. 0 when the encoder kept up.
        */
       droppedFrames: number;
+      /**
+       * Clip duration of an Instant Replay save (the DVR ring window span in
+       * ms). Absent for manual recordings — the renderer times those itself.
+       */
+      durationMs?: number;
     }
   | {
       /**

@@ -53,6 +53,7 @@ export const IPC_CHANNELS = {
   NATIVE_RECORDING_START: "gfn:native-recording-start",
   NATIVE_RECORDING_STOP: "gfn:native-recording-stop",
   NATIVE_RECORDING_ABORT: "gfn:native-recording-abort",
+  NATIVE_INSTANT_REPLAY_SAVE: "gfn:native-instant-replay-save",
   NATIVE_DATA_CHANNEL_SEND: "gfn:native-data-channel-send",
   REQUEST_KEYFRAME: "gfn:request-keyframe",
   SIGNALING_EVENT: "gfn:signaling-event",

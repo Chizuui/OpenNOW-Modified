@@ -158,7 +158,7 @@ export class NativeStreamerManager {
   private activeNativeRecordingId: string | null = null;
   /** Resolver for the in-flight `stop-recording` finalization wait. */
   private pendingRecordingFinishedResolve:
-    | ((result: { thumbnailBase64?: string; droppedFrames: number }) => void)
+    | ((result: { thumbnailBase64?: string; droppedFrames: number; durationMs?: number }) => void)
     | null = null;
   private pendingRecordingFinishedReject: ((error: Error) => void) | null = null;
   /** Serialize native chunk writes; stdout events can arrive faster than disk writes. */
@@ -645,6 +645,63 @@ export class NativeStreamerManager {
       await this.request({ type: "stop-recording", finalize: false }, CONTROL_TIMEOUT_MS);
     } catch (error) {
       console.warn("[NativeStreamer] Failed to abort native recording:", error);
+    }
+  }
+
+  /**
+   * Save the native Instant Replay ring window as a standalone clip. The
+   * native streamer snapshots its DVR pre-roll buffer and remuxes it offline
+   * (the same path the recording stop uses); the finished file flows back as
+   * a `recording-ready` event that `handleEvent` installs under
+   * `recordingId`. Resolves on `recording-finished` (carrying the clip
+   * duration the renderer cannot time itself) or rejects on an
+   * `instant-replay-save-failed` error / timeout.
+   */
+  async saveNativeInstantReplay(
+    recordingId: string,
+  ): Promise<{ thumbnailBase64?: string; droppedFrames: number; durationMs?: number }> {
+    if (!this.child || !this.activeSessionId) {
+      this.activeNativeRecordingId = null;
+      throw new Error("Native streamer is not running.");
+    }
+    if (this.activeNativeRecordingId) {
+      throw new Error("A native recording operation is already in progress.");
+    }
+    this.activeNativeRecordingId = recordingId;
+    this.recordingFinalizeQueue = Promise.resolve();
+    const finished = new Promise<{
+      thumbnailBase64?: string;
+      droppedFrames: number;
+      durationMs?: number;
+    }>((resolve, reject) => {
+      this.pendingRecordingFinishedResolve = resolve;
+      this.pendingRecordingFinishedReject = reject;
+    });
+    const clearPending = () => {
+      this.pendingRecordingFinishedResolve = null;
+      this.pendingRecordingFinishedReject = null;
+    };
+    try {
+      await this.request({ type: "save-instant-replay" }, CONTROL_TIMEOUT_MS);
+    } catch (error) {
+      clearPending();
+      this.activeNativeRecordingId = null;
+      throw error;
+    }
+    try {
+      const result = await Promise.race([
+        finished,
+        new Promise<never>((_, reject) => {
+          const timeout = setTimeout(() => {
+            clearPending();
+            reject(new Error("Instant Replay did not save in time."));
+          }, RECORDING_STOP_TIMEOUT_MS);
+          timeout.unref?.();
+        }),
+      ]);
+      return result;
+    } finally {
+      this.activeNativeRecordingId = null;
     }
   }
 
@@ -1145,6 +1202,7 @@ export class NativeStreamerManager {
           resolve?.({
             thumbnailBase64: message.thumbnailBase64,
             droppedFrames: message.droppedFrames ?? 0,
+            durationMs: message.durationMs,
           });
         })
         .catch((error) => {
@@ -1236,11 +1294,15 @@ export class NativeStreamerManager {
     }
 
     if (message.type === "error") {
-      // A native recording finalize that errors (e.g. the offline remux found
-      // empty elementary streams) never emits `recording-finished` — reject the
-      // pending finalize promise now instead of letting the renderer time out
-      // ~20 s later. Anything else is surfaced as a plain streamer error.
-      if (message.code === "recording-stop-failed" && this.pendingRecordingFinishedReject) {
+      // A native recording finalize (or Instant Replay save) that errors
+      // (e.g. the offline remux found empty elementary streams) never emits
+      // `recording-finished` — reject the pending finalize promise now
+      // instead of letting the renderer time out ~60 s later. Anything else
+      // is surfaced as a plain streamer error.
+      if (
+        (message.code === "recording-stop-failed" || message.code === "instant-replay-save-failed")
+        && this.pendingRecordingFinishedReject
+      ) {
         const reject = this.pendingRecordingFinishedReject;
         this.pendingRecordingFinishedResolve = null;
         this.pendingRecordingFinishedReject = null;
@@ -1267,6 +1329,16 @@ export class NativeStreamerManager {
     this.surfaceUpdates.markNotReady();
     this.clearQueuedRemoteIce();
     this.rejectPending(new Error(`Native streamer process ended (${reason}).${tail}`));
+
+    // A recording finalize / Instant Replay save in flight will never see its
+    // `recording-finished` now — fail it immediately instead of leaving the
+    // renderer (and the user's Save button) hanging until the stop timeout.
+    if (this.pendingRecordingFinishedReject) {
+      const reject = this.pendingRecordingFinishedReject;
+      this.pendingRecordingFinishedResolve = null;
+      this.pendingRecordingFinishedReject = null;
+      reject(new Error(`Native streamer process ended (${reason}).${tail}`));
+    }
 
     if (hadActiveSession) {
       this.options.emit({ type: "native-stream-stopped", reason: stoppedReason });

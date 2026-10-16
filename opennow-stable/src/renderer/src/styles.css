@@ -9022,6 +9022,27 @@ button.game-card-store-chip.owned.active:hover {
   padding: 24px;
 }
 
+/* Capture toasts (Instant Replay save/toggle feedback): floats above the
+   stream, never intercepts input, auto-dismisses from its owner. */
+.sv-capture-toast {
+  position: fixed;
+  top: 84px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1200;
+  max-width: min(480px, calc(100vw - 48px));
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+  color: var(--ink);
+  font-size: 0.86rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  pointer-events: none;
+}
+
 .sv-exit-backdrop {
   position: absolute;
   inset: 0;

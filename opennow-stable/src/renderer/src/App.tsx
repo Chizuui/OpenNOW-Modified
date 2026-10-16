@@ -1118,7 +1118,9 @@ export function App(): JSX.Element {
     const screenshot = parseWithFallback(settings.shortcutScreenshot, DEFAULT_SHORTCUTS.shortcutScreenshot);
     const recording = parseWithFallback(settings.shortcutToggleRecording, DEFAULT_SHORTCUTS.shortcutToggleRecording);
     const cyclePacing = parseWithFallback(settings.shortcutCyclePacing, DEFAULT_SHORTCUTS.shortcutCyclePacing);
-    return { toggleStats, togglePointerLock, toggleFullscreen, stopStream, toggleAntiAfk, toggleMicrophone, screenshot, recording, cyclePacing };
+    const instantReplaySave = parseWithFallback(settings.shortcutInstantReplaySave, DEFAULT_SHORTCUTS.shortcutInstantReplaySave);
+    const instantReplayToggle = parseWithFallback(settings.shortcutInstantReplayToggle, DEFAULT_SHORTCUTS.shortcutInstantReplayToggle);
+    return { toggleStats, togglePointerLock, toggleFullscreen, stopStream, toggleAntiAfk, toggleMicrophone, screenshot, recording, cyclePacing, instantReplaySave, instantReplayToggle };
   }, [
     settings.shortcutToggleStats,
     settings.shortcutTogglePointerLock,
@@ -1129,6 +1131,8 @@ export function App(): JSX.Element {
     settings.shortcutScreenshot,
     settings.shortcutToggleRecording,
     settings.shortcutCyclePacing,
+    settings.shortcutInstantReplaySave,
+    settings.shortcutInstantReplayToggle,
   ]);
 
   const nativeStreamerShortcuts = useMemo(() => ({
@@ -1141,6 +1145,14 @@ export function App(): JSX.Element {
     screenshot: "",
     toggleRecording: "",
     cyclePacing: shortcuts.cyclePacing.canonical,
+    // Real bindings (not ""): the native matcher keeps the Instant Replay
+    // keys out of the game while input capture is active, and emits the
+    // shortcut event in the legacy external-window mode. In the
+    // internal/stacked renderer Electron's keydown owns the action and the
+    // native side only suppresses the key, so this never double-fires —
+    // same contract as the other native bindings above.
+    instantReplaySave: shortcuts.instantReplaySave.canonical,
+    instantReplayToggle: shortcuts.instantReplayToggle.canonical,
   }), [shortcuts]);
 
   const buildSignalingConnectRequest = useCallback((activeSession: SessionInfo, codecOverride?: VideoCodec): SignalingConnectRequest => {
@@ -2840,6 +2852,16 @@ export function App(): JSX.Element {
           setPacingCycleNotice({ label });
         }
         return;
+      case "instantReplaySave":
+      case "instantReplayToggle":
+        // Native Instant Replay keys: when input capture is active the native
+        // matcher suppresses the key from the game and (in the internal and
+        // stacked renderer modes) Electron keydown runs the action — but the
+        // legacy external-window mode has no Electron keydown, so the action
+        // arrives here. Dispatch both cases like screenshot/recording; the
+        // renderer-side handlers own the actual save/toggle.
+        dispatchStreamShortcutAction(action);
+        return;
     }
   }, [handlePromptedStopStream, handleToggleMicrophone, requestPointerLockCapture, settings.nativePacingMode, streamStatus, t, toggleSessionFullscreen]);
 
@@ -3320,6 +3342,8 @@ export function App(): JSX.Element {
                 toggleMicrophone: formatShortcutForDisplay(settings.shortcutToggleMicrophone, isMac),
                 screenshot: shortcuts.screenshot.canonical,
                 recording: shortcuts.recording.canonical,
+                instantReplaySave: shortcuts.instantReplaySave.canonical,
+                instantReplayToggle: shortcuts.instantReplayToggle.canonical,
               }}
               hideStreamButtons={settings.hideStreamButtons}
               serverRegion={session?.signalingServer || session?.serverIp}
@@ -3343,7 +3367,13 @@ export function App(): JSX.Element {
               recordingResolution={settings.recordingResolution}
               recordingFps={settings.recordingFps}
               recordingMixMic={settings.recordingMixMic}
-              recordingDvrSeconds={settings.recordingDvrSeconds}
+              instantReplayEnabled={settings.instantReplayEnabled}
+              instantReplaySeconds={settings.instantReplaySeconds}
+              onToggleInstantReplay={() => {
+                const next = !settings.instantReplayEnabled;
+                void updateSetting("instantReplayEnabled", next);
+                return next;
+              }}
               onRecordingResolutionChange={(value) => { void updateSetting("recordingResolution", value); }}
               onRecordingFpsChange={(value) => { void updateSetting("recordingFps", value); }}
               onRecordingBitrateMbpsChange={(value) => { void updateSetting("recordingBitrateMbps", value); }}

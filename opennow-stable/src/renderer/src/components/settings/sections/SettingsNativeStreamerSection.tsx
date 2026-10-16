@@ -71,19 +71,19 @@ export function SettingsNativeStreamerSection({
   const [nativeStreamerEnablePromptOpen, setNativeStreamerEnablePromptOpen] = useState(false);
   const nativeStreamerEnablePromptConfirmRef = useRef<HTMLButtonElement | null>(null);
   const [dvrSecondsDraft, setDvrSecondsDraft] = useState(
-    String(settings.recordingDvrSeconds),
+    String(settings.instantReplaySeconds),
   );
 
   useEffect(() => {
-    setDvrSecondsDraft(String(settings.recordingDvrSeconds));
-  }, [settings.recordingDvrSeconds]);
+    setDvrSecondsDraft(String(settings.instantReplaySeconds));
+  }, [settings.instantReplaySeconds]);
 
   const commitDvrSecondsDraft = useCallback(() => {
     const parsed = Math.round(Number(dvrSecondsDraft));
     const clamped = Number.isFinite(parsed)
       ? Math.max(5, Math.min(300, parsed))
-      : 30;
-    handleChange("recordingDvrSeconds", clamped);
+      : 120;
+    handleChange("instantReplaySeconds", clamped);
     setDvrSecondsDraft(String(clamped));
   }, [dvrSecondsDraft, handleChange]);
   const hostVideoBackends = getHostVideoBackends(nativeStreamerStatus);
@@ -352,7 +352,7 @@ export function SettingsNativeStreamerSection({
                   >
                     {t("settings.nativeStreamer.recordingDvrSeconds")}
                   </label>
-                  <span className="settings-value-badge">{settings.recordingDvrSeconds}s</span>
+                  <span className="settings-value-badge">{settings.instantReplaySeconds}s</span>
                 </div>
                 <div className="settings-slider-control">
                   <SettingRange
@@ -361,9 +361,9 @@ export function SettingsNativeStreamerSection({
                     min={5}
                     max={300}
                     step={5}
-                    value={settings.recordingDvrSeconds}
+                    value={settings.instantReplaySeconds}
                     onPreview={(value) => setDvrSecondsDraft(String(value))}
-                    onCommit={(value) => handleChange("recordingDvrSeconds", value)}
+                    onCommit={(value) => handleChange("instantReplaySeconds", value)}
                   />
                   <input
                     id="settings-native-dvr-seconds-number"
@@ -380,7 +380,7 @@ export function SettingsNativeStreamerSection({
                       if (e.key === "Enter") {
                         e.currentTarget.blur();
                       } else if (e.key === "Escape") {
-                        setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+                        setDvrSecondsDraft(String(settings.instantReplaySeconds));
                       }
                     }}
                   />

@@ -223,6 +223,21 @@ export class SignalingCoordinator {
     );
 
     ipcMain.handle(
+      IPC_CHANNELS.NATIVE_INSTANT_REPLAY_SAVE,
+      async (
+        _event,
+        recordingId: string,
+      ): Promise<{ thumbnailBase64?: string; droppedFrames: number; durationMs?: number }> => {
+        if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
+          throw new Error("Native streamer is not active for this session.");
+        }
+        // Return the resolved value — the renderer reads durationMs /
+        // thumbnailBase64 from the invoke result (same contract as stop).
+        return await this.getNativeStreamerManager().saveNativeInstantReplay(recordingId);
+      },
+    );
+
+    ipcMain.handle(
       IPC_CHANNELS.NATIVE_DATA_CHANNEL_SEND,
       async (_event, label: string, payloadBase64: string): Promise<void> => {
         if (!this.isNativeStreamerSelected() || !this.nativeStreamerContext) {
@@ -467,8 +482,15 @@ export class SignalingCoordinator {
         this.deps.settingsManager?.get("nativeExternalRenderer") ?? false,
       getStackedRendererEnabled: () =>
         this.deps.settingsManager?.get("nativeStackedRenderer") ?? false,
+      // Instant Replay gates the shared DVR buffer: enabled → the user's
+      // buffer length; disabled → the native streamer's small legacy pre-roll
+      // baseline (30 s) so manual recordings still open on a clean keyframe
+      // (outside the ring the native recorder has no record-start keyframe
+      // gate). The web recorder disarms its ring entirely when disabled.
       getDvrPreRollSeconds: () =>
-        this.deps.settingsManager?.get("recordingDvrSeconds") ?? 30,
+        this.deps.settingsManager?.get("instantReplayEnabled")
+          ? (this.deps.settingsManager?.get("instantReplaySeconds") ?? 120)
+          : 30,
       emit: (event) => this.emitToRenderer(event),
       sendAnswer: async (payload) => {
         if (!this.signalingClient) {

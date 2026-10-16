@@ -71,22 +71,22 @@ function normalizeRecordingBitrateMbps(raw: unknown): number | null {
 }
 
 /**
- * GFN DVR pre-roll duration (seconds) shared by the native and web recorders:
- * 5..300, integer. Falls back to 30 (the native streamer's own default) on
- * garbage.
+ * Instant Replay buffer length (seconds) shared by the native and web
+ * recorders: 5..300, integer. Falls back to 120 (the official client's
+ * default buffer) on garbage.
  */
-const RECORDING_DVR_SECONDS_MIN = 5;
-const RECORDING_DVR_SECONDS_MAX = 300;
-const RECORDING_DVR_SECONDS_DEFAULT = 30;
+const INSTANT_REPLAY_SECONDS_MIN = 5;
+const INSTANT_REPLAY_SECONDS_MAX = 300;
+const INSTANT_REPLAY_SECONDS_DEFAULT = 120;
 
-function normalizeRecordingDvrSeconds(raw: unknown): number {
+function normalizeInstantReplaySeconds(raw: unknown): number {
   const value = Number(raw);
   if (!Number.isFinite(value)) {
-    return RECORDING_DVR_SECONDS_DEFAULT;
+    return INSTANT_REPLAY_SECONDS_DEFAULT;
   }
   return Math.max(
-    RECORDING_DVR_SECONDS_MIN,
-    Math.min(RECORDING_DVR_SECONDS_MAX, Math.round(value)),
+    INSTANT_REPLAY_SECONDS_MIN,
+    Math.min(INSTANT_REPLAY_SECONDS_MAX, Math.round(value)),
   );
 }
 
@@ -116,8 +116,10 @@ const SIDEBAR_RESERVED_SHORTCUT_FALLBACKS: Record<ShortcutSettingKey, readonly s
   shortcutToggleMicrophone: [defaultMicShortcut, "Ctrl+Alt+M", "Ctrl+Alt+Shift+M"],
   shortcutScreenshot: ["F11", "Ctrl+Shift+S", "Ctrl+Alt+S", "Ctrl+Shift+F11", "Ctrl+Alt+Shift+S"],
   shortcutToggleRecording: ["F12", "Ctrl+Shift+R", "Ctrl+Alt+R", "Ctrl+Shift+F12", "Ctrl+Alt+Shift+R"],
-  // New shortcut: no legacy aliases to accept yet, so an empty list (the
+  // New shortcuts: no legacy aliases to accept yet, so empty lists (the
   // sidebar-reserved check only ever consults non-empty aliases).
+  shortcutInstantReplaySave: [],
+  shortcutInstantReplayToggle: [],
   shortcutCyclePacing: [],
 };
 
@@ -174,11 +176,14 @@ export class SettingsManager {
         sessionTimeRemainingDisplay?: unknown;
         /** Renamed to recordingDvrSeconds in v0.6 — migrated on load. */
         nativeRecordingDvrSeconds?: unknown;
+        /** Renamed to instantReplaySeconds in v0.8 — migrated on load. */
+        recordingDvrSeconds?: unknown;
       };
       const parsed = JSON.parse(content) as PersistedSettings;
       const {
         sessionTimeRemainingDisplay: legacySessionTimeDisplay,
         nativeRecordingDvrSeconds: legacyNativeRecordingDvrSeconds,
+        recordingDvrSeconds: legacyRecordingDvrSeconds,
         ...parsedSettings
       } = parsed;
 
@@ -215,13 +220,16 @@ export class SettingsManager {
         migrated = true;
       }
 
-      // Renamed in v0.6: nativeRecordingDvrSeconds → recordingDvrSeconds (the
-      // DVR pre-roll is now shared by the web and native recorders). Carry the
-      // old persisted value over (normalized) so existing configs keep their
-      // pre-roll preference instead of silently falling back to the default.
-      if (legacyNativeRecordingDvrSeconds !== undefined) {
-        merged.recordingDvrSeconds =
-          normalizeRecordingDvrSeconds(legacyNativeRecordingDvrSeconds);
+      // Renamed in v0.8: recordingDvrSeconds → instantReplaySeconds (the DVR
+      // pre-roll became the Instant Replay buffer). Installations that had a
+      // pre-roll preference migrate to Instant Replay ON with their old
+      // buffer length instead of silently losing it; fresh installs keep the
+      // official default (OFF, 120 s). The v0.6 rename
+      // (nativeRecordingDvrSeconds) chains through the same migration.
+      const legacyDvrSeconds = legacyRecordingDvrSeconds ?? legacyNativeRecordingDvrSeconds;
+      if (legacyDvrSeconds !== undefined && parsedSettings.instantReplaySeconds === undefined) {
+        merged.instantReplaySeconds = normalizeInstantReplaySeconds(legacyDvrSeconds);
+        merged.instantReplayEnabled = true;
         migrated = true;
       }
 
@@ -318,10 +326,14 @@ export class SettingsManager {
       settings.nativeExternalRenderer = false;
       migrated = true;
     }
-    const dvrSecondsBefore = settings.recordingDvrSeconds;
-    settings.recordingDvrSeconds =
-      normalizeRecordingDvrSeconds(settings.recordingDvrSeconds);
-    if (settings.recordingDvrSeconds !== dvrSecondsBefore) {
+    const instantReplaySecondsBefore = settings.instantReplaySeconds;
+    settings.instantReplaySeconds =
+      normalizeInstantReplaySeconds(settings.instantReplaySeconds);
+    if (settings.instantReplaySeconds !== instantReplaySecondsBefore) {
+      migrated = true;
+    }
+    if (typeof settings.instantReplayEnabled !== "boolean") {
+      settings.instantReplayEnabled = false;
       migrated = true;
     }
     const transportMode = normalizeTransportModeForPlatform(

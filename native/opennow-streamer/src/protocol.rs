@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 
-pub const PROTOCOL_VERSION: u64 = 4;
+pub const PROTOCOL_VERSION: u64 = 5;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,6 +409,13 @@ pub struct NativeStreamerShortcutBindings {
     pub toggle_recording: String,
     #[serde(default)]
     pub cycle_pacing: String,
+    /// Instant Replay save (the official client's Ctrl+0): snapshot the DVR
+    /// pre-roll ring into a standalone clip.
+    #[serde(default)]
+    pub instant_replay_save: String,
+    /// Instant Replay on/off (the official client's Ctrl+Shift+0).
+    #[serde(default)]
+    pub instant_replay_toggle: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -423,6 +430,8 @@ pub enum NativeStreamerShortcutAction {
     Screenshot,
     ToggleRecording,
     CyclePacing,
+    InstantReplaySave,
+    InstantReplayToggle,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -792,6 +801,12 @@ pub enum Event {
         thumbnail_base64: Option<String>,
         #[serde(rename = "droppedFrames")]
         dropped_frames: u64,
+        /// Clip duration of an Instant Replay save (the DVR ring window span
+        /// in ms). The renderer has no live timer for a retrospective save,
+        /// so the native side reports the span it actually remuxed. Absent
+        /// for manual recordings (the renderer times those itself).
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// The negotiated video codec produced zero decoded frames during startup
     /// (every decoder candidate exhausted, keyframes and latency resyncs did
@@ -1011,19 +1026,47 @@ mod tests {
         let finished = serde_json::to_value(Event::RecordingFinished {
             thumbnail_base64: Some("L3RodW1ibmFpbA==".to_owned()),
             dropped_frames: 0,
+            duration_ms: Some(4_500),
         })
         .expect("serializes");
         assert_eq!(finished["type"], "recording-finished");
         assert_eq!(finished["thumbnailBase64"], "L3RodW1ibmFpbA==");
         assert_eq!(finished["droppedFrames"], 0);
+        assert_eq!(finished["durationMs"], 4_500);
 
         let finished_none = serde_json::to_value(Event::RecordingFinished {
             thumbnail_base64: None,
             dropped_frames: 12,
+            duration_ms: None,
         })
         .expect("serializes");
         assert!(finished_none.get("thumbnailBase64").is_none());
+        assert!(finished_none.get("durationMs").is_none());
         assert_eq!(finished_none["droppedFrames"], 12);
+    }
+
+    #[test]
+    fn save_instant_replay_command_parses() {
+        let value = serde_json::json!({
+            "id": "ir-1",
+            "type": "save-instant-replay"
+        });
+        let command: CommandEnvelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(command.command_type, "save-instant-replay");
+    }
+
+    #[test]
+    fn shortcut_bindings_deserialize_instant_replay_fields() {
+        let value = serde_json::json!({
+            "toggleStats": "F3",
+            "instantReplaySave": "Ctrl+0",
+            "instantReplayToggle": "Ctrl+Shift+0"
+        });
+        let bindings: NativeStreamerShortcutBindings =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(bindings.instant_replay_save, "Ctrl+0");
+        assert_eq!(bindings.instant_replay_toggle, "Ctrl+Shift+0");
+        assert_eq!(bindings.toggle_stats, "F3");
     }
 
     #[test]

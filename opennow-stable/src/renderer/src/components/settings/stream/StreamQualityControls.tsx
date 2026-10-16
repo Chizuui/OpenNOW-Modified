@@ -78,17 +78,17 @@ export function StreamQualityControls({
   // DVR pre-roll draft (web recordings): synced from the shared setting,
   // clamped 5..300 on commit (same slider as the Native Streamer section).
   const [dvrSecondsDraft, setDvrSecondsDraft] = useState(
-    String(settings.recordingDvrSeconds),
+    String(settings.instantReplaySeconds),
   );
   useEffect(() => {
-    setDvrSecondsDraft(String(settings.recordingDvrSeconds));
-  }, [settings.recordingDvrSeconds]);
+    setDvrSecondsDraft(String(settings.instantReplaySeconds));
+  }, [settings.instantReplaySeconds]);
   const commitDvrSecondsDraft = useCallback(() => {
     const parsed = Math.round(Number(dvrSecondsDraft));
     const clamped = Number.isFinite(parsed)
       ? Math.max(5, Math.min(300, parsed))
-      : 30;
-    handleChange("recordingDvrSeconds", clamped);
+      : 120;
+    handleChange("instantReplaySeconds", clamped);
     setDvrSecondsDraft(String(clamped));
   }, [dvrSecondsDraft, handleChange]);
   const nativeStreamerStatus = useNativeStreamerStatus(settings.streamClientMode === "native");
@@ -606,7 +606,7 @@ export function StreamQualityControls({
           >
             {t("settings.video.recordingDvrSeconds")}
           </label>
-          <span className="settings-value-badge">{settings.recordingDvrSeconds}s</span>
+          <span className="settings-value-badge">{settings.instantReplaySeconds}s</span>
         </div>
         <div className="settings-slider-control">
           <SettingRange
@@ -615,9 +615,9 @@ export function StreamQualityControls({
             min={5}
             max={300}
             step={5}
-            value={settings.recordingDvrSeconds}
+            value={settings.instantReplaySeconds}
             onPreview={(value) => setDvrSecondsDraft(String(value))}
-            onCommit={(value) => handleChange("recordingDvrSeconds", value)}
+            onCommit={(value) => handleChange("instantReplaySeconds", value)}
           />
           <input
             id="settings-web-dvr-seconds-number"
@@ -634,7 +634,7 @@ export function StreamQualityControls({
               if (e.key === "Enter") {
                 e.currentTarget.blur();
               } else if (e.key === "Escape") {
-                setDvrSecondsDraft(String(settings.recordingDvrSeconds));
+                setDvrSecondsDraft(String(settings.instantReplaySeconds));
               }
             }}
           />

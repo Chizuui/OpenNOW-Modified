@@ -252,6 +252,18 @@ export interface OpenNowApi {
   abortNativeRecording(): Promise<void>;
 
   /**
+   * Save the native Instant Replay ring window (the DVR pre-roll buffer) as
+   * a standalone clip. Runs entirely natively (snapshot + offline remux);
+   * resolves with the clip duration so the renderer can label it without a
+   * live timer. Only valid while a native streamer session is active.
+   */
+  saveNativeInstantReplay(recordingId: string): Promise<{
+    thumbnailBase64?: string;
+    droppedFrames: number;
+    durationMs?: number;
+  }>;
+
+  /**
    * Send a base64 message on a remote WebRTC data channel of the native
    * streamer (e.g. GFN `control_channel` clipboard responses).
    */
