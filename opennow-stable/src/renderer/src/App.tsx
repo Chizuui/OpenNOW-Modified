@@ -3369,11 +3369,8 @@ export function App(): JSX.Element {
               recordingMixMic={settings.recordingMixMic}
               instantReplayEnabled={settings.instantReplayEnabled}
               instantReplaySeconds={settings.instantReplaySeconds}
-              onToggleInstantReplay={() => {
-                const next = !settings.instantReplayEnabled;
-                void updateSetting("instantReplayEnabled", next);
-                return next;
-              }}
+              onInstantReplayEnabledChange={(value) => { void updateSetting("instantReplayEnabled", value); }}
+              onInstantReplaySecondsChange={(value) => { void updateSetting("instantReplaySeconds", value); }}
               onRecordingResolutionChange={(value) => { void updateSetting("recordingResolution", value); }}
               onRecordingFpsChange={(value) => { void updateSetting("recordingFps", value); }}
               onRecordingBitrateMbpsChange={(value) => { void updateSetting("recordingBitrateMbps", value); }}

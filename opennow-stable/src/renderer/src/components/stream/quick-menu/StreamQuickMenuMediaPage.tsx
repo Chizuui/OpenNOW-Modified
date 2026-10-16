@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Circle,
   FolderOpen,
+  Save,
   Square,
   Trash2,
   Video,
@@ -59,6 +60,18 @@ interface StreamQuickMenuMediaPageProps {
   nativeRecording: boolean;
   /** Shown after a recording that dropped frames (encoder/queue could not keep up). */
   recordingDropNotice: string | null;
+  /** Instant Replay buffer state (official capture parity). */
+  instantReplayEnabled: boolean;
+  instantReplaySeconds: number;
+  /** True while a replay save is muxing — disables the save button. */
+  isSavingInstantReplay: boolean;
+  /** Display string of the Instant Replay save key (e.g. "Ctrl+0"). */
+  instantReplaySaveShortcut: string;
+  /** Sets the persisted Instant Replay setting (chips; the hotkey toggles). */
+  onSetInstantReplay: (value: boolean) => void;
+  /** Saves the buffered replay window; outcomes surface as capture toasts. */
+  onSaveInstantReplay: () => void;
+  onInstantReplaySecondsChange: (value: number) => void;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
@@ -94,6 +107,13 @@ export function StreamQuickMenuMediaPage({
   micTrack,
   nativeRecording,
   recordingDropNotice,
+  instantReplayEnabled,
+  instantReplaySeconds,
+  isSavingInstantReplay,
+  instantReplaySaveShortcut,
+  onSetInstantReplay,
+  onSaveInstantReplay,
+  onInstantReplaySecondsChange,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
@@ -114,6 +134,76 @@ export function StreamQuickMenuMediaPage({
   useMicMeter(micMeterRef, micTrack, micLevelMeterActive);
   return (
     <div className="sidebar-page" role="tabpanel">
+      <section className="sidebar-section">
+        <div className="sidebar-section-header">
+          <span>Instant Replay</span>
+          <span className="sidebar-section-sub">Save key: {instantReplaySaveShortcut}</span>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Replay buffer</span>
+            <span className="settings-value-badge">{instantReplayEnabled ? "On" : "Off"}</span>
+          </div>
+          <div className="sidebar-chip-row">
+            <button
+              type="button"
+              className={`sidebar-chip${instantReplayEnabled ? " sidebar-chip--active" : ""}`}
+              aria-pressed={instantReplayEnabled}
+              onClick={() => onSetInstantReplay(true)}
+            >
+              <span>On</span>
+            </button>
+            <button
+              type="button"
+              className={`sidebar-chip${!instantReplayEnabled ? " sidebar-chip--active" : ""}`}
+              aria-pressed={!instantReplayEnabled}
+              onClick={() => onSetInstantReplay(false)}
+            >
+              <span>Off</span>
+            </button>
+          </div>
+          <span className="sidebar-hint">
+            {instantReplayEnabled
+              ? `The last ${formatElapsed(instantReplaySeconds)} of gameplay is buffered and ready to save.`
+              : "Off — turn it on to buffer recent gameplay for saving."}
+          </span>
+        </div>
+        <div className="sidebar-row sidebar-row--column">
+          <div className="sidebar-row-top">
+            <span className="sidebar-label">Buffer length</span>
+            <span className="settings-value-badge">{formatElapsed(instantReplaySeconds)}</span>
+          </div>
+          <SettingRange
+            id="quick-menu-instant-replay-seconds"
+            className="settings-slider"
+            min={5}
+            max={300}
+            step={5}
+            value={instantReplaySeconds}
+            onPreview={onInstantReplaySecondsChange}
+            onCommit={onInstantReplaySecondsChange}
+          />
+          <span className="sidebar-hint">
+            How much recent gameplay is kept. Changes apply from the next session.
+          </span>
+        </div>
+        <div className="sidebar-row sidebar-row--aligned">
+          <span className="sidebar-label">Save replay</span>
+          <button
+            type="button"
+            className="sidebar-button sidebar-screenshot-button"
+            onClick={onSaveInstantReplay}
+            disabled={isSavingInstantReplay || !instantReplayEnabled}
+          >
+            <Save size={14} />
+            <span>{isSavingInstantReplay ? "Saving..." : "Save"}</span>
+          </button>
+        </div>
+        {instantReplayEnabled && isRecording && !isSavingInstantReplay && (
+          <span className="sidebar-hint">Stop the recording to save the replay.</span>
+        )}
+      </section>
+      <div className="sidebar-separator" aria-hidden="true" />
       <section className="sidebar-section">
         <div className="sidebar-section-header">
           <span>Recording Settings</span>

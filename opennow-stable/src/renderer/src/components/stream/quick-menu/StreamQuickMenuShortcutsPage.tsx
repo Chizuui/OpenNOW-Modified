@@ -12,6 +12,8 @@ export interface StreamShortcutBindings {
   toggleMicrophone?: string;
   screenshot: string;
   recording: string;
+  instantReplaySave: string;
+  instantReplayToggle: string;
 }
 
 interface UseStreamQuickMenuShortcutsOptions {

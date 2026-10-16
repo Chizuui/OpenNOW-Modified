@@ -93,19 +93,16 @@ interface StreamViewProps {
   recordingResolution: string;
   recordingFps: number;
   recordingMixMic: boolean;
-  /** Instant Replay enabled — arms the web encoded DVR ring. */
+  /** Instant Replay enabled — arms the capture DVR ring. */
   instantReplayEnabled: boolean;
-  /** Instant Replay buffer length (seconds) for web encoded recordings. */
+  /** Instant Replay buffer length (seconds) kept by the DVR ring. */
   instantReplaySeconds: number;
+  onInstantReplayEnabledChange: (value: boolean) => void;
+  onInstantReplaySecondsChange: (value: number) => void;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
   onRecordingMixMicChange: (value: boolean) => void;
-  /**
-   * Toggles the Instant Replay setting and returns the NEW state (feeds the
-   * capture toast copy). Lives in App because it updates persisted settings.
-   */
-  onToggleInstantReplay: () => boolean;
   platformStore?: string;
   onToggleFullscreen: () => void;
   onConfirmExit: () => void;
@@ -170,11 +167,12 @@ export function StreamView({
   recordingMixMic,
   instantReplayEnabled,
   instantReplaySeconds,
+  onInstantReplayEnabledChange,
+  onInstantReplaySecondsChange,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
   onRecordingMixMicChange,
-  onToggleInstantReplay,
   platformStore,
   onToggleFullscreen,
   onConfirmExit,
@@ -436,10 +434,15 @@ export function StreamView({
         setCaptureNotice({ text: INSTANT_REPLAY_SAVE_NOTICES.failed });
       });
   }, [streamRecorder.saveInstantReplay]);
+  /** Chips in the quick menu set an explicit target; the hotkey toggles. */
+  const handleSetInstantReplay = useCallback((enabled: boolean): void => {
+    if (enabled === instantReplayEnabled) return;
+    onInstantReplayEnabledChange(enabled);
+    setCaptureNotice({ text: enabled ? "Instant Replay is on" : "Instant Replay is off" });
+  }, [instantReplayEnabled, onInstantReplayEnabledChange]);
   const handleToggleInstantReplay = useCallback((): void => {
-    const next = onToggleInstantReplay();
-    setCaptureNotice({ text: next ? "Instant Replay is on" : "Instant Replay is off" });
-  }, [onToggleInstantReplay]);
+    handleSetInstantReplay(!instantReplayEnabled);
+  }, [handleSetInstantReplay, instantReplayEnabled]);
 
   const releasePointerLockForMenu = useCallback(() => {
     if (document.pointerLockElement) {
@@ -926,6 +929,11 @@ export function StreamView({
         onRecordingFpsChange={onRecordingFpsChange}
         onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
         onRecordingMixMicChange={onRecordingMixMicChange}
+        instantReplayEnabled={instantReplayEnabled}
+        instantReplaySeconds={instantReplaySeconds}
+        onSetInstantReplay={handleSetInstantReplay}
+        onSaveInstantReplay={handleSaveInstantReplay}
+        onInstantReplaySecondsChange={onInstantReplaySecondsChange}
       />
 
       {/* Gradient background when no video */}

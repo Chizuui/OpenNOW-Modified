@@ -68,6 +68,11 @@ interface StreamQuickMenuProps {
   nativeRecording: boolean;
   /** Shown after a recording that dropped frames (encoder/queue could not keep up). */
   recordingDropNotice: string | null;
+  instantReplayEnabled: boolean;
+  instantReplaySeconds: number;
+  onSetInstantReplay: (value: boolean) => void;
+  onSaveInstantReplay: () => void;
+  onInstantReplaySecondsChange: (value: number) => void;
   onRecordingResolutionChange: (value: string) => void;
   onRecordingFpsChange: (value: number) => void;
   onRecordingBitrateMbpsChange: (value: number | null) => void;
@@ -124,6 +129,11 @@ export function StreamQuickMenu({
   recordingMixMic,
   nativeRecording,
   recordingDropNotice,
+  instantReplayEnabled,
+  instantReplaySeconds,
+  onSetInstantReplay,
+  onSaveInstantReplay,
+  onInstantReplaySecondsChange,
   onRecordingResolutionChange,
   onRecordingFpsChange,
   onRecordingBitrateMbpsChange,
@@ -321,6 +331,13 @@ export function StreamQuickMenu({
                 micTrack={micTrack}
                 nativeRecording={nativeRecording}
                 recordingDropNotice={recordingDropNotice}
+                instantReplayEnabled={instantReplayEnabled}
+                instantReplaySeconds={instantReplaySeconds}
+                isSavingInstantReplay={streamRecorder.isSavingInstantReplay}
+                instantReplaySaveShortcut={shortcuts.instantReplaySave}
+                onSetInstantReplay={onSetInstantReplay}
+                onSaveInstantReplay={onSaveInstantReplay}
+                onInstantReplaySecondsChange={onInstantReplaySecondsChange}
                 onRecordingResolutionChange={onRecordingResolutionChange}
                 onRecordingFpsChange={onRecordingFpsChange}
                 onRecordingBitrateMbpsChange={onRecordingBitrateMbpsChange}
