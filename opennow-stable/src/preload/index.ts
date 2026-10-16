@@ -45,6 +45,7 @@ import type {
   RecordingEntry,
   RecordingDeleteRequest,
   MediaListingResult,
+  GalleryUsage,
   PrintedWasteQueueData,
   PrintedWasteServerMapping,
   ThankYouDataResult,
@@ -278,6 +279,12 @@ const api: OpenNowApi = {
   listScreenshots: () => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_LIST),
   deleteScreenshot: (input: ScreenshotDeleteRequest) => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_DELETE, input),
   saveScreenshotAs: (input: ScreenshotSaveAsRequest) => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_SAVE_AS, input),
+  readScreenshotPreview: (input: { filePath: string }): Promise<string | null> =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_READ, input),
+  chooseGalleryDirectory: (): Promise<string | null> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GALLERY_CHOOSE_DIRECTORY),
+  getGalleryUsage: (): Promise<GalleryUsage> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GALLERY_USAGE),
   onTriggerScreenshot: (listener: () => void) => {
     const wrapped = () => listener();
     ipcRenderer.on("app:trigger-screenshot", wrapped);
@@ -297,8 +304,8 @@ const api: OpenNowApi = {
     ipcRenderer.invoke(IPC_CHANNELS.RECORDING_LIST),
   deleteRecording: (input: RecordingDeleteRequest): Promise<void> =>
     ipcRenderer.invoke(IPC_CHANNELS.RECORDING_DELETE, input),
-  showRecordingInFolder: (id: string): Promise<void> =>
-    ipcRenderer.invoke(IPC_CHANNELS.RECORDING_SHOW_IN_FOLDER, id),
+  showRecordingInFolder: (filePath: string): Promise<void> =>
+    ipcRenderer.invoke(IPC_CHANNELS.RECORDING_SHOW_IN_FOLDER, filePath),
   listMediaByGame: (input: { gameTitle?: string } = {}): Promise<MediaListingResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.MEDIA_LIST_BY_GAME, input),
   getMediaThumbnail: (input: { filePath: string }) => ipcRenderer.invoke(IPC_CHANNELS.MEDIA_THUMBNAIL, input),

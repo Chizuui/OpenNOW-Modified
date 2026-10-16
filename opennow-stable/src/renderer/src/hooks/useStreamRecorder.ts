@@ -53,6 +53,13 @@ let cachedGeneratorTrackResolver: GeneratorTrackResolver | null | undefined;
  * constructor missing/throws, no writable stream, no usable track — resolves
  * to null.
  */
+/**
+ * Client-side mirror of the main-process recording listing cap: newest 500
+ * entries are kept in renderer state. Retention on disk is governed by the
+ * gallery disk budget, not this cap.
+ */
+const RECORDING_LIST_CAP = 500;
+
 const getGeneratorTrackResolver = (): GeneratorTrackResolver | null => {
   if (cachedGeneratorTrackResolver !== undefined) {
     return cachedGeneratorTrackResolver;
@@ -289,12 +296,12 @@ export function useStreamRecorder({
     }
   }, [recordingApiAvailable]);
 
-  const deleteRecording = useCallback(async (id: string) => {
+  const deleteRecording = useCallback(async (filePath: string) => {
     setRecordingError(null);
     if (!recordingApiAvailable) return;
     try {
-      await window.openNow.deleteRecording({ id });
-      setRecordings((prev) => prev.filter((recording) => recording.id !== id));
+      await window.openNow.deleteRecording({ filePath });
+      setRecordings((prev) => prev.filter((recording) => recording.filePath !== filePath));
     } catch (error) {
       console.error("[StreamView] Failed to delete recording:", error);
       setRecordingError("Unable to delete recording.");
@@ -596,7 +603,7 @@ export function useStreamRecorder({
           gameTitle,
           thumbnailDataUrl,
         });
-        setRecordings((prev) => [entry, ...prev].slice(0, 20));
+        setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
       }
     } catch (error) {
       console.error("[StreamView] Failed to finalize encoded recording:", error);
@@ -675,7 +682,7 @@ export function useStreamRecorder({
             ? `data:image/jpeg;base64,${result.thumbnailBase64}`
             : undefined,
         });
-        setRecordings((prev) => [entry, ...prev].slice(0, 20));
+        setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
         console.info(
           `[StreamView] Instant Replay saved (native): ${Math.round(result.durationMs ?? 0)}ms ring window`,
         );
@@ -774,7 +781,7 @@ export function useStreamRecorder({
         gameTitle,
         thumbnailDataUrl,
       });
-      setRecordings((prev) => [entry, ...prev].slice(0, 20));
+      setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
       console.info(`[StreamView] Instant Replay saved: ${Math.round(durationMs)}ms ring window`);
       return "saved";
     } catch (error) {
@@ -936,7 +943,7 @@ export function useStreamRecorder({
               ? `data:image/jpeg;base64,${thumbnailBase64}`
               : undefined,
           });
-          setRecordings((prev) => [entry, ...prev].slice(0, 20));
+          setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
         } catch (error) {
           console.error("[StreamView] Failed to finish native recording:", error);
           setRecordingError("Recording could not be saved.");
@@ -1415,7 +1422,7 @@ export function useStreamRecorder({
           }),
         )
         .then((entry) => {
-          setRecordings((prev) => [entry, ...prev].slice(0, 20));
+          setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
           thumbnailDataUrlRef.current = null;
         })
         .catch((error: unknown) => {

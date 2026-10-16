@@ -90,6 +90,22 @@ function normalizeInstantReplaySeconds(raw: unknown): number {
   );
 }
 
+/** Capture-gallery disk budget (GB): 0 = unlimited, capped to a sane maximum. */
+const GALLERY_DISK_LIMIT_MAX_GB = 10_000;
+
+function normalizeGalleryDiskLimitGb(raw: unknown): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(Math.round(value), GALLERY_DISK_LIMIT_MAX_GB);
+}
+
+/** Capture-gallery root override; empty keeps the default Pictures/OpenNOW. */
+function normalizeGalleryDirectory(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.replace(/\0/g, "").trim();
+  return trimmed.length <= 1024 ? trimmed : "";
+}
+
 
 const ERROR_REPORTING_CONSENTS = new Set<ErrorReportingConsent>(["unset", "granted", "denied"]);
 
@@ -334,6 +350,16 @@ export class SettingsManager {
     }
     if (typeof settings.instantReplayEnabled !== "boolean") {
       settings.instantReplayEnabled = false;
+      migrated = true;
+    }
+    const galleryDiskLimitGb = normalizeGalleryDiskLimitGb(settings.galleryDiskLimitGb);
+    if (settings.galleryDiskLimitGb !== galleryDiskLimitGb) {
+      settings.galleryDiskLimitGb = galleryDiskLimitGb;
+      migrated = true;
+    }
+    const galleryDirectory = normalizeGalleryDirectory(settings.galleryDirectory);
+    if (settings.galleryDirectory !== galleryDirectory) {
+      settings.galleryDirectory = galleryDirectory;
       migrated = true;
     }
     const transportMode = normalizeTransportModeForPlatform(

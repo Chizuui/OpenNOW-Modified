@@ -1,9 +1,15 @@
-import { app } from "electron";
-import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { basename, join } from "node:path";
 import type {
   RecordingAbortRequest,
   RecordingBeginRequest,
@@ -15,12 +21,30 @@ import type {
   RecordingInstallRequest,
 } from "@shared/gfn";
 import {
-  assertSafeMediaId,
-  dataUrlToBuffer,
-  sanitizeTitleForFileName,
-} from "./mediaFiles";
+  getGalleryRootDirectory,
+  getGalleryTempDirectory,
+  getManagedGalleryRoots,
+  pruneGalleryDiskLimit,
+} from "./gallery";
+import { walkGalleryCaptureFiles } from "./galleryFiles";
+import {
+  buildCaptureBaseName,
+  resolveUniqueCapturePath,
+  sanitizeGameFolderName,
+  thumbnailPathForCapture,
+} from "./galleryNaming";
+import { dataUrlToBuffer } from "./mediaFiles";
+import { resolveTrustedOpenNowMediaPath } from "../mediaPaths";
+import { probeMp4File } from "./mp4Probe";
 
-const RECORDING_LIMIT = 20;
+/**
+ * Listing safety cap only — retention is governed by the gallery disk budget
+ * (`galleryDiskLimitGb`). This keeps a pathological folder from flooding the
+ * IPC channel and renderer state.
+ */
+const RECORDING_LIST_LIMIT = 500;
+
+const VIDEO_EXTENSION = /\.(mp4|webm)$/i;
 
 interface ActiveRecording {
   writeStream: ReturnType<typeof createWriteStream>;
@@ -30,71 +54,74 @@ interface ActiveRecording {
 
 const activeRecordings = new Map<string, ActiveRecording>();
 
-export function getRecordingsDirectory(): string {
-  return join(app.getPath("pictures"), "OpenNOW", "Recordings");
-}
-
-export async function ensureRecordingsDirectory(): Promise<string> {
-  const dir = getRecordingsDirectory();
-  await mkdir(dir, { recursive: true });
-  return dir;
-}
-
-export function assertSafeRecordingId(id: string): void {
-  assertSafeMediaId(id, "recording");
-}
-
 export function extFromMimeType(mimeType: string): ".mp4" | ".webm" {
   return mimeType.startsWith("video/mp4") ? ".mp4" : ".webm";
 }
 
+/** Legacy names: `{stamp}-{title}-{rand}[-dur{ms}].{ext}`. */
+function parseLegacyRecordingName(fileName: string): {
+  durationMs: number;
+  gameTitle?: string;
+} {
+  const durMatch = /-dur(\d+)\.(mp4|webm)$/i.exec(fileName);
+  const titleMatch =
+    /^[^-]+-[^-]+-([^-]+(?:-[^-]+)*?)-[a-f0-9]{6}(?:-dur\d+)?\.(mp4|webm)$/i.exec(
+      fileName,
+    );
+  return {
+    durationMs: durMatch ? Number(durMatch[1]) : 0,
+    gameTitle: titleMatch ? titleMatch[1].replace(/-/g, " ") : undefined,
+  };
+}
+
+async function readThumbnailDataUrl(filePath: string): Promise<string | undefined> {
+  try {
+    const thumbBuf = await readFile(thumbnailPathForCapture(filePath));
+    return `data:image/jpeg;base64,${thumbBuf.toString("base64")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Gallery listing, newest first. Both layouts are supported:
+ *  - official per-game folders (`<root>/<Game>/…`) → title from the folder
+ *  - legacy flat `Recordings` dirs → title/duration from the old file name
+ * MP4 entries get duration and track info from the file itself (`moov`
+ * probe); files without a readable video track (stub artifacts, audio-only
+ * muxes from interrupted sessions) stay hidden instead of surfacing as
+ * broken zero-second clips. WebM fallback clips keep the legacy `-dur{ms}`
+ * name suffix — there is no cheap in-process probe for that container.
+ */
 export async function listRecordings(): Promise<RecordingEntry[]> {
-  const dir = await ensureRecordingsDirectory();
-  const entries = await readdir(dir, { withFileTypes: true });
-  const webmFiles = entries
-    .filter((e) => e.isFile())
-    .map((e) => e.name)
-    .filter((name) => /\.(mp4|webm)$/i.test(name));
+  const files = (await walkGalleryCaptureFiles(getManagedGalleryRoots())).filter((file) =>
+    VIDEO_EXTENSION.test(file.fileName),
+  );
 
   const loaded = await Promise.all(
-    webmFiles.map(async (fileName): Promise<RecordingEntry | null> => {
-      const filePath = join(dir, fileName);
+    files.map(async (file): Promise<RecordingEntry | null> => {
       try {
-        const fileStats = await stat(filePath);
-        const stem = fileName.replace(/\.(mp4|webm)$/i, "");
-        const thumbName = `${stem}-thumb.jpg`;
-        const thumbPath = join(dir, thumbName);
-
-        let thumbnailDataUrl: string | undefined;
-        try {
-          const thumbBuf = await readFile(thumbPath);
-          thumbnailDataUrl = `data:image/jpeg;base64,${thumbBuf.toString("base64")}`;
-        } catch {
-          // No thumbnail for this recording — that's fine
+        let gameTitle = file.gameTitle;
+        let durationMs = 0;
+        if (file.fileName.toLowerCase().endsWith(".mp4")) {
+          const probe = await probeMp4File(file.filePath);
+          if (!probe || !probe.hasVideo || probe.durationMs <= 0) return null;
+          durationMs = probe.durationMs;
+        } else {
+          const legacy = parseLegacyRecordingName(file.fileName);
+          durationMs = legacy.durationMs;
+          gameTitle = gameTitle ?? legacy.gameTitle;
         }
 
-        // Parse durationMs encoded in filename as last numeric segment before extension
-        const durMatch = /-dur(\d+)\.(mp4|webm)$/i.exec(fileName);
-        const durationMs = durMatch ? Number(durMatch[1]) : 0;
-
-        // Parse game title from filename: {stamp}-{title}-{rand}[-dur{ms}].{ext}
-        const titleMatch =
-          /^[^-]+-[^-]+-([^-]+(?:-[^-]+)*?)-[a-f0-9]{6}(?:-dur\d+)?\.(mp4|webm)$/i.exec(
-            fileName,
-          );
-        const gameTitle = titleMatch
-          ? titleMatch[1].replace(/-/g, " ")
-          : undefined;
-
         return {
-          id: fileName,
-          fileName,
-          filePath,
-          createdAtMs: fileStats.birthtimeMs || fileStats.mtimeMs,
-          sizeBytes: fileStats.size,
+          id: file.filePath,
+          fileName: file.fileName,
+          filePath: file.filePath,
+          createdAtMs: file.createdAtMs,
+          sizeBytes: file.sizeBytes,
           durationMs,
           gameTitle,
-          thumbnailDataUrl,
+          thumbnailDataUrl: await readThumbnailDataUrl(file.filePath),
         };
       } catch {
         return null;
@@ -105,16 +132,17 @@ export async function listRecordings(): Promise<RecordingEntry[]> {
   return loaded
     .filter((item): item is RecordingEntry => item !== null)
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
-    .slice(0, RECORDING_LIMIT);
+    .slice(0, RECORDING_LIST_LIMIT);
 }
 
 export async function beginRecording(
   input: RecordingBeginRequest,
 ): Promise<RecordingBeginResult> {
-  const dir = await ensureRecordingsDirectory();
+  const tempDir = getGalleryTempDirectory();
+  await mkdir(tempDir, { recursive: true });
   const recordingId = randomUUID();
   const ext = extFromMimeType(input.mimeType);
-  const tempPath = join(dir, `${recordingId}${ext}.tmp`);
+  const tempPath = join(tempDir, `${recordingId}${ext}.tmp`);
   const writeStream = createWriteStream(tempPath);
   activeRecordings.set(recordingId, {
     writeStream,
@@ -144,8 +172,8 @@ export async function appendRecordingChunk(
  * file (written by the offline remux worker in its temp dir). Close the
  * (empty) chunk stream, then move the file into this recording's temp slot
  * so `finishRecording`'s rename to the final name works unchanged. The move
- * is copy + unlink — the native temp dir and the recordings directory can
- * live on different volumes, where a plain rename would fail with EXDEV.
+ * is copy + unlink — the native temp dir and the gallery root can live on
+ * different volumes, where a plain rename would fail with EXDEV.
  */
 export async function installRecordingFile(
   input: RecordingInstallRequest,
@@ -191,51 +219,46 @@ export async function finishRecording(
     });
   }
 
-  const dir = getRecordingsDirectory();
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const title = sanitizeTitleForFileName(input.gameTitle);
-  const rand = Math.random().toString(16).slice(2, 8);
-  const durSuffix =
-    input.durationMs > 0 ? `-dur${Math.round(input.durationMs)}` : "";
   const ext = extFromMimeType(rec.mimeType);
-  const fileName = `${stamp}-${title}-${rand}${durSuffix}${ext}`;
-  const finalPath = join(dir, fileName);
+  const gameFolder = sanitizeGameFolderName(input.gameTitle);
+  const dir = join(getGalleryRootDirectory(), gameFolder);
+  await mkdir(dir, { recursive: true });
+
+  // MP4s carry their duration in the `moov` box, so the official file name
+  // needs no suffix. The WebM fallback keeps the legacy `-dur{ms}` marker so
+  // its listing duration survives without a container probe.
+  const durSuffix =
+    ext === ".webm" && input.durationMs > 0
+      ? `-dur${Math.round(input.durationMs)}`
+      : "";
+  const base = buildCaptureBaseName(input.gameTitle, new Date());
+  const finalPath = await resolveUniqueCapturePath(dir, base, `${durSuffix}${ext}`);
 
   await rename(rec.tempPath, finalPath);
 
-  // Save thumbnail if provided
+  // Save thumbnail if provided (best-effort — never fail the recording).
   let thumbnailDataUrl: string | undefined;
   if (input.thumbnailDataUrl) {
     try {
       const { buffer } = dataUrlToBuffer(input.thumbnailDataUrl);
-      const stem = fileName.replace(/\.(mp4|webm)$/i, "");
-      const thumbPath = join(dir, `${stem}-thumb.jpg`);
-      await writeFile(thumbPath, buffer);
+      await writeFile(thumbnailPathForCapture(finalPath), buffer);
       thumbnailDataUrl = input.thumbnailDataUrl;
     } catch {
       // Thumbnail save is best-effort — don't fail the recording
     }
   }
 
-  // Enforce recording limit: delete oldest entries beyond RECORDING_LIMIT
-  const all = await listRecordings();
-  if (all.length > RECORDING_LIMIT) {
-    const toDelete = all.slice(RECORDING_LIMIT);
-    await Promise.all(
-      toDelete.map(async (entry) => {
-        await unlink(entry.filePath).catch(() => undefined);
-        const stem = entry.fileName.replace(/\.(mp4|webm)$/i, "");
-        await unlink(join(dir, `${stem}-thumb.jpg`)).catch(() => undefined);
-      }),
-    );
-  }
+  // Disk budget (replaces the old 20-item cap): prune the oldest captures
+  // when the gallery exceeds the configured limit. Throws when the new file
+  // alone cannot fit, and the renderer surfaces that as a save failure.
+  await pruneGalleryDiskLimit(finalPath);
 
   const fileStats = await stat(finalPath);
   return {
-    id: fileName,
-    fileName,
+    id: finalPath,
+    fileName: basename(finalPath),
     filePath: finalPath,
-    createdAtMs: Date.now(),
+    createdAtMs: fileStats.birthtimeMs || fileStats.mtimeMs || Date.now(),
     sizeBytes: fileStats.size,
     durationMs: input.durationMs,
     gameTitle: input.gameTitle,
@@ -258,16 +281,18 @@ export async function abortRecording(
 export async function deleteRecording(
   input: RecordingDeleteRequest,
 ): Promise<void> {
-  assertSafeRecordingId(input.id);
-  const dir = await ensureRecordingsDirectory();
-  const filePath = join(dir, input.id);
+  const filePath = await resolveTrustedOpenNowMediaPath(input.filePath);
+  if (!filePath) {
+    throw new Error("Invalid recording path");
+  }
   await unlink(filePath);
-  const stem = input.id.replace(/\.(mp4|webm)$/i, "");
-  await unlink(join(dir, `${stem}-thumb.jpg`)).catch(() => undefined);
+  await unlink(thumbnailPathForCapture(filePath)).catch(() => undefined);
 }
 
-export async function getRecordingFilePath(id: string): Promise<string> {
-  assertSafeRecordingId(id);
-  const dir = await ensureRecordingsDirectory();
-  return join(dir, id);
+export async function getRecordingFilePath(rawPath: string): Promise<string> {
+  const filePath = await resolveTrustedOpenNowMediaPath(rawPath);
+  if (!filePath) {
+    throw new Error("Invalid recording path");
+  }
+  return filePath;
 }

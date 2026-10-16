@@ -344,7 +344,7 @@ export function StreamQuickMenu({
                 onRecordingMixMicChange={onRecordingMixMicChange}
                 recCarouselRef={streamRecorder.recCarouselRef}
                 onToggleRecording={() => { void streamRecorder.toggleRecording(); }}
-                onDeleteRecording={(id) => { void streamRecorder.deleteRecording(id); }}
+                onDeleteRecording={(filePath) => { void streamRecorder.deleteRecording(filePath); }}
                 onScrollRecordings={streamRecorder.scrollRecordings}
               />
             )}
@@ -386,7 +386,10 @@ export function StreamQuickMenu({
             </div>
             <img
               className="sv-shot-modal-image"
-              src={screenshotGallery.selectedScreenshot.dataUrl}
+              src={
+                screenshotGallery.selectedScreenshotPreviewDataUrl ??
+                screenshotGallery.selectedScreenshot.thumbnailDataUrl
+              }
               alt={`Screenshot ${screenshotGallery.selectedScreenshot.fileName}`}
             />
             <div className="sv-shot-modal-actions">

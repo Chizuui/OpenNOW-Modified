@@ -1,12 +1,5 @@
 import { Buffer } from "node:buffer";
 
-export function sanitizeTitleForFileName(value: string | undefined): string {
-  const source = (value ?? "").trim().toLowerCase();
-  const compact = source.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  if (!compact) return "stream";
-  return compact.slice(0, 48);
-}
-
 export function dataUrlToBuffer(dataUrl: string): {
   ext: "png" | "jpg" | "webp";
   buffer: Buffer;
@@ -36,10 +29,4 @@ export function buildImageDataUrl(ext: string, buffer: Buffer): string {
         ? "image/webp"
         : "image/png";
   return `data:${mime};base64,${buffer.toString("base64")}`;
-}
-
-export function assertSafeMediaId(id: string, label: string): void {
-  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
-    throw new Error(`Invalid ${label} id`);
-  }
 }

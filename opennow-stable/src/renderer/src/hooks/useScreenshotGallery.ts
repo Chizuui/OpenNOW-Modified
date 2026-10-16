@@ -2,6 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { ScreenshotEntry } from "@shared/gfn";
 
+/**
+ * Client-side mirror of the main-process screenshot listing cap: newest 500
+ * entries are kept in renderer state. Entries only carry a small thumbnail;
+ * the full-resolution image is read on demand for the preview.
+ */
+const SCREENSHOT_LIST_CAP = 500;
+
 interface UseScreenshotGalleryOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   gameTitle: string;
@@ -22,6 +29,14 @@ export function useScreenshotGallery({
   const [isSavingScreenshot, setIsSavingScreenshot] = useState(false);
   const [galleryError, setGalleryError] = useState<string | null>(null);
   const [selectedScreenshotId, setSelectedScreenshotId] = useState<string | null>(null);
+  /**
+   * Full-resolution data URL of the selected screenshot, fetched on demand.
+   * Listing entries only carry a small thumbnail (`thumbnailDataUrl`) so a
+   * large library stays light in renderer memory.
+   */
+  const [selectedScreenshotPreviewDataUrl, setSelectedScreenshotPreviewDataUrl] = useState<
+    string | null
+  >(null);
   const galleryStripRef = useRef<HTMLDivElement | null>(null);
   const screenshotApiAvailable =
     typeof window.openNow?.captureNativeScreenshot === "function" &&
@@ -34,6 +49,22 @@ export function useScreenshotGallery({
     if (!selectedScreenshotId) return null;
     return screenshots.find((item) => item.id === selectedScreenshotId) ?? null;
   }, [screenshots, selectedScreenshotId]);
+
+  useEffect(() => {
+    setSelectedScreenshotPreviewDataUrl(null);
+    if (!selectedScreenshot) return;
+    if (typeof window.openNow?.readScreenshotPreview !== "function") return;
+    let cancelled = false;
+    window.openNow
+      .readScreenshotPreview({ filePath: selectedScreenshot.filePath })
+      .then((dataUrl) => {
+        if (!cancelled && dataUrl) setSelectedScreenshotPreviewDataUrl(dataUrl);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedScreenshot]);
 
   const refreshScreenshots = useCallback(async () => {
     setGalleryError(null);
@@ -66,7 +97,7 @@ export function useScreenshotGallery({
       // and saved by the main process straight into the gallery.
       if (nativeCaptureScreenshot) {
         const saved = await nativeCaptureScreenshot();
-        setScreenshots((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)].slice(0, 60));
+        setScreenshots((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)].slice(0, SCREENSHOT_LIST_CAP));
         return;
       }
 
@@ -87,7 +118,7 @@ export function useScreenshotGallery({
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL("image/png");
       const saved = await window.openNow.saveScreenshot({ dataUrl, gameTitle });
-      setScreenshots((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)].slice(0, 60));
+      setScreenshots((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)].slice(0, SCREENSHOT_LIST_CAP));
     } catch (error) {
       console.error("[StreamView] Failed to capture screenshot:", error);
       setGalleryError("Screenshot failed. Try again.");
@@ -112,7 +143,7 @@ export function useScreenshotGallery({
     if (!selectedScreenshot) return;
 
     try {
-      await window.openNow.deleteScreenshot({ id: selectedScreenshot.id });
+      await window.openNow.deleteScreenshot({ filePath: selectedScreenshot.filePath });
       setScreenshots((prev) => prev.filter((item) => item.id !== selectedScreenshot.id));
       setSelectedScreenshotId(null);
     } catch (error) {
@@ -130,7 +161,7 @@ export function useScreenshotGallery({
     if (!selectedScreenshot) return;
 
     try {
-      await window.openNow.saveScreenshotAs({ id: selectedScreenshot.id });
+      await window.openNow.saveScreenshotAs({ filePath: selectedScreenshot.filePath });
     } catch (error) {
       console.error("[StreamView] Failed to save screenshot as:", error);
       setGalleryError("Unable to save screenshot.");
@@ -150,6 +181,7 @@ export function useScreenshotGallery({
     galleryError,
     selectedScreenshot,
     selectedScreenshotId,
+    selectedScreenshotPreviewDataUrl,
     setSelectedScreenshotId,
     galleryStripRef,
     screenshotApiAvailable,

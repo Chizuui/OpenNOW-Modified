@@ -78,7 +78,7 @@ interface StreamQuickMenuMediaPageProps {
   onRecordingMixMicChange: (value: boolean) => void;
   recCarouselRef: RefObject<HTMLDivElement | null>;
   onToggleRecording: () => void;
-  onDeleteRecording: (id: string) => void;
+  onDeleteRecording: (filePath: string) => void;
   onScrollRecordings: (direction: "left" | "right") => void;
 }
 
@@ -388,7 +388,7 @@ export function StreamQuickMenuMediaPage({
                 onClick={() => onSelectScreenshot(shot.id)}
                 title={new Date(shot.createdAtMs).toLocaleString()}
               >
-                <img src={shot.dataUrl} alt={`Screenshot ${shot.fileName}`} />
+                <img src={shot.thumbnailDataUrl} alt={`Screenshot ${shot.fileName}`} />
               </button>
             ))}
           </div>
@@ -483,7 +483,7 @@ export function StreamQuickMenuMediaPage({
                       className="sidebar-rec-card-action"
                       aria-label="Show in folder"
                       title="Show in folder"
-                      onClick={() => { void window.openNow.showRecordingInFolder(recording.id); }}
+                      onClick={() => { void window.openNow.showRecordingInFolder(recording.filePath); }}
                       disabled={typeof window.openNow?.showRecordingInFolder !== "function"}
                     >
                       <FolderOpen size={11} />
@@ -493,7 +493,7 @@ export function StreamQuickMenuMediaPage({
                       className="sidebar-rec-card-action sidebar-rec-card-action--danger"
                       aria-label="Delete recording"
                       title="Delete"
-                      onClick={() => onDeleteRecording(recording.id)}
+                      onClick={() => onDeleteRecording(recording.filePath)}
                     >
                       <Trash2 size={11} />
                     </button>

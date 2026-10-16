@@ -95,6 +95,12 @@ export const IPC_CHANNELS = {
   SCREENSHOT_LIST: "screenshot:list",
   SCREENSHOT_DELETE: "screenshot:delete",
   SCREENSHOT_SAVE_AS: "screenshot:save-as",
+  /** Full-resolution data URL for the selected gallery screenshot (preview). */
+  SCREENSHOT_READ: "screenshot:read",
+  /** Gallery capture folder picker (configured by the user in settings). */
+  GALLERY_CHOOSE_DIRECTORY: "gallery:choose-directory",
+  /** Managed gallery bytes/files + configured disk budget. */
+  GALLERY_USAGE: "gallery:usage",
   RECORDING_BEGIN: "recording:begin",
   RECORDING_CHUNK: "recording:chunk",
   RECORDING_FINISH: "recording:finish",

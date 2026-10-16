@@ -1,9 +1,10 @@
-import { app, protocol } from "electron";
+import { protocol } from "electron";
 import { createReadStream } from "node:fs";
-import { join, resolve, relative } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { realpath, stat } from "node:fs/promises";
 import { isPlayableVideoFilePath } from "@shared/mediaPlayback";
+import { getManagedGalleryRoots } from "./media/gallery";
 
 const MAX_MEDIA_PATH_LENGTH = 4096;
 
@@ -49,18 +50,23 @@ function parseByteRangeHeader(rangeHeader: string, fileSize: number): { start: n
 }
 
 /**
- * Resolve a user-supplied path to a real path under Pictures/OpenNOW, or null if unsafe / missing.
+ * Resolve a user-supplied path to a real path under one of the managed media
+ * roots (the configured capture gallery root plus the legacy
+ * `Pictures/OpenNOW` root), or null if unsafe / missing.
  */
 export async function resolveTrustedOpenNowMediaPath(rawFp: string): Promise<string | null> {
   if (typeof rawFp !== "string" || rawFp.length > MAX_MEDIA_PATH_LENGTH) return null;
   try {
-    const allowedRoot = resolve(join(app.getPath("pictures"), "OpenNOW"));
     const fpResolved = resolve(rawFp);
-    const allowedRootReal = await realpath(allowedRoot).catch(() => allowedRoot);
     const fpReal = await realpath(fpResolved).catch(() => fpResolved);
-    const rel = relative(allowedRootReal, fpReal);
-    if (rel.startsWith("..")) return null;
-    return fpReal;
+    for (const root of getManagedGalleryRoots()) {
+      const rootReal = await realpath(root).catch(() => root);
+      const rel = relative(rootReal, fpReal);
+      if (rel.length > 0 && !rel.startsWith("..") && !isAbsolute(rel)) {
+        return fpReal;
+      }
+    }
+    return null;
   } catch {
     return null;
   }

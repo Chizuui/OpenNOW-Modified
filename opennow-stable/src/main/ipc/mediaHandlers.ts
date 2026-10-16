@@ -2,6 +2,7 @@ import type { BrowserWindow, IpcMain, Shell } from "electron";
 import { unlink } from "node:fs/promises";
 import { IPC_CHANNELS } from "@shared/ipc";
 import type {
+  GalleryUsage,
   RecordingAbortRequest,
   RecordingBeginRequest,
   RecordingBeginResult,
@@ -19,9 +20,12 @@ import {
   getTrustedVideoPlaybackFileUrl,
   resolveTrustedOpenNowMediaPath,
 } from "../mediaPaths";
+import { getGalleryDiskLimitBytes, getManagedGalleryRoots } from "../media/gallery";
+import { getGalleryUsage } from "../media/galleryFiles";
 import {
   deleteScreenshot,
   listScreenshots,
+  readScreenshotDataUrl,
   saveScreenshot,
   saveScreenshotAs,
 } from "../media/screenshots";
@@ -63,6 +67,45 @@ export function registerMediaIpcHandlers(deps: MediaIpcHandlerDeps): void {
   );
 
   deps.ipcMain.handle(
+    IPC_CHANNELS.SCREENSHOT_READ,
+    async (_event, payload: { filePath: string }): Promise<string | null> => {
+      const rawFp = payload?.filePath;
+      if (typeof rawFp !== "string") return null;
+      try {
+        return await readScreenshotDataUrl(rawFp);
+      } catch (err) {
+        console.warn("SCREENSHOT_READ error:", err);
+        return null;
+      }
+    },
+  );
+
+  deps.ipcMain.handle(
+    IPC_CHANNELS.GALLERY_CHOOSE_DIRECTORY,
+    async (): Promise<string | null> => {
+      const options: Electron.OpenDialogOptions = {
+        title: "Choose capture folder",
+        properties: ["openDirectory", "createDirectory"],
+      };
+      const mainWindow = deps.getMainWindow();
+      const result =
+        mainWindow && !mainWindow.isDestroyed()
+          ? await deps.dialog.showOpenDialog(mainWindow, options)
+          : await deps.dialog.showOpenDialog(options);
+      if (result.canceled || !result.filePaths[0]) return null;
+      return result.filePaths[0];
+    },
+  );
+
+  deps.ipcMain.handle(
+    IPC_CHANNELS.GALLERY_USAGE,
+    async (): Promise<GalleryUsage> => {
+      const usage = await getGalleryUsage(getManagedGalleryRoots());
+      return { ...usage, limitBytes: getGalleryDiskLimitBytes() };
+    },
+  );
+
+  deps.ipcMain.handle(
     IPC_CHANNELS.MEDIA_LIST_BY_GAME,
     async (_event, payload: { gameTitle?: string } = {}) => {
       const title = (payload?.gameTitle || "").trim().toLowerCase();
@@ -75,7 +118,8 @@ export function registerMediaIpcHandlers(deps: MediaIpcHandlerDeps): void {
 
       const matchedScreens = screenshots.filter((s) => {
         if (!needle) return true;
-        const candidate = normalize(s.fileName) + normalize(s.filePath || "");
+        const candidate =
+          normalize(s.gameTitle) + normalize(s.fileName) + normalize(s.filePath || "");
         return candidate.includes(needle);
       });
 

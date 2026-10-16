@@ -1,6 +1,6 @@
 import { app, type BrowserWindow } from "electron";
-import { join } from "node:path";
-import { copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { copyFile, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import type {
   ScreenshotDeleteRequest,
   ScreenshotEntry,
@@ -9,62 +9,91 @@ import type {
   ScreenshotSaveRequest,
 } from "@shared/gfn";
 import {
-  assertSafeMediaId,
-  dataUrlToBuffer,
-  sanitizeTitleForFileName,
-} from "./mediaFiles";
+  buildScreenshotThumbnailDataUrl,
+  getGalleryRootDirectory,
+  getManagedGalleryRoots,
+  pruneGalleryDiskLimit,
+  writeScreenshotThumbnailSidecar,
+} from "./gallery";
+import { walkGalleryCaptureFiles } from "./galleryFiles";
+import {
+  buildCaptureBaseName,
+  resolveUniqueCapturePath,
+  sanitizeGameFolderName,
+  thumbnailPathForCapture,
+} from "./galleryNaming";
+import { dataUrlToBuffer } from "./mediaFiles";
+import { resolveTrustedOpenNowMediaPath } from "../mediaPaths";
 
-const SCREENSHOT_LIMIT = 60;
+/**
+ * Listing safety cap only — retention is governed by the gallery disk budget
+ * (`galleryDiskLimitGb`).
+ */
+const SCREENSHOT_LIST_LIMIT = 500;
+
+const IMAGE_EXTENSION = /\.(png|jpe?g|webp)$/i;
 
 export interface ScreenshotSaveAsDeps {
   dialog: Electron.Dialog;
   getMainWindow(): BrowserWindow | null;
 }
 
-export function getScreenshotDirectory(): string {
-  return join(app.getPath("pictures"), "OpenNOW", "Screenshots");
-}
-
-export async function ensureScreenshotDirectory(): Promise<string> {
-  const dir = getScreenshotDirectory();
-  await mkdir(dir, { recursive: true });
-  return dir;
-}
-
 export function buildScreenshotDataUrl(ext: string, buffer: Buffer): string {
   const mime =
-    ext === "jpg" ? "image/jpeg" : ext === "webp" ? "image/webp" : "image/png";
+    ext === "jpg" || ext === "jpeg"
+      ? "image/jpeg"
+      : ext === "webp"
+        ? "image/webp"
+        : "image/png";
   return `data:${mime};base64,${buffer.toString("base64")}`;
 }
 
-export function assertSafeScreenshotId(id: string): void {
-  assertSafeMediaId(id, "screenshot");
+/**
+ * Full-resolution data URL for a gallery screenshot — used by the preview
+ * panel (one image at a time) and as the decode fallback for formats
+ * `nativeImage` cannot resize (WebP).
+ */
+export async function readScreenshotDataUrl(rawPath: string): Promise<string | null> {
+  const filePath = await resolveTrustedOpenNowMediaPath(rawPath);
+  if (!filePath || !IMAGE_EXTENSION.test(filePath)) return null;
+  try {
+    const buffer = await readFile(filePath);
+    const ext = /\.([^.]+)$/.exec(filePath)?.[1]?.toLowerCase() ?? "png";
+    return buildScreenshotDataUrl(ext, buffer);
+  } catch {
+    return null;
+  }
 }
 
+/**
+ * Gallery listing, newest first. Both layouts are supported:
+ *  - official per-game folders (`<root>/<Game>/…`) → gameTitle from the folder
+ *  - legacy flat `Screenshots` dirs
+ * Entries carry a small JPEG `thumbnailDataUrl` so a large library stays
+ * light in renderer memory; the full-resolution image is read on demand.
+ */
 export async function listScreenshots(): Promise<ScreenshotEntry[]> {
-  const dir = await ensureScreenshotDirectory();
-  const entries = await readdir(dir, { withFileTypes: true });
-  const screenshotFiles = entries
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .filter((name) => /\.(png|jpg|jpeg|webp)$/i.test(name));
+  const files = (await walkGalleryCaptureFiles(getManagedGalleryRoots())).filter((file) =>
+    IMAGE_EXTENSION.test(file.fileName),
+  );
 
   const loaded = await Promise.all(
-    screenshotFiles.map(async (fileName): Promise<ScreenshotEntry | null> => {
-      const filePath = join(dir, fileName);
+    files.map(async (file): Promise<ScreenshotEntry | null> => {
       try {
-        const fileStats = await stat(filePath);
-        const fileBuffer = await readFile(filePath);
-        const extMatch = /\.([^.]+)$/.exec(fileName);
-        const ext = (extMatch?.[1] ?? "png").toLowerCase();
+        if (file.sizeBytes <= 0) return null;
+        const thumbnailDataUrl =
+          (await buildScreenshotThumbnailDataUrl(file.filePath)) ??
+          (await readScreenshotDataUrl(file.filePath));
+        if (!thumbnailDataUrl) return null;
 
         return {
-          id: fileName,
-          fileName,
-          filePath,
-          createdAtMs: fileStats.birthtimeMs || fileStats.mtimeMs,
-          sizeBytes: fileStats.size,
-          dataUrl: buildScreenshotDataUrl(ext, fileBuffer),
+          id: file.filePath,
+          fileName: file.fileName,
+          filePath: file.filePath,
+          createdAtMs: file.createdAtMs,
+          sizeBytes: file.sizeBytes,
+          gameTitle: file.gameTitle,
+          thumbnailDataUrl,
         };
       } catch {
         return null;
@@ -75,51 +104,68 @@ export async function listScreenshots(): Promise<ScreenshotEntry[]> {
   return loaded
     .filter((item): item is ScreenshotEntry => item !== null)
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
-    .slice(0, SCREENSHOT_LIMIT);
+    .slice(0, SCREENSHOT_LIST_LIMIT);
 }
 
 export async function saveScreenshot(
   input: ScreenshotSaveRequest,
 ): Promise<ScreenshotEntry> {
   const { ext, buffer } = dataUrlToBuffer(input.dataUrl);
-  const dir = await ensureScreenshotDirectory();
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const title = sanitizeTitleForFileName(input.gameTitle);
-  const fileName = `${stamp}-${title}-${Math.random().toString(16).slice(2, 8)}.${ext}`;
-  const filePath = join(dir, fileName);
+  const gameFolder = sanitizeGameFolderName(input.gameTitle);
+  const dir = join(getGalleryRootDirectory(), gameFolder);
+  await mkdir(dir, { recursive: true });
+
+  const base = buildCaptureBaseName(input.gameTitle, new Date());
+  const filePath = await resolveUniqueCapturePath(dir, base, `.${ext}`);
 
   await writeFile(filePath, buffer);
 
+  // Sidecar preview for the gallery strip (best-effort — if the bytes are not
+  // decodable the listing falls back to the raw image data URL).
+  const thumbnailDataUrl =
+    (await writeScreenshotThumbnailSidecar(filePath, buffer)) ??
+    buildScreenshotDataUrl(ext, buffer);
+
+  // Disk budget (replaces the old 60-item listing cap): prune the oldest
+  // captures when the gallery exceeds the configured limit; throws when this
+  // file alone cannot fit, and the save is reported as failed.
+  await pruneGalleryDiskLimit(filePath);
+
+  const fileStats = await stat(filePath);
   return {
-    id: fileName,
-    fileName,
+    id: filePath,
+    fileName: basename(filePath),
     filePath,
-    createdAtMs: Date.now(),
-    sizeBytes: buffer.byteLength,
-    dataUrl: buildScreenshotDataUrl(ext, buffer),
+    createdAtMs: fileStats.birthtimeMs || fileStats.mtimeMs || Date.now(),
+    sizeBytes: fileStats.size,
+    gameTitle: input.gameTitle,
+    thumbnailDataUrl,
   };
 }
 
 export async function deleteScreenshot(
   input: ScreenshotDeleteRequest,
 ): Promise<void> {
-  assertSafeScreenshotId(input.id);
-  const dir = await ensureScreenshotDirectory();
-  const filePath = join(dir, input.id);
+  const filePath = await resolveTrustedOpenNowMediaPath(input.filePath);
+  if (!filePath) {
+    throw new Error("Invalid screenshot path");
+  }
   await unlink(filePath);
+  await unlink(thumbnailPathForCapture(filePath)).catch(() => undefined);
 }
 
 export async function saveScreenshotAs(
   input: ScreenshotSaveAsRequest,
   deps: ScreenshotSaveAsDeps,
 ): Promise<ScreenshotSaveAsResult> {
-  assertSafeScreenshotId(input.id);
-  const dir = await ensureScreenshotDirectory();
-  const sourcePath = join(dir, input.id);
+  const sourcePath = await resolveTrustedOpenNowMediaPath(input.filePath);
+  if (!sourcePath) {
+    throw new Error("Invalid screenshot path");
+  }
 
   const saveDialogOptions = {
     title: "Save Screenshot",
-    defaultPath: join(app.getPath("pictures"), input.id),
+    defaultPath: join(app.getPath("pictures"), basename(sourcePath)),
     filters: [
       { name: "PNG Image", extensions: ["png"] },
       { name: "JPEG Image", extensions: ["jpg", "jpeg"] },

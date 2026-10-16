@@ -22,6 +22,8 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { IPC_CHANNELS } from "@shared/ipc";
 import { registerOpenNowMediaProtocol } from "./mediaPaths";
+import { getManagedGalleryRoots } from "./media/gallery";
+import { cleanupStaleGalleryTemps } from "./media/galleryFiles";
 import { initLogCapture } from "@shared/logger";
 import { cacheManager } from "./services/cacheManager";
 import { refreshScheduler } from "./services/refreshScheduler";
@@ -547,6 +549,17 @@ app.whenReady().then(async () => {
 
   settingsManager = getSettingsManager();
   configureIdentifyAsSteamDeck(() => settingsManager.get("identifyAsSteamDeck"));
+
+  // Reap recording temp files left behind by a session that quit/crashed
+  // mid-write; nothing is recording this early in startup, so every `.tmp`
+  // under the gallery roots is stale.
+  void cleanupStaleGalleryTemps(getManagedGalleryRoots())
+    .then((removed) => {
+      if (removed > 0) {
+        console.log(`[gallery] removed ${removed} stale recording temp file(s)`);
+      }
+    })
+    .catch((err) => console.warn("[gallery] stale temp cleanup failed:", err));
   appUpdater = createAppUpdaterController({
     onStateChanged: emitUpdaterStateToRenderer,
     automaticChecksEnabled: settingsManager.get("autoCheckForUpdates"),

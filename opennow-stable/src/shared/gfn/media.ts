@@ -4,11 +4,13 @@ export interface ScreenshotSaveRequest {
 }
 
 export interface ScreenshotDeleteRequest {
-  id: string;
+  /** Absolute path of the gallery file (entries carry `filePath` as their id). */
+  filePath: string;
 }
 
 export interface ScreenshotSaveAsRequest {
-  id: string;
+  /** Absolute path of the gallery file to copy to the chosen target. */
+  filePath: string;
 }
 
 export interface ScreenshotSaveAsResult {
@@ -22,7 +24,13 @@ export interface ScreenshotEntry {
   filePath: string;
   createdAtMs: number;
   sizeBytes: number;
-  dataUrl: string;
+  /** Per-game folder name in the official layout; undefined for legacy files. */
+  gameTitle?: string;
+  /**
+   * Small JPEG preview for the gallery strip. The full-resolution image is
+   * read on demand (`readScreenshotPreview`) so large libraries stay light.
+   */
+  thumbnailDataUrl: string;
 }
 
 export interface RecordingEntry {
@@ -73,7 +81,15 @@ export interface RecordingAbortRequest {
 }
 
 export interface RecordingDeleteRequest {
-  id: string;
+  /** Absolute path of the gallery file (entries carry `filePath` as their id). */
+  filePath: string;
+}
+
+export interface GalleryUsage {
+  usedBytes: number;
+  fileCount: number;
+  /** 0 = unlimited (mirrors the `galleryDiskLimitGb` setting). */
+  limitBytes: number;
 }
 
 export interface MediaListingEntry {

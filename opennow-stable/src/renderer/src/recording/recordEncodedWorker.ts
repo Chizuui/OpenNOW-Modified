@@ -206,6 +206,10 @@ let lastAudioRtp: number | null = null;
 let lastVideoTsUs: number | null = null;
 let lastAudioTsUs: number | null = null;
 let finalized = false;
+// Video frames that actually reached the current muxer (pre-roll head + live).
+// A recording that finalizes with zero frames would emit a header-only file;
+// the guard in finalize() drops it instead of saving a broken clip.
+let muxedVideoFrames = 0;
 // DVR ring (GFN-style pre-roll): the worker is armed from the moment the
 // transforms attach (session start) and buffers the last `dvrPreRollUs` of
 // keyframe-aligned video (plus a matching audio window) here. `start` slices
@@ -521,6 +525,7 @@ function beginMuxer(forceRingAudio = false): void {
       // Ring frames carry no metadata — the decoderConfig for the first video
       // sample is supplied by the muxer's video config (codec record).
       handle.video(convertSample(frame.data), frame.type, frame.tsUs);
+      muxedVideoFrames += 1;
     }
   }
   // `forceRingAudio` (Instant Replay snapshot) keeps the buffered game audio
@@ -546,6 +551,7 @@ function startRecording(forceRingAudio = false): boolean {
   recordingActive = true;
   recordingPendingMuxer = !videoConfigReady;
   recordingStartUs = lastVideoTsUs ?? 0;
+  muxedVideoFrames = 0;
   // The video head lands `preRollUs` before the record point; shift the audio
   // (pre-roll slice and live) forward by that duration to keep A/V in sync.
   audioShiftUs = dvrPreRollUs;
@@ -675,9 +681,12 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
       dvrVideoRing.push({ data: raw, tsUs, type });
     }
     if (!recordingActive) return;
-    handle?.video(convertSample(raw), type, tsUs, {
-      decoderConfig: { codec: codecString, description },
-    });
+    if (handle) {
+      handle.video(convertSample(raw), type, tsUs, {
+        decoderConfig: { codec: codecString, description },
+      });
+      muxedVideoFrames += 1;
+    }
     return;
   }
   if (recordingPendingMuxer && handle) {
@@ -687,6 +696,7 @@ function captureVideo(frame: RTCEncodedVideoFrame): void {
   }
   if (recordingActive && handle) {
     handle.video(convertSample(raw), type, tsUs);
+    muxedVideoFrames += 1;
     return;
   }
   // Armed: buffer into the DVR ring for the next recording's pre-roll.
@@ -821,6 +831,15 @@ async function finalize(): Promise<void> {
         console.warn("[recordEncodedWorker] Mic mix flush failed:", error);
       }
     }
+    if (muxedVideoFrames === 0) {
+      // Nothing reached the muxer (e.g. the first keyframe never arrived):
+      // finalizing would emit an empty/header-only file. Drop it and report —
+      // the renderer aborts the file instead of saving a broken clip.
+      resetRecordingState();
+      finalized = false;
+      postError("Recording captured no video frames — nothing was saved.");
+      return;
+    }
     handle?.finalize();
     writer?.flushAll();
     // Re-arm for the next recording: clear per-recording state (the codec
@@ -845,6 +864,7 @@ function resetRecordingState(): void {
   audioConfigReady = false;
   av1CPatched = false;
   audioShiftUs = 0;
+  muxedVideoFrames = 0;
 }
 
 /** Abort the current recording without finalizing: drop state, stay armed. */
@@ -882,6 +902,13 @@ function saveSnapshot(): void {
     if (!startRecording(true) || !handle) {
       resetRecordingState();
       postError("Instant Replay could not be saved.");
+      return;
+    }
+    if (muxedVideoFrames === 0) {
+      // The ring had frames but none made it into the muxer (no
+      // keyframe-aligned head): saving would produce an audio-only clip.
+      resetRecordingState();
+      postError("Instant Replay buffer is still filling — try again in a few seconds.");
       return;
     }
     handle.finalize();

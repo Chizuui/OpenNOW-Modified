@@ -131,6 +131,17 @@ export interface Settings {
    * Official client default: 120. Applied at session start (new sessions).
    */
   instantReplaySeconds: number;
+  /**
+   * Capture gallery root. New captures (Instant Replay saves, recordings,
+   * screenshots) are written to per-game folders under it, in the official
+   * layout; empty keeps the default `Pictures/OpenNOW`.
+   */
+  galleryDirectory: string;
+  /**
+   * Disk budget (GB) for the whole capture gallery; 0 = unlimited. Oldest
+   * captures are pruned automatically once the budget is exceeded.
+   */
+  galleryDiskLimitGb: number;
   mouseSensitivity: number;
   mouseAcceleration: number;
   shortcutToggleStats: string;
@@ -332,6 +343,10 @@ export function createDefaultSettings(platform: string): Settings {
     codec: DEFAULT_STREAM_PREFERENCES.codec,
     fallbackCodec: DEFAULT_STREAM_PREFERENCES.fallbackCodec,
     decoderPreference: "auto",
+    // Capture gallery: per-game folders under this root (official layout).
+    // Empty keeps the default `Pictures/OpenNOW`; 0 GB = unlimited budget.
+    galleryDirectory: "",
+    galleryDiskLimitGb: 0,
     encoderPreference: "auto",
     colorQuality: DEFAULT_STREAM_PREFERENCES.colorQuality,
     region: "",

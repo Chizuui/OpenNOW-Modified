@@ -4,6 +4,7 @@ import type {
   ColorQuality,
   EntitledResolution,
   FallbackCodecPreference,
+  GalleryUsage,
   Settings,
   VideoCodec,
 } from "@shared/gfn";
@@ -38,6 +39,7 @@ import { SelectDropdown, type SelectDropdownOption } from "../../ui/SelectDropdo
 import { SettingRange } from "../SettingRange";
 import {
   colorQualityOptions,
+  formatBytes,
   getFpsForResolution,
   groupResolutions,
   inferAspectRatioFromResolution,
@@ -91,6 +93,32 @@ export function StreamQualityControls({
     handleChange("instantReplaySeconds", clamped);
     setDvrSecondsDraft(String(clamped));
   }, [dvrSecondsDraft, handleChange]);
+  // Capture gallery: custom root (native folder picker) + disk budget with
+  // live usage from the main process. The usage line doubles as feedback for
+  // the picker (covers both the configured and the legacy default root).
+  const [galleryUsage, setGalleryUsage] = useState<GalleryUsage | null>(null);
+  const refreshGalleryUsage = useCallback(async () => {
+    if (typeof window.openNow?.getGalleryUsage !== "function") return;
+    try {
+      setGalleryUsage(await window.openNow.getGalleryUsage());
+    } catch {
+      setGalleryUsage(null);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshGalleryUsage();
+  }, [refreshGalleryUsage]);
+  const chooseGalleryDirectory = useCallback(async () => {
+    if (typeof window.openNow?.chooseGalleryDirectory !== "function") return;
+    try {
+      const dir = await window.openNow.chooseGalleryDirectory();
+      if (!dir) return;
+      handleChange("galleryDirectory", dir);
+      void refreshGalleryUsage();
+    } catch (error) {
+      console.error("[Settings] Failed to choose gallery folder:", error);
+    }
+  }, [handleChange, refreshGalleryUsage]);
   const nativeStreamerStatus = useNativeStreamerStatus(settings.streamClientMode === "native");
   const nativeAvailability = useMemo<NativeCodecAvailability | null>(
     () => (settings.streamClientMode === "native"
@@ -645,6 +673,81 @@ export function StreamQualityControls({
       </div>
         </>
       )}
+
+      <div className="settings-row settings-row--column">
+        <div className="settings-row-top">
+          <label className="settings-label">{t("settings.video.galleryDirectory")}</label>
+        </div>
+        <div className="settings-chip-row">
+          <button
+            type="button"
+            className="settings-chip"
+            onClick={() => { void chooseGalleryDirectory(); }}
+          >
+            <span>{t("settings.video.galleryDirectoryBrowse")}</span>
+          </button>
+          {settings.galleryDirectory ? (
+            <button
+              type="button"
+              className="settings-chip"
+              onClick={() => handleChange("galleryDirectory", "")}
+            >
+              <span>{t("settings.video.galleryDirectoryReset")}</span>
+            </button>
+          ) : null}
+        </div>
+        <span className="settings-subtle-hint">
+          {settings.galleryDirectory
+            ? t("settings.video.galleryDirectoryCustomHint", {
+                path: settings.galleryDirectory,
+              })
+            : t("settings.video.galleryDirectoryHint")}
+        </span>
+      </div>
+
+      <div className="settings-row settings-row--column">
+        <div className="settings-row-top">
+          <label
+            id="settings-gallery-disk-limit-label"
+            className="settings-label"
+            htmlFor="settings-gallery-disk-limit-slider"
+          >
+            {t("settings.video.galleryDiskLimit")}
+          </label>
+          <span className="settings-value-badge">
+            {settings.galleryDiskLimitGb > 0
+              ? `${settings.galleryDiskLimitGb} GB`
+              : t("settings.video.galleryDiskLimitUnlimited")}
+          </span>
+        </div>
+        <SettingRange
+          id="settings-gallery-disk-limit-slider"
+          className="settings-slider"
+          min={0}
+          max={500}
+          step={5}
+          value={settings.galleryDiskLimitGb}
+          onPreview={(value) => handlePreview("galleryDiskLimitGb", value)}
+          onCommit={(value) => {
+            handleChange("galleryDiskLimitGb", value);
+            void refreshGalleryUsage();
+          }}
+        />
+        <span className="settings-subtle-hint">
+          {t("settings.video.galleryDiskLimitHint")}
+        </span>
+        {galleryUsage ? (
+          <span className="settings-subtle-hint">
+            {t("settings.video.galleryUsage", {
+              used: formatBytes(galleryUsage.usedBytes),
+              limit:
+                galleryUsage.limitBytes > 0
+                  ? formatBytes(galleryUsage.limitBytes)
+                  : t("settings.video.galleryDiskLimitUnlimited"),
+            })}
+          </span>
+        ) : null}
+      </div>
 
       <div className="settings-row settings-row--column">
         <div className="settings-row-top">

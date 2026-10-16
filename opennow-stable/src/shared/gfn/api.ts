@@ -61,6 +61,7 @@ import type { SubscriptionInfo } from "./subscription";
 import type { ThankYouDataResult } from "./thankYou";
 import type { AppUpdaterState, ReleaseHighlightsPayload } from "./updater";
 import type {
+  GalleryUsage,
   MediaListingResult,
   RecordingAbortRequest,
   RecordingBeginRequest,
@@ -278,6 +279,15 @@ export interface OpenNowApi {
   /** Export a screenshot to a user-selected path */
   saveScreenshotAs(input: ScreenshotSaveAsRequest): Promise<ScreenshotSaveAsResult>;
 
+  /** Full-resolution data URL for a gallery screenshot (preview on selection) */
+  readScreenshotPreview(input: { filePath: string }): Promise<string | null>;
+
+  /** Pick a capture-gallery folder in a native dialog; null when cancelled */
+  chooseGalleryDirectory(): Promise<string | null>;
+
+  /** Managed gallery usage (bytes/files) plus the configured disk budget */
+  getGalleryUsage(): Promise<GalleryUsage>;
+
   /** Listen for screenshot hotkey events from the main process (F11) */
   onTriggerScreenshot(listener: () => void): () => void;
 
@@ -316,7 +326,7 @@ export interface OpenNowApi {
   deleteRecording(input: RecordingDeleteRequest): Promise<void>;
 
   /** Reveal a saved recording in the system file manager */
-  showRecordingInFolder(id: string): Promise<void>;
+  showRecordingInFolder(filePath: string): Promise<void>;
 
   /** List screenshot and recording media, optionally filtered by game title */
   listMediaByGame(input?: { gameTitle?: string }): Promise<MediaListingResult>;
