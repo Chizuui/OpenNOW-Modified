@@ -21,9 +21,9 @@ import { getActiveWebRtcPeerConnection } from "../platforms/gfn/webrtcClient";
 
 // Web recording uses one of two strategies (see selectRecordingStrategy):
 // "raw-track" hands MediaRecorder the incoming WebRTC track directly (no
-// canvas/draw loop) and is only taken when the stream already fits the user's
-// recording cap AND a hardware AVC encoder is available; "canvas-downscale"
-// bounds the encode cost to the cap (720p30 by default; resolution/FPS are
+// canvas/draw loop) and is taken whenever the stream already fits the user's
+// recording cap AND an AVC container is supported; "canvas-downscale" bounds
+// the encode cost to the cap (720p30 by default; resolution/FPS are
 // user-selectable via recordingResolution / recordingFps settings).
 // Resolver that extracts the video track a MediaStreamTrackGenerator exposes
 // for MediaRecorder, regardless of which API shape the runtime ships.
@@ -1069,11 +1069,12 @@ export function useStreamRecorder({
     }
 
     // Raw-track path: no canvas, no draw loop — MediaRecorder encodes every
-    // decoded frame directly. Canvas-downscale path (fallback for software-only
-    // platforms): draw at most one frame per record-period into a capped canvas
-    // so a full-res software re-encode can't starve the main thread that also
-    // runs the WebRTC decoder. The cap follows the user's
-    // recordingResolution/recordingFps settings.
+    // decoded frame directly. Canvas-downscale path (taken when the stream
+    // exceeds the cap or no AVC container is available): draw at most one
+    // frame per record-period into a capped canvas so a full-res software
+    // re-encode can't starve the main thread that also runs the WebRTC
+    // decoder. The cap follows the user's recordingResolution/recordingFps
+    // settings.
     const rawTrackMode = strategy === "raw-track";
     // Cap resolved once above — the strategy gate and the canvas draw loop
     // below share it, so the raw-track path can never outrun the user's

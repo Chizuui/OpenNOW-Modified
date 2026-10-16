@@ -23,16 +23,12 @@ async function pick(
   stream: { width: number; height: number; fps: number | null },
   cap: { width: number; height: number; fps: number },
   encodedTransformAvailable = false,
-  probe: () => Promise<{ powerEfficient?: boolean } | undefined> = async () => ({
-    powerEfficient: true,
-  }),
 ) {
   const choice = await selectRecordingStrategy(
     isTypeSupported,
     stream,
     cap,
     encodedTransformAvailable,
-    probe,
   );
   return { strategy: choice.strategy, mimeType: choice.mimeType, hwAccelerated: choice.hwAccelerated };
 }
@@ -60,7 +56,7 @@ test("recording strategy prefers encoded transform whenever it is available (cap
   // path, even when the stream exceeds the cap and even without AVC support
   // (AV1/VP9 capture goes to WebM). "Jangan di cap": no cap involved.
   assert.deepEqual(
-    await pick(() => true, STREAM_1080P60, CAP_720P30, true, async () => ({ powerEfficient: false })),
+    await pick(() => true, STREAM_1080P60, CAP_720P30, true),
     { strategy: "encoded-transform", mimeType: "video/mp4", hwAccelerated: true },
   );
   assert.deepEqual(
@@ -69,10 +65,14 @@ test("recording strategy prefers encoded transform whenever it is available (cap
   );
 });
 
-test("recording strategy uses raw track only when stream fits cap AND AVC encode is hardware", async () => {
-  // Stream already within the 720p30 cap + hardware AVC → raw track.
+test("recording strategy uses the raw track whenever the stream fits the cap", async () => {
+  // Stream already within the 720p30 cap → direct track capture. The canvas
+  // pipeline would re-encode the SAME pixels with extra per-frame main-thread
+  // work (it does not downscale anything within the cap), so it is never
+  // chosen here — the field render drops during recording came from exactly
+  // that overhead.
   assert.deepEqual(
-    await pick(() => true, STREAM_720P30, CAP_720P30, false, async () => ({ powerEfficient: true })),
+    await pick(() => true, STREAM_720P30, CAP_720P30),
     {
       strategy: "raw-track",
       mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
@@ -85,20 +85,14 @@ test("recording strategy uses raw track only when stream fits cap AND AVC encode
     await pick(() => true, { width: 1280, height: 720, fps: null }, CAP_720P30),
     { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2", hwAccelerated: true },
   );
-  // Only non-baseline AVC MP4 supported, hardware → still raw-track.
+  // Only non-baseline AVC MP4 supported → still raw-track.
   assert.deepEqual(
-    await pick(
-      (mimeType) => mimeType === "video/mp4;codecs=avc1",
-      STREAM_720P30,
-      CAP_720P30,
-      false,
-      async () => ({ powerEfficient: true }),
-    ),
+    await pick((mimeType) => mimeType === "video/mp4;codecs=avc1", STREAM_720P30, CAP_720P30),
     { strategy: "raw-track", mimeType: "video/mp4;codecs=avc1", hwAccelerated: true },
   );
-  // Stream resolution EXCEEDS the cap even with a hardware encoder → the
-  // encode is bounded to the cap instead of re-encoding the full stream
-  // (the field-report lag: recording starves the decode pipeline).
+  // Stream resolution EXCEEDS the cap → the encode is bounded to the cap
+  // instead of re-encoding the full stream (the field-report lag: recording
+  // starves the decode pipeline).
   assert.deepEqual(
     await pick(() => true, STREAM_1080P60, CAP_720P30),
     {
@@ -113,47 +107,10 @@ test("recording strategy uses raw track only when stream fits cap AND AVC encode
     await pick(() => true, { width: 1280, height: 720, fps: 60 }, CAP_720P30),
     { strategy: "canvas-downscale", mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2", hwAccelerated: false },
   );
-  // AVC supported but the encoder is SOFTWARE (OpenH264 fallback) → the
-  // raw track would starve the WebRTC decoder (8-fps field report), so it
-  // falls back to the bounded canvas downscale even within the cap.
+  // No AVC container (e.g. VP8-only runtime) → canvas regardless of the
+  // stream fitting the cap.
   assert.deepEqual(
-    await pick(() => true, STREAM_720P30, CAP_720P30, false, async () => ({ powerEfficient: false })),
-    {
-      strategy: "canvas-downscale",
-      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-      hwAccelerated: false,
-    },
-  );
-  // Probe unavailable / throws → safe canvas path, never a software full-res
-  // raw track.
-  assert.deepEqual(
-    await pick(() => true, STREAM_720P30, CAP_720P30, false, async () => undefined),
-    {
-      strategy: "canvas-downscale",
-      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-      hwAccelerated: false,
-    },
-  );
-  assert.deepEqual(
-    await pick(() => true, STREAM_720P30, CAP_720P30, false, async () => {
-      throw new Error("no mediaCapabilities");
-    }),
-    {
-      strategy: "canvas-downscale",
-      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-      hwAccelerated: false,
-    },
-  );
-  // Software-only platforms (e.g. VP8 on Linux without VAAPI) → canvas
-  // downscale regardless of the probe.
-  assert.deepEqual(
-    await pick(
-      (mimeType) => mimeType === "video/webm;codecs=vp8",
-      STREAM_720P30,
-      CAP_720P30,
-      false,
-      async () => ({ powerEfficient: true }),
-    ),
+    await pick((mimeType) => mimeType === "video/webm;codecs=vp8", STREAM_720P30, CAP_720P30),
     { strategy: "canvas-downscale", mimeType: "video/webm;codecs=vp8", hwAccelerated: false },
   );
   // Nothing supported → last-resort webm still routes through the canvas.

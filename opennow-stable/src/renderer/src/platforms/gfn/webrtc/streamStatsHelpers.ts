@@ -130,18 +130,32 @@ export interface BweLowWarnCheck {
 }
 
 /**
+ * Chromium placeholder band for `availableIncomingBitrate` before a real
+ * estimate exists: 0 and a fixed 300 kbps. Field logs (2026-10-16) show the
+ * 300 kbps value persisting for entire sessions — while the server delivered
+ * 12+ Mbps and while it sat at the ~4 Mbps floor — so it is NOT the server's
+ * estimate and must not feed the BWE-anomaly warning.
+ */
+export const BWE_PLACEHOLDER_MAX_KBPS = 500;
+
+/**
  * Whether to warn that the receiver's bandwidth estimate is stuck BELOW the
  * bitrate floor the client negotiates (`vqos.bw.minimumBitrateKbps`, ~4000
  * kbps) while the link is healthy. On a healthy path the estimate should sit
  * far above the floor; a stuck-low value usually means the server is not
  * ramping its encoder — and the first thing to check is whether transport-cc
  * was negotiated, because the server BWE is blind without TWCC feedback (the
- * native streamer's ~3.4 Mbps root cause). Pure + unit-tested.
+ * native streamer's ~3.4 Mbps root cause). Placeholder-range values
+ * (0 .. BWE_PLACEHOLDER_MAX_KBPS) mean "no real estimate" and stay silent.
+ * Pure + unit-tested.
  */
 export function shouldWarnBweLow(check: BweLowWarnCheck): boolean {
   if (check.alreadyWarned) return false;
-  // No real estimate yet (0 / placeholder) or above the floor: nothing to say.
-  if (check.availableKbps <= 0 || check.availableKbps >= check.floorKbps) return false;
+  // No real estimate yet (Chromium placeholder 0 / 300 kbps) or above the
+  // floor: nothing to say.
+  if (check.availableKbps <= BWE_PLACEHOLDER_MAX_KBPS || check.availableKbps >= check.floorKbps) {
+    return false;
+  }
   // Only on a healthy link — a low estimate under congestion is expected.
   if (check.rttMs <= 0 || check.rttMs >= check.healthyRttMs) return false;
   if (check.packetLossPercent >= check.healthyLossPct) return false;

@@ -114,25 +114,11 @@ export function resolveRecordCap(resolution: string, fps: number): RecordingCap 
 export interface RecordingStrategyChoice {
   strategy: RecordingStrategy;
   mimeType: string;
-  /** True when the chosen encoder runs on hardware (power-efficient). */
+  /** True when the chosen path avoids the software canvas re-encode (encoded transform / direct track capture). */
   hwAccelerated: boolean;
   /** Short human-readable reason for the choice (logged + surfaced in the UI). */
   reason: string;
 }
-
-/**
- * MediaCapabilities encode probe, injected so tests can stub it. Defaults to
- * `navigator.mediaCapabilities.encodingInfo` for a MediaRecorder session.
- */
-export type RecordingEncodeProbe = (
-  config: {
-    contentType: string;
-    width: number;
-    height: number;
-    bitrate: number;
-    framerate: number;
-  },
-) => Promise<{ powerEfficient?: boolean } | undefined>;
 
 /**
  * Pick the recording path for web mode.
@@ -145,34 +131,28 @@ export type RecordingEncodeProbe = (
  * encoded transforms and the session's negotiated codec is capturable.
  *
  * "raw-track": the raw WebRTC video track goes straight into MediaRecorder
- * (no canvas, no draw loop). "canvas-downscale": a downscaled canvas track
- * bounds the encode cost to the user's recording cap.
+ * (no canvas, no draw loop, no per-frame main-thread handoff).
+ * "canvas-downscale": a downscaled canvas track bounds the encode cost to
+ * the user's recording cap.
  *
- * Raw-track is chosen ONLY when ALL of these hold:
- * 1. an AVC (avc1) container is supported — the format MediaRecorder can
- *    hardware-encode on Windows/macOS/Linux;
- * 2. the live stream already fits inside the user's recording cap
- *    (resolution AND frame rate). A full-resolution re-encode of a 1080p60
- *    stream competes with the WebRTC decoder for the same GPU/CPU even with a
- *    hardware encoder (the field report: "recording makes the stream lag" on
- *    a device that is otherwise fine) — so when the stream exceeds the cap,
- *    the encode is bounded to the cap instead, honoring the user's
- *    recordingResolution/recordingFps settings;
- * 3. the encoder at stream resolution is hardware (power-efficient per
- *    MediaCapabilities). `isTypeSupported` alone is not enough: on machines
- *    without Media Foundation / VideoToolbox / VAAPI hardware AVC encode,
- *    Chromium silently falls back to the software OpenH264 encoder, and a
- *    full-resolution software re-encode saturates the CPU that also runs the
- *    WebRTC decoder.
+ * Raw-track is chosen when an AVC (avc1) container is supported AND the live
+ * stream already fits inside the user's recording cap (resolution AND frame
+ * rate). The old power-efficiency MediaCapabilities gate is gone: Chromium
+ * removed the "record" MediaEncodingType (verified on the shipped Electron
+ * 43 / Chromium 150 build — the probe ALWAYS threw a TypeError), so every
+ * within-cap stream was forced into the canvas pipeline even though it
+ * re-encodes the SAME resolution the raw track would — pure overhead that
+ * surfaced as render-side drops ("recording drops the stream fps").
  *
- * Everything else goes through the bounded canvas downscale.
+ * Streams that exceed the cap (or miss AVC support) go through the bounded
+ * canvas downscale, which honors the user's recordingResolution/recordingFps
+ * settings instead of re-encoding the full stream.
  */
 export async function selectRecordingStrategy(
   isTypeSupported: (mimeType: string) => boolean,
   stream: StreamInfo,
   cap: RecordingCap,
   encodedTransformAvailable: boolean,
-  encodeProbe: RecordingEncodeProbe = defaultRecordingEncodeProbe,
 ): Promise<RecordingStrategyChoice> {
   if (encodedTransformAvailable) {
     // mimeType placeholder — the caller replaces it with the codec-specific
@@ -214,63 +194,16 @@ export async function selectRecordingStrategy(
       reason: `stream ${streamLabel} exceeds recording cap ${cap.width}x${cap.height}@${cap.fps} — encode bounded to cap`,
     };
   }
-  try {
-    const info = await encodeProbe({
-      contentType: mimeType,
-      width: stream.width,
-      height: stream.height,
-      bitrate: 12_000_000,
-      framerate: stream.fps ?? cap.fps,
-    });
-    if (info?.powerEfficient) {
-      return {
-        strategy: "raw-track",
-        mimeType,
-        hwAccelerated: true,
-        reason: `hardware AVC encoder and stream ${stream.width}x${stream.height}@${stream.fps ?? cap.fps} within cap ${cap.width}x${cap.height}@${cap.fps}`,
-      };
-    }
-    return {
-      strategy: "canvas-downscale",
-      mimeType,
-      hwAccelerated: false,
-      reason: "AVC encoder not power-efficient at stream resolution — bounded canvas used",
-    };
-  } catch {
-    // Probe unavailable (old runtime / sandbox) — fall through to the safe
-    // canvas path rather than risk a software full-res encode.
-    return {
-      strategy: "canvas-downscale",
-      mimeType,
-      hwAccelerated: false,
-      reason: "encoder probe unavailable — bounded canvas used",
-    };
-  }
-}
-
-async function defaultRecordingEncodeProbe(
-  config: {
-    contentType: string;
-    width: number;
-    height: number;
-    bitrate: number;
-    framerate: number;
-  },
-): Promise<{ powerEfficient?: boolean } | undefined> {
-  if (!navigator.mediaCapabilities?.encodingInfo) {
-    return undefined;
-  }
-  const result = await navigator.mediaCapabilities.encodingInfo({
-    type: "record",
-    video: {
-      contentType: config.contentType,
-      width: config.width,
-      height: config.height,
-      bitrate: config.bitrate,
-      framerate: config.framerate,
-    },
-  });
-  return { powerEfficient: result.powerEfficient };
+  // Within the cap the raw track and the canvas draw encode the SAME pixels,
+  // so every per-frame cost the canvas adds (main-thread frame handoff,
+  // bitmap round-trip) is pure overhead. The direct track capture is always
+  // the right choice here.
+  return {
+    strategy: "raw-track",
+    mimeType,
+    hwAccelerated: true,
+    reason: `direct track capture — stream ${stream.width}x${stream.height}@${stream.fps ?? cap.fps} within cap ${cap.width}x${cap.height}@${cap.fps} (no canvas draw loop)`,
+  };
 }
 
 /**

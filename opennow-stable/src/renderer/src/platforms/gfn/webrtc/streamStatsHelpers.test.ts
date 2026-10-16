@@ -283,6 +283,24 @@ test("shouldWarnBweLow stays silent during the startup BWE ramp and before any f
     }),
     false,
   );
+  // Chromium's 300 kbps placeholder persists for whole sessions even while
+  // 12+ Mbps flow (field logs 2026-10-16) — it is not the server's estimate
+  // and must not fire the warning.
+  assert.equal(
+    shouldWarnBweLow({
+      availableKbps: 300,
+      rttMs: 38,
+      packetLossPercent: 0,
+      measuredBitrateKbps: 4200,
+      sessionAgeMs: 360_000,
+      alreadyWarned: false,
+      floorKbps: 4000,
+      graceMs: 15_000,
+      healthyRttMs: 100,
+      healthyLossPct: 1,
+    }),
+    false,
+  );
 });
 
 test("shouldWarnBweLow is a one-shot guard per session", () => {
