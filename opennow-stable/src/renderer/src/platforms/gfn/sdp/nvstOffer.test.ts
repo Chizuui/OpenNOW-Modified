@@ -201,3 +201,89 @@ test("buildNvstSdp floors low bitrate and applies protocol input defaults", () =
   assert.equal(lines.has("a=ri.enablePartiallyReliableTransferHid:4294967295"), true);
   assert.equal(sdp.endsWith("\n"), true);
 });
+
+function buildSdpWithMode(fps: number, dynamicStreamingMode: 0 | 1 | 2 | 3): string {
+  return buildNvstSdp({
+    width: 1920,
+    height: 1080,
+    fps,
+    maxBitrateKbps: 15000,
+    partialReliableThresholdMs: 16,
+    codec: "H265",
+    colorQuality: "8bit_420",
+    credentials: {
+      ufrag: "ufrag-test",
+      pwd: "password-test",
+      fingerprint: "AA:BB:CC",
+    },
+    dynamicStreamingMode,
+  });
+}
+
+test("buildNvstSdp locks the resolution with dynamicStreamingMode 0", () => {
+  const lines = new Set(buildSdpWithMode(60, 0).split("\n"));
+  assert.equal(lines.has("a=vqos.dynamicStreamingMode:0"), true);
+  // Mode 0 at 60 FPS: only drc.enable:0 — no DFC profile lines at all.
+  assert.equal(lines.has("a=vqos.drc.enable:0"), true);
+  assert.equal(lines.has("a=vqos.drc.enable:1"), false);
+  assert.equal(lines.has("a=vqos.dfc.enable:1"), false);
+  assert.equal(lines.has("a=vqos.dfc.decodeFpsAdjPercent:85"), false);
+  assert.equal(lines.has("a=vqos.cpm.flags:1"), false);
+});
+
+test("buildNvstSdp prefer-FPS mode keeps DRC enabled at 60 FPS", () => {
+  const lines = new Set(buildSdpWithMode(60, 1).split("\n"));
+  assert.equal(lines.has("a=vqos.dynamicStreamingMode:1"), true);
+  assert.equal(lines.has("a=vqos.drc.enable:1"), true);
+  assert.equal(lines.has("a=vqos.dfc.decodeFpsAdjPercent:85"), false);
+});
+
+test("buildNvstSdp prefer-resolution mode applies the official mode-2 DFC profile", () => {
+  const sdp = buildSdpWithMode(60, 2);
+  const lines = new Set(sdp.split("\n"));
+  for (const line of [
+    "a=vqos.dynamicStreamingMode:2",
+    "a=vqos.resControl.qp.qpg.featureSetting:0",
+    "a=vqos.drc.enable:0",
+    "a=vqos.dfc.enable:1",
+    "a=vqos.dfc.decodeFpsAdjPercent:85",
+    "a=vqos.dfc.dfcAlgoVersion:1",
+    "a=vqos.dfc.minTargetFps:30",
+    "a=vqos.dfc.lowResMinTargetFps:30",
+    "a=vqos.dfc.targetUpCooldownMs:5",
+    "a=vqos.dfc.fpsIncreasePercent:100",
+    "a=vqos.dfc.initFpsIncreasePercent:100",
+    "a=vqos.dfc.highResMinClientFps:0",
+    "a=vqos.dfc.targetDownCooldownMs:250",
+    "a=vqos.resControl.dfc.preserveTargetFpsWhenResolutionChange:1",
+    "a=vqos.cpm.flags:0",
+    "a=vqos.gfc.minTargetFps:30",
+    "a=vqos.relaxMaxBitrate.decodeFpsHeadroomPercent:110",
+    "a=vqos.dfc.adjustResAndFps:1",
+  ]) {
+    assert.equal(lines.has(line), true, `missing exact SDP line: ${line}`);
+  }
+  // The mode-2 qpg override replaces the base value in place — exactly one
+  // qpg.featureSetting line reaches the wire.
+  const qpgLines = sdp.split("\n").filter((line) =>
+    line.startsWith("a=vqos.resControl.qp.qpg.featureSetting"));
+  assert.deepEqual(qpgLines, ["a=vqos.resControl.qp.qpg.featureSetting:0"]);
+});
+
+test("buildNvstSdp high-FPS mode 0 disables the resolve-and-fps loop", () => {
+  const lines = new Set(buildSdpWithMode(120, 0).split("\n"));
+  assert.equal(lines.has("a=vqos.dynamicStreamingMode:0"), true);
+  // High-FPS mode 0: the official side-effect block still writes the DFC
+  // profile, but the mode-0 case pins dfc.adjustResAndFps:0 instead of 1.
+  assert.equal(lines.has("a=vqos.dfc.adjustResAndFps:0"), true);
+  assert.equal(lines.has("a=vqos.drc.enable:0"), true);
+  assert.equal(lines.has("a=vqos.dfc.enable:1"), true);
+  assert.equal(lines.has("a=vqos.dfc.dfcAlgoVersion:2"), true);
+});
+
+test("buildNvstSdp 144 FPS uses the official >=120 FPS DFC algorithm profile", () => {
+  const lines = new Set(buildSdpWithMode(144, 3).split("\n"));
+  assert.equal(lines.has("a=vqos.dfc.dfcAlgoVersion:2"), true);
+  assert.equal(lines.has("a=vqos.dfc.minTargetFps:100"), true);
+  assert.equal(lines.has("a=vqos.dfc.adjustResAndFps:1"), true);
+});

@@ -1,4 +1,5 @@
 import type { AppLaunchMode, CodecPreference, SessionCreateRequest, StreamSettings, VideoCodec } from "@shared/gfn";
+import { normalizeDynamicStreamingMode } from "@shared/gfn";
 import { DEFAULT_MINIMUM_FPS_FOR_REFLEX_WITHOUT_VRR } from "@shared/cloudGsync";
 
 import type { CloudMatchRequest } from "./types";
@@ -51,11 +52,12 @@ export function buildRequestedStreamingFeatures(
     ),
     // No client vsync preference in the fork (GFN streams client-side vsync off).
     vsync: false,
-    // Official client default (desiredFeatures.dynamicStreamingMode ?? 3).
-    // Aligned with nvstOffer's dynamicStreamingMode:3 so the server runs the
-    // same dynamic-streaming profile as the web app. The renderer handles
-    // mid-session track (SSRC) replacement, so mode 3 is safe.
-    dynamicStreamingMode: 3,
+    // Official client default when the user profile has no preference is 3
+    // (fully dynamic); the fork exposes the choice so users can lock the
+    // resolution (0) on weak links. Keep in sync with nvstOffer's
+    // `vqos.dynamicStreamingMode` so the session request and the NVST SDP
+    // always agree.
+    dynamicStreamingMode: normalizeDynamicStreamingMode(settings.dynamicStreamingMode),
     // STEREO (matches audioMode: 2); official mapping: stereo=2, 5.1=6, 7.1=8.
     audioChannelCount: 2,
   };

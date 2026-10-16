@@ -10,6 +10,7 @@ import type {
 import {
   CODEC_PREFERENCE_OPTIONS,
   colorQualityRequiresHevc,
+  DYNAMIC_STREAMING_MODES,
   expandEntitledStreamResolutions,
   FALLBACK_CODEC_PREFERENCE_OPTIONS,
   getSafeFallbackEntitledResolutions,
@@ -671,6 +672,37 @@ export function StreamQualityControls({
         </div>
         <span className="settings-subtle-hint">
           {t("settings.video.jitterBufferHint")}
+        </span>
+      </div>
+
+      <div className="settings-row settings-row--column">
+        <div className="settings-row-top">
+          <label className="settings-label">{t("settings.video.dynamicStreaming")}</label>
+        </div>
+        <div className="settings-chip-row">
+          {DYNAMIC_STREAMING_MODES.map((mode) => {
+            const label = mode === 0
+              ? t("settings.video.dynamicStreamingLocked")
+              : mode === 1
+                ? t("settings.video.dynamicStreamingPreferFps")
+                : mode === 2
+                  ? t("settings.video.dynamicStreamingPreferResolution")
+                  : t("settings.video.dynamicStreamingDynamic");
+            return (
+              <button
+                key={mode}
+                type="button"
+                className={`settings-chip ${settings.dynamicStreamingMode === mode ? "active" : ""}`}
+                aria-pressed={settings.dynamicStreamingMode === mode}
+                onClick={() => handleChange("dynamicStreamingMode", mode)}
+              >
+                <span>{label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <span className="settings-subtle-hint">
+          {t("settings.video.dynamicStreamingHint")}
         </span>
       </div>
 

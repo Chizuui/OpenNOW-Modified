@@ -775,6 +775,9 @@ export function App(): JSX.Element {
       maxBitrateMbps: settings.maxBitrateMbps,
       codec: resolvedCodecProfile.codec as VideoCodec,
       colorQuality: resolvedCodecProfile.colorQuality,
+      // Server-side dynamic streaming mode (official default 3); 0 locks the
+      // requested resolution/FPS so the server never lowers them on weak links.
+      dynamicStreamingMode: settings.dynamicStreamingMode,
       // "auto" means the full official ladder; only pin a concrete fallback.
       fallbackCodec: settings.fallbackCodec === "auto" ? undefined : settings.fallbackCodec,
       keyboardLayout: settings.keyboardLayout,
@@ -800,6 +803,7 @@ export function App(): JSX.Element {
     settings.colorQuality,
     settings.controllerMode,
     directLaunchConsoleMode,
+    settings.dynamicStreamingMode,
     settings.enableCloudGsync,
     settings.enableL4S,
     settings.fps,
@@ -1611,6 +1615,15 @@ export function App(): JSX.Element {
       try {
         // Web mode: apply the preset to the running WebRTC client immediately.
         (clientRef.current as any)?.setJitterBufferMode?.(value);
+      } catch {
+        // ignore
+      }
+    }
+    if (key === "dynamicStreamingMode") {
+      try {
+        // Web mode: push the new mode to the running WebRTC client (best-effort
+        // mid-session NVST update; the server may defer it to the next session).
+        (clientRef.current as any)?.setDynamicStreamingMode?.(value);
       } catch {
         // ignore
       }

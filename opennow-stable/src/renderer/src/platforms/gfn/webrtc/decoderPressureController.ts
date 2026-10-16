@@ -77,7 +77,11 @@ export const JITTER_BUFFER_PRESETS: Record<JitterBufferMode, {
 };
 
 const MAX_VIDEO_JITTER_TARGET_MS = 100;
-const VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR = 0.5;
+// One full RTT of floor: a NACK retransmission takes a round trip, so the
+// buffer needs at least the measured RTT of headroom for a recovered packet to
+// arrive before its frame is due. (The previous 0.5× factor left every
+// retransmit inherently half a round trip too late.)
+const VIDEO_JITTER_FLOOR_FROM_RTT_FACTOR = 1;
 // Only re-apply receiver tuning when the floor moves by at least this much, so
 // oscillating RTT (43↔45ms) does not churn the jitter buffer target every poll.
 const JITTER_FLOOR_DEADBAND_MS = 5;
@@ -127,6 +131,14 @@ const FREEZE_RETRIGGER_COOLDOWN_MS = 2500;
 // (~2s at a 1s poll) so a single lossy second does not interrupt the stream.
 const LOSS_PLI_THRESHOLD_PERCENT = 2;
 const LOSS_PLI_CONSECUTIVE_POLLS = 2;
+// Once a loss-triggered keyframe is out, further requests during a continuing
+// impairment are mostly wasted: the requested IDR is itself lossy, and the
+// server keeps generating keyframes the link cannot deliver (a 5-minute 30%
+// loss window produced ~75 PLI requests). Back off exponentially — 2s → 4s →
+// 8s → 12s cap — while loss stays above the threshold; one recovered poll
+// resets the ladder so the next moderate episode still resyncs in ~2s.
+const LOSS_PLI_BACKOFF_BASE_MS = 2000;
+const LOSS_PLI_BACKOFF_MAX_MS = 12000;
 
 // Auto low-latency jitter mode: on a clean link (RTT below the entry
 // threshold and no packet loss for AUTO_LOW_CLEAN_POLLS consecutive polls)
@@ -308,6 +320,10 @@ export class DecoderPressureController {
   private freezeConsecutiveStrikes = 0;
   /** Consecutive polls whose loss stayed above the PLI threshold. */
   private lossConsecutivePolls = 0;
+  /** Last loss-triggered keyframe timestamp; the backoff is measured from here. */
+  private lossPliLastSentAtMs = 0;
+  /** Minimum gap before the next loss-triggered keyframe (0 = none sent yet). */
+  private lossPliNextWaitMs = 0;
   private activeReceivers: Array<{
     receiver: RTCRtpReceiver;
     kind: "audio" | "video";
@@ -540,6 +556,8 @@ export class DecoderPressureController {
     this.activeReceivers = [];
     this.stopFreezeMonitoring();
     this.lossConsecutivePolls = 0;
+    this.lossPliLastSentAtMs = 0;
+    this.lossPliNextWaitMs = 0;
     this.freezeTriggeredAtMs = 0;
     this.freezeConsecutiveStrikes = 0;
     this.emitState();
@@ -612,18 +630,33 @@ export class DecoderPressureController {
    * corrupted — the picture would stay broken until the next natural
    * keyframe. Request one immediately (shared keyframe cooldown) so the
    * stream resyncs. Single lossy polls are ignored so transient loss never
-   * interrupts the stream.
+   * interrupts the stream, and repeated requests during a continued
+   * impairment back off exponentially (LOSS_PLI_BACKOFF_*) so a long loss
+   * episode does not turn into a keyframe-request flood that keeps the
+   * encoder stuck in IDR mode.
    */
   reportPacketLoss(packetLossPercent: number): void {
     const loss = Number.isFinite(packetLossPercent) ? Math.max(0, packetLossPercent) : 0;
-    this.lossConsecutivePolls = loss >= LOSS_PLI_THRESHOLD_PERCENT
-      ? this.lossConsecutivePolls + 1
-      : 0;
+    if (loss < LOSS_PLI_THRESHOLD_PERCENT) {
+      this.lossConsecutivePolls = 0;
+      // Loss recovered — restart the backoff ladder for the next episode.
+      this.lossPliNextWaitMs = 0;
+      return;
+    }
+    this.lossConsecutivePolls += 1;
     if (!shouldRequestLossKeyframe(loss, this.lossConsecutivePolls)) {
+      return;
+    }
+    const now = this.dependencies.now?.() ?? performance.now();
+    if (now - this.lossPliLastSentAtMs < this.lossPliNextWaitMs) {
       return;
     }
     void this.requestKeyframe(0, "network_loss").then((requested) => {
       if (requested) {
+        this.lossPliLastSentAtMs = now;
+        this.lossPliNextWaitMs = this.lossPliNextWaitMs === 0
+          ? LOSS_PLI_BACKOFF_BASE_MS
+          : Math.min(LOSS_PLI_BACKOFF_MAX_MS, this.lossPliNextWaitMs * 2);
         this.recoveryAttemptCount += 1;
         this.emitState();
       }

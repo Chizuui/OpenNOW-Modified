@@ -222,7 +222,7 @@ test("jitter buffer floor grows with measured RTT and clamps to bounds", () => {
   );
 });
 
-test("jitter buffer RTT ramp applies the 0.5x floor when RTT is stable", () => {
+test("jitter buffer RTT ramp applies a full-RTT floor when RTT is stable", () => {
   const videoReceiver = makeFakeReceiver("video");
   const audioReceiver = makeFakeReceiver("audio");
   const controller = new DecoderPressureController({
@@ -237,10 +237,11 @@ test("jitter buffer RTT ramp applies the 0.5x floor when RTT is stable", () => {
   controller.configureReceiver(audioReceiver, "audio");
 
   // First sample initializes the spike-detection EMA, so a stable 100ms link
-  // applies the 0.5x ramp floor without tripping the burst hold.
+  // applies the 1x ramp floor (capped at the 100ms maximum) without tripping
+  // the burst hold.
   controller.updateJitterFloorFromRtt(100);
-  assert.equal(videoReceiver.jitterBufferTarget, 50);
-  assert.equal(audioReceiver.jitterBufferTarget, 65);
+  assert.equal(videoReceiver.jitterBufferTarget, 100);
+  assert.equal(audioReceiver.jitterBufferTarget, 115);
 });
 
 test("packet loss raises the jitter floor before RTT climbs", () => {
@@ -445,13 +446,13 @@ test("auto-low has RTT hysteresis and never engages on the low preset or borderl
   controller.configureReceiver(audioReceiver, "audio");
 
   // RTT at 45ms is above the entry threshold (40ms): never engages even after
-  // many clean-ish polls.
+  // many clean-ish polls. The floor tracks the full measured RTT.
   for (let poll = 0; poll < 10; poll++) {
     now += 1000;
     controller.updateJitterFloorFromRtt(45);
   }
   assert.equal(controller.isAutoLowActive, false);
-  assert.equal(videoReceiver.jitterBufferTarget, 35);
+  assert.equal(videoReceiver.jitterBufferTarget, 45);
 
   // Clean 20ms link engages auto-low.
   for (let poll = 0; poll < 6; poll++) {
@@ -462,17 +463,18 @@ test("auto-low has RTT hysteresis and never engages on the low preset or borderl
   assert.equal(videoReceiver.jitterBufferTarget, 20);
 
   // Hysteresis: 45ms (above entry 40ms but below exit 50ms) keeps auto-low
-  // active instead of flapping the floors.
+  // active instead of flapping the floors; the floor itself grows to the full
+  // RTT headroom.
   now += 1000;
   controller.updateJitterFloorFromRtt(45);
   assert.equal(controller.isAutoLowActive, true);
-  assert.equal(videoReceiver.jitterBufferTarget, 20);
+  assert.equal(videoReceiver.jitterBufferTarget, 45);
 
-  // Crossing the exit threshold (50ms) reverts to the user preset.
+  // Crossing the exit threshold (50ms) reverts to the user preset floor.
   now += 1000;
   controller.updateJitterFloorFromRtt(55);
   assert.equal(controller.isAutoLowActive, false);
-  assert.equal(videoReceiver.jitterBufferTarget, 35);
+  assert.equal(videoReceiver.jitterBufferTarget, 55);
 
   // User already on "low" preset: auto-low has nothing to gain and stays off.
   const lowPresetController = new DecoderPressureController({
@@ -651,24 +653,40 @@ test("network loss triggers a keyframe only after sustained loss, with cooldown"
     logs.some((line) => line.includes("reason=network_loss")),
     "sustained loss requests a keyframe",
   );
-  // Cooldown throttles a third poll even while loss persists.
+  // The backoff throttles a third poll even while loss persists.
   controller.reportPacketLoss(2.5);
   await flushMicrotasks();
   assert.equal(keyframeRequests, 1);
-  // A clean poll resets the consecutive counter; loss must re-accumulate.
+  // A clean poll resets the consecutive counter (and the backoff ladder);
+  // loss must re-accumulate.
   controller.reportPacketLoss(0.1);
   controller.reportPacketLoss(2.5);
   await flushMicrotasks();
   assert.equal(keyframeRequests, 1, "one lossy poll after a clean reset does not re-trigger");
-  // After the cooldown passes, sustained loss can request again.
+  // After the 2s backoff passes, sustained loss requests again.
   nowMs = 4_000;
   controller.reportPacketLoss(2.5);
   await flushMicrotasks();
   assert.equal(keyframeRequests, 2);
-  // And the cooldown throttles a third poll immediately after.
+  // The backoff ladder now requires a 2s gap: an immediate poll is throttled.
   controller.reportPacketLoss(2.5);
   await flushMicrotasks();
   assert.equal(keyframeRequests, 2);
+  // 4s gap → allowed; the required gap then doubles to 4s.
+  nowMs = 8_000;
+  controller.reportPacketLoss(2.5);
+  await flushMicrotasks();
+  assert.equal(keyframeRequests, 3);
+  // 2s gap with a 4s requirement → throttled.
+  nowMs = 10_000;
+  controller.reportPacketLoss(2.5);
+  await flushMicrotasks();
+  assert.equal(keyframeRequests, 3);
+  // 8s gap → allowed; the ladder keeps doubling from here.
+  nowMs = 16_000;
+  controller.reportPacketLoss(2.5);
+  await flushMicrotasks();
+  assert.equal(keyframeRequests, 4);
 });
 
 /** Drain the promise chain of the async keyframe path before asserting. */

@@ -12,6 +12,7 @@ import {
   createDefaultSettings,
   createPlatformShortcutDefaults,
   SHORTCUT_SETTING_KEYS,
+  normalizeDynamicStreamingMode,
   normalizeJitterBufferMode,
   normalizeNativeExternalRendererForPlatform,
   normalizeStreamClientModeForPlatform,
@@ -335,6 +336,11 @@ export class SettingsManager {
     const jitterBufferMode = normalizeJitterBufferMode(settings.jitterBufferMode);
     if (settings.jitterBufferMode !== jitterBufferMode) {
       settings.jitterBufferMode = jitterBufferMode;
+      migrated = true;
+    }
+    const dynamicStreamingMode = normalizeDynamicStreamingMode(settings.dynamicStreamingMode);
+    if (settings.dynamicStreamingMode !== dynamicStreamingMode) {
+      settings.dynamicStreamingMode = dynamicStreamingMode;
       migrated = true;
     }
     const nativeVideoBackend = normalizeNativeVideoBackendPreference(settings.nativeVideoBackend);

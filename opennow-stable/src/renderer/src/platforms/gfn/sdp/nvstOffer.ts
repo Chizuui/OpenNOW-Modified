@@ -1,4 +1,5 @@
-import type { ColorQuality, VideoCodec } from "@shared/gfn";
+import type { ColorQuality, DynamicStreamingMode, VideoCodec } from "@shared/gfn";
+import { normalizeDynamicStreamingMode } from "@shared/gfn";
 import {
   PARTIALLY_RELIABLE_GAMEPAD_MASK_ALL,
   PARTIALLY_RELIABLE_HID_DEVICE_MASK_ALL,
@@ -32,6 +33,8 @@ export interface NvstParams {
   enablePartiallyReliableTransferGamepad?: number;
   enablePartiallyReliableTransferHid?: number;
   dynamicSplitEncodeUpdatesEnabled?: boolean;
+  /** Server-side dynamic streaming mode; undefined = official default (3). */
+  dynamicStreamingMode?: DynamicStreamingMode;
 }
 
 // This builder targets the WEB (Chromium WebRTC) transport and is aligned
@@ -59,6 +62,7 @@ export function buildNvstSdp(params: NvstParams): string {
     ?? PARTIALLY_RELIABLE_GAMEPAD_MASK_ALL;
   const enablePartiallyReliableTransferHid = params.enablePartiallyReliableTransferHid ?? hidDeviceMask;
   const dynamicSplitEncodeUpdatesEnabled = params.dynamicSplitEncodeUpdatesEnabled ?? ENABLE_DYNAMIC_SPLIT_ENCODE_UPDATES;
+  const dynamicStreamingMode = normalizeDynamicStreamingMode(params.dynamicStreamingMode);
 
   const lines: string[] = [
     "v=0",
@@ -78,42 +82,89 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=vqos.fec.repairMinPercent:5",
     "a=vqos.fec.repairPercent:5",
     "a=vqos.fec.repairMaxPercent:35",
-    // Official web client defaults to dynamicStreamingMode=3 (full dynamic
-    // streaming: DRC + DFC + bitrate envelope). The fork previously locked 0
-    // to prevent mid-session SSRC switches, but the renderer now handles track
-    // replacement (peerMediaLifecycleController), so align with the official
-    // default and let the server's BWE drive the bitrate like the web app.
-    "a=vqos.dynamicStreamingMode:3",
+    // User-selectable dynamic streaming mode (official default 3 = fully
+    // dynamic: DRC + DFC + bitrate envelope). "Off" (0) locks the requested
+    // resolution/FPS so the server cannot lower them on weak links; the
+    // renderer handles mid-session track (SSRC) replacement, so mode 3 — the
+    // official default — is safe.
+    `a=vqos.dynamicStreamingMode:${dynamicStreamingMode}`,
     // Official web client always sends vqos.bllFec.enable:0 (backward-lossless
-    // FEC off). drc.enable / dfc.enable are NOT emitted for 60 FPS sessions —
-    // the official DFC/DRC helper only writes them for high-FPS (see below).
+    // FEC off). The drc/dfc attributes follow the mode switch below — the DFC
+    // profile block writes only for high-FPS sessions or mode 2, while the
+    // switch emits a single drc.enable / dfc.adjustResAndFps for the mode.
     // vqos.calculateAvgVideoStreamingBitrate was a fork-only extra (zero hits
     // in the play.geforcenow.com bundle) and is dropped for parity.
     "a=vqos.bllFec.enable:0",
   ];
 
-  if (isHighFps) {
-    lines.push(
-      // Official web client, dynamicStreamingMode=3 + high FPS: drc.enable:0,
-      // dfc.enable:1, decodeFpsAdjPercent:85, targetDownCooldownMs:250,
-      // dfcAlgoVersion 2 (120/240) / 1 (90), minTargetFps 100 (120/240) / 60
-      // (90), resControl.dfc.useClientFpsPerf:0, and dfc.adjustResAndFps:1
-      // (the mode-3 case sets it for high-FPS sessions).
-      "a=vqos.drc.enable:0",
-      "a=vqos.dfc.enable:1",
-      "a=vqos.dfc.decodeFpsAdjPercent:85",
-      "a=vqos.dfc.targetDownCooldownMs:250",
-      `a=vqos.dfc.dfcAlgoVersion:${is120Fps || is240Fps ? 2 : 1}`,
-      `a=vqos.dfc.minTargetFps:${is90Fps ? 60 : 100}`,
-      "a=vqos.resControl.dfc.useClientFpsPerf:0",
-      "a=vqos.dfc.adjustResAndFps:1",
-    );
-  } else {
-    // Official web client, 60 FPS + dynamicStreamingMode=3: only drc.enable:1
-    // is emitted (the mode-3 case enables DRC for non-high-FPS sessions).
-    lines.push(
-      "a=vqos.drc.enable:1",
-    );
+  // DRC/DFC profile — mirrors the official client's dynamicStreamingMode
+  // switch verbatim (verified against the play.geforcenow.com bundle). The
+  // side-effect block runs for high-FPS sessions (fps > 60) or mode 2 (prefer
+  // resolution); the switch tail then applies the mode's own overrides.
+  // Writes go through an ordered map like the official client's attribute
+  // builder, so a later override (e.g. mode 2 pinning minTargetFps:30) updates
+  // the value in place instead of emitting duplicate SDP lines.
+  const profileAttrs = new Map<string, string>();
+  // qp.qpg.featureSetting lives in the official map too, but the fork emits it
+  // with the encoder settings below — keep it a single variable so mode 2's
+  // override never produces a duplicate SDP line.
+  let qpgFeatureSetting = "7";
+  if (isHighFps || dynamicStreamingMode === 2) {
+    if (dynamicStreamingMode !== 1) {
+      profileAttrs.set("vqos.drc.enable", "0");
+      profileAttrs.set("vqos.dfc.enable", "1");
+    }
+    profileAttrs.set("vqos.dfc.decodeFpsAdjPercent", "85");
+    profileAttrs.set("vqos.dfc.targetDownCooldownMs", "250");
+    // Official: dfcAlgoVersion 2 + minTargetFps 100 from 120 FPS up, else
+    // version 1 + 60 (covers 90 Hz and any in-between capture rate).
+    if (params.fps >= 120) {
+      profileAttrs.set("vqos.dfc.dfcAlgoVersion", "2");
+      profileAttrs.set("vqos.dfc.minTargetFps", "100");
+    } else {
+      profileAttrs.set("vqos.dfc.dfcAlgoVersion", "1");
+      profileAttrs.set("vqos.dfc.minTargetFps", "60");
+    }
+    // CPM is always enabled on the desktop web transport (featureMask:3).
+    profileAttrs.set("vqos.cpm.flags", "1");
+    profileAttrs.set("vqos.resControl.dfc.useClientFpsPerf", "0");
+  }
+  switch (dynamicStreamingMode) {
+    case 3:
+      // Dynamic (official default): DRC drives resolution at 60 FPS;
+      // high-FPS sessions use the DFC resolve-and-fps loop instead.
+      profileAttrs.set(isHighFps ? "vqos.dfc.adjustResAndFps" : "vqos.drc.enable", "1");
+      break;
+    case 2:
+      // Prefer resolution: keep the picture sharp and let client-informed DFC
+      // drop FPS first (official mode-2 profile).
+      qpgFeatureSetting = "0";
+      profileAttrs.set("vqos.drc.enable", "0");
+      profileAttrs.set("vqos.dfc.enable", "1");
+      profileAttrs.set("vqos.dfc.minTargetFps", "30");
+      profileAttrs.set("vqos.dfc.lowResMinTargetFps", "30");
+      profileAttrs.set("vqos.dfc.targetUpCooldownMs", "5");
+      profileAttrs.set("vqos.dfc.fpsIncreasePercent", "100");
+      profileAttrs.set("vqos.dfc.initFpsIncreasePercent", "100");
+      profileAttrs.set("vqos.dfc.highResMinClientFps", "0");
+      profileAttrs.set("vqos.dfc.targetDownCooldownMs", "250");
+      profileAttrs.set("vqos.resControl.dfc.preserveTargetFpsWhenResolutionChange", "1");
+      profileAttrs.set("vqos.cpm.flags", "0");
+      profileAttrs.set("vqos.gfc.minTargetFps", "30");
+      profileAttrs.set("vqos.relaxMaxBitrate.decodeFpsHeadroomPercent", "110");
+      profileAttrs.set("vqos.dfc.adjustResAndFps", "1");
+      break;
+    case 1:
+      // Prefer FPS: DRC may trade resolution down to protect frame rate.
+      profileAttrs.set("vqos.drc.enable", "1");
+      break;
+    case 0:
+      // Off: lock the requested resolution/FPS (no DRC/DFC adjustments).
+      profileAttrs.set(isHighFps ? "vqos.dfc.adjustResAndFps" : "vqos.drc.enable", "0");
+      break;
+  }
+  for (const [attribute, value] of profileAttrs) {
+    lines.push(`a=${attribute}:${value}`);
   }
 
   // Video encoder settings
@@ -121,7 +172,7 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=video.dx9EnableNv12:1",
     "a=video.dx9EnableHdr:1",
     "a=vqos.qpg.enable:1",
-    "a=vqos.resControl.qp.qpg.featureSetting:7",
+    `a=vqos.resControl.qp.qpg.featureSetting:${qpgFeatureSetting}`,
     // NOTE: the official web client does NOT send video.framePacing.* or
     // video.adaptiveQuantization.* — those fork additions came from native
     // client dumps. Dropped to match play.geforcenow.com byte-for-byte.
@@ -182,29 +233,34 @@ export function buildNvstSdp(params: NvstParams): string {
     "a=vqos.resControl.cpmRtc.featureMask:3",
   );
 
-  // Packet pacing group/delay + NACK queues (official Nvsc defaults).
-  lines.push(
-    `a=packetPacing.numGroups:${is120Fps ? 3 : 5}`,
-    "a=packetPacing.maxDelayUs:1000",
-    "a=packetPacing.minNumPacketsFrame:10",
-    "a=video.rtpNackQueueLength:1024",
-    "a=video.rtpNackQueueMaxPackets:512",
-    "a=video.rtpNackMaxPacketCount:25",
-  );
-
   if (useHighThroughputPacing) {
+    // High-throughput profile (only for the high-resolution / high-bitrate
+    // class, mirroring the official gate `Ei || cap >= 42 Mbps`): bigger
+    // pacing groups and NACK queues. On smaller sessions the official client
+    // leaves these unset and the server keeps its conservative defaults — the
+    // fork used to send the aggressive NACK flood-control values
+    // unconditionally, which amplified retransmission churn on lossy links.
     lines.push(
-      // Resolution/quality thresholds — match the browser client's high-throughput profile.
-      "a=vqos.drc.iirFilterFactor:100",
+      `a=packetPacing.numGroups:${is120Fps ? 3 : 5}`,
+      "a=packetPacing.maxDelayUs:1000",
+      "a=packetPacing.minNumPacketsFrame:10",
+      "a=video.rtpNackQueueLength:1024",
+      "a=video.rtpNackQueueMaxPackets:512",
+      "a=video.rtpNackMaxPacketCount:25",
     );
 
     if (!isAv1) {
       lines.push(
+        // Resolution/quality thresholds — match the browser client's high-throughput profile.
         "a=vqos.drc.qpMaxResThresholdAdj:4",
         "a=vqos.dfc.qpMaxResThresholdAdj:4",
         "a=vqos.grc.qpMaxResThresholdAdj:2",
       );
     }
+
+    lines.push(
+      "a=vqos.drc.iirFilterFactor:100",
+    );
   }
 
   // AV1-specific DRC/GRC tuning (mirrors official client intent):

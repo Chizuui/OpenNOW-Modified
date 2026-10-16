@@ -1,6 +1,7 @@
 import type {
   CodecPreference,
   ColorQuality,
+  DynamicStreamingMode,
   FallbackCodecPreference,
   JitterBufferMode,
   NativeTransitionDiagnostics,
@@ -59,6 +60,12 @@ export interface Settings {
   maxBitrateMbps: number;
   /** Web-mode jitter buffer aggressiveness: low latency / balanced / smooth */
   jitterBufferMode: JitterBufferMode;
+  /**
+   * Server-side dynamic streaming mode (web + session request). "Dynamic" (3)
+   * is the official default; choose "off" (0) to lock the requested
+   * resolution/FPS instead of letting the server lower them on weak links.
+   */
+  dynamicStreamingMode: DynamicStreamingMode;
   /** Recording video bitrate in Mbps; null means let MediaRecorder choose automatically */
   recordingBitrateMbps: number | null;
   recordingResolution: string;
@@ -273,6 +280,7 @@ export function createDefaultSettings(platform: string): Settings {
     fps: 60,
     maxBitrateMbps: 75,
     jitterBufferMode: "balanced",
+    dynamicStreamingMode: 3,
     recordingBitrateMbps: null,
     // Safe defaults matching the canvas recorder's low-encode budget: MediaRecorder
     // encodes on the same main thread as the WebRTC decoder, so 720p30 is the

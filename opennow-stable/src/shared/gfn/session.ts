@@ -2,6 +2,7 @@ import type { CloudGsyncResolution } from "../cloudGsync";
 import type {
   AppLaunchMode,
   ColorQuality,
+  DynamicStreamingMode,
   FallbackCodecPreference,
   NativeTransitionDiagnostics,
   StreamClientMode,
@@ -24,6 +25,8 @@ export interface StreamSettings {
   maxBitrateMbps: number;
   codec: VideoCodec;
   colorQuality: ColorQuality;
+  /** Server-side dynamic streaming mode (session request); undefined = official default (3). */
+  dynamicStreamingMode?: DynamicStreamingMode;
   /** Keyboard layout for mapping physical keys inside the remote session */
   keyboardLayout: KeyboardLayout;
   /** In-game language setting (sent to GFN servers via languageCode parameter) */

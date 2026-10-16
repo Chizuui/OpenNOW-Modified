@@ -32,6 +32,32 @@ export function normalizeJitterBufferMode(raw: unknown): JitterBufferMode {
     ? (raw as JitterBufferMode)
     : "balanced";
 }
+
+/**
+ * Server-side dynamic streaming mode (`vqos.dynamicStreamingMode` in the NVST
+ * SDP / `requestedStreamingFeatures.dynamicStreamingMode` in the CloudMatch
+ * session request), mirroring the official client's DynamicStreamingMode enum:
+ * - 0: off — the server keeps the requested resolution/FPS (no DRC/DFC).
+ * - 1: prefer FPS — the server may lower resolution to protect frame rate.
+ * - 2: prefer resolution — client-informed DFC lowers FPS before resolution.
+ * - 3: dynamic — official default; DRC + DFC adapt both.
+ */
+export type DynamicStreamingMode = 0 | 1 | 2 | 3;
+
+export const DYNAMIC_STREAMING_MODES: readonly DynamicStreamingMode[] = [0, 1, 2, 3] as const;
+
+/** Normalize an unknown persisted value to a valid dynamic streaming mode. */
+export function normalizeDynamicStreamingMode(raw: unknown): DynamicStreamingMode {
+  if (raw === null || raw === undefined) {
+    return 3;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return 3;
+  }
+  const mode = Math.trunc(value);
+  return mode >= 0 && mode <= 3 ? (mode as DynamicStreamingMode) : 3;
+}
 /**
  * How the server-side session should present launched games.
  * Mirrors the official client's AppLaunchMode: TV/console clients request

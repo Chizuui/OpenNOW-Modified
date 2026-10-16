@@ -1,6 +1,7 @@
 import type {
   IceCandidatePayload,
   ColorQuality,
+  DynamicStreamingMode,
   FallbackCodecPreference,
   IceServer,
   JitterBufferMode,
@@ -10,6 +11,7 @@ import type {
   NativeTransitionDiagnostics,
   KeyboardLayout,
 } from "@shared/gfn";
+import { normalizeDynamicStreamingMode } from "@shared/gfn";
 
 import {
   InputEncoder,
@@ -130,6 +132,8 @@ interface OfferSettings {
   maxBitrateKbps: number;
   /** Web-mode jitter buffer aggressiveness preset (defaults to balanced). */
   jitterBufferMode?: JitterBufferMode;
+  /** Server-side dynamic streaming mode; undefined = official default (3). */
+  dynamicStreamingMode?: DynamicStreamingMode;
   /**
    * User-pinned fallback codec for web mode. `"auto"` (default) keeps every
    * supported GFN primary as a fallback; a concrete value wins whenever the
@@ -403,6 +407,11 @@ export class GfnWebRtcClient {
     atMs: number;
   } | null = null;
   private renderFpsCounter = { frames: 0, lastUpdate: 0, fps: 0 };
+  /**
+   * Last decoded output resolution reported by the remote video track, used to
+   * log server-side DRC/DFC resolution changes exactly once per transition.
+   */
+  private lastReportedResolution: { width: number; height: number } | null = null;
   private lastEmittedDiagnostics: StreamDiagnostics | null = null;
   /**
    * EWMA of the raw inbound-rtp jitter reading, smoothed for the HUD so
@@ -1032,18 +1041,23 @@ export class GfnWebRtcClient {
     return result.join("\r\n");
   }
 
-  /**
-   * Update the maximum receive bitrate ceiling mid-stream by rewriting the
-   * NVST bitrate attributes in the local SDP and re-applying it.
-   * Chrome/Electron honours this change without requiring a full ICE
-   * renegotiation.
-   */
   /** Update the jitter buffer preset live (applies to current receivers). */
   public setJitterBufferMode(mode: JitterBufferMode): void {
     this.decoderPressureController.setJitterBufferMode(mode);
     this.log(`Jitter buffer mode updated to ${mode}`);
   }
 
+  /** Update the dynamic streaming mode live (best-effort mid-session NVST push). */
+  public setDynamicStreamingMode(mode: DynamicStreamingMode): void {
+    void this.pushMidSessionDynamicStreamingMode(normalizeDynamicStreamingMode(mode));
+  }
+
+  /**
+   * Update the maximum receive bitrate ceiling mid-stream by rewriting the
+   * NVST bitrate attributes in the local SDP and re-applying it.
+   * Chrome/Electron honours this change without requiring a full ICE
+   * renegotiation.
+   */
   public async setMaxBitrateKbps(kbps: number): Promise<void> {
     const normalizedKbps = Math.max(OFFICIAL_MIN_BITRATE_KBPS, Math.floor(kbps));
     // The cloud-gaming client is receive-only (it never adds a video track), so
@@ -1130,13 +1144,29 @@ export class GfnWebRtcClient {
   }
 
   /**
-   * Jitter buffer policy (web mode): keep an explicit user-selectable floor
-   * during normal playback (low/balanced/smooth presets, scaled up with
-   * measured RTT) so jitter spikes on long international links are absorbed
-   * instead of turning into dropped frames. A tighter target is pinned only
-   * while recovering from a hard decode stall. Drop bursts request a keyframe
-   * immediately.
+   * Best-effort mid-session dynamic streaming mode update: rebuild the NVST SDP
+   * with the new `vqos.dynamicStreamingMode` (+ its DRC/DFC profile) and
+   * re-send it on the same `sendAnswer` signaling channel used at session
+   * start. Servers that ignore mid-session NVST updates still apply the mode on
+   * the next offer/reconnect.
    */
+  private async pushMidSessionDynamicStreamingMode(mode: DynamicStreamingMode): Promise<void> {
+    if (!this.sessionNvstSdpParams || !this.lastAnswerSdp) {
+      this.log(`Dynamic streaming mode set to ${mode} (applies at session start)`);
+      return;
+    }
+    this.sessionNvstSdpParams = { ...this.sessionNvstSdpParams, dynamicStreamingMode: mode };
+    const updatedNvstSdp = buildNvstSdp(this.sessionNvstSdpParams);
+    try {
+      await window.openNow.sendAnswer({ sdp: this.lastAnswerSdp, nvstSdp: updatedNvstSdp });
+      this.log(
+        `Dynamic streaming mode ${mode} pushed mid-session (server may apply it immediately or on the next offer/reconnect).`,
+      );
+    } catch (error) {
+      this.log(`Dynamic streaming mode mid-session push failed: ${String(error)}`);
+    }
+  }
+
   private log(message: string): void {
     this.options.onLog(message);
   }
@@ -1164,6 +1194,7 @@ export class GfnWebRtcClient {
 
   private resetDiagnostics(): void {
     this.lastStatsSample = null;
+    this.lastReportedResolution = null;
     this.lastEmittedDiagnostics = null;
     this.jitterEwmaMs = 0;
     this.lastRecoveryAtMs = 0;
@@ -1403,6 +1434,32 @@ export class GfnWebRtcClient {
     }
   }
 
+  /**
+   * Log server-side output resolution changes once per transition, with the
+   * link context attached. The server's DRC (active whenever
+   * dynamicStreamingMode is not locked to 0) can lower the resolution
+   * mid-session when the network degrades — without this line the change is
+   * only visible as a silently updated stats value.
+   */
+  private logResolutionChangeIfNeeded(width: number, height: number): void {
+    const previous = this.lastReportedResolution;
+    if (previous && previous.width === width && previous.height === height) {
+      return;
+    }
+    this.lastReportedResolution = { width, height };
+    if (!previous) {
+      this.log(`[Stream] Output resolution: ${width}x${height}`);
+      return;
+    }
+    const dropped = width * height < previous.width * previous.height;
+    const mode = this.sessionNvstSdpParams?.dynamicStreamingMode ?? 3;
+    this.log(
+      `[Stream] Output resolution ${dropped ? "dropped" : "raised"} from ${previous.width}x${previous.height} to ${width}x${height} `
+      + `(bitrate=${this.diagnostics.bitrateKbps} kbps, loss=${this.diagnostics.packetLossPercent.toFixed(2)}%, rtt=${Math.round(this.diagnostics.rttMs)}ms)`
+      + (dropped ? ` — server-side DRC/DFC (dynamicStreamingMode=${mode}; set it to 0 to lock the resolution)` : ""),
+    );
+  }
+
   private async collectStats(): Promise<void> {
     if (!this.pc) {
       return;
@@ -1609,6 +1666,7 @@ export class GfnWebRtcClient {
         if (settings.width && settings.height) {
           this.currentResolution = `${settings.width}x${settings.height}`;
           this.diagnostics.resolution = this.currentResolution;
+          this.logResolutionChangeIfNeeded(settings.width, settings.height);
         }
       }
 
@@ -2614,7 +2672,7 @@ export class GfnWebRtcClient {
     this.log(`Signaling: server=${session.signalingServer}, url=${session.signalingUrl}`);
     this.log(`MediaConnectionInfo: ${session.mediaConnectionInfo ? `ip=${session.mediaConnectionInfo.ip}, port=${session.mediaConnectionInfo.port}` : "NONE"}`);
     this.log(
-      `Settings: codec=${settings.codec}, colorQuality=${settings.colorQuality}, resolution=${settings.resolution}, fps=${settings.fps}, maxBitrate=${settings.maxBitrateKbps}kbps`,
+      `Settings: codec=${settings.codec}, colorQuality=${settings.colorQuality}, resolution=${settings.resolution}, fps=${settings.fps}, maxBitrate=${settings.maxBitrateKbps}kbps, dynamicStreamingMode=${normalizeDynamicStreamingMode(settings.dynamicStreamingMode)}`,
     );
     if (session.negotiatedStreamProfile) {
       this.log(`Negotiated stream profile override: ${JSON.stringify(session.negotiatedStreamProfile)}`);
@@ -3112,6 +3170,7 @@ export class GfnWebRtcClient {
       enablePartiallyReliableTransferHid: this.riInputCapabilities.enablePartiallyReliableTransferHid,
       codec: effectiveCodec,
       colorQuality: settings.colorQuality,
+      dynamicStreamingMode: settings.dynamicStreamingMode,
       credentials,
       dynamicSplitEncodeUpdatesEnabled:
         settings.nativeTransitionDiagnostics?.disableDynamicSplitEncodeUpdates !== true,
