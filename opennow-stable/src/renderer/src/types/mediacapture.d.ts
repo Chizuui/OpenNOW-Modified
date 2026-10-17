@@ -22,6 +22,22 @@ declare class MediaStreamTrackGenerator extends MediaStreamTrack {
   readonly readable?: MediaStreamTrack;
 }
 
+// MediaStreamTrackProcessor (mediacapture-transform) reads a live track
+// through a ReadableStream with live-edge drop semantics: stale frames are
+// dropped for a slow consumer and the track is never backpressured. The
+// WebCodecs recorder uses it to ingest the live stream without touching the
+// decode pipeline.
+interface MediaStreamTrackProcessorInit {
+  track: MediaStreamTrack;
+  /** Frames held before live-edge drops kick in (default 1). */
+  maxBufferSize?: number;
+}
+
+declare class MediaStreamTrackProcessor<T = VideoFrame> {
+  constructor(init: MediaStreamTrackProcessorInit);
+  readonly readable: ReadableStream<T>;
+}
+
 interface FileReaderSync {
   readonly error: DOMException | null;
   readAsArrayBuffer(blob: Blob): ArrayBuffer;

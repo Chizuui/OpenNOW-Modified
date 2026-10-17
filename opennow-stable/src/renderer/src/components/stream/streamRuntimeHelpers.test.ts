@@ -23,12 +23,14 @@ async function pick(
   stream: { width: number; height: number; fps: number | null },
   cap: { width: number; height: number; fps: number },
   encodedTransformAvailable = false,
+  webCodecsAvailable = false,
 ) {
   const choice = await selectRecordingStrategy(
     isTypeSupported,
     stream,
     cap,
     encodedTransformAvailable,
+    webCodecsAvailable,
   );
   return { strategy: choice.strategy, mimeType: choice.mimeType, hwAccelerated: choice.hwAccelerated };
 }
@@ -120,6 +122,59 @@ test("recording strategy uses the raw track whenever the stream fits the cap", a
   );
 });
 
+test("recording strategy prefers the WebCodecs recorder for within-cap streams when available", async () => {
+  // Within-cap stream + WebCodecs surface → the drop-controlled recorder:
+  // MSTP ingest means a lagging recorder drops frames from the FILE instead
+  // of backpressuring the decode pipeline (the field stutter).
+  assert.deepEqual(
+    await pick(() => true, STREAM_1080P60, { width: 1920, height: 1080, fps: 60 }, false, true),
+    {
+      strategy: "webcodecs-track",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: true,
+    },
+  );
+  // The encoded transform still wins: zero re-encode beats any re-encode.
+  assert.deepEqual(
+    await pick(() => true, STREAM_1080P60, CAP_720P30, true, true),
+    { strategy: "encoded-transform", mimeType: "video/mp4", hwAccelerated: true },
+  );
+  // Over-cap streams keep the bounded canvas downscale — the WebCodecs
+  // recorder encodes at stream resolution and would blow the user's cap.
+  assert.deepEqual(
+    await pick(() => true, STREAM_1080P60, CAP_720P30, false, true),
+    {
+      strategy: "canvas-downscale",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: false,
+    },
+  );
+  // Unknown frame rate still qualifies (resolution gate is dominant).
+  assert.deepEqual(
+    await pick(
+      () => true,
+      { width: 1920, height: 1080, fps: null },
+      { width: 1920, height: 1080, fps: 60 },
+      false,
+      true,
+    ),
+    {
+      strategy: "webcodecs-track",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: true,
+    },
+  );
+  // Without the WebCodecs surface the within-cap fallback stays raw-track.
+  assert.deepEqual(
+    await pick(() => true, STREAM_1080P60, { width: 1920, height: 1080, fps: 60 }),
+    {
+      strategy: "raw-track",
+      mimeType: "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+      hwAccelerated: true,
+    },
+  );
+});
+
 test("recording stream fps resolves from the negotiated rate first, track estimate second", () => {
   // Field case: a 60 fps session whose remote track reported 103.7 fps
   // (decode catch-up burst). The negotiated rate is the authoritative bound.
@@ -170,6 +225,10 @@ test("recording bitrate clamp honors strategy ceilings", () => {
   assert.equal(clampRecordingBitrate(30, "raw-track"), 30_000_000);
   assert.equal(clampRecordingBitrate(80, "raw-track"), 75_000_000);
   assert.equal(clampRecordingBitrate(10.4, "raw-track"), 10_000_000);
+  // WebCodecs records at stream resolution too — same ceiling as raw-track.
+  assert.equal(clampRecordingBitrate(null, "webcodecs-track"), undefined);
+  assert.equal(clampRecordingBitrate(30, "webcodecs-track"), 30_000_000);
+  assert.equal(clampRecordingBitrate(80, "webcodecs-track"), 75_000_000);
   // Degenerate inputs stay at the floor.
   assert.equal(clampRecordingBitrate(0, "raw-track"), 1_000_000);
   assert.equal(clampRecordingBitrate(-5, "canvas-downscale"), 1_000_000);

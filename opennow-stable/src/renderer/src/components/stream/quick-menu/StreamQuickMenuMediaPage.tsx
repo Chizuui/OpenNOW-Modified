@@ -40,7 +40,7 @@ interface StreamQuickMenuMediaPageProps {
   recordingError: string | null;
   recordingApiAvailable: boolean;
   usedMimeType: string | null;
-  /** Recording strategy chosen at start (raw-track vs canvas-downscale). */
+  /** Recording strategy chosen at start (encoded-transform / webcodecs-track / raw-track / canvas-downscale). */
   usedStrategy: string | null;
   recordingBitrateMbps: number | null;
   recordingResolution: string;
@@ -420,9 +420,11 @@ export function StreamQuickMenuMediaPage({
             Mode:{" "}
             {usedStrategy === "encoded-transform"
               ? `encoded bitstream (no re-encode${recordingMixMic ? ", mic mix" : ""})`
-              : usedStrategy === "raw-track"
-                ? "raw track (stream res)"
-                : "bounded canvas"}
+              : usedStrategy === "webcodecs-track"
+                ? "stream-safe re-encode"
+                : usedStrategy === "raw-track"
+                  ? "raw track (stream res)"
+                  : "bounded canvas"}
           </span>
         )}
         <div className="sidebar-row sidebar-row--aligned">

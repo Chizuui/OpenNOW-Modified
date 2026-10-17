@@ -40,7 +40,11 @@ export function selectRecordingMimeType(
   return RECORDING_MIME_TYPES.find(isTypeSupported) ?? "video/webm";
 }
 
-export type RecordingStrategy = "encoded-transform" | "raw-track" | "canvas-downscale";
+export type RecordingStrategy =
+  | "encoded-transform"
+  | "webcodecs-track"
+  | "raw-track"
+  | "canvas-downscale";
 
 export const DEFAULT_RECORD_CAP_WIDTH = 1280;
 export const DEFAULT_RECORD_CAP_HEIGHT = 720;
@@ -130,8 +134,20 @@ export interface RecordingStrategyChoice {
  * whatever the stream is). Taken whenever the runtime supports receiver
  * encoded transforms and the session's negotiated codec is capturable.
  *
+ * "webcodecs-track": the live track is ingested through a
+ * MediaStreamTrackProcessor and re-encoded with hardware WebCodecs, and the
+ * recorder drops frames on encoder backpressure instead of queueing. MSTP's
+ * live-edge semantics mean a recorder that cannot keep up NEVER backpressures
+ * the WebRTC receive pipeline (probe-verified: a stalled consumer kept the
+ * video element at 60 fps), which is the fix for the field case where
+ * MediaRecorder on the raw track stalled the decoder while recording
+ * (decTime 0.7 → 75 ms, drops 0 → 86). Taken for within-cap streams when the
+ * runtime exposes the WebCodecs surface; the MediaRecorder raw-track path
+ * stays as the fallback.
+ *
  * "raw-track": the raw WebRTC video track goes straight into MediaRecorder
- * (no canvas, no draw loop, no per-frame main-thread handoff).
+ * (no canvas, no draw loop, no per-frame main-thread handoff). Legacy
+ * fallback when the WebCodecs recorder is unavailable.
  * "canvas-downscale": a downscaled canvas track bounds the encode cost to
  * the user's recording cap.
  *
@@ -153,6 +169,7 @@ export async function selectRecordingStrategy(
   stream: StreamInfo,
   cap: RecordingCap,
   encodedTransformAvailable: boolean,
+  webCodecsAvailable = false,
 ): Promise<RecordingStrategyChoice> {
   if (encodedTransformAvailable) {
     // mimeType placeholder — the caller replaces it with the codec-specific
@@ -165,14 +182,6 @@ export async function selectRecordingStrategy(
     };
   }
   const mimeType = selectRecordingMimeType(isTypeSupported);
-  if (!mimeType.includes("avc1")) {
-    return {
-      strategy: "canvas-downscale",
-      mimeType,
-      hwAccelerated: false,
-      reason: "no avc1 container — hardware encode unavailable, bounded canvas used",
-    };
-  }
   const streamWithinCap =
     stream.width > 0 &&
     stream.height > 0 &&
@@ -182,6 +191,26 @@ export async function selectRecordingStrategy(
     // is the dominant cost factor, and an unknown rate should not force the
     // downscale path on its own.
     (stream.fps === null || stream.fps <= cap.fps);
+  // Within the cap the WebCodecs recorder re-encodes the SAME pixels the raw
+  // MediaRecorder track would, but its MSTP ingest makes the recording drop
+  // frames under load instead of backpressuring the decode pipeline — the
+  // stream-safety property the MediaRecorder path lacks.
+  if (webCodecsAvailable && streamWithinCap) {
+    return {
+      strategy: "webcodecs-track",
+      mimeType,
+      hwAccelerated: true,
+      reason: `stream ${stream.width}x${stream.height}@${stream.fps ?? cap.fps} within cap ${cap.width}x${cap.height}@${cap.fps} — WebCodecs recorder (MSTP ingest: the recorder drops frames, the stream never stalls)`,
+    };
+  }
+  if (!mimeType.includes("avc1")) {
+    return {
+      strategy: "canvas-downscale",
+      mimeType,
+      hwAccelerated: false,
+      reason: "no avc1 container — hardware encode unavailable, bounded canvas used",
+    };
+  }
   if (!streamWithinCap) {
     const streamLabel =
       stream.width > 0 && stream.height > 0
@@ -208,17 +237,18 @@ export async function selectRecordingStrategy(
 
 /**
  * Bound the user's recording bitrate per strategy. Canvas-downscale caps at
- * 12 Mbps (720p30 never benefits from more). Raw-track records at stream
- * resolution, so the user's explicit choice is honored up to the settings
- * slider's ceiling. `null` (auto) returns `undefined` — Chromium's
- * conservative resolution-based default is left untouched.
+ * 12 Mbps (720p30 never benefits from more). Raw-track and the WebCodecs
+ * recorder record at stream resolution, so the user's explicit choice is
+ * honored up to the settings slider's ceiling. `null` (auto) returns
+ * `undefined` — Chromium's conservative resolution-based default is left
+ * untouched.
  */
 export function clampRecordingBitrate(
   recordingBitrateMbps: number | null,
   strategy: RecordingStrategy,
 ): number | undefined {
   if (recordingBitrateMbps === null) return undefined;
-  const max = strategy === "raw-track" ? 75 : 12;
+  const max = strategy === "raw-track" || strategy === "webcodecs-track" ? 75 : 12;
   return Math.max(1, Math.min(max, Math.round(recordingBitrateMbps))) * 1_000_000;
 }
 

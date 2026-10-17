@@ -17,14 +17,23 @@ import {
 } from "../recording/encodedCapture";
 import type { RecordCanvasWorkerOutboundMessage } from "../recording/recordCanvasWorker";
 import type { EncodedWorkerOutboundMessage } from "../recording/recordEncodedWorker";
+import {
+  isWebCodecsRecordingSupported,
+  startWebCodecsTrackRecorder,
+  type WebCodecsRecordingResult,
+  type WebCodecsTrackRecorder,
+} from "../recording/webCodecsTrackRecorder";
 import { getActiveWebRtcPeerConnection } from "../platforms/gfn/webrtcClient";
 
-// Web recording uses one of two strategies (see selectRecordingStrategy):
-// "raw-track" hands MediaRecorder the incoming WebRTC track directly (no
-// canvas/draw loop) and is taken whenever the stream already fits the user's
-// recording cap AND an AVC container is supported; "canvas-downscale" bounds
-// the encode cost to the cap (720p30 by default; resolution/FPS are
-// user-selectable via recordingResolution / recordingFps settings).
+// Web recording uses one of the strategies from selectRecordingStrategy:
+// "encoded-transform" captures the stream's encoded bitstream pre-decode
+// (zero re-encode, cap not applied); "webcodecs-track" ingests the live track
+// through a MediaStreamTrackProcessor and hardware-encodes it — a recorder
+// that cannot keep up drops frames from the FILE instead of backpressuring
+// the stream; "raw-track" hands MediaRecorder the raw WebRTC track directly
+// (legacy fallback when the WebCodecs surface is missing); "canvas-downscale"
+// bounds the encode cost to the user's recording cap
+// (recordingResolution/recordingFps settings).
 // Resolver that extracts the video track a MediaStreamTrackGenerator exposes
 // for MediaRecorder, regardless of which API shape the runtime ships.
 type GeneratorTrackResolver = (generator: MediaStreamTrackGenerator) => MediaStreamTrack | null;
@@ -200,6 +209,12 @@ export function useStreamRecorder({
   // feeds the save toast's timing.
   const [isSavingInstantReplay, setIsSavingInstantReplay] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  // Stream-protecting WebCodecs recorder (MSTP ingest + hardware encoders):
+  // the primary web path for within-cap streams. Non-null while recording.
+  const webCodecsRecorderRef = useRef<WebCodecsTrackRecorder | null>(null);
+  // The stream frame rate the WebCodecs recording was started against: the
+  // stop-time shortfall notice compares the recorded frame count to it.
+  const webCodecsExpectedFpsRef = useRef<number | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartTimeRef = useRef(0);
   const recordingTimerRef = useRef<number | undefined>(undefined);
@@ -283,6 +298,24 @@ export function useStreamRecorder({
       worker.terminate();
     }
   };
+  // Downscale a frame source to the small JPEG thumbnail shown on the
+  // recording entry. The canvas path takes the thumbnail from its worker; the
+  // raw-track MediaRecorder path and the WebCodecs recorder take it from the
+  // live video element (cheap there — no draw loop is running).
+  const thumbnailFromSource = useCallback(
+    (source: CanvasImageSource, sourceWidth: number, sourceHeight: number): void => {
+      const { width, height } = fitThumbnailSize(sourceWidth, sourceHeight);
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(source, 0, 0, width, height);
+        thumbnailDataUrlRef.current = canvas.toDataURL("image/jpeg", 0.72);
+      }
+    },
+    [],
+  );
   const recordingApiAvailable =
     typeof window.openNow?.beginRecording === "function" &&
     typeof window.openNow?.sendRecordingChunk === "function" &&
@@ -900,6 +933,175 @@ export function useStreamRecorder({
     armEncodedRecorder();
   }, [armEncodedRecorder, dvrSeconds, streamActive, streamVideoReady]);
 
+  /**
+   * Stop the active WebCodecs recording: flush the encoders, finalize the
+   * muxer (both ends of the FIFO drain into a complete fragmented MP4), drain
+   * the chunk queue and finish the recording — the same end-to-end contract
+   * as the MediaRecorder onstop flow. `abort: true` (session teardown or a
+   * mid-recording encoder failure) drops the file instead.
+   */
+  const stopWebCodecsRecording = useCallback(
+    async (stopOptions?: { abort?: boolean }): Promise<void> => {
+      const recorder = webCodecsRecorderRef.current;
+      if (!recorder) return;
+      webCodecsRecorderRef.current = null;
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = undefined;
+      setIsRecording(false);
+      const id = recordingIdRef.current;
+      recordingIdRef.current = null;
+
+      if (stopOptions?.abort) {
+        recorder.abort();
+        audioCtxRef.current?.close().catch(() => undefined);
+        audioCtxRef.current = null;
+        webCodecsExpectedFpsRef.current = null;
+        if (id) {
+          window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
+        }
+        setRecordingError("Recording encountered an error.");
+        return;
+      }
+
+      let result: WebCodecsRecordingResult;
+      try {
+        result = await recorder.stop();
+      } catch (error) {
+        console.error("[StreamView] Failed to finalize WebCodecs recording:", error);
+        setRecordingError("Recording could not be saved.");
+        if (id) {
+          window.openNow.abortRecording({ recordingId: id }).catch(() => undefined);
+        }
+        return;
+      } finally {
+        audioCtxRef.current?.close().catch(() => undefined);
+        audioCtxRef.current = null;
+      }
+
+      const expectedFps = webCodecsExpectedFpsRef.current;
+      webCodecsExpectedFpsRef.current = null;
+      const durationMs = Date.now() - recordingStartTimeRef.current;
+      // Frames missing against the stream's own rate: the honest "device
+      // could not keep up" signal for this path. The recorder drops frames
+      // from the FILE only — encoder-queue skips are counted live, MSTP's
+      // live-edge drops are not, so the shortfall is the truthful number.
+      if (expectedFps !== null) {
+        const lostFrames = computeRecordingFrameShortfall(result.videoFrames, durationMs, expectedFps);
+        if (lostFrames > 0) {
+          setRecordingDropNotice(
+            `Recording missed ${lostFrames} frame${lostFrames === 1 ? "" : "s"} — the device could not keep up.`,
+          );
+        }
+      }
+      if (!id) return;
+      // Worker chunks are already queued in the send chain (message order);
+      // drain it before finishing so every byte of the file is on disk.
+      await chunkSendChainRef.current;
+      try {
+        const entry = await window.openNow.finishRecording({
+          recordingId: id,
+          durationMs,
+          gameTitle,
+          thumbnailDataUrl: thumbnailDataUrlRef.current ?? undefined,
+        });
+        setRecordings((prev) => [entry, ...prev].slice(0, RECORDING_LIST_CAP));
+        thumbnailDataUrlRef.current = null;
+      } catch (error) {
+        console.error("[StreamView] Failed to finish recording:", error);
+        setRecordingError("Recording could not be saved.");
+      }
+    },
+    [gameTitle],
+  );
+
+  /**
+   * WebCodecs recorder start for within-cap streams (web mode). Taps the live
+   * remote video track and the composed audio track with
+   * MediaStreamTrackProcessor, re-encodes with hardware WebCodecs encoders
+   * and streams fragmented MP4 straight into the recording file. The MSTP
+   * ingest is what protects the stream: a recorder that cannot keep up drops
+   * frames from the file and never backpressures the WebRTC receive pipeline
+   * (MediaRecorder on the raw track did exactly that — the field stutter).
+   *
+   * Returns false (with nothing left behind) when the path cannot start; the
+   * caller then falls back to the MediaRecorder raw-track flow.
+   */
+  const startWebCodecsRecording = useCallback(
+    async (input: {
+      videoTrack: MediaStreamTrack;
+      audioTrack: MediaStreamTrack | null;
+    }): Promise<boolean> => {
+      const expectedFps = resolveRecordingStreamFps(
+        streamFps,
+        input.videoTrack.getSettings().frameRate,
+      );
+      const currentVideo = videoRef.current;
+      const width = currentVideo?.videoWidth ?? 0;
+      const height = currentVideo?.videoHeight ?? 0;
+
+      let recordingId: string;
+      try {
+        const result = await window.openNow.beginRecording({ mimeType: "video/mp4" });
+        recordingId = result.recordingId;
+      } catch (error) {
+        console.error("[StreamView] Failed to begin WebCodecs recording:", error);
+        return false;
+      }
+
+      let recorder: WebCodecsTrackRecorder;
+      try {
+        recorder = await startWebCodecsTrackRecorder({
+          videoTrack: input.videoTrack,
+          audioTrack: input.audioTrack,
+          width,
+          height,
+          fps: expectedFps,
+          videoBitrate: clampRecordingBitrate(recordingBitrateMbps, "webcodecs-track"),
+          onChunk: (chunk) => {
+            chunkSendChainRef.current = chunkSendChainRef.current
+              .then(() => window.openNow.sendRecordingChunk({ recordingId, chunk }))
+              .catch((error: unknown) => {
+                console.error("[StreamView] Failed to send recording chunk:", error);
+              });
+          },
+          onDiagnostic: (message) => console.info(`[StreamView] ${message}`),
+          onFatal: (error) => {
+            console.error("[StreamView] WebCodecs recorder failed mid-recording:", error);
+            void stopWebCodecsRecording({ abort: true });
+          },
+          workerFactory: () =>
+            new Worker(new URL("../recording/recordWebCodecsWorker.ts", import.meta.url), {
+              type: "module",
+            }),
+        });
+      } catch (error) {
+        console.warn(
+          "[StreamView] WebCodecs recorder could not start — falling back to MediaRecorder:",
+          error,
+        );
+        window.openNow.abortRecording({ recordingId }).catch(() => undefined);
+        return false;
+      }
+
+      webCodecsRecorderRef.current = recorder;
+      webCodecsExpectedFpsRef.current = expectedFps;
+      recordingIdRef.current = recordingId;
+      thumbnailDataUrlRef.current = null;
+      recordingStartTimeRef.current = Date.now();
+      setRecordingDurationMs(0);
+      setRecordingDropNotice(null);
+      setIsRecording(true);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingDurationMs(Date.now() - recordingStartTimeRef.current);
+      }, 500);
+      if (currentVideo && width > 0 && height > 0) {
+        thumbnailFromSource(currentVideo, width, height);
+      }
+      return true;
+    },
+    [recordingBitrateMbps, stopWebCodecsRecording, streamFps, thumbnailFromSource, videoRef],
+  );
+
   const toggleRecording = useCallback(async () => {
     setRecordingError(null);
 
@@ -965,6 +1167,10 @@ export function useStreamRecorder({
         void stopEncodedRecording();
         return;
       }
+      if (webCodecsRecorderRef.current) {
+        void stopWebCodecsRecording();
+        return;
+      }
       mediaRecorderRef.current?.stop();
       return;
     }
@@ -1022,9 +1228,10 @@ export function useStreamRecorder({
       const videoMime =
         pc?.getReceivers().find((receiver) => receiver.track?.kind === "video")?.getParameters()
           .codecs[0]?.mimeType ?? "";
-      if (videoMime.toLowerCase().includes("hevc")) {
+      const videoMimeLower = videoMime.toLowerCase();
+      if (videoMimeLower.includes("hevc") || videoMimeLower.includes("h265")) {
         console.info(
-          "[StreamView] HEVC negotiated — Chromium does not deliver receiver encoded transforms for H.265; recording via the MediaRecorder path instead.",
+          "[StreamView] HEVC negotiated — Chromium does not deliver receiver encoded transforms for H.265; the recording re-encodes the frames instead.",
         );
       }
     }
@@ -1037,6 +1244,7 @@ export function useStreamRecorder({
       },
       recordCap,
       encodedCapture !== null,
+      isWebCodecsRecordingSupported(),
     );
     const effectiveMimeType =
       strategy === "encoded-transform" && encodedCapture ? encodedCapture.mimeType : mimeType;
@@ -1068,14 +1276,28 @@ export function useStreamRecorder({
       audioCtx.createMediaStreamSource(micStream).connect(audioDest);
     }
 
-    // Raw-track path: no canvas, no draw loop — MediaRecorder encodes every
-    // decoded frame directly. Canvas-downscale path (taken when the stream
-    // exceeds the cap or no AVC container is available): draw at most one
-    // frame per record-period into a capped canvas so a full-res software
-    // re-encode can't starve the main thread that also runs the WebRTC
-    // decoder. The cap follows the user's recordingResolution/recordingFps
-    // settings.
-    const rawTrackMode = strategy === "raw-track";
+    if (strategy === "webcodecs-track" && streamVideoTrack) {
+      const started = await startWebCodecsRecording({
+        videoTrack: streamVideoTrack,
+        audioTrack: audioDest.stream.getAudioTracks()[0] ?? null,
+      });
+      if (started) return;
+      // The WebCodecs recorder could not start (unsupported configuration or
+      // a worker failure at init) and has already aborted its file. Fall
+      // through to MediaRecorder on the raw track — the same within-cap
+      // reasoning that selected WebCodecs, through Chromium's own encoder.
+      // rawTrackMode below keeps the canvas setup out of this fallback.
+      setUsedStrategy("raw-track");
+    }
+
+    // Raw-track path (also the WebCodecs fallback when its start failed): no
+    // canvas, no draw loop — MediaRecorder encodes every decoded frame
+    // directly. Canvas-downscale path (taken when the stream exceeds the cap
+    // or no AVC container is available): draw at most one frame per
+    // record-period into a capped canvas so a full-res software re-encode
+    // can't starve the main thread that also runs the WebRTC decoder. The cap
+    // follows the user's recordingResolution/recordingFps settings.
+    const rawTrackMode = strategy === "raw-track" || strategy === "webcodecs-track";
     // Cap resolved once above — the strategy gate and the canvas draw loop
     // below share it, so the raw-track path can never outrun the user's
     // recordingResolution/recordingFps settings.
@@ -1333,25 +1555,7 @@ export function useStreamRecorder({
     }
     try {
     const recorder = new MediaRecorder(composed, recorderOptions);
-
-    // Downscale a frame source to the small JPEG thumbnail. Used only in
-    // raw-track mode — the canvas path gets its thumbnail from the worker —
-    // and the encode itself is at thumb size.
-    const thumbnailFromSource = (
-      source: CanvasImageSource,
-      sourceWidth: number,
-      sourceHeight: number,
-    ): void => {
-      const { width, height } = fitThumbnailSize(sourceWidth, sourceHeight);
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      if (context) {
-        context.drawImage(source, 0, 0, width, height);
-        thumbnailDataUrlRef.current = canvas.toDataURL("image/jpeg", 0.72);
-      }
-    };
+    console.info(`[StreamView] MediaRecorder active — mimeType "${recorder.mimeType}"`);
 
     recorder.ondataavailable = (event: BlobEvent) => {
       if (!event.data || event.data.size === 0) return;
@@ -1492,8 +1696,10 @@ export function useStreamRecorder({
     recordingResolution,
     startEncodedMicCapture,
     startEncodedRecording,
+    startWebCodecsRecording,
     stopEncodedMicCapture,
     stopEncodedRecording,
+    stopWebCodecsRecording,
     streamActive,
     videoRef,
   ]);
@@ -1520,6 +1726,12 @@ export function useStreamRecorder({
         }
         encodedWorker.terminate();
       }
+      const webCodecsRecorder = webCodecsRecorderRef.current;
+      if (webCodecsRecorder) {
+        webCodecsRecorderRef.current = null;
+        webCodecsRecorder.abort();
+      }
+      webCodecsExpectedFpsRef.current = null;
       const recorder = mediaRecorderRef.current;
       const id = recordingIdRef.current;
       if (recorder && recorder.state !== "inactive") {

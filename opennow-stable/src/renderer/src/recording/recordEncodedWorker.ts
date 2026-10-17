@@ -17,6 +17,8 @@
 import { Muxer as Mp4Muxer, StreamTarget as Mp4StreamTarget } from "mp4-muxer";
 import { Muxer as WebmMuxer, StreamTarget as WebmStreamTarget } from "webm-muxer";
 
+import { PositionalWriter } from "./positionalWriter";
+
 import {
   annexBToLengthPrefixed,
   buildAv1CFromObuStream,
@@ -160,38 +162,9 @@ interface MuxerHandle {
  * Both muxers emit merged, ascending sections (overlapping rewrites — moof
  * patches, CodecPrivate placeholders — are collapsed inside each flush), so
  * the only non-contiguity is the occasional gap, buffered here until it
- * fills. flushAll() drains whatever remains after finalize().
+ * fills. flushAll() drains whatever remains after finalize(). Shared with the
+ * WebCodecs muxer worker — see ./positionalWriter.
  */
-class PositionalWriter {
-  private readonly chunks = new Map<number, Uint8Array>();
-  private nextEmit = 0;
-
-  constructor(private readonly onData: (data: Uint8Array) => void) {}
-
-  write(data: Uint8Array, position: number): void {
-    if (position < this.nextEmit) {
-      // Backward write into already-emitted bytes. Should not happen after the
-      // muxer's own merge; dropping keeps the append-only file consistent.
-      return;
-    }
-    this.chunks.set(position, data);
-    this.flush();
-  }
-
-  flushAll(): void {
-    this.flush();
-  }
-
-  private flush(): void {
-    let data = this.chunks.get(this.nextEmit);
-    while (data) {
-      this.chunks.delete(this.nextEmit);
-      this.nextEmit += data.byteLength;
-      this.onData(data);
-      data = this.chunks.get(this.nextEmit);
-    }
-  }
-}
 
 let config: EncodedCaptureInit | null = null;
 let handle: MuxerHandle | null = null;
