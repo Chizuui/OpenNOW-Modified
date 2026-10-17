@@ -675,6 +675,8 @@
     "queueAdUrlLoad": "Error loading url"
   },
   "androidStreamInput": {
+    "stream_mouse_with_touch_controller": "Finger mouse with touch controller",
+    "stream_mouse_with_touch_controller_description": "Allow touches outside the controller to move or click the mouse. Leave off to avoid accidental input switching.",
     "settings_high_settings_warning_title": "High settings may prevent a session from launching",
     "settings_high_settings_warning_body": "You can try these settings, but some devices or servers may not support them. If the session fails to launch, lower the resolution, frame rate, or bitrate and try again.",
     "stream_input_choose_at_launch_title": "Choose input for this game",

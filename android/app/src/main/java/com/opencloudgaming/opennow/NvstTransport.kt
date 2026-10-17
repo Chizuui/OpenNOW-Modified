@@ -190,7 +190,9 @@ internal class NvstTransport(
     private var codecName: String? = null
     @Volatile private var decodedResolution: String? = null
     @Volatile private var decodeTimeMs: Double? = null
-    private val decoderBuffers = ArrayBlockingQueue<ByteBuffer>(8)
+    private var decoderInput: NvstDecoderInput? = null
+    private val decodeInfo = VideoDecoder.DecodeInfo(false, 0)
+    private val decodedSize = DecodedResolutionTracker()
     private val initialDecoderSize = nvstDecoderInitialSize(session, settings)
     private val inputWorker = ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
         ArrayBlockingQueue(128), { task -> Thread({
@@ -306,7 +308,9 @@ internal class NvstTransport(
             val (width, height) = initialDecoderSize
             val status = created.initDecode(VideoDecoder.Settings(2, width, height), VideoDecoder.Callback { frame, decodeMs, _ ->
                 if (!stopped) {
-                    decodedResolution = "${frame.rotatedWidth}x${frame.rotatedHeight}"
+                    decodedSize.observe(frame.rotatedWidth, frame.rotatedHeight)?.let { size ->
+                        decodedResolution = "${size.width}x${size.height}"
+                    }
                     decodeTimeMs = decodeMs?.toDouble()
                     decodedFrames.incrementAndGet()
                     lastDecodedAt.set(SystemClock.elapsedRealtime())
@@ -315,18 +319,16 @@ internal class NvstTransport(
                 }
             })
             check(status == VideoCodecStatus.OK) { "NVST decoder initialization failed: $status" }
+            val borrowedInput = created.supportsBorrowedNvstInput()
+            decoderInput = NvstDecoderInput(borrowedInput)
+            NativeInputDiagnostics.addRetained("nvst.decoder-input",
+                "NVST decoder input borrowed=$borrowedInput implementation=${created.implementationName}")
             codecName = codec
             created
         }
-        val reusable = decoderBuffers.poll()
-        val buffer = if (reusable != null && reusable.capacity() >= bytes.remaining()) reusable
-            else ByteBuffer.allocateDirect(bytes.remaining())
-        buffer.clear()
-        buffer.put(bytes)
-        buffer.flip()
-        val image = nvstEncodedImage(buffer, timestampNs, keyframe) { decoderBuffers.offer(buffer) }
+        val image = checkNotNull(decoderInput).frame(bytes, timestampNs, keyframe)
         return try {
-            val status = activeDecoder.decode(image, VideoDecoder.DecodeInfo(false, 0))
+            val status = activeDecoder.decode(image, decodeInfo)
             val accepted = status == VideoCodecStatus.OK
             needsKeyframe = !accepted
             accepted
@@ -344,6 +346,7 @@ private class NvstAudioOutput(
     private val info = MediaCodec.BufferInfo()
     private val pending = java.util.ArrayDeque<ByteBuffer>()
     private var pendingBytes = 0
+    private var appliedMute: Boolean? = null
 
     init {
         var openedTrack: AudioTrack? = null
@@ -378,7 +381,9 @@ private class NvstAudioOutput(
     }
 
     fun feed(bytes: ByteBuffer, ptsUs: Long, muted: Boolean) {
-        track.setVolume(if (muted) 0f else 1f)
+        if (appliedMute != muted) {
+            if (track.setVolume(if (muted) 0f else 1f) == AudioTrack.SUCCESS) appliedMute = muted
+        }
         drainPcm()
         val index = codec.dequeueInputBuffer(0)
         if (index >= 0) {

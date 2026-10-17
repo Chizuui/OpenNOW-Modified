@@ -13,7 +13,9 @@ internal fun shouldPreferDirectSdrSurface(
         defaultStreamVideoOutput(playStoreRelease)
     } else settings.videoOutput
     return output == StreamVideoOutput.MediaCodecSurface && !settings.hdrEnabled &&
-        !settings.usesTenBitStreamProfile() && !settings.streamSharpeningEnabled
+        !settings.usesTenBitStreamProfile() && !streamSharpnessShaderActive(
+            streamSharpnessShaderStrength(settings.streamSharpeningEnabled, settings.streamSharpeningAmount),
+        )
 }
 
 internal fun sdrSurfaceDecoderConfiguration(

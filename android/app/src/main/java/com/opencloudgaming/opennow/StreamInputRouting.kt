@@ -14,6 +14,15 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
+internal fun touchMouseEnabledForStream(
+    touch: AndroidTouchSettings,
+    streamReady: Boolean,
+    touchInputEnabled: Boolean,
+    nativeTouchActive: Boolean,
+    virtualGamepadVisible: Boolean,
+): Boolean = streamReady && touchInputEnabled && touch.mousePad && !nativeTouchActive &&
+    (!virtualGamepadVisible || touch.mouseWithTouchController)
+
 internal class NativeUiTouchRoutingState {
     @Volatile
     private var streamChromeBounds: TouchPassthroughBounds? = null
@@ -242,6 +251,8 @@ object NativeStreamInputRouter {
     @Volatile
     private var mouseDirectClick = false
     @Volatile
+    private var touchMouseButtonsEnabled = true
+    @Volatile
     private var stretchToFit = false
     @Volatile
     private var renderingAspectRatio = 0f
@@ -278,6 +289,7 @@ object NativeStreamInputRouter {
     private var streamUiActive = false
     private val nativeUiTouchRouting = NativeUiTouchRoutingState()
     private val touchMouseState = TouchMouseState()
+    private var touchMouseOutput: TouchMouseOutput? = null
 
     /**
      * When set, fingers are forwarded to the host as real touch instead of being turned into a
@@ -289,9 +301,9 @@ object NativeStreamInputRouter {
     private val touchSlots = TouchSlotAllocator()
 
     fun attach(next: NativeStreamClient) {
+        if (client !== next) touchMouseState.reset(touchMouseOutput)
         client = next
-        // Never carry an in-progress drag position into a different host session.
-        touchMouseState.forgetCursorPosition()
+        touchMouseOutput = NativeTouchMouseOutput(next)
         decodedStreamResolution = 0 to 0
         resetPresentationTransform()
     }
@@ -301,7 +313,7 @@ object NativeStreamInputRouter {
             releaseInputForLifecycle("stream-detached")
             consumedControllerMenuHoldDeviceId = null
             client = null
-            touchMouseState.forgetCursorPosition()
+            touchMouseOutput = null
             decodedStreamResolution = 0 to 0
             resetPresentationTransform()
         }
@@ -311,7 +323,7 @@ object NativeStreamInputRouter {
     fun releaseInputForLifecycle(reason: String) {
         cancelControllerMenuHold(releaseForwardedStart = true)
         client?.releasePhysicalInputForLifecycle(reason)
-        touchMouseState.reset(client)
+        touchMouseState.reset(touchMouseOutput)
         releaseAllNativeTouches()
         nativeUiTouchRouting.endPointerGesture()
     }
@@ -319,13 +331,20 @@ object NativeStreamInputRouter {
     fun setTouchMouseEnabled(enabled: Boolean) {
         touchMouseEnabled = enabled
         if (!enabled) {
-            touchMouseState.reset(client)
+            touchMouseState.reset(touchMouseOutput)
         }
     }
 
     fun setMouseDirectClick(enabled: Boolean) {
         mouseDirectClick = enabled
-        touchMouseState.reset(client)
+        touchMouseState.reset(touchMouseOutput)
+    }
+
+    /** K&M overlay buttons own clicks; background fingers only position the cursor. */
+    fun setTouchMouseButtonsEnabled(enabled: Boolean) {
+        if (touchMouseButtonsEnabled == enabled) return
+        touchMouseState.reset(touchMouseOutput)
+        touchMouseButtonsEnabled = enabled
     }
 
     fun setNativeTouchEnabled(enabled: Boolean) {
@@ -334,20 +353,20 @@ object NativeStreamInputRouter {
         // Leaving the mode mid-gesture would otherwise strand whatever fingers are down.
         releaseAllNativeTouches()
         nativeUiTouchRouting.endPointerGesture()
-        touchMouseState.reset(client)
+        touchMouseState.reset(touchMouseOutput)
     }
 
     fun setStretchToFit(enabled: Boolean) {
         if (stretchToFit != enabled) {
             stretchToFit = enabled
-            touchMouseState.reset(client)
+            touchMouseState.reset(touchMouseOutput)
         }
     }
 
     fun setRenderingAspectRatio(ratio: Float) {
         if (renderingAspectRatio != ratio) {
             renderingAspectRatio = ratio
-            touchMouseState.reset(client)
+            touchMouseState.reset(touchMouseOutput)
         }
     }
 
@@ -362,7 +381,7 @@ object NativeStreamInputRouter {
         val safeTranslationY = translationY.takeIf { it.isFinite() } ?: 0f
         val next = PresentationTransform(safeScale, safeTranslationX, safeTranslationY)
         if (presentationTransform == next) return
-        touchMouseState.reset(client)
+        touchMouseState.reset(touchMouseOutput)
         presentationTransform = next
     }
 
@@ -377,7 +396,7 @@ object NativeStreamInputRouter {
                 // A new decoded geometry changes the visible content bounds even though the
                 // selected viewport remains fixed. End in-flight gestures before switching
                 // coordinate spaces so a held pointer cannot jump across the host screen.
-                touchMouseState.reset(client)
+                touchMouseState.reset(touchMouseOutput)
                 releaseAllNativeTouches()
             }
             decodedStreamResolution = next
@@ -417,7 +436,7 @@ object NativeStreamInputRouter {
             // host will not receive that finger's eventual UP once UI routing takes over, so cancel
             // it at the transition instead of leaving a stuck press in the game.
             releaseAllNativeTouches()
-            touchMouseState.reset(client)
+            touchMouseState.reset(touchMouseOutput)
             client?.releasePhysicalInputForLifecycle("stream-ui-opened")
         }
         streamUiActive = active
@@ -503,7 +522,7 @@ object NativeStreamInputRouter {
     }
 
     fun cancelTouchMouse() {
-        touchMouseState.reset(client)
+        touchMouseState.reset(touchMouseOutput)
     }
 
     fun isNativeUiTouchGestureActive(): Boolean =
@@ -566,14 +585,21 @@ object NativeStreamInputRouter {
         if (nativeTouchEnabled && event.isFingerTouchEvent() && width > 0 && height > 0) {
             return dispatchNativeTouch(event, current, width, height)
         }
+        // Direct click must respect the finger-mouse gate too. External mouse/touchpad input
+        // remains independent, including when background fingers are blocked by the controller.
+        if (event.isFingerTouchEvent() && !touchMouseEnabled) {
+            touchMouseState.reset(touchMouseOutput)
+            return false
+        }
         val decodedResolution = decodedStreamResolution
         val transform = presentationTransform
         return touchMouseState.handle(
             event = event,
             enabled = (touchMouseEnabled || isDirectClick) && width > 0 && height > 0,
-            client = current,
+            client = touchMouseOutput ?: return false,
             ignoredPointerIds = nativeUiTouchRouting.ownedPointers(),
             directClick = mouseDirectClick,
+            buttonsEnabled = touchMouseButtonsEnabled || !event.isFingerTouchEvent(),
             width = width,
             height = height,
             stretchToFit = stretchToFit,

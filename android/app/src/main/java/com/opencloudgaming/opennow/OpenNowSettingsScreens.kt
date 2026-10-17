@@ -1108,6 +1108,13 @@ private fun SettingsContent(
                 }
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Stream, searchQuery, stringResource(R.string.settings_section_stream_connection), "stream", "connection", "network", "region", "session proxy", "proxy") {
+                SettingSwitch(
+                    label = stringResource(R.string.settings_browser_client_mode),
+                    checked = settings.stream.browserClientMode,
+                    description = stringResource(R.string.settings_browser_client_mode_desc),
+                ) { enabled ->
+                    viewModel.updateStreamSettings { s -> s.copy(browserClientMode = enabled) }
+                }
                 ChoiceRow(stringResource(R.string.settings_region), listOf(stringResource(R.string.option_auto)) + state.regions.map { it.name }, state.regions.firstOrNull { it.url == settings.stream.region }?.name ?: stringResource(R.string.option_auto)) { label ->
                     val url = state.regions.firstOrNull { it.name == label }?.url.orEmpty()
                     viewModel.updateStreamSettings { s -> s.copy(region = url) }
@@ -1428,6 +1435,16 @@ private fun SettingsContent(
                 }
                 SettingSwitch(stringResource(R.string.stream_panel_finger_mouse), settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {
+                    Column(Modifier.padding(start = 24.dp)) {
+                        SettingSwitch(stringResource(R.string.stream_mouse_with_touch_controller), settings.androidTouch.mouseWithTouchController) { enabled ->
+                            viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseWithTouchController = enabled)))
+                        }
+                        Text(
+                            text = stringResource(R.string.stream_mouse_with_touch_controller_description),
+                            color = SettingsTextMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     Box(Modifier.padding(start = 24.dp)) {
                         SettingSwitch(stringResource(R.string.stream_panel_direct_click), settings.androidTouch.mouseDirectClick) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseDirectClick = enabled))) }
                     }

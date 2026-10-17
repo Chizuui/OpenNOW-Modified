@@ -295,8 +295,9 @@ fn run(
                 let accepted = env
                     .with_local_frame(8, |env| -> jni::errors::Result<bool> {
                         let codec = env.new_string(&frame.codec)?;
-                        // The Arc stays alive through this synchronous call. Android copies into a
-                        // retained decoder buffer before returning; it never stores this borrowed view.
+                        // The Arc stays alive through this synchronous call. Audited Android
+                        // decoders copy into MediaCodec before returning, or retain their own
+                        // pending-input copy. Unknown decoders use an owned staging copy.
                         let bytes = unsafe {
                             env.new_direct_byte_buffer(
                                 frame.payload.as_ptr() as *mut u8,

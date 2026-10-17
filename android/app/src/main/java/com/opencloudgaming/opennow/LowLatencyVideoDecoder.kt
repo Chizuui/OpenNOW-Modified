@@ -18,6 +18,11 @@ class LowLatencyVideoDecoder(
 ) : VideoDecoder {
 
     private var patched = false
+    private var wrapperInstalled = false
+    private val bufferProgress = CodecBufferProgress()
+
+    internal val canBorrowEncodedInput: Boolean
+        get() = delegate.supportsBorrowedNvstInput()
 
     override fun initDecode(settings: VideoDecoder.Settings?, decodeCallback: VideoDecoder.Callback?): VideoCodecStatus {
         NativeInputDiagnostics.add(
@@ -30,7 +35,9 @@ class LowLatencyVideoDecoder(
     }
 
     override fun release(): VideoCodecStatus {
-        return delegate.release()
+        val result = delegate.release()
+        if (wrapperInstalled) retainBufferProgress(force = true)
+        return result
     }
 
     override fun decode(frame: EncodedImage?, info: VideoDecoder.DecodeInfo?): VideoCodecStatus {
@@ -88,9 +95,17 @@ class LowLatencyVideoDecoder(
                     override fun started(codecName: String, parameters: OpenNowMediaCodecTuning.ParameterSetter) {
                         applyStreamParameters(parameters, lowLatencyEnabled, standardLowLatencyEnabled)
                     }
+
+                    override fun inputQueued() = bufferProgress.inputQueued()
+                    override fun outputDequeued(codecConfig: Boolean) = bufferProgress.outputDequeued(codecConfig)
+                    override fun outputReleased(render: Boolean) {
+                        bufferProgress.outputReleased(render)
+                        retainBufferProgress()
+                    }
                 },
             )
             factoryField.set(delegate, tunedFactory)
+            wrapperInstalled = true
             val msg = "Successfully patched MediaCodecWrapperFactory on ${delegate.javaClass.name}"
             Log.i(TAG, msg)
             NativeInputDiagnostics.add("LowLatencyVideoDecoder: $msg")
@@ -98,6 +113,13 @@ class LowLatencyVideoDecoder(
             val msg = "Failed to install low latency MediaCodec wrapper: ${tr.message}"
             Log.w(TAG, msg, tr)
             NativeInputDiagnostics.add("LowLatencyVideoDecoder: $msg")
+        }
+    }
+
+    private fun retainBufferProgress(force: Boolean = false) {
+        bufferProgress.report(android.os.SystemClock.elapsedRealtime(), force)?.let { progress ->
+            NativeInputDiagnostics.addRetained("codec-buffer-progress",
+                "MediaCodec texture progress decoder=${delegate.implementationName} $progress")
         }
     }
 

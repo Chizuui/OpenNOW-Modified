@@ -2,7 +2,7 @@ package com.opencloudgaming.opennow
 
 import androidx.annotation.StringRes
 
-internal const val DEFAULT_STREAM_STATS_BACKGROUND_OPACITY = 0.52f
+internal const val DEFAULT_STREAM_STATS_BACKGROUND_OPACITY = 0.60f
 
 internal fun AppSettings.streamStatsBackgroundAlpha(): Float = if (!streamStatsBackgroundEnabled) {
     0f

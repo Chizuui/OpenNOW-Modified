@@ -10,14 +10,21 @@ internal class SurfacePresentationClock(fps: Int) {
     fun next(mediaNs: Long, nowNs: Long): Long {
         val previous = lastMediaNs
         val target = localAnchorNs + (mediaNs - mediaAnchorNs)
-        // One frame of headroom absorbs callback jitter. A pause, a backward timestamp,
-        // or a burst outside two frames starts a fresh timeline rather than building a queue.
-        val reset = previous == null || mediaNs <= previous || target < nowNs ||
-            target - nowNs > 2 * frameNs
+        // One frame of headroom absorbs callback jitter. A pause or a backward timestamp
+        // starts a fresh timeline rather than building a queue.
+        val reset = previous == null || mediaNs <= previous || target < nowNs
         lastMediaNs = mediaNs
         if (reset) {
             mediaAnchorNs = mediaNs
             localAnchorNs = nowNs + frameNs
+            return localAnchorNs
+        }
+        if (target - nowNs > 2 * frameNs) {
+            // A catch-up burst must not move presentation backwards from two frames ahead
+            // to one frame ahead. Clamp the newest frame to the same bounded horizon,
+            // allowing the Surface to replace stale scheduled output without sawtooth pacing.
+            mediaAnchorNs = mediaNs
+            localAnchorNs = nowNs + 2 * frameNs
             return localAnchorNs
         }
         return target

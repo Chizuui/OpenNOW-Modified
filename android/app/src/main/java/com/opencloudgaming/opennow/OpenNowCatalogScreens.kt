@@ -1198,7 +1198,6 @@ private fun GameGridSkeleton(
                     GameCardSkeleton(
                         expressiveUi = settings.expressiveUi,
                         tvProfile = tvProfile,
-                        squareCard = gridSpec.squareCards,
                         thumbnailFavoriteOverlay = shouldShowCatalogFavoriteIcon(settings),
                         showCardTitles = !artworkOnly && shouldShowCatalogCardTitles(
                             tvProfile = tvProfile,
@@ -1371,7 +1370,6 @@ private fun StoreRailSectionSkeleton(
                         width = cardWidth,
                         expressiveUi = expressiveUi,
                         tvProfile = tvProfile,
-                        portraitCard = !tvProfile,
                         showFavoriteIcon = showFavoriteIcon,
                     )
                 }
@@ -1385,7 +1383,6 @@ private fun StoreRailGameCardSkeleton(
     width: Dp,
     expressiveUi: Boolean,
     tvProfile: Boolean,
-    portraitCard: Boolean,
     showFavoriteIcon: Boolean,
 ) {
     val shape = RoundedCornerShape(if (expressiveUi) 12.dp else 8.dp)
@@ -1393,7 +1390,7 @@ private fun StoreRailGameCardSkeleton(
         modifier = Modifier
             .width(width)
             .padding(vertical = if (tvProfile) CATALOG_CONTROLLER_FOCUS_INSET else 0.dp)
-            .aspectRatio(if (portraitCard) GAME_BOX_ART_ASPECT_RATIO else 1f)
+            .aspectRatio(GAME_BOX_ART_ASPECT_RATIO)
             .border(
                 1.dp,
                 catalogCardBorderColor(
@@ -1426,7 +1423,6 @@ private fun StoreRailGameCardSkeleton(
 private fun GameCardSkeleton(
     expressiveUi: Boolean,
     tvProfile: Boolean,
-    squareCard: Boolean,
     thumbnailFavoriteOverlay: Boolean,
     showCardTitles: Boolean,
 ) {
@@ -1436,7 +1432,7 @@ private fun GameCardSkeleton(
             .fillMaxWidth()
             .padding(vertical = if (tvProfile) CATALOG_CONTROLLER_FOCUS_INSET else 0.dp),
     ) {
-        Box(Modifier.catalogCardArtworkSize(squareCard)) {
+        Box(Modifier.catalogCardArtworkSize()) {
             Card(
                 modifier = Modifier.matchParentSize(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)),
@@ -1462,8 +1458,8 @@ private fun GameCardSkeleton(
 }
 
 /** One artwork measurement path for loaded recommendation cards and their loading skeletons. */
-private fun Modifier.catalogCardArtworkSize(squareCard: Boolean): Modifier =
-    fillMaxWidth().aspectRatio(if (squareCard) 1f else GAME_BOX_ART_ASPECT_RATIO)
+private fun Modifier.catalogCardArtworkSize(): Modifier =
+    fillMaxWidth().aspectRatio(GAME_BOX_ART_ASPECT_RATIO)
 
 private const val CATALOG_CARD_TITLE_LINES = 2
 
@@ -1629,7 +1625,6 @@ private fun GameGrid(
                                 tvProfile = tvProfile,
                                 enabled = settings.showCardTitles,
                             ),
-                            squareCard = gridSpec.squareCards,
                             imageRequestWidth = cardRequestWidth,
                             thumbnailFavoriteOverlay = shouldShowCatalogFavoriteIcon(settings),
                             showPremiumMarker = settings.showPremiumMarker,
@@ -1788,7 +1783,6 @@ private fun StoreGameGrid(
                                 tvProfile = tvProfile,
                                 enabled = settings.showCardTitles,
                             ),
-                            squareCard = gridSpec.squareCards,
                             imageRequestWidth = cardRequestWidth,
                             thumbnailFavoriteOverlay = shouldShowCatalogFavoriteIcon(settings),
                             showPremiumMarker = settings.showPremiumMarker,
@@ -2574,7 +2568,7 @@ private fun StoreRailGameCard(
         Box(
             Modifier
                 .width(width)
-                .aspectRatio(if (tvProfile) 1f else GAME_BOX_ART_ASPECT_RATIO)
+                .aspectRatio(GAME_BOX_ART_ASPECT_RATIO)
                 .catalogCardTransform(scale = cardScale, alpha = dimAlpha)
                 // Keep the lightweight coordinates handle while scrolling and calculate the global
                 // rectangle only when the card is actually selected.
@@ -2812,7 +2806,6 @@ private data class GameGridSpec(
     val horizontalSpacing: Dp,
     val verticalSpacing: Dp,
     val contentPadding: PaddingValues,
-    val squareCards: Boolean,
 )
 
 /**
@@ -3016,9 +3009,6 @@ private fun gameGridSpec(
             end = horizontalPadding,
             bottom = AppScrollEndSpacing,
         ),
-        // TV grid cards match the TV rail cards, which have always been square — this is the shape
-        // NVIDIA's tvCardImageUrl assets are cut for.
-        squareCards = !handheldLayout,
     )
 }
 
@@ -3081,7 +3071,6 @@ private fun GameCard(
     expressiveUi: Boolean,
     liveSelectedOutlines: Boolean,
     showCardTitles: Boolean,
-    squareCard: Boolean,
     imageRequestWidth: Int = MOBILE_CARD_IMAGE_REQUEST_WIDTH,
     thumbnailFavoriteOverlay: Boolean,
     showPremiumMarker: Boolean,
@@ -3161,7 +3150,7 @@ private fun GameCard(
                 role = Role.Button
             },
     ) {
-        Box(Modifier.catalogCardArtworkSize(squareCard)) {
+        Box(Modifier.catalogCardArtworkSize()) {
             Card(
                 modifier = Modifier
                     .matchParentSize()

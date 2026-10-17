@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Slider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -103,6 +104,8 @@ internal fun TouchOverlay(
     onButtonAppearanceChange: (String, TouchButtonAppearance) -> Unit,
     onKeyboardButtonAdd: (String) -> Unit = {},
     onKeyboardButtonRemove: (String) -> Unit = {},
+    onKeyboardStickVisibleChange: (Boolean) -> Unit = {},
+    onKeyboardStickScaleChange: (Float) -> Unit = {},
     inputResetKey: Any = Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -115,9 +118,10 @@ internal fun TouchOverlay(
         onDispose { lifecycle.removeObserver(observer) }
     }
     val opacity = touch.opacity
-    val layoutScale = touch.scale
+    // Keep the gamepad compact while giving its sticks more room; keyboard controls retain their sizing.
+    val layoutScale = touch.scale * if (touch.keyboardModeEnabled) 1f else 0.9f
     val buttonScale = touch.buttonScale
-    val stickScale = touch.stickScale
+    val stickScale = touch.stickScale * if (touch.keyboardModeEnabled) 1f else 1.25f
     val defaultOffsets = remember { AndroidTouchSettings().offsets }
 
     val localOffsets = remember(touch.offsets) {
@@ -203,12 +207,14 @@ internal fun TouchOverlay(
                             landscape = landscape,
                             layoutEditing = layoutEditing,
                             buttons = touch.keyboardButtons,
+                            stickVisible = touch.isControlVisible(TouchControlGroup.LeftStick),
+                            onStickVisibleChange = onKeyboardStickVisibleChange,
+                            onStickScaleChange = onKeyboardStickScaleChange,
                             getLocalOffset = getOrientationLocalOffset,
                             getStoredOffset = { key -> localOffsets[key + suffix] },
                             onLocalOffsetChange = onOrientationLocalOffsetChange,
                             onButtonTone = onButtonTone,
                             onKeyboardButtonAdd = onKeyboardButtonAdd,
-                            onKeyboardButtonRemove = onKeyboardButtonRemove,
                         )
                     } else if (landscape) {
                         LandscapeTouchControls(
@@ -274,6 +280,9 @@ internal fun TouchOverlay(
                 onButtonAppearanceChange(button, updated.buttonAppearances[button] ?: TouchButtonAppearance())
             },
             onDismiss = { editingButton = null },
+            onRemove = touch.keyboardButtons.firstOrNull { it.appearanceKey() == button }?.let { keyboardButton ->
+                { onKeyboardButtonRemove(keyboardButton.id); editingButton = null }
+            },
             wideLayout = true,
         )
     }
@@ -304,24 +313,29 @@ private fun BoxScope.KeyboardTouchControls(
     landscape: Boolean,
     layoutEditing: Boolean,
     buttons: List<KeyboardOverlayButton>,
+    stickVisible: Boolean,
+    onStickVisibleChange: (Boolean) -> Unit,
+    onStickScaleChange: (Float) -> Unit,
     getLocalOffset: (String) -> TouchOffset,
     getStoredOffset: (String) -> TouchOffset?,
     onLocalOffsetChange: (String, Float, Float) -> Unit,
     onButtonTone: () -> Unit,
     onKeyboardButtonAdd: (String) -> Unit,
-    onKeyboardButtonRemove: (String) -> Unit,
 ) {
     val orientation = if (landscape) "landscape" else "portrait"
     val stickDiameter = (if (landscape) 148.dp else 128.dp) * layoutScale * stickScale * leftStickScale
     val buttonSize = 48.dp * layoutScale * buttonScale
     val gap = 7.dp * layoutScale
     var showButtonPicker by rememberSaveable { mutableStateOf(false) }
-    TouchControlGroup(
+    var editingStick by rememberSaveable(layoutEditing) { mutableStateOf(false) }
+    val editButton = LocalTouchButtonEdit.current
+    if (stickVisible) TouchControlGroup(
         id = "keyboard-$orientation-stick",
         layoutEditing = layoutEditing,
         offsetX = getLocalOffset("keyboard_stick").x.dp,
         offsetY = getLocalOffset("keyboard_stick").y.dp,
         onOffsetChange = { x, y -> onLocalOffsetChange("keyboard_stick", x, y) },
+        onEdit = { editingStick = true },
         modifier = Modifier.align(Alignment.BottomStart),
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -351,7 +365,7 @@ private fun BoxScope.KeyboardTouchControls(
                 offsetX = offset.x.dp,
                 offsetY = offset.y.dp,
                 onOffsetChange = { x, y -> onLocalOffsetChange(positionKey, x, y) },
-                onRemove = { onKeyboardButtonRemove(button.id) },
+                onEdit = { editButton?.invoke(button.appearanceKey()) },
                 modifier = Modifier.align(Alignment.BottomEnd),
             ) {
                 KeyboardCatalogButton(button, option, client, buttonSize, onButtonTone)
@@ -374,6 +388,11 @@ private fun BoxScope.KeyboardTouchControls(
             )
         }
     }
+    if (editingStick && layoutEditing) {
+        TouchStickSizeDialog(leftStickScale, onStickScaleChange,
+            onRemove = { onStickVisibleChange(false); editingStick = false },
+            onDismiss = { editingStick = false })
+    }
     if (showButtonPicker) {
         KeyboardButtonPickerDialog(
             onDismiss = { showButtonPicker = false },
@@ -383,6 +402,31 @@ private fun BoxScope.KeyboardTouchControls(
             },
         )
     }
+}
+
+@Composable
+internal fun TouchStickSizeDialog(
+    scale: Float,
+    onSave: (Float) -> Unit,
+    onRemove: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var draft by rememberSaveable { mutableStateOf(scale) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.settings_touch_left_stick_size)) },
+        text = {
+            Column {
+                Text("${(draft * 100).roundToInt()}%")
+                Slider(value = draft, onValueChange = { draft = it }, valueRange = 0.6f..1.5f)
+                TextButton(onClick = onRemove) { Text(stringResource(R.string.keyboard_overlay_remove_button)) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(draft); onDismiss() }) { Text(stringResource(R.string.touch_editor_save)) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_cancel)) } },
+    )
 }
 
 @Composable
@@ -1288,7 +1332,7 @@ internal fun TouchControlGroup(
     offsetX: Dp,
     offsetY: Dp,
     onOffsetChange: (Float, Float) -> Unit,
-    onRemove: (() -> Unit)? = null,
+    onEdit: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -1301,6 +1345,7 @@ internal fun TouchControlGroup(
     Box(
         modifier
             .absoluteOffset(x = offsetX, y = offsetY)
+            .then(if (layoutEditing && onEdit != null) Modifier.clickable(onClick = onEdit) else Modifier)
             .pointerInput(layoutEditing) {
                 if (!layoutEditing) return@pointerInput
                 var start = TouchOffset()
@@ -1343,21 +1388,6 @@ internal fun TouchControlGroup(
     ) {
         content()
         if (layoutEditing) {
-            if (onRemove != null) {
-                Surface(
-                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).clickable(
-                        onClickLabel = stringResource(R.string.keyboard_overlay_remove_button),
-                        onClick = onRemove,
-                    ),
-                    shape = RoundedCornerShape(999.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    shadowElevation = 2.dp,
-                ) {
-                    Text("−", style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp))
-                }
-            }
             Box(
                 Modifier
                     .matchParentSize()
@@ -1434,16 +1464,16 @@ internal fun applyTouchJoystickDeadZone(value: Float, deadZone: Float): Float {
     return if (clampedValue < 0f) -adjusted else adjusted
 }
 
-/** Offset the fixed origin toward the finger without a response jump at the calibration limit. */
+/** Fixed sticks keep their layout center; only dynamic sticks follow the initial touch. */
 internal fun touchStickGestureCenter(
     fixedCenter: Offset,
     downPosition: Offset,
-    maxRadius: Float,
     mode: TouchJoystickMode,
 ): Offset {
-    if (mode == TouchJoystickMode.Dynamic) return downPosition
-    val offset = downPosition - fixedCenter
-    return fixedCenter + clampStickOffset(offset, maxRadius * 0.6f)
+    return when (mode) {
+        TouchJoystickMode.Fixed -> fixedCenter
+        TouchJoystickMode.Dynamic -> downPosition
+    }
 }
 
 @Composable
@@ -1616,7 +1646,7 @@ private fun VirtualStick(
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                     val fixedCenter = Offset(size.width / 2f, size.height / 2f)
                     val maxRadius = min(size.width, size.height) * 0.34f
-                    val gestureCenter = touchStickGestureCenter(fixedCenter, down.position, maxRadius, mode)
+                    val gestureCenter = touchStickGestureCenter(fixedCenter, down.position, mode)
                     pressed = true
                     baseOffset = gestureCenter - fixedCenter
                     var lastValue = Offset.Zero

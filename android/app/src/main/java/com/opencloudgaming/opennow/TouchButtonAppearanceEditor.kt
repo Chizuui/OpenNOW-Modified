@@ -111,7 +111,10 @@ internal fun TouchButtonAppearanceEditor(touch: AndroidTouchSettings, onChange: 
             confirmButton = { TextButton(onClick = { open = false }) { Text(stringResource(R.string.touch_editor_close)) } },
         )
     } else {
-        TouchButtonAppearanceDialog(button, touch, onChange, onDismiss = { selected = null })
+        TouchButtonAppearanceDialog(button, touch, onChange, onDismiss = { selected = null },
+            onRemove = touch.keyboardButtons.firstOrNull { it.appearanceKey() == button }?.let { keyboardButton ->
+                { onChange(touch.withKeyboardButtonRemoved(keyboardButton.id)); selected = null }
+            })
     }
 }
 
@@ -123,6 +126,7 @@ internal fun TouchButtonAppearanceDialog(
     onChange: (AndroidTouchSettings) -> Unit,
     onDismiss: () -> Unit,
     wideLayout: Boolean = false,
+    onRemove: (() -> Unit)? = null,
 ) {
     val saved = (touch.buttonAppearances[button] ?: TouchButtonAppearance()).normalized()
     var label by rememberSaveable(button) { mutableStateOf(saved.label) }
@@ -163,6 +167,9 @@ internal fun TouchButtonAppearanceDialog(
             modifier = Modifier.semantics { contentDescription = sizeLabel },
         )
         Text(stringResource(R.string.touch_button_size_hint), style = MaterialTheme.typography.bodySmall)
+        onRemove?.let { remove ->
+            TextButton(onClick = remove) { Text(stringResource(R.string.keyboard_overlay_remove_button)) }
+        }
         Text(stringResource(R.string.touch_button_shape), style = MaterialTheme.typography.titleSmall)
         FlowRow(
             modifier = Modifier.fillMaxWidth(),

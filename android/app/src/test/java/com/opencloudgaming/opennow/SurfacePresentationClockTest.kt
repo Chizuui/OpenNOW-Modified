@@ -37,6 +37,19 @@ class SurfacePresentationClockTest {
         }
     }
 
+    @Test fun catchupBurstNeverSchedulesANewerFrameBeforeAnOlderFrame() {
+        val clock = SurfacePresentationClock(60)
+        val interval = 1_000_000_000L / 60
+        var previous = 0L
+        for (frame in 0..100) {
+            val now = 1000L + frame * 100_000L
+            val target = clock.next(frame * interval, now)
+            assertTrue("frame $frame: $target before $previous", target >= previous)
+            assertTrue(target <= now + 2 * interval)
+            previous = target
+        }
+    }
+
     @Test fun highFpsRetainsItsOwnSchedulingInterval() {
         for (fps in listOf(120, 240, 360)) {
             val clock = SurfacePresentationClock(fps)

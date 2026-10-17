@@ -146,6 +146,24 @@ class NativeTouchGamesTest {
     }
 
     @Test
+    fun websiteClientModeDisablesNativeTouchProvisioning() {
+        assertFalse(
+            shouldUseNativeTouch(
+                NativeTouchMode.Always,
+                game(supportedControls = listOf("TOUCHSCREEN")),
+                StreamSettings(browserClientMode = true),
+            ),
+        )
+        assertTrue(
+            shouldUseNativeTouch(
+                NativeTouchMode.Always,
+                game(supportedControls = listOf("TOUCHSCREEN")),
+                StreamSettings(browserClientMode = true).forProviderInput("OTHER"),
+            ),
+        )
+    }
+
+    @Test
     fun offWinsOverEverything() {
         assertFalse(shouldUseNativeTouch(NativeTouchMode.Off, game(supportedControls = listOf("TOUCHSCREEN"))))
     }

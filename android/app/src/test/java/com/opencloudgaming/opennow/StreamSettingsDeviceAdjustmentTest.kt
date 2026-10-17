@@ -651,7 +651,7 @@ class StreamSettingsDeviceAdjustmentTest {
         assertEquals(VideoCodec.H265, adjusted.codec)
         assertEquals(ColorQuality.EightBit420, adjusted.colorQuality)
         assertEquals(false, adjusted.hdrEnabled)
-        assertEquals(true, adjusted.streamSharpeningEnabled)
+        assertEquals(false, adjusted.streamSharpeningEnabled)
     }
 
     @Test

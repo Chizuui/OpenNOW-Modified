@@ -46,15 +46,18 @@ internal fun shouldUseNativeTouch(mode: NativeTouchMode, game: GameInfo?): Boole
 }
 
 /**
- * Native touch now uses the native Android touch identity, which keeps the desktop allocation
- * matrix. Auto can therefore follow the catalog capability at high resolution and high FPS too.
+ * Native touch uses the native Android touch identity. Explicit website client mode disables
+ * native touch so the host provisions a gamepad-friendly browser session instead.
  */
 internal fun shouldUseNativeTouch(
     mode: NativeTouchMode,
     game: GameInfo?,
-    @Suppress("UNUSED_PARAMETER")
     streamSettings: StreamSettings,
-): Boolean = shouldUseNativeTouch(mode, game)
+): Boolean = !streamSettings.browserClientMode && shouldUseNativeTouch(mode, game)
+
+/** Alliance sessions retain their native touch behavior when the NVIDIA-only option is saved. */
+internal fun StreamSettings.forProviderInput(providerCode: String?): StreamSettings =
+    if (!browserClientMode || providerCode.equals("NVIDIA", ignoreCase = true)) this else copy(browserClientMode = false)
 
 /**
  * Resolves native game touch for the active stream after the player has made a session-level

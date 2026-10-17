@@ -51,6 +51,11 @@ for abi, target, clang_target in [
     env['CMAKE_TOOLCHAIN_FILE'] = str(root / 'android-toolchain.cmake')
     env['CARGO_TARGET_DIR'] = str(root / 'target')
     env['RUSTFLAGS'] = env.get('RUSTFLAGS', '') + ' -C link-arg=-Wl,-z,max-page-size=16384'
+    if target == 'aarch64-linux-android':
+        # RustCrypto 0.8/0.6 require these cfgs to compile ARM AES/PMULL backends.
+        # cpufeatures checks Android HWCAP at runtime and keeps the software fallback.
+        # Do not force +aes target features: older ARM64 CPUs must remain eligible.
+        env['RUSTFLAGS'] += ' --cfg aes_armv8 --cfg polyval_armv8'
     subprocess.run([cargo, 'build', '--locked', '--release', '--manifest-path', str(root / 'Cargo.toml'), '--target', target], env=env, check=True)
     destination = output / abi
     destination.mkdir(parents=True, exist_ok=True)

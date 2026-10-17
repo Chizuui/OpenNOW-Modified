@@ -101,6 +101,86 @@ class AndroidAuthRefreshTest {
         assertSame(cancellation, thrown)
     }
 
+    @Test
+    fun launchUsesTokensReloadedFromBackgroundRefresh() = runBlocking {
+        val staleUiSession = session("expired-ui-token")
+        val persistedSession = session("current-worker-token").let {
+            it.copy(tokens = it.tokens.copy(expiresAt = Long.MAX_VALUE))
+        }
+
+        val result = authSessionForLaunch(
+            expected = staleUiSession,
+            load = { persistedSession },
+            refresh = { error("Fresh saved tokens must not cause a network refresh") },
+        )
+
+        assertSame(persistedSession, result)
+    }
+
+    @Test
+    fun launchRefreshesOnlyInsideExistingExpiryWindow() = runBlocking {
+        val now = 1_000_000L
+        val expected = session("saved-token")
+        var refreshCalls = 0
+        for ((remainingMs, shouldRefresh) in listOf(
+            TOKEN_REFRESH_WINDOW_MS + 1L to false,
+            TOKEN_REFRESH_WINDOW_MS to false,
+            TOKEN_REFRESH_WINDOW_MS - 1L to true,
+            0L to true,
+        )) {
+            val saved = expected.copy(tokens = expected.tokens.copy(expiresAt = now + remainingMs))
+            val before = refreshCalls
+            authSessionForLaunch(
+                expected = expected,
+                load = { saved },
+                refresh = { refreshCalls++; saved },
+                nowMs = now,
+            )
+            assertEquals(if (shouldRefresh) 1 else 0, refreshCalls - before)
+        }
+    }
+
+    @Test
+    fun launchDoesNotFallBackToStaleTokensWhenRefreshFails() = runBlocking {
+        val failure = IllegalStateException("Token refresh failed")
+
+        val thrown = runCatching {
+            authSessionForLaunch(session("stale-token"), load = { session("expired-token") }, refresh = { throw failure })
+        }.exceptionOrNull()
+
+        assertSame(failure, thrown)
+    }
+
+    @Test
+    fun launchRejectsSignOutAndAccountOrProviderSwitchDuringRefresh() = runBlocking {
+        val expected = session("stale-token")
+        val switchedUser = expected.copy(user = expected.user.copy(userId = "other-user"))
+        val switchedProvider = expected.copy(provider = expected.provider.copy(idpId = "other-provider"))
+
+        for (restored in listOf(null, switchedUser, switchedProvider)) {
+            val failure = runCatching {
+                authSessionForLaunch(expected, load = { expected }, refresh = { restored })
+            }.exceptionOrNull()
+
+            assertTrue(failure is IllegalStateException)
+            val loadFailure = runCatching {
+                authSessionForLaunch(expected, load = { restored }, refresh = { error("Must not refresh another account") })
+            }.exceptionOrNull()
+            assertTrue(loadFailure is IllegalStateException)
+        }
+    }
+
+    @Test
+    fun launchRefreshPropagatesCancellation() = runBlocking {
+        val cancellation = CancellationException("cancelled")
+
+        val thrown = runCatching {
+            authSessionForLaunch(session("stale-token"), load = { session("expired-token") }, refresh = { throw cancellation })
+        }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+    }
+
     private fun session(accessToken: String): AuthSession = AuthSession(
         provider = LoginProvider(
             idpId = "test-idp",

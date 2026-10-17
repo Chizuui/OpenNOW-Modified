@@ -5,12 +5,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /**
- * Direct click has no absolute-positioning packet to lean on — the wire format only carries
- * relative motion — so it maps a touch into stream space and sends the delta from a shadow copy of
- * the host's cursor. That makes [streamPointForTouch] the whole feature's correctness surface, and
- * one property in particular has already regressed once in this file's history: a view resize (PiP,
- * rotation, minimise) must change nothing about where a proportionally-equivalent touch lands,
- * because the host's cursor does not move when our window does.
+ * Direct click maps a touch into stream space before sending an absolute host position. A view
+ * resize (PiP, rotation, minimise) must preserve where a proportionally-equivalent touch lands.
  */
 class StreamPointForTouchTest {
 
@@ -175,7 +171,7 @@ class StreamPointForTouchTest {
 
     /**
      * The PiP regression, stated as a property. A window resize must not move where an equivalent
-     * touch lands — that is what lets the cursor shadow survive PiP untouched.
+     * touch lands on the host.
      */
     @Test
     fun resizingTheViewDoesNotMoveWhereAnEquivalentTouchLands() {

@@ -1,4 +1,20 @@
 {
+  "167": {
+    "version": "2.1.1",
+    "notes": [
+      "Added **Website client mode** under **Settings > Stream > Connection**. Native touch is disabled while using it.",
+      "**Your library loads faster now, and it's fixed.**",
+      "Fixed games showing up in your library that weren't added to it",
+      "**Direct click is more accurate now**",
+      "Smoother video with **MediaCodec (Direct)**",
+      "Controller Sizing Changes",
+      "DPad fixes",
+      "Improved streaming performance, especially on **Android TV**",
+      "Improved controller support with **experimental NVST**",
+      "Game covers look better on **Android TV**",
+      "Goofy can now pop up from any edge of the screen"
+    ]
+  },
   "161": {
     "version": "2.0.5",
     "notes": [

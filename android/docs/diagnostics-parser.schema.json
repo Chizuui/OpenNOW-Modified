@@ -1409,6 +1409,9 @@
                 "experimentalNvst": {
                     "type": "boolean"
                 },
+                "browserClientMode": {
+                    "type": "boolean"
+                },
                 "experimentalDynamicNetworkAdjustment": {
                     "type": "boolean"
                 },
@@ -1423,6 +1426,14 @@
                 },
                 "streamSharpeningEnabled": {
                     "type": "boolean"
+                },
+                "videoOutput": {
+                    "type": "string",
+                    "enum": [
+                        "Default",
+                        "MediaCodecSurface",
+                        "WebRtcTexture"
+                    ]
                 },
                 "streamSharpeningAmount": {
                     "type": "number"

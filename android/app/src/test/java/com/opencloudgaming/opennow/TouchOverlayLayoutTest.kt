@@ -54,19 +54,41 @@ class TouchOverlayLayoutTest {
     }
 
     @Test
-    fun fixedStickCalibratesNearCenterPressForOneGesture() {
+    fun fixedStickKeepsItsBaseAnchoredAcrossOffCenterPresses() {
         val center = Offset(56f, 56f)
-        val down = Offset(70f, 52f)
-        val gestureCenter = touchStickGestureCenter(center, down, 38f, TouchJoystickMode.Fixed)
+        val presses = listOf(center, Offset(70f, 52f), Offset(90f, 56f), Offset(18f, 56f), Offset(56f, 94f))
 
-        assertEquals(down, gestureCenter)
+        presses.forEach { down ->
+            val gestureCenter = touchStickGestureCenter(center, down, TouchJoystickMode.Fixed)
+            assertEquals(center, gestureCenter)
+            assertEquals(Offset.Zero, gestureCenter - center)
+        }
+    }
+
+    @Test
+    fun fixedStickRespondsToInitialPressRelativeToItsVisibleCenter() {
+        val center = Offset(56f, 56f)
+        val down = Offset(75f, 56f)
+        val gestureCenter = touchStickGestureCenter(center, down, TouchJoystickMode.Fixed)
+        val delta = down - gestureCenter
+
+        assertEquals(Offset(0.5f, 0f), touchStickValue(delta.x, delta.y, 38f, 0f))
         assertEquals(Offset.Zero, touchStickValue(0f, 0f, 38f, 0.05f))
         assertEquals(Offset.Zero, touchStickValue(1f, 0f, 38f, 0.05f))
-        assertTrue(touchStickValue(4f, 0f, 38f, 0.05f).x > 0f)
-        assertEquals(Offset(78.8f, 56f), touchStickGestureCenter(center, Offset(90f, 56f), 38f, TouchJoystickMode.Fixed))
-        val justPastLimit = touchStickGestureCenter(center, Offset(79f, 56f), 38f, TouchJoystickMode.Fixed)
-        assertTrue(touchStickValue(79f - justPastLimit.x, 0f, 38f, 0.05f).x < 0.01f)
-        assertEquals(Offset(90f, 56f), touchStickGestureCenter(center, Offset(90f, 56f), 38f, TouchJoystickMode.Dynamic))
+    }
+
+    @Test
+    fun dynamicStickStartsNeutralAtEachInitialTouchPosition() {
+        val center = Offset(56f, 56f)
+        val presses = listOf(Offset(70f, 52f), Offset(90f, 56f), Offset(18f, 56f))
+
+        presses.forEach { down ->
+            val gestureCenter = touchStickGestureCenter(center, down, TouchJoystickMode.Dynamic)
+            val delta = down - gestureCenter
+            assertEquals(down, gestureCenter)
+            assertEquals(Offset.Zero, touchStickValue(delta.x, delta.y, 38f, 0f))
+            assertTrue(touchStickValue(delta.x + 4f, delta.y, 38f, 0.05f).x > 0f)
+        }
     }
 
     @Test

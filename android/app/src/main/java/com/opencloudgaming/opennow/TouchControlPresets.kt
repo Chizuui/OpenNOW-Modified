@@ -88,6 +88,7 @@ internal fun newTouchPreset(
 internal fun AndroidTouchSettings.applyingTouchPreset(preset: TouchControlPreset): AndroidTouchSettings =
     preset.controls.normalizedPresetControls().copy(
         enabled = enabled, mousePad = mousePad, mouseDirectClick = mouseDirectClick,
+        mouseWithTouchController = mouseWithTouchController,
         nativeTouchMode = nativeTouchMode, nativeTouchOptedIn = nativeTouchOptedIn,
         keyboardModeEnabled = keyboardModeEnabled, keyboardButtons = keyboardButtons,
     )

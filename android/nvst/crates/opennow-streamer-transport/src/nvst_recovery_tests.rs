@@ -236,3 +236,40 @@ fn conflicting_fec_layout_invalidates_only_discarded_picture_data() {
         assert_eq!(receiver.next_frame_contiguous, parity);
     }
 }
+
+#[test]
+fn fec_repair_cancels_an_outstanding_nack_without_counting_a_retransmission() {
+    let config = config();
+    let feedback = config.feedback();
+    let crypto = test_srtp(&config);
+    let mut receiver = NvstVideoReceiver::new(config);
+    let now = Instant::now();
+    let initial = reference_fec_block(10, 5, 1, 200, true);
+    let damaged = reference_fec_block(13, 6, 2, 100, false);
+    let successor = reference_fec_block(17, 7, 1, 200, false);
+    for packet in [&initial[0], &damaged[0]] {
+        let encrypted = protect_for_test(&crypto, packet.clone(), 0);
+        receiver.process_datagram(peer(), &encrypted, now);
+    }
+    let later = protect_for_test(&crypto, successor[0].clone(), 0);
+    assert!(receiver.process_datagram(peer(), &later, now + Duration::from_millis(1)).is_empty());
+    assert_eq!(feedback.take_nack(now + Duration::from_millis(2)), Some((14, 14)));
+
+    // A delayed parity shard repairs the missing picture data while its NACK is
+    // in flight. Neither retries nor a late original should trigger extra work.
+    let parity = protect_for_test(&crypto, damaged[2].clone(), 0);
+    let events = receiver.process_datagram(peer(), &parity, now + Duration::from_millis(3));
+    let frames = events.into_iter().map(|event| match event {
+        NvstReceiveEvent::Frame(frame) => frame,
+        other => panic!("unexpected FEC event: {other:?}"),
+    }).collect::<Vec<_>>();
+    assert_eq!(frames.iter().map(|frame| frame.frame_index).collect::<Vec<_>>(), [6, 7]);
+    assert!(frames.iter().all(|frame| frame.contiguous));
+    assert_eq!(receiver.fec_repaired_packets, 1);
+    assert_eq!(receiver.recovered_retransmissions, 0);
+    assert_eq!(feedback.take_nack(now + Duration::from_millis(6)), None);
+    let original = protect_for_test(&crypto, damaged[1].clone(), 0);
+    assert!(receiver.process_datagram(peer(), &original, now + Duration::from_millis(7)).is_empty());
+    assert_eq!(receiver.recovered_retransmissions, 0);
+    assert!(!feedback.keyframe_request_pending());
+}

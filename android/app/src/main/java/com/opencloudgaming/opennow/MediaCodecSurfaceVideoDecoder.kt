@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
+import android.util.LongSparseArray
 import org.webrtc.EncodedImage
 import org.webrtc.VideoCodecStatus
 import org.webrtc.VideoDecoder
@@ -83,7 +84,9 @@ internal class MediaCodecSurfaceVideoDecoder(
     private var rotation = 0
     private var generation = 0
     private var nextPtsUs = 0L
-    private val frames = mutableMapOf<Long, FrameInfo>()
+    // MediaCodec timestamps are primitive longs; avoid a boxed key and map
+    // entry per frame. nextPtsUs increases, so the first key is the oldest input.
+    private val frames = LongSparseArray<FrameInfo>()
     private var needsKeyFrame = true
     private var running = false
     private var callbackThread: HandlerThread? = null
@@ -143,9 +146,9 @@ internal class MediaCodecSurfaceVideoDecoder(
                     "MediaCodec direct surface decoder=${selected.name} size=${width}x$height fps=$fps hdr=$hdr async=true")
             }
             val nowMs = SystemClock.elapsedRealtime()
-            val oldestMs = minOf(frames.values.firstOrNull()?.queuedAtMs ?: nowMs,
+            val oldestMs = minOf((if (frames.size() > 0) frames.valueAt(0).queuedAtMs else nowMs),
                 pendingFrames.peekFirst()?.info?.queuedAtMs ?: nowMs)
-            queuePolicy.failure(frames.size + pendingFrames.size, queuedBytes + frame.buffer.remaining(),
+            queuePolicy.failure(frames.size() + pendingFrames.size, queuedBytes + frame.buffer.remaining(),
                 nowMs - oldestMs, priming = !producedOutput)?.let { return@synchronized failLocked(it) }
             val frameInfo = FrameInfo(frame.captureTimeNs, frame.rotation, nowMs, frame.buffer.remaining())
             queuedBytes += frameInfo.size
@@ -178,12 +181,13 @@ internal class MediaCodecSurfaceVideoDecoder(
                 if (!isCurrentCodec(decoder, codecGeneration)) return
                 try {
                     outputCallbackCount++
-                    val frame = frames.remove(info.presentationTimeUs)
+                    val frame = frames[info.presentationTimeUs]
+                    frames.remove(info.presentationTimeUs)
                     if (frame != null) queuedBytes -= frame.size
                     if (frame == null || failureReason != null || info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         if (frame == null) NativeInputDiagnostics.addRetained("surface-unmatched-output",
                             "surface output unmatched ptsUs=${info.presentationTimeUs} flags=${info.flags} " +
-                                "oldestPtsUs=${frames.keys.firstOrNull()} newestPtsUs=$nextPtsUs callbacks=$outputCallbackCount")
+                                "oldestPtsUs=${(if (frames.size() > 0) frames.keyAt(0) else null)} newestPtsUs=$nextPtsUs callbacks=$outputCallbackCount")
                         decoder.releaseOutputBuffer(index, false)
                         return
                     }
@@ -260,7 +264,7 @@ internal class MediaCodecSurfaceVideoDecoder(
         failureReason = reason
         NativeInputDiagnostics.addRetained("surface-decoder-error",
             "MediaCodec direct surface failure=$reason hdr=$hdr input=$inputCount output=$outputCount " +
-                "presented=$presentedCount callbacks=$outputCallbackCount pending=${pendingFrames.size} inCodec=${frames.size}")
+                "presented=$presentedCount callbacks=$outputCallbackCount pending=${pendingFrames.size} inCodec=${frames.size()}")
         return VideoCodecStatus.ERROR
     }
 
@@ -280,7 +284,7 @@ internal class MediaCodecSurfaceVideoDecoder(
         require(info.size <= input.remaining()) { "Encoded frame exceeds codec buffer" }
         input.put(source.duplicate())
         nextPtsUs = maxOf(nextPtsUs + 1, info.timestampNs / 1000)
-        frames[nextPtsUs] = info
+        frames.append(nextPtsUs, info)
         decoder.queueInputBuffer(index, 0, info.size, nextPtsUs, 0)
         inputCount++
     }
@@ -331,7 +335,7 @@ internal class MediaCodecSurfaceVideoDecoder(
         if (presentedCount == 1 || presentedCount % fps.coerceAtLeast(1) == 0) {
             NativeInputDiagnostics.addRetained("surface-decoder-progress",
                 "MediaCodec direct surface progress input=$inputCount output=$outputCount presented=$presentedCount " +
-                    "pending=${pendingFrames.size} inCodec=${frames.size} queuedBytes=$queuedBytes hdr=$hdr")
+                    "pending=${pendingFrames.size} inCodec=${frames.size()} queuedBytes=$queuedBytes hdr=$hdr")
         }
     }
 }

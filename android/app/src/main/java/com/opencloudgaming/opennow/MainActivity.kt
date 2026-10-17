@@ -19,9 +19,7 @@ import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.view.PointerIcon
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -465,7 +463,6 @@ class MainActivity : ComponentActivity() {
             return
         }
         streamSystemUiActive = active
-        applyStreamPointerIcon(active && NativeStreamInputRouter.isExternalMousePointerCaptureEnabled())
         applyStreamKeepAwake(active)
         updateStreamSystemUiEnforcer(active)
 
@@ -643,16 +640,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun applyStreamPointerIcon(active: Boolean) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        runCatching {
-            val icon = if (active) PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL) else null
-            window.decorView.applyPointerIconRecursive(icon)
-        }.onFailure { error ->
-            Log.w(MAIN_ACTIVITY_LOG_TAG, "Unable to apply stream pointer icon", error)
-        }
-    }
-
     private fun applyStreamDisplayRefreshRate(active: Boolean, requestedFps: Int, force: Boolean = false) {
         streamDisplayRefreshActive = active
         streamDisplayRefreshFps = requestedFps
@@ -814,16 +801,6 @@ class MainActivity : ComponentActivity() {
             InputDevice.SOURCE_DPAD,
         )
         return super.dispatchKeyEvent(event)
-    }
-
-    private fun View.applyPointerIconRecursive(icon: PointerIcon?) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        pointerIcon = icon
-        if (this is ViewGroup) {
-            for (index in 0 until childCount) {
-                getChildAt(index).applyPointerIconRecursive(icon)
-            }
-        }
     }
 
     private fun MotionEvent.isMouseLikePointerEvent(): Boolean {

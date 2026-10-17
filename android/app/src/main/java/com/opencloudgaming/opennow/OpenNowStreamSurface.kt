@@ -163,7 +163,7 @@ internal fun StreamScreen(
     val nativeTouchAvailable = !tvProfile && shouldUseNativeTouch(
         state.settings.androidTouch.effectiveNativeTouchMode(),
         game,
-        state.activeStreamSettings ?: state.settings.stream,
+        (state.activeStreamSettings ?: state.settings.stream).forProviderInput(state.authSession?.provider?.code),
     )
     val launchInputMode = state.streamInputModeAtLaunch ?: streamInputModeAtStart(
         nativeTouchAvailable = nativeTouchAvailable,
@@ -196,7 +196,7 @@ internal fun StreamScreen(
     val nativeTouchActive = !tvProfile && shouldUseNativeTouchForStream(
         state.settings.androidTouch.effectiveNativeTouchMode(),
         game,
-        state.activeStreamSettings ?: state.settings.stream,
+        (state.activeStreamSettings ?: state.settings.stream).forProviderInput(state.authSession?.provider?.code),
         preferVirtualController = preferVirtualController,
         preferKeyboardMouse = streamInputMode == StreamInputMode.KeyboardMouse,
     )
@@ -209,8 +209,13 @@ internal fun StreamScreen(
         allowWithPhysicalMouse = showTouchControlsWithPhysicalMouse || keyboardModeEnabled,
     ) && !nativeTouchActive && (!nativeTouchProvisionedForSession || keyboardModeEnabled)
     val virtualGamepadVisible = touchControlsVisible && !keyboardModeEnabled
-    val touchMouseActive =
-        streamReady && touchInputEnabled && state.settings.androidTouch.mousePad && !nativeTouchActive
+    val touchMouseActive = touchMouseEnabledForStream(
+        touch = state.settings.androidTouch,
+        streamReady = streamReady,
+        touchInputEnabled = touchInputEnabled,
+        nativeTouchActive = nativeTouchActive,
+        virtualGamepadVisible = virtualGamepadVisible,
+    )
     val fallbackSessionStartedAtMs = remember(session?.sessionId) { System.currentTimeMillis() }
     val sessionStartedAtMs = session?.timerStartedAtMs ?: fallbackSessionStartedAtMs
     var timerNowMs by remember(session?.sessionId) { mutableStateOf(System.currentTimeMillis()) }
@@ -639,7 +644,8 @@ internal fun StreamScreen(
 
     // Also gated on nativeTouchActive: dispatchTouch would take the native branch first anyway, but
     // leaving two input modes both flagged "enabled" is how they end up fighting later.
-    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, nativeTouchActive) {
+    LaunchedEffect(touchMouseActive, keyboardModeEnabled) {
+        NativeStreamInputRouter.setTouchMouseButtonsEnabled(!keyboardModeEnabled)
         NativeStreamInputRouter.setTouchMouseEnabled(touchMouseActive)
         client.setTouchMouseEnabled(touchMouseActive)
     }
@@ -674,11 +680,11 @@ internal fun StreamScreen(
         }
     }
 
-    LaunchedEffect(streamReady, touchInputEnabled, state.settings.androidTouch.mousePad, nativeTouchActive, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen, touchControlsVisible) {
+    LaunchedEffect(touchMouseActive, nativeTouchActive, streamReady, touchInputEnabled, controlsOpen, exitConfirmOpen, keyboardOpen, streamGuideOpen) {
         NativeStreamInputRouter.setCaptureAllTouch(
             streamReady &&
                 touchInputEnabled &&
-                (state.settings.androidTouch.mousePad || nativeTouchActive) &&
+                (touchMouseActive || nativeTouchActive) &&
                 !controlsOpen &&
                 !exitConfirmOpen &&
                 !keyboardOpen &&
@@ -801,12 +807,12 @@ internal fun StreamScreen(
                 serverNegotiatedResolution = session.monitorSnapshot?.returnedResolution
                     ?: session.negotiatedStreamProfile?.resolution,
                 serverFinalSelectedResolution = session.monitorSnapshot?.finalSelectedResolution,
-                hideExternalMousePointer = externalMousePointerCaptureActive,
+                hideExternalMousePointer = shouldHideExternalMousePointer(streamReady, streamOverlayOpen),
+                captureExternalMousePointer = externalMousePointerCaptureActive,
                 touchMouseEnabled =
                     touchMouseActive,
                 pinchZoomEnabled = streamPinchZoomEnabled(
-                    touchMouseEnabled =
-                        touchInputEnabled && state.settings.androidTouch.mousePad && !nativeTouchActive,
+                    touchMouseEnabled = touchMouseActive,
                     touchControllerVisible = touchControlsVisible,
                 ),
                 externalMouseRoot = activity?.window?.decorView,
@@ -923,6 +929,16 @@ internal fun StreamScreen(
                     onButtonAppearanceChange = { button, appearance ->
                         viewModel.updateSettings(state.settings.copy(
                             androidTouch = state.settings.androidTouch.withButtonAppearance(button, appearance),
+                        ))
+                    },
+                    onKeyboardStickVisibleChange = { visible ->
+                        viewModel.updateSettings(state.settings.copy(
+                            androidTouch = state.settings.androidTouch.withControlVisible(TouchControlGroup.LeftStick, visible),
+                        ))
+                    },
+                    onKeyboardStickScaleChange = { scale ->
+                        viewModel.updateSettings(state.settings.copy(
+                            androidTouch = state.settings.androidTouch.copy(leftStickScale = scale),
                         ))
                     },
                     onKeyboardButtonAdd = { actionId ->
@@ -1693,6 +1709,7 @@ private fun StreamVideoSurface(
     serverNegotiatedResolution: String?,
     serverFinalSelectedResolution: String?,
     hideExternalMousePointer: Boolean,
+    captureExternalMousePointer: Boolean,
     touchMouseEnabled: Boolean,
     pinchZoomEnabled: Boolean,
     externalMouseRoot: android.view.View?,
@@ -1801,20 +1818,26 @@ private fun StreamVideoSurface(
     LaunchedEffect(streamAspectRatio) {
         NativeStreamInputRouter.setRenderingAspectRatio(streamAspectRatio)
     }
-    DisposableEffect(client, rootView, pointerRootView, hideExternalMousePointer) {
-        NativeStreamInputRouter.setExternalMousePointerCaptureEnabled(hideExternalMousePointer)
-        pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
+    DisposableEffect(client, rootView, pointerRootView, captureExternalMousePointer) {
+        NativeStreamInputRouter.setExternalMousePointerCaptureEnabled(captureExternalMousePointer)
+        pointerRootView.configureAndroidMousePointerCapture(captureExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
             client.dispatchMotion(event)
         }
+        onDispose {
+            NativeStreamInputRouter.setPresentationTransform(1f, 0f, 0f)
+            NativeStreamInputRouter.setExternalMousePointerCaptureEnabled(false)
+            pointerRootView.clearAndroidMousePointerCapture()
+        }
+    }
+    // The host cursor is already in the stream. Hiding Android's duplicate is independent of
+    // pointer capture; menus and disposal restore the local pointer even when Mouse Lock is off.
+    DisposableEffect(pointerRootView, hideExternalMousePointer) {
         if (hideExternalMousePointer) {
             pointerRootView.hideAndroidPointerTree()
         } else {
             pointerRootView.showAndroidPointerTree()
         }
         onDispose {
-            NativeStreamInputRouter.setPresentationTransform(1f, 0f, 0f)
-            NativeStreamInputRouter.setExternalMousePointerCaptureEnabled(false)
-            pointerRootView.clearAndroidMousePointerCapture()
             pointerRootView.showAndroidPointerTree()
         }
     }
@@ -1856,7 +1879,7 @@ private fun StreamVideoSurface(
                     client.createRenderer(ctx, settings).apply {
                         isFocusable = false
                         isFocusableInTouchMode = false
-                        hideAndroidPointerTree()
+                        if (hideExternalMousePointer) hideAndroidPointerTree()
                         setPresentationScale(stretchScale.first, stretchScale.second)
                     }
                 },
@@ -1865,7 +1888,7 @@ private fun StreamVideoSurface(
                     renderer.setPresentationScale(stretchScale.first, stretchScale.second)
                     renderer.isFocusable = false
                     renderer.isFocusableInTouchMode = false
-                    pointerRootView.configureAndroidMousePointerCapture(hideExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
+                    pointerRootView.configureAndroidMousePointerCapture(captureExternalMousePointer, { currentOnMouseCaptureInput() }) { event ->
                         client.dispatchMotion(event)
                     }
                     if (hideExternalMousePointer) {
@@ -1963,7 +1986,12 @@ internal fun shouldEnableExternalMousePointerCapture(
     streamReady: Boolean,
     streamOverlayOpen: Boolean,
     pointerLockEnabled: Boolean,
-): Boolean = streamReady && !streamOverlayOpen && pointerLockEnabled
+): Boolean = shouldHideExternalMousePointer(streamReady, streamOverlayOpen) && pointerLockEnabled
+
+internal fun shouldHideExternalMousePointer(
+    streamReady: Boolean,
+    streamOverlayOpen: Boolean,
+): Boolean = streamReady && !streamOverlayOpen
 
 private fun streamAspectRatioForPixels(pixels: Pair<Int, Int>): Float {
     val (width, height) = pixels

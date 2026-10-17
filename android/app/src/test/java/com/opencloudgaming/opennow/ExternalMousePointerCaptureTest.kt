@@ -8,6 +8,25 @@ import org.junit.Test
 
 class ExternalMousePointerCaptureTest {
     @Test
+    fun hidesDuplicateLocalPointerEvenWhenMouseLockIsDisabled() {
+        assertTrue(shouldHideExternalMousePointer(streamReady = true, streamOverlayOpen = false))
+        assertFalse(
+            shouldEnableExternalMousePointerCapture(
+                streamReady = true,
+                streamOverlayOpen = false,
+                pointerLockEnabled = false,
+            ),
+        )
+    }
+
+    @Test
+    fun restoresLocalPointerForMenusAndInactiveStreams() {
+        assertFalse(shouldHideExternalMousePointer(streamReady = true, streamOverlayOpen = true))
+        assertFalse(shouldHideExternalMousePointer(streamReady = false, streamOverlayOpen = false))
+        assertFalse(shouldHideExternalMousePointer(streamReady = false, streamOverlayOpen = true))
+    }
+
+    @Test
     fun enablesCaptureOnlyDuringUnobstructedGameplayWhenMouseLockIsOn() {
         assertTrue(
             shouldEnableExternalMousePointerCapture(

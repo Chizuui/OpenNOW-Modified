@@ -70,6 +70,7 @@ import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 
@@ -210,11 +211,17 @@ private val ALLIANCE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
 private fun cloudMatchClientIdentity(
     streamingBaseUrl: String?,
     appLaunchMode: Int? = null,
+    preferBrowserMode: Boolean = false,
     preferNativeDesktopMode: Boolean = false,
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
     preferNativeAndroidMode: Boolean = false,
 ): CloudMatchClientIdentity {
+    // The opt-in applies only to NVIDIA. Alliance client identities are provider-owned.
+    val host = streamingBaseUrl?.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
+    if (preferBrowserMode && (streamingBaseUrl.isNullOrBlank() || host?.let(::isNvidiaCloudMatchHost) == true)) {
+        return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
+    }
     // Touch sessions use the desktop-native CloudMatch identity (NVIDIA-CLASSIC / NATIVE)
     // with Android os + TABLET device type, so the server allocates the full desktop
     // resolution matrix (including ultrawide 2560×1080) while still enabling the
@@ -234,11 +241,17 @@ private fun cloudMatchClientIdentity(
     if (streamingBaseUrl.isNullOrBlank()) {
         return requestedNativeIdentity ?: NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     }
-    val host = streamingBaseUrl.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
-        ?: return ALLIANCE_CLOUD_MATCH_IDENTITY
-    if (!isNvidiaCloudMatchHost(host)) return ALLIANCE_CLOUD_MATCH_IDENTITY
+    val parsedHost = host ?: return ALLIANCE_CLOUD_MATCH_IDENTITY
+    if (!isNvidiaCloudMatchHost(parsedHost)) return ALLIANCE_CLOUD_MATCH_IDENTITY
     return requestedNativeIdentity ?: NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
 }
+
+private fun cloudMatchPlatformName(identity: CloudMatchClientIdentity, appLaunchMode: Int): String =
+    if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY && identity != NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY) {
+        "android"
+    } else {
+        identity.platformName
+    }
 
 internal fun isNvidiaShieldTvDevice(
     androidTvProfile: Boolean,
@@ -287,7 +300,6 @@ private fun gfnControllerCapabilities(appLaunchMode: Int, multiControllerEnabled
         )
     }
 
-private const val LIBRARY_WITH_TIME_QUERY_HASH = "7f54d6bbbf3b1c09d0e5264dfa36f0f4aaf5e2678f2089f0cbf0d4dda18c3af9"
 private const val DEFAULT_LOCALE = "en_US"
 
 internal fun gfnLocaleForAndroidLanguageTag(languageTag: String): String {
@@ -325,10 +337,6 @@ private const val POPULAR_SORT_ORDER = "itemMetadata.relevance:DESC,sortName:ASC
 private const val LAST_PLAYED_SORT_ORDER = "variants.gfn.library.lastPlayedDate:DESC,sortName:ASC"
 private const val GFN_THURSDAY_SECTION_TITLE = "GFN Thursday"
 private const val GFN_THURSDAY_SECTION_ID_PREFIX = "section-cbc43218-6ad6-4ff3-8538-bc84f90c796c-"
-private const val LIBRARY_APPS_FETCH_COUNT = 200
-private const val MAX_LIBRARY_APPS_PAGES = 25
-private const val LIBRARY_APPS_SORT_ORDER =
-    "variants.gfn.library.lastPlayedDate:DESC,computedValues.libraryAddedDate:DESC,sortName:ASC"
 private const val SESSION_MODIFY_ACTION_AD_UPDATE = 6
 internal const val OPENNOW_STREAM_SETTINGS_METADATA_KEY = "OpenNOWStreamSettingsSignature"
 private const val STORAGE_ADDON_TYPE = "STORAGE"
@@ -359,6 +367,21 @@ internal fun sessionClaimResponseFailure(httpStatus: Int, requestStatus: Int?, o
     httpStatus !in 200..299 -> "Cloud session $operation failed (HTTP $httpStatus)."
     requestStatus != 1 -> "Cloud session $operation failed (provider status ${requestStatus ?: "missing"})."
     else -> null
+}
+
+/** An unsuccessful lookup cannot establish that it is safe to create another session. */
+internal fun checkActiveSessionsResponse(httpStatus: Int, payload: JsonObject?) {
+    val requestStatus = payload?.obj("requestStatus")
+    val statusCode = requestStatus?.int("statusCode")
+    if (statusCode != null && statusCode != 1) {
+        throw CloudMatchRequestStatusException(
+            statusCode = statusCode,
+            statusDescription = requestStatus.string("statusDescription"),
+            unifiedErrorCode = requestStatus.string("unifiedErrorCode"),
+        )
+    }
+    check(httpStatus in 200..299) { "Active session lookup failed (HTTP $httpStatus)." }
+    check(statusCode == 1) { "Active session lookup returned an invalid response." }
 }
 private const val INVALID_SESSION_PROXY_MESSAGE =
     "Invalid session proxy URL. Use http://host:port, https://host:port, socks4://host:port, or socks5://host:port."
@@ -649,6 +672,7 @@ internal fun buildMinimalClaimRequestBody(
     val identity = cloudMatchClientIdentity(
         streamingBaseUrl = streamingBaseUrl,
         appLaunchMode = appLaunchMode,
+        preferBrowserMode = settings?.browserClientMode == true,
         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings?.requiresNativeDesktopCloudMatchMode() == true,
         preferNativeAndroidMode = settings?.requiresNativeAndroidCloudMatchMode() == true,
         isAndroidTv = isAndroidTv,
@@ -671,7 +695,7 @@ internal fun buildMinimalClaimRequestBody(
             putStreamTransportRequest(settings)
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
-            put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else identity.platformName)
+            put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps, identity))
@@ -960,6 +984,7 @@ internal fun cloudMatchHeaders(
     includeOrigin: Boolean,
     streamingBaseUrl: String? = null,
     appLaunchMode: Int? = null,
+    preferBrowserMode: Boolean = false,
     preferNativeDesktopMode: Boolean = false,
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
@@ -968,18 +993,21 @@ internal fun cloudMatchHeaders(
     val identity = cloudMatchClientIdentity(
         streamingBaseUrl = streamingBaseUrl,
         appLaunchMode = appLaunchMode,
+        preferBrowserMode = preferBrowserMode,
         preferNativeDesktopMode = preferNativeDesktopMode,
         preferNativeAndroidMode = preferNativeAndroidMode,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
     val userAgent = when {
+        preferBrowserMode && identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.userAgent
         identity == NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY -> identity.userAgent
         isAndroidTv -> GFN_ANDROID_TV_USER_AGENT
         appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY -> GFN_ANDROID_TOUCH_USER_AGENT
         else -> identity.userAgent
     }
     val deviceType = when {
+        preferBrowserMode && identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.deviceType
         isAndroidTv -> "DESKTOP"
         appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY -> "TABLET"
         else -> identity.deviceType
@@ -2021,34 +2049,6 @@ internal fun gfnVariantMetadataFields(includeAppStore: Boolean): String = """
     gfn { status library { status selected lastPlayedDate } }
 """.trimIndent()
 
-internal data class LibraryBrowseSpec(
-    val filterIds: List<String>,
-    val sortOrderId: String?,
-)
-
-internal fun libraryBrowseSpec(payload: JsonObject): LibraryBrowseSpec? =
-    payload.obj("data")?.arr("panels")
-        ?.flatMap { panel -> panel.asObject()?.arr("sections").orEmpty() }
-        ?.mapNotNull { section -> section.asObject()?.obj("seeMoreInfo") }
-        ?.firstNotNullOfOrNull { seeMore ->
-            val filterIds = seeMore.arr("filterIds")?.mapNotNull { it.asString() }.orEmpty()
-            filterIds.takeIf { it.isNotEmpty() }?.let {
-                LibraryBrowseSpec(filterIds = it, sortOrderId = seeMore.string("sortOrderId"))
-            }
-        }
-
-internal fun libraryAppsFilter(): JsonObject = buildJsonObject {
-    putJsonObject("variants") {
-        putJsonObject("gfn") {
-            putJsonObject("library") {
-                putJsonObject("status") {
-                    put("notEquals", "NOT_OWNED")
-                }
-            }
-        }
-    }
-}
-
 internal fun hasFreeToPlayPaymentModel(paymentModels: JsonArray?): Boolean =
     paymentModels.orEmpty().any { model ->
         val name = model.asObject()?.string("__typename") ?: model.asString()
@@ -2170,6 +2170,7 @@ class GfnCatalogRepository(
     private data class CachedCatalogDefinitions(val value: CatalogDefinitions, val expiresAtElapsedMs: Long)
     private data class CachedPublicGames(val value: List<GameInfo>, val expiresAtElapsedMs: Long)
 
+    private val libraryRevision = AtomicLong()
     private val vpcIdMutex = Mutex()
     private val vpcIdCache = mutableMapOf<String, CachedVpcId>()
     private val catalogDefinitionsMutex = Mutex()
@@ -2187,7 +2188,7 @@ class GfnCatalogRepository(
         includeSupplementalPublicVariants: Boolean = true,
     ): List<GameInfo> {
         val vpcId = getVpcId(token, providerStreamingBaseUrl)
-        val panels = fetchPanels(token, listOf("MAIN"), vpcId, withLibraryTime = false)
+        val panels = fetchPanels(token, listOf("MAIN"), vpcId)
         val games = enrichGamesWithMetadata(token, vpcId, flattenPanels(panels))
         return if (includeSupplementalPublicVariants) mergePublicGameVariants(games, fetchPublicGames()) else games
     }
@@ -2198,7 +2199,7 @@ class GfnCatalogRepository(
         includeSupplementalPublicVariants: Boolean = true,
     ): List<GameInfo> {
         val vpcId = getVpcId(token, providerStreamingBaseUrl)
-        val panels = fetchPanels(token, listOf("MAIN"), vpcId, withLibraryTime = false)
+        val panels = fetchPanels(token, listOf("MAIN"), vpcId)
         val games = enrichGamesWithMetadata(
             token = token,
             vpcId = vpcId,
@@ -2210,51 +2211,28 @@ class GfnCatalogRepository(
     suspend fun fetchLibraryGames(
         token: String,
         providerStreamingBaseUrl: String,
-        includeSupplementalPublicVariants: Boolean = true,
+        isCurrentScope: () -> Boolean = { true },
     ): List<GameInfo> {
+        val revision = libraryRevision.get()
         val vpcId = getVpcId(token, providerStreamingBaseUrl)
-        val paginatedLibrary = try {
-            val page = fetchCatalogAppsPages(
+        val locale = requestLocale()
+        val apps = fetchLibraryCatalogApps(
+            isCurrentScope = { isCurrentScope() && libraryRevision.get() == revision },
+        ) { count, cursor ->
+            postGraphQlWithAppStoreFallback(
+                query = ::libraryCatalogQuery,
+                variables = buildJsonObject {
+                    put("vpcId", vpcId)
+                    put("locale", locale)
+                    put("sortString", LIBRARY_APPS_SORT_ORDER)
+                    put("fetchCount", count)
+                    put("cursor", cursor)
+                    put("filters", libraryAppsFilter())
+                },
                 token = token,
-                vpcId = vpcId,
-                searchQuery = "",
-                sortOrder = LIBRARY_APPS_SORT_ORDER,
-                fetchCount = LIBRARY_APPS_FETCH_COUNT,
-                filters = libraryAppsFilter(),
-                maxPages = MAX_LIBRARY_APPS_PAGES,
             )
-            enrichGamesWithMetadata(token, vpcId, dedupeGames(page.apps.map(::appToGame)))
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
         }
-        if (paginatedLibrary != null) {
-            return if (includeSupplementalPublicVariants) {
-                mergePublicGameVariants(paginatedLibrary, fetchPublicGames())
-            } else {
-                paginatedLibrary
-            }
-        }
-
-        val panels = runCatching { fetchPanels(token, listOf("LIBRARY"), vpcId, withLibraryTime = true) }
-            .getOrElse { fetchPanels(token, listOf("LIBRARY"), vpcId, withLibraryTime = false) }
-        val panelGames = enrichGamesWithMetadata(token, vpcId, flattenPanels(panels))
-        val paginatedGames = libraryBrowseSpec(panels)?.let { spec ->
-            runCatching {
-                browseCatalog(
-                    token = token,
-                    providerStreamingBaseUrl = providerStreamingBaseUrl,
-                    searchQuery = "",
-                    sortId = spec.sortOrderId ?: DEFAULT_SORT_ID,
-                    filterIds = spec.filterIds,
-                    maxPages = MAX_CATALOG_REQUEST_PAGES,
-                    includeSupplementalPublicVariants = false,
-                ).games
-            }.getOrDefault(emptyList())
-        }.orEmpty()
-        val games = mergeKnownLibraryGames(panelGames, paginatedGames)
-        return if (includeSupplementalPublicVariants) mergePublicGameVariants(games, fetchPublicGames()) else games
+        return apps.map(::appToGame)
     }
 
     /**
@@ -2467,6 +2445,7 @@ class GfnCatalogRepository(
         check(confirmedVariantId == variantId) {
             "GFN confirmed a different owned variant ($confirmedVariantId instead of $variantId)"
         }
+        libraryRevision.incrementAndGet()
         return confirmedVariantId
     }
 
@@ -2490,6 +2469,7 @@ class GfnCatalogRepository(
         check(confirmedVariantId == variantId) {
             "GFN confirmed a different removed variant ($confirmedVariantId instead of $variantId)"
         }
+        libraryRevision.incrementAndGet()
         return confirmedVariantId
     }
 
@@ -2542,7 +2522,7 @@ class GfnCatalogRepository(
         const val PUBLIC_GAMES_CACHE_TTL_MS = 6 * 60 * 60 * 1_000L
     }
 
-    private suspend fun fetchPanels(token: String, panelNames: List<String>, vpcId: String, withLibraryTime: Boolean): JsonObject {
+    private suspend fun fetchPanels(token: String, panelNames: List<String>, vpcId: String): JsonObject {
         val variables = buildJsonObject {
             put("vpcId", vpcId)
             put("locale", requestLocale())
@@ -2550,7 +2530,7 @@ class GfnCatalogRepository(
         }.toString()
         val extensions = buildJsonObject {
             putJsonObject("persistedQuery") {
-                put("sha256Hash", if (withLibraryTime) LIBRARY_WITH_TIME_QUERY_HASH else PANELS_QUERY_HASH)
+                put("sha256Hash", PANELS_QUERY_HASH)
             }
         }.toString()
         val requestType = if (panelNames.contains("LIBRARY")) "panels/Library" else "panels/MainV2"
@@ -3271,6 +3251,7 @@ class GfnSessionRepository(
                     includeOrigin = true,
                     streamingBaseUrl = base,
                     appLaunchMode = appLaunchMode,
+                    preferBrowserMode = settings.browserClientMode,
                     preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                     preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                     isAndroidTv = isAndroidTv,
@@ -3361,9 +3342,9 @@ class GfnSessionRepository(
             .build()
         val (code, text) = requestHttp.awaitText(request)
         recordDiagnosticResponse("session.active", request, code, text)
-        if (code !in 200..299) return emptyList()
-        val payload = runCatching { OpenNowJson.parseToJsonElement(text).jsonObject }.getOrNull() ?: return emptyList()
-        if (payload.obj("requestStatus")?.int("statusCode") != 1) return emptyList()
+        val payload = runCatching { OpenNowJson.parseToJsonElement(text).jsonObject }.getOrNull()
+        checkActiveSessionsResponse(code, payload)
+        checkNotNull(payload)
         return payload.arr("sessions")?.mapNotNull { raw ->
             val s = raw.asObject() ?: return@mapNotNull null
             val status = s.int("status") ?: return@mapNotNull null
@@ -3462,6 +3443,7 @@ class GfnSessionRepository(
                         includeOrigin = true,
                         streamingBaseUrl = active.streamingBaseUrl,
                         appLaunchMode = appLaunchMode,
+                        preferBrowserMode = settings.browserClientMode,
                         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                         preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                         isAndroidTv = isAndroidTv,
@@ -3604,6 +3586,7 @@ class GfnSessionRepository(
         val identity = cloudMatchClientIdentity(
             streamingBaseUrl = streamingBaseUrl,
             appLaunchMode = appLaunchMode,
+            preferBrowserMode = settings.browserClientMode,
             preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
             preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
             isAndroidTv = isAndroidTv,
@@ -3624,7 +3607,7 @@ class GfnSessionRepository(
                 put("deviceHashId", deviceId)
                 put("clientVersion", "30.0")
                 putStreamTransportRequest(settings)
-                put("clientPlatformName", if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "android" else identity.platformName)
+                put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps, identity))
                 }

@@ -8,7 +8,7 @@ internal object NvstHaptics {
     fun parse(bytes: ByteArray): List<GamepadRumbleCommand> {
         if (bytes.isEmpty() || bytes.size > 4096) return emptyList()
         if (bytes[0] == 0x22.toByte()) {
-            // NVST registers gamepad descriptor indices 3..6; WebRTC uses 6..9.
+            // Legacy OC feedback has its own ID base. ServerControl uses slots 0..3 below.
             return listOfNotNull(HapticsPacketParser.parse(bytes, controllerBase = 3))
                 .filter { it.controllerId in 0..3 }
         }

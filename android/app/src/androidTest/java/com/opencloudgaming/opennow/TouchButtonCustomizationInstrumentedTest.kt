@@ -104,6 +104,52 @@ class TouchButtonCustomizationInstrumentedTest {
         compose.onNodeWithContentDescription("Button size").assertExists()
     }
 
+    @Test fun keyboardButtonCanBeResizedThenRemovedFromItsEditor() {
+        val button = newKeyboardOverlayButton("letter_e")!!
+        var touch by mutableStateOf(AndroidTouchSettings().withKeyboardButtonAdded(button))
+        compose.setContent { MaterialTheme { TouchButtonAppearanceEditor(touch) { touch = it } } }
+        compose.onNodeWithText("Customize buttons").performClick()
+        compose.onNodeWithText("E").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Button size").performScrollTo()
+            .performSemanticsAction(SemanticsActions.SetProgress) { it(0.5f) }
+        compose.onNodeWithText("Save").performClick()
+        compose.runOnIdle { assertEquals(0.5f, touch.buttonAppearances.getValue(button.appearanceKey()).sizeScale, 0f) }
+        compose.onNodeWithText("E").performScrollTo().performClick()
+        compose.onNodeWithText("Remove button").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertFalse(touch.keyboardButtons.any { it.id == button.id })
+            assertFalse(touch.buttonAppearances.containsKey(button.appearanceKey()))
+        }
+    }
+
+    @Test fun stickTapEditsDragMovesAndRemoveHidesIt() {
+        var visible by mutableStateOf(true)
+        var editing by mutableStateOf(false)
+        var scale by mutableStateOf(1f)
+        var offset by mutableStateOf(TouchOffset())
+        compose.setContent {
+            MaterialTheme {
+                Box(Modifier.fillMaxSize()) {
+                    if (visible) TouchControlGroup("WASD", true, offset.x.dp, offset.y.dp,
+                        { x, y -> offset = TouchOffset(x, y) }, onEdit = { editing = true }) {
+                        Box(Modifier.size(100.dp * scale).testTag("stick")) { Text("WASD") }
+                    }
+                }
+                if (editing) TouchStickSizeDialog(scale, { scale = it },
+                    onRemove = { visible = false; editing = false }, onDismiss = { editing = false })
+            }
+        }
+        compose.onNodeWithTag("stick").performTouchInput { swipe(center, center + Offset(100f, 60f), 600) }
+        compose.runOnIdle { assertFalse(editing); assertTrue(offset.x > 0f) }
+        compose.onNodeWithTag("stick").performTouchInput { click() }
+        compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.SetProgress)).performSemanticsAction(SemanticsActions.SetProgress) { it(1.5f) }
+        compose.onNodeWithText("Save").performClick()
+        compose.runOnIdle { assertEquals(1.5f, scale, 0f) }
+        compose.onNodeWithTag("stick").performTouchInput { click() }
+        compose.onNodeWithText("Remove button").performClick()
+        compose.onNodeWithTag("stick").assertDoesNotExist()
+    }
+
     @Test fun aControlCanBeDraggedAcrossTheScreenAndBack() {
         var offset by mutableStateOf(TouchOffset())
         compose.setContent {

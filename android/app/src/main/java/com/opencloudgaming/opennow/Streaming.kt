@@ -397,7 +397,7 @@ class NativeStreamClient(
     private var heartbeatJob: Job? = null
     private var gamepadKeepaliveJob: Job? = null
     private var statsJob: Job? = null
-    private val statsPollQueued = AtomicBoolean(false)
+    private val statsPollGate = RuntimeStatsPollGate()
     private var iceRecoveryJob: Job? = null
     private var offerTimeoutJob: Job? = null
     private var bitrateUpdateJob: Job? = null
@@ -852,8 +852,9 @@ class NativeStreamClient(
         )
         if (updatedSettings == this.settings) return
         this.settings = updatedSettings
-        if (updatedSettings.streamSharpeningEnabled) renderer?.requestTextureOutput("sharpening needs texture frames")
-        rendererSharpnessDrawer?.amount = streamSharpnessShaderStrength(settings.streamSharpeningEnabled, settings.streamSharpeningAmount)
+        val strength = streamSharpnessShaderStrength(updatedSettings.streamSharpeningEnabled, updatedSettings.streamSharpeningAmount)
+        if (streamSharpnessShaderActive(strength)) renderer?.requestTextureOutput("sharpening needs texture frames")
+        rendererSharpnessDrawer?.amount = strength
     }
 
     private fun StreamVideoSurface.setStreamScaling() {
@@ -1316,6 +1317,17 @@ class NativeStreamClient(
      */
     fun sendRawMouseMove(dx: Int, dy: Int): Boolean {
         return sendBurstLimitedMouseMove(dx, dy, partiallyReliable = false)
+    }
+
+    /** Position and the following click must reach the host in order on the reliable channel. */
+    internal fun sendDirectClickMousePosition(position: AbsoluteMousePosition): Boolean {
+        flushPendingMouseMove()
+        return sendInput(
+            inputEncoder.encodeMouseAbsolute(position.x, position.y, position.width, position.height),
+            partiallyReliable = false,
+            fallbackToReliable = true,
+            resultDiagnosticKey = "mouse.direct-click.position",
+        )
     }
 
     /** Sends one batch of finger updates, coalescing replaceable MOVE snapshots. */
@@ -2091,15 +2103,39 @@ class NativeStreamClient(
         return setVirtualMouseButtonFromSource(button = 1, sourceId = "touch-mouse-pad", pressed = pressed)
     }
 
+    internal fun setDirectClickMouseButton(pressed: Boolean): Boolean {
+        return setVirtualMouseButtonFromSource(
+            button = 1,
+            sourceId = "touch-mouse-pad",
+            pressed = pressed,
+            sendPartiallyReliableCopy = false,
+        )
+    }
+
     /** Shares button edges between physical mice, the keyboard overlay, touchpad, and synthesized clicks. */
-    fun setVirtualMouseButtonFromSource(button: Int, sourceId: String, pressed: Boolean): Boolean {
+    fun setVirtualMouseButtonFromSource(
+        button: Int,
+        sourceId: String,
+        pressed: Boolean,
+        sendPartiallyReliableCopy: Boolean = true,
+    ): Boolean {
         if (button !in 1..3) return false
         return mouseButtonPressSources.update(button, sourceId, pressed) { edgePressed ->
-            sendMouseButton(button, edgePressed, source = "virtual mouse")
+            sendMouseButton(
+                button,
+                edgePressed,
+                source = "virtual mouse",
+                sendPartiallyReliableCopy = sendPartiallyReliableCopy,
+            )
         }
     }
 
-    private fun sendMouseButton(button: Int, pressed: Boolean, source: String): Boolean {
+    private fun sendMouseButton(
+        button: Int,
+        pressed: Boolean,
+        source: String,
+        sendPartiallyReliableCopy: Boolean = true,
+    ): Boolean {
         flushPendingMouseMove()
         val packet = inputEncoder.encodeMouseButton(
             if (pressed) InputEncoder.INPUT_MOUSE_BUTTON_DOWN else InputEncoder.INPUT_MOUSE_BUTTON_UP,
@@ -2108,7 +2144,9 @@ class NativeStreamClient(
         val reliableSent = sendInput(packet, partiallyReliable = false)
         // NVST maps mouse buttons to its one reliable control stream. Sending the WebRTC
         // compatibility copy there would deliver the same button edge twice.
-        val partialSent = nvstTransport == null && sendInput(packet, partiallyReliable = true)
+        // Direct-click edges share the position's ordered channel; a compatibility copy on the
+        // other channel could reach the host before the cursor has moved to the touch target.
+        val partialSent = sendPartiallyReliableCopy && nvstTransport == null && sendInput(packet, partiallyReliable = true)
         NativeInputDiagnostics.add(
             "$source button=$button ${if (pressed) "down" else "up"} reliableSent=$reliableSent partialSent=$partialSent ${inputChannelStateSummary()}",
         )
@@ -2618,6 +2656,7 @@ class NativeStreamClient(
         heartbeatJob = null
         gamepadKeepaliveJob = null
         statsJob = null
+        statsPollGate.reset()
         offerTimeoutJob = null
         resetMouseMoveBurstLimiter()
         resetNativeTouchMoveLimiter()
@@ -3655,31 +3694,42 @@ class NativeStreamClient(
     }
 
     private fun pollRuntimeStats() {
-        if (!statsPollQueued.compareAndSet(false, true)) return
+        val request = statsPollGate.begin() ?: return
         val generation = transportGeneration
         val queued = enqueueNativeLifecycleOperation("runtime-stats") {
+            var awaitingCallback = false
             try {
                 val pc = activePeerConnection(generation) ?: return@enqueueNativeLifecycleOperation
                 pc.getStats(RTCStatsCollectorCallback { report ->
-                    if (generation != transportGeneration) return@RTCStatsCollectorCallback
-                    val cpuSample = processCpuSampler.sample()
-                    cpuSample?.let(ProcessCpuDiagnostics::record)
-                    val snapshot = buildRuntimeStatsSnapshot(
-                        timestampMs = report.timestampUs / 1000.0,
-                        stats = report.statsMap.values,
-                        cpuSample = cpuSample,
-                    ) ?: return@RTCStatsCollectorCallback
-                    scope.launch {
-                        if (generation != transportGeneration) return@launch
-                        handleMediaLiveness(snapshot)
-                        onStats(snapshot.stats)
+                    try {
+                        if (!statsPollGate.isCurrent(request) ||
+                            !isCurrentPeerOperation(generation, transportGeneration, pc, peerConnection)) {
+                            return@RTCStatsCollectorCallback
+                        }
+                        val cpuSample = processCpuSampler.sample()
+                        cpuSample?.let(ProcessCpuDiagnostics::record)
+                        val snapshot = buildRuntimeStatsSnapshot(
+                            timestampMs = report.timestampUs / 1000.0,
+                            stats = report.statsMap.values,
+                            cpuSample = cpuSample,
+                        ) ?: return@RTCStatsCollectorCallback
+                        scope.launch {
+                            if (!isCurrentPeerOperation(generation, transportGeneration, pc, peerConnection)) return@launch
+                            handleMediaLiveness(snapshot)
+                            onStats(snapshot.stats)
+                        }
+                    } finally {
+                        statsPollGate.finish(request)
                     }
                 })
+                awaitingCallback = true
             } finally {
-                statsPollQueued.set(false)
+                // getStats returns before its callback. Keep the lease until the
+                // callback finishes; only a rejected/failed call releases it here.
+                if (!awaitingCallback) statsPollGate.finish(request)
             }
         }
-        if (!queued) statsPollQueued.set(false)
+        if (!queued) statsPollGate.finish(request)
     }
 
     @Synchronized

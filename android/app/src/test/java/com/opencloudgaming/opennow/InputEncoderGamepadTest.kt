@@ -4,6 +4,7 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -11,6 +12,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InputEncoderGamepadTest {
+    @Test
+    fun virtualGamepadMatchesTheNvstSharedReportFixture() {
+        val expected = checkNotNull(javaClass.getResourceAsStream("/nvst-android-gamepad-report.hex"))
+            .bufferedReader().use { it.readText().trim() }
+            .chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        for ((protocol, partial, offset) in listOf(Triple(2, false, 0), Triple(3, false, 12), Triple(3, true, 16))) {
+            val packet = InputEncoder().apply { setProtocolVersion(protocol) }.encodeGamepadState(
+                controllerId = 0, buttons = 0x5101, leftTrigger = 17, rightTrigger = 231,
+                leftStickX = -12345, leftStickY = 23456, rightStickX = -30000, rightStickY = 30001,
+                bitmap = 0x0101, partiallyReliable = partial, timestampUs = 0x0102030405060708L,
+            )
+            assertArrayEquals(expected, packet.copyOfRange(offset, packet.size))
+        }
+    }
+
     @Test
     fun twoDualSenseControllersRemainConnectedInEveryGamepadSnapshot() {
         val bitmap = androidGamepadConnectionBitmapForSlots(

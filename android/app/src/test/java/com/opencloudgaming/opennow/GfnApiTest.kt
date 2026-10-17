@@ -21,6 +21,34 @@ import org.junit.Test
 
 class GfnApiTest {
     @Test
+    fun activeSessionLookupPreservesAuthFailureInsteadOfAllowingCreate() {
+        val response = OpenNowJson.parseToJsonElement(
+            """{"requestStatus":{"statusCode":14,"statusDescription":"AUTH_FAILURE_STATUS 8A8C0025","unifiedErrorCode":-1970536411}}""",
+        ).jsonObject
+
+        val failure = runCatching { checkActiveSessionsResponse(401, response) }.exceptionOrNull()
+
+        assertTrue(failure is CloudMatchRequestStatusException)
+        failure as CloudMatchRequestStatusException
+        assertEquals(14, failure.statusCode)
+        assertEquals("AUTH_FAILURE_STATUS 8A8C0025", failure.statusDescription)
+        assertEquals("-1970536411", failure.unifiedErrorCode)
+    }
+
+    @Test
+    fun activeSessionLookupRejectsHttpAndMalformedProviderResponses() {
+        val success = OpenNowJson.parseToJsonElement("""{"requestStatus":{"statusCode":1},"sessions":[]}""").jsonObject
+        val providerFailure = OpenNowJson.parseToJsonElement("""{"requestStatus":{"statusCode":14}}""").jsonObject
+
+        assertTrue(runCatching { checkActiveSessionsResponse(503, success) }.isFailure)
+        assertTrue(runCatching { checkActiveSessionsResponse(401, null) }.isFailure)
+        assertTrue(runCatching { checkActiveSessionsResponse(200, null) }.isFailure)
+        assertTrue(runCatching { checkActiveSessionsResponse(200, buildJsonObject {}) }.isFailure)
+        assertTrue(runCatching { checkActiveSessionsResponse(200, providerFailure) }.isFailure)
+        checkActiveSessionsResponse(200, success)
+    }
+
+    @Test
     fun cloudFrontCatalogRejectionFallsBackToAppsGraphQlWithoutChangingRequest() {
         val primary = "https://games.geforce.com/graphql?requestType=panels%2FMainV2&huId=123".toHttpUrl()
 
@@ -179,34 +207,6 @@ class GfnApiTest {
         )
         assertTrue(sessionClaimResponseFailure(httpStatus = 200, requestStatus = null) != null)
         assertNull(sessionClaimResponseFailure(httpStatus = 200, requestStatus = 1))
-    }
-
-    @Test
-    fun libraryBrowseSpecUsesPanelSeeMorePaginationMetadata() {
-        val payload = buildJsonObject {
-            putJsonObject("data") {
-                putJsonArray("panels") {
-                    add(buildJsonObject {
-                        putJsonArray("sections") {
-                            add(buildJsonObject {
-                                putJsonObject("seeMoreInfo") {
-                                    put("sortOrderId", JsonPrimitive("last_played"))
-                                    putJsonArray("filterIds") {
-                                        add(JsonPrimitive("library"))
-                                        add(JsonPrimitive("owned"))
-                                    }
-                                }
-                            })
-                        }
-                    })
-                }
-            }
-        }
-
-        assertEquals(
-            LibraryBrowseSpec(listOf("library", "owned"), "last_played"),
-            libraryBrowseSpec(payload),
-        )
     }
 
     @Test
@@ -739,6 +739,47 @@ class GfnApiTest {
         val userAgent = headers["User-Agent"].orEmpty()
         assertTrue(userAgent.contains("Android-Generic-Touch"))
         assertEquals("https://play.geforcenow.com", headers["Origin"])
+    }
+
+    @Test
+    fun websiteClientModeOverridesNativeTouchAndHighQualityIdentityForNvidia() {
+        val settings = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", browserClientMode = true)
+        val base = "https://np-ams-06.cloudmatchbeta.nvidiagrid.net"
+        val headers = cloudMatchHeaders(
+            token = "token",
+            clientId = "client",
+            deviceId = "device",
+            includeOrigin = true,
+            streamingBaseUrl = base,
+            appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+            preferBrowserMode = settings.browserClientMode,
+            preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+        )
+        val requestData = buildMinimalClaimRequestBody(
+            appId = "102691611",
+            deviceId = "device",
+            settings = settings,
+            streamingBaseUrl = base,
+            appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+        ).getValue("sessionRequestData").jsonObject
+
+        assertEquals("WEBRTC", headers["nv-client-streamer"])
+        assertEquals("BROWSER", headers["nv-client-type"])
+        assertEquals("PHONE", headers["nv-device-type"])
+        assertEquals("browser", requestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals(GfnAppLaunchMode.GAMEPAD_FRIENDLY, requestData.getValue("appLaunchMode").jsonPrimitive.int)
+        assertFalse(requestData.getValue("enablePersistingInGameSettings").jsonPrimitive.boolean)
+
+        val allianceHeaders = cloudMatchHeaders(
+            token = "token",
+            clientId = "client",
+            deviceId = "device",
+            includeOrigin = true,
+            streamingBaseUrl = "https://example.alliance.invalid",
+            appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+            preferBrowserMode = true,
+        )
+        assertEquals("NATIVE", allianceHeaders["nv-client-type"])
     }
 
     @Test

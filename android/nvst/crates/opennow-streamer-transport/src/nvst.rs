@@ -15,11 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockEncrypt, KeyIvInit, StreamCipher};
+use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::{Aes128, Aes256};
 use crc32fast::hash as crc32;
-use ctr::{Ctr32BE, Ctr128BE};
-use ghash::{GHash, universal_hash::UniversalHash};
+use ctr::Ctr128BE;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha1::Sha1;
@@ -50,6 +49,19 @@ use super::{
 #[path = "nvst_stun_rtt.rs"]
 mod stun_rtt;
 
+#[path = "nvst_gcm.rs"]
+mod gcm;
+use gcm::{GcmCtr, GcmKey};
+
+#[path = "nvst_nack.rs"]
+mod nack;
+use nack::NackQueue;
+#[cfg(test)]
+use nack::{
+    INITIAL_WAIT as NACK_INITIAL_WAIT, MAX_ATTEMPTS as MAX_NACK_ATTEMPTS,
+    RETRY_INTERVAL as NACK_RETRY_INTERVAL, TRACKING_TIMEOUT as NACK_TRACKING_TIMEOUT,
+};
+
 const RTP_FIXED_HEADER_LEN: usize = 12;
 const SRTP_AES_CM_HMAC_SHA1_80_TAG_LEN: usize = 10;
 /// RFC 7714 `AEAD_AES_*_GCM` profiles carry a 16-byte authentication tag.
@@ -70,12 +82,9 @@ const RTCP_SENDER_SSRC: u32 = 0x4f4e_4f57; // "ONOW"
 const SRTCP_RR_INTERVAL: Duration = Duration::from_secs(1);
 // Poll at the official retry cadence so a 4 ms NACK retry is not silently rounded
 // up to the old 10 ms control-loop interval.
-const RTCP_RECOVERY_INTERVAL: Duration = Duration::from_millis(4);
-const NACK_RETRY_INTERVAL: Duration = Duration::from_millis(4);
-const NACK_TRACKING_TIMEOUT: Duration = Duration::from_millis(52);
-const MAX_NACK_ATTEMPTS: u8 = 3;
+const RTCP_RECOVERY_INTERVAL: Duration = nack::RETRY_INTERVAL;
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(250);
-const MAX_PENDING_NACK_RANGES: usize = 16;
+const MAX_NACK_BATCHES_PER_POLL: usize = 4;
 const MAX_PENDING_FRAME_ACKS: usize = 512;
 
 fn verbose_diagnostics_enabled() -> bool {
@@ -86,7 +95,7 @@ fn verbose_diagnostics_enabled() -> bool {
             .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
     })
 }
-const MAX_NACK_PACKET_COUNT: usize = 64;
+const MAX_NACK_PACKET_COUNT: usize = nack::MAX_BATCH_PACKETS;
 const MAX_NACK_FCI_ENTRIES: usize = MAX_NACK_PACKET_COUNT.div_ceil(17);
 // At 120 FPS several FEC blocks can arrive during a single retransmission round trip. Keep them
 // ordered instead of throwing away the incomplete head block when its successor arrives.
@@ -318,15 +327,6 @@ struct CompletedFrameFeedback {
     accepted_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PendingNackRange {
-    first: u64,
-    last: u64,
-    requested_at: Instant,
-    last_sent_at: Option<Instant>,
-    attempts: u8,
-}
-
 #[derive(Debug)]
 pub struct NvstFeedbackState {
     application_ready: AtomicBool,
@@ -340,8 +340,8 @@ pub struct NvstFeedbackState {
     reception_timing: Mutex<ReceptionTiming>,
     /// Remains set through send attempts until assembly receives a fresh keyframe.
     keyframe_needed: AtomicBool,
-    /// Missing extended RTP sequence ranges awaiting RFC 4585 generic NACK.
-    pending_nacks: Mutex<VecDeque<PendingNackRange>>,
+    /// Missing packets awaiting RFC 4585 generic NACK, each with an independent budget.
+    pending_nacks: Mutex<NackQueue>,
     completed_frames: AtomicU32,
     completed_frame_bytes: AtomicU64,
     last_completed_rtp_timestamp: AtomicU32,
@@ -360,7 +360,7 @@ impl Default for NvstFeedbackState {
             report_prior: Mutex::new((0, 0)),
             reception_timing: Mutex::new(ReceptionTiming::default()),
             keyframe_needed: AtomicBool::new(false),
-            pending_nacks: Mutex::new(VecDeque::new()),
+            pending_nacks: Mutex::new(NackQueue::default()),
             completed_frames: AtomicU32::new(0),
             completed_frame_bytes: AtomicU64::new(0),
             last_completed_rtp_timestamp: AtomicU32::new(0),
@@ -421,72 +421,18 @@ impl NvstFeedbackState {
         self.keyframe_needed.store(true, Ordering::Release);
     }
 
-    fn request_nack(&self, first_missing_index: u64, last_missing_index: u64, now: Instant) {
-        if first_missing_index > last_missing_index {
-            return;
-        }
-        let mut pending = self
-            .pending_nacks
+    fn request_nack(&self, first: u64, last: u64, now: Instant) {
+        self.pending_nacks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(queued) = pending.iter_mut().find(|queued| {
-            first_missing_index <= queued.last.saturating_add(1)
-                && last_missing_index.saturating_add(1) >= queued.first
-        }) {
-            let first = queued.first.min(first_missing_index);
-            let last = queued.last.max(last_missing_index);
-            if first != queued.first || last != queued.last {
-                queued.first = first;
-                queued.last = last;
-                queued.requested_at = now;
-                queued.last_sent_at = None;
-                queued.attempts = 0;
-            }
-            return;
-        }
-        if pending.len() == MAX_PENDING_NACK_RANGES {
-            pending.pop_front();
-        }
-        pending.push_back(PendingNackRange {
-            first: first_missing_index,
-            last: last_missing_index,
-            requested_at: now,
-            last_sent_at: None,
-            attempts: 0,
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request(first, last, now);
     }
 
-    fn resolve_nack(&self, received_index: u64) -> bool {
-        let mut pending = self
-            .pending_nacks
+    fn resolve_nack(&self, index: u64) -> bool {
+        self.pending_nacks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut updated = VecDeque::with_capacity(pending.len().saturating_add(1));
-        let mut resolved = false;
-        while let Some(range) = pending.pop_front() {
-            if received_index < range.first || received_index > range.last {
-                updated.push_back(range);
-                continue;
-            }
-            // A naturally reordered packet can fill the gap before feedback
-            // leaves the client. Remove it either way, but count it as a NACK
-            // recovery only after at least one request was actually sent.
-            resolved |= range.last_sent_at.is_some();
-            if range.first < received_index {
-                updated.push_back(PendingNackRange {
-                    last: received_index - 1,
-                    ..range
-                });
-            }
-            if received_index < range.last {
-                updated.push_back(PendingNackRange {
-                    first: received_index + 1,
-                    ..range
-                });
-            }
-        }
-        *pending = updated;
-        resolved
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(index)
     }
 
     fn publish_completed_frame(&self, frame: &EncodedVideoAccessUnit) {
@@ -644,58 +590,23 @@ impl NvstFeedbackState {
         (rtcp_open && self.stream_snapshot().is_some(), control_open)
     }
 
+    #[cfg(test)]
     fn take_nack(&self, now: Instant) -> Option<(u64, u64)> {
-        let mut pending = self
-            .pending_nacks
+        self.take_nack_up_to(now, MAX_NACK_PACKET_COUNT)
+    }
+
+    fn take_nack_up_to(&self, now: Instant, packet_limit: usize) -> Option<(u64, u64)> {
+        self.pending_nacks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain(|range| {
-            now.saturating_duration_since(range.requested_at) < NACK_TRACKING_TIMEOUT
-        });
-        let index = pending.iter().position(|range| {
-            range.attempts < MAX_NACK_ATTEMPTS
-                && range.last_sent_at.is_none_or(|last_sent| {
-                    now.saturating_duration_since(last_sent) >= NACK_RETRY_INTERVAL
-                })
-        })?;
-        let mut range = pending.remove(index)?;
-        let send_last = range.last.min(
-            range
-                .first
-                .saturating_add((MAX_NACK_PACKET_COUNT.saturating_sub(1)) as u64),
-        );
-        if send_last < range.last {
-            pending.insert(
-                index,
-                PendingNackRange {
-                    first: send_last + 1,
-                    last: range.last,
-                    requested_at: range.requested_at,
-                    last_sent_at: None,
-                    attempts: 0,
-                },
-            );
-            range.last = send_last;
-        }
-        range.last_sent_at = Some(now);
-        range.attempts = range.attempts.saturating_add(1);
-        let result = (range.first, range.last);
-        pending.insert(index, range);
-        Some(result)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_up_to(now, packet_limit)
     }
 
     fn mark_nack_send_failed(&self, first: u64, last: u64) {
-        let mut pending = self
-            .pending_nacks
+        self.pending_nacks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(range) = pending
-            .iter_mut()
-            .find(|range| range.first == first && range.last == last)
-        {
-            range.last_sent_at = None;
-            range.attempts = range.attempts.saturating_sub(1);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_failed(first, last);
     }
 
     fn clear_nacks(&self) {
@@ -1584,6 +1495,7 @@ enum RtpPacketOrigin {
 #[derive(Clone)]
 struct SrtpReceiver {
     cipher: SrtpCipher,
+    gcm: OnceLock<Arc<GcmKey>>,
     replay: ReplayWindow,
 }
 
@@ -1669,6 +1581,7 @@ impl SrtpReceiver {
         };
         Self {
             cipher,
+            gcm: OnceLock::new(),
             replay: ReplayWindow::default(),
         }
     }
@@ -1686,7 +1599,8 @@ impl SrtpReceiver {
                 datagram,
                 header,
                 roc,
-                encryption_key,
+                self.gcm
+                    .get_or_init(|| Arc::new(GcmKey::new(encryption_key))),
                 session_salt,
                 *authentication_tag_len,
             )?,
@@ -1698,7 +1612,8 @@ impl SrtpReceiver {
                 datagram,
                 header,
                 roc,
-                encryption_key,
+                self.gcm
+                    .get_or_init(|| Arc::new(GcmKey::new(encryption_key))),
                 session_salt,
                 *authentication_tag_len,
             )?,
@@ -1753,7 +1668,7 @@ fn unprotect_aes_gcm(
     datagram: &[u8],
     header: RtpHeader,
     roc: u32,
-    encryption_key: &[u8],
+    key: &GcmKey,
     session_salt: &[u8; 12],
     tag_len: usize,
 ) -> Result<Vec<u8>, NvstDropReason> {
@@ -1773,7 +1688,7 @@ fn unprotect_aes_gcm(
     let aad = &datagram[..header.payload_offset];
     let ciphertext = &datagram[header.payload_offset..ciphertext_end];
     let received_tag = &datagram[ciphertext_end..];
-    let (expected_tag, mut ctr) = aes_gcm_tag_and_ctr(encryption_key, &iv, aad, ciphertext);
+    let (expected_tag, mut ctr) = key.tag_and_ctr(&iv, aad, ciphertext);
     if expected_tag[..tag_len].ct_eq(received_tag).unwrap_u8() != 1 {
         return Err(NvstDropReason::AuthenticationFailed);
     }
@@ -1782,64 +1697,13 @@ fn unprotect_aes_gcm(
     Ok(plaintext)
 }
 
-enum GcmCtr {
-    Aes128(Box<Ctr32BE<Aes128>>),
-    Aes256(Box<Ctr32BE<Aes256>>),
-}
-
-impl GcmCtr {
-    fn apply_keystream(&mut self, buffer: &mut [u8]) {
-        match self {
-            Self::Aes128(cipher) => cipher.apply_keystream(buffer),
-            Self::Aes256(cipher) => cipher.apply_keystream(buffer),
-        }
-    }
-}
-
 fn aes_gcm_tag_and_ctr(
     encryption_key: &[u8],
     iv: &[u8; 12],
     aad: &[u8],
     ciphertext: &[u8],
 ) -> ([u8; 16], GcmCtr) {
-    let mut j0 = [0_u8; 16];
-    j0[..12].copy_from_slice(iv);
-    j0[15] = 1;
-    let mut hash_key = [0_u8; 16];
-    let mut tag_mask = [0_u8; 16];
-    let ctr = match encryption_key.len() {
-        16 => {
-            let key: &[u8; 16] = encryption_key.try_into().expect("16-byte GCM key");
-            let aes = <Aes128 as aes::cipher::KeyInit>::new(key.into());
-            aes.encrypt_block((&mut hash_key).into());
-            let mut ctr = Ctr32BE::<Aes128>::new(key.into(), (&j0).into());
-            ctr.apply_keystream(&mut tag_mask);
-            GcmCtr::Aes128(Box::new(ctr))
-        }
-        32 => {
-            let key: &[u8; 32] = encryption_key.try_into().expect("32-byte GCM key");
-            let aes = <Aes256 as aes::cipher::KeyInit>::new(key.into());
-            aes.encrypt_block((&mut hash_key).into());
-            let mut ctr = Ctr32BE::<Aes256>::new(key.into(), (&j0).into());
-            ctr.apply_keystream(&mut tag_mask);
-            GcmCtr::Aes256(Box::new(ctr))
-        }
-        _ => unreachable!("AES-GCM key is 16 or 32 bytes"),
-    };
-    let mut hasher = <GHash as ghash::universal_hash::KeyInit>::new((&hash_key).into());
-    hasher.update_padded(aad);
-    hasher.update_padded(ciphertext);
-    let mut len_block = ghash::Block::default();
-    len_block[..8].copy_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
-    len_block[8..].copy_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
-    hasher.update(&[len_block]);
-    let mut tag = hasher.finalize();
-    for (byte, mask) in tag.iter_mut().zip(tag_mask) {
-        *byte ^= mask;
-    }
-    let mut expected = [0_u8; 16];
-    expected.copy_from_slice(&tag);
-    (expected, ctr)
+    GcmKey::new(encryption_key).tag_and_ctr(iv, aad, ciphertext)
 }
 
 #[cfg(test)]
@@ -3568,6 +3432,11 @@ impl NvstVideoReceiver {
             events.push(NvstReceiveEvent::RecoveryNeeded(recovery));
         }
         for packet in result.ready {
+            if packet.origin == RtpPacketOrigin::RecoveredData {
+                // FEC already supplied this packet. Cancel any outstanding NACK
+                // without counting it as a network retransmission recovery.
+                self.config.feedback.resolve_nack(packet.index);
+            }
             let payload = match packet.header.payload(&packet.plaintext) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -5130,6 +4999,7 @@ fn run_nvst_webrtc_bundle(
                             .as_micros()
                             .try_into()
                             .unwrap_or(u64::MAX);
+                        let previous_input_codec = input_codec.clone();
                         match input_codec.encode(&bytes, timestamp_us) {
                             Ok(messages) => {
                                 for message in messages {
@@ -5143,10 +5013,14 @@ fn run_nvst_webrtc_bundle(
                                     }
                                     if !channels.send_encoded(&mut rtc, &message) {
                                         sent = false;
+                                        // Topology changes must be retried before state if the
+                                        // reliable registration or following input write failed.
+                                        input_codec = previous_input_codec;
                                         eprintln!(
                                             "NVST input packet could not be queued on {:?}",
                                             message.route
                                         );
+                                        break;
                                     }
                                 }
                             }
@@ -5409,7 +5283,18 @@ fn run_nvst_webrtc_bundle(
                 && let Some(channel_id) = rtcp_channel
                 && let Some(mut channel) = rtc.channel(channel_id)
             {
-                if let Some((first_missing_index, last_missing_index)) = feedback.take_nack(now) {
+                // Drain several independent due runs without letting a large loss
+                // burst monopolize this loop or starve input/control traffic.
+                // Keep the previous 64-packet total budget while allowing it
+                // to cover multiple small gaps in this four-millisecond poll.
+                let mut packet_budget = MAX_NACK_PACKET_COUNT;
+                for _ in 0..MAX_NACK_BATCHES_PER_POLL {
+                    let Some((first_missing_index, last_missing_index)) =
+                        feedback.take_nack_up_to(now, packet_budget)
+                    else {
+                        break;
+                    };
+                    packet_budget -= (last_missing_index - first_missing_index + 1) as usize;
                     let nack = build_rtcp_nack(
                         rtcp_sender_ssrc,
                         media_ssrc,
@@ -5422,6 +5307,7 @@ fn run_nvst_webrtc_bundle(
                         );
                     } else {
                         feedback.mark_nack_send_failed(first_missing_index, last_missing_index);
+                        break;
                     }
                 }
             }
@@ -7143,6 +7029,48 @@ mod tests {
     }
 
     #[test]
+    fn cached_gcm_authentication_survives_tampering_and_sequence_rollover() {
+        for bits in [128, 256] {
+            for tag_len in [8, 16] {
+                let material = if bits == 128 {
+                    NvstSrtpMaterial::AeadAes128Gcm {
+                        master_key: [7; 16],
+                        master_salt: [9; 12],
+                        authentication_tag_len: tag_len,
+                    }
+                } else {
+                    NvstSrtpMaterial::AeadAes256Gcm {
+                        master_key: [7; 32],
+                        master_salt: [9; 12],
+                        authentication_tag_len: tag_len,
+                    }
+                };
+                let mut receiver = SrtpReceiver::from_material(&material);
+                for (sequence, roc) in [(65534, 0), (65535, 0), (0, 1), (1, 1)] {
+                    let plaintext =
+                        build_plaintext_rtp(sequence, FLAG_SOF | FLAG_EOF, 7, &[0, 0, 1, 0x65]);
+                    let protected = protect_for_test(&receiver, plaintext.clone(), roc);
+                    let mut tampered = protected.clone();
+                    *tampered.last_mut().unwrap() ^= 1;
+                    assert!(matches!(
+                        receiver.unprotect(&tampered),
+                        Err(NvstDropReason::AuthenticationFailed)
+                    ));
+                    let packet = receiver
+                        .unprotect(&protected)
+                        .expect("valid packet after invalid authentication");
+                    assert_eq!(packet.plaintext, plaintext);
+                    assert_eq!(packet.index, (u64::from(roc) << 16) | u64::from(sequence));
+                    assert!(matches!(
+                        receiver.unprotect(&protected),
+                        Err(NvstDropReason::ReplayRejected)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn srtp_aes_cm_hmac_sha1_known_answer_unprotects_packet_when_explicitly_selected() {
         let key = decode_fixed_hex::<16>(
             "000102030405060708090A0B0C0D0E0F",
@@ -7198,6 +7126,7 @@ mod tests {
                 session_salt,
                 authentication_tag_len: SRTP_AEAD_AES_GCM_TAG_LEN,
             },
+            gcm: OnceLock::new(),
             replay: ReplayWindow::default(),
         };
         let protected = hex_bytes(
@@ -7221,6 +7150,7 @@ mod tests {
                 session_salt,
                 authentication_tag_len: SRTP_AEAD_AES_GCM_TAG_LEN,
             },
+            gcm: OnceLock::new(),
             replay: ReplayWindow::default(),
         };
         assert!(matches!(
@@ -7245,6 +7175,7 @@ mod tests {
                 session_salt,
                 authentication_tag_len: SRTP_AEAD_AES_GCM_TAG_LEN,
             },
+            gcm: OnceLock::new(),
             replay: ReplayWindow::default(),
         };
         let protected = hex_bytes(
@@ -7268,6 +7199,7 @@ mod tests {
                 session_salt,
                 authentication_tag_len: SRTP_AEAD_AES_GCM_TAG_LEN,
             },
+            gcm: OnceLock::new(),
             replay: ReplayWindow::default(),
         };
         assert!(matches!(
@@ -8276,7 +8208,10 @@ mod tests {
         for packet in &packets {
             let _ = receiver.process_datagram(peer(), packet, Instant::now());
         }
-        assert_eq!(feedback.take_nack(Instant::now()), Some((2, 2)));
+        assert_eq!(
+            feedback.take_nack(Instant::now() + NACK_INITIAL_WAIT),
+            Some((2, 2))
+        );
         assert_eq!(feedback.take_nack(Instant::now()), None);
     }
 
@@ -8553,16 +8488,16 @@ mod tests {
         let now = Instant::now();
         feedback.request_nack(10, 100, now);
         feedback.resolve_nack(12);
-        assert_eq!(feedback.take_nack(now), Some((10, 11)));
-        assert_eq!(feedback.take_nack(now), Some((13, 76)));
-        assert_eq!(feedback.take_nack(now), Some((77, 100)));
-        assert_eq!(feedback.take_nack(now), None);
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((10, 11)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((13, 76)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((77, 100)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), None);
 
         feedback.clear_nacks();
         feedback.request_nack(10, 100, now);
-        assert_eq!(feedback.take_nack(now), Some((10, 73)));
-        assert_eq!(feedback.take_nack(now), Some((74, 100)));
-        assert_eq!(feedback.take_nack(now), None);
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((10, 73)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((74, 100)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), None);
     }
 
     #[test]
@@ -8574,7 +8509,7 @@ mod tests {
 
         feedback.request_nack(42, 42, now);
 
-        assert_eq!(feedback.take_nack(now), Some((42, 42)));
+        assert_eq!(feedback.take_nack(now + NACK_INITIAL_WAIT), Some((42, 42)));
         feedback.request_nack(42, 42, now + Duration::from_millis(1));
         assert_eq!(feedback.take_nack(now + NACK_RETRY_INTERVAL / 2), None);
         assert!(feedback.resolve_nack(42));
@@ -8589,7 +8524,8 @@ mod tests {
 
         for attempt in 0..MAX_NACK_ATTEMPTS {
             assert_eq!(
-                feedback.take_nack(now + NACK_RETRY_INTERVAL * u32::from(attempt)),
+                feedback
+                    .take_nack(now + NACK_INITIAL_WAIT + NACK_RETRY_INTERVAL * u32::from(attempt)),
                 Some((7, 7))
             );
         }

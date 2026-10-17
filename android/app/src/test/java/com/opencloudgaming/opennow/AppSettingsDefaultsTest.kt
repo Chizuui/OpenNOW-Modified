@@ -55,7 +55,7 @@ class AppSettingsDefaultsTest {
         assertFalse(settings.developerOptionsUnlocked)
         assertEquals(StreamKeyboardButtonPosition(), settings.streamKeyboardButtonPosition)
         assertTrue(settings.streamStatsBackgroundEnabled)
-        assertEquals(0.52f, settings.streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(0.60f, settings.streamStatsBackgroundAlpha(), 0.0001f)
         assertTrue(metrics.fps)
         assertTrue(metrics.ping)
         assertFalse(metrics.bitrate)
@@ -77,7 +77,7 @@ class AppSettingsDefaultsTest {
 
         assertEquals(StreamStatsMetrics(), settings.streamStatsMetrics)
         assertTrue(settings.streamStatsBackgroundEnabled)
-        assertEquals(0.52f, settings.streamStatsBackgroundAlpha(), 0.0001f)
+        assertEquals(0.60f, settings.streamStatsBackgroundAlpha(), 0.0001f)
         assertTrue(settings.showStatsOnLaunch)
         assertFalse(settings.hideStreamButtons)
         assertFalse(settings.streamKeyboardClearConfirmationDisabled)

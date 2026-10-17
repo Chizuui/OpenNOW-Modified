@@ -17,6 +17,9 @@ internal class SurfaceOrTextureVideoDecoder(
     private var active: VideoDecoder? = null
     private var usingTexture = false
 
+    internal val canBorrowEncodedInput: Boolean
+        get() = surfaceDecoder.supportsBorrowedNvstInput() && textureDecoder.supportsBorrowedNvstInput()
+
     override fun initDecode(settings: VideoDecoder.Settings?, decodeCallback: VideoDecoder.Callback?): VideoCodecStatus {
         if (settings == null || decodeCallback == null) return VideoCodecStatus.ERR_PARAMETER
         if (active != null) return VideoCodecStatus.ERROR

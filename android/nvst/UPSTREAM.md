@@ -68,3 +68,12 @@ The NVST text adapter now starts UTF-8 after the four-byte input type: the singl
 marker was already removed by native_events. The previous five-byte offset discarded
 single-character IME input and the first character of each pasted chunk. A failing-before,
 passing-after regression reproduces Android's actual 0x22/type-23/UTF-8 framing.
+
+Android's gamepad encoder now selectively incorporates upstream commit
+086b505a8f21 (PR #837, native gamepad packets and registration). NVST 0x020d carries the
+full 38-byte Android report in a length-prefixed v3 envelope, with the real slot, connected/XInput
+bitmap, controls, timestamp, and independent 16-bit sequence. Reliable topology announcements
+replace the old hard-coded descriptor values; removal neutralizes departing slots, and refused
+channel writes restore encoder state so the next snapshot retries registration. A shared report
+fixture checks the Kotlin encoder and Rust translation. This does not change WebRTC framing or
+CloudMatch input provisioning. Live on-screen controller response remains to be verified.

@@ -45,6 +45,9 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
     private var oesProgram: SharpnessProgram? = null
     private var rgbProgram: SharpnessProgram? = null
     private var yuvProgram: SharpnessProgram? = null
+    // Each drawer belongs to one EGL render thread. OES/RGB draws consume this
+    // synchronously, so neither needs a new texture-ID array for every frame.
+    private val singleTexture = IntArray(1)
 
     override fun drawOes(
         oesTextureId: Int,
@@ -71,8 +74,9 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
             return
         }
         val program = oesProgram ?: SharpnessProgram(SHARPEN_OES_FRAGMENT_SHADER, TextureMode.Oes).also { oesProgram = it }
+        singleTexture[0] = oesTextureId
         program.draw(
-            textureIds = intArrayOf(oesTextureId),
+            textureIds = singleTexture,
             textureTarget = GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
             texMatrix = texMatrix,
             frameWidth = frameWidth,
@@ -112,8 +116,9 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
             return
         }
         val program = rgbProgram ?: SharpnessProgram(SHARPEN_RGB_FRAGMENT_SHADER, TextureMode.Rgb).also { rgbProgram = it }
+        singleTexture[0] = textureId
         program.draw(
-            textureIds = intArrayOf(textureId),
+            textureIds = singleTexture,
             textureTarget = GLES20.GL_TEXTURE_2D,
             texMatrix = texMatrix,
             frameWidth = frameWidth,
@@ -184,6 +189,11 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
         private val texMatrixLocation = shader.getUniformLocation("tex_mat")
         private val sharpnessLocation = shader.getUniformLocation("sharpness")
         private val texelSizeLocation = shader.getUniformLocation("texel_size")
+        private val positionLocation = shader.getAttribLocation("in_pos")
+        private val coordinateLocation = shader.getAttribLocation("in_tc")
+        private var lastAmount = Float.NaN
+        private var lastWidth = 0
+        private var lastHeight = 0
         private val textureLocations: IntArray = when (mode) {
             TextureMode.Oes,
             TextureMode.Rgb,
@@ -193,6 +203,14 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
                 shader.getUniformLocation("u_tex"),
                 shader.getUniformLocation("v_tex"),
             )
+        }
+
+        init {
+            // Sampler bindings belong to the linked program and survive draws
+            // by other programs; refresh them only when this program is built.
+            shader.useProgram()
+            textureLocations.forEachIndexed { index, location -> GLES20.glUniform1i(location, index) }
+            GlUtil.checkNoGLES2Error("StreamSharpnessGlDrawer.init")
         }
 
         fun draw(
@@ -211,26 +229,37 @@ internal class StreamSharpnessGlDrawer : RendererCommon.GlDrawer {
         ) {
             shader.useProgram()
             GLES20.glViewport(viewportX, viewportY, viewportWidth, viewportHeight)
-            shader.setVertexAttribArray("in_pos", 2, vertexBuffer)
-            shader.setVertexAttribArray("in_tc", 2, textureBuffer)
+            // Attribute bindings are shared GL state and still need restoring
+            // per draw; their program-specific locations do not need querying.
+            GLES20.glEnableVertexAttribArray(positionLocation)
+            GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+            GLES20.glEnableVertexAttribArray(coordinateLocation)
+            GLES20.glVertexAttribPointer(coordinateLocation, 2, GLES20.GL_FLOAT, false, 0, textureBuffer)
             GLES20.glUniformMatrix4fv(texMatrixLocation, 1, false, texMatrix, 0)
-            GLES20.glUniform1f(sharpnessLocation, amount.coerceIn(0f, STREAM_SHARPNESS_MAX_SHADER_STRENGTH))
-            GLES20.glUniform2f(
-                texelSizeLocation,
-                1f / frameWidth.coerceAtLeast(1).toFloat(),
-                1f / frameHeight.coerceAtLeast(1).toFloat(),
-            )
-            textureLocations.forEachIndexed { index, location ->
+            val strength = amount.coerceIn(0f, STREAM_SHARPNESS_MAX_SHADER_STRENGTH)
+            if (lastAmount != strength) {
+                GLES20.glUniform1f(sharpnessLocation, strength)
+            }
+            val width = frameWidth.coerceAtLeast(1)
+            val height = frameHeight.coerceAtLeast(1)
+            if (lastWidth != width || lastHeight != height) {
+                GLES20.glUniform2f(texelSizeLocation, 1f / width.toFloat(), 1f / height.toFloat())
+            }
+            for (index in textureLocations.indices) {
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + index)
                 GLES20.glBindTexture(textureTarget, textureIds.getOrElse(index) { 0 })
-                GLES20.glUniform1i(location, index)
             }
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            textureLocations.indices.forEach { index ->
+            for (index in textureLocations.indices) {
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + index)
                 GLES20.glBindTexture(textureTarget, 0)
             }
             GlUtil.checkNoGLES2Error("StreamSharpnessGlDrawer.draw")
+            // Failed GL calls must not mark uniforms as applied and suppress a
+            // later retry if the renderer continues after an error.
+            lastAmount = strength
+            lastWidth = width
+            lastHeight = height
         }
 
         fun release() {
@@ -847,105 +876,6 @@ internal fun streamPointForTouch(
 
 private fun viewAspectOf(width: Int, height: Int): Float = width.toFloat() / height.toFloat()
 
-/** A whole-pixel relative move, the only kind the wire format carries. */
-internal data class CursorDelta(val dx: Int, val dy: Int)
-
-/**
- * Our model of where the host's cursor sits while a direct-click drag is active.
- *
- * The protocol has no absolute-positioning packet — [InputEncoder.INPUT_MOUSE_REL] is all there is.
- * At the start of every tap, [reanchorDeltasTo] first sends the largest supported negative movement
- * so the desktop clamps the cursor to its top-left boundary, then sends the target coordinates from
- * that known origin. That removes the old assumption that the host cursor started in the centre,
- * which left every direct click offset whenever a game had moved it elsewhere.
- */
-internal class VirtualCursor {
-    private var x = 0f
-    private var y = 0f
-    private var initialized = false
-    private var streamWidth = 0
-    private var streamHeight = 0
-
-    /** Exposed for tests; production code only ever needs [consumeDeltaTo]. */
-    val position: StreamPoint get() = StreamPoint(x, y)
-
-    fun onStreamSize(width: Int, height: Int) {
-        if (width <= 0 || height <= 0) {
-            // Do not reset to 0,0 if we already have a valid size. This prevents the cursor
-            // from re-centering when the stream momentarily reports a 0x0 size during a
-            // resolution change or PiP transition.
-            if (streamWidth > 0 && streamHeight > 0) return
-            // Never anchor to a degenerate size either: a 0x0 report before the first valid size
-            // must leave the model uninitialised so the first real size anchors normally.
-            if (!initialized) return
-        }
-        if (!initialized) {
-            // Direct click reanchors before pressing; this temporary value only keeps the generic
-            // relative cursor model well-defined until that first DOWN arrives.
-            x = width / 2f
-            y = height / 2f
-            initialized = true
-        } else if (streamWidth != width || streamHeight != height) {
-            if (streamWidth > 0 && streamHeight > 0) {
-                x = x / streamWidth * width
-                y = y / streamHeight * height
-            }
-        }
-        streamWidth = width
-        streamHeight = height
-    }
-
-    /**
-     * The move to send in order to land on [target], advancing the model by exactly that much —
-     * not by [target]. The two differ by the rounding residue, and assigning [target] would swallow
-     * that residue every event, letting the model random-walk away from the real cursor over a long
-     * drag. Null when the rounded move is zero and there is nothing worth sending.
-     */
-    fun consumeDeltaTo(target: StreamPoint): CursorDelta? {
-        if (!target.x.isFinite() || !target.y.isFinite() || !x.isFinite() || !y.isFinite()) return null
-        val dx = (target.x - x).roundToInt()
-        val dy = (target.y - y).roundToInt()
-        if (dx == 0 && dy == 0) return null
-        // Advance the model by what was actually sent, never by [target]: the difference is the
-        // rounding residue, and assigning [target] would swallow it every event, letting the model
-        // drift away from the host cursor over a long drag.
-        x += dx
-        y += dy
-        return CursorDelta(dx, dy)
-    }
-
-    /**
-     * Reliable relative moves that place the host cursor at [target] without knowing its current
-     * position. The first move is already the protocol's signed-16-bit minimum, so the encoder will
-     * transmit it unchanged and any supported single-display stream is guaranteed to hit (0, 0).
-     */
-    fun reanchorDeltasTo(target: StreamPoint): List<CursorDelta> {
-        if (
-            !initialized ||
-            streamWidth <= 0 ||
-            streamHeight <= 0 ||
-            !target.x.isFinite() ||
-            !target.y.isFinite()
-        ) return emptyList()
-        val targetX = target.x.roundToInt().coerceIn(0, streamWidth - 1)
-        val targetY = target.y.roundToInt().coerceIn(0, streamHeight - 1)
-        x = targetX.toFloat()
-        y = targetY.toFloat()
-        return buildList {
-            repeat(2) {
-                add(CursorDelta(Short.MIN_VALUE.toInt(), Short.MIN_VALUE.toInt()))
-            }
-            add(CursorDelta(targetX, targetY))
-        }
-    }
-
-    fun forget() {
-        initialized = false
-        streamWidth = 0
-        streamHeight = 0
-    }
-}
-
 internal class TouchMouseState {
     private var activePointerId = -1
     private var downX = 0f
@@ -958,7 +888,8 @@ internal class TouchMouseState {
     private var lastTapTimeMs = Long.MIN_VALUE
     private var lastTapX = Float.NaN
     private var lastTapY = Float.NaN
-    private val virtualCursor = VirtualCursor()
+    private val directClickMouse = DirectClickMouse()
+    private var clickEnabled = true
     private var twoFingerTapCandidate = false
     private val motionAccumulator = MouseMotionAccumulator()
     // 2-finger scroll state
@@ -969,18 +900,15 @@ internal class TouchMouseState {
     private var scrollAccumulator = 0f
     private var scrollGestureOccurred = false
 
-    /**
-     * Tears down the in-flight gesture. The cursor model is retained only for an active drag; every
-     * new direct-click DOWN independently reanchors at the host boundary before moving to its target.
-     */
-    fun reset(client: NativeStreamClient?) {
-        // Correct for both modes now that direct click also maintains `selecting`. Widening this
-        // to `activePointerId >= 0` instead would fire in touchpad mode during an ordinary drag,
-        // where a pointer is tracked but no button is held, sending a spurious release.
+    /** Releases the in-flight gesture when input mode, focus, or session changes. */
+    fun reset(client: TouchMouseOutput?) {
+        // Touchpad motion tracks a pointer without holding a button; release only actual presses.
         if (selecting) client?.setTouchMouseButton(false)
+        directClickMouse.release(client?.let { it::setDirectClickMouseButton })
         activePointerId = -1
         selecting = false
         doubleTapDragCandidate = false
+        lastTapTimeMs = Long.MIN_VALUE
         twoFingerTapCandidate = false
         motionAccumulator.reset()
         secondPointerId = -1
@@ -989,37 +917,13 @@ internal class TouchMouseState {
         scrollGestureOccurred = false
     }
 
-    /** Clears any position retained from the previous stream client. */
-    fun forgetCursorPosition() {
-        virtualCursor.forget()
-    }
-
-    private fun moveVirtualCursorTo(target: StreamPoint, client: NativeStreamClient) {
-        val delta = virtualCursor.consumeDeltaTo(target) ?: return
-        client.sendRawMouseMove(delta.dx, delta.dy)
-    }
-
-    private fun reanchorVirtualCursorTo(target: StreamPoint, client: NativeStreamClient): Boolean {
-        val deltas = virtualCursor.reanchorDeltasTo(target)
-        if (deltas.isEmpty()) return false
-        for (delta in deltas) {
-            // The reanchor series is order-sensitive: the host must clamp through the top-left
-            // boundary before moving to the target. The unordered loss-tolerant channel could
-            // deliver these out of order and clamp the cursor back to 0,0, so keep it reliable.
-            if (!client.sendRawMouseMove(delta.dx, delta.dy)) {
-                virtualCursor.forget()
-                return false
-            }
-        }
-        return true
-    }
-
     fun handle(
         event: MotionEvent,
         enabled: Boolean,
-        client: NativeStreamClient,
+        client: TouchMouseOutput,
         ignoredPointerIds: Set<Int>,
         directClick: Boolean = false,
+        buttonsEnabled: Boolean = true,
         width: Int = 0,
         height: Int = 0,
         stretchToFit: Boolean = false,
@@ -1030,6 +934,10 @@ internal class TouchMouseState {
         decodedStreamWidth: Int = 0,
         decodedStreamHeight: Int = 0,
     ): Boolean {
+        if (clickEnabled != buttonsEnabled) {
+            reset(client)
+            clickEnabled = buttonsEnabled
+        }
         if (!enabled) {
             reset(client)
             return false
@@ -1039,7 +947,24 @@ internal class TouchMouseState {
             val settingsRes = streamResolutionPixels(client.settings)
             val streamWidth = if (decodedStreamWidth > 0) decodedStreamWidth else settingsRes.first
             val streamHeight = if (decodedStreamHeight > 0) decodedStreamHeight else settingsRes.second
-            virtualCursor.onStreamSize(streamWidth, streamHeight)
+
+            fun positionAt(index: Int): AbsoluteMousePosition? = directClickMousePosition(
+                streamPointForTouch(
+                    touchX = event.getX(index),
+                    touchY = event.getY(index),
+                    viewWidth = width,
+                    viewHeight = height,
+                    streamWidth = streamWidth,
+                    streamHeight = streamHeight,
+                    stretchToFit = stretchToFit,
+                    renderingAspectRatio = renderingAspectRatio,
+                    presentationZoomScale = presentationZoomScale,
+                    presentationTranslationX = presentationTranslationX,
+                    presentationTranslationY = presentationTranslationY,
+                ),
+                streamWidth,
+                streamHeight,
+            )
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -1054,37 +979,22 @@ internal class TouchMouseState {
                         }
                         // If we get here the old pointer was lifted without a UP event — reset first.
                         if (activePointerId >= 0) {
-                            client.setTouchMouseButton(false)
-                            selecting = false
+                            directClickMouse.release(client::setDirectClickMouseButton)
                         }
 
                         activePointerId = pointerId
-                        val target = streamPointForTouch(
-                            touchX = event.getX(index),
-                            touchY = event.getY(index),
-                            viewWidth = width,
-                            viewHeight = height,
-                            streamWidth = streamWidth,
-                            streamHeight = streamHeight,
-                            stretchToFit = stretchToFit,
-                            renderingAspectRatio = renderingAspectRatio,
-                            presentationZoomScale = presentationZoomScale,
-                            presentationTranslationX = presentationTranslationX,
-                            presentationTranslationY = presentationTranslationY,
+                        val position = positionAt(index)
+                        val positioned = directClickMouse.press(
+                            position = position,
+                            sendPosition = client::sendDirectClickMousePosition,
+                            setButton = client::setDirectClickMouseButton,
+                            clickEnabled = clickEnabled,
                         )
-                        // Move cursor smoothly to target without forced reanchoring.
-                        moveVirtualCursorTo(target, client)
-
-                        selecting = client.setTouchMouseButton(true)
-                        if (!selecting) {
-                            activePointerId = -1
-                            return true
-                        }
-                        // `selecting` is this class's single record of "we are holding the button
-                        // down on the host". Direct click used to leave it false and track the
-                        // press only through activePointerId, so reset() — which releases on
-                        // `selecting` — could not release it, and backgrounding mid-tap left the
-                        // button stuck down with no event left to clear it.
+                        NativeInputDiagnostics.add(
+                            "touch direct click target=${position?.x},${position?.y} " +
+                                "stream=${streamWidth}x${streamHeight} positioned=$positioned clickEnabled=$clickEnabled",
+                        )
+                        if (!positioned) activePointerId = -1
                     }
                     return true
                 }
@@ -1092,51 +1002,34 @@ internal class TouchMouseState {
                     if (activePointerId >= 0) {
                         val index = event.findPointerIndex(activePointerId)
                         if (index >= 0) {
-                            fun moveTo(x: Float, y: Float) {
-                                moveVirtualCursorTo(
-                                    streamPointForTouch(
-                                        touchX = x,
-                                        touchY = y,
-                                        viewWidth = width,
-                                        viewHeight = height,
-                                        streamWidth = streamWidth,
-                                        streamHeight = streamHeight,
-                                        stretchToFit = stretchToFit,
-                                        renderingAspectRatio = renderingAspectRatio,
-                                        presentationZoomScale = presentationZoomScale,
-                                        presentationTranslationX = presentationTranslationX,
-                                        presentationTranslationY = presentationTranslationY,
-                                    ),
-                                    client,
-                                )
-                            }
-                            for (historyIndex in 0 until event.historySize) {
-                                moveTo(event.getHistoricalX(index, historyIndex), event.getHistoricalY(index, historyIndex))
-                            }
-                            moveTo(event.getX(index), event.getY(index))
+                            // Absolute motion needs only the newest sample, so batched history
+                            // cannot build a queue of obsolete cursor positions.
+                            directClickMouse.move(
+                                positionAt(index),
+                                client::sendDirectClickMousePosition,
+                            )
                         }
                     }
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
-                    // Final pointer lifted — always release the button.
-                    client.setTouchMouseButton(false)
-                    selecting = false
+                    val index = event.findPointerIndex(activePointerId)
+                    if (index >= 0) directClickMouse.move(positionAt(index), client::sendDirectClickMousePosition)
+                    directClickMouse.release(client::setDirectClickMouseButton)
                     activePointerId = -1
                     return true
                 }
                 MotionEvent.ACTION_POINTER_UP -> {
                     val releasedId = event.getPointerId(event.actionIndex)
                     if (releasedId == activePointerId) {
-                        client.setTouchMouseButton(false)
-                        selecting = false
+                        directClickMouse.move(positionAt(event.actionIndex), client::sendDirectClickMousePosition)
+                        directClickMouse.release(client::setDirectClickMouseButton)
                         activePointerId = -1
                     }
                     return true
                 }
                 MotionEvent.ACTION_CANCEL -> {
-                    client.setTouchMouseButton(false)
-                    selecting = false
+                    directClickMouse.release(client::setDirectClickMouseButton)
                     activePointerId = -1
                     return true
                 }
@@ -1268,13 +1161,13 @@ internal class TouchMouseState {
         lastY = downY
         motionAccumulator.reset()
         selecting = false
-        doubleTapDragCandidate = isDoubleTap(event, index)
+        doubleTapDragCandidate = clickEnabled && isDoubleTap(event, index)
         if (doubleTapDragCandidate) {
             lastTapTimeMs = Long.MIN_VALUE
         }
     }
 
-    private fun processMove(x: Float, y: Float, eventTimeMs: Long, client: NativeStreamClient) {
+    private fun processMove(x: Float, y: Float, eventTimeMs: Long, client: TouchMouseOutput) {
         if (
             doubleTapDragCandidate && !selecting &&
             (abs(x - downX) > TOUCH_MOUSE_DRAG_START_SLOP_PX || abs(y - downY) > TOUCH_MOUSE_DRAG_START_SLOP_PX)
@@ -1288,7 +1181,7 @@ internal class TouchMouseState {
         lastY = y
     }
 
-    private fun finishPointer(event: MotionEvent, index: Int, client: NativeStreamClient) {
+    private fun finishPointer(event: MotionEvent, index: Int, client: TouchMouseOutput) {
         val x = event.getX(index)
         val y = event.getY(index)
         sendMouseDelta(
@@ -1315,7 +1208,7 @@ internal class TouchMouseState {
             selecting = false
             return
         }
-        if (wasTap) {
+        if (clickEnabled && wasTap) {
             if (twoFingerTapCandidate) {
                 NativeInputDiagnostics.add("touch 2-finger tap right click dx=${tapDistanceX.roundToInt()} dy=${tapDistanceY.roundToInt()}")
                 client.sendTouchMouseRightClick()
@@ -1349,7 +1242,7 @@ internal class TouchMouseState {
         dx: Float,
         dy: Float,
         eventTimeMs: Long,
-        client: NativeStreamClient,
+        client: TouchMouseOutput,
         force: Boolean = false,
     ) {
         val delta = motionAccumulator.add(

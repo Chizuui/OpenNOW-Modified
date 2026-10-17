@@ -1060,14 +1060,15 @@ internal fun StreamControlsPanel(
                         }
                         TouchButtonAppearanceEditor(settings.androidTouch, onTouchSettingsChange)
                     }
-                    if (!keyboardOverlayActive) item {
+                    item {
                         ControlSection(stringResource(R.string.settings_touch_visible_controls)) {
                             Text(
                                 text = stringResource(R.string.settings_touch_visible_controls_desc),
                                 color = TextMuted,
                                 style = MaterialTheme.typography.bodySmall,
                             )
-                            TouchControlGroup.entries.forEach { group ->
+                            val groups = if (keyboardOverlayActive) listOf(TouchControlGroup.LeftStick) else TouchControlGroup.entries
+                            groups.forEach { group ->
                                 val visible = settings.androidTouch.isControlVisible(group)
                                 ControlSwitchRow(
                                     label = stringResource(touchControlGroupLabelRes(group)),
@@ -1468,6 +1469,17 @@ internal fun StreamControlsPanel(
                                 value = onOffLabel(settings.androidTouch.mousePad),
                             )
                             if (settings.androidTouch.mousePad) {
+                                ControlSwitchRow(
+                                    label = stringResource(R.string.stream_mouse_with_touch_controller),
+                                    checked = settings.androidTouch.mouseWithTouchController,
+                                    onCheckedChange = { enabled ->
+                                        onButtonTone()
+                                        onTouchSettingsChange(settings.androidTouch.copy(mouseWithTouchController = enabled))
+                                    },
+                                    value = onOffLabel(settings.androidTouch.mouseWithTouchController),
+                                    description = stringResource(R.string.stream_mouse_with_touch_controller_description),
+                                    indentLevel = 1,
+                                )
                                 ControlSwitchRow(
                                     label = stringResource(R.string.stream_panel_direct_click),
                                     checked = settings.androidTouch.mouseDirectClick,

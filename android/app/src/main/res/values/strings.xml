@@ -217,7 +217,7 @@
     <string name="action_view">View</string>
     <string name="action_play_on_tv_generic">Play on TV</string>
     <string name="queue_starting_stream">Starting stream</string>
-    <string name="queue_position">Queue position %1$d</string>
+    <string name="queue_position">Queue position: %1$d</string>
     <string name="queue_waiting_for_rig">Waiting for a rig</string>
     <string name="queue_connecting_stream">Connecting...</string>
     <string name="queue_resuming_session">Resuming session</string>
@@ -350,6 +350,8 @@
     <string name="stream_panel_touch_controller">Touch controller</string>
     <string name="stream_touch_controller_requires_new_session">This session uses native touch. To use the on-screen controller, set Native touch to Off and start a new session.</string>
     <string name="settings_native_touch_mode_desc">Native touch sends fingers directly to the streamed game. For OpenNOW’s on-screen controller, choose Off before starting a session.</string>
+    <string name="settings_browser_client_mode">Website client mode</string>
+    <string name="settings_browser_client_mode_desc">Use GeForce NOW’s browser identity for new NVIDIA sessions. Tries the web platform for games such as Fortnite Save the World. Native touch is unavailable; use the on-screen controller or keyboard and mouse. Some stream settings may be rejected by GeForce NOW.</string>
     <string name="stream_touch_builtin_title">Built-in game touch detected</string>
     <string name="stream_touch_builtin_available">This game supports built-in touch controls. You can still turn on OpenNOW’s touch controller below if you prefer.</string>
     <string name="stream_touch_builtin_overridden">This game supports built-in touch controls. OpenNOW’s touch controller is enabled for this session.</string>

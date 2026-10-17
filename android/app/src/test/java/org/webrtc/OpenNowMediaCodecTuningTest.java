@@ -83,13 +83,25 @@ public class OpenNowMediaCodecTuningTest {
   @Test
   public void bufferFailureKeepsOriginalException() throws Exception {
     IllegalStateException failure = new IllegalStateException("codec released");
+    int[] notifications = {0};
     MediaCodecWrapper codec = (MediaCodecWrapper) Proxy.newProxyInstance(
         MediaCodecWrapper.class.getClassLoader(), new Class<?>[] {MediaCodecWrapper.class},
         (proxy, method, args) -> { throw failure; });
     MediaCodecWrapperFactory tuned = (MediaCodecWrapperFactory) OpenNowMediaCodecTuning.wrapFactory(
-        (MediaCodecWrapperFactory) name -> codec, noTuning());
+        (MediaCodecWrapperFactory) name -> codec, new OpenNowMediaCodecTuning.Tuning() {
+          @Override public String selectCodecName(String name) { return name; }
+          @Override public void configure(String name, android.media.MediaFormat format) {}
+          @Override public void started(String name, OpenNowMediaCodecTuning.ParameterSetter setter) {}
+          @Override public void inputQueued() { notifications[0]++; }
+          @Override public void outputDequeued(boolean codecConfig) { notifications[0]++; }
+          @Override public void outputReleased(boolean render) { notifications[0]++; }
+        });
     MediaCodecWrapper result = tuned.createByCodecName("decoder");
     assertSame(failure, assertThrows(IllegalStateException.class, () -> result.dequeueInputBuffer(0)));
+    assertSame(failure, assertThrows(IllegalStateException.class, () -> result.queueInputBuffer(0, 0, 0, 0, 0)));
+    assertSame(failure, assertThrows(IllegalStateException.class, () -> result.dequeueOutputBuffer(null, 0)));
+    assertSame(failure, assertThrows(IllegalStateException.class, () -> result.releaseOutputBuffer(0, true)));
+    assertEquals(0, notifications[0]);
   }
 
   private OpenNowMediaCodecTuning.Tuning noTuning() {
