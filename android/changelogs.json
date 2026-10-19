@@ -1,6 +1,6 @@
 {
-  "173": {
-    "version": "2.1.7",
+  "174": {
+    "version": "2.1.8",
     "notes": [
       "Added **Space UI** under **Settings > Interface**. Still experimental, landscape only, and a controller is recommended.",
       "**On screen controls have their own settings page now**",
