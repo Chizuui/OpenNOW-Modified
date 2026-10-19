@@ -248,7 +248,7 @@ internal fun SpaceUiScreen(
                 if (searchVisible) NativeSearchField(query, onSearchChange, stringResource(R.string.nav_search),
                     searching = state.loadingGames, focusRequester = searchRequester, gamepadImeMode = family != null,
                     modifier = Modifier.padding(top = 10.dp).fillMaxWidth())
-                SpaceDiscoverCatalog(games, game?.id, storeGridState, selectedRequester, compact,
+                SpaceDiscoverCatalog(games, game?.id, storeGridState, selectedRequester, compact, state.settings.showPremiumMarker,
                     Modifier.weight(1f), onFocused = { storeSelectedId = it }, onSelectGame = onSelectGame,
                     onBack = { discoverCatalog = false }, catalogControls = catalogControls)
             } else {
@@ -297,6 +297,7 @@ internal fun SpaceUiScreen(
                                 itemsIndexed(games, key = { _, item -> item.id }) { index, item ->
                                     SpaceGameTile(game = item, selected = game?.id == item.id,
                                         compact = compact, reduceMotion = reduceMotion,
+                                        showPremiumMarker = state.settings.showPremiumMarker,
                                         modifier = Modifier.spaceArrival(item.id, (index.coerceAtMost(5) * 24)).then(if (game?.id == item.id) Modifier.focusRequester(selectedRequester) else Modifier),
                                         onFocused = {
                                             if (state.page == AppPage.Library) librarySelectedId = item.id
@@ -398,14 +399,15 @@ private fun SpaceLibraryBody(
                 Text(stringResource(R.string.no_games_loaded), color = SpaceWhite, fontSize = 20.sp)
                 Text(stringResource(R.string.space_ui_empty), color = SpaceMuted, fontSize = 13.sp)
                 SpaceControl(stringResource(R.string.space_ui_refresh), onClick = onRefresh)
-            } else LazyVerticalGrid(columns = GridCells.Adaptive(if (compact) 122.dp else if (portrait) 140.dp else 158.dp), state = gridState,
+            } else LazyVerticalGrid(columns = GridCells.Fixed(4), state = gridState,
                 contentPadding = PaddingValues(6.dp), verticalArrangement = Arrangement.spacedBy(0.dp),
                 horizontalArrangement = Arrangement.spacedBy(0.dp), modifier = Modifier.weight(1f).testTag("space-library-grid")) {
                 gridItemsIndexed(games, key = { _, game -> game.id }) { _, game ->
                     SpaceGameTile(game, selectedGame?.id == game.id, compact, reduceMotion,
-                        modifier = Modifier.fillMaxWidth().aspectRatio(1f).then(
+                        showPremiumMarker = state.settings.showPremiumMarker,
+                        modifier = Modifier.fillMaxWidth().then(
                             if (selectedGame?.id == game.id) Modifier.focusRequester(selectedRequester) else Modifier),
-                        onFocused = { onFocused(game.id) }, onClick = { onSelectGame(game) })
+                        onFocused = { onFocused(game.id) }, onClick = { onSelectGame(game) }, fillWidth = true)
                 }
             }
         }
@@ -421,7 +423,10 @@ private fun SpaceLibraryBody(
 
 @Composable
 internal fun SpaceGameTile(game: GameInfo, selected: Boolean, compact: Boolean, reduceMotion: Boolean,
-    modifier: Modifier, onFocused: () -> Unit, onClick: () -> Unit, portraitArtwork: Boolean = false) {
+    showPremiumMarker: Boolean, modifier: Modifier, onFocused: () -> Unit, onClick: () -> Unit,
+    portraitArtwork: Boolean = false, fillWidth: Boolean = false) {
+    val premiumMarker = showPremiumMarker && game.hasPremiumMembershipMarker()
+    val premiumDescription = stringResource(R.string.catalog_premium_marker)
     var focused by remember { mutableStateOf(false) }
     val interaction = rememberSpaceInteraction(focused, tile = true, reduceMotion = reduceMotion)
     val latestOnFocused by rememberUpdatedState(onFocused)
@@ -437,9 +442,13 @@ internal fun SpaceGameTile(game: GameInfo, selected: Boolean, compact: Boolean, 
             latestOnFocused()
             onClick()
         })
-        .semantics { contentDescription = game.title; this.selected = selected }
+        .semantics {
+            contentDescription = if (premiumMarker) "${game.title}, $premiumDescription" else game.title
+            this.selected = selected
+        }
         .testTag("space-game-${game.id}").padding(12.dp)) {
-        Box((if (portraitArtwork) Modifier.fillMaxWidth().aspectRatio(628f / 888f) else Modifier.size(if (compact) 98.dp else 134.dp))
+        Box((if (portraitArtwork || fillWidth) Modifier.fillMaxWidth().aspectRatio(if (portraitArtwork) 628f / 888f else 1f)
+            else Modifier.size(if (compact) 98.dp else 134.dp))
             .testTag("space-game-art-${game.id}").then(interaction.modifier)
             .spaceFocusFrame(focused || interaction.hovered, 14.dp, hovered = interaction.hovered)
             .border(1.dp, if (selected) SpaceIce.copy(alpha = .3f) else SpaceWhite.copy(alpha = .16f), shape)) {
@@ -451,6 +460,7 @@ internal fun SpaceGameTile(game: GameInfo, selected: Boolean, compact: Boolean, 
                     lineHeight = if (portraitArtwork) 19.sp else 15.sp, fontWeight = FontWeight.Medium,
                     maxLines = 2, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.align(Alignment.BottomStart).padding(10.dp))
+                if (premiumMarker) PremiumMembershipMarker(Modifier.align(Alignment.TopEnd).padding(6.dp))
             }
         }
     }

@@ -6,7 +6,7 @@ import org.junit.Test
 
 class TouchMouseStateInstrumentedTest {
     private class Output : TouchMouseOutput {
-        override val settings = StreamSettings(mouseAcceleration = 0)
+        override var settings = StreamSettings(mouseAcceleration = 1)
         val moves = mutableListOf<Pair<Int, Int>>()
         val positions = mutableListOf<AbsoluteMousePosition>()
         val buttons = mutableListOf<Boolean>()
@@ -36,6 +36,20 @@ class TouchMouseStateInstrumentedTest {
             handle(event, true, output, emptySet(), directClick = direct, buttonsEnabled = buttonsEnabled,
                 width = 1920, height = 1080, decodedStreamWidth = 1920, decodedStreamHeight = 1080)
         } finally { event.recycle() }
+    }
+
+    @Test fun touchSensitivityChangesCursorTravelAndCanUpdateDuringAGesture() {
+        val output = Output()
+        val state = TouchMouseState()
+        output.settings = StreamSettings(mouseSensitivity = 3f, touchMouseSensitivity = 0.5f)
+        state.event(output, MotionEvent.ACTION_DOWN, 1000)
+        state.event(output, MotionEvent.ACTION_MOVE, 1100, x = 120f)
+        assertEquals(10, output.moves.sumOf { it.first })
+        output.settings = output.settings.copy(touchMouseSensitivity = 2f)
+        state.event(output, MotionEvent.ACTION_MOVE, 1200, x = 140f)
+        state.event(output, MotionEvent.ACTION_UP, 1300, x = 140f)
+        assertEquals(50, output.moves.sumOf { it.first })
+        assertTrue(output.buttons.isEmpty())
     }
 
     @Test fun keyboardMouseTapsAndRepeatedDragsOnlyMoveTheCursor() {

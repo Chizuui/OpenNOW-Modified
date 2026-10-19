@@ -268,6 +268,7 @@ internal fun StreamScreen(
     val streamSettings = launchStreamSettings.copy(
         videoOutput = state.settings.stream.videoOutput,
         mouseSensitivity = state.settings.stream.mouseSensitivity,
+        touchMouseSensitivity = state.settings.stream.touchMouseSensitivity,
         mouseAcceleration = state.settings.stream.mouseAcceleration,
         streamSharpeningEnabled = launchStreamSettings.streamSharpeningEnabled && state.settings.stream.streamSharpeningEnabled,
         streamSharpeningAmount = state.settings.stream.streamSharpeningAmount,
@@ -369,7 +370,7 @@ internal fun StreamScreen(
     }
     BackHandler(enabled = streamReady) {
         NativeInputDiagnostics.addRetained("stream.controls.back", "stream controls back origin=android-back-dispatcher")
-        handleStreamBack()
+        NativeStreamInputRouter.dispatchSystemBack()
     }
     val client = remember {
         NativeStreamClient(
@@ -534,6 +535,7 @@ internal fun StreamScreen(
             NativeStreamInputRouter.setSystemBackHandler(null)
             NativeStreamInputRouter.setAndroidTvProfile(false)
             NativeStreamInputRouter.setStreamMenuShortcut(DEFAULT_ANDROID_STREAM_MENU_SHORTCUT)
+            NativeStreamInputRouter.setBackAsEscape(false)
             NativeStreamInputRouter.setStreamUiActive(false)
             NativeStreamInputRouter.setTouchControllerVisible(false)
             client.setVirtualControllerVisible(false)
@@ -565,6 +567,10 @@ internal fun StreamScreen(
 
     LaunchedEffect(state.settings.streamMenuShortcut) {
         NativeStreamInputRouter.setStreamMenuShortcut(state.settings.streamMenuShortcut)
+    }
+
+    LaunchedEffect(streamReady, state.settings.androidBackAsEscape) {
+        NativeStreamInputRouter.setBackAsEscape(streamReady && state.settings.androidBackAsEscape)
     }
 
     // StreamScreen owns the effective controller/mouse modes even when TouchOverlay is absent.
@@ -1469,6 +1475,9 @@ internal fun StreamScreen(
                     onMouseSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = value) }
                     },
+                    onTouchMouseSensitivityChange = { value ->
+                        viewModel.updateStreamSettings { s -> s.copy(touchMouseSensitivity = value) }
+                    },
                     onMouseScrollSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value) }
                     },
@@ -1790,6 +1799,7 @@ private fun StreamVideoSurface(
     }
     LaunchedEffect(
         settings.mouseSensitivity,
+        settings.touchMouseSensitivity,
         settings.mouseScrollSensitivity,
         settings.mouseAcceleration,
         settings.streamSharpeningEnabled,

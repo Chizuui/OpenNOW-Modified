@@ -182,16 +182,62 @@ class SpaceUiInstrumentedTest {
             val manager = LocalInputModeManager.current
             SideEffect { inputModeManager = manager }
             MaterialTheme {
-                SpaceUiScreen(OpenNowUiState(page = AppPage.Library, libraryGames = games),
-                    onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {}, onResumeSession = {},
-                    inputEnabled = true, settingsContent = {})
+                CompositionLocalProvider(LocalReduceMotion provides true) {
+                    SpaceUiScreen(OpenNowUiState(page = AppPage.Library, libraryGames = games),
+                        onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {}, onResumeSession = {},
+                        inputEnabled = true, settingsContent = {})
+                }
             }
         }
         compose.onNodeWithTag("space-library-grid").assertIsDisplayed()
         focusFirstGame()
+        val first = compose.onNodeWithTag("space-game-art-1", useUnmergedTree = true).getUnclippedBoundsInRoot()
+        val second = compose.onNodeWithTag("space-game-art-2", useUnmergedTree = true).getUnclippedBoundsInRoot()
+        val fourth = compose.onNodeWithTag("space-game-art-4", useUnmergedTree = true).getUnclippedBoundsInRoot()
+        val fifth = compose.onNodeWithTag("space-game-art-5", useUnmergedTree = true).getUnclippedBoundsInRoot()
+        assertEquals("Library keeps the square Discover artwork", (first.right - first.left).value, (first.bottom - first.top).value, 1f)
+        assertEquals(first.top.value, fourth.top.value, 1f)
+        assertTrue("The fifth game starts the next row", fifth.top > first.top)
+        assertEquals("Only the focus gutters separate adjacent cards", 24f, (second.left - first.right).value, 1f)
+        val target = compose.onNodeWithTag("space-game-1").getUnclippedBoundsInRoot()
+        assertEquals("Artwork fills its grid cell inside the focus gutters", (target.right - target.left).value - 24f,
+            (first.right - first.left).value, 1f)
         compose.onNodeWithTag("space-game-1").performKeyInput { pressKey(Key.DirectionRight) }
         awaitFocused("space-game-2")
         capture("space-collection")
+    }
+
+    @Test fun premiumMarkerSettingAppliesToDiscoverRailCatalogAndLibrary() {
+        val samples = games.map { if (it.id == "1") it.copy(membershipTierLabel = "PREMIUM") else it }
+        var state by mutableStateOf(OpenNowUiState(games = samples, libraryGames = samples,
+            settings = AppSettings(showPremiumMarker = false)))
+        val marker = InstrumentationRegistry.getInstrumentation().targetContext.getString(R.string.catalog_premium_marker)
+        compose.setContent {
+            CompositionLocalProvider(LocalReduceMotion provides true) {
+                SpaceUiTheme {
+                    SpaceUiScreen(state, onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {},
+                        onResumeSession = {}, inputEnabled = true, settingsContent = {})
+                }
+            }
+        }
+        fun assertMarkerToggle() {
+            compose.onNodeWithText(marker, useUnmergedTree = true).assertDoesNotExist()
+            compose.runOnIdle { state = state.copy(settings = state.settings.copy(showPremiumMarker = true)) }
+            compose.onNodeWithText(marker, useUnmergedTree = true).assertIsDisplayed()
+            compose.onNodeWithContentDescription("${samples.first().title}, $marker").assertExists()
+            compose.onNodeWithContentDescription(samples[1].title).assertExists()
+            capture("space-premium-${state.page}")
+            compose.runOnIdle { state = state.copy(settings = state.settings.copy(showPremiumMarker = false)) }
+            compose.onNodeWithText(marker, useUnmergedTree = true).assertDoesNotExist()
+            compose.onNodeWithContentDescription(samples.first().title).assertExists()
+        }
+        assertMarkerToggle()
+        compose.onNodeWithTag("space-discover-scroll").performTouchInput { swipeUp() }
+        compose.onNodeWithTag("space-discover-catalog").assertIsDisplayed()
+        assertMarkerToggle()
+        compose.runOnIdle { state = state.copy(page = AppPage.Library) }
+        compose.onNodeWithTag("space-library-grid").assertIsDisplayed()
+        assertMarkerToggle()
     }
 
     @Test fun renderGameHubAndLaunch() {

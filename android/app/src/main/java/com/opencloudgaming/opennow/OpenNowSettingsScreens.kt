@@ -438,6 +438,10 @@ internal fun SettingsScreen(
         if (selectedCategory == SettingsCategory.OnScreenControls) {
             OnScreenControlsSettings(
                 touch = state.settings.androidTouch,
+                stream = state.settings.stream,
+                onTouchMouseSensitivityChange = { value ->
+                    viewModel.updateStreamSettings { it.copy(touchMouseSensitivity = value) }
+                },
                 presets = state.settings.touchControlPresets,
                 gyroscopeAvailable = remember { hasMobileGyroscope(touchSettingsContext) },
                 onChange = { viewModel.updateSettings(state.settings.copy(androidTouch = it)) },
@@ -1259,7 +1263,7 @@ private fun SettingsContent(
                     ) { amount -> viewModel.updateRecordingSettings { it.copy(recordingSharpeningAmount = amount) } }
                 }
             }
-        CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste") {
+        CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste", "back", "esc", "escape") {
                 SettingSwitch(
                     label = stringResource(R.string.settings_low_latency_game_audio),
                     checked = settings.lowLatencyGameAudio,
@@ -1294,6 +1298,13 @@ private fun SettingsContent(
                 }
                 ChoiceOptionRow(stringResource(R.string.settings_keyboard_layout), keyboardLayoutOptions, settings.stream.keyboardLayout) {
                     viewModel.updateStreamSettings { s -> s.copy(keyboardLayout = it) }
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_back_as_escape),
+                    checked = settings.androidBackAsEscape,
+                    description = stringResource(R.string.settings_back_as_escape_description),
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(androidBackAsEscape = enabled))
                 }
                 ControlActionRow(
                     label = stringResource(R.string.stream_menu_shortcut),
@@ -1486,6 +1497,9 @@ private fun SettingsContent(
                 }
                 SettingSwitch(stringResource(R.string.stream_panel_finger_mouse), settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {
+                    TouchMouseSensitivitySlider(settings.stream) { value ->
+                        viewModel.updateStreamSettings { it.copy(touchMouseSensitivity = value) }
+                    }
                     Column(Modifier.padding(start = 24.dp)) {
                         SettingSwitch(stringResource(R.string.stream_mouse_with_touch_controller), settings.androidTouch.mouseWithTouchController) { enabled ->
                             viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseWithTouchController = enabled)))

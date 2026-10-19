@@ -39,6 +39,8 @@ private enum class TouchSettingsPage(@StringRes val title: Int) {
 @Composable
 internal fun OnScreenControlsSettings(
     touch: AndroidTouchSettings,
+    stream: StreamSettings,
+    onTouchMouseSensitivityChange: (Float) -> Unit,
     presets: List<TouchControlPreset>,
     gyroscopeAvailable: Boolean,
     onChange: (AndroidTouchSettings) -> Unit,
@@ -134,6 +136,7 @@ internal fun OnScreenControlsSettings(
                     }
                     TouchSettingsPage.Keyboard -> {
                         item { Text(stringResource(R.string.controls_keyboard_help), style = MaterialTheme.typography.bodyMedium) }
+                        item { TouchMouseSensitivitySlider(stream, onTouchMouseSensitivityChange) }
                         item {
                             ControlActionRow(
                                 stringResource(R.string.keyboard_overlay_add_button), stringResource(R.string.controls_add),

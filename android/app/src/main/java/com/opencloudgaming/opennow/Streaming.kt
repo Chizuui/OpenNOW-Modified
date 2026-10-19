@@ -853,6 +853,7 @@ class NativeStreamClient(
     fun updateRendererSettings(settings: StreamSettings) {
         val updatedSettings = this.settings.copy(
             mouseSensitivity = settings.mouseSensitivity,
+            touchMouseSensitivity = settings.touchMouseSensitivity,
             mouseAcceleration = settings.mouseAcceleration,
             streamSharpeningEnabled = settings.streamSharpeningEnabled,
             streamSharpeningAmount = settings.streamSharpeningAmount,

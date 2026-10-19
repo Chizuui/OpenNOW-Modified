@@ -41,12 +41,25 @@ class GfnSessionConnectionsTest {
         }
     }
 
-    @Test fun relativeWebSocketUsesAdvertisedPortAndIpv6() {
+    @Test fun relativeWebSocketUses443AndKeepsIpv6MediaPortSeparate() {
         val result = resolve("""[{"usage":14,"ip":"2001:db8::10","port":8443,"resourcePath":"/nvst/"}]""")!!
-        assertEquals("wss://[2001:db8::10]:8443/nvst/", result.signalingUrl)
-        assertEquals("[2001:db8::10]:8443", result.signalingServer)
+        assertEquals("wss://[2001:db8::10]/nvst/", result.signalingUrl)
+        assertEquals("[2001:db8::10]:443", result.signalingServer)
         assertEquals("2001:db8::10", result.serverIp)
         assertEquals(MediaConnectionInfo("2001:db8::10", 8443), result.mediaConnectionInfo)
+    }
+
+    @Test fun nvidiaRelativeSignalingDoesNotUseTheAdvertisedUdpMediaPort() {
+        for (resource in listOf("null", "\"/nvst/\"", "\"/nvst/?version=1\"")) {
+            val result = resolve("""[{"usage":14,"ip":"203.0.113.10","port":49003,
+                "resourcePath":$resource}]""")!!
+            val path = if (resource.contains("version")) "/nvst/?version=1" else "/nvst/"
+            assertEquals("wss://203.0.113.10$path", result.signalingUrl)
+            assertEquals("203.0.113.10:443", result.signalingServer)
+            assertEquals(MediaConnectionInfo("203.0.113.10", 49003), result.mediaConnectionInfo)
+            assertEquals("wss://203.0.113.10/nvst/sign_in?peer_id=peer-test&version=2&peer_role=1&pairing_id=session-test",
+                buildGfnSignInUrl(result.signalingUrl, result.signalingServer, "peer-test", "session-test", reconnect = false))
+        }
     }
 
     @Test fun nativeRelativeDescriptorDoesNotReuseRtspPortForWebSocket() {
@@ -58,7 +71,7 @@ class GfnSessionConnectionsTest {
         val result = resolve("""[
             {"usage":14,"resourcePath":"wss://user:password@seat.example/nvst/"},
             {"usage":14,"ip":"0.0.0.0","resourcePath":"/nvst/"},
-            {"usage":14,"ip":"seat.example","port":70000,"resourcePath":"/nvst/"},
+            {"usage":14,"ip":"","port":70000,"resourcePath":"/nvst/"},
             {"usage":14,"resourcePath":"https://seat.example:9443/nvst/"},
             {"usage":2,"resourcePath":"https://seat.example/media"},
             {"usage":17,"ip":"not-an-ip.example","port":49000},

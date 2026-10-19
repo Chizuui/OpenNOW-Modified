@@ -675,6 +675,8 @@
     "queueAdUrlLoad": "Error loading url"
   },
   "androidStreamInput": {
+    "stream_touch_mouse_sensitivity": "Touch cursor sensitivity",
+    "stream_touch_mouse_sensitivity_description": "Controls how far the cursor or camera moves when you drag a finger. Lower values give finer aim; higher values turn faster. Applies to Finger mouse, including keyboard & mouse controls. Direct click and native touch use the touched position instead.",
     "controls_show_to_move": "Show on-screen controls first",
     "controls_title": "On-screen controls",
     "controls_summary": "Gamepad, keyboard & mouse buttons, layouts and appearance",
@@ -722,6 +724,8 @@
     "stream_input_use_keyboard_mouse_controller": "Keyboard, mouse or controller",
     "stream_menu_shortcut": "Open Stream Controls shortcut",
     "stream_menu_shortcut_description": "Choose the physical-keyboard shortcut that opens the in-stream menu. Shift + right-click will no longer open it unless you explicitly bind the Menu key combination.",
+    "settings_back_as_escape": "Back sends Esc",
+    "settings_back_as_escape_description": "Send Android Back to the game as Esc while playing. Use this if your keyboard reports Esc as Back. Open session controls with the menu button, the configured keyboard shortcut, or a swipe from the left edge. Back still closes open menus.",
     "stream_menu_shortcut_configure": "Configure",
     "stream_menu_shortcut_dialog_title": "Open Stream Controls shortcut",
     "stream_menu_shortcut_press_keys": "Press the key combination you want to use. Modifier-only and controller buttons are ignored.",

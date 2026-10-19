@@ -223,6 +223,8 @@ data class StreamSettings(
     val experimentalDynamicNetworkAdjustment: Boolean = false,
     val experimentalDynamicMinimumBitrateMbps: Int = 5,
     val mouseSensitivity: Float = 1f,
+    /** Null preserves the shared mouse sensitivity used by older saved settings. */
+    val touchMouseSensitivity: Float? = null,
     val mouseAcceleration: Int = 1,
     val streamSharpeningEnabled: Boolean = false,
     /** Default follows the APK/Play profile; explicit choices survive updates and presets. */
@@ -695,6 +697,7 @@ data class AppSettings(
     val externalMousePointerLock: Boolean = true,
     /** Physical-keyboard shortcut used to open Stream Controls during a session. */
     val streamMenuShortcut: String = DEFAULT_ANDROID_STREAM_MENU_SHORTCUT,
+    val androidBackAsEscape: Boolean = false,
     val controllerBackgroundAnimations: Boolean = true,
     val controllerThemeStyle: String = "aurora",
     val controllerThemeColor: ControllerThemeRgb = ControllerThemeRgb(),

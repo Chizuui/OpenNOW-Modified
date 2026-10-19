@@ -237,6 +237,12 @@ object NativeStreamInputRouter {
         streamMenuShortcut = shortcut
     }
     @Volatile
+    private var backAsEscape = false
+
+    fun setBackAsEscape(enabled: Boolean) {
+        backAsEscape = enabled
+    }
+    @Volatile
     private var externalMousePointerCaptureEnabled = false
 
     fun setExternalMousePointerCaptureEnabled(enabled: Boolean) {
@@ -424,6 +430,14 @@ object NativeStreamInputRouter {
     }
 
     fun dispatchSystemBack(): Boolean {
+        if (shouldSendBackAsEscape(backAsEscape, streamUiActive, client != null)) {
+            client?.sendTextControlKey(KeyEvent.KEYCODE_ESCAPE)
+            return true
+        }
+        return dispatchLocalBack()
+    }
+
+    private fun dispatchLocalBack(): Boolean {
         val handler = systemBackHandler ?: return false
         handler()
         return true
@@ -798,6 +812,14 @@ object NativeStreamInputRouter {
             return true
         }
         val streamExitShortcut = event.isStreamExitShortcutKey(externalMouseInputDevice)
+        val sendBackAsEscape = shouldSendBackAsEscape(
+            enabled = backAsEscape,
+            streamUiActive = streamUiActive,
+            clientAttached = client != null,
+            keyCode = event.keyCode,
+            controllerInputDevice = controllerInputDevice,
+            externalMouseInputDevice = externalMouseInputDevice,
+        )
         if (event.repeatCount == 0 &&
             (event.keyCode == KeyEvent.KEYCODE_ESCAPE ||
                 (event.keyCode == KeyEvent.KEYCODE_BACK && event.isHardwareKeyboardSource())) &&
@@ -806,7 +828,7 @@ object NativeStreamInputRouter {
             NativeInputDiagnostics.retainCounted(key = "keyboard.escape.route.${event.action}") {
                 "keyboard Escape/Back route key=${event.keyCode} action=${event.action} rawScan=${event.scanCode} " +
                     "source=${event.source} device=${event.deviceId} keyboard=${event.isHardwareKeyboardSource()} " +
-                    "controller=$controllerInputDevice streamUi=$streamUiActive back=$streamExitShortcut"
+                    "controller=$controllerInputDevice streamUi=$streamUiActive back=$streamExitShortcut escape=$sendBackAsEscape"
             }
         }
         if (
@@ -818,12 +840,25 @@ object NativeStreamInputRouter {
             NativeInputDiagnostics.add(
                 "tv back key key=${event.keyCode} source=${event.source} device=${event.deviceId}:${event.device?.name.orEmpty()} " +
                     "controller=$controllerInputDevice mouse=$externalMouseInputDevice dpad=${event.isDpadSource()} " +
-                    "route=${if (streamExitShortcut) "stream_overlay" else "cloud_input"}",
+                    "route=${if (streamExitShortcut && !sendBackAsEscape) "stream_overlay" else "cloud_input"}",
             )
+        }
+        if (sendBackAsEscape &&
+            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)
+        ) {
+            // Preserve the physical DOWN/UP pair and modifiers, but discard the Back scan code.
+            // Consume even during reconnect so Android cannot turn it into local navigation.
+            client?.dispatchKey(KeyEvent(
+                event.downTime, event.eventTime, event.action, KeyEvent.KEYCODE_ESCAPE,
+                event.repeatCount, event.metaState, event.deviceId, 0, event.flags,
+                InputDevice.SOURCE_KEYBOARD,
+            ))
+            return true
         }
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && streamExitShortcut) {
             recordStreamMenuKey(event, "back")
-            return dispatchSystemBack()
+            // Remote BUTTON_B aliases remain local navigation, even when Back sends Escape.
+            return dispatchLocalBack()
         }
         if (event.action == KeyEvent.ACTION_UP && streamExitShortcut) {
             return systemBackHandler != null
@@ -850,6 +885,16 @@ object NativeStreamInputRouter {
         controllerInputDevice: Boolean,
         streamUiActive: Boolean,
     ): Boolean = keyCode == KeyEvent.KEYCODE_BUTTON_START && controllerInputDevice && !streamUiActive
+
+    internal fun shouldSendBackAsEscape(
+        enabled: Boolean,
+        streamUiActive: Boolean,
+        clientAttached: Boolean,
+        keyCode: Int = KeyEvent.KEYCODE_BACK,
+        controllerInputDevice: Boolean = false,
+        externalMouseInputDevice: Boolean = false,
+    ): Boolean = enabled && clientAttached && !streamUiActive &&
+        keyCode == KeyEvent.KEYCODE_BACK && !controllerInputDevice && !externalMouseInputDevice
 
     fun dispatchMotion(event: MotionEvent): Boolean {
         if (streamUiActive && event.isExternalMousePointerEvent()) {

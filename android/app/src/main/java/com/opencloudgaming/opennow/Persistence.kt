@@ -309,6 +309,8 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
         experimentalDynamicMinimumBitrateMbps = compatibleStream.experimentalDynamicMinimumBitrateMbps.coerceIn(1, 150),
         fps = compatibleStream.fps.coerceIn(30, 360),
         mouseSensitivity = compatibleStream.mouseSensitivity.finiteIn(0.25f, 3f, streamDefaults.mouseSensitivity),
+        touchMouseSensitivity = compatibleStream.touchMouseSensitivity
+            ?.takeIf { it.isFinite() }?.coerceIn(MIN_TOUCH_MOUSE_SENSITIVITY, MAX_TOUCH_MOUSE_SENSITIVITY),
         mouseAcceleration = compatibleStream.mouseAcceleration.coerceIn(1, 150),
         mouseScrollSensitivity = compatibleStream.mouseScrollSensitivity.coerceIn(10, 100),
         streamSharpeningAmount = compatibleStream.streamSharpeningAmount.finiteIn(

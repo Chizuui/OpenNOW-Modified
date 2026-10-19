@@ -3312,24 +3312,6 @@ internal fun catalogControllerActionMode(
 internal fun shouldShowCatalogFavoriteIcon(settings: AppSettings): Boolean =
     settings.showFavoriteIconOnGameCards
 
-@Composable
-private fun PremiumMembershipMarker(modifier: Modifier = Modifier) {
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(100.dp),
-        color = Color.Black.copy(alpha = 0.78f),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.7f)),
-    ) {
-        Text(
-            text = stringResource(R.string.catalog_premium_marker),
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
-            color = Color.White,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
 /** Titles may be captioned on touch handhelds; controller-first layouts suppress them upstream. */
 internal fun shouldShowCatalogCardTitles(tvProfile: Boolean, enabled: Boolean): Boolean =
     enabled && !tvProfile

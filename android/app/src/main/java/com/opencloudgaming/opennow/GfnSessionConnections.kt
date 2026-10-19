@@ -74,7 +74,6 @@ private fun webRtcSignalingUrl(connection: JsonObject): okhttp3.HttpUrl? {
     val resource = connection.connectionValue("resourcePath")?.takeIf { it.isNotEmpty() } ?: "/nvst/"
     val rtsp = resource.startsWith("rtsp://") || resource.startsWith("rtsps://")
     val absolute = rtsp || resource.startsWith("wss://") || resource.startsWith("https://")
-    val nativeDescriptor = usage == 16 || connection.connectionValue("appLevelProtocol") in listOf("1", "6")
     val builder = if (absolute) {
         val translated = resource.replaceFirst("rtsps://", "https://")
             .replaceFirst("rtsp://", "https://").replaceFirst("wss://", "https://")
@@ -89,14 +88,10 @@ private fun webRtcSignalingUrl(connection: JsonObject): okhttp3.HttpUrl? {
         if (host in listOf("0.0.0.0", "::", "[::]")) return null
         val authority = if (':' in host && !host.startsWith('[')) "[$host]" else host
         val parsed = "https://$authority$resource".toHttpUrlOrNull() ?: return null
-        parsed.newBuilder().apply {
-            if (!nativeDescriptor) {
-                connection.connectionValue("port")?.let {
-                    val port = it.toIntOrNull()?.takeIf { p -> p in 1..65535 } ?: return null
-                    port(port)
-                }
-            }
-        }
+        // For a relative path, connectionInfo.port can be the UDP media peer
+        // (for example 49003), not the WebSocket service. Keep signaling on 443;
+        // a nonstandard signaling port must come from an absolute WSS/HTTPS URL.
+        parsed.newBuilder()
     }
     return builder.build()
 }

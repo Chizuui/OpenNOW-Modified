@@ -24,7 +24,7 @@ import kotlin.math.ceil
 
 @Composable
 internal fun SpaceDiscoverCatalog(games: List<GameInfo>, selectedId: String?, gridState: LazyGridState,
-    selectedRequester: FocusRequester, compact: Boolean, modifier: Modifier, onFocused: (String) -> Unit,
+    selectedRequester: FocusRequester, compact: Boolean, showPremiumMarker: Boolean, modifier: Modifier, onFocused: (String) -> Unit,
     onSelectGame: (GameInfo) -> Unit, onBack: () -> Unit, catalogControls: @Composable () -> Unit) {
     val reduced = LocalReduceMotion.current
     Column(modifier.fillMaxWidth().spaceArrival("discover-catalog")) {
@@ -43,7 +43,7 @@ internal fun SpaceDiscoverCatalog(games: List<GameInfo>, selectedId: String?, gr
             LazyVerticalGrid(columns = GridCells.Fixed(columns), state = gridState,
                 modifier = Modifier.fillMaxSize().testTag("space-discover-catalog"), contentPadding = PaddingValues(4.dp)) {
                 items(games, key = { it.id }) { game ->
-                    SpaceGameTile(game, selectedId == game.id, compact, reduced,
+                    SpaceGameTile(game, selectedId == game.id, compact, reduced, showPremiumMarker,
                         modifier = Modifier.fillMaxWidth().then(if (selectedId == game.id) Modifier.focusRequester(selectedRequester) else Modifier),
                         onFocused = { onFocused(game.id) }, onClick = { onSelectGame(game) }, portraitArtwork = true)
                 }

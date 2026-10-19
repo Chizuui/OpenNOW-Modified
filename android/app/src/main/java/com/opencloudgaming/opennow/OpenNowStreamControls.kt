@@ -797,6 +797,7 @@ internal fun StreamControlsPanel(
     onMaxBitrateChange: (Int) -> Unit,
     onStretchToFitToggle: () -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
+    onTouchMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
     onPhysicalStickDeadZoneChange: (Float) -> Unit,
     onTouchSettingsChange: (AndroidTouchSettings) -> Unit,
@@ -876,6 +877,8 @@ internal fun StreamControlsPanel(
         if (currentPage == StreamControlsPage.TouchControls) {
             OnScreenControlsSettings(
                 touch = settings.androidTouch,
+                stream = settings.stream,
+                onTouchMouseSensitivityChange = onTouchMouseSensitivityChange,
                 presets = settings.touchControlPresets,
                 gyroscopeAvailable = gyroscopeAvailable,
                 onChange = onTouchSettingsChange,
@@ -1157,6 +1160,7 @@ internal fun StreamControlsPanel(
                                 value = onOffLabel(settings.androidTouch.mousePad),
                             )
                             if (settings.androidTouch.mousePad) {
+                                TouchMouseSensitivitySlider(settings.stream, onTouchMouseSensitivityChange)
                                 ControlSwitchRow(
                                     label = stringResource(R.string.stream_mouse_with_touch_controller),
                                     checked = settings.androidTouch.mouseWithTouchController,

@@ -13,6 +13,14 @@ import org.junit.Test
  */
 class SettingsPersistenceTest {
     @Test
+    fun backAsEscapeDefaultsOffAndSurvivesSettingsReload() {
+        assertFalse(OpenNowJson.decodeFromString<AppSettings>("{}").androidBackAsEscape)
+        val saved = AppSettings(androidBackAsEscape = true)
+        val restored = OpenNowJson.decodeFromString<AppSettings>(OpenNowJson.encodeToString(saved))
+        assertTrue(restored.normalizedForAndroid().androidBackAsEscape)
+    }
+
+    @Test
     fun `system wallpaper normalization disables OpenNOW backgrounds`() {
         val normalized = AppSettings(
             nerdCatalogBackground = true,

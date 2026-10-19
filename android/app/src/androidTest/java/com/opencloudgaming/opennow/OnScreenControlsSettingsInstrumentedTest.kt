@@ -40,6 +40,7 @@ class OnScreenControlsSettingsInstrumentedTest {
         onVisibilityChange: ((Boolean) -> Unit)? = null,
         onEdit: (() -> Unit)? = null,
     ) {
+        var stream by mutableStateOf(StreamSettings())
         var touch by mutableStateOf(initial)
         var effectiveVisible by mutableStateOf(visible)
         compose.setContent {
@@ -48,7 +49,9 @@ class OnScreenControlsSettingsInstrumentedTest {
                 OpenNowTheme(AppSettings(), physicalControllerConnected = false) {
                     androidx.compose.material3.Surface(Modifier.fillMaxSize()) {
                     OnScreenControlsSettings(
-                        touch, emptyList(), false,
+                        touch = touch, stream = stream,
+                        onTouchMouseSensitivityChange = { stream = stream.copy(touchMouseSensitivity = it) },
+                        presets = emptyList(), gyroscopeAvailable = false,
                         onChange = { touch = it; onChange(it) }, onPresetsChange = {}, onBack = {},
                         controlsVisible = effectiveVisible ?: touch.enabled,
                         onVisibilityChange = { enabled ->
@@ -85,6 +88,15 @@ class OnScreenControlsSettingsInstrumentedTest {
         compose.onNodeWithText("Keyboard & mouse buttons").performClick()
         compose.onNodeWithText("Add button").assertIsDisplayed()
         compose.onNodeWithText("WASD movement stick").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test fun keyboardMouseSensitivitySliderIsReachableAndAdjustable() {
+        show()
+        compose.onNodeWithText("Keyboard & mouse buttons").performClick()
+        compose.onNodeWithText("Touch cursor sensitivity").performScrollTo().assertIsDisplayed()
+        compose.onNode(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo)).performScrollTo()
+            .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(2.5f) }
+        compose.onNodeWithText("2.50×").assertIsDisplayed()
     }
 
     @Test fun keyboardButtonCanBeAddedResizedAndRemovedFromSettingsWithLargeText() {
@@ -194,6 +206,7 @@ class OnScreenControlsSettingsInstrumentedTest {
                         onMaxBitrateChange = { _ -> },
                         onStretchToFitToggle = { },
                         onMouseSensitivityChange = { _ -> },
+                        onTouchMouseSensitivityChange = { value -> settings = settings.copy(stream = settings.stream.copy(touchMouseSensitivity = value)) },
                         onMouseScrollSensitivityChange = { _ -> },
                         onPhysicalStickDeadZoneChange = { _ -> },
                         onTouchSettingsChange = { settings = settings.copy(androidTouch = it) },

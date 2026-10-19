@@ -47,10 +47,11 @@ internal fun SpacePortraitCatalog(
 ) {
     val reduceMotion = LocalReduceMotion.current
     val library = state.page == AppPage.Library
-    LazyVerticalGrid(columns = GridCells.Fixed(2), state = gridState,
+    LazyVerticalGrid(columns = GridCells.Fixed(if (library) 4 else 2), state = gridState,
         modifier = modifier.fillMaxWidth().testTag(if (library) "space-library-grid" else "space-portrait-discover"),
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 20.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        horizontalArrangement = Arrangement.spacedBy(if (library) 0.dp else 14.dp),
+        verticalArrangement = Arrangement.spacedBy(if (library) 0.dp else 16.dp)) {
         item(key = "portrait-heading", span = { GridItemSpan(maxLineSpan) }) {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 if (state.activeSession != null) SpaceControl(stringResource(R.string.action_resume), onClick = onResumeSession)
@@ -75,8 +76,11 @@ internal fun SpacePortraitCatalog(
         }
         items(games, key = { it.id }) { game ->
             SpaceGameTile(game, selectedGame?.id == game.id, compact = false, reduceMotion = reduceMotion,
-                modifier = if (selectedGame?.id == game.id) Modifier.focusRequester(selectedRequester) else Modifier,
-                onFocused = { onFocused(game.id) }, onClick = { onSelectGame(game) }, portraitArtwork = true)
+                showPremiumMarker = state.settings.showPremiumMarker,
+                modifier = Modifier.fillMaxWidth().then(
+                    if (selectedGame?.id == game.id) Modifier.focusRequester(selectedRequester) else Modifier),
+                onFocused = { onFocused(game.id) }, onClick = { onSelectGame(game) },
+                portraitArtwork = !library, fillWidth = true)
         }
     }
 }
