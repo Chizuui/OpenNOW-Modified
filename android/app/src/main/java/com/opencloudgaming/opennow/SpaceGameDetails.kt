@@ -18,9 +18,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 
-/** Same facts and actions as standard details, with a five-line, expandable console presentation. */
+/** Five-line expandable description with controller scrolling. */
 @Composable
-internal fun SpaceGameDetails(game: GameInfo, narrow: Boolean, defaultVariantId: String?, descriptionRequester: FocusRequester,
+internal fun SpaceGameAbout(game: GameInfo, narrow: Boolean, descriptionRequester: FocusRequester,
     previousRequester: FocusRequester) {
     val description = remember(game) { gameDescriptionForDetails(game) }
         ?: stringResource(R.string.catalog_no_description)
@@ -42,10 +42,8 @@ internal fun SpaceGameDetails(game: GameInfo, narrow: Boolean, defaultVariantId:
         }
     }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        OwnershipStatusRow(game, compact = true)
-        MembershipUpgradeNotice(game)
-        GameLastPlayed(game)
-        Text(stringResource(R.string.space_ui_about_game), color = SpaceWhite, fontSize = 22.sp, fontWeight = FontWeight.Light)
+        Text(stringResource(R.string.space_ui_about_game), color = SpaceWhite, fontSize = 22.sp, fontWeight = FontWeight.Light,
+            modifier = Modifier.testTag("space-hub-about"))
         Text(description, color = SpaceMuted, fontSize = 15.sp, lineHeight = 25.sp,
             maxLines = if (expanded) Int.MAX_VALUE else 5, overflow = TextOverflow.Ellipsis,
             onTextLayout = { if (!expanded) canExpand = it.hasVisualOverflow },
@@ -55,7 +53,14 @@ internal fun SpaceGameDetails(game: GameInfo, narrow: Boolean, defaultVariantId:
         if (canExpand || expanded) SpaceControl(stringResource(if (expanded) R.string.space_ui_show_less else R.string.space_ui_show_more),
             Modifier.testTag("space-hub-description-toggle"), rectangular = true, onClick = { expanded = !expanded })
     }
+}
+
+@Composable
+internal fun SpaceGameDetails(game: GameInfo, defaultVariantId: String?) {
     Column(Modifier.fillMaxWidth().testTag("space-hub-details"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        OwnershipStatusRow(game, compact = true)
+        MembershipUpgradeNotice(game)
+        GameLastPlayed(game)
         Text(stringResource(R.string.space_ui_game_details), color = SpaceWhite, fontSize = 22.sp, fontWeight = FontWeight.Light)
         SpaceGameMetadata(game)
         LaunchOptionsList(game, defaultVariantId, compact = false)

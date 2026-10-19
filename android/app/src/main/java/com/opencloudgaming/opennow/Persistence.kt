@@ -25,6 +25,7 @@ private const val STORE_NAME = "opennow_native"
 private const val CATALOG_CACHE_STORE_NAME = "opennow_catalog_cache"
 private const val SECURE_STORE_NAME = "opennow_auth_secure"
 private const val KEY_SETTINGS = "settings"
+private const val KEY_SPACE_UI_ENABLE_CONFIRMED = "space_ui_enable_confirmed"
 private const val KEY_AUTH = "auth"
 private const val KEY_DEVICE_ID = "gfn_device_id"
 private const val KEY_CATALOG_CACHE_PREFIX = "catalog_cache_"
@@ -404,10 +405,12 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
 internal fun loadAndroidSettings(
     raw: String?,
     playStoreRelease: Boolean,
+    androidTvProfile: Boolean = false,
+    gamingHandheld: Boolean = false,
     persistInitialOrMigration: (AppSettings) -> Unit = {},
 ): AppSettings {
     if (raw == null) {
-        val initial = firstInstallSettings(playStoreRelease)
+        val initial = firstInstallSettings(playStoreRelease, androidTvProfile, gamingHandheld)
             .withCurrentStreamPresentationDefaults()
             .normalizedForAndroid()
         persistInitialOrMigration(initial)
@@ -419,9 +422,18 @@ internal fun loadAndroidSettings(
 }
 
 class SettingsStore(context: Context) {
+    private val androidTvProfile = isAndroidTvProfile(context)
+    private val gamingHandheld = isGamingHandheldDevice()
     private val prefs = ExternalPrefs.get(context, STORE_NAME)
     private val _settings = MutableStateFlow(load())
     val settings: StateFlow<AppSettings> = _settings
+
+    internal fun hasConfirmedSpaceUiEnable(): Boolean =
+        prefs.getString(KEY_SPACE_UI_ENABLE_CONFIRMED, null) == "true"
+
+    internal fun confirmSpaceUiEnable() {
+        prefs.edit().putString(KEY_SPACE_UI_ENABLE_CONFIRMED, "true").apply()
+    }
 
     /**
      * Serializing [AppSettings] used to happen on whichever thread called [update] — in practice the
@@ -451,7 +463,7 @@ class SettingsStore(context: Context) {
         val raw = prefs.getString(KEY_SETTINGS, null)
         // Persist the selected first-install profile or an existing-settings migration. The
         // regular writer skips the initial StateFlow value, so it cannot save these for us.
-        return loadAndroidSettings(raw, BuildConfig.PLAY_STORE_RELEASE) { initialOrMigrated ->
+        return loadAndroidSettings(raw, BuildConfig.PLAY_STORE_RELEASE, androidTvProfile, gamingHandheld) { initialOrMigrated ->
             prefs.edit().putString(KEY_SETTINGS, OpenNowJson.encodeToString(initialOrMigrated)).apply()
         }
     }
@@ -477,7 +489,7 @@ class SettingsStore(context: Context) {
     }
 
     fun reset() {
-        replace(firstInstallSettings(BuildConfig.PLAY_STORE_RELEASE))
+        replace(firstInstallSettings(BuildConfig.PLAY_STORE_RELEASE, androidTvProfile, gamingHandheld))
     }
 }
 

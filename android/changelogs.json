@@ -1,4 +1,22 @@
 {
+  "173": {
+    "version": "2.1.7",
+    "notes": [
+      "Added **Space UI** under **Settings > Interface**. Still experimental, landscape only, and a controller is recommended.",
+      "**On screen controls have their own settings page now**",
+      "Keyboard & mouse buttons are easier to find and customize",
+      "Touch control customization works better on smaller screens",
+      "Floating joysticks are now the default for new installs",
+      "You can now remember your input choice for each game",
+      "Games will now warn you if they're updating or under maintenance",
+      "**Recordings can now include your microphone and camera**",
+      "Fixed a recording folder crash on some devices",
+      "More **MediaCodec (Direct)** fixes",
+      "Improved reconnecting and alliance provider support with **experimental NVST**",
+      "Fixed a crash when connecting to a stream",
+      "Goofy has a screensaver now. Tap the avatar under **Settings > Interface** to try it"
+    ]
+  },
   "167": {
     "version": "2.1.1",
     "notes": [

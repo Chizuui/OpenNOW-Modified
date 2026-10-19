@@ -105,8 +105,9 @@ internal fun SpaceUiScreen(
     settingsContent: @Composable () -> Unit,
     catalogControls: @Composable () -> Unit = {},
     libraryContent: @Composable () -> Unit = {},
-    queueContent: @Composable () -> Unit = {},
+    queueContent: @Composable (compact: Boolean) -> Unit = {},
     onOpenLocalApps: () -> Unit = { onNavigate(AppPage.Settings) },
+    onSpaceUiChange: (Boolean) -> Unit = {},
 ) {
     val games = remember(state.page, state.games, state.catalogResult.games, state.libraryGames,
         state.catalogFilterIds, state.libraryFilterIds, state.librarySearch, state.librarySortId,
@@ -187,17 +188,20 @@ internal fun SpaceUiScreen(
     ) {
         val compact = maxHeight < 560.dp
         val portrait = maxWidth < maxHeight
+        val compactQueue = portrait || maxWidth < 700.dp
         val inset = if (compact) 22.dp else if (portrait) 20.dp else 36.dp
         SpaceSceneBackdrop(backdropUrl.takeUnless { portrait || state.page == AppPage.Settings })
         Column(Modifier.fillMaxSize().testTag("space-scene-content").padding(horizontal = inset, vertical = if (compact) 10.dp else 20.dp)) {
-            Row(Modifier.fillMaxWidth().focusGroup(), verticalAlignment = Alignment.CenterVertically,
+            Row(Modifier.fillMaxWidth().focusGroup().testTag("space-top-rail"), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TopBarProfileMenu(
                     state = state, focusRequester = profileRequester, nextFocusRequester = navigationRequester,
                     onOpenSettings = { onNavigate(AppPage.Settings) }, onOpenLocalApps = onOpenLocalApps,
+                    onSpaceUiChange = onSpaceUiChange,
                 )
                 if (portrait) Spacer(Modifier.weight(1f))
                 else SpaceNavigationTabs(state.page, pages, false, navigationRequester, onNavigate, Modifier.weight(1f), settingsEntryRequester)
+                queueContent(compactQueue)
                 if (state.page != AppPage.Settings) {
                     SpaceControl(stringResource(R.string.nav_search), onClick = { searchOpen = !searchOpen }) {
                         Icon(Icons.Outlined.Search, null, Modifier.size(20.dp))
@@ -309,7 +313,6 @@ internal fun SpaceUiScreen(
                     }
                 }
             }
-            queueContent()
         }
     }
     }
@@ -325,7 +328,7 @@ private fun SpaceNavigationTabs(page: AppPage, pages: List<AppPage>, portrait: B
                 AppPage.Home -> R.string.space_ui_discover
                 AppPage.Library -> R.string.nav_library
                 else -> R.string.nav_settings
-            }), active = page == destination,
+            }), active = page == destination, showFocusOutline = page != AppPage.Settings,
                 modifier = (if (portrait) Modifier.weight(1f) else Modifier).then(
                     if (page == destination) Modifier.focusRequester(requester) else Modifier)
                     .onPreviewKeyEvent { event ->
@@ -438,7 +441,7 @@ internal fun SpaceGameTile(game: GameInfo, selected: Boolean, compact: Boolean, 
         .testTag("space-game-${game.id}").padding(12.dp)) {
         Box((if (portraitArtwork) Modifier.fillMaxWidth().aspectRatio(628f / 888f) else Modifier.size(if (compact) 98.dp else 134.dp))
             .testTag("space-game-art-${game.id}").then(interaction.modifier)
-            .spaceFocusFrame(focused || interaction.hovered, 14.dp)
+            .spaceFocusFrame(focused || interaction.hovered, 14.dp, hovered = interaction.hovered)
             .border(1.dp, if (selected) SpaceIce.copy(alpha = .3f) else SpaceWhite.copy(alpha = .16f), shape)) {
             Box(Modifier.fillMaxSize().clip(shape).background(SpaceInk)) {
                 UrlImage(catalogCardImageUrl(game, tvProfile = !portraitArtwork, requestWidth = if (portraitArtwork) 512 else 272), Modifier.fillMaxSize())
@@ -455,9 +458,11 @@ internal fun SpaceGameTile(game: GameInfo, selected: Boolean, compact: Boolean, 
 
 @Composable
 internal fun SpaceControl(label: String, modifier: Modifier = Modifier, active: Boolean = false,
-    filled: Boolean = false, rectangular: Boolean = false, enabled: Boolean = true, minHeight: androidx.compose.ui.unit.Dp = if (filled) 52.dp else 42.dp, onClick: () -> Unit, content: (@Composable RowScope.() -> Unit)? = null) {
+    filled: Boolean = false, rectangular: Boolean = false, enabled: Boolean = true, showFocusOutline: Boolean = true,
+    minHeight: androidx.compose.ui.unit.Dp = if (filled) 52.dp else 42.dp, onClick: () -> Unit, content: (@Composable RowScope.() -> Unit)? = null) {
     var focused by remember { mutableStateOf(false) }
-    val interaction = rememberSpaceInteraction(focused, enabled = enabled, cornerRadius = if (rectangular) 4.dp else minHeight / 2)
+    val interaction = rememberSpaceInteraction(focused, enabled = enabled, cornerRadius = if (rectangular) 4.dp else minHeight / 2,
+        showFocusOutline = showFocusOutline)
     val shape = RoundedCornerShape(if (rectangular) 4.dp else 50.dp)
     val focusManager = LocalFocusManager.current
     Row(modifier.defaultMinSize(minHeight = minHeight, minWidth = if (filled) 132.dp else 42.dp)
@@ -466,7 +471,7 @@ internal fun SpaceControl(label: String, modifier: Modifier = Modifier, active: 
         .hoverable(interaction.source, enabled = enabled)
         .graphicsLayer { alpha = if (enabled) 1f else .38f }
         .clip(shape).background(when { filled -> SpaceWhite; else -> SpaceWhite.copy(alpha = (if (active) .12f else 0f) + .13f * interaction.emphasis) })
-        .border(1.dp, SpaceIce.copy(alpha = interaction.emphasis), shape)
+        .border(1.dp, SpaceIce.copy(alpha = if (showFocusOutline) interaction.emphasis else 0f), shape)
         .onPreviewKeyEvent { event ->
             handleDpadFocusMove(event, focusManager)
         }

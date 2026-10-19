@@ -2,7 +2,6 @@ package com.opencloudgaming.opennow
 
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,10 +20,8 @@ import com.opencloudgaming.opennow.ui.controls.ControlSectionStyle
 import com.opencloudgaming.opennow.ui.controls.LocalControlRowStyle
 import com.opencloudgaming.opennow.ui.controls.LocalControlSectionStyle
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
 
@@ -89,7 +86,7 @@ internal fun Modifier.spaceSafeViewport(insets: WindowInsets = WindowInsets.disp
     background(SpaceInk).windowInsetsPadding(insets).clipToBounds()
 
 @Composable
-internal fun SpaceSceneBackdrop(url: String?, showOrbits: Boolean = true) {
+internal fun SpaceSceneBackdrop(url: String?) {
     val reduceMotion = LocalReduceMotion.current
     Box(Modifier.fillMaxSize().clipToBounds().background(SpaceInk)) {
         Crossfade(url, animationSpec = tween(if (reduceMotion) 0 else if (LocalSpaceFastNavigation.current) 80 else 480), label = "space-scene") { image ->
@@ -97,11 +94,5 @@ internal fun SpaceSceneBackdrop(url: String?, showOrbits: Boolean = true) {
         }
         Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(listOf(SpaceInk.copy(alpha = .96f), SpaceInk.copy(alpha = .28f)))))
         Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(SpaceInk.copy(alpha = .36f), Color.Transparent, SpaceInk))))
-        if (showOrbits) Canvas(Modifier.fillMaxSize()) {
-            val center = Offset(size.width * .86f, size.height * .38f)
-            for (radius in listOf(.30f, .47f, .64f)) {
-                drawCircle(SpaceIce.copy(alpha = .045f), size.width * radius, center, style = Stroke(1.dp.toPx()))
-            }
-        }
     }
 }

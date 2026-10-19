@@ -5,6 +5,20 @@ import org.junit.Test
 
 class GoofySceneTimingTest {
     @Test
+    fun countsEachImpactOnceAndStartsFreshAtZero() {
+        for (time in listOf(-1L, 0L, 3_300L, GOOFY_CATCH_TIME_MILLIS - 1)) {
+            assertEquals(0L, goofyCatchCount(time))
+        }
+        for (time in listOf(GOOFY_CATCH_TIME_MILLIS, 4_000L, 7_999L, 8_000L, 11_649L)) {
+            assertEquals(1L, goofyCatchCount(time))
+        }
+        assertEquals(2L, goofyCatchCount(11_650L))
+        // A long frame spanning several cycles counts catches without repeated increment side effects.
+        assertEquals(101L, goofyCatchCount(GOOFY_SCENE_DURATION_MILLIS * 100 + GOOFY_CATCH_TIME_MILLIS))
+        assertEquals(0L, goofyCatchCount(0L))
+    }
+
+    @Test
     fun peekerSpeaksBeforeTheBoltAndDisappearsAfterImpact() {
         assertEquals(0f, goofySceneCue(0).peekerReveal, 0f)
         assertEquals(0.5f, goofySceneCue(350).peekerReveal, 0f)

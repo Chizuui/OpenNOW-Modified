@@ -68,47 +68,6 @@ internal const val FOCUS_HAPTIC_MIN_INTERVAL_MS = 45L
 internal fun shouldEmitFocusHaptic(lastAtMs: Long, nowMs: Long): Boolean =
     lastAtMs == 0L || nowMs - lastAtMs >= FOCUS_HAPTIC_MIN_INTERVAL_MS
 
-/**
- * Built-in-controller Android handhelds that should receive tactile D-pad focus ticks.
- *
- * These devices are not consistently exposed as Android TV and some firmware reports the
- * integrated controls in ways that make input-device-only detection unreliable. Build identity is
- * stable for this purpose and deliberately stays conservative so ordinary phones do not start
- * buzzing merely because a Bluetooth pad was paired once.
- */
-internal fun isGamingHandheldDevice(
-    manufacturer: String?,
-    brand: String?,
-    model: String?,
-    device: String?,
-    product: String?,
-): Boolean {
-    val identity = listOf(manufacturer, brand, model, device, product)
-        .joinToString(" ") { it.orEmpty() }
-        .lowercase(java.util.Locale.US)
-        .replace(Regex("[^a-z0-9]+"), " ")
-        .trim()
-    val tokens = identity.split(' ').filterTo(mutableSetOf()) { it.isNotBlank() }
-    return tokens.contains("ayn") ||
-        identity.contains("odin") ||
-        identity.contains("retroid") ||
-        identity.contains("anbernic") ||
-        identity.contains("ayaneo") ||
-        identity.contains("powkiddy") ||
-        identity.contains("abxylute") ||
-        tokens.contains("gpd") ||
-        (tokens.contains("razer") && tokens.contains("edge")) ||
-        (tokens.contains("logitech") && (identity.contains("g cloud") || identity.contains("gr0006")))
-}
-
-internal fun isGamingHandheldDevice(): Boolean = isGamingHandheldDevice(
-    manufacturer = Build.MANUFACTURER,
-    brand = Build.BRAND,
-    model = Build.MODEL,
-    device = Build.DEVICE,
-    product = Build.PRODUCT,
-)
-
 internal class OpenNowHaptics(context: Context) {
     private val appContext = context.applicationContext
 

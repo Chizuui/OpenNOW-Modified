@@ -40,6 +40,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.HourglassEmpty
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -71,6 +75,7 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -111,13 +116,6 @@ internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMod
     val visibleQueuePosition = rememberStableQueuePosition(session?.sessionId, queuePosition)
     val launchStatus = queueLaunchStatus(state, visibleQueuePosition)
     val queueCopy = queueLaunchStatusText(state, visibleQueuePosition)
-    if (state.settings.experimentalSpaceUi && (ad == null || mediaUrl == null)) {
-        SpaceLaunchScreen(state, queueCopy,
-            queuePosition = visibleQueuePosition.takeIf { launchStatus.kind == QueueLaunchStatusKind.QueuePosition },
-            onMinimize = viewModel::minimizeStreamLaunch,
-            onCancel = { viewModel.stopStream(StreamStopOrigin.QueueCancel) })
-        return
-    }
     val isSettingUp = launchStatus.kind == QueueLaunchStatusKind.ConnectingStream ||
         launchStatus.kind == QueueLaunchStatusKind.SettingUpRig
     val setupProgress = remember(session?.sessionId) { Animatable(0f) }
@@ -135,6 +133,14 @@ internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMod
         } else {
             setupProgress.snapTo(0f)
         }
+    }
+    if (state.settings.experimentalSpaceUi && (ad == null || mediaUrl == null)) {
+        SpaceLaunchScreen(state, queueCopy,
+            queuePosition = visibleQueuePosition.takeIf { launchStatus.kind == QueueLaunchStatusKind.QueuePosition },
+            connectingProgress = setupProgressProvider.takeIf { isSettingUp },
+            onMinimize = viewModel::minimizeStreamLaunch,
+            onCancel = { viewModel.stopStream(StreamStopOrigin.QueueCancel) })
+        return
     }
     val hasPlayableAd = ad != null && mediaUrl != null
     val reduceMotion = LocalReduceMotion.current
@@ -1079,6 +1085,34 @@ private fun QueueStatusAndActions(
                     Text(stringResource(R.string.action_cancel), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun SpaceMinimizedQueueControl(
+    state: OpenNowUiState,
+    compact: Boolean,
+    onRestore: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val position = rememberStableQueuePosition(state.streamSession?.sessionId, activeQueuePosition(state))
+    val status = queueLaunchStatusText(state, position)
+    val title = state.streamGame?.title ?: stringResource(R.string.queue_starting_stream)
+    val showOutline = state.page != AppPage.Settings
+    Row(Modifier.testTag("space-queue-rail"), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        SpaceControl("$title, $status", Modifier.widthIn(max = if (compact) 100.dp else 220.dp).testTag("space-queue-restore"),
+            showFocusOutline = showOutline, onClick = onRestore) {
+            Icon(Icons.Outlined.HourglassEmpty, null, Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(if (compact) position?.toString() ?: stringResource(R.string.action_view) else status,
+                color = SpaceWhite, style = MaterialTheme.typography.labelMedium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        SpaceControl(stringResource(R.string.action_cancel), Modifier.testTag("space-queue-rail-cancel"),
+            showFocusOutline = showOutline, onClick = onCancel) {
+            Icon(Icons.Outlined.Close, null, Modifier.size(18.dp))
         }
     }
 }

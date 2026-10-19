@@ -12,8 +12,13 @@ package com.opencloudgaming.opennow
  * Fields not listed here retain the constructor defaults in AppSettings, StreamSettings, and
  * AndroidTouchSettings. Add any of those fields here when a fresh-install override is needed.
  */
-internal fun firstInstallSettings(playStoreRelease: Boolean): AppSettings =
-    if (playStoreRelease) playStoreFirstInstallSettings() else apkFirstInstallSettings()
+internal fun firstInstallSettings(
+    playStoreRelease: Boolean,
+    androidTvProfile: Boolean = false,
+    gamingHandheld: Boolean = false,
+): AppSettings =
+    (if (playStoreRelease) playStoreFirstInstallSettings() else apkFirstInstallSettings())
+        .copy(experimentalSpaceUi = androidTvProfile || gamingHandheld)
 
 // Also resolves "Default" for older saved settings which have no video-output choice yet.
 internal fun defaultStreamVideoOutput(playStoreRelease: Boolean): StreamVideoOutput =
@@ -84,7 +89,7 @@ private fun commonFirstInstallSettings(): AppSettings = AppSettings(
         touchControllerStyle = TouchControllerStyle.V1, // V1, V2, Neon, Frost, Contrast, Retro, Arcade.
         opacity = 0.82f, // 0..1.
         scale = 1f,
-        joystickMode = TouchJoystickMode.Fixed, // Fixed or Dynamic.
+        joystickMode = TouchJoystickMode.Dynamic, // Fixed or Dynamic.
         aimMode = TouchAimMode.LockJoystick, // LockJoystick or LockZone.
         joystickDeadZone = DEFAULT_TOUCH_JOYSTICK_DEAD_ZONE, // Fraction, 0..1.
         nativeTouchMode = NativeTouchMode.Auto, // Auto, Off, Always.

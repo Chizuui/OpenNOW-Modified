@@ -374,8 +374,11 @@ class NativeStreamClient(
     private var hapticsAdvertised: Boolean? = null
     private var lastHapticsAdvertisementAtMs = 0L
     private var videoTrack: VideoTrack? = null
+    // Audio-track JNI and sink ownership stay on nativeLifecycleExecutor, including recording.
     private var audioTrack: AudioTrack? = null
-    @Volatile private var recordingAudioTrack: AudioTrack? = null
+    private var recordingAudioTrack: AudioTrack? = null
+    // Do not share the monitor held by microphone JNI and runtime stats with UI recording actions.
+    private val recordingLock = Any()
     @Volatile private var streamRecorder: AndroidStreamRecorder? = null
     @Volatile private var streamRecorderForShutdown: AndroidStreamRecorder? = null
     internal val recordingPhase = MutableStateFlow<StreamRecorderPhase?>(null)
@@ -2402,8 +2405,7 @@ class NativeStreamClient(
         return unavailableReason == null
     }
 
-    @Synchronized
-    internal fun startStreamRecording(outputUri: Uri, recordingSettings: StreamSettings = settings): Boolean {
+    internal fun startStreamRecording(outputUri: Uri, recordingSettings: StreamSettings = settings): Boolean = synchronized(recordingLock) {
         if (streamRecorder != null) return false
         if (recordingPhase.value in setOf(StreamRecorderPhase.Starting, StreamRecorderPhase.Recording, StreamRecorderPhase.Finalizing)) return false
         val activeRenderer = renderer ?: return false
@@ -2434,7 +2436,7 @@ class NativeStreamClient(
             ) { phase, error ->
                 if (phase == StreamRecorderPhase.Recording && error != null) {
                     recordStreamDiagnostic("stream recorder notice: $error")
-                } else synchronized(this) {
+                } else synchronized(recordingLock) {
                     recordingPhase.value = phase
                     recordingError.value = error.takeIf { phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted }
                     if (phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted) {
@@ -2443,7 +2445,7 @@ class NativeStreamClient(
                     if (phase == StreamRecorderPhase.Finished || phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted) {
                         streamRecorder = null
                         if (renderer === activeRenderer) activeRenderer.setRecordingSink(null)
-                        detachRecordingAudioSink()
+                        requestRecordingAudioSinkUpdate()
                     }
                 }
             }
@@ -2459,37 +2461,48 @@ class NativeStreamClient(
         }
         if (recordingPhase.value == StreamRecorderPhase.Failed) return false
         activeRenderer.setRecordingSink(recorder)
-        attachRecordingAudioSink()
+        requestRecordingAudioSinkUpdate()
         return true
     }
 
-    @Synchronized
-    internal fun stopPersonalRecordingInBackground() {
+    internal fun stopPersonalRecordingInBackground() = synchronized(recordingLock) {
         if (streamRecorder?.recordsPersonalInputs == true) stopStreamRecording()
     }
 
-    @Synchronized
-    internal fun stopStreamRecording() {
+    internal fun stopStreamRecording() = synchronized(recordingLock) {
         val recorder = streamRecorder ?: return
         streamRecorderForShutdown = recorder
         streamRecorder = null
         renderer?.setRecordingSink(null)
-        detachRecordingAudioSink()
+        requestRecordingAudioSinkUpdate()
         recordingPhase.value = StreamRecorderPhase.Finalizing
         recorder.stop()
     }
 
-    @Synchronized
-    private fun attachRecordingAudioSink() {
-        val track = audioTrack ?: return
-        if (recordingAudioTrack === track) return
-        detachRecordingAudioSink()
-        track.addSink(recordingAudioSink)
-        recordingAudioTrack = track
-        track.setEnabled(!audioMuted || streamRecorder != null)
+    private fun requestRecordingAudioSinkUpdate() {
+        val generation = transportGeneration
+        enqueueNativeLifecycleOperation("recording-audio-sink-update") {
+            if (activePeerConnection(generation) == null) return@enqueueNativeLifecycleOperation
+            updateRecordingAudioSink()
+        }
     }
 
-    @Synchronized
+    /** Runs on nativeLifecycleExecutor; never take the client monitor around blocking JNI. */
+    private fun updateRecordingAudioSink() {
+        // Read the current recorder here so a queued start cannot reattach after recording stops.
+        val track = audioTrack
+        val desiredTrack = track.takeIf { streamRecorder != null }
+        if (recordingAudioTrack !== desiredTrack) {
+            detachRecordingAudioSink()
+            if (desiredTrack != null) {
+                desiredTrack.addSink(recordingAudioSink)
+                recordingAudioTrack = desiredTrack
+            }
+        }
+        track?.setEnabled(!audioMuted || streamRecorder != null)
+    }
+
+    /** Runs on nativeLifecycleExecutor, before the owning peer can be disposed. */
     private fun detachRecordingAudioSink() {
         val track = recordingAudioTrack ?: return
         recordingAudioTrack = null
@@ -2498,15 +2511,13 @@ class NativeStreamClient(
         track.setEnabled(!audioMuted || streamRecorder != null)
     }
 
-    @Synchronized
     private fun attachAudio(track: AudioTrack) {
         val previousTrack = audioTrack
         if (previousTrack !== track) {
             detachRecordingAudioSink()
             audioTrack = track
         }
-        track.setEnabled(!audioMuted || streamRecorder != null)
-        if (streamRecorder != null) attachRecordingAudioSink()
+        updateRecordingAudioSink()
     }
 
     private fun sendAccumulatedMouseMove(

@@ -181,6 +181,11 @@ internal fun GoofyScreensaverScene() {
             Color(0xFFB9F584), width, height,
             logoX + MASCOT_SIZE_DP / 2f, logoY + MASCOT_SIZE_DP / 2f, MASCOT_SIZE_DP / 2f,
         )
+        MascotCatchCounter(
+            catches = if (peeker != null) goofyCatchCount(elapsed) else 0L,
+            viewportWidth = width, viewportHeight = height,
+            snowmanX = companionX, snowmanY = companionY,
+        )
     }
 }
 

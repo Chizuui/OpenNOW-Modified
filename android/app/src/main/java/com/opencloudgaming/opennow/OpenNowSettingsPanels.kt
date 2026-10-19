@@ -828,7 +828,7 @@ private fun AccountServicesSettingsPanel(state: OpenNowUiState, viewModel: OpenN
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(onClick = { addAccountPromptOpen = true }, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.account_add)) }
+            SettingsButton(onClick = { addAccountPromptOpen = true }, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.account_add)) }
             OutlinedButton(onClick = viewModel::logout, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.account_sign_out)) }
         }
         OutlinedButton(onClick = viewModel::logoutAll, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.account_sign_out_all)) }

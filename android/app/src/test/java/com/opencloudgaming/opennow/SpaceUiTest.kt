@@ -16,7 +16,7 @@ class SpaceUiTest {
         assertTrue(cadence.changed("5", 1680))
     }
 
-    @Test fun existingAndNewInstallsStartOutsideTheExperiment() {
+    @Test fun serializationDefaultsKeepOlderSavedSettingsOutsideTheExperiment() {
         assertFalse(AppSettings().experimentalSpaceUi)
         assertFalse(OpenNowJson.decodeFromString<AppSettings>("{}").experimentalSpaceUi)
         val restored = OpenNowJson.decodeFromString<AppSettings>(

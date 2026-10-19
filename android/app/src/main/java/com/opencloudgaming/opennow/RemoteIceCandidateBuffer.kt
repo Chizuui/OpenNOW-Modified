@@ -8,12 +8,17 @@ internal class RemoteIceCandidateBuffer {
     private var remoteDescriptionReady = false
 
     fun receive(candidate: IceCandidate, deliver: (IceCandidate) -> Unit) {
+        // Signaling may identify a media section by index alone. WebRTC's Android JNI string
+        // bridge aborts on a null MID; an empty MID preserves native index-based routing.
+        val nativeCandidate = if (candidate.sdpMid == null) {
+            IceCandidate("", candidate.sdpMLineIndex, candidate.sdp)
+        } else candidate
         if (remoteDescriptionReady) {
-            deliver(candidate)
+            deliver(nativeCandidate)
             return
         }
         if (pending.size == MAX_PENDING_CANDIDATES) pending.removeFirst()
-        pending.addLast(candidate)
+        pending.addLast(nativeCandidate)
     }
 
     fun onRemoteDescriptionSet(deliver: (IceCandidate) -> Unit) {

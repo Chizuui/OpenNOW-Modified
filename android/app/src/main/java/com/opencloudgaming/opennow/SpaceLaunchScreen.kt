@@ -25,7 +25,8 @@ import androidx.compose.ui.unit.sp
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
 
 @Composable
-internal fun SpaceLaunchScreen(state: OpenNowUiState, status: String, onMinimize: () -> Unit, onCancel: () -> Unit, queuePosition: Int? = null) {
+internal fun SpaceLaunchScreen(state: OpenNowUiState, status: String, onMinimize: () -> Unit, onCancel: () -> Unit,
+    queuePosition: Int? = null, connectingProgress: (() -> Float)? = null) {
     val context = LocalContext.current
     val requester = remember { FocusRequester() }
     val focused = LocalWindowInfo.current.isWindowFocused
@@ -35,7 +36,7 @@ internal fun SpaceLaunchScreen(state: OpenNowUiState, status: String, onMinimize
         BoxWithConstraints(Modifier.fillMaxSize().testTag("space-launch").spaceSafeViewport()) {
             val compact = maxHeight < 500.dp
             val narrow = maxWidth < 500.dp
-            SpaceSceneBackdrop(state.streamGame?.let { gameTvBannerImageUrl(context, it) }, showOrbits = false)
+            SpaceSceneBackdrop(state.streamGame?.let { gameTvBannerImageUrl(context, it) })
             Column(Modifier.fillMaxSize().testTag("space-launch-content").spaceArrival(state.streamGame?.id)
                 .padding(if (compact || narrow) 24.dp else 44.dp)) {
                 OpenNowAppIcon(size = 32.dp)
@@ -46,7 +47,7 @@ internal fun SpaceLaunchScreen(state: OpenNowUiState, status: String, onMinimize
                         Text(state.streamGame?.title.orEmpty(), color = SpaceWhite, fontSize = if (compact || narrow) 34.sp else 54.sp,
                             lineHeight = if (compact || narrow) 40.sp else 62.sp, fontWeight = FontWeight.Light, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            if (state.error == null) SpaceLaunchStatusProgress()
+                            if (state.error == null) SpaceLaunchStatusProgress(connectingProgress)
                             AnimatedQueueStatusText(status, queuePosition, compact,
                                 modifier = Modifier.weight(1f, fill = false).testTag("space-queue-status")
                                     .spaceArrival(if (queuePosition == null) status else "queue")
@@ -70,9 +71,12 @@ internal fun SpaceLaunchScreen(state: OpenNowUiState, status: String, onMinimize
 }
 
 @Composable
-private fun SpaceLaunchStatusProgress() {
+private fun SpaceLaunchStatusProgress(connectingProgress: (() -> Float)?) {
     val modifier = Modifier.size(18.dp).clearAndSetSemantics { }
-    if (LocalReduceMotion.current || !LocalWindowInfo.current.isWindowFocused) {
+    if (connectingProgress != null) {
+        CircularProgressIndicator(progress = connectingProgress, modifier = modifier, color = SpaceWhite,
+            trackColor = SpaceWhite.copy(alpha = .12f), strokeWidth = 2.dp)
+    } else if (LocalReduceMotion.current || !LocalWindowInfo.current.isWindowFocused) {
         CircularProgressIndicator(progress = { .72f }, modifier = modifier, color = SpaceWhite,
             trackColor = SpaceWhite.copy(alpha = .12f), strokeWidth = 2.dp)
     } else {

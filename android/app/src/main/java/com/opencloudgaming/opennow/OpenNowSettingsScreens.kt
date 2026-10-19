@@ -49,6 +49,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.SportsEsports
+import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Tv
 import androidx.compose.material.icons.outlined.Movie
@@ -93,6 +94,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import com.opencloudgaming.opennow.ui.controls.ControlActionRow
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
@@ -212,6 +214,7 @@ private enum class SettingsCategory(
     General(R.string.settings_category_general, R.string.settings_category_general_summary, Icons.Outlined.Tune),
     Stream(R.string.settings_category_stream, R.string.settings_category_stream_summary, Icons.Outlined.Monitor),
     Recording(R.string.settings_category_recording, R.string.settings_category_recording_summary, Icons.Outlined.Movie),
+    OnScreenControls(R.string.controls_title, R.string.controls_summary, Icons.Outlined.TouchApp),
     Input(R.string.settings_category_input, R.string.settings_category_input_summary, Icons.Outlined.SportsEsports),
     Interface(R.string.settings_category_interface, R.string.settings_category_interface_summary, Icons.Outlined.Palette),
     Account(R.string.settings_category_account, R.string.settings_category_account_summary, Icons.Outlined.Person),
@@ -322,6 +325,7 @@ internal fun SettingsScreen(
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     val controllerFamily = rememberPhysicalControllerFamily(enabled = true)
+    val touchSettingsContext = LocalContext.current
     val gamingHandheld = remember { isGamingHandheldDevice() }
     val controllerNavigationEnabled = shouldEnableSettingsControllerNavigation(
         tvProfile = tvProfile,
@@ -431,7 +435,17 @@ internal fun SettingsScreen(
                 },
             )
         }
-        if (spacePresentation) {
+        if (selectedCategory == SettingsCategory.OnScreenControls) {
+            OnScreenControlsSettings(
+                touch = state.settings.androidTouch,
+                presets = state.settings.touchControlPresets,
+                gyroscopeAvailable = remember { hasMobileGyroscope(touchSettingsContext) },
+                onChange = { viewModel.updateSettings(state.settings.copy(androidTouch = it)) },
+                onPresetsChange = { viewModel.updateSettings(state.settings.copy(touchControlPresets = it)) },
+                onBack = { selectedCategory = null },
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else if (spacePresentation) {
             SpaceSettingsLayout(
                 state = state,
                 viewModel = viewModel,
@@ -715,13 +729,11 @@ private fun SettingsContent(
         ChangelogSettingsContent(changelogs)
         return
     }
-    val gyroscopeAvailable = remember(context) { hasMobileGyroscope(context) }
     val deviceHasBattery = rememberDeviceHasBattery()
     val fallbackMembershipTier = state.authSession?.user?.membershipTier
     var pendingMicrophoneMode by remember { mutableStateOf<MicrophoneMode?>(null) }
     var showStreamMenuShortcutDialog by remember { mutableStateOf(false) }
     var showBugReportDialog by rememberSaveable { mutableStateOf(false) }
-    var showAdvancedControllerSettings by rememberSaveable { mutableStateOf(false) }
     val recordingFolderName by produceState<String?>(null, context, settings.recordingDirectoryUri) {
         value = settings.recordingDirectoryUri?.let { folder ->
             withContext(Dispatchers.IO) { RecordingDestination.folderName(context, folder) }
@@ -1181,7 +1193,7 @@ private fun SettingsContent(
                         } else {
                             R.string.settings_recording_folder_selected
                         }),
-                    onClick = { recordingFolderLauncher.launch(null) },
+                    onClick = { RecordingDestination.launchFolderPicker(context, recordingFolderLauncher) },
                 )
                 Text(
                     stringResource(R.string.settings_recording_next_session_hint),
@@ -1489,7 +1501,12 @@ private fun SettingsContent(
                     }
                 }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_controller_touch), "input", "rumble", "touch", "controller", "style", "skin", "theme", "colour", "color", "labels", "layout", "scale", "size", "opacity", "edge", "padding", "offset", "horizontal", "vertical", "controls", "visible", "hide", "programmable", "extra", "accessibility", "guide", "home", "stick", "joystick", "analog", "dynamic", "dead zone", "button") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_controller_touch), "input", "rumble", "touch", "keyboard", "mouse", "wasd", "on-screen", "controller", "style", "skin", "theme", "colour", "color", "labels", "layout", "scale", "size", "opacity", "edge", "padding", "offset", "horizontal", "vertical", "controls", "visible", "hide", "programmable", "extra", "accessibility", "guide", "home", "stick", "joystick", "analog", "dynamic", "dead zone", "button") {
+                ControlNavigationRow(
+                    label = stringResource(R.string.controls_title),
+                    value = stringResource(R.string.controls_summary),
+                    onClick = { onSelectCategory(SettingsCategory.OnScreenControls) },
+                )
                 if (settings.androidPhysicalControllerPromptDismissed) {
                     ControlActionRow(
                         label = stringResource(R.string.settings_show_controller_prompt_again),
@@ -1530,235 +1547,12 @@ private fun SettingsContent(
                         )
                     }
                 }
-                SettingSwitch(stringResource(R.string.stream_touch_controls_title), settings.androidTouch.enabled) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(enabled = enabled))) }
-                val touchStyleOptions = TouchControllerStyle.entries.map { style ->
-                    SettingsChoiceOption(style.name, touchControllerStyleLabel(style))
-                }
-                ChoiceOptionRow(
-                    stringResource(R.string.settings_touch_skin),
-                    touchStyleOptions,
-                    settings.androidTouch.touchControllerStyle.name,
-                    description = stringResource(R.string.settings_touch_skin_desc),
-                ) { styleName ->
-                    val style = TouchControllerStyle.valueOf(styleName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(touchControllerStyle = style)))
-                }
-                // The skins differ by shape now, which a list of names cannot show.
-                TouchControllerSkinPreview(
-                    style = settings.androidTouch.touchControllerStyle,
-                    tint = settings.androidTouch.touchSkinTint,
-                    opacity = settings.androidTouch.opacity,
-                    showLabels = settings.androidTouch.touchButtonLabels,
-                    modifier = Modifier.padding(vertical = 8.dp),
-                )
-                SettingSwitch(
-                    label = stringResource(R.string.settings_advanced_controller_customization),
-                    checked = showAdvancedControllerSettings,
-                    description = stringResource(R.string.settings_advanced_controller_customization_desc),
-                ) { showAdvancedControllerSettings = it }
-                if (showAdvancedControllerSettings || searchQuery.isNotBlank()) {
-                val touchTintOptions = TOUCH_SKIN_TINTS.map { SettingsChoiceOption(it.id, it.label) }
-                ChoiceOptionRow(
-                    stringResource(R.string.settings_touch_skin_tint),
-                    touchTintOptions,
-                    touchSkinTintId(settings.androidTouch.touchSkinTint),
-                    description = stringResource(R.string.settings_touch_skin_tint_desc),
-                ) { tintId ->
-                    viewModel.updateSettings(
-                        settings.copy(
-                            androidTouch = settings.androidTouch.copy(touchSkinTint = touchSkinTintForId(tintId)),
-                        ),
-                    )
-                }
-                SettingSwitch(
-                    label = stringResource(R.string.settings_touch_button_labels),
-                    checked = settings.androidTouch.touchButtonLabels,
-                ) { enabled ->
-                    viewModel.updateSettings(
-                        settings.copy(androidTouch = settings.androidTouch.copy(touchButtonLabels = enabled)),
-                    )
-                }
-                TouchControlPresetEditor(
-                    touch = settings.androidTouch,
-                    presets = settings.touchControlPresets,
-                    onTouchChange = { viewModel.updateSettings(settings.copy(androidTouch = it)) },
-                    onPresetsChange = { viewModel.updateSettings(settings.copy(touchControlPresets = it)) },
-                )
-                TouchButtonAppearanceEditor(settings.androidTouch) { touch ->
-                    viewModel.updateSettings(settings.copy(androidTouch = touch))
-                }
-                Text(
-                    text = stringResource(R.string.settings_touch_visible_controls),
-                    color = SettingsText,
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    text = stringResource(R.string.settings_touch_visible_controls_desc),
-                    color = SettingsTextMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TouchControlGroup.entries.forEach { group ->
-                    SettingSwitch(
-                        label = stringResource(touchControlGroupLabelRes(group)),
-                        checked = settings.androidTouch.isControlVisible(group),
-                    ) { visible ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.withControlVisible(group, visible)),
-                        )
-                    }
-                }
-                Text(
-                    text = stringResource(R.string.settings_touch_extra_buttons),
-                    color = SettingsText,
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    text = stringResource(R.string.settings_touch_extra_buttons_desc),
-                    color = SettingsTextMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                val extraButtonOptions = TouchExtraButtonAction.entries.map { action ->
-                    SettingsChoiceOption(action.name, touchExtraButtonActionLabel(action))
-                }
-                repeat(TOUCH_EXTRA_BUTTON_COUNT) { index ->
-                    val customCombo = extraButtonComboKey(index) in settings.androidTouch.extraButtonCombos
-                    val customValue = "custom-combo-$index"
-                    val options = if (customCombo) {
-                        listOf(
-                            SettingsChoiceOption(
-                                customValue,
-                                stringResource(
-                                    R.string.touch_extra_combo_custom_value,
-                                    touchExtraButtonComboLabel(settings.androidTouch.extraButtonCombo(index)),
-                                ),
-                            ),
-                        ) + extraButtonOptions
-                    } else {
-                        extraButtonOptions
-                    }
-                    ChoiceOptionRow(
-                        label = stringResource(R.string.settings_touch_extra_button, index + 1),
-                        options = options,
-                        selectedValue = if (customCombo) customValue else settings.androidTouch.extraButtonAction(index).name,
-                    ) { actionName ->
-                        if (actionName == customValue) return@ChoiceOptionRow
-                        val action = TouchExtraButtonAction.valueOf(actionName)
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.withExtraButtonAction(index, action)),
-                        )
-                    }
-                }
-                TouchExtraButtonComboEditor(settings.androidTouch) { touch ->
-                    viewModel.updateSettings(settings.copy(androidTouch = touch))
-                }
-                NumberSlider(
-                    stringResource(R.string.settings_touch_extra_button_size),
-                    settings.androidTouch.extraButtonScale,
-                    0.6f,
-                    1.6f,
-                    0.05f,
-                ) { value ->
-                    viewModel.updateSettings(
-                        settings.copy(androidTouch = settings.androidTouch.copy(extraButtonScale = value)),
-                    )
-                }
-                val touchAimOptions = listOf(
-                    SettingsChoiceOption(TouchAimMode.LockJoystick.name, stringResource(R.string.stream_joysticks_lock_joystick)),
-                    SettingsChoiceOption(TouchAimMode.LockZone.name, stringResource(R.string.stream_joysticks_lock_zone)),
-                )
-                ChoiceOptionRow(stringResource(R.string.stream_joysticks_aim_mode), touchAimOptions, settings.androidTouch.aimMode.name) { modeName ->
-                    val mode = TouchAimMode.valueOf(modeName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(aimMode = mode)))
-                }
-                if (settings.androidTouch.aimMode == TouchAimMode.LockZone) {
-                    NumberSlider(
-                        stringResource(R.string.stream_joysticks_aim_zone_scale),
-                        settings.androidTouch.aimZoneScale,
-                        0.5f,
-                        1.5f,
-                        0.05f,
-                    ) { value ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.copy(aimZoneScale = value)),
-                        )
-                    }
-                    NumberSlider(
-                        stringResource(R.string.stream_joysticks_aim_zone_sensitivity),
-                        settings.androidTouch.aimZoneSensitivity,
-                        0.25f,
-                        3f,
-                        0.05f,
-                    ) { value ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.copy(aimZoneSensitivity = value)),
-                        )
-                    }
-                }
-                val joystickModeOptions = listOf(
-                    SettingsChoiceOption(TouchJoystickMode.Fixed.name, stringResource(R.string.stream_panel_joystick_fixed)),
-                    SettingsChoiceOption(TouchJoystickMode.Dynamic.name, stringResource(R.string.stream_panel_joystick_dynamic)),
-                )
-                ChoiceOptionRow("Touch joystick", joystickModeOptions, settings.androidTouch.joystickMode.name) { modeName ->
-                    val mode = TouchJoystickMode.valueOf(modeName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(joystickMode = mode)))
-                }
-                NumberSlider("Joystick dead zone", settings.androidTouch.joystickDeadZone, 0f, 0.3f, 0.01f) { value ->
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(joystickDeadZone = value)))
-                }
-                SettingSwitch(
-                    label = stringResource(R.string.settings_touch_gyro),
-                    checked = settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable,
-                    enabled = gyroscopeAvailable,
-                    description = stringResource(
-                        if (gyroscopeAvailable) R.string.settings_touch_gyro_desc
-                        else R.string.settings_touch_gyro_unavailable,
-                    ),
-                ) { enabled ->
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeEnabled = enabled)))
-                }
-                if (settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable) {
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_sensitivity), settings.androidTouch.gyroscopeSensitivity, 0.25f, 3f, 0.05f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeSensitivity = value)))
-                    }
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_dead_zone), settings.androidTouch.gyroscopeDeadZone, 0f, 0.2f, 0.005f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeDeadZone = value)))
-                    }
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_smoothing), settings.androidTouch.gyroscopeSmoothing, 0f, 0.9f, 0.05f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeSmoothing = value)))
-                    }
-                    SettingSwitch(
-                        stringResource(R.string.settings_touch_gyro_invert_horizontal),
-                        settings.androidTouch.gyroscopeInvertHorizontal,
-                    ) { enabled ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeInvertHorizontal = enabled)))
-                    }
-                    SettingSwitch(
-                        stringResource(R.string.settings_touch_gyro_invert_vertical),
-                        settings.androidTouch.gyroscopeInvertVertical,
-                    ) { enabled ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeInvertVertical = enabled)))
-                    }
-                }
-                NumberSlider("Touch layout scale", settings.androidTouch.scale, 0.6f, 1.4f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(scale = value))) }
-                NumberSlider("Touch button size", settings.androidTouch.buttonScale, 0.65f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(buttonScale = value))) }
-                NumberSlider("Touch stick size", settings.androidTouch.stickScale, 0.65f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(stickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_face_size), settings.androidTouch.faceButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(faceButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_dpad_size), settings.androidTouch.dpadScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(dpadScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_shoulders_size), settings.androidTouch.shoulderButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(shoulderButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_center_size), settings.androidTouch.centerButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(centerButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_left_stick_size), settings.androidTouch.leftStickScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftStickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_right_stick_size), settings.androidTouch.rightStickScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightStickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_stick_knob_size), settings.androidTouch.stickKnobScale, 0.28f, 0.72f, 0.02f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(stickKnobScale = value))) }
-                NumberSlider("Touch opacity", settings.androidTouch.opacity, 0f, 1f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(opacity = value))) }
-                NumberSlider("Touch edge padding", settings.androidTouch.edgePaddingDp, 0f, 72f, 1f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(edgePaddingDp = value))) }
-                NumberSlider("Touch bottom padding", settings.androidTouch.bottomPaddingDp, 0f, 120f, 1f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(bottomPaddingDp = value))) }
-                NumberSlider("Left controls horizontal offset", settings.androidTouch.leftOffsetXDp, -220f, 220f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftOffsetXDp = value))) }
-                NumberSlider("Left controls vertical offset", settings.androidTouch.leftOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftOffsetYDp = value))) }
-                NumberSlider("Right controls horizontal offset", settings.androidTouch.rightOffsetXDp, -220f, 220f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetXDp = value))) }
-                NumberSlider("Right controls vertical offset", settings.androidTouch.rightOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetYDp = value))) }
-                }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "navigation", "sidebar", "opacity", "transparency", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "space", "experimental", "console", "controller", "landscape", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "navigation", "sidebar", "opacity", "transparency", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
+                SpaceUiSettingsToggle(
+                    checked = settings.experimentalSpaceUi,
+                    onCheckedChange = viewModel::setSpaceUiEnabled,
+                )
                 val accentOptions = selectableUiAccents().map { it to uiAccentLabel(it) }
                 SettingSwitch(stringResource(R.string.settings_dynamic_color), settings.dynamicColor) { viewModel.updateSettings(settings.copy(dynamicColor = it)) }
                 SettingSwitch(
@@ -2018,7 +1812,7 @@ private fun SettingsContent(
                     showTitle = false,
                 )
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, stringResource(R.string.settings_experimental_streaming), "experimental", "stream", "network", "dynamic", "adjustment", "nvst", "l4s", "space", "ui", "console", "session", "launch", "failure", "battery", "optimization", "background", "allow", "run") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, stringResource(R.string.settings_experimental_streaming), "experimental", "stream", "network", "dynamic", "adjustment", "nvst", "l4s", "session", "launch", "failure", "battery", "optimization", "background", "allow", "run") {
                 if (!LocalSpaceUiPresentation.current) {
                     Text(
                         stringResource(R.string.settings_experimental_streaming_warning),
@@ -2067,10 +1861,6 @@ private fun SettingsContent(
                 ) {
                     viewModel.updateStreamSettings { s -> s.copy(enableL4S = it) }
                 }
-                SpaceUiSettingsToggle(
-                    checked = settings.experimentalSpaceUi,
-                    onCheckedChange = { viewModel.updateSettings(settings.copy(experimentalSpaceUi = it)) },
-                )
                 if (deviceHasBattery) {
                     Text(
                         text = stringResource(R.string.settings_battery_optimization_title),

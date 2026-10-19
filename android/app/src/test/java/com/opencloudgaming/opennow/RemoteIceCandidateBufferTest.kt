@@ -7,6 +7,33 @@ import org.webrtc.IceCandidate
 
 class RemoteIceCandidateBufferTest {
     @Test
+    fun mediaIdsCanCrossTheBundledWebRtcStringBridgeBeforeAndAfterRemoteDescription() {
+        // nativeAddIceCandidate calls this exact Java helper for sdpMid before parsing ICE.
+        // Passing null throws inside JNI and aborts the process instead of returning false.
+        val stringBridge = Class.forName("org.webrtc.JniHelper")
+            .getDeclaredMethod("getStringBytes", String::class.java)
+            .apply { isAccessible = true }
+        val sdp = "candidate:1 1 udp 2122260223 192.0.2.10 5000 typ host"
+        for (ready in listOf(false, true)) {
+            for (mid in listOf(null, "", "video-primary")) {
+                val buffer = RemoteIceCandidateBuffer()
+                val delivered = mutableListOf<IceCandidate>()
+                if (ready) buffer.onRemoteDescriptionSet { delivered += it }
+
+                buffer.receive(IceCandidate(mid, 2, sdp)) { delivered += it }
+                buffer.onRemoteDescriptionSet { delivered += it }
+
+                val candidate = delivered.single()
+                val convertedMid = stringBridge.invoke(null, candidate.sdpMid) as ByteArray
+                assertEquals(mid.orEmpty(), convertedMid.toString(Charsets.ISO_8859_1))
+                // Empty MID must retain index routing, rather than inventing a media section ID.
+                assertEquals(2, candidate.sdpMLineIndex)
+                assertEquals(sdp, candidate.sdp)
+            }
+        }
+    }
+
+    @Test
     fun candidatesWaitForRemoteDescriptionAndThenArriveInOrder() {
         val buffer = RemoteIceCandidateBuffer()
         val delivered = mutableListOf<IceCandidate>()

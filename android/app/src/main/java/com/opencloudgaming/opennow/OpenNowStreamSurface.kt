@@ -487,8 +487,13 @@ internal fun StreamScreen(
             return
         }
         val folder = state.settings.recordingDirectoryUri
-        if (folder == null) recordingFolderLauncher.launch(null)
-        else {
+        if (folder == null) {
+            if (!RecordingDestination.launchFolderPicker(context, recordingFolderLauncher)) {
+                pendingRecordingSessionId = null
+                pendingRecordingFileName = null
+                pendingRecordingSettings = null
+            }
+        } else {
             pendingRecordingSessionId = null
             pendingRecordingFileName = null
             pendingRecordingSettings = null
@@ -1435,57 +1440,6 @@ internal fun StreamScreen(
                             ),
                         )
                     },
-                    onToggleTouchControllerStyle = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(
-                                    touchControllerStyle = nextTouchControllerStyle(
-                                        state.settings.androidTouch.touchControllerStyle,
-                                    ),
-                                ),
-                            ),
-                        )
-                    },
-                    onTouchButtonLabelsToggle = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(
-                                    touchButtonLabels = !state.settings.androidTouch.touchButtonLabels,
-                                ),
-                            ),
-                        )
-                    },
-                    onJoystickModeToggle = {
-                        val nextMode = if (state.settings.androidTouch.joystickMode == TouchJoystickMode.Fixed) {
-                            TouchJoystickMode.Dynamic
-                        } else {
-                            TouchJoystickMode.Fixed
-                        }
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(joystickMode = nextMode),
-                            ),
-                        )
-                    },
-                    onTouchAimModeToggle = {
-                        val nextMode = if (state.settings.androidTouch.aimMode == TouchAimMode.LockJoystick) {
-                            TouchAimMode.LockZone
-                        } else {
-                            TouchAimMode.LockJoystick
-                        }
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(aimMode = nextMode),
-                            ),
-                        )
-                    },
-                    onJoystickDeadZoneChange = { value ->
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(joystickDeadZone = value),
-                            ),
-                        )
-                    },
                     onSharpeningToggle = {
                         viewModel.updateStreamSettings { settings ->
                             settings.copy(streamSharpeningEnabled = !settings.streamSharpeningEnabled)
@@ -1512,18 +1466,6 @@ internal fun StreamScreen(
                         // strand the allocated cloud session on a stale signaling endpoint.
                         client.updateBitrateLimit(value * 1000)
                     },
-                    onTouchScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(scale = value)))
-                    },
-                    onButtonScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(buttonScale = value)))
-                    },
-                    onStickScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(stickScale = value)))
-                    },
-                    onOpacityChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(opacity = value)))
-                    },
                     onMouseSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = value) }
                     },
@@ -1534,25 +1476,6 @@ internal fun StreamScreen(
                         val physicalInput = state.settings.physicalInput.copy(stickDeadZone = value)
                         client.updatePhysicalInputSettings(physicalInput)
                         viewModel.updateSettings(state.settings.copy(physicalInput = physicalInput))
-                    },
-                    onTouchEdgePaddingChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(edgePaddingDp = value)))
-                    },
-                    onTouchBottomPaddingChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(bottomPaddingDp = value)))
-                    },
-                    onTouchLeftOffsetChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(leftOffsetYDp = value)))
-                    },
-                    onTouchRightOffsetChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(rightOffsetYDp = value)))
-                    },
-                    onTouchLayoutReset = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.withResetOffsets()
-                            )
-                        )
                     },
                     onTouchPresetsChange = { presets ->
                         viewModel.updateSettings(state.settings.copy(touchControlPresets = presets))

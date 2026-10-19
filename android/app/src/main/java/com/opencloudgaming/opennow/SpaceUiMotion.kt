@@ -30,7 +30,7 @@ internal class SpaceInteraction(
 
 @Composable
 internal fun rememberSpaceInteraction(focused: Boolean, tile: Boolean = false, enabled: Boolean = true,
-    reduceMotion: Boolean = LocalReduceMotion.current, cornerRadius: Dp = 4.dp): SpaceInteraction {
+    reduceMotion: Boolean = LocalReduceMotion.current, cornerRadius: Dp = 4.dp, showFocusOutline: Boolean = true): SpaceInteraction {
     val fast = LocalSpaceFastNavigation.current
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
@@ -38,17 +38,18 @@ internal fun rememberSpaceInteraction(focused: Boolean, tile: Boolean = false, e
     val engaged = enabled && (focused || hovered)
     val emphasis by animateFloatAsState(if (engaged) 1f else 0f,
         tween(if (reduceMotion) 0 else if (fast) 55 else 180), label = "space-emphasis")
-    val scale by animateFloatAsState(when {
+    val scale = animateFloatAsState(when {
         reduceMotion -> 1f
         enabled && pressed -> .97f
         engaged && tile -> 1.045f
+        engaged -> 1.015f
         else -> 1f
     }, tween(if (reduceMotion) 0 else if (fast) 45 else if (pressed) 80 else 180, easing = FastOutSlowInEasing), label = "space-scale")
     val lift = with(LocalDensity.current) { (if (tile) 3.dp else 0.dp).toPx() }
     return SpaceInteraction(source, enabled && hovered, emphasis, Modifier.graphicsLayer {
-        scaleX = scale; scaleY = scale
+        scaleX = scale.value; scaleY = scale.value
         translationY = if (reduceMotion || pressed) 0f else -lift * emphasis
-    }.then(if (tile || !LocalSpaceAnimatedFocusOutline.current) Modifier else Modifier.spaceFocusFrame(engaged, cornerRadius)))
+    }.then(if (tile || !showFocusOutline || !LocalSpaceAnimatedFocusOutline.current) Modifier else Modifier.spaceFocusFrame(engaged, cornerRadius, hovered = enabled && hovered)))
 }
 
 /** Finite entrance on navigation/selection, cancelled immediately by the next navigation. */
@@ -71,8 +72,9 @@ internal fun Modifier.spaceArrival(key: Any?, delayMillis: Int = 0): Modifier {
 
 /** Spring-in frame with a slow moving light while a tile owns focus or hover. */
 @Composable
-internal fun Modifier.spaceFocusFrame(active: Boolean, radius: androidx.compose.ui.unit.Dp): Modifier {
-    val engaged = active && LocalSpaceAnimatedFocusOutline.current && LocalSpaceControllerConnected.current &&
+internal fun Modifier.spaceFocusFrame(active: Boolean, radius: Dp, hovered: Boolean = false): Modifier {
+    // A mouse owns its hover frame even when no physical controller is connected.
+    val engaged = active && LocalSpaceAnimatedFocusOutline.current && (hovered || LocalSpaceControllerConnected.current) &&
         androidx.compose.ui.platform.LocalWindowInfo.current.isWindowFocused
     val reduced = LocalReduceMotion.current
     val fast = LocalSpaceFastNavigation.current

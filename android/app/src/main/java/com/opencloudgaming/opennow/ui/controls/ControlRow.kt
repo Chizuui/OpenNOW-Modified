@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -73,6 +74,7 @@ data class ControlRowStyle(
     val horizontalPadding: Dp,
     val verticalPadding: Dp,
     val contentGap: Dp,
+    val labelColor: Color,
     val labelStyle: TextStyle,
     val labelWeight: FontWeight?,
     val supportingStyle: TextStyle,
@@ -98,6 +100,7 @@ data class ControlRowStyle(
                 horizontalPadding = OpenNowSpacing.md,
                 verticalPadding = OpenNowSpacing.sm,
                 contentGap = 3.dp,
+                labelColor = MaterialTheme.colorScheme.onSurface,
                 labelStyle = MaterialTheme.typography.bodyLarge,
                 labelWeight = null,
                 supportingStyle = MaterialTheme.typography.bodySmall,
@@ -125,6 +128,7 @@ data class ControlRowStyle(
             horizontalPadding = OpenNowSpacing.md,
             verticalPadding = 10.dp,
             contentGap = 2.dp,
+            labelColor = OpenNowPalette.TextPrimary,
             labelStyle = MaterialTheme.typography.titleSmall,
             labelWeight = FontWeight.SemiBold,
             supportingStyle = MaterialTheme.typography.labelSmall,
@@ -177,6 +181,7 @@ internal fun ControlRow(
         Row(
             Modifier
                 .fillMaxWidth()
+                .heightIn(min = 48.dp)
                 .then(motion?.modifier ?: Modifier)
                 .hoverable(hoverInteraction, enabled = enabled)
                 .onFocusChanged { focused = style.focusable && (it.isFocused || it.hasFocus) }
@@ -247,7 +252,7 @@ internal fun RowScope.ControlRowLabels(
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(style.contentGap)) {
         Text(
             label,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
+            color = style.labelColor.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
             style = style.labelStyle,
             fontWeight = style.labelWeight,
             maxLines = 2,

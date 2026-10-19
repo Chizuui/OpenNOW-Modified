@@ -253,6 +253,8 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -566,6 +568,7 @@ private fun OpenNowAppContent(
     state: OpenNowUiState,
     onMicrophoneCaptureActiveChange: (Boolean) -> Unit,
 ) {
+    val spaceUiEnableConfirmationPending by viewModel.spaceUiEnableConfirmationPending.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val physicalControllerConnected = rememberPhysicalControllerConnected(enabled = true)
@@ -809,6 +812,12 @@ private fun OpenNowAppContent(
                             )
                             else -> LoginScreen(state, viewModel)
                         }
+                    }
+                    if (spaceUiEnableConfirmationPending) {
+                        SpaceUiEnableDialog(
+                            onConfirm = viewModel::confirmSpaceUiEnable,
+                            onDismiss = viewModel::cancelSpaceUiEnable,
+                        )
                     }
                     if (state.awaitingLaunchInputModeChoice) {
                         StreamLaunchInputModeDialog(
@@ -1168,6 +1177,7 @@ private fun MainShell(
                                     onRefresh = viewModel::refreshGames,
                                     onResumeSession = viewModel::resumeActiveSession,
                                     onOpenLocalApps = viewModel::openInterfaceSettings,
+                                    onSpaceUiChange = viewModel::setSpaceUiEnabled,
                                     onSearchChange = { query ->
                                         if (state.page == AppPage.Library) viewModel.setLibrarySearch(query)
                                         else viewModel.setCatalogSearch(query)
@@ -1228,10 +1238,11 @@ private fun MainShell(
                                             )
                                         }
                                     },
-                                    queueContent = {
+                                    queueContent = { compact ->
                                         if (showMinimizedQueueDock) {
-                                            MinimizedQueueDock(
+                                            SpaceMinimizedQueueControl(
                                                 state = state,
+                                                compact = compact,
                                                 onRestore = viewModel::restoreStreamLaunch,
                                                 onCancel = { viewModel.stopStream(StreamStopOrigin.MinimizedQueueCancel) },
                                             )
@@ -1294,6 +1305,7 @@ private fun MainShell(
                                         visibleSearchTarget = null
                                         viewModel.openInterfaceSettings()
                                     },
+                                    onSpaceUiChange = viewModel::setSpaceUiEnabled,
                                     onOpenStreamSettings = viewModel::openStreamSettings,
                                     musicControl = musicControl,
                                     showRefreshAction = shouldShowTvRefreshAction(tvProfile, inStream),
@@ -2010,6 +2022,7 @@ private fun TopStatusBar(
     onOpenSettings: () -> Unit,
     onOpenLocalApps: () -> Unit,
     onOpenStreamSettings: () -> Unit,
+    onSpaceUiChange: (Boolean) -> Unit,
     musicControl: TopBarMusicControl,
     showRefreshAction: Boolean = false,
     refreshing: Boolean = false,
@@ -2042,6 +2055,7 @@ private fun TopStatusBar(
                 nextFocusRequester = catalogControlFocusRequester,
                 onOpenSettings = onOpenSettings,
                 onOpenLocalApps = onOpenLocalApps,
+                onSpaceUiChange = onSpaceUiChange,
             )
             Spacer(Modifier.width(8.dp))
             Row(
@@ -2129,6 +2143,7 @@ internal fun TopBarProfileMenu(
     nextFocusRequester: FocusRequester?,
     onOpenSettings: () -> Unit,
     onOpenLocalApps: () -> Unit,
+    onSpaceUiChange: (Boolean) -> Unit,
 ) {
     val activity = LocalContext.current as? Activity
     var expanded by remember { mutableStateOf(false) }
@@ -2255,6 +2270,19 @@ internal fun TopBarProfileMenu(
                 HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
             }
             ProfileDropdownMenuItem(
+                text = { Text(stringResource(R.string.space_ui_name), fontWeight = FontWeight.SemiBold) },
+                trailingIcon = { Switch(checked = state.settings.experimentalSpaceUi, onCheckedChange = null) },
+                modifier = Modifier.semantics {
+                    role = Role.Switch
+                    toggleableState = ToggleableState(state.settings.experimentalSpaceUi)
+                },
+                onClick = {
+                    expanded = false
+                    haptics?.play(HapticCue.Activate)
+                    onSpaceUiChange(!state.settings.experimentalSpaceUi)
+                },
+            )
+            ProfileDropdownMenuItem(
                 text = {
                     Text(
                         stringResource(R.string.nav_settings),
@@ -2286,13 +2314,16 @@ internal fun TopBarProfileMenu(
 private fun ProfileDropdownMenuItem(
     text: @Composable () -> Unit,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    trailingIcon: (@Composable () -> Unit)? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth()) {
         DropdownMenuItem(
             text = text,
             onClick = onClick,
-            modifier = Modifier.onFocusChanged { focused = it.isFocused || it.hasFocus },
+            modifier = modifier.onFocusChanged { focused = it.isFocused || it.hasFocus },
+            trailingIcon = trailingIcon,
         )
         InteractionFocusFrame(
             visible = focused,

@@ -93,6 +93,7 @@ class SpaceUiInstrumentedTest {
         second.performMouseInput { enter(center) }
         second.assertIsSelected()
         compose.runOnIdle { assertEquals(0, launches) }
+        capture("space-mouse-hover")
         second.performMouseInput { click() }
         compose.runOnIdle { assertEquals(1, launches) }
         second.performMouseInput { exit() }
@@ -196,7 +197,7 @@ class SpaceUiInstrumentedTest {
     @Test fun renderGameHubAndLaunch() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val art = "android.resource://${context.packageName}/${R.drawable.catalog_colorful_abstract_background}"
-        val game = games.first().copy(imageUrl = art, tvBannerUrl = art, screenshotUrl = art,
+        val game = games.first().copy(imageUrl = art, tvBannerUrl = art, screenshotUrl = art, publisherName = "Horizon Studio",
             variants = listOf(GameVariant("steam", "STEAM"), GameVariant("epic", "EPIC")))
         var showLaunch by mutableStateOf(false)
         compose.setContent {
@@ -216,10 +217,15 @@ class SpaceUiInstrumentedTest {
         compose.onNodeWithText(context.getString(R.string.controller_action_favorite)).assertDoesNotExist()
         val screen = compose.onNodeWithTag("space-game-hub").getUnclippedBoundsInRoot()
         val viewport = compose.onNodeWithTag("space-hub-scroll").getUnclippedBoundsInRoot()
-        assertTrue("Actions begin near the bottom of the initial viewport", play.bottom > viewport.bottom - 24.dp)
+        val author = compose.onNodeWithTag("space-hub-author").getUnclippedBoundsInRoot()
+        assertTrue("Play sits directly below the developer", play.top >= author.bottom && play.top - author.bottom < 24.dp)
+        assertEquals("Play aligns with the developer name", author.left.value, play.left.value, 2f)
+        compose.onNodeWithTag("space-hub-about").assertIsDisplayed()
+        val details = compose.onNodeWithTag("space-hub-details").getUnclippedBoundsInRoot()
+        assertTrue("Additional details start below the initial viewport", details.top >= viewport.bottom)
         compose.onNodeWithTag("space-hub-play").assertIsDisplayed()
         capture("space-hub")
-        compose.onNodeWithTag("space-hub-description").performScrollTo()
+        compose.onNodeWithTag("space-hub-details").performScrollTo()
         val movedPlay = compose.onNodeWithTag("space-hub-play").getUnclippedBoundsInRoot()
         assertTrue("Actions scroll upward with the hero", movedPlay.top < play.top)
         compose.onNodeWithTag("space-ownership-badge").performScrollTo()
@@ -228,6 +234,7 @@ class SpaceUiInstrumentedTest {
         compose.onNodeWithContentDescription("Gallery").performClick()
         compose.onNodeWithTag("space-gallery-image").assertIsDisplayed()
         capture("space-gallery")
+        compose.runOnIdle { inputModeManager.requestInputMode(InputMode.Keyboard) }
         compose.onNodeWithTag("space-gallery-image").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.RequestFocus) { it() }
         compose.onNodeWithTag("space-gallery-image").performKeyInput { pressKey(Key.DirectionDown) }
         compose.onNodeWithTag("space-hub-description").assertIsDisplayed()
@@ -279,12 +286,14 @@ class SpaceUiInstrumentedTest {
     @Test fun gameHubShowsFullDescriptionAndAvailableCatalogFacts() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val art = "android.resource://${context.packageName}/${R.drawable.catalog_colorful_abstract_background}"
-        val fullDescription = "Explore a living world, build your team, and discover the secrets beyond the horizon. ".repeat(12).trim()
+        val fullDescription = "Explore a living world, build your team, and discover the secrets beyond the horizon. ".repeat(100).trim()
         val game = games.first().copy(imageUrl = art, tvBannerUrl = art, description = fullDescription, longDescription = "Different provider-only description",
             publisherName = "Horizon Studio", playabilityState = "AVAILABLE", membershipTierLabel = "Ultimate",
             contentRatings = listOf("ESRB T"), featureLabels = listOf("SINGLE_PLAYER", "MULTIPLAYER", "RTX"),
             variants = listOf(GameVariant("steam", "STEAM", supportedControls = listOf("GAMEPAD", "KEYBOARD_MOUSE"))))
         compose.setContent {
+            val inputMode = LocalInputModeManager.current
+            SideEffect { inputMode.requestInputMode(InputMode.Keyboard) }
             SpaceGameHub(game, false, null, onPlay = {}, onChooseStore = {}, onFavorite = {},
                 connectedTvName = null, onPlayOnTv = {}, removeLabel = null, removeConfirmationText = null,
                 removeEnabled = false, onRemove = null, onDismiss = {})
@@ -487,6 +496,53 @@ class SpaceUiInstrumentedTest {
         compose.runOnIdle { position = 3 }
         compose.mainClock.advanceTimeBy(32)
         compose.onNodeWithTag("space-queue-status").assertTextEquals("Queue position: 3")
+    }
+
+    @Test fun minimizedQueueUsesTheTopRailAndKeepsRestoreAndCancelActions() {
+        var restores = 0
+        var cancels = 0
+        val state = OpenNowUiState(games = games, streamGame = games.first(), streamStatus = "queue",
+            streamLaunchMinimized = true, queuePosition = 12)
+        compose.setContent {
+            SpaceUiTheme {
+                SpaceUiScreen(state, onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {},
+                    onResumeSession = {}, inputEnabled = true, settingsContent = {},
+                    queueContent = { compact ->
+                        SpaceMinimizedQueueControl(state, compact, onRestore = { restores++ }, onCancel = { cancels++ })
+                    })
+            }
+        }
+        val rail = compose.onNodeWithTag("space-top-rail").getUnclippedBoundsInRoot()
+        val queue = compose.onNodeWithTag("space-queue-rail").getUnclippedBoundsInRoot()
+        assertTrue("The minimized queue must fit inside the top rail", queue.top >= rail.top && queue.bottom <= rail.bottom)
+        assertTrue("The queue controls must fit horizontally", queue.left >= rail.left && queue.right <= rail.right)
+        compose.onNodeWithTag("space-queue-restore").performClick()
+        compose.onNodeWithTag("space-queue-rail-cancel").performClick()
+        compose.runOnIdle { assertEquals(1, restores); assertEquals(1, cancels) }
+        capture("space-queue-rail")
+    }
+
+    @Test fun rigSetupCircleDisplaysSuppliedProgressAndHoldsWithoutSpinning() {
+        compose.mainClock.autoAdvance = false
+        var progress by mutableFloatStateOf(0f)
+        compose.setContent {
+            CompositionLocalProvider(LocalReduceMotion provides true) {
+                SpaceLaunchScreen(OpenNowUiState(streamGame = games.first(), streamStatus = "connecting"),
+                    status = "Setting up rig", connectingProgress = { progress }, onMinimize = {}, onCancel = {})
+            }
+        }
+        compose.mainClock.advanceTimeBy(1000)
+        val empty = compose.onRoot().captureToImage().asAndroidBitmap()
+        compose.runOnIdle { progress = .45f }
+        compose.mainClock.advanceTimeBy(32)
+        val halfway = compose.onRoot().captureToImage().asAndroidBitmap()
+        assertFalse("The setup circle must display changing progress even with reduced motion", empty.sameAs(halfway))
+        compose.runOnIdle { progress = .9f }
+        compose.mainClock.advanceTimeBy(32)
+        val capped = compose.onRoot().captureToImage().asAndroidBitmap()
+        assertFalse("The circle must continue filling to 90%", halfway.sameAs(capped))
+        compose.mainClock.advanceTimeBy(2000)
+        assertTrue("Determinate setup progress must hold instead of spinning", capped.sameAs(compose.onRoot().captureToImage().asAndroidBitmap()))
     }
 
     @Test fun consoleSettingsKeepSectionsAndExperimentalControlsAccessible() {

@@ -479,6 +479,12 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     private val openNowApplication = application as OpenNowApplication
     private val http: OkHttpClient = openNowApplication.httpClient
     private val settingsStore = SettingsStore(application)
+    private val spaceUiEnablement = SpaceUiEnablement(
+        hasConfirmed = settingsStore::hasConfirmedSpaceUiEnable,
+        rememberConfirmation = settingsStore::confirmSpaceUiEnable,
+        setEnabled = { enabled -> settingsStore.update { it.copy(experimentalSpaceUi = enabled) } },
+    )
+    internal val spaceUiEnableConfirmationPending = spaceUiEnablement.confirmationPending
     private val sessionTimerAnchorStore = SessionTimerAnchorStore(application)
     private val authStore = openNowApplication.authStore
     private val authRepository = openNowApplication.authRepository
@@ -2175,6 +2181,14 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
+
+    fun setSpaceUiEnabled(enabled: Boolean) {
+        spaceUiEnablement.request(enabled)
+    }
+
+    internal fun confirmSpaceUiEnable() = spaceUiEnablement.confirm()
+
+    internal fun cancelSpaceUiEnable() = spaceUiEnablement.cancel()
 
     fun updateSettings(next: AppSettings) {
         settingsStore.replace(next)
