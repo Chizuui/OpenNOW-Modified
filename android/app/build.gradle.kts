@@ -1,6 +1,7 @@
 import com.android.build.api.instrumentation.FramesComputationMode
 import com.android.build.api.instrumentation.InstrumentationScope
 import com.opencloudgaming.buildlogic.WebRtcAudioGuardFactory
+import com.opencloudgaming.buildlogic.WebRtcTextureDeliveryFactory
 
 plugins {
     id("com.android.application")
@@ -11,6 +12,10 @@ plugins {
 androidComponents.onVariants { variant ->
     variant.instrumentation.transformClassesWith(
         WebRtcAudioGuardFactory::class.java,
+        InstrumentationScope.ALL,
+    ) {}
+    variant.instrumentation.transformClassesWith(
+        WebRtcTextureDeliveryFactory::class.java,
         InstrumentationScope.ALL,
     ) {}
     variant.instrumentation.setAsmFramesComputationMode(
@@ -35,8 +40,8 @@ android {
         // target changes are audited; LAN access is permission-gated at its feature boundary.
         //noinspection EditedTargetSdkVersion
         targetSdk = 37
-        versionCode = 174
-        versionName = "2.1.8"
+        versionCode = 176
+        versionName = "2.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("boolean", "APK_UPDATES_SUPPORTED", "true")

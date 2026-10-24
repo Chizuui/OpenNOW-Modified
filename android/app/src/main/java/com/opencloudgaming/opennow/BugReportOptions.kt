@@ -1,8 +1,5 @@
 package com.opencloudgaming.opennow
 
-import android.content.ContentResolver
-import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
@@ -46,7 +43,6 @@ import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
 import java.io.Serializable
 
 private const val ANDROID_BUG_REPORT_MAX_MEDIA_TOTAL_BYTES = 20L * 1024L * 1024L
@@ -110,7 +106,7 @@ internal fun BugReportOptions(
                 runCatching {
                     var totalBytes = attachments.sumOf { it.bytes.size.toLong() }
                     uris.take(4 - attachments.size).map { uri ->
-                        readBugReportMedia(context.contentResolver, uri).also { media ->
+                        readBugReportAttachment(context.contentResolver, uri).also { media ->
                             totalBytes += media.bytes.size
                             require(totalBytes <= ANDROID_BUG_REPORT_MAX_MEDIA_TOTAL_BYTES) {
                                 "Attached media must be 20 MiB or less in total"
@@ -276,30 +272,4 @@ private fun <T> BugReportOptionChips(
             }
         }
     }
-}
-
-private fun readBugReportMedia(contentResolver: ContentResolver, uri: Uri): AndroidBugReportAttachment {
-    val fileName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-        if (cursor.moveToFirst()) cursor.getString(0) else null
-    }?.take(180)?.takeIf { it.isNotBlank() } ?: "media"
-    val declaredSize = contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
-    require(declaredSize <= ANDROID_BUG_REPORT_MAX_FILE_BYTES || declaredSize < 0) { "$fileName is larger than 10 MiB" }
-    val bytes = contentResolver.openInputStream(uri)?.use { input ->
-        val output = ByteArrayOutputStream()
-        val buffer = ByteArray(16 * 1024)
-        var total = 0L
-        while (true) {
-            val count = input.read(buffer)
-            if (count < 0) break
-            total += count
-            require(total <= ANDROID_BUG_REPORT_MAX_FILE_BYTES) { "$fileName is larger than 10 MiB" }
-            output.write(buffer, 0, count)
-        }
-        output.toByteArray()
-    } ?: error("Could not read $fileName")
-    return AndroidBugReportAttachment(
-        fileName = fileName,
-        contentType = contentResolver.getType(uri)?.take(120) ?: "application/octet-stream",
-        bytes = bytes,
-    )
 }

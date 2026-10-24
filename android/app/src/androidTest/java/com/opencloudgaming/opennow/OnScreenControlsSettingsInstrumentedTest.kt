@@ -144,6 +144,7 @@ class OnScreenControlsSettingsInstrumentedTest {
     }
     @Test fun compactStreamMenuKeepsControlsAudioAndStatusBarVisible() {
         var settings by mutableStateOf(AppSettings())
+        var screenshotBusy by mutableStateOf(false)
         compose.setContent {
             OpenNowTheme(AppSettings(), physicalControllerConnected = false) {
                 androidx.compose.foundation.layout.Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
@@ -171,6 +172,9 @@ class OnScreenControlsSettingsInstrumentedTest {
                         statusBarDragging = false,
                         receivedBitrateKbps = null,
                         recordingPhase = null,
+                        screenshotEnabled = !screenshotBusy,
+                        screenshotBusy = screenshotBusy,
+                        onScreenshot = { screenshotBusy = true },
                         touchLayoutEditing = false,
                         bugReportSubmission = BugReportSubmissionState(),
                         bugReportVersionCheck = AndroidBugReportVersionCheckState(),
@@ -221,6 +225,9 @@ class OnScreenControlsSettingsInstrumentedTest {
                 }
             }
         }
+        compose.onNodeWithText("Screenshot").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Saving screenshot…").assertIsNotEnabled()
+        compose.runOnIdle { screenshotBusy = false }
         capture("stream-controls.png")
         compose.onNodeWithText("On-screen controls").assertIsDisplayed()
         compose.onNodeWithText("Audio").assertIsDisplayed()

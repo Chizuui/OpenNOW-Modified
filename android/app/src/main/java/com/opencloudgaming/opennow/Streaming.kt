@@ -461,6 +461,9 @@ class NativeStreamClient(
     private val controllerSlots = linkedMapOf<Int, Int>()
     private val controllerFamiliesBySlot = mutableMapOf<Int, AndroidControllerFamily>()
     private val controllerAxisAvailability = mutableMapOf<Int, AndroidGamepadAxisAvailability>()
+    private var controllerCapabilitiesJob: Job? = null
+    private var controllerCapabilitiesSampleAtMs = Long.MIN_VALUE
+    private var controllerCapabilitiesDeviceIds = emptyList<Int>()
     private val physicalGamepadStates = Array(GAMEPAD_MAX_CONTROLLERS) { PhysicalGamepadState() }
     private val activePhysicalGamepadState get() = physicalGamepadStates[activeControllerId]
     private var physicalButtons: Int
@@ -1156,6 +1159,10 @@ class NativeStreamClient(
         controllerSlots.clear()
         controllerFamiliesBySlot.clear()
         controllerAxisAvailability.clear()
+        controllerCapabilitiesJob?.cancel()
+        controllerCapabilitiesJob = null
+        controllerCapabilitiesSampleAtMs = Long.MIN_VALUE
+        controllerCapabilitiesDeviceIds = emptyList()
         mousePositionValid = false
         mouseSuppressNextAbsoluteDelta = false
         externalMouseMotionAccumulator.reset()
@@ -1183,20 +1190,21 @@ class NativeStreamClient(
     fun dispatchKey(event: KeyEvent): Boolean {
         // Before the WebRTC input channel opens, leave keyboard events available to Android and
         // Compose. Consuming them here makes queue/desktop UI look completely unresponsive.
-        if (!hasReadyInputChannel()) return false
-        if (event.isGamepadEvent()) {
-            val receivedAtMs = SystemClock.uptimeMillis()
+        val inputReady = hasReadyInputChannel()
+        val controllerInput = event.isControllerInputDevice()
+        val receivedAtMs = SystemClock.uptimeMillis()
+        if (!inputReady) {
+            if (controllerInput) recordControllerKey(event, receivedAtMs, ready = false, routed = false, handled = false)
+            return false
+        }
+        if (NativeStreamInputRouter.shouldRouteKeyAsGamepad(controllerInput, event.keyCode)) {
             val handled = dispatchGamepadKey(event)
-            if (event.repeatCount == 0) {
-                NativeInputDiagnostics.retainCounted(
-                    key = "controller.key.${event.action}",
-                ) {
-                    "physical gamepad key device=${event.deviceId} key=${event.keyCode} action=${event.action} " +
-                        "deliveryDelayMs=${(receivedAtMs - event.eventTime).coerceAtLeast(0L)} " +
-                        "dispatchMs=${SystemClock.uptimeMillis() - receivedAtMs} handled=$handled"
-                }
-            }
+            recordControllerKey(event, receivedAtMs, ready = true, routed = true, handled = handled)
             if (handled) return true
+        } else if (controllerInput) {
+            // Numbered/unknown buttons can miss the gamepad router entirely. Preserve their
+            // scan codes too; otherwise the very buttons requiring a compatibility fix vanish.
+            recordControllerKey(event, receivedAtMs, ready = true, routed = false, handled = false)
         }
         val hardwareKeyboard = event.isHardwareKeyboardSource()
         val remappedKeyCode = if (hardwareKeyboard) physicalInputSettings.keyboardKeyCode(event.keyCode) else event.keyCode
@@ -1309,7 +1317,14 @@ class NativeStreamClient(
 
     fun dispatchMotion(event: MotionEvent): Boolean {
         // Mouse/controller events must fall through to native UI until cloud input is ready.
-        if (!hasReadyInputChannel()) return false
+        if (!hasReadyInputChannel()) {
+            if (event.isGamepadMotionEvent()) {
+                NativeInputDiagnostics.controllerSample("controller.motion-not-ready.${event.deviceId}") {
+                    "physical gamepad motion inputId=${event.deviceId} inputReady=false " + inputChannelStateSummary()
+                }
+            }
+            return false
+        }
         if (event.isGamepadMotionEvent()) {
             return dispatchJoystick(event)
         }
@@ -2393,6 +2408,9 @@ class NativeStreamClient(
     fun endGyroscopeMouseAim(eventTimeMs: Long) {
         flushAccumulatedMouseMove(gyroscopeMouseMotionAccumulator, eventTimeMs)
     }
+
+    internal suspend fun captureStreamScreenshot(): android.graphics.Bitmap =
+        checkNotNull(renderer) { "No active video renderer" }.captureScreenshot()
 
     internal fun canStartStreamRecording(): Boolean {
         val activeRenderer = renderer
@@ -4189,6 +4207,24 @@ class NativeStreamClient(
             setControllerMouseAssistActive(false)
         }
         val sent = sendBurstLimitedGamepadState(controllerId = controllerId, trackPhysicalStickRelease = true)
+        // Include neutral samples: logging only activity hides stuck axes and failed releases.
+        // All string building and extra axis reads are behind the sampling gate.
+        val neutralOutput = lastLeftStickX == 0 && lastLeftStickY == 0 && lastRightStickX == 0 &&
+            lastRightStickY == 0 && lastLeftTrigger == 0 && lastRightTrigger == 0 &&
+            (physicalButtons or physicalHatButtons) == 0
+        NativeInputDiagnostics.controllerSample(
+            "controller.motion.$controllerId.${if (neutralOutput) "neutral" else "active"}", history = true,
+        ) {
+            "physical gamepad motion inputId=${event.deviceId} slot=$controllerId " +
+                "eventTimeMs=${event.eventTime} source=0x${event.source.toString(16)} " +
+                "raw=[${ControllerInputDiagnostics.axes(event)}] " +
+                "resolvedLeft=${axes.leftSource} resolvedRight=${axes.rightSource} hatAsLeft=${axes.hatUsedAsLeftStick} " +
+                "analogTriggers=$hasAnalogL,$hasAnalogR triggerInput=$ltRaw,$rtRaw " +
+                "outputLeft=$lastLeftStickX,$lastLeftStickY outputRight=$lastRightStickX,$lastRightStickY " +
+                "outputTriggers=$lastLeftTrigger,$lastRightTrigger outputButtons=${physicalButtons or physicalHatButtons} " +
+                "mouseEmulation=$controllerMouseEmulationActive mouseAssist=$controllerMouseAssistActive " +
+                "settings=$physicalInputSettings sendAccepted=$sent ${inputChannelStateSummary()}"
+        }
         if (
             abs(leftX) > ANALOG_ACTIVITY_THRESHOLD ||
             abs(leftY) > ANALOG_ACTIVITY_THRESHOLD ||
@@ -4208,6 +4244,34 @@ class NativeStreamClient(
             }
         }
         return sent
+    }
+
+    private fun recordControllerKey(event: KeyEvent, receivedAtMs: Long, ready: Boolean, routed: Boolean, handled: Boolean) {
+        if (event.repeatCount != 0) return
+        NativeInputDiagnostics.controllerSample(
+            key = "controller.raw-key.${event.deviceId}.${event.keyCode}.${event.scanCode}.${event.action}.$ready.$routed.$handled",
+            history = true,
+        ) {
+            val baseMask = GamepadButtonMapping.maskForKeyCode(event.keyCode, controllerActivation = true)
+            val mappedMask = baseMask?.let(physicalInputSettings::buttonMask)
+            val trigger = when (event.keyCode) {
+                KeyEvent.KEYCODE_BUTTON_L2 -> "left"
+                KeyEvent.KEYCODE_BUTTON_R2 -> "right"
+                else -> "none"
+            }
+            // Unsupported keys may not assign a slot. Never attribute them to whichever
+            // other controller happened to send the previous event.
+            val slot = controllerSlots[event.deviceId] ?: -1
+            val physical = physicalGamepadStates.getOrNull(slot)
+            "physical gamepad key ${ControllerInputDiagnostics.key(event)} slot=$slot eventTimeMs=${event.eventTime} " +
+                "baseMask=$baseMask mappedMask=$mappedMask trigger=$trigger " +
+                "physicalButtons=${physical?.let { it.buttons or it.hatButtons }} " +
+                "physicalTriggers=${physical?.leftTrigger},${physical?.rightTrigger} " +
+                "inputReady=$ready gamepadRoute=$routed handled=$handled " +
+                "mouseEmulation=$controllerMouseEmulationActive mouseAssist=$controllerMouseAssistActive " +
+                "deliveryDelayMs=${(receivedAtMs - event.eventTime).coerceAtLeast(0L)} " +
+                "dispatchMs=${SystemClock.uptimeMillis() - receivedAtMs} ${inputChannelStateSummary()}"
+        }
     }
 
     private fun dispatchGamepadKey(event: KeyEvent): Boolean {
@@ -4853,6 +4917,7 @@ class NativeStreamClient(
                 }
             }
         }
+        sampleControllerCapabilities(connectedDevices)
         val activeControllerDisconnected = activeControllerId in removedControllerSlots.values
         val connected = connectedDevices.isNotEmpty()
         val connectionChanged = connected != physicalControllerConnected
@@ -4883,6 +4948,31 @@ class NativeStreamClient(
             (newlyAssignedSlots + removedControllerSlots.values).distinct().forEach(::sendCurrentGamepadState)
         }
         updateHapticsAdvertisement(force = connectionChanged)
+    }
+
+    private fun sampleControllerCapabilities(devices: List<InputDevice>) {
+        // hasKeys() can call the Android input service. Never query it on the input/UI thread
+        // or while holding the diagnostics lock. One bounded batch, with no pending backlog.
+        if (controllerCapabilitiesJob?.isActive == true) return
+        val selected = devices.take(GAMEPAD_MAX_CONTROLLERS)
+        val ids = selected.map { it.id }
+        val now = SystemClock.elapsedRealtime()
+        if (ids == controllerCapabilitiesDeviceIds && controllerCapabilitiesSampleAtMs != Long.MIN_VALUE &&
+            now - controllerCapabilitiesSampleAtMs in 0 until 30_000L) return
+        controllerCapabilitiesDeviceIds = ids
+        controllerCapabilitiesSampleAtMs = now
+        val slots = selected.map { controllerSlots[it.id] }
+        controllerCapabilitiesJob = scope.launch {
+            val descriptions = withContext(Dispatchers.IO) {
+                selected.mapIndexed { index, device ->
+                    runCatching { ControllerInputDiagnostics.capabilities(device, slots[index]) }
+                        .getOrElse { "controller capabilities inputId=${device.id} unavailable=${it.javaClass.simpleName}" }
+                }
+            }
+            descriptions.forEachIndexed { index, description ->
+                NativeInputDiagnostics.controllerSample("controller.capabilities.${ids[index]}") { description }
+            }
+        }
     }
 
     private fun schedulePrimeConnectedGamepadState(reason: String) {

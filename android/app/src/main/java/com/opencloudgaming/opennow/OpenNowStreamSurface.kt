@@ -402,6 +402,16 @@ internal fun StreamScreen(
         )
     }
 
+    val screenshotAction = rememberStreamScreenshotAction(
+        client = client,
+        sessionId = session?.sessionId,
+        streamReady = streamReady,
+        gameTitle = game?.title,
+        folder = state.settings.recordingDirectoryUri,
+        onFolderSelected = { folder ->
+            viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = folder))
+        },
+    )
     val recordingPhase by client.recordingPhase.collectAsStateWithLifecycle()
     val recordingLifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(client, recordingLifecycleOwner) {
@@ -426,7 +436,7 @@ internal fun StreamScreen(
             var started = false
             try {
                 val uri = withContext(Dispatchers.IO) {
-                    RecordingDestination.createFile(context, folder, fileName).also { createdUri = it }
+                    StreamCaptureDestination.createFile(context, folder, fileName).also { createdUri = it }
                 }
                 val sameActiveSession = requestedSessionId == currentRecordingSessionId && currentRecordingStreamReady &&
                     recordingLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
@@ -468,7 +478,7 @@ internal fun StreamScreen(
         pendingRecordingFileName = null
         pendingRecordingSettings = null
         if (uri != null && requestedSessionId != null && fileName != null && options != null) {
-            if (RecordingDestination.rememberFolder(context, uri)) {
+            if (StreamCaptureDestination.rememberFolder(context, uri)) {
                 viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = uri.toString()))
                 startRecordingInFolder(uri.toString(), requestedSessionId, fileName, options)
             } else {
@@ -489,7 +499,7 @@ internal fun StreamScreen(
         }
         val folder = state.settings.recordingDirectoryUri
         if (folder == null) {
-            if (!RecordingDestination.launchFolderPicker(context, recordingFolderLauncher)) {
+            if (!StreamCaptureDestination.launchFolderPicker(context, recordingFolderLauncher)) {
                 pendingRecordingSessionId = null
                 pendingRecordingFileName = null
                 pendingRecordingSettings = null
@@ -1207,6 +1217,9 @@ internal fun StreamScreen(
                     statusBarDragging = statusBarDragging,
                     receivedBitrateKbps = streamStats.bitrateKbps,
                     recordingPhase = recordingPhase,
+                    screenshotEnabled = streamReady && !screenshotAction.busy && !recordingOutputPending && pendingRecordingSessionId == null,
+                    screenshotBusy = screenshotAction.busy,
+                    onScreenshot = screenshotAction.capture,
                     touchLayoutEditing = touchLayoutEditing,
                     bugReportSubmission = state.bugReportSubmission,
                     bugReportVersionCheck = state.bugReportVersionCheck,
@@ -1294,16 +1307,11 @@ internal fun StreamScreen(
                             StreamRecorderPhase.Recording -> client.stopStreamRecording()
                             StreamRecorderPhase.Starting, StreamRecorderPhase.Finalizing -> Unit
                             else -> {
-                                if (recordingOutputPending || pendingRecordingSessionId != null) {
+                                if (screenshotAction.busy || recordingOutputPending || pendingRecordingSessionId != null) {
                                     Unit
                                 } else if (client.canStartStreamRecording()) {
-                                    val safeTitle = game?.title
-                                        ?.replace(Regex("[^\\p{L}\\p{N}._-]+"), "_")
-                                        ?.take(48)
-                                        .orEmpty()
-                                        .ifBlank { "Game" }
                                     session?.sessionId?.let { activeSessionId ->
-                                        val fileName = "OpenNOW_${safeTitle}_${System.currentTimeMillis()}.mp4"
+                                        val fileName = streamCaptureFileName(game?.title, "mp4")
                                         val options = state.settings.stream
                                         if (options.recordingCameraEnabled && !context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
                                             Toast.makeText(context, R.string.stream_record_camera_unavailable, Toast.LENGTH_LONG).show()

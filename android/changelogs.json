@@ -1,7 +1,8 @@
 {
-  "174": {
-    "version": "2.1.8",
+  "175": {
+    "version": "2.1.9",
     "notes": [
+      "Fixed the Android TV launcher banner",
       "Added **Space UI** under **Settings > Interface**. Still experimental, landscape only, and a controller is recommended.",
       "**On screen controls have their own settings page now**",
       "Keyboard & mouse buttons are easier to find and customize",

@@ -14,7 +14,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class RecordingDestinationInstrumentedTest {
+class StreamCaptureDestinationInstrumentedTest {
     @Test
     fun deviceWithoutFolderPickerDoesNotCrashAndCanRetry() {
         var pickerInstalled = false
@@ -22,16 +22,16 @@ class RecordingDestinationInstrumentedTest {
             if (!pickerInstalled) throw ActivityNotFoundException("No folder picker")
         }
         onMainThread {
-            assertFalse(RecordingDestination.launchFolderPicker(context, launcher))
+            assertFalse(StreamCaptureDestination.launchFolderPicker(context, launcher))
             pickerInstalled = true
-            assertTrue(RecordingDestination.launchFolderPicker(context, launcher))
+            assertTrue(StreamCaptureDestination.launchFolderPicker(context, launcher))
         }
     }
 
     @Test
     fun restrictedFolderPickerDoesNotCrash() {
         onMainThread {
-            assertFalse(RecordingDestination.launchFolderPicker(context, folderLauncher {
+            assertFalse(StreamCaptureDestination.launchFolderPicker(context, folderLauncher {
                 throw SecurityException("Folder picker disabled by device policy")
             }))
         }
@@ -42,7 +42,7 @@ class RecordingDestinationInstrumentedTest {
         var propagated = false
         onMainThread {
             try {
-                RecordingDestination.launchFolderPicker(context, folderLauncher {
+                StreamCaptureDestination.launchFolderPicker(context, folderLauncher {
                     throw IllegalStateException("Launcher is not registered")
                 })
             } catch (_: IllegalStateException) {

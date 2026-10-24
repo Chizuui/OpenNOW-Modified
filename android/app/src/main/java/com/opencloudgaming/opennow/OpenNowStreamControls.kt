@@ -762,6 +762,9 @@ internal fun StreamControlsPanel(
     statusBarDragging: Boolean,
     receivedBitrateKbps: Int?,
     recordingPhase: StreamRecorderPhase?,
+    screenshotEnabled: Boolean,
+    screenshotBusy: Boolean,
+    onScreenshot: () -> Unit,
     touchLayoutEditing: Boolean,
     bugReportSubmission: BugReportSubmissionState,
     bugReportVersionCheck: AndroidBugReportVersionCheckState,
@@ -963,34 +966,50 @@ internal fun StreamControlsPanel(
                 }
                 StreamControlsPage.Main -> {
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
-                    val recordingBusy = recordingPhase == StreamRecorderPhase.Starting || recordingPhase == StreamRecorderPhase.Finalizing
-                    val recordingLabel = when (recordingPhase) {
-                        StreamRecorderPhase.Starting -> R.string.stream_record_starting
-                        StreamRecorderPhase.Finalizing -> R.string.stream_record_saving
-                        StreamRecorderPhase.Recording -> R.string.stream_record_stop
-                        else -> R.string.stream_record_start
+                Column(verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                        val recordingBusy = recordingPhase == StreamRecorderPhase.Starting || recordingPhase == StreamRecorderPhase.Finalizing
+                        val recordingLabel = when (recordingPhase) {
+                            StreamRecorderPhase.Starting -> R.string.stream_record_starting
+                            StreamRecorderPhase.Finalizing -> R.string.stream_record_saving
+                            StreamRecorderPhase.Recording -> R.string.stream_record_stop
+                            else -> R.string.stream_record_start
+                        }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onRecordingToggle() },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            enabled = !recordingBusy,
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(recordingLabel), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onScreenshot() },
+                            enabled = screenshotEnabled,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(
+                                stringResource(if (screenshotBusy) R.string.stream_screenshot_saving else R.string.stream_screenshot),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onRecordingToggle() },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
-                        enabled = !recordingBusy,
-                        modifier = Modifier.weight(1f),
-                    ) { Text(stringResource(recordingLabel), maxLines = 1, overflow = TextOverflow.Ellipsis) }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onKeyboardOpen() },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
-                        modifier = Modifier.weight(1f),
-                    ) { Text(stringResource(R.string.stream_panel_keyboard), maxLines = 1) }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onExit() },
-                        modifier = Modifier.weight(1f),
-                        border = BorderStroke(1.dp, OpenNowPalette.AccentSwitchRed),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = OpenNowPalette.AccentSwitchRed.copy(alpha = 0.10f),
-                            contentColor = OpenNowPalette.AccentSwitchRed,
-                        ),
-                    ) { Text(stringResource(R.string.stream_panel_exit), maxLines = 1) }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onKeyboardOpen() },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(R.string.stream_panel_keyboard), maxLines = 1) }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onExit() },
+                            modifier = Modifier.weight(1f),
+                            border = BorderStroke(1.dp, OpenNowPalette.AccentSwitchRed),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = OpenNowPalette.AccentSwitchRed.copy(alpha = 0.10f),
+                                contentColor = OpenNowPalette.AccentSwitchRed,
+                            ),
+                        ) { Text(stringResource(R.string.stream_panel_exit), maxLines = 1) }
+                    }
                 }
             }
             if (!tvProfile) item {

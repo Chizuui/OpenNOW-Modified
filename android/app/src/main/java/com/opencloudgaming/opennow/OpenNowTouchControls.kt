@@ -353,10 +353,10 @@ private fun BoxScope.KeyboardTouchControls(
         if (option != null) key(button.id) {
             val positionKey = button.positionKey()
             val layoutIndex = button.layoutIndex.takeIf { it >= 0 } ?: index
-            val footprint = (buttonSize * (LocalTouchButtonAppearances.current[button.appearanceKey()]?.effectiveSizeScale() ?: 1f))
-                .coerceAtLeast(48.dp)
-            val offset = getStoredOffset(positionKey) ?: keyboardButtonViewportOffset(
+            val footprint = buttonSize * (LocalTouchButtonAppearances.current[button.appearanceKey()]?.effectiveSizeScale() ?: 1f)
+            val offset = keyboardButtonViewportOffset(
                 index = layoutIndex,
+                storedOffset = getStoredOffset(positionKey),
                 spacingDp = maxOf(buttonSize, footprint).value + gap.value,
                 buttonSizeDp = footprint.value,
                 viewportWidthDp = viewportWidth.value,

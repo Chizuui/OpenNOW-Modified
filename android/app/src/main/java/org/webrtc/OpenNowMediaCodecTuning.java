@@ -25,6 +25,7 @@ public final class OpenNowMediaCodecTuning {
     default void inputQueued() {}
     default void outputDequeued(boolean codecConfig) {}
     default void outputReleased(boolean render) {}
+    default void outputFormat(String codecName, MediaFormat format) {}
   }
 
   private OpenNowMediaCodecTuning() {}
@@ -85,7 +86,15 @@ public final class OpenNowMediaCodecTuning {
       tuning.outputReleased(render);
     }
     @Override public MediaFormat getInputFormat() { return delegate.getInputFormat(); }
-    @Override public MediaFormat getOutputFormat() { return delegate.getOutputFormat(); }
+    @Override public MediaFormat getOutputFormat() {
+      MediaFormat format = delegate.getOutputFormat();
+      // AndroidVideoDecoder reads this on format changes. Keep diagnostics off the per-frame
+      // getOutputFormat(index) path, and never let an observer interrupt video delivery.
+      try {
+        tuning.outputFormat(name, format);
+      } catch (RuntimeException ignored) {}
+      return format;
+    }
     @Override public MediaFormat getOutputFormat(int index) { return delegate.getOutputFormat(index); }
     @Override public ByteBuffer getInputBuffer(int index) { return delegate.getInputBuffer(index); }
     @Override public ByteBuffer getOutputBuffer(int index) { return delegate.getOutputBuffer(index); }

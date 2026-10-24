@@ -1421,6 +1421,16 @@
                 "mouseSensitivity": {
                     "type": "number"
                 },
+                "touchMouseSensitivity": {
+                    "anyOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
                 "mouseAcceleration": {
                     "type": "integer"
                 },

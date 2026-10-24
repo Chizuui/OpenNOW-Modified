@@ -735,7 +735,11 @@
     "stream_menu_shortcut_reset": "Reset"
   },
   "androidStreamVideo": {
-    "stream_record_folder_picker_unavailable": "Could not open the folder picker. Install or enable a system Files app to choose a recording folder.",
+    "stream_screenshot": "Screenshot",
+    "stream_screenshot_saving": "Saving screenshot…",
+    "stream_screenshot_saved": "Screenshot saved to your recording folder.",
+    "stream_screenshot_failed": "Could not save the screenshot. Check that video is playing and your recording folder is available.",
+    "stream_record_folder_picker_unavailable": "Could not open the folder picker. Install or enable a system Files app to choose a folder for recordings and screenshots.",
     "settings_recording_microphone": "Include microphone",
     "settings_recording_microphone_desc": "Mix your voice with game audio. When the in-game microphone is enabled, its mute control also mutes your recorded voice. Recording stops when you leave the app.",
     "settings_recording_camera": "Include camera",
@@ -850,6 +854,10 @@
     "bug_report_inbox_reply_title": "Reply to the release team",
     "bug_report_inbox_reply_hint": "Add more information or answer a question",
     "bug_report_inbox_terms": "I agree to use bug reporting for good-faith product feedback. Abusive, spam, or knowingly false reports may result in a reporting ban.",
+    "bug_report_reply_add_files": "Attach files",
+    "bug_report_reply_include_logs": "Attach current debug logs",
+    "bug_report_reply_reading_files": "Reading attachments…",
+    "bug_report_reply_attachment_note": "Attach up to 4 files (10 MiB each, 20 MiB total). Current debug logs are optional and captured when you send.",
     "bug_report_inbox_send": "Send reply",
     "bug_report_inbox_sending_reply": "Sending reply…",
     "bug_report_inbox_closed": "This conversation is closed. If the release team reopens it, replies will become available again.",

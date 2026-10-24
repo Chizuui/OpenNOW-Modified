@@ -2,7 +2,6 @@ package com.opencloudgaming.opennow
 
 import android.view.KeyEvent
 import java.util.UUID
-import kotlin.math.roundToInt
 
 internal enum class KeyboardButtonCategory {
     Mouse,
@@ -229,7 +228,7 @@ internal fun AndroidTouchSettings.withKeyboardButtonAdded(button: KeyboardOverla
     if (normalizeKeyboardOverlayButtons(listOf(button)).isEmpty() || keyboardButtons.any { it.id == button.id }) return this
     val normalizedButtons = normalizeKeyboardOverlayButtons(keyboardButtons)
     if (normalizedButtons.size >= MAX_KEYBOARD_OVERLAY_BUTTONS) return this
-    val nextSlot = (normalizedButtons.maxOfOrNull(KeyboardOverlayButton::layoutIndex) ?: 6) + 1
+    val nextSlot = maxOf(6, normalizedButtons.maxOfOrNull(KeyboardOverlayButton::layoutIndex) ?: 6) + 1
     return copy(keyboardButtons = normalizedButtons + button.copy(layoutIndex = nextSlot))
 }
 
@@ -265,7 +264,7 @@ internal fun keyboardButtonDefaultOffset(index: Int, spacingDp: Float, migratedG
     return TouchOffset(x + migration.x, y + migration.y)
 }
 
-/** Wrap automatic slots into adjacent columns instead of extending above a short screen. */
+/** Keep saved positions reachable; unpositioned custom keys start at the viewport center. */
 internal fun keyboardButtonViewportOffset(
     index: Int,
     spacingDp: Float,
@@ -273,6 +272,7 @@ internal fun keyboardButtonViewportOffset(
     viewportWidthDp: Float,
     viewportHeightDp: Float,
     migratedGroupOffset: TouchOffset = TouchOffset(),
+    storedOffset: TouchOffset? = null,
 ): TouchOffset {
     if (index < 0 || !spacingDp.isFinite() || spacingDp <= 0f ||
         !buttonSizeDp.isFinite() || buttonSizeDp <= 0f ||
@@ -280,31 +280,14 @@ internal fun keyboardButtonViewportOffset(
     ) return TouchOffset()
     val availableX = (viewportWidthDp - buttonSizeDp).coerceAtLeast(0f)
     val availableY = (viewportHeightDp - buttonSizeDp).coerceAtLeast(0f)
-    val columns = (availableX / spacingDp).toInt() + 1
-    val rows = (availableY / spacingDp).toInt() + 1
-    val original = keyboardButtonDefaultOffset(index, spacingDp)
-    val column = (-original.x / spacingDp).roundToInt()
-    val row = (-original.y / spacingDp).roundToInt()
-    // Retain the original three-column layout, then fill bands to its left. The last
-    // band may be narrower. Only reuse cells once the available grid is full.
-    val slot = (if (rows < 3 || columns < 3) index else row * 3 + column) % (rows * columns)
-    val fullColumns = columns / 3 * 3
-    val fullCapacity = rows * fullColumns
-    val wrappedColumn: Int
-    val wrappedRow: Int
-    if (slot < fullCapacity) {
-        val bandSize = rows * 3
-        wrappedColumn = slot / bandSize * 3 + slot % 3
-        wrappedRow = slot % bandSize / 3
+    val offset = storedOffset ?: if (index < 7) {
+        keyboardButtonDefaultOffset(index, spacingDp, migratedGroupOffset)
     } else {
-        val remainder = slot - fullCapacity
-        val bandWidth = columns - fullColumns
-        wrappedColumn = fullColumns + remainder % bandWidth
-        wrappedRow = remainder / bandWidth
+        // Deliberately allow overlap so adding more keys never pushes them off screen.
+        TouchOffset(-availableX / 2f, -availableY / 2f)
     }
-    val migration = if (index < 7) migratedGroupOffset else TouchOffset()
     return TouchOffset(
-        (-wrappedColumn * spacingDp + migration.x).coerceIn(-availableX, 0f),
-        (-wrappedRow * spacingDp + migration.y).coerceIn(-availableY, 0f),
+        offset.x.coerceIn(-availableX, 0f),
+        offset.y.coerceIn(-availableY, 0f),
     )
 }

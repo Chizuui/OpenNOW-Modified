@@ -740,14 +740,14 @@ private fun SettingsContent(
     var showBugReportDialog by rememberSaveable { mutableStateOf(false) }
     val recordingFolderName by produceState<String?>(null, context, settings.recordingDirectoryUri) {
         value = settings.recordingDirectoryUri?.let { folder ->
-            withContext(Dispatchers.IO) { RecordingDestination.folderName(context, folder) }
+            withContext(Dispatchers.IO) { StreamCaptureDestination.folderName(context, folder) }
         }
     }
     val recordingFolderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
         if (uri != null) {
-            if (RecordingDestination.rememberFolder(context, uri)) {
+            if (StreamCaptureDestination.rememberFolder(context, uri)) {
                 viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = uri.toString()))
             } else {
                 Toast.makeText(context, R.string.stream_record_folder_permission_failed, Toast.LENGTH_LONG).show()
@@ -1197,7 +1197,7 @@ private fun SettingsContent(
                         } else {
                             R.string.settings_recording_folder_selected
                         }),
-                    onClick = { RecordingDestination.launchFolderPicker(context, recordingFolderLauncher) },
+                    onClick = { StreamCaptureDestination.launchFolderPicker(context, recordingFolderLauncher) },
                 )
                 Text(
                     stringResource(R.string.settings_recording_next_session_hint),

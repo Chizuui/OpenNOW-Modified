@@ -238,6 +238,8 @@ internal class MediaCodecSurfaceVideoDecoder(
                     outputWidth = croppedDimension(format, "crop-left", "crop-right", MediaFormat.KEY_WIDTH, width)
                     outputHeight = croppedDimension(format, "crop-top", "crop-bottom", MediaFormat.KEY_HEIGHT, height)
                     require(outputWidth > 0 && outputHeight > 0)
+                    NativeInputDiagnostics.addRetained("codec-output-format",
+                        "MediaCodec direct output hdrRequested=$hdr format=$format")
                     if (hdr && !hdrOutputColorSupported(format.integerOrNull(MediaFormat.KEY_COLOR_STANDARD),
                             format.integerOrNull(MediaFormat.KEY_COLOR_TRANSFER))) {
                         failLocked("HDR output color conversion")
@@ -245,7 +247,6 @@ internal class MediaCodecSurfaceVideoDecoder(
                     }
                     // Format changes can reset scaling mode. Surface layout owns aspect fitting.
                     decoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
-                    NativeInputDiagnostics.add("surface decoder output format=$format hdr=$hdr")
                 } catch (error: Exception) { failLocked("format callback ${error.javaClass.simpleName}") }
             }
         }

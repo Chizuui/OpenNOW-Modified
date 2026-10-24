@@ -1165,7 +1165,12 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun commentOnBugReport(reportId: String, comment: String) {
+    internal fun commentOnBugReport(
+        reportId: String,
+        comment: String,
+        files: List<AndroidBugReportAttachment>,
+        includeLogs: Boolean,
+    ) {
         if (state.value.bugReportThreads.postingReportId != null || state.value.bugReportThreads.changingReportId != null) return
         if (state.value.bugReportThreads.reports.any { it.id == reportId && androidBugReportThreadClosed(it.status) }) {
             _state.update {
@@ -1178,7 +1183,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
-        if (comment.isBlank()) return
+        if (comment.isBlank() && files.isEmpty() && !includeLogs) return
         _state.update {
             it.copy(
                 bugReportThreads = it.bugReportThreads.copy(
@@ -1190,11 +1195,15 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
         viewModelScope.launch {
             try {
+                val replyFiles = if (includeLogs) {
+                    files + bugReportLogAttachment()
+                } else files
                 val updated = postAndroidBugReportComment(
                     http = http,
                     reporterId = androidBugReportReporterId(authStore.stableDeviceId()),
                     reportId = reportId,
                     comment = comment,
+                    files = replyFiles,
                 )
                 _state.update { current ->
                     val reports = current.bugReportThreads.reports
@@ -1315,15 +1324,13 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             try {
                 val languageCheck = identifyAndroidBugReportLanguage(title, description)
-                val logFileName = debugLogFileName()
+                val logAttachment = bugReportLogAttachment()
+                val logFileName = logAttachment.fileName
                 val metadata = buildAndroidBugReportMetadata(
                     logFileName = logFileName,
                     knownIssueOverrideKey = knownIssueOverrideKey,
                     device = AndroidDeviceDiagnostics.snapshot(getApplication()),
                 )
-                val logBytes = withContext(Dispatchers.Default) {
-                    sanitizedDebugLogText().toByteArray(Charsets.UTF_8)
-                }
                 val receipt = uploadAndroidBugReport(
                     http = http,
                     report = AndroidBugReport(
@@ -1335,13 +1342,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                         appLanguageSelectionTag = appLocale.bugReportLanguageTag.orEmpty(),
                         languageCheck = languageCheck,
                         metadata = metadata,
-                        files = listOf(
-                            AndroidBugReportAttachment(
-                                fileName = logFileName,
-                                contentType = "text/plain; charset=utf-8",
-                                bytes = logBytes,
-                            ),
-                        ) + additionalFiles.take(ANDROID_BUG_REPORT_MAX_FILES - 1),
+                        files = listOf(logAttachment) + additionalFiles.take(ANDROID_BUG_REPORT_MAX_FILES - 1),
                         details = details,
                     ),
                 )
@@ -4315,6 +4316,14 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     )
 
     suspend fun sanitizedDebugLogText(): String = withContext(Dispatchers.IO) { debugLogText() }
+
+    private suspend fun bugReportLogAttachment(): AndroidBugReportAttachment = withContext(Dispatchers.IO) {
+        AndroidBugReportAttachment(
+            fileName = debugLogFileName(),
+            contentType = "text/plain; charset=utf-8",
+            bytes = sanitizedDebugLogText().toByteArray(Charsets.UTF_8),
+        )
+    }
 
     fun debugLogFileName(): String {
         val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())

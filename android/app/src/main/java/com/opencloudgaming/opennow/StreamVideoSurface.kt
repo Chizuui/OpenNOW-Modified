@@ -51,6 +51,13 @@ class StreamVideoSurface(context: Context, private val hdr: Boolean, preferDirec
     internal fun currentDecodedSize(): Pair<Int, Int>? =
         if (frameWidth > 0 && frameHeight > 0) frameWidth to frameHeight else null
 
+    /** Copies only the active video layer, including the direct decoder path. Call on the UI thread. */
+    internal suspend fun captureScreenshot(): android.graphics.Bitmap {
+        check(!released && currentDecodedSize() != null) { "No video frame available" }
+        val source = surfaceView
+        return copyStreamScreenshot(source) { !released && surfaceView === source }
+    }
+
     internal fun setRecordingSink(sink: VideoSink?) {
         if (sink != null) requestTextureOutput("recording needs texture frames")
         recordingSink = sink
