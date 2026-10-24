@@ -156,13 +156,13 @@ internal fun OnScreenControlsSettings(
                                             stringResource(R.string.controls_gamepad),
                                             value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_gamepad_hint else R.string.controls_selected),
                                             leadingIcon = Icons.Outlined.SportsEsports,
-                                            onClick = { onModeChange(false); page = TouchSettingsPage.Gamepad },
+                                            onClick = { page = TouchSettingsPage.Gamepad },
                                         )
                                         ControlNavigationRow(
                                             stringResource(R.string.controls_keyboard),
                                             value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_selected else R.string.controls_keyboard_hint),
                                             leadingIcon = Icons.Outlined.Keyboard,
-                                            onClick = { onModeChange(true); page = TouchSettingsPage.Keyboard },
+                                            onClick = { page = TouchSettingsPage.Keyboard },
                                         )
                                     }
                                 }
@@ -187,6 +187,7 @@ internal fun OnScreenControlsSettings(
                                 item { additionalSettings() }
                             }
                             TouchSettingsPage.Keyboard -> {
+                                item { TouchLayoutSelection(touch.keyboardModeEnabled) { onModeChange(true) } }
                                 item { Text(stringResource(R.string.controls_keyboard_help), color = rowStyle.supportingColor, style = MaterialTheme.typography.bodyMedium) }
                                 item { TouchMouseSensitivitySlider(stream, onTouchMouseSensitivityChange) }
                                 item {
@@ -217,6 +218,7 @@ internal fun OnScreenControlsSettings(
                                 }
                             }
                             TouchSettingsPage.Gamepad -> {
+                                item { TouchLayoutSelection(!touch.keyboardModeEnabled) { onModeChange(false) } }
                                 item { notice() }
                                 if (onEditLayout != null) item {
                                     ControlActionRow(
@@ -273,6 +275,18 @@ internal fun OnScreenControlsSettings(
         editingButton.appearanceKey(), touch, onChange,
         onDismiss = { editingButtonId = null },
         onRemove = { onChange(touch.withKeyboardButtonRemoved(editingButton.id)); editingButtonId = null },
+    )
+}
+
+/** Browsing or customizing a layout must not change the saved input mode. */
+@Composable
+private fun TouchLayoutSelection(selected: Boolean, onSelect: () -> Unit) {
+    // Reapplying a saved keyboard choice lets the stream host leave native-touch mode.
+    ControlActionRow(
+        label = stringResource(R.string.controls_use_layout),
+        actionLabel = stringResource(R.string.controls_activate_layout),
+        value = if (selected) stringResource(R.string.controls_layout_active) else null,
+        onClick = onSelect,
     )
 }
 

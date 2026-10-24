@@ -96,7 +96,40 @@ class OnScreenControlsSettingsInstrumentedTest {
         capture("on-screen-controls.png")
         compose.onNodeWithText("Keyboard & mouse buttons").performClick()
         compose.onNodeWithText("Add button").assertIsDisplayed()
-        compose.onNodeWithText("WASD movement stick").performScrollTo().assertIsDisplayed()
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("WASD movement stick"))
+        compose.onNodeWithText("WASD movement stick").assertIsDisplayed()
+    }
+
+    @Test fun browsingAndCustomizingKeyboardControlsDoesNotSelectThem() {
+        var saved = AndroidTouchSettings()
+        val selections = mutableListOf<Boolean>()
+        show(onChange = { saved = it }, onModeChange = selections::add)
+        compose.onNodeWithText("Keyboard & mouse buttons").performClick()
+        compose.runOnIdle { assertTrue(selections.isEmpty()) }
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("WASD movement stick"))
+        compose.onNodeWithText("WASD movement stick").performClick()
+        compose.runOnIdle {
+            assertFalse(saved.keyboardModeEnabled)
+            assertTrue(selections.isEmpty())
+        }
+        compose.onNodeWithContentDescription("Back").performClick()
+        compose.onNodeWithText("Gamepad buttons").performScrollTo().performClick()
+        compose.onNodeWithText("Use this layout").performScrollTo().assertIsEnabled()
+        compose.runOnIdle { assertTrue(selections.isEmpty()) }
+    }
+
+    @Test fun browsingGamepadControlsPreservesAnExplicitKeyboardChoice() {
+        val selections = mutableListOf<Boolean>()
+        show(initial = AndroidTouchSettings(keyboardModeEnabled = true), onModeChange = selections::add)
+        compose.onNodeWithText("Gamepad buttons").performClick()
+        compose.runOnIdle { assertTrue(selections.isEmpty()) }
+        compose.onNodeWithContentDescription("Back").performClick()
+        compose.onNodeWithText("Keyboard & mouse buttons").performClick()
+        compose.onNodeWithText("Use this layout").assertIsEnabled()
+        compose.runOnIdle { assertTrue(selections.isEmpty()) }
+        // Reapplying a saved choice must still reach the host if native touch is currently active.
+        compose.onNodeWithText("Use this layout").performClick()
+        compose.runOnIdle { assertEquals(listOf(true), selections) }
     }
 
     @Test fun keyboardMouseSensitivitySliderIsReachableAndAdjustable() {
@@ -112,7 +145,9 @@ class OnScreenControlsSettingsInstrumentedTest {
         var saved = AndroidTouchSettings()
         show(fontScale = 1.5f, onChange = { saved = it })
         compose.onNodeWithText("Keyboard & mouse buttons").performScrollTo().performClick()
-        compose.onNodeWithText("Add button").performScrollTo().performClick()
+        compose.onNodeWithText("Use this layout").performClick()
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Add button"))
+        compose.onNodeWithText("Add button").performClick()
         compose.onNode(hasSetTextAction()).performTextInput("space")
         closeSoftKeyboard()
         compose.onNodeWithText("Space", substring = false).performClick()
@@ -142,14 +177,18 @@ class OnScreenControlsSettingsInstrumentedTest {
         compose.onNodeWithText("Show on-screen controls").performClick()
         compose.runOnIdle { assertEquals(true, visibility) }
         compose.onNodeWithText("Keyboard & mouse buttons").performClick()
+        compose.runOnIdle { assertNull(mode) }
+        compose.onNodeWithText("Use this layout").performClick()
         compose.runOnIdle { assertEquals(true, mode) }
         compose.onNodeWithText("Move buttons on screen").performScrollTo().performClick()
         compose.runOnIdle { assertTrue(edited) }
         compose.onNodeWithContentDescription("Back").performClick()
         compose.onNodeWithText("Gamepad buttons").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(true, mode) }
+        compose.onNodeWithText("Use this layout").performClick()
         compose.runOnIdle { assertEquals(false, mode) }
-        compose.onNodeWithText("Visible controls").assertIsDisplayed()
-        compose.onNodeWithText("Programmable buttons").assertIsDisplayed()
+        compose.onNodeWithText("Visible controls").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Programmable buttons").performScrollTo().assertIsDisplayed()
     }
     @Test fun compactStreamMenuKeepsControlsAudioAndStatusBarVisible() {
         var settings by mutableStateOf(AppSettings())
