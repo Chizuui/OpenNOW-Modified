@@ -2,7 +2,19 @@ package com.opencloudgaming.opennow
 
 import androidx.activity.compose.BackHandler
 import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.SportsEsports
+import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.OpenWith
+import androidx.compose.material.icons.outlined.ControlCamera
+import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
+import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -57,6 +69,8 @@ internal fun OnScreenControlsSettings(
     additionalSettings: @Composable () -> Unit = {},
     notice: @Composable () -> Unit = {},
 ) {
+    val rowStyle = controlRowStyle()
+    val reduceMotion = LocalReduceMotion.current
     var page by rememberSaveable { mutableStateOf(TouchSettingsPage.Home) }
     var pickerOpen by rememberSaveable { mutableStateOf(false) }
     var editingButtonId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -74,139 +88,178 @@ internal fun OnScreenControlsSettings(
         else -> TouchSettingsPage.Home
     } }
     BackHandler { goBack() }
-    CompositionLocalProvider(LocalTouchSettingsLivePreview provides livePreview) {
-    Column(modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(onClick = goBack, modifier = Modifier.focusRequester(backFocusRequester)) {
-                Icon(painterResource(R.drawable.ic_arrow_back), stringResource(R.string.action_back))
+    CompositionLocalProvider(
+        LocalTouchSettingsLivePreview provides livePreview,
+        LocalContentColor provides rowStyle.labelColor,
+    ) {
+        Column(modifier.fillMaxSize()) {
+            val actions: @Composable RowScope.() -> Unit = {
+                headerActions()
+                TextButton(
+                    onClick = onClose,
+                    colors = ButtonDefaults.textButtonColors(contentColor = rowStyle.labelColor),
+                ) { Text(stringResource(R.string.stream_panel_done)) }
             }
-            Text(stringResource(page.title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            headerActions()
-            TextButton(onClick = onClose) { Text(stringResource(R.string.stream_panel_done)) }
-        }
-        // Each destination starts at its first row.
-        key(page) {
-            LazyColumn(
-                Modifier.weight(1f).fillMaxWidth()
-                    .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
-                state = rememberLazyListState(),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                when (page) {
-                    TouchSettingsPage.Home -> {
-                        item {
-                            ControlSwitchRow(stringResource(R.string.controls_show), controlsVisible, onVisibilityChange)
-                        }
-                        item {
-                            ControlNavigationRow(
-                                stringResource(R.string.controls_gamepad),
-                                value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_gamepad_hint else R.string.controls_selected),
-                                onClick = { onModeChange(false); page = TouchSettingsPage.Gamepad },
-                            )
-                        }
-                        item {
-                            ControlNavigationRow(
-                                stringResource(R.string.controls_keyboard),
-                                value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_selected else R.string.controls_keyboard_hint),
-                                onClick = { onModeChange(true); page = TouchSettingsPage.Keyboard },
-                            )
-                        }
-                        if (onEditLayout != null) item {
-                            ControlActionRow(
-                                stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
-                                enabled = controlsVisible,
-                                value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
-                            )
-                        }
-                        item {
-                            ControlNavigationRow(stringResource(R.string.controls_appearance), onClick = { page = TouchSettingsPage.Appearance })
-                        }
-                        item {
-                            ControlNavigationRow(stringResource(R.string.controls_sizing), onClick = { page = TouchSettingsPage.Sizing })
-                        }
-                        item {
-                            ControlNavigationRow(stringResource(R.string.controls_sticks), onClick = { page = TouchSettingsPage.Sticks })
-                        }
-                        item { TouchControlPresetEditor(touch, presets, onChange, onPresetsChange) }
-                        item { additionalSettings() }
+            if (livePreview) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = goBack, modifier = Modifier.focusRequester(backFocusRequester)) {
+                        Icon(painterResource(R.drawable.ic_arrow_back), stringResource(R.string.action_back))
                     }
-                    TouchSettingsPage.Keyboard -> {
-                        item { Text(stringResource(R.string.controls_keyboard_help), style = MaterialTheme.typography.bodyMedium) }
-                        item { TouchMouseSensitivitySlider(stream, onTouchMouseSensitivityChange) }
-                        item {
-                            ControlActionRow(
-                                stringResource(R.string.keyboard_overlay_add_button), stringResource(R.string.controls_add),
-                                onClick = { pickerOpen = true }, enabled = touch.keyboardButtons.size < MAX_KEYBOARD_OVERLAY_BUTTONS,
-                            )
-                        }
-                        if (onEditLayout != null) item {
-                            ControlActionRow(
-                                stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
-                                enabled = controlsVisible,
-                                value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
-                            )
-                        } else item { Text(stringResource(R.string.controls_position_in_stream), style = MaterialTheme.typography.bodySmall) }
-                        item {
-                            ControlSwitchRow(
-                                stringResource(R.string.controls_wasd_stick), touch.isControlVisible(TouchControlGroup.LeftStick),
-                                { onChange(touch.withControlVisible(TouchControlGroup.LeftStick, it)) },
-                            )
-                        }
-                        items(touch.keyboardButtons, key = { it.id }) { button ->
-                            ControlNavigationRow(
-                                label = keyboardButtonOption(button.actionId)?.label ?: button.actionId,
-                                value = stringResource(R.string.controls_edit_button_hint),
-                                onClick = { editingButtonId = button.id },
-                            )
-                        }
-                    }
-                    TouchSettingsPage.Gamepad -> {
-                        item { notice() }
-                        if (onEditLayout != null) item {
-                            ControlActionRow(
-                                stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
-                                enabled = controlsVisible,
-                                value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
-                            )
-                        }
-                        item { ControlNavigationRow(stringResource(R.string.settings_touch_visible_controls), onClick = { page = TouchSettingsPage.Visibility }) }
-                        item { ControlNavigationRow(stringResource(R.string.settings_touch_extra_buttons), onClick = { page = TouchSettingsPage.ExtraButtons }) }
-                        item { TouchButtonAppearanceEditor(touch, onChange) }
-                    }
-                    TouchSettingsPage.Visibility -> item {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { GamepadVisibilitySettings(touch, onChange) }
-                    }
-                    TouchSettingsPage.ExtraButtons -> item {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { GamepadExtraButtonsSettings(touch, onChange) }
-                    }
-                    TouchSettingsPage.Appearance -> item {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (!touch.keyboardModeEnabled) AppearanceSettings(touch, onChange)
-                            TouchButtonAppearanceEditor(touch, onChange)
-                            TouchSettingsSlider(stringResource(R.string.stream_panel_opacity), touch.opacity, 0f, 1f, 0.05f) {
-                                onChange(touch.copy(opacity = it))
+                    Text(stringResource(page.title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    actions()
+                }
+            } else {
+                SettingsDetailHeader(
+                    title = stringResource(page.title),
+                    summary = if (page == TouchSettingsPage.Home) stringResource(R.string.controls_summary) else null,
+                    onBack = goBack,
+                    backFocusRequester = backFocusRequester,
+                    actions = actions,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 14.dp),
+                )
+            }
+            SettingsRouteContent(
+                targetState = page,
+                reduceMotion = reduceMotion,
+                depth = { destination -> when (destination) {
+                    TouchSettingsPage.Home -> 0
+                    TouchSettingsPage.Visibility, TouchSettingsPage.ExtraButtons -> 2
+                    else -> 1
+                } },
+                modifier = Modifier.weight(1f),
+                animateInitial = !livePreview,
+            ) { destination ->
+                // A destination starts at its first row without retaining another settings tree.
+                key(destination) {
+                    LazyColumn(
+                        Modifier.fillMaxSize()
+                            .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
+                        state = rememberLazyListState(),
+                        contentPadding = PaddingValues(
+                            start = if (livePreview) 12.dp else 14.dp,
+                            end = if (livePreview) 12.dp else 14.dp,
+                            bottom = if (livePreview) 12.dp else AppScrollEndSpacing,
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        when (destination) {
+                            TouchSettingsPage.Home -> {
+                                item {
+                                    ControlSwitchRow(stringResource(R.string.controls_show), controlsVisible, onVisibilityChange)
+                                }
+                                item {
+                                    ControlSection(stringResource(R.string.controls_section_input)) {
+                                        ControlNavigationRow(
+                                            stringResource(R.string.controls_gamepad),
+                                            value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_gamepad_hint else R.string.controls_selected),
+                                            leadingIcon = Icons.Outlined.SportsEsports,
+                                            onClick = { onModeChange(false); page = TouchSettingsPage.Gamepad },
+                                        )
+                                        ControlNavigationRow(
+                                            stringResource(R.string.controls_keyboard),
+                                            value = stringResource(if (touch.keyboardModeEnabled) R.string.controls_selected else R.string.controls_keyboard_hint),
+                                            leadingIcon = Icons.Outlined.Keyboard,
+                                            onClick = { onModeChange(true); page = TouchSettingsPage.Keyboard },
+                                        )
+                                    }
+                                }
+                                if (onEditLayout != null) item {
+                                    ControlActionRow(
+                                        stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
+                                        enabled = controlsVisible,
+                                        value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
+                                    )
+                                }
+                                item {
+                                    ControlSection(stringResource(R.string.controls_section_customize)) {
+                                        ControlNavigationRow(stringResource(R.string.controls_appearance),
+                                            leadingIcon = Icons.Outlined.Palette, onClick = { page = TouchSettingsPage.Appearance })
+                                        ControlNavigationRow(stringResource(R.string.controls_sizing),
+                                            leadingIcon = Icons.Outlined.OpenWith, onClick = { page = TouchSettingsPage.Sizing })
+                                        ControlNavigationRow(stringResource(R.string.controls_sticks),
+                                            leadingIcon = Icons.Outlined.ControlCamera, onClick = { page = TouchSettingsPage.Sticks })
+                                        TouchControlPresetEditor(touch, presets, onChange, onPresetsChange)
+                                    }
+                                }
+                                item { additionalSettings() }
+                            }
+                            TouchSettingsPage.Keyboard -> {
+                                item { Text(stringResource(R.string.controls_keyboard_help), color = rowStyle.supportingColor, style = MaterialTheme.typography.bodyMedium) }
+                                item { TouchMouseSensitivitySlider(stream, onTouchMouseSensitivityChange) }
+                                item {
+                                    ControlActionRow(
+                                        stringResource(R.string.keyboard_overlay_add_button), stringResource(R.string.controls_add),
+                                        onClick = { pickerOpen = true }, enabled = touch.keyboardButtons.size < MAX_KEYBOARD_OVERLAY_BUTTONS,
+                                    )
+                                }
+                                if (onEditLayout != null) item {
+                                    ControlActionRow(
+                                        stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
+                                        enabled = controlsVisible,
+                                        value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
+                                    )
+                                } else item { Text(stringResource(R.string.controls_position_in_stream), color = rowStyle.supportingColor, style = MaterialTheme.typography.bodySmall) }
+                                item {
+                                    ControlSwitchRow(
+                                        stringResource(R.string.controls_wasd_stick), touch.isControlVisible(TouchControlGroup.LeftStick),
+                                        { onChange(touch.withControlVisible(TouchControlGroup.LeftStick, it)) },
+                                    )
+                                }
+                                items(touch.keyboardButtons, key = { it.id }) { button ->
+                                    ControlNavigationRow(
+                                        label = keyboardButtonOption(button.actionId)?.label ?: button.actionId,
+                                        value = stringResource(R.string.controls_edit_button_hint),
+                                        onClick = { editingButtonId = button.id },
+                                    )
+                                }
+                            }
+                            TouchSettingsPage.Gamepad -> {
+                                item { notice() }
+                                if (onEditLayout != null) item {
+                                    ControlActionRow(
+                                        stringResource(R.string.controls_edit_layout), stringResource(R.string.controls_open), onEditLayout,
+                                        enabled = controlsVisible,
+                                        value = if (controlsVisible) null else stringResource(R.string.controls_show_to_move),
+                                    )
+                                }
+                                item { ControlNavigationRow(stringResource(R.string.settings_touch_visible_controls), onClick = { page = TouchSettingsPage.Visibility }) }
+                                item { ControlNavigationRow(stringResource(R.string.settings_touch_extra_buttons), onClick = { page = TouchSettingsPage.ExtraButtons }) }
+                                item { TouchButtonAppearanceEditor(touch, onChange) }
+                            }
+                            TouchSettingsPage.Visibility -> item {
+                                ControlSection(stringResource(R.string.settings_touch_visible_controls)) { GamepadVisibilitySettings(touch, onChange) }
+                            }
+                            TouchSettingsPage.ExtraButtons -> item {
+                                ControlSection(stringResource(R.string.settings_touch_extra_buttons)) { GamepadExtraButtonsSettings(touch, onChange) }
+                            }
+                            TouchSettingsPage.Appearance -> item {
+                                ControlSection(stringResource(R.string.controls_appearance)) {
+                                    if (!touch.keyboardModeEnabled) AppearanceSettings(touch, onChange)
+                                    TouchButtonAppearanceEditor(touch, onChange)
+                                    TouchSettingsSlider(stringResource(R.string.stream_panel_opacity), touch.opacity, 0f, 1f, 0.05f) {
+                                        onChange(touch.copy(opacity = it))
+                                    }
+                                }
+                            }
+                            TouchSettingsPage.Sizing -> item {
+                                ControlSection(stringResource(R.string.controls_sizing)) {
+                                    Text(stringResource(R.string.controls_position_in_stream), color = rowStyle.supportingColor, style = MaterialTheme.typography.bodySmall)
+                                    ControlActionRow(stringResource(R.string.stream_panel_reset_layout), stringResource(R.string.action_reset),
+                                        onClick = { onChange(touch.withResetOffsets()) })
+                                    SizingSettings(touch, onChange)
+                                }
+                            }
+                            TouchSettingsPage.Sticks -> item {
+                                ControlSection(stringResource(R.string.controls_sticks)) { SticksSettings(touch, onChange, gyroscopeAvailable) }
                             }
                         }
-                    }
-                    TouchSettingsPage.Sizing -> item {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(stringResource(R.string.controls_position_in_stream), style = MaterialTheme.typography.bodySmall)
-                            ControlActionRow(stringResource(R.string.stream_panel_reset_layout), stringResource(R.string.action_reset),
-                                onClick = { onChange(touch.withResetOffsets()) })
-                            SizingSettings(touch, onChange)
-                        }
-                    }
-                    TouchSettingsPage.Sticks -> item {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { SticksSettings(touch, onChange, gyroscopeAvailable) }
                     }
                 }
             }
         }
-    }
     } // Live-preview policy
     if (pickerOpen) KeyboardButtonPickerDialog(
         onDismiss = { pickerOpen = false },
@@ -266,11 +319,6 @@ private fun AppearanceSettings(touch: AndroidTouchSettings, onChange: (AndroidTo
 @Composable
 private fun GamepadVisibilitySettings(touch: AndroidTouchSettings, onChange: (AndroidTouchSettings) -> Unit) {
     Text(
-        text = stringResource(R.string.settings_touch_visible_controls),
-        color = LocalContentColor.current,
-        style = MaterialTheme.typography.titleSmall,
-    )
-    Text(
         text = stringResource(R.string.settings_touch_visible_controls_desc),
         color = controlRowStyle().supportingColor,
         style = MaterialTheme.typography.bodySmall,
@@ -287,11 +335,6 @@ private fun GamepadVisibilitySettings(touch: AndroidTouchSettings, onChange: (An
 
 @Composable
 private fun GamepadExtraButtonsSettings(touch: AndroidTouchSettings, onChange: (AndroidTouchSettings) -> Unit) {
-    Text(
-        text = stringResource(R.string.settings_touch_extra_buttons),
-        color = LocalContentColor.current,
-        style = MaterialTheme.typography.titleSmall,
-    )
     Text(
         text = stringResource(R.string.settings_touch_extra_buttons_desc),
         color = controlRowStyle().supportingColor,
@@ -350,7 +393,7 @@ private fun SticksSettings(touch: AndroidTouchSettings, onChange: (AndroidTouchS
             val mode = TouchAimMode.valueOf(modeName)
             onChange(touch.copy(aimMode = mode))
         }
-        if (touch.aimMode == TouchAimMode.LockZone) {
+        TouchSettingsExpansion(touch.aimMode == TouchAimMode.LockZone) {
             TouchSettingsSlider(
                 stringResource(R.string.stream_joysticks_aim_zone_scale),
                 touch.aimZoneScale,
@@ -394,7 +437,7 @@ private fun SticksSettings(touch: AndroidTouchSettings, onChange: (AndroidTouchS
         ) { enabled ->
             onChange(touch.copy(gyroscopeEnabled = enabled))
         }
-        if (touch.gyroscopeEnabled && gyroscopeAvailable) {
+        TouchSettingsExpansion(touch.gyroscopeEnabled && gyroscopeAvailable) {
             TouchSettingsSlider(stringResource(R.string.settings_touch_gyro_sensitivity), touch.gyroscopeSensitivity, 0.25f, 3f, 0.05f) { value ->
                 onChange(touch.copy(gyroscopeSensitivity = value))
             }
@@ -459,4 +502,17 @@ private fun TouchSettingsSlider(
         unit = unit, onChange = onChange,
         onChangePreview = onChange.takeIf { preview },
     )
+}
+
+/** Respect the same motion policy as navigation; settings stay immediately interactive. */
+@Composable
+private fun TouchSettingsExpansion(visible: Boolean, content: @Composable ColumnScope.() -> Unit) {
+    val duration = if (LocalReduceMotion.current) 0 else OpenNowMotion.DurationStandard
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(tween(duration, easing = OpenNowMotion.EasingEmphasizedDecel)),
+        exit = shrinkVertically(tween(duration, easing = OpenNowMotion.EasingStandard)),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp), content = content)
+    }
 }

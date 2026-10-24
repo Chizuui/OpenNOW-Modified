@@ -2,14 +2,20 @@ package com.opencloudgaming.opennow
 
 import android.content.pm.ActivityInfo
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
@@ -34,6 +40,7 @@ class OnScreenControlsSettingsInstrumentedTest {
     private fun show(
         initial: AndroidTouchSettings = AndroidTouchSettings(),
         fontScale: Float = 1f,
+        spaceTheme: Boolean = false,
         onChange: (AndroidTouchSettings) -> Unit = {},
         onModeChange: ((Boolean) -> Unit)? = null,
         visible: Boolean? = null,
@@ -47,25 +54,27 @@ class OnScreenControlsSettingsInstrumentedTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
                 OpenNowTheme(AppSettings(), physicalControllerConnected = false) {
-                    androidx.compose.material3.Surface(Modifier.fillMaxSize()) {
-                    OnScreenControlsSettings(
-                        touch = touch, stream = stream,
-                        onTouchMouseSensitivityChange = { stream = stream.copy(touchMouseSensitivity = it) },
-                        presets = emptyList(), gyroscopeAvailable = false,
-                        onChange = { touch = it; onChange(it) }, onPresetsChange = {}, onBack = {},
-                        controlsVisible = effectiveVisible ?: touch.enabled,
-                        onVisibilityChange = { enabled ->
-                            if (visible != null) effectiveVisible = enabled
-                            if (onVisibilityChange != null) onVisibilityChange(enabled)
-                            else touch = touch.copy(enabled = enabled)
-                        },
-                        onModeChange = { enabled ->
-                            touch = touch.copy(keyboardModeEnabled = enabled)
-                            onModeChange?.invoke(enabled)
-                        },
-                        onEditLayout = onEdit,
-                        modifier = Modifier.fillMaxSize(),
-                    )
+                    SpaceUiTheme(enabled = spaceTheme) {
+                        androidx.compose.material3.Surface(Modifier.fillMaxSize()) {
+                            OnScreenControlsSettings(
+                                touch = touch, stream = stream,
+                                onTouchMouseSensitivityChange = { stream = stream.copy(touchMouseSensitivity = it) },
+                                presets = emptyList(), gyroscopeAvailable = false,
+                                onChange = { touch = it; onChange(it) }, onPresetsChange = {}, onBack = {},
+                                controlsVisible = effectiveVisible ?: touch.enabled,
+                                onVisibilityChange = { enabled ->
+                                    if (visible != null) effectiveVisible = enabled
+                                    if (onVisibilityChange != null) onVisibilityChange(enabled)
+                                    else touch = touch.copy(enabled = enabled)
+                                },
+                                onModeChange = { enabled ->
+                                    touch = touch.copy(keyboardModeEnabled = enabled)
+                                    onModeChange?.invoke(enabled)
+                                },
+                                onEditLayout = onEdit,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
                     }
                 }
             }
@@ -260,6 +269,106 @@ class OnScreenControlsSettingsInstrumentedTest {
         }
         val contrast = (lightest + 0.05f) / (darkest + 0.05f)
         assertTrue("Stream label contrast was $contrast:1", contrast >= 4.5f)
+    }
+
+    private fun assertReadableText(text: String) {
+        val pixels = compose.onNodeWithText(text, substring = false).captureToImage().toPixelMap()
+        var lightest = 0f
+        var darkest = 1f
+        for (y in 0 until pixels.height) for (x in 0 until pixels.width) {
+            val luminance = pixels[x, y].luminance()
+            lightest = maxOf(lightest, luminance)
+            darkest = minOf(darkest, luminance)
+        }
+        val contrast = (lightest + 0.05f) / (darkest + 0.05f)
+        assertTrue("Text '$text' contrast was $contrast:1", contrast >= 4.5f)
+    }
+
+    @Test fun headerAndHelpRemainReadableWhenTheHostContentColorIsBlack() {
+        var touch by mutableStateOf(AndroidTouchSettings())
+        compose.setContent {
+            OpenNowTheme(AppSettings(dynamicColor = false), physicalControllerConnected = false) {
+                // MaterialTheme alone does not provide LocalContentColor. Reproduce the app's
+                // background-only host, which used to leave header/help text black on dark.
+                CompositionLocalProvider(LocalContentColor provides Color.Black) {
+                    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                        OnScreenControlsSettings(
+                            touch = touch, stream = StreamSettings(),
+                            onTouchMouseSensitivityChange = {}, presets = emptyList(),
+                            gyroscopeAvailable = false, onChange = { touch = it },
+                            onPresetsChange = {}, onBack = {},
+                        )
+                    }
+                }
+            }
+        }
+        assertReadableText("On-screen controls")
+        assertReadableText("Gamepad, keyboard & mouse buttons, layouts and appearance")
+        compose.onNodeWithText("Keyboard & mouse buttons").performScrollTo().performClick()
+        assertReadableText("Keyboard & mouse buttons")
+        assertReadableText("Add any keyboard key or mouse button. Tap a button below to change its size, style or remove it.")
+        capture("on-screen-controls-keyboard.png")
+    }
+
+    @Test fun spaceThemeKeepsModeChoicesAndCustomizationReachable() {
+        show(spaceTheme = true)
+        compose.onNodeWithText("Keyboard & mouse buttons").performScrollTo().assertIsDisplayed()
+        assertReadableText("Gamepad buttons")
+        capture("on-screen-controls-space.png")
+        // Search through the lazy list so prefetched, unplaced rows are scrolled into view.
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Appearance"))
+        compose.onNodeWithText("Appearance").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Customize buttons").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithContentDescription("Back").performClick()
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Presets and themes"))
+        compose.onNodeWithText("Presets and themes").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Save current controls").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test fun settingsPagesAnimateInBothDirectionsAndHonorReducedMotion() {
+        var destination by mutableStateOf(0)
+        var reduceMotion by mutableStateOf(false)
+        compose.mainClock.autoAdvance = false
+        compose.setContent {
+            MaterialTheme {
+                Box(Modifier.fillMaxSize()) {
+                    SettingsRouteContent(destination, reduceMotion, depth = { it }) {
+                        Text("Page $it", Modifier.testTag("destination"))
+                    }
+                }
+            }
+        }
+        compose.mainClock.advanceTimeByFrame()
+        fun position() = compose.onNodeWithTag("destination").fetchSemanticsNode().positionInRoot.x
+        val rest = position()
+        compose.runOnIdle { destination = 1 }
+        compose.mainClock.advanceTimeBy(32)
+        assertTrue("Forward navigation should slide in from the right", position() > rest)
+        compose.mainClock.advanceTimeBy(500)
+        assertEquals(rest, position(), 0.5f)
+        compose.runOnIdle { destination = 0 }
+        compose.mainClock.advanceTimeBy(32)
+        assertTrue("Back navigation should slide in from the left", position() < rest)
+        compose.mainClock.advanceTimeBy(500)
+        compose.runOnIdle { reduceMotion = true; destination = 2 }
+        compose.mainClock.advanceTimeByFrame()
+        assertEquals("Reduced motion should place the page immediately", rest, position(), 0.5f)
+        compose.onNodeWithText("Page 2").assertIsDisplayed()
+        compose.mainClock.autoAdvance = true
+    }
+
+    @Test fun portraitSettingsKeepLargeTextAndCustomizationReachable() {
+        compose.activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        compose.waitUntil(10_000) {
+            compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT
+        }
+        show(fontScale = 1.5f)
+        compose.onNodeWithText("On-screen controls").assertIsDisplayed()
+        compose.onNodeWithText("Keyboard & mouse buttons").performScrollTo().assertIsDisplayed()
+        capture("on-screen-controls-portrait.png")
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Presets and themes"))
+        compose.onNodeWithText("Presets and themes").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Save current controls").performScrollTo().assertIsDisplayed()
     }
 
 }

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -25,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalFocusManager
@@ -106,6 +108,7 @@ internal fun ControlNavigationRow(
     enabled: Boolean = true,
     indentLevel: Int = 0,
     style: ControlRowStyle = controlRowStyle(),
+    leadingIcon: ImageVector? = null,
 ) {
     ControlRow(
         modifier = modifier,
@@ -114,6 +117,12 @@ internal fun ControlNavigationRow(
         indentLevel = indentLevel,
         style = style,
     ) {
+        if (leadingIcon != null) {
+            Icon(leadingIcon, contentDescription = null,
+                tint = style.labelColor.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
+                modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+        }
         ControlRowLabels(label, value, expandedDescription = null, enabled = enabled, style = style)
         Icon(
             painter = painterResource(R.drawable.ic_chevron_right),

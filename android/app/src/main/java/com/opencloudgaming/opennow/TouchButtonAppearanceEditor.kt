@@ -1,6 +1,7 @@
 package com.opencloudgaming.opennow
 
 import androidx.annotation.StringRes
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -85,9 +86,7 @@ private fun touchButtonName(key: String, touch: AndroidTouchSettings): String = 
 internal fun TouchButtonAppearanceEditor(touch: AndroidTouchSettings, onChange: (AndroidTouchSettings) -> Unit) {
     var open by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf<String?>(null) }
-    OutlinedButton(onClick = { selected = null; open = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(stringResource(R.string.touch_customize_buttons))
-    }
+    ControlNavigationRow(stringResource(R.string.touch_customize_buttons), onClick = { selected = null; open = true })
     if (!open) return
     val button = selected
     if (button == null) {

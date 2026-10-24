@@ -678,6 +678,8 @@
     "stream_touch_mouse_sensitivity": "Touch cursor sensitivity",
     "stream_touch_mouse_sensitivity_description": "Controls how far the cursor or camera moves when you drag a finger. Lower values give finer aim; higher values turn faster. Applies to Finger mouse, including keyboard & mouse controls. Direct click and native touch use the touched position instead.",
     "controls_show_to_move": "Show on-screen controls first",
+    "controls_section_input": "Input mode",
+    "controls_section_customize": "Customization",
     "controls_title": "On-screen controls",
     "controls_summary": "Gamepad, keyboard & mouse buttons, layouts and appearance",
     "controls_show": "Show on-screen controls",

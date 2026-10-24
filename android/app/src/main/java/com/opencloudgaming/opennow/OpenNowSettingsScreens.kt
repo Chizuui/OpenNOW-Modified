@@ -9,8 +9,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -26,7 +24,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -88,7 +85,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
@@ -97,7 +93,6 @@ import kotlinx.coroutines.launch
 import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import com.opencloudgaming.opennow.ui.controls.ControlActionRow
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
-import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -492,6 +487,7 @@ internal fun SettingsScreen(
                     SettingsRouteContent(
                         targetState = selectedCategory,
                         reduceMotion = reduceMotion,
+                        depth = ::settingsRouteDepth,
                     ) { category ->
                         SettingsBody(
                             state = state,
@@ -546,6 +542,7 @@ internal fun SettingsScreen(
                         SettingsRouteContent(
                             targetState = selectedCategory,
                             reduceMotion = reduceMotion,
+                            depth = ::settingsRouteDepth,
                         ) { category ->
                             SettingsBody(
                                 state = state,
@@ -596,59 +593,6 @@ private fun SpaceSettingsLayout(
 }
 
 
-/**
- * Slides only the incoming Settings route using layout placement.
- *
- * The outgoing route is discarded immediately, so two control-heavy Settings trees are never
- * measured or drawn together. Unlike the former alpha/translation implementation, this does not
- * create a page-sized RenderNode animation layer.
- */
-@Composable
-private fun SettingsRouteContent(
-    targetState: SettingsCategory?,
-    reduceMotion: Boolean,
-    content: @Composable (SettingsCategory?) -> Unit,
-) {
-    var initialized by remember { mutableStateOf(false) }
-    var previousDepth by remember { mutableStateOf(settingsRouteDepth(targetState)) }
-    var direction by remember { mutableStateOf(1f) }
-    val animateEntrance = initialized && !reduceMotion
-    val progress = remember(targetState, reduceMotion) {
-        Animatable(if (animateEntrance) 0f else 1f)
-    }
-    val slideDistancePx = with(LocalDensity.current) { 28.dp.toPx() }
-
-    LaunchedEffect(targetState, reduceMotion) {
-        val nextDepth = settingsRouteDepth(targetState)
-        direction = if (nextDepth < previousDepth) -1f else 1f
-        previousDepth = nextDepth
-        if (!initialized) {
-            initialized = true
-        } else if (!reduceMotion) {
-            progress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(
-                    durationMillis = OpenNowMotion.DurationStandard,
-                    easing = OpenNowMotion.EasingEmphasizedDecel,
-                ),
-            )
-        }
-    }
-
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .offset {
-                IntOffset(
-                    x = (direction * slideDistancePx * (1f - progress.value)).roundToInt(),
-                    y = 0,
-                )
-            },
-    ) {
-        content(targetState)
-    }
-}
-
 @Composable
 private fun SettingsBody(
     state: OpenNowUiState,
@@ -690,7 +634,8 @@ private fun SettingsBody(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 SettingsDetailHeader(
-                    category = selectedCategory,
+                    title = stringResource(selectedCategory.titleRes),
+                    summary = stringResource(selectedCategory.summaryRes),
                     tvProfile = tvProfile,
                     controllerFamily = controllerFamily,
                     onBack = onBack,
@@ -2195,139 +2140,6 @@ private fun SettingsCategoryRow(category: SettingsCategory, onClick: () -> Unit)
             cornerRadius = 14.dp,
             cinemaEffectEnabled = LocalAbsoluteCinemaEffects.current,
         )
-    }
-}
-
-@Composable
-private fun SettingsDetailHeader(
-    category: SettingsCategory,
-    tvProfile: Boolean,
-    controllerFamily: AndroidControllerFamily?,
-    onBack: () -> Unit,
-) {
-    val controllerNavigationEnabled = LocalSettingsControllerNavigationEnabled.current
-    val showHardwareBackHint = tvProfile || controllerNavigationEnabled
-    var backFocused by remember { mutableStateOf(false) }
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        if (showHardwareBackHint) {
-            Surface(
-                modifier = Modifier
-                    .onFocusChanged { backFocused = it.isFocused || it.hasFocus }
-                    .border(
-                        width = if (backFocused) 3.dp else 1.dp,
-                        color = cinemaBorderColor(
-                            LocalAbsoluteCinemaEffects.current,
-                            LocalActiveSelectionColor.current,
-                        ),
-                        shape = RoundedCornerShape(999.dp),
-                    )
-                    .clickable(onClick = onBack),
-                shape = RoundedCornerShape(999.dp),
-                color = if (backFocused) MaterialTheme.colorScheme.primary.copy(alpha = 0.24f) else Color.Transparent,
-            ) {
-                Row(
-                    // The badge touches the capsule edge so its white ring and the focused outer
-                    // ring read as one continuous controller affordance instead of two outlines
-                    // separated by a dark crescent.
-                    modifier = Modifier.padding(end = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                ) {
-                    val backBadgeColor = when (controllerFamily) {
-                        null, AndroidControllerFamily.Google -> Color.White
-                        AndroidControllerFamily.Xbox -> Color(0xFFFFC107)
-                        AndroidControllerFamily.PlayStation -> Color(0xFFE94B5F)
-                        AndroidControllerFamily.Nintendo -> Color(0xFFE60012)
-                        AndroidControllerFamily.Generic -> MaterialTheme.colorScheme.primary
-                    }
-                    Surface(
-                        modifier = Modifier
-                            .size(38.dp)
-                            .border(
-                                2.dp,
-                                cinemaBorderColor(
-                                    LocalAbsoluteCinemaEffects.current,
-                                    LocalActiveSelectionColor.current,
-                                ),
-                                CircleShape,
-                            ),
-                        shape = CircleShape,
-                        color = backBadgeColor,
-                    ) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            when (controllerFamily) {
-                                null, AndroidControllerFamily.Google -> Icon(
-                                    painter = painterResource(R.drawable.ic_arrow_back),
-                                    contentDescription = stringResource(R.string.cd_remote_back),
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(17.dp),
-                                )
-                                AndroidControllerFamily.PlayStation -> Text(
-                                    "○",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Black,
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                                AndroidControllerFamily.Xbox,
-                                AndroidControllerFamily.Nintendo,
-                                AndroidControllerFamily.Generic,
-                                -> Text(
-                                    "B",
-                                    color = if (controllerFamily == AndroidControllerFamily.Xbox) Color.Black else Color.White,
-                                    fontWeight = FontWeight.Black,
-                                    style = MaterialTheme.typography.labelLarge,
-                                )
-                            }
-                        }
-                    }
-                    Text(
-                        stringResource(R.string.remote_back_label),
-                        color = SettingsText,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(end = 7.dp),
-                    )
-                }
-            }
-        } else {
-            Surface(
-                modifier = Modifier
-                    .size(42.dp)
-                    .border(1.dp, SettingsTextMuted.copy(alpha = 0.5f), CircleShape)
-                    .clickable(onClick = onBack),
-                shape = CircleShape,
-                color = Color.Transparent,
-            ) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_arrow_back),
-                        contentDescription = stringResource(R.string.action_back),
-                        tint = SettingsText,
-                        modifier = Modifier.size(21.dp),
-                    )
-                }
-            }
-        }
-        Column(Modifier.fillMaxWidth()) {
-            Text(
-                stringResource(category.titleRes),
-                color = SettingsText,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                stringResource(category.summaryRes),
-                color = SettingsTextMuted,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
     }
 }
 
