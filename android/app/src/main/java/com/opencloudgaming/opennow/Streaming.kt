@@ -2597,12 +2597,12 @@ class NativeStreamClient(
         recordStreamDiagnostic(
             "transport start generation=$generation reconnectAttempts=$reconnectAttempts session=${streamDiagnosticId(session.sessionId)} iceServers=${session.iceServers.size} media=${session.mediaConnectionInfo?.let { "${it.ip}:${it.port}" } ?: "unknown"}",
         )
-        if (settings.experimentalNvst) {
+        if (session.usesNvstTransport(settings)) {
             if (session.rtspsEndpoints.isEmpty()) {
                 failStream("The session has no NVST endpoint. Disable experimental NVST to use WebRTC, or launch a new session. The cloud session is retained.", generation)
                 return
             }
-            emitState("Connecting experimental NVST")
+            emitState(if (settings.experimentalNvst) "Connecting experimental NVST" else "Connecting native stream")
             runCatching {
                 NvstTransport(appContext, session, settings, lowLatencyGameAudio,
                     OpenNowVideoDecoderFactory(eglBase.eglBaseContext,
@@ -3220,6 +3220,7 @@ class NativeStreamClient(
             delay(OFFER_TIMEOUT_MS)
             if (generation != transportGeneration || peerConnection != null) return@launch
             offerTimeoutJob = null
+            signaling?.recordOfferTimeout()
             NativeInputDiagnostics.add("video offer timeout codec=${settings.codec} resolution=${settings.resolution} bitrate=${settings.maxBitrateMbps}")
             if (
                 requestSelectedVideoProfileRetry(
@@ -3436,7 +3437,7 @@ class NativeStreamClient(
         }
         if (consumeReconnectAttempt && reconnectAttempts >= MAX_TRANSPORT_RECONNECT_ATTEMPTS) {
             recordStreamDiagnostic("reconnect limit reached reason=$reason attempts=$reconnectAttempts")
-            if (currentSettings.experimentalNvst) {
+            if (currentSession.usesNvstTransport(currentSettings)) {
                 val error = lastNvstError ?: reason
                 if (nvstAttachmentRequiresResume(error, retriesExhausted = true)) {
                     // The ViewModel owns the per-session claim budget across client recreation.

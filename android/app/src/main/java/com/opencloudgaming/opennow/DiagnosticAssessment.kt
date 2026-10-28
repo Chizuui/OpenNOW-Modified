@@ -8,8 +8,34 @@ internal fun diagnosticFailureAssessment(
     streamError: String?,
     sessionReport: SessionReport?,
     previousExits: List<DiagnosticProcessExit> = emptyList(),
+    streamConnections: JsonObject? = null,
 ): JsonObject {
     val findings = buildList {
+        // Retained connection evidence survives dismissed UI errors and normal stream teardown.
+        // Group repeated retries, linking every retained observation without claiming a root cause.
+        val connectionIssues = streamConnections?.get("attempts")?.jsonArray.orEmpty()
+            .flatMapIndexed { attemptIndex, attempt ->
+                attempt.jsonObject["issues"]?.jsonArray.orEmpty().mapIndexed { issueIndex, issue ->
+                    issue.jsonObject to "/streamConnections/attempts/$attemptIndex/issues/$issueIndex"
+                }
+            }.groupBy { it.first["reasonCode"]?.jsonPrimitive?.content }
+        connectionIssues.forEach { (reason, evidence) ->
+            val explanation = when (reason) {
+                "signaling_offer_timeout" -> "The signaling WebSocket opened, but no usable video offer arrived before the offer deadline. Check received packet types and queued/rejected sends for these attempts; successful HTTP session calls do not establish media readiness."
+                "signaling_connection_failed" -> "A signaling connection failed. Its phase, HTTP status, exception class chain and packet counters show how far startup progressed; they do not establish whether the provider, network or client caused it."
+                "signaling_remote_closed" -> "The signaling socket closed without a local close request. Inspect its close code and startup phase; closure alone does not establish the root cause."
+                else -> return@forEach
+            }
+            add(buildJsonObject {
+                put("reasonCode", reason)
+                put("category", "stream_connection")
+                put("confidence", "observed_failure")
+                put("possibleReason", explanation)
+                put("timestamp", evidence.last().first.getValue("timestamp"))
+                put("occurrences", evidence.size)
+                put("evidencePaths", JsonArray(evidence.map { JsonPrimitive(it.second) }))
+            })
+        }
         previousExits.forEachIndexed { index, exit ->
             if (exit.reason !in setOf(3, 4, 5, 6, 7, 9, 12)) return@forEachIndexed
             add(buildJsonObject {
@@ -93,7 +119,7 @@ internal fun diagnosticFailureAssessment(
         }
     }
     return buildJsonObject {
-        put("rulesVersion", 1)
+        put("rulesVersion", 2)
         put("crashConclusion", "not_established")
         put("crashEvidence", "No current-process crash is established. Previous OS exit reasons, when available, are separate historical evidence; API and quality failures do not prove an app crash.")
         put("scope", "retained_run_records")

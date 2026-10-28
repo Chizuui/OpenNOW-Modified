@@ -10,8 +10,9 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.put
 import okhttp3.ConnectionSpec
 import okhttp3.OkHttpClient
@@ -86,9 +87,12 @@ class GfnSignalingClient(
     private var peerId = 0
     private var remotePeerId = 1
     private var ackCounter = 0
+    private var connectionDiagnostic: StreamConnectionAttempt? = null
 
     fun connect() {
         val url = buildSignInUrl()
+        val diagnostic = StreamConnectionDiagnostics.begin(url, reconnect)
+        connectionDiagnostic = diagnostic
         val host = url.removePrefix("wss://").substringBefore("/")
         onEvent(SignalingEvent.Log("Signaling connecting url=${signalingUrlForDiagnostics(url, session.sessionId)} session=${streamDiagnosticId(session.sessionId)}"))
         val request = Request.Builder()
@@ -98,10 +102,13 @@ class GfnSignalingClient(
             .header("Origin", "https://play.geforcenow.com")
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36")
             .build()
-        webSocket = signalingHttp.newWebSocket(
+        webSocket = signalingHttp.newBuilder()
+            .eventListener(signalingDiagnosticEventListener(diagnostic))
+            .build().newWebSocket(
             request,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    diagnostic.opened(response.code, response.handshake?.tlsVersion?.javaName)
                     onEvent(
                         SignalingEvent.Log(
                             "Signaling open http=${response.code} tls=${response.handshake?.tlsVersion?.javaName ?: "unknown"} " +
@@ -117,7 +124,7 @@ class GfnSignalingClient(
                     heartbeatJob = scope.launch {
                         while (true) {
                             delay(5000)
-                            val sent = sendJson("""{"hb":1}""")
+                            val sent = sendJson("""{"hb":1}""", "heartbeat")
                             NativeInputDiagnostics.retainResult("heartbeat.signaling.send", sent) {
                                 "client heartbeat session=${streamDiagnosticId(session.sessionId)}"
                             }
@@ -126,10 +133,17 @@ class GfnSignalingClient(
                     onEvent(SignalingEvent.Connected)
                 }
 
-                override fun onMessage(webSocket: WebSocket, text: String) = handleMessage(text)
-                override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handleMessage(bytes.utf8())
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    handleMessage(text)
+                }
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) = onMessage(webSocket, bytes.utf8())
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    diagnostic.closing(code)
+                }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    diagnostic.closed(code)
                     heartbeatJob?.cancel()
                     NativeInputDiagnostics.retain(
                         "heartbeat.signaling.lifecycle",
@@ -139,6 +153,7 @@ class GfnSignalingClient(
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    diagnostic.failed(t, response?.code)
                     heartbeatJob?.cancel()
                     NativeInputDiagnostics.retain(
                         "heartbeat.signaling.lifecycle",
@@ -161,7 +176,7 @@ class GfnSignalingClient(
             put("sdp", sdp)
             if (nvstSdp != null) put("nvstSdp", nvstSdp)
         }.toString()
-        sendPeerMessage(msg)
+        sendPeerMessage(msg, "answer")
     }
 
     fun sendIceCandidate(candidate: IceCandidate) {
@@ -175,7 +190,7 @@ class GfnSignalingClient(
             put("sdpMid", candidate.sdpMid)
             put("sdpMLineIndex", candidate.sdpMLineIndex)
         }.toString()
-        sendPeerMessage(msg)
+        sendPeerMessage(msg, "ice")
     }
 
     fun requestKeyframe(reason: String, backlogFrames: Int, attempt: Int) {
@@ -185,10 +200,11 @@ class GfnSignalingClient(
             put("backlogFrames", backlogFrames)
             put("attempt", attempt)
         }.toString()
-        sendPeerMessage(msg)
+        sendPeerMessage(msg, "keyframe")
     }
 
     fun disconnect() {
+        connectionDiagnostic?.localClose()
         heartbeatJob?.cancel()
         if (webSocket != null) {
             NativeInputDiagnostics.retain(
@@ -198,6 +214,10 @@ class GfnSignalingClient(
         }
         webSocket?.close(1000, "closed")
         webSocket = null
+    }
+
+    internal fun recordOfferTimeout() {
+        connectionDiagnostic?.offerTimedOut()
     }
 
     private fun buildSignInUrl(): String {
@@ -210,48 +230,57 @@ class GfnSignalingClient(
         )
     }
 
-    private fun handleMessage(text: String) {
-        val parsed = runCatching { OpenNowJson.parseToJsonElement(text).jsonObject }.getOrNull()
+    internal fun handleMessage(text: String) {
+        val element = runCatching { OpenNowJson.parseToJsonElement(text) }.getOrNull()
+        connectionDiagnostic?.received(element)
+        val parsed = element as? JsonObject
         if (parsed == null) {
             onEvent(SignalingEvent.Log("Ignoring non-JSON signaling packet"))
             return
         }
-        parsed["peer_info"]?.jsonObject?.let { info ->
-            if (info["name"]?.jsonPrimitive?.contentOrNull == peerName) {
-                peerId = info["id"]?.jsonPrimitive?.intOrNull ?: peerId
+        // Optional fields can be explicitly null. jsonObject/jsonPrimitive throw on a
+        // different JSON shape, which would escape OkHttp's callback and kill the process.
+        val peerInfo = parsed["peer_info"] as? JsonObject
+        peerInfo?.let { info ->
+            onEvent(SignalingEvent.Log("Signaling peer registration local=${(info["name"] as? JsonPrimitive)?.contentOrNull == peerName} id=${(info["id"] as? JsonPrimitive)?.intOrNull} role=${(info["peerRole"] as? JsonPrimitive)?.intOrNull}"))
+            if ((info["name"] as? JsonPrimitive)?.contentOrNull == peerName) {
+                peerId = (info["id"] as? JsonPrimitive)?.intOrNull ?: peerId
             }
         }
-        parsed["ackid"]?.jsonPrimitive?.intOrNull?.let { ack ->
-            val shouldAck = parsed["peer_info"]?.jsonObject?.get("id")?.jsonPrimitive?.intOrNull != peerId
-            if (shouldAck) sendJson("""{"ack":$ack}""")
+        (parsed["ackid"] as? JsonPrimitive)?.intOrNull?.let { ack ->
+            val shouldAck = (peerInfo?.get("id") as? JsonPrimitive)?.intOrNull != peerId
+            if (shouldAck) sendJson("""{"ack":$ack}""", "ack")
+        }
+        parsed["error"]?.takeUnless { it == JsonNull }?.let { error ->
+            onEvent(SignalingEvent.Log("Signaling server rejected request error=${sanitizeDiagnosticLogPayload(error.toString(), limit = 400)}"))
         }
         signalingHeartbeatReply(parsed)?.let { reply ->
             // Match the desktop client and acknowledge server-driven
             // heartbeats immediately. The periodic client heartbeat remains
             // a separate keepalive when the server does not initiate one.
-            val sent = sendJson(reply)
+            val sent = sendJson(reply, "heartbeat_reply")
             NativeInputDiagnostics.retainResult("heartbeat.signaling.reply", sent) {
                 "server heartbeat reply session=${streamDiagnosticId(session.sessionId)}"
             }
             return
         }
-        val peerMsg = parsed["peer_msg"]?.jsonObject ?: return
-        remotePeerId = peerMsg["from"]?.jsonPrimitive?.intOrNull ?: remotePeerId
-        val msg = peerMsg["msg"]?.jsonPrimitive?.contentOrNull ?: return
-        val payload = runCatching { OpenNowJson.parseToJsonElement(msg).jsonObject }.getOrNull() ?: return
+        val peerMsg = parsed["peer_msg"] as? JsonObject ?: return
+        remotePeerId = (peerMsg["from"] as? JsonPrimitive)?.intOrNull ?: remotePeerId
+        val msg = (peerMsg["msg"] as? JsonPrimitive)?.contentOrNull ?: return
+        val payload = runCatching { OpenNowJson.parseToJsonElement(msg) as? JsonObject }.getOrNull() ?: return
         when {
-            payload["type"]?.jsonPrimitive?.contentOrNull == "offer" -> {
-                val sdp = payload["sdp"]?.jsonPrimitive?.contentOrNull
+            (payload["type"] as? JsonPrimitive)?.contentOrNull == "offer" -> {
+                val sdp = (payload["sdp"] as? JsonPrimitive)?.contentOrNull
                 if (sdp != null) {
                     onEvent(SignalingEvent.Log(sdpDiagnosticSummary("Received offer", sdp)))
                     onEvent(SignalingEvent.Offer(sdp))
                 }
             }
-            payload["candidate"]?.jsonPrimitive?.contentOrNull != null -> {
+            (payload["candidate"] as? JsonPrimitive)?.contentOrNull != null -> {
                 val candidate = IceCandidate(
-                    payload["sdpMid"]?.jsonPrimitive?.contentOrNull,
-                    payload["sdpMLineIndex"]?.jsonPrimitive?.intOrNull ?: 0,
-                    payload["candidate"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                    (payload["sdpMid"] as? JsonPrimitive)?.contentOrNull,
+                    (payload["sdpMLineIndex"] as? JsonPrimitive)?.intOrNull ?: 0,
+                    (payload["candidate"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
                 )
                 onEvent(SignalingEvent.Log("Received remote ICE candidate ${candidate.diagnosticSummary()}"))
                 onEvent(SignalingEvent.RemoteIce(candidate))
@@ -266,15 +295,20 @@ class GfnSignalingClient(
             """
             {"ackid":${nextAckId()},"peer_info":{"browser":"Chrome","browserVersion":"131","connected":true,"id":$peerId,"name":"$peerName","peerRole":0,"resolution":"${width}x$height","version":2}}
             """.trimIndent(),
+            "peer_info",
         )
     }
 
-    private fun sendPeerMessage(message: String) {
+    private fun sendPeerMessage(message: String, kind: String) {
         val escaped = message.replace("\\", "\\\\").replace("\"", "\\\"")
-        sendJson("""{"peer_msg":{"from":$peerId,"to":$remotePeerId,"msg":"$escaped"},"ackid":${nextAckId()}}""")
+        sendJson("""{"peer_msg":{"from":$peerId,"to":$remotePeerId,"msg":"$escaped"},"ackid":${nextAckId()}}""", kind)
     }
 
-    private fun sendJson(text: String): Boolean = webSocket?.send(text) == true
+    private fun sendJson(text: String, kind: String): Boolean {
+        val accepted = webSocket?.send(text) == true
+        connectionDiagnostic?.sent(kind, accepted)
+        return accepted
+    }
 
     private fun nextAckId(): Int {
         ackCounter += 1

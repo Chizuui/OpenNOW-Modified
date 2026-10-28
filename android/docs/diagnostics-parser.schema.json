@@ -473,6 +473,155 @@
                     ],
                     "additionalProperties": true
                 },
+                "streamConnections": {
+                    "type": "object",
+                    "properties": {
+                        "attemptLimit": {
+                            "type": "integer"
+                        },
+                        "totalAttempts": {
+                            "type": "integer"
+                        },
+                        "evictedAttempts": {
+                            "type": "integer"
+                        },
+                        "attempts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "attempt": {
+                                        "type": "integer"
+                                    },
+                                    "endpoint": {
+                                        "type": "string"
+                                    },
+                                    "reconnect": {
+                                        "type": "boolean"
+                                    },
+                                    "startedAt": {
+                                        "type": "string"
+                                    },
+                                    "uptimeMs": {
+                                        "type": "integer"
+                                    },
+                                    "elapsedMs": {
+                                        "type": "integer"
+                                    },
+                                    "phase": {
+                                        "type": "string"
+                                    },
+                                    "handshakeStage": {
+                                        "type": "string"
+                                    },
+                                    "handshakeStagesMs": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "integer"
+                                        }
+                                    },
+                                    "localCloseRequested": {
+                                        "type": "boolean"
+                                    },
+                                    "ended": {
+                                        "type": "boolean"
+                                    },
+                                    "handshakeMs": {
+                                        "type": "integer"
+                                    },
+                                    "lastReceiveAfterStartMs": {
+                                        "type": "integer"
+                                    },
+                                    "httpStatus": {
+                                        "type": "integer"
+                                    },
+                                    "tlsVersion": {
+                                        "type": "string"
+                                    },
+                                    "closeCode": {
+                                        "type": "integer"
+                                    },
+                                    "received": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "integer"
+                                        }
+                                    },
+                                    "sendQueued": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "integer"
+                                        }
+                                    },
+                                    "sendRejected": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "integer"
+                                        }
+                                    },
+                                    "issues": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "reasonCode": {
+                                                    "type": "string"
+                                                },
+                                                "timestamp": {
+                                                    "type": "string"
+                                                },
+                                                "phase": {
+                                                    "type": "string"
+                                                },
+                                                "handshakeStage": {
+                                                    "type": "string"
+                                                },
+                                                "exceptionClasses": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "string"
+                                                    }
+                                                }
+                                            },
+                                            "required": [
+                                                "reasonCode",
+                                                "timestamp",
+                                                "phase",
+                                                "handshakeStage"
+                                            ],
+                                            "additionalProperties": true
+                                        }
+                                    }
+                                },
+                                "required": [
+                                    "attempt",
+                                    "endpoint",
+                                    "reconnect",
+                                    "startedAt",
+                                    "uptimeMs",
+                                    "elapsedMs",
+                                    "phase",
+                                    "handshakeStage",
+                                    "handshakeStagesMs",
+                                    "localCloseRequested",
+                                    "ended",
+                                    "received",
+                                    "sendQueued",
+                                    "sendRejected",
+                                    "issues"
+                                ],
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "required": [
+                        "attemptLimit",
+                        "totalAttempts",
+                        "evictedAttempts",
+                        "attempts"
+                    ],
+                    "additionalProperties": true
+                },
                 "events": {
                     "type": "array",
                     "items": {
@@ -760,6 +909,47 @@
                 "processExitHistory": {
                     "$ref": "#/$defs/DiagnosticProcessExitHistory"
                 },
+                "previousJavaCrash": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "const": "previous_process_uncaught_java_exception"
+                        },
+                        "timestampEpochMs": {
+                            "type": "integer"
+                        },
+                        "timestamp": {
+                            "type": "string"
+                        },
+                        "version": {
+                            "type": "string"
+                        },
+                        "build": {
+                            "type": "integer"
+                        },
+                        "thread": {
+                            "type": "string"
+                        },
+                        "streamContext": {
+                            "type": "string"
+                        },
+                        "stackTrace": {
+                            "type": "string",
+                            "maxLength": 32768
+                        }
+                    },
+                    "required": [
+                        "scope",
+                        "timestampEpochMs",
+                        "timestamp",
+                        "version",
+                        "build",
+                        "thread",
+                        "streamContext",
+                        "stackTrace"
+                    ],
+                    "additionalProperties": true
+                },
                 "failureAssessment": {
                     "type": "object",
                     "properties": {
@@ -819,6 +1009,9 @@
                                     },
                                     "error": {
                                         "type": "string"
+                                    },
+                                    "occurrences": {
+                                        "type": "integer"
                                     }
                                 },
                                 "required": [
@@ -1831,6 +2024,9 @@
                 },
                 "signalingUrl": {
                     "type": "string"
+                },
+                "nativeTransportRequired": {
+                    "type": "boolean"
                 },
                 "rtspsEndpoints": {
                     "type": "array",

@@ -677,14 +677,15 @@ class GfnApiTest {
     }
 
     @Test
-    fun freePortalLaunchAndClaimUseNativeAndroidIdentityWithExactGeometry() {
+    fun freePortalLaunchAndClaimUseCanonicalNativeAndroidIdentityWithExactGeometry() {
         val settings = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", fps = 120)
             .eligibleForAndroidLaunch(SubscriptionInfo(membershipTier = "FREE"), null, androidTvProfile = false)
-        for (baseUrl in listOf(
-            "https://np-lax-01.cloudmatchbeta.nvidiagrid.net",
-            "https://my-yes.yes.geforcenow.nvidiagrid.net",
+        for ((baseUrl, nvidia) in listOf(
+            "https://np-lax-01.cloudmatchbeta.nvidiagrid.net" to true,
+            "https://my-yes.yes.geforcenow.nvidiagrid.net" to false,
         )) {
             for (launchMode in listOf(GfnAppLaunchMode.GAMEPAD_FRIENDLY, GfnAppLaunchMode.TOUCH_FRIENDLY)) {
+                val nativeAndroid = nvidia && launchMode == GfnAppLaunchMode.GAMEPAD_FRIENDLY
                 val headers = cloudMatchHeaders(
                     token = "token",
                     clientId = "client",
@@ -699,6 +700,7 @@ class GfnApiTest {
                 assertEquals("NATIVE", headers["nv-client-type"])
                 assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
                 assertTrue(headers["User-Agent"].orEmpty().startsWith("GFN-PC/22.0 (Android"))
+                assertEquals(if (nativeAndroid) "6.39.39022815" else "2.0.88.129", headers["nv-client-version"])
                 assertEquals(
                     if (launchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) "TABLET" else "PHONE",
                     headers["nv-device-type"],
@@ -712,14 +714,143 @@ class GfnApiTest {
                     appLaunchMode = launchMode,
                 ).getValue("sessionRequestData").jsonObject
                 val monitor = data.getValue("clientRequestMonitorSettings").jsonArray.single().jsonObject
-                assertEquals("android", data.getValue("clientPlatformName").jsonPrimitive.content)
+                assertEquals(
+                    if (nativeAndroid) "Android-Generic-Touch" else "android",
+                    data.getValue("clientPlatformName").jsonPrimitive.content,
+                )
                 assertEquals(launchMode, data.getValue("appLaunchMode").jsonPrimitive.int)
                 assertEquals(1376, monitor.getValue("widthInPixels").jsonPrimitive.int)
                 assertEquals(640, monitor.getValue("heightInPixels").jsonPrimitive.int)
                 assertEquals(60, monitor.getValue("framesPerSecond").jsonPrimitive.int)
                 assertEquals(100, monitor.getValue("dpi").jsonPrimitive.int)
+                assertEquals("1", data.getValue("streamerVersion").jsonPrimitive.content)
+                assertEquals("1.0", data.getValue("sdkVersion").jsonPrimitive.content)
+                assertEquals(1, data.getValue("enhancedStreamMode").jsonPrimitive.int)
+                assertEquals(nativeAndroid, data.getValue("secureRTSPSupported").jsonPrimitive.boolean)
+                val streamerMetadata = data.getValue("metaData").jsonArray.firstOrNull {
+                    it.jsonObject["key"]?.jsonPrimitive?.contentOrNull == "GSStreamerType"
+                }
+                if (nativeAndroid) {
+                    assertNull("Native Android requests must not provision the WebRTC streamer", streamerMetadata)
+                } else {
+                    assertEquals("WebRTC", streamerMetadata?.jsonObject?.get("value")?.jsonPrimitive?.content)
+                }
             }
         }
+    }
+
+    @Test
+    fun portalNvstStillUsesNativeAndroidAllocationAndRtspRequest() {
+        val settings = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", experimentalNvst = true)
+        val base = "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net"
+        val headers = cloudMatchHeaders(
+            token = "token", clientId = "client", deviceId = "device", includeOrigin = true,
+            streamingBaseUrl = base, appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+            preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+        )
+        assertEquals("NATIVE", headers["nv-client-type"])
+        assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
+        val data = buildMinimalClaimRequestBody(
+            appId = "123", deviceId = "device", settings = settings, streamingBaseUrl = base,
+        ).getValue("sessionRequestData").jsonObject
+        assertEquals("Android-Generic-Touch", data.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals("14", data.getValue("streamerVersion").jsonPrimitive.content)
+        assertEquals("2.0", data.getValue("sdkVersion").jsonPrimitive.content)
+        assertEquals(0, data.getValue("enhancedStreamMode").jsonPrimitive.int)
+        assertTrue(data.getValue("secureRTSPSupported").jsonPrimitive.boolean)
+        assertTrue(data.getValue("metaData").jsonArray.none {
+            it.jsonObject["key"]?.jsonPrimitive?.contentOrNull == "GSStreamerType"
+        })
+    }
+
+    @Test
+    fun ordinaryBrowserWebsiteAndTvClaimsKeepTheirExistingWebRtcProfile() {
+        val base = "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net"
+        for ((settings, tv) in listOf(
+            StreamSettings(resolution = "1280x720", aspectRatio = "16:9") to false,
+            StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", browserClientMode = true) to false,
+            StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9") to true,
+        )) {
+            val data = buildMinimalClaimRequestBody(
+                appId = "123", deviceId = "device", settings = settings,
+                streamingBaseUrl = base, isAndroidTv = tv,
+            ).getValue("sessionRequestData").jsonObject
+            assertEquals("1", data.getValue("streamerVersion").jsonPrimitive.content)
+            assertEquals("1.0", data.getValue("sdkVersion").jsonPrimitive.content)
+            assertEquals(1, data.getValue("enhancedStreamMode").jsonPrimitive.int)
+            assertFalse(data.getValue("secureRTSPSupported").jsonPrimitive.boolean)
+            val streamerMetadata = data.getValue("metaData").jsonArray.firstOrNull {
+                it.jsonObject["key"]?.jsonPrimitive?.contentOrNull == "GSStreamerType"
+            }
+            assertEquals("WebRTC", streamerMetadata?.jsonObject?.get("value")?.jsonPrimitive?.content)
+        }
+    }
+
+    @Test
+    fun portalIdentityPreservesAdvancedProfileAndTvAllocation() {
+        for ((settings, tv) in listOf(
+            StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", fps = 120) to false,
+            StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9") to true,
+        )) {
+            val base = "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net"
+            val headers = cloudMatchHeaders(
+                token = "token", clientId = "client", deviceId = "device", includeOrigin = true,
+                streamingBaseUrl = base, appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+                preferNativeDesktopMode = settings.requiresNativeDesktopCloudMatchMode(),
+                preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+                isAndroidTv = tv,
+            )
+            assertEquals("NATIVE", headers["nv-client-type"])
+            assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
+            assertEquals(if (tv) "DESKTOP" else "PHONE", headers["nv-device-type"])
+            val data = buildMinimalClaimRequestBody(
+                appId = "123", deviceId = "device", settings = settings,
+                streamingBaseUrl = base, isAndroidTv = tv,
+            ).getValue("sessionRequestData").jsonObject
+            assertEquals(if (tv) "android" else "Android-Generic-Touch", data.getValue("clientPlatformName").jsonPrimitive.content)
+            val monitor = data.getValue("clientRequestMonitorSettings").jsonArray.single().jsonObject
+            assertEquals(settings.fps, monitor.getValue("framesPerSecond").jsonPrimitive.int)
+            assertEquals(100, monitor.getValue("dpi").jsonPrimitive.int)
+        }
+    }
+
+    @Test
+    fun nativeAndroidPortalIdentityUsesCurrentOfficialClientVersion() {
+        val headers = cloudMatchHeaders(
+            token = "token", clientId = "client", deviceId = "device", includeOrigin = true,
+            streamingBaseUrl = "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net",
+            appLaunchMode = GfnAppLaunchMode.GAMEPAD_FRIENDLY,
+            preferNativeAndroidMode = true,
+        )
+        assertEquals("6.39.39022815", headers["nv-client-version"])
+        assertTrue(headers["User-Agent"].orEmpty().contains("PGC/3.8 (6.39.39022815)"))
+        assertFalse(headers["User-Agent"].orEmpty().contains("Android-Generic-Touch"))
+    }
+
+    @Test
+    fun nativeAndroidUserAgentUsesDeviceReleaseAndCurrentAppVersion() {
+        for (release in listOf("14", "15", "17", "17.QPR-1_beta")) {
+            assertEquals(
+                "GFN-PC/22.0 (Android $release) PGC/3.8 (6.39.39022815) okhttp/4.12.0",
+                nativeAndroidCloudMatchUserAgent(release),
+            )
+        }
+        for (release in listOf(null, "", " ", "()\r\n", "\u0661\u0667")) {
+            assertEquals(nativeAndroidCloudMatchUserAgent("14"), nativeAndroidCloudMatchUserAgent(release))
+        }
+    }
+
+    @Test
+    fun nativeAndroidUserAgentBoundsAndSanitizesAnOemReleaseValue() {
+        val oversizedRelease = "17\r\n:" + "x".repeat(200)
+        val actual = nativeAndroidCloudMatchUserAgent(oversizedRelease)
+        assertFalse(actual.contains('\r'))
+        assertFalse(actual.contains('\n'))
+        assertFalse(actual.contains(':'))
+        val release = actual.substringAfter("(Android ").substringBefore(')')
+        assertEquals(40, release.length)
+        assertTrue(release.startsWith("17"))
+        assertEquals(nativeAndroidCloudMatchUserAgent("17"), nativeAndroidCloudMatchUserAgent("17\u03b2"))
     }
 
     @Test

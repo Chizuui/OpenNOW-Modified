@@ -5,6 +5,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NativeStreamReadinessTest {
+    @Test fun stoppingCloudSessionCannotAttachOrRestartItsNativeTransport() {
+        assertFalse(OpenNowUiState(streamStatus = "stopping", streamSession = readySession()).isNativeStreamReady())
+    }
     @Test
     fun readyCloudSessionDoesNotStartNativeTransportBeforeClaimCompletes() {
         val readySession = readySession()
