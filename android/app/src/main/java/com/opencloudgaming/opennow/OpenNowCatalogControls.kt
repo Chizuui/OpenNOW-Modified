@@ -15,6 +15,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -504,7 +505,15 @@ internal fun PrintedWasteSelector(
     viewModel: OpenNowViewModel,
     modifier: Modifier = Modifier,
 ) {
-    BackHandler(onBack = viewModel::dismissPrintedWasteSelector)
+    PrintedWasteSelectorContent(state, game, viewModel::dismissPrintedWasteSelector,
+        viewModel::refreshPrintedWasteQueues, viewModel::launchWithPrintedWaste, viewModel::updateSettings, modifier)
+}
+
+@Composable
+internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, onDismiss: () -> Unit,
+    onRetry: () -> Unit, onLaunch: (String?) -> Unit, onSettingsChange: (AppSettings) -> Unit,
+    modifier: Modifier = Modifier) {
+    BackHandler(onBack = onDismiss)
     val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings, state.regions) {
         state.printedWasteQueue
             .filter { (zoneId, _) -> isStandardPrintedWasteZone(zoneId) && state.printedWasteMapping[zoneId]?.nuked != true }
@@ -558,7 +567,7 @@ internal fun PrintedWasteSelector(
                 dismissHigherPingWarning = false
                 pendingHigherPingLaunch = zone
             } else {
-                viewModel.launchWithPrintedWaste(zone.routingUrl)
+                onLaunch(zone.routingUrl)
             }
         }
     }
@@ -590,8 +599,8 @@ internal fun PrintedWasteSelector(
                                 .fillMaxHeight(0.82f)
                         },
                     ),
-                colors = CardDefaults.cardColors(containerColor = Panel),
-                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(containerColor = if (LocalSpaceUiPresentation.current) SpaceInk else Panel, contentColor = TextPrimary),
+                shape = RoundedCornerShape(if (LocalSpaceUiPresentation.current) 8.dp else 22.dp),
             ) {
                 if (phoneLandscape) {
                     Row(
@@ -612,11 +621,11 @@ internal fun PrintedWasteSelector(
                             selectedZoneId = selectedZoneId,
                             selectedZone = selectedZone,
                             autoLocation = autoLocation,
-                            showRecommendedCard = true,
+                            showRecommendedCard = !LocalSpaceUiPresentation.current,
                             onSelectZone = { selectedZoneId = it },
-                            onRetry = viewModel::refreshPrintedWasteQueues,
-                            onDismiss = viewModel::dismissPrintedWasteSelector,
-                            onDefault = { viewModel.launchWithPrintedWaste(null) },
+                            onRetry = onRetry,
+                            onDismiss = onDismiss,
+                            onDefault = { onLaunch(null) },
                             onLaunch = launchSelectedZone,
                             modifier = Modifier
                                 .weight(1f)
@@ -646,11 +655,11 @@ internal fun PrintedWasteSelector(
                             selectedZoneId = selectedZoneId,
                             selectedZone = selectedZone,
                             autoLocation = autoLocation,
-                            showRecommendedCard = true,
+                            showRecommendedCard = !LocalSpaceUiPresentation.current,
                             onSelectZone = { selectedZoneId = it },
-                            onRetry = viewModel::refreshPrintedWasteQueues,
-                            onDismiss = viewModel::dismissPrintedWasteSelector,
-                            onDefault = { viewModel.launchWithPrintedWaste(null) },
+                            onRetry = onRetry,
+                            onDismiss = onDismiss,
+                            onDefault = { onLaunch(null) },
                             onLaunch = launchSelectedZone,
                             modifier = Modifier.weight(1f),
                         )
@@ -697,13 +706,13 @@ internal fun PrintedWasteSelector(
                 Button(
                     onClick = {
                         if (dismissHigherPingWarning) {
-                            viewModel.updateSettings(
+                            onSettingsChange(
                                 state.settings.copy(higherPingWarningDismissed = true),
                             )
                         }
                         dismissHigherPingWarning = false
                         pendingHigherPingLaunch = null
-                        viewModel.launchWithPrintedWaste(zone.routingUrl)
+                        onLaunch(zone.routingUrl)
                     },
                 ) {
                     Text(stringResource(R.string.action_ok))
@@ -883,6 +892,12 @@ private fun PrintedWasteOptionsColumn(
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (LocalSpaceUiPresentation.current) {
+                SpaceControl(stringResource(R.string.action_cancel), Modifier.weight(1f), minHeight = 52.dp, onClick = onDismiss)
+                SpaceControl(stringResource(R.string.store_selector_default), Modifier.weight(1f).focusRequester(defaultFocusRequester), minHeight = 52.dp, onClick = onDefault)
+                SpaceControl(stringResource(R.string.action_launch), Modifier.weight(1f).focusRequester(launchFocusRequester).focusProperties { up = zoneListFocusRequester },
+                    filled = true, enabled = !state.printedWasteLoading && selectedZone != null, onClick = onLaunch)
+            } else {
             TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
             OutlinedButton(
                 onClick = onDefault,
@@ -902,6 +917,7 @@ private fun PrintedWasteOptionsColumn(
             ) {
                 Text(stringResource(R.string.action_launch), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
+            }
         }
     }
 }
@@ -910,8 +926,9 @@ private fun PrintedWasteOptionsColumn(
 private fun RecommendedPrintedWasteCard(location: PrintedWasteLocation) {
     val zoneOption = location.primary
     Surface(
+        contentColor = TextPrimary,
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(if (LocalSpaceUiPresentation.current) 4.dp else 16.dp),
         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
     ) {
         Row(
@@ -981,16 +998,22 @@ private fun PrintedWasteLocationRow(
     liveSelectedOutlines: Boolean,
     onClick: () -> Unit,
 ) {
+    val space = LocalSpaceUiPresentation.current
+    val motion = if (space) rememberSpaceInteraction(focused) else null
     val zoneOption = location.primary
     val zone = zoneOption.zone
     val detail = printedWasteLocationDetail(location)
     Box(Modifier.fillMaxWidth()) {
         Surface(
+        contentColor = TextPrimary,
             modifier = Modifier
                 .fillMaxWidth()
+                .then(motion?.modifier ?: Modifier)
+                .then(if (motion != null) Modifier.hoverable(motion.source) else Modifier)
                 .focusProperties { canFocus = false }
-                .clickable { onClick() },
-            shape = RoundedCornerShape(12.dp),
+                .then(if (motion != null) Modifier.clickable(interactionSource = motion.source, indication = null, onClick = onClick)
+                    else Modifier.clickable(onClick = onClick)),
+            shape = RoundedCornerShape(if (space) 4.dp else 12.dp),
             color = if (focused) {
                 Color.White.copy(alpha = 0.16f)
             } else if (selected) {
@@ -999,7 +1022,7 @@ private fun PrintedWasteLocationRow(
                 PanelAlt
             },
             tonalElevation = if (selected) 2.dp else 0.dp,
-            border = if (selected && listFocused && !liveSelectedOutlines) {
+            border = if (!space && selected && listFocused && !liveSelectedOutlines) {
                 BorderStroke(2.dp, LocalSelectionTintColor.current)
             } else {
                 null
@@ -1055,7 +1078,7 @@ private fun PrintedWasteLocationRow(
             }
         }
         ControllerFocusFrame(
-            visible = shouldShowActiveSelectionOutline(selected, liveSelectedOutlines),
+            visible = !space && shouldShowActiveSelectionOutline(selected, liveSelectedOutlines),
             cornerRadius = 12.dp,
             tint = LocalActiveSelectionColor.current,
             secondaryTint = LocalActiveSelectionSecondaryColor.current,
@@ -1088,6 +1111,7 @@ private fun QueueMetricPill(
     valueColor: Color = TextPrimary,
 ) {
     Surface(
+        contentColor = TextPrimary,
         shape = RoundedCornerShape(10.dp),
         color = Color.Black.copy(alpha = 0.22f),
         border = if (LocalAbsoluteCinemaEffects.current) {

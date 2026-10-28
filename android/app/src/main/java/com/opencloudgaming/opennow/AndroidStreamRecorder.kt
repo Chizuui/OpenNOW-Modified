@@ -10,6 +10,7 @@ import android.opengl.GLES20
 import android.os.Build
 import android.os.SystemClock
 import org.webrtc.EglBase
+import org.webrtc.GlRectDrawer
 import org.webrtc.VideoFrame
 import org.webrtc.VideoFrameDrawer
 import org.webrtc.VideoSink
@@ -32,6 +33,8 @@ internal enum class StreamRecorderPhase {
     Recording,
     Finalizing,
     Finished,
+    /** The MP4 was saved, but a selected personal input became unavailable. */
+    Interrupted,
     Failed,
 }
 
@@ -51,8 +54,13 @@ internal class AndroidStreamRecorder(
     private val fps: Int,
     private val bitrateMbps: Int,
     private val sharpnessAmount: Float,
+    private val includeMicrophone: Boolean = false,
+    private val includeCamera: Boolean = false,
+    val usesSharedMicrophone: Boolean = false,
+    private val microphoneDeviceId: String = "",
     private val onPhase: (StreamRecorderPhase, String?) -> Unit,
 ) : VideoSink {
+    val recordsPersonalInputs: Boolean get() = includeMicrophone || includeCamera
     private companion object {
         private const val VIDEO_MIME = MediaFormat.MIMETYPE_VIDEO_AVC
         private const val AUDIO_MIME = MediaFormat.MIMETYPE_AUDIO_AAC
@@ -106,6 +114,12 @@ internal class AndroidStreamRecorder(
     private val workerFinished = CountDownLatch(1)
     private val audioDroppedBlocks = AtomicLong(0L)
     private val videoDroppedFrames = AtomicLong(0L)
+    private val inputFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    private var microphoneCapture: MicrophonePcmCapture? = null
+    private var cameraCapture: RecordingCameraCapture? = null
+    private var cameraDrawer: GlRectDrawer? = null
+    private var audioMixer: RecordingAudioMixer? = null
+    private var stopTimeNs = 0L
     private val audioDiscontinuityAtNs = AtomicLong(-1L)
     private val reportedAudioQueueOverflow = AtomicBoolean(false)
     @Volatile private var acceptingInput = false
@@ -173,6 +187,27 @@ internal class AndroidStreamRecorder(
         }
     }
 
+    fun queueMicrophoneAudio(pcm: ByteBuffer, sampleRate: Int, channels: Int) {
+        synchronized(inputGate) {
+            if (!acceptingInput || !includeMicrophone) return
+            val durationNs = pcm.remaining().toLong() * 1_000_000_000L /
+                (sampleRate.coerceAtLeast(1).toLong() * channels.coerceAtLeast(1) * 2)
+            audioMixer?.queue(RecordingAudioMixer.Source.Microphone, pcm, sampleRate, channels,
+                SystemClock.elapsedRealtimeNanos() - durationNs)
+        }
+    }
+
+    fun queueMicrophoneAudio(samples: ShortArray) {
+        if (!acceptingInput || !includeMicrophone) return
+        val bytes = ByteBuffer.allocate(samples.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bytes.asShortBuffer().put(samples)
+        queueMicrophoneAudio(bytes, DEFAULT_SAMPLE_RATE, 1)
+    }
+
+    fun onSharedMicrophoneError(message: String) {
+        if (usesSharedMicrophone) inputFailure.compareAndSet(null, "Microphone: $message")
+    }
+
     /**
      * Copies the callback buffer before returning. Only PCM16/48 kHz is accepted because
      * MediaCodec's AAC input is stereo; mono packets are duplicated sample-for-sample, while
@@ -195,6 +230,14 @@ internal class AndroidStreamRecorder(
 
         synchronized(inputGate) {
             if (!acceptingInput) return
+            if (includeMicrophone) {
+                if (bitsPerSample == DEFAULT_BITS_PER_SAMPLE) {
+                    val durationNs = audioData.remaining().toLong() * 1_000_000_000L /
+                        (sampleRate.coerceAtLeast(1).toLong() * numberOfChannels.coerceAtLeast(1) * 2)
+                    audioMixer?.queue(RecordingAudioMixer.Source.Game, audioData, sampleRate, numberOfChannels, ptsNs - durationNs)
+                }
+                return
+            }
             if (
                 bitsPerSample != DEFAULT_BITS_PER_SAMPLE ||
                 sampleRate != DEFAULT_SAMPLE_RATE ||
@@ -294,6 +337,7 @@ internal class AndroidStreamRecorder(
         }
         if (!started.compareAndSet(false, true)) return false
         timelineOriginNs = SystemClock.elapsedRealtimeNanos()
+        if (includeMicrophone) audioMixer = RecordingAudioMixer(timelineOriginNs)
         synchronized(inputGate) { acceptingInput = true }
         report(StreamRecorderPhase.Starting, null)
         val thread = Thread(::runWorker, "OpenNOW-stream-recorder")
@@ -319,7 +363,9 @@ internal class AndroidStreamRecorder(
         if (!started.get()) return
         synchronized(inputGate) {
             acceptingInput = false
-            if (!stopRequested.compareAndSet(false, true)) return
+            if (stopRequested.get()) return
+            stopTimeNs = SystemClock.elapsedRealtimeNanos()
+            stopRequested.set(true)
         }
         val worker = workerThread
         if (worker != null) LockSupport.unpark(worker)
@@ -346,6 +392,8 @@ internal class AndroidStreamRecorder(
         try {
             createVideoEncoder()
             createAudioEncoder()
+            startOptionalInputs()
+            awaitInitialCameraFrame()
             report(StreamRecorderPhase.Recording, null)
             recordingLoop()
             finishOutput()
@@ -358,7 +406,9 @@ internal class AndroidStreamRecorder(
                 if (audioDrops > 0L) add("dropped $audioDrops audio PCM blocks to stay synchronized")
                 if (videoDrops > 0L) add("dropped $videoDrops video frames under encoder load")
             }.takeIf { it.isNotEmpty() }?.joinToString("; ")
-            report(StreamRecorderPhase.Finished, finishMessage)
+            val interrupted = inputFailure.get()
+            report(if (interrupted == null) StreamRecorderPhase.Finished else StreamRecorderPhase.Interrupted,
+                interrupted ?: finishMessage)
         } catch (error: Throwable) {
             releaseResources()
             deleteTemporaryOutput()
@@ -368,6 +418,38 @@ internal class AndroidStreamRecorder(
             synchronized(inputGate) { acceptingInput = false }
             workerThread = null
             workerFinished.countDown()
+        }
+    }
+
+    private fun startOptionalInputs() {
+        if (stopRequested.get()) return
+        if (includeCamera) {
+            cameraDrawer = GlRectDrawer()
+            cameraCapture = RecordingCameraCapture(appContext, sharedContext) {
+                inputFailure.compareAndSet(null, "Camera: $it")
+            }
+            cameraCapture!!.start()
+        }
+        if (includeMicrophone && !usesSharedMicrophone) {
+            microphoneCapture = MicrophonePcmCapture(appContext, microphoneDeviceId,
+                ready = { !stopRequested.get() },
+                send = { samples, _, _ ->
+                    queueMicrophoneAudio(samples)
+                    true
+                },
+                error = { inputFailure.compareAndSet(null, "Microphone: $it") },
+            ).also { it.enabled = true; it.start() }
+        }
+    }
+
+    private fun awaitInitialCameraFrame() {
+        if (!includeCamera) return
+        val deadlineNs = System.nanoTime() + 8_000_000_000L
+        while (cameraCapture?.hasFrame() != true) {
+            inputFailure.get()?.let { throw IOException(it) }
+            if (stopRequested.get()) throw IOException("Recording stopped before the camera was ready")
+            if (System.nanoTime() >= deadlineNs) throw IOException("Camera did not provide a frame")
+            LockSupport.parkNanos(2_000_000L)
         }
     }
 
@@ -429,8 +511,7 @@ internal class AndroidStreamRecorder(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16 * 1024)
-            // The AAC encoder receives signed interleaved PCM16 from the decoder callback; no
-            // microphone or platform audio capture API is involved.
+            // Both the decoder and optional microphone mix produce interleaved PCM16 stereo.
         }
         val encoder = MediaCodec.createEncoderByType(AUDIO_MIME)
         try {
@@ -448,19 +529,31 @@ internal class AndroidStreamRecorder(
         var videoInputEos = false
         var audioInputEos = false
         var pendingAudio: QueuedAudio? = null
+        var mixedAudioDrained = false
         var finalizeDeadlineNs = Long.MAX_VALUE
 
         while (true) {
+            if (inputFailure.get() != null && !stopRequested.get()) stop()
             var progress = false
             if (stopRequested.get() && !finalizing) {
                 finalizing = true
+                stopOptionalInputs()
                 finalizeDeadlineNs = System.nanoTime() + FINALIZE_TIMEOUT_NS
                 report(StreamRecorderPhase.Finalizing, null)
             }
 
             var audioInputsFed = 0
             while (audioInputsFed < AUDIO_INPUTS_PER_TICK) {
-                if (pendingAudio == null) pendingAudio = audioQueue.poll()
+                if (pendingAudio == null) {
+                    pendingAudio = if (includeMicrophone) {
+                        val throughNs = if (finalizing) stopTimeNs
+                            else SystemClock.elapsedRealtimeNanos() - RecordingAudioMixer.INPUT_DELAY_NS
+                        audioMixer?.poll(throughNs)?.let {
+                            QueuedAudio(it.bytes, DEFAULT_BITS_PER_SAMPLE, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS, it.ptsNs)
+                        }
+                    } else audioQueue.poll()
+                    mixedAudioDrained = pendingAudio == null
+                }
                 val currentPendingAudio = pendingAudio ?: break
                 if (!feedAudio(currentPendingAudio)) break
                 if (currentPendingAudio.offset >= currentPendingAudio.bytes.size) pendingAudio = null
@@ -484,7 +577,7 @@ internal class AndroidStreamRecorder(
                 progress = true
             }
             if (
-                finalizing && pendingAudio == null && audioQueue.isEmpty() && !audioInputEos &&
+                finalizing && pendingAudio == null && audioQueue.isEmpty() && (!includeMicrophone || mixedAudioDrained) && !audioInputEos &&
                     queueAudioEos()
             ) {
                 audioInputEos = true
@@ -533,6 +626,28 @@ internal class AndroidStreamRecorder(
         // based on rotatedWidth/rotatedHeight, so changed resolutions are letterboxed, never
         // cropped or stretched, while the unused encoder surface remains black.
         drawer.drawFrame(frame, gl, null, viewportX, viewportY, viewportWidth, viewportHeight)
+        cameraCapture?.let { camera ->
+            val cameraFrame = camera.acquireFrame()
+            if (cameraFrame != null) {
+                try {
+                    val inset = max(2, width / 60)
+                    val overlayWidth = max(1, width / 4)
+                    val overlayHeight = min(max(1, height / 3),
+                        max(1, overlayWidth * cameraFrame.rotatedHeight / cameraFrame.rotatedWidth.coerceAtLeast(1)))
+                    val overlayScale = min(overlayWidth.toFloat() / cameraFrame.rotatedWidth.coerceAtLeast(1),
+                        overlayHeight.toFloat() / cameraFrame.rotatedHeight.coerceAtLeast(1))
+                    val drawWidth = max(1, (cameraFrame.rotatedWidth * overlayScale).toInt())
+                    val drawHeight = max(1, (cameraFrame.rotatedHeight * overlayScale).toInt())
+                    drawer.drawFrame(cameraFrame, cameraDrawer!!, null,
+                        width - inset - drawWidth, inset, drawWidth, drawHeight)
+                } finally { cameraFrame.release() }
+            } else {
+                if (SystemClock.elapsedRealtimeNanos() - timelineOriginNs > 8_000_000_000L) {
+                    throw IOException("Camera did not provide a frame")
+                }
+                return // Do not save frames without the camera the user asked to include.
+            }
+        }
         egl.swapBuffers(ptsUs * 1_000L)
         val frameIntervalNs = 1_000_000_000L / fps
         var nextPtsNs = if (scheduledPtsNs == 0L) receivedPtsNs + frameIntervalNs
@@ -749,6 +864,9 @@ internal class AndroidStreamRecorder(
     private fun releaseResources() {
         if (!resourcesReleased.compareAndSet(false, true)) return
         synchronized(inputGate) { acceptingInput = false }
+        stopOptionalInputs()
+        cameraCapture?.close()
+        cameraCapture = null
         while (true) {
             val queued = frameQueue.poll() ?: break
             queued.frame.release()
@@ -759,7 +877,10 @@ internal class AndroidStreamRecorder(
         videoOutputFormat = null
         audioOutputFormat = null
         runCatching { glDrawer?.release() }
+        runCatching { cameraDrawer?.release() }
+        cameraDrawer = null
         glDrawer = null
+        runCatching { videoDrawer?.release() }
         videoDrawer = null
         runCatching { eglBase?.release() }
         eglBase = null
@@ -775,6 +896,15 @@ internal class AndroidStreamRecorder(
         muxer = null
         runCatching { outputPfd?.close() }
         outputPfd = null
+    }
+
+    private fun stopOptionalInputs() {
+        microphoneCapture?.let { capture ->
+            capture.stop()
+            runCatching { capture.awaitStopped() }
+        }
+        microphoneCapture = null
+        cameraCapture?.stop()
     }
 
     private fun copyLegacyOutputIfNeeded() {

@@ -86,6 +86,15 @@ internal fun nvstSessionContext(session: SessionInfo, settings: StreamSettings):
         put("sessionId", session.sessionId)
         put("serverIp", session.serverIp)
         session.mediaConnectionInfo?.let { put("mediaConnectionInfo", OpenNowJson.encodeToJsonElement(it)) }
+        session.bundleConnectionInfo?.let { bundle ->
+            putJsonArray("connectionInfo") {
+                add(buildJsonObject {
+                    put("ip", bundle.ip)
+                    put("port", bundle.port)
+                    put("usage", 17)
+                })
+            }
+        }
         put("rtspsEndpoints", JsonArray(session.rtspsEndpoints.map(::JsonPrimitive)))
     })
     put("settings", buildJsonObject {
@@ -157,16 +166,19 @@ internal class NvstTransport(
     private val stats: (StreamRuntimeStats) -> Unit,
     private val rumble: (GamepadRumbleCommand) -> Unit,
     private val recordingAudio: (ByteBuffer) -> Unit = {},
+    private val recordingMicrophone: (ShortArray) -> Unit = {},
 ) {
     private val handle = NvstBridge.create()
-    private val wifiPerformance = StreamWifiPerformanceLock(context)
     @Volatile private var stopped = false
     @Volatile var inputReady = false
         private set
     @Volatile var muted = false
-    private val microphone = NvstMicrophoneCapture(context.applicationContext, settings.microphoneDeviceId,
+    private val microphone = MicrophonePcmCapture(context.applicationContext, settings.microphoneDeviceId,
         ready = { inputReady && !stopped },
-        send = { samples, timestamp, restart -> NvstBridge.microphone(handle, samples, timestamp, restart) },
+        send = { samples, timestamp, restart ->
+            recordingMicrophone(samples)
+            NvstBridge.microphone(handle, samples, timestamp, restart)
+        },
         error = { detail ->
             NvstBridge.microphoneEnabled(handle, false)
             event("microphone-error", detail)
@@ -204,13 +216,11 @@ internal class NvstTransport(
         Thread({
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
-                wifiPerformance.acquire()
                 microphone.start()
                 NvstBridge.run(handle, nvstSessionContext(session, settings), this)
             } catch (error: Exception) {
                 if (!stopped) event("error", "NVST failed: ${error.javaClass.simpleName}")
             } finally {
-                wifiPerformance.release()
                 stopped = true
                 inputReady = false
                 inputWorker.shutdownNow()

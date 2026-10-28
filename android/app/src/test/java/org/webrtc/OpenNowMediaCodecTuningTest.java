@@ -73,6 +73,48 @@ public class OpenNowMediaCodecTuningTest {
   }
 
   @Test
+  public void observesFormatChangesWithoutInspectingEveryOutputBuffer() throws Exception {
+    List<String> events = new ArrayList<>();
+    IllegalStateException failure = new IllegalStateException("codec released");
+    boolean[] formatFails = {false};
+    MediaCodecWrapper codec = (MediaCodecWrapper) Proxy.newProxyInstance(
+        MediaCodecWrapper.class.getClassLoader(), new Class<?>[] {MediaCodecWrapper.class},
+        (proxy, method, args) -> {
+          if (method.getName().equals("getOutputFormat")) {
+            if (args == null || args.length == 0) {
+              events.add("format");
+              if (formatFails[0]) throw failure;
+            } else {
+              assertEquals(7, args[0]);
+              events.add("bufferFormat");
+            }
+          }
+          // Framework MediaFormat cannot be constructed in this JVM test; the bridge must
+          // pass even this placeholder through without reading or replacing the format.
+          return null;
+        });
+    MediaCodecWrapperFactory tuned = (MediaCodecWrapperFactory) OpenNowMediaCodecTuning.wrapFactory(
+        (MediaCodecWrapperFactory) name -> codec, new OpenNowMediaCodecTuning.Tuning() {
+          @Override public String selectCodecName(String name) { return name; }
+          @Override public void configure(String name, android.media.MediaFormat format) {}
+          @Override public void started(String name, OpenNowMediaCodecTuning.ParameterSetter setter) {}
+          @Override public void outputFormat(String name, android.media.MediaFormat format) {
+            assertEquals("decoder", name);
+            assertNull(format);
+            events.add("observed");
+            throw new IllegalStateException("diagnostics unavailable");
+          }
+        });
+    MediaCodecWrapper result = tuned.createByCodecName("decoder");
+    assertNull(result.getOutputFormat());
+    assertNull(result.getOutputFormat(7));
+    assertEquals(Arrays.asList("format", "observed", "bufferFormat"), events);
+    formatFails[0] = true;
+    assertSame(failure, assertThrows(IllegalStateException.class, result::getOutputFormat));
+    assertEquals(Arrays.asList("format", "observed", "bufferFormat", "format"), events);
+  }
+
+  @Test
   public void codecCreationFailureKeepsOriginalException() {
     java.io.IOException failure = new java.io.IOException("codec unavailable");
     MediaCodecWrapperFactory factory = name -> { throw failure; };

@@ -8,8 +8,8 @@ package com.opencloudgaming.opennow
  * device, the same split `AndroidSetupFlow.kt` uses for first-run setup.
  *
  * Nothing here unlocks paid entitlements, bypasses the provider, or changes what OpenNOW reports
- * about the user. Every action either resets local state the user already controls elsewhere or
- * shows information already available in the diagnostics export.
+ * to the provider. Demo mode changes presentation only; other actions reset local state or show
+ * information already available in the diagnostics export.
  */
 
 /** Taps on the build row needed to reveal developer options. Matches the Android platform gesture. */
@@ -59,7 +59,7 @@ internal fun AppSettings.unlockingDeveloperOptions(): AppSettings =
     if (developerOptionsUnlocked) this else copy(developerOptionsUnlocked = true)
 
 internal fun AppSettings.lockingDeveloperOptions(): AppSettings =
-    if (!developerOptionsUnlocked) this else copy(developerOptionsUnlocked = false)
+    copy(developerOptionsUnlocked = false, demoMode = false)
 
 // ---------------------------------------------------------------------------
 // Flow resets

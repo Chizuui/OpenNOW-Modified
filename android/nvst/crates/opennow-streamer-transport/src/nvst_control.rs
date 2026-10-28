@@ -2,6 +2,8 @@ use std::time::Duration;
 
 pub(crate) const FRAME_ACK_CODE: u16 = 0x204;
 pub(crate) const QOS_REPORT_CODE: u16 = 0x207;
+pub(crate) const NACK_V2_CODE: u16 = 0x317;
+pub(crate) const MAX_NACK_PACKET_COUNT: usize = 64;
 pub(crate) const IDR_REQUEST_CODE: u16 = 0x302;
 
 pub(crate) const FRAME_ACK_PAYLOAD_LEN: usize = 102;
@@ -54,6 +56,38 @@ pub(crate) fn batch_control_records(
         batches.push(batch);
     }
     batches
+}
+
+pub(crate) fn nack_v2(stream_index: u8, missing: &[u16]) -> Option<NvstControlCommand> {
+    if missing.is_empty() || missing.len() > MAX_NACK_PACKET_COUNT {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(3 + missing.len() * 10);
+    payload.extend_from_slice(&[2, stream_index, 0]);
+    let mut base = missing[0];
+    let mut bitmap = 0_u64;
+    for &sequence in &missing[1..] {
+        let distance = sequence.wrapping_sub(base);
+        if distance == 0 {
+            continue;
+        }
+        if distance <= 64 {
+            bitmap |= 1_u64 << (distance - 1);
+        } else {
+            payload.extend_from_slice(&base.to_le_bytes());
+            payload.extend_from_slice(&bitmap.to_le_bytes());
+            payload[2] += 1;
+            base = sequence;
+            bitmap = 0;
+        }
+    }
+    payload.extend_from_slice(&base.to_le_bytes());
+    payload.extend_from_slice(&bitmap.to_le_bytes());
+    payload[2] += 1;
+    Some(NvstControlCommand {
+        code: NACK_V2_CODE,
+        payload,
+    })
 }
 
 pub(crate) fn frame_ack(
@@ -240,5 +274,25 @@ mod tests {
     #[test]
     fn idr_request_matches_the_source_layout() {
         assert_eq!(idr_request().encoded(), [0x02, 0x03, 0x02, 0x00, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod alliance_tests {
+    use super::*;
+    #[test]
+    fn private_nack_v2_keeps_implicit_base_wrap_and_bounds() {
+        let packet = nack_v2(0, &[0x1234]).unwrap().encoded();
+        assert_eq!(
+            packet,
+            [0x17, 3, 13, 0, 2, 0, 1, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let packet = nack_v2(0, &[65534, 65535, 0, 62, 63]).unwrap().payload;
+        assert_eq!(packet[2], 2);
+        assert_eq!(&packet[3..5], &65534u16.to_le_bytes());
+        assert_eq!(&packet[5..13], &(3u64 | (1 << 63)).to_le_bytes());
+        assert_eq!(&packet[13..15], &63u16.to_le_bytes());
+        assert!(nack_v2(0, &[]).is_none());
+        assert!(nack_v2(0, &[0; 65]).is_none());
     }
 }

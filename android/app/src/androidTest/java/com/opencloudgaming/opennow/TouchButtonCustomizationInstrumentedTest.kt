@@ -139,15 +139,15 @@ class TouchButtonCustomizationInstrumentedTest {
                     onRemove = { visible = false; editing = false }, onDismiss = { editing = false })
             }
         }
-        compose.onNodeWithTag("stick").performTouchInput { swipe(center, center + Offset(100f, 60f), 600) }
+        compose.onNodeWithTag("stick", useUnmergedTree = true).performTouchInput { swipe(center, center + Offset(100f, 60f), 600) }
         compose.runOnIdle { assertFalse(editing); assertTrue(offset.x > 0f) }
-        compose.onNodeWithTag("stick").performTouchInput { click() }
+        compose.onNodeWithTag("stick", useUnmergedTree = true).performTouchInput { click() }
         compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.SetProgress)).performSemanticsAction(SemanticsActions.SetProgress) { it(1.5f) }
         compose.onNodeWithText("Save").performClick()
         compose.runOnIdle { assertEquals(1.5f, scale, 0f) }
-        compose.onNodeWithTag("stick").performTouchInput { click() }
+        compose.onNodeWithTag("stick", useUnmergedTree = true).performTouchInput { click() }
         compose.onNodeWithText("Remove button").performClick()
-        compose.onNodeWithTag("stick").assertDoesNotExist()
+        compose.onNodeWithTag("stick", useUnmergedTree = true).assertDoesNotExist()
     }
 
     @Test fun aControlCanBeDraggedAcrossTheScreenAndBack() {

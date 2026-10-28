@@ -25,12 +25,14 @@ private const val STORE_NAME = "opennow_native"
 private const val CATALOG_CACHE_STORE_NAME = "opennow_catalog_cache"
 private const val SECURE_STORE_NAME = "opennow_auth_secure"
 private const val KEY_SETTINGS = "settings"
+private const val KEY_SPACE_UI_ENABLE_CONFIRMED = "space_ui_enable_confirmed"
 private const val KEY_AUTH = "auth"
 private const val KEY_DEVICE_ID = "gfn_device_id"
 private const val KEY_CATALOG_CACHE_PREFIX = "catalog_cache_"
 private const val KEY_ANDROID_UPDATE_DISMISSED_NOTICE = "android_update_dismissed_notice"
 private const val KEY_QUEUED_GAME_KEYS = "queued_game_keys"
 private const val KEY_CONTINUE_PLAYING_DISMISSALS = "continue_playing_dismissals"
+private const val KEY_GAME_INPUT_MODE_PREFIX = "game_input_mode_"
 private const val CATALOG_CACHE_TTL_MS = 12L * 60L * 60L * 1000L
 
 /**
@@ -307,6 +309,8 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
         experimentalDynamicMinimumBitrateMbps = compatibleStream.experimentalDynamicMinimumBitrateMbps.coerceIn(1, 150),
         fps = compatibleStream.fps.coerceIn(30, 360),
         mouseSensitivity = compatibleStream.mouseSensitivity.finiteIn(0.25f, 3f, streamDefaults.mouseSensitivity),
+        touchMouseSensitivity = compatibleStream.touchMouseSensitivity
+            ?.takeIf { it.isFinite() }?.coerceIn(MIN_TOUCH_MOUSE_SENSITIVITY, MAX_TOUCH_MOUSE_SENSITIVITY),
         mouseAcceleration = compatibleStream.mouseAcceleration.coerceIn(1, 150),
         mouseScrollSensitivity = compatibleStream.mouseScrollSensitivity.coerceIn(10, 100),
         streamSharpeningAmount = compatibleStream.streamSharpeningAmount.finiteIn(
@@ -404,10 +408,12 @@ internal fun AppSettings.normalizedForAndroid(): AppSettings {
 internal fun loadAndroidSettings(
     raw: String?,
     playStoreRelease: Boolean,
+    androidTvProfile: Boolean = false,
+    gamingHandheld: Boolean = false,
     persistInitialOrMigration: (AppSettings) -> Unit = {},
 ): AppSettings {
     if (raw == null) {
-        val initial = firstInstallSettings(playStoreRelease)
+        val initial = firstInstallSettings(playStoreRelease, androidTvProfile, gamingHandheld)
             .withCurrentStreamPresentationDefaults()
             .normalizedForAndroid()
         persistInitialOrMigration(initial)
@@ -419,9 +425,18 @@ internal fun loadAndroidSettings(
 }
 
 class SettingsStore(context: Context) {
+    private val androidTvProfile = isAndroidTvProfile(context)
+    private val gamingHandheld = isGamingHandheldDevice()
     private val prefs = ExternalPrefs.get(context, STORE_NAME)
     private val _settings = MutableStateFlow(load())
     val settings: StateFlow<AppSettings> = _settings
+
+    internal fun hasConfirmedSpaceUiEnable(): Boolean =
+        prefs.getString(KEY_SPACE_UI_ENABLE_CONFIRMED, null) == "true"
+
+    internal fun confirmSpaceUiEnable() {
+        prefs.edit().putString(KEY_SPACE_UI_ENABLE_CONFIRMED, "true").apply()
+    }
 
     /**
      * Serializing [AppSettings] used to happen on whichever thread called [update] — in practice the
@@ -451,7 +466,7 @@ class SettingsStore(context: Context) {
         val raw = prefs.getString(KEY_SETTINGS, null)
         // Persist the selected first-install profile or an existing-settings migration. The
         // regular writer skips the initial StateFlow value, so it cannot save these for us.
-        return loadAndroidSettings(raw, BuildConfig.PLAY_STORE_RELEASE) { initialOrMigrated ->
+        return loadAndroidSettings(raw, BuildConfig.PLAY_STORE_RELEASE, androidTvProfile, gamingHandheld) { initialOrMigrated ->
             prefs.edit().putString(KEY_SETTINGS, OpenNowJson.encodeToString(initialOrMigrated)).apply()
         }
     }
@@ -477,7 +492,7 @@ class SettingsStore(context: Context) {
     }
 
     fun reset() {
-        replace(firstInstallSettings(BuildConfig.PLAY_STORE_RELEASE))
+        replace(firstInstallSettings(BuildConfig.PLAY_STORE_RELEASE, androidTvProfile, gamingHandheld))
     }
 }
 
@@ -815,6 +830,21 @@ class CatalogCacheStore private constructor(
             return
         }
         backup.delete()
+    }
+}
+
+internal class GameInputModeStore(context: Context) {
+    private val prefs = ExternalPrefs.get(context, STORE_NAME)
+
+    fun load(gameId: String?): StreamInputMode? {
+        if (gameId.isNullOrBlank()) return null
+        val saved = prefs.getString(KEY_GAME_INPUT_MODE_PREFIX + gameId, null)
+        return StreamInputMode.entries.firstOrNull { it.name == saved }
+    }
+
+    fun save(gameId: String?, mode: StreamInputMode) {
+        if (gameId.isNullOrBlank()) return
+        prefs.edit().putString(KEY_GAME_INPUT_MODE_PREFIX + gameId, mode.name).apply()
     }
 }
 

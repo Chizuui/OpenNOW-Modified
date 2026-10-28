@@ -11,11 +11,9 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.security.MessageDigest
 
 internal const val ANDROID_BUG_REPORT_ENDPOINT =
@@ -191,9 +189,6 @@ internal fun buildAndroidBugReportRequest(
     require(report.reporterId.matches(ANDROID_BUG_REPORT_REPORTER_ID_REGEX)) {
         "Bug report installation ID is invalid"
     }
-    require(report.files.size <= ANDROID_BUG_REPORT_MAX_FILES) {
-        "Bug reports support up to $ANDROID_BUG_REPORT_MAX_FILES files"
-    }
     runCatching { OpenNowJson.parseToJsonElement(report.metadata).jsonObject }
         .getOrElse { throw IllegalArgumentException("Bug report metadata must be a JSON object", it) }
 
@@ -213,18 +208,7 @@ internal fun buildAndroidBugReportRequest(
         .addFormDataPart("termsVersion", ANDROID_BUG_REPORT_TERMS_VERSION)
         .addFormDataPart("metadata", report.metadata)
 
-    report.files.forEach { attachment ->
-        require(attachment.fileName.isNotBlank()) { "Bug report files must have a name" }
-        require(attachment.bytes.size.toLong() <= ANDROID_BUG_REPORT_MAX_FILE_BYTES) {
-            "${attachment.fileName} is larger than 10 MiB"
-        }
-        val mediaType = attachment.contentType.toMediaType()
-        multipart.addFormDataPart(
-            "files",
-            attachment.fileName,
-            attachment.bytes.toRequestBody(mediaType),
-        )
-    }
+    multipart.addBugReportAttachments(report.files)
 
     return Request.Builder()
         .url(endpoint)

@@ -77,3 +77,21 @@ replace the old hard-coded descriptor values; removal neutralizes departing slot
 channel writes restore encoder state so the next snapshot retries registration. A shared report
 fixture checks the Kotlin encoder and Rust translation. This does not change WebRTC framing or
 CloudMatch input provisioning. Live on-screen controller response remains to be verified.
+
+Alliance streaming backport (2026-10-18), reviewed against dev 987ab3da4:
+- bfc0cac50 (#882): enable TLS 1.2 for partner RTSPS endpoints.
+- d041cd133 / e518df2c6 / 43c304919 (#998, #1022): bounded video SETUP URI/Transport
+  compatibility, stop at the first 200, retain SETUP metadata and use CloudMatch's
+  media peer when Transport is omitted. Native Mjolnir loss recovery uses private
+  NACK-v2 on partial control and control IDR rather than RTCP Generic NACK/PLI.
+- 7ce3cd549 (#1162): prefer usage-17 BUNDLE over usage-2 VIDEO for native ICE/DTLS,
+  demux unified-socket Mjolnir video with its negotiated SRTP keys, and leave the
+  separate video receiver inactive in unified mode. ANNOUNCE reflects that mode.
+- WebRTC endpoint selection follows dev cloudmatch.rs: prefer explicit WebSocket/HTTPS
+  and non-RTSP usage-14 descriptors, then native usage-14/16 converted to WSS 443.
+  Preserve explicit WebSocket ports, IPv6 authorities and separate media mappings.
+
+Android already defaults to WebRTC, so no desktop compatibility-mode preference or
+provider identity policy was copied. Existing Android JNI/media/input ownership and
+attachment-only disconnect remain. Scripted SETUP and encrypted UDP loopback tests
+cover negotiation and media demux; ABYA/provider acceptance still needs a live session.

@@ -365,12 +365,16 @@ internal class OpenNowVideoDecoderFactory(
     private val defaultFactory = DefaultVideoDecoderFactory(sharedContext)
     private val hardwareFactory = openNowHardwareVideoDecoderFactory(sharedContext)
     private val platformSoftwareFactory = PlatformSoftwareVideoDecoderFactory(sharedContext)
+    private val surfacePresentationMode = if (directJavaDecode) SurfacePresentationMode.MediaCadence
+        else SurfacePresentationMode.Immediate
 
     override fun createDecoder(info: VideoCodecInfo): VideoDecoder? {
         val codec = info.name.toOpenNowVideoCodec()
         if (hdrEnabled()) {
             // Never let an HDR session fall through an 8-bit texture or software decoder.
-            return if (codec == VideoCodec.H265) hdrSurfaceDecoder(requestedFps(), decoderSurface) else null
+            return if (codec == VideoCodec.H265) {
+                hdrSurfaceDecoder(requestedFps(), decoderSurface, surfacePresentationMode)
+            } else null
         }
         val hardwareDecoder = if (codec != null) hardwareFactory.createDecoder(info) else null
         // DefaultVideoDecoderFactory can return VideoDecoderFallback, a native-only wrapper whose
@@ -447,7 +451,8 @@ internal class OpenNowVideoDecoderFactory(
             requestTextureOutput("no approved hardware surface decoder")
             return textureDecoder
         }
-        val surfaceDecoder = MediaCodecSurfaceVideoDecoder(exactRequestedFps, decoderSurface, hdr = false) { width, height, rate ->
+        val surfaceDecoder = MediaCodecSurfaceVideoDecoder(exactRequestedFps, decoderSurface,
+            hdr = false, presentationMode = surfacePresentationMode) { width, height, rate ->
             sdrSurfaceDecoderConfiguration(codec, hardwareDecoderImplementation, width, height, rate,
                 tuneSelectedDecoder, nativeLowLatencyDecoderEnabled, standardLowLatencyEnabled)
         }

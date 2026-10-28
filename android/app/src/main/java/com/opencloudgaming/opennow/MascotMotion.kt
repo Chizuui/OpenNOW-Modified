@@ -12,6 +12,7 @@ internal const val MASCOT_SIDE_PEEK_VISIBLE_DP = 15f
 internal const val MASCOT_SIDE_PEEK_DURATION_SECONDS = 0.65f
 internal const val MASCOT_MIN_SPEED_DP_PER_SECOND = 220f
 internal const val MASCOT_MAX_SPEED_DP_PER_SECOND = 350f
+internal const val MASCOT_COMPANION_SPEED_SCALE = 0.5f
 
 internal fun mascotMinX(width: Float): Float =
     if (width <= 0f) 0f else -(MASCOT_SIZE_DP - minOf(MASCOT_SIDE_PEEK_VISIBLE_DP, width))
@@ -25,12 +26,24 @@ internal fun normalizeMascotDelaySeconds(seconds: Int): Int =
 internal fun nextMascotMessage(current: Int, count: Int, random: Random = Random.Default): Int =
     if (count < 2) 0 else (current + 1 + random.nextInt(count - 1)) % count
 
+/** Start across the screen from the logo, travelling the other way at half its speed. */
+internal fun createMascotCompanionMotion(logo: MascotMotion, width: Float, height: Float): MascotMotion =
+    MascotMotion(
+        x = (width - MASCOT_SIZE_DP - logo.x).coerceIn(mascotMinX(width), mascotMaxX(width)),
+        y = ((height - MASCOT_SIZE_DP).coerceAtLeast(0f) - logo.y)
+            .coerceIn(0f, (height - MASCOT_SIZE_DP).coerceAtLeast(0f)),
+        vx = -logo.vx * MASCOT_COMPANION_SPEED_SCALE,
+        vy = -logo.vy * MASCOT_COMPANION_SPEED_SCALE,
+        speedScale = MASCOT_COMPANION_SPEED_SCALE,
+    )
+
 /** Positions and speed are in dp so the mascot behaves consistently across display densities. */
 internal class MascotMotion(
     var x: Float,
     var y: Float,
     var vx: Float,
     var vy: Float,
+    private val speedScale: Float = 1f,
 ) {
     private var sidePeekSecondsRemaining = 0f
 
@@ -39,8 +52,8 @@ internal class MascotMotion(
 
     fun randomizeVelocity(random: Random = Random.Default) {
         val angle = PI.toFloat() / 9f + random.nextFloat() * PI.toFloat() * 5f / 18f
-        val speed = MASCOT_MIN_SPEED_DP_PER_SECOND +
-            random.nextFloat() * (MASCOT_MAX_SPEED_DP_PER_SECOND - MASCOT_MIN_SPEED_DP_PER_SECOND)
+        val speed = (MASCOT_MIN_SPEED_DP_PER_SECOND +
+            random.nextFloat() * (MASCOT_MAX_SPEED_DP_PER_SECOND - MASCOT_MIN_SPEED_DP_PER_SECOND)) * speedScale
         vx = cos(angle) * speed * if (random.nextBoolean()) 1f else -1f
         vy = sin(angle) * speed * if (random.nextBoolean()) 1f else -1f
     }

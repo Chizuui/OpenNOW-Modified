@@ -29,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.opencloudgaming.opennow.ui.controls.ControlActionRow
+import com.opencloudgaming.opennow.ui.controls.ControlSwitchRow
 import com.opencloudgaming.opennow.ui.controls.ControlSection
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
@@ -45,10 +46,8 @@ import kotlinx.coroutines.launch
  * The unlock gesture, and every transform an action applies to [AppSettings], live in
  * `AndroidDeveloperOptions.kt` where they are unit tested.
  *
- * Scope is deliberately narrow, and stays inside what a store build may ship: each action either
- * resets local state the user can already reach elsewhere, or shows information already present in
- * the diagnostics export. Nothing here grants entitlements, alters what is reported about the user,
- * or reaches outside OpenNOW's own data.
+ * Demo mode masks presentation without changing provider state. Other actions reset local state
+ * or show diagnostics; none grants entitlements or changes what is reported to the provider.
  */
 @Composable
 internal fun DeveloperOptionsPanel(state: OpenNowUiState, viewModel: OpenNowViewModel) {
@@ -88,6 +87,15 @@ internal fun DeveloperOptionsPanel(state: OpenNowUiState, viewModel: OpenNowView
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md)) {
         DeveloperOptionsNotice()
+
+        ControlSection(stringResource(R.string.dev_demo_section)) {
+            ControlSwitchRow(
+                label = stringResource(R.string.dev_demo_mode),
+                value = stringResource(R.string.dev_demo_mode_summary),
+                checked = settings.demoMode,
+                onCheckedChange = { viewModel.updateSettings(settings.copy(demoMode = it)) },
+            )
+        }
 
         ControlSection(stringResource(R.string.dev_section_flows)) {
             ControlActionRow(
@@ -319,7 +327,7 @@ private fun DeveloperOptionsNotice() {
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                stringResource(R.string.dev_notice_body),
+                stringResource(R.string.dev_notice_with_demo_body),
                 color = SettingsTextMuted,
                 style = MaterialTheme.typography.bodySmall,
             )

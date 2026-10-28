@@ -13,6 +13,58 @@ import org.junit.Test
 
 class StreamInputModeChoiceTest {
     @Test
+    fun rememberedChoiceSkipsPromptRegardlessOfConnectedDevices() = runBlocking {
+        for (mode in StreamInputMode.entries) {
+            for (connected in listOf(false, true)) {
+                assertEquals(
+                    mode,
+                    chooseStreamInputModeAtStart(
+                        nativeTouchAvailable = true,
+                        keyboardMouseConnected = connected,
+                        promptForChoice = true,
+                        rememberedMode = mode,
+                    ) { error("Remembered choice should skip the prompt") },
+                )
+            }
+        }
+    }
+
+    @Test
+    fun rememberedNativeTouchDoesNotOverrideUnavailableTouch() = runBlocking {
+        assertEquals(
+            StreamInputMode.KeyboardMouse,
+            chooseStreamInputModeAtStart(
+                nativeTouchAvailable = false,
+                keyboardMouseConnected = false,
+                promptForChoice = false,
+                rememberedMode = StreamInputMode.NativeTouch,
+            ) { error("Unavailable touch should not prompt") },
+        )
+    }
+
+    @Test
+    fun rememberedControllerDoesNotEnableTouchOrDisableWebsiteMode() = runBlocking {
+        val mode = chooseStreamInputModeAtStart(
+            nativeTouchAvailable = true,
+            keyboardMouseConnected = false,
+            promptForChoice = true,
+            rememberedMode = StreamInputMode.KeyboardMouse,
+        ) { error("Remembered choice should skip the prompt") }
+        assertTrue(StreamSettings(browserClientMode = true).forStreamInputMode(mode).browserClientMode)
+    }
+
+    @Test
+    fun rememberedNativeTouchStillDisablesWebsiteModeBeforeProvisioning() = runBlocking {
+        val mode = chooseStreamInputModeAtStart(
+            nativeTouchAvailable = true,
+            keyboardMouseConnected = true,
+            promptForChoice = true,
+            rememberedMode = StreamInputMode.NativeTouch,
+        ) { error("Remembered choice should skip the prompt") }
+        assertFalse(StreamSettings(browserClientMode = true).forStreamInputMode(mode).browserClientMode)
+    }
+
+    @Test
     fun savedKeyboardOverlayDoesNotSuppressAProvisionedNativeTouchSession() {
         assertFalse(keyboardOverlayEnabledForStream(true, StreamInputMode.NativeTouch))
         assertTrue(keyboardOverlayEnabledForStream(true, StreamInputMode.KeyboardMouse))
@@ -77,6 +129,59 @@ class StreamInputModeChoiceTest {
         assertTrue(shouldPromptForLaunchInputMode(true, false, true))
         assertFalse(shouldPromptForLaunchInputMode(true, false, false))
         assertFalse(shouldPromptForLaunchInputMode(false, true, true))
+    }
+
+    @Test
+    fun websiteModeWaitsForInputChoiceBeforeChangingTheLaunchSettings() = runBlocking {
+        val settings = StreamSettings(browserClientMode = true)
+        val game = GameInfo(
+            id = "genshin",
+            title = "Genshin Impact",
+            variants = listOf(GameVariant(id = "variant", store = "EPIC", supportedControls = listOf("TOUCHSCREEN"))),
+        )
+        val touchAvailable = shouldUseNativeTouch(
+            NativeTouchMode.Auto,
+            game,
+            settings.forStreamInputMode(StreamInputMode.NativeTouch),
+        )
+        assertTrue(touchAvailable)
+        val prompt = shouldPromptForLaunchInputMode(touchAvailable, true, false, websiteClientMode = true)
+        assertTrue(prompt)
+
+        for (mode in StreamInputMode.entries) {
+            val answer = CompletableDeferred<StreamInputMode>()
+            val launch = async(start = CoroutineStart.UNDISPATCHED) {
+                val selected = chooseStreamInputModeAtStart(touchAvailable, false, prompt) { answer.await() }
+                settings.forStreamInputMode(selected)
+            }
+            assertFalse(launch.isCompleted)
+            assertTrue(settings.browserClientMode)
+            answer.complete(mode)
+            val resolved = launch.await()
+            assertEquals(mode != StreamInputMode.NativeTouch, resolved.browserClientMode)
+            assertEquals(mode == StreamInputMode.NativeTouch, shouldUseNativeTouch(NativeTouchMode.Auto, game, resolved))
+            assertEquals(settings.copy(browserClientMode = resolved.browserClientMode), resolved)
+        }
+    }
+
+    @Test
+    fun websiteModeRequiresConsentEvenForAlwaysTouchWithoutCatalogSupport() {
+        assertTrue(shouldPromptForLaunchInputMode(true, false, false, websiteClientMode = true))
+        assertFalse(shouldPromptForLaunchInputMode(false, true, false, websiteClientMode = true))
+        assertFalse(shouldPromptForLaunchInputMode(false, false, false, websiteClientMode = true))
+    }
+
+    @Test
+    fun dismissingWebsiteModeChoicePreservesBrowserSettings() = runBlocking {
+        var settings = StreamSettings(browserClientMode = true)
+        val answer = CompletableDeferred<StreamInputMode>()
+        val launch = async(start = CoroutineStart.UNDISPATCHED) {
+            val mode = chooseStreamInputModeAtStart(true, false, promptForChoice = true) { answer.await() }
+            settings = settings.forStreamInputMode(mode)
+        }
+        launch.cancelAndJoin()
+        answer.complete(StreamInputMode.NativeTouch)
+        assertTrue(settings.browserClientMode)
     }
 
     @Test

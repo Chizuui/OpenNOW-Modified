@@ -40,6 +40,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.HourglassEmpty
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -71,6 +75,7 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -129,6 +134,14 @@ internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMod
             setupProgress.snapTo(0f)
         }
     }
+    if (state.settings.experimentalSpaceUi && (ad == null || mediaUrl == null)) {
+        SpaceLaunchScreen(state, queueCopy,
+            queuePosition = visibleQueuePosition.takeIf { launchStatus.kind == QueueLaunchStatusKind.QueuePosition },
+            connectingProgress = setupProgressProvider.takeIf { isSettingUp },
+            onMinimize = viewModel::minimizeStreamLaunch,
+            onCancel = { viewModel.stopStream(StreamStopOrigin.QueueCancel) })
+        return
+    }
     val hasPlayableAd = ad != null && mediaUrl != null
     val reduceMotion = LocalReduceMotion.current
     val entranceState = remember(game?.id) {
@@ -138,10 +151,12 @@ internal fun QueueLoadingScreen(state: OpenNowUiState, viewModel: OpenNowViewMod
     BoxWithConstraints(
         Modifier
             .fillMaxSize()
+            .then(if (state.settings.experimentalSpaceUi) Modifier.spaceSafeViewport() else Modifier)
             .clipToBounds(),
         contentAlignment = Alignment.Center,
     ) {
-        QueueAmbientBackdrop(
+        if (state.settings.experimentalSpaceUi) Box(Modifier.fillMaxSize().background(SpaceInk))
+        else QueueAmbientBackdrop(
             accent = state.settings.uiAccent.color,
             queuePosition = visibleQueuePosition,
         )
@@ -398,19 +413,22 @@ private fun QueueSignalField(
 }
 
 @Composable
-private fun AnimatedQueueStatusText(
+internal fun AnimatedQueueStatusText(
     queueCopy: String,
     queuePosition: Int?,
     compact: Boolean,
     modifier: Modifier = Modifier,
+    style: TextStyle? = null,
+    contentColor: Color = TextMuted,
 ) {
+    val textStyle = style ?: (if (compact) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.titleMedium)
+        .copy(fontWeight = FontWeight.Normal)
     if (queuePosition == null) {
         Text(
             queueCopy,
             modifier = modifier,
-            color = queueIdleStatusColor(queueCopy),
-            style = (if (compact) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.titleMedium)
-                .copy(fontWeight = FontWeight.Normal),
+            color = if (style == null) queueIdleStatusColor(queueCopy) else contentColor,
+            style = textStyle,
             textAlign = TextAlign.Center,
         )
         return
@@ -426,7 +444,8 @@ private fun AnimatedQueueStatusText(
     val reduceMotion = LocalReduceMotion.current
     val glow: State<Float>
     val moleculePhase: State<Float>
-    if (reduceMotion) {
+    val animate = !reduceMotion && androidx.compose.ui.platform.LocalWindowInfo.current.isWindowFocused
+    if (!animate || !hotQueue) {
         glow = remember { mutableFloatStateOf(0.72f) }
         moleculePhase = remember { mutableFloatStateOf(0f) }
     } else {
@@ -453,8 +472,8 @@ private fun AnimatedQueueStatusText(
         )
     }
     val statusColor by animateColorAsState(
-        targetValue = queueUrgencyColor(queuePosition),
-        animationSpec = tween(durationMillis = 240),
+        targetValue = if (hotQueue) queueUrgencyColor(queuePosition) else contentColor,
+        animationSpec = tween(durationMillis = if (animate) 240 else 0),
         label = "queue-status-color",
     )
 
@@ -472,7 +491,11 @@ private fun AnimatedQueueStatusText(
         previousQueuePosition = current
     }
 
-    LaunchedEffect(numberTrigger) {
+    LaunchedEffect(numberTrigger, animate) {
+        if (!animate) {
+            numberProgress.snapTo(1f)
+            return@LaunchedEffect
+        }
         if (numberTrigger == 0) return@LaunchedEffect
         numberProgress.snapTo(0f)
         numberProgress.animateTo(
@@ -485,8 +508,6 @@ private fun AnimatedQueueStatusText(
         (if (hotQueue) (0.45f + heat * 1.45f).dp else 0.dp).toPx()
     }
     val parts = queueStatusParts(queueCopy, queuePosition)
-    val textStyle = (if (compact) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.titleMedium)
-        .copy(fontWeight = FontWeight.Normal)
     val numberAnimating = numberTrigger > 0 && numberFrom != numberTo
     val numberTravelPx = with(LocalDensity.current) { (if (compact) 18.dp else 22.dp).toPx() }
 
@@ -497,7 +518,7 @@ private fun AnimatedQueueStatusText(
     ) {
         Text(
             parts.prefix,
-            color = TextMuted,
+            color = contentColor,
             style = textStyle,
             textAlign = TextAlign.Center,
         )
@@ -523,7 +544,7 @@ private fun AnimatedQueueStatusText(
         )
         Text(
             parts.suffix,
-            color = TextMuted,
+            color = contentColor,
             style = textStyle,
             textAlign = TextAlign.Center,
         )
@@ -1064,6 +1085,34 @@ private fun QueueStatusAndActions(
                     Text(stringResource(R.string.action_cancel), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun SpaceMinimizedQueueControl(
+    state: OpenNowUiState,
+    compact: Boolean,
+    onRestore: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val position = rememberStableQueuePosition(state.streamSession?.sessionId, activeQueuePosition(state))
+    val status = queueLaunchStatusText(state, position)
+    val title = state.streamGame?.title ?: stringResource(R.string.queue_starting_stream)
+    val showOutline = state.page != AppPage.Settings
+    Row(Modifier.testTag("space-queue-rail"), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        SpaceControl("$title, $status", Modifier.widthIn(max = if (compact) 100.dp else 220.dp).testTag("space-queue-restore"),
+            showFocusOutline = showOutline, onClick = onRestore) {
+            Icon(Icons.Outlined.HourglassEmpty, null, Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(if (compact) position?.toString() ?: stringResource(R.string.action_view) else status,
+                color = SpaceWhite, style = MaterialTheme.typography.labelMedium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        SpaceControl(stringResource(R.string.action_cancel), Modifier.testTag("space-queue-rail-cancel"),
+            showFocusOutline = showOutline, onClick = onCancel) {
+            Icon(Icons.Outlined.Close, null, Modifier.size(18.dp))
         }
     }
 }

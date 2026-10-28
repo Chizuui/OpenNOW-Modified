@@ -223,6 +223,8 @@ data class StreamSettings(
     val experimentalDynamicNetworkAdjustment: Boolean = false,
     val experimentalDynamicMinimumBitrateMbps: Int = 5,
     val mouseSensitivity: Float = 1f,
+    /** Null preserves the shared mouse sensitivity used by older saved settings. */
+    val touchMouseSensitivity: Float? = null,
     val mouseAcceleration: Int = 1,
     val streamSharpeningEnabled: Boolean = false,
     /** Default follows the APK/Play profile; explicit choices survive updates and presets. */
@@ -237,6 +239,8 @@ data class StreamSettings(
     val recordingFps: Int = 0,
     val recordingSharpeningEnabled: Boolean = false,
     val recordingSharpeningAmount: Float = 0.25f,
+    val recordingMicrophoneEnabled: Boolean = false,
+    val recordingCameraEnabled: Boolean = false,
 )
 
 internal fun StreamSettings.withUserStreamOptionsFrom(source: StreamSettings): StreamSettings =
@@ -252,6 +256,8 @@ internal fun StreamSettings.withUserStreamOptionsFrom(source: StreamSettings): S
         recordingFps = source.recordingFps,
         recordingSharpeningEnabled = source.recordingSharpeningEnabled,
         recordingSharpeningAmount = source.recordingSharpeningAmount,
+        recordingMicrophoneEnabled = source.recordingMicrophoneEnabled,
+        recordingCameraEnabled = source.recordingCameraEnabled,
     )
 
 /**
@@ -658,6 +664,8 @@ data class AppSettings(
     val libraryFilterIds: List<String> = emptyList(),
     val launchPage: AppLaunchPage = AppLaunchPage.Store,
     val nerdMode: Boolean = false,
+    /** Opt-in experimental console shell. */
+    val experimentalSpaceUi: Boolean = false,
     val hideStreamButtons: Boolean = false,
     val streamKeyboardClearConfirmationDisabled: Boolean = false,
     val streamKeyboardButtonPosition: StreamKeyboardButtonPosition = StreamKeyboardButtonPosition(),
@@ -689,6 +697,7 @@ data class AppSettings(
     val externalMousePointerLock: Boolean = true,
     /** Physical-keyboard shortcut used to open Stream Controls during a session. */
     val streamMenuShortcut: String = DEFAULT_ANDROID_STREAM_MENU_SHORTCUT,
+    val androidBackAsEscape: Boolean = false,
     val controllerBackgroundAnimations: Boolean = true,
     val controllerThemeStyle: String = "aurora",
     val controllerThemeColor: ControllerThemeRgb = ControllerThemeRgb(),
@@ -756,6 +765,8 @@ data class AppSettings(
      */
     val developerOptionsUnlocked: Boolean = false,
     val chizuiLoginUrl: String = "https://gfn.chizuui.com",
+    /** Masks account and ownership presentation for screenshots and demonstrations. */
+    val demoMode: Boolean = false,
 )
 
 internal const val MIN_GAME_CARD_SCALE = 0.75f
@@ -2038,6 +2049,8 @@ data class SessionInfo(
     val gpuType: String? = null,
     val iceServers: List<IceServer> = emptyList(),
     val mediaConnectionInfo: MediaConnectionInfo? = null,
+    /** Explicit usage-17 BUNDLE mapping; native transport falls back to mediaConnectionInfo. */
+    val bundleConnectionInfo: MediaConnectionInfo? = null,
     val negotiatedStreamProfile: NegotiatedStreamProfile? = null,
     val monitorSnapshot: SessionMonitorSnapshot? = null,
     val requestedStreamingFeatures: StreamingFeatures? = null,
@@ -2061,6 +2074,7 @@ internal data class NativeStreamTransportIdentity(
     val rtspsEndpoints: List<String>,
     val iceServers: List<IceServer>,
     val mediaConnectionInfo: MediaConnectionInfo?,
+    val bundleConnectionInfo: MediaConnectionInfo?,
 )
 
 internal fun SessionInfo.nativeStreamTransportIdentity(): NativeStreamTransportIdentity =
@@ -2072,6 +2086,7 @@ internal fun SessionInfo.nativeStreamTransportIdentity(): NativeStreamTransportI
         rtspsEndpoints = rtspsEndpoints,
         iceServers = iceServers,
         mediaConnectionInfo = mediaConnectionInfo,
+        bundleConnectionInfo = bundleConnectionInfo,
     )
 
 @Serializable

@@ -1,13 +1,22 @@
 package com.opencloudgaming.opennow
 
-/** Maps the media timeline to SurfaceView's monotonic clock without accumulating latency. */
-internal class SurfacePresentationClock(fps: Int) {
+internal enum class SurfacePresentationMode {
+    Immediate,
+    MediaCadence,
+}
+
+/** WebRTC paces its sink callbacks; a direct NVST decoder needs its own bounded media clock. */
+internal class SurfacePresentationClock(
+    fps: Int,
+    private val mode: SurfacePresentationMode = SurfacePresentationMode.MediaCadence,
+) {
     private val frameNs = 1_000_000_000L / fps.coerceAtLeast(1)
     private var mediaAnchorNs = 0L
     private var localAnchorNs = 0L
     private var lastMediaNs: Long? = null
 
     fun next(mediaNs: Long, nowNs: Long): Long {
+        if (mode == SurfacePresentationMode.Immediate) return nowNs
         val previous = lastMediaNs
         val target = localAnchorNs + (mediaNs - mediaAnchorNs)
         // One frame of headroom absorbs callback jitter. A pause or a backward timestamp

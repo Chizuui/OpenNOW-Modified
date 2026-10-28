@@ -162,3 +162,29 @@ Before accepting files, validate `reporterId`, load the enabled non-expired bloc
 structured `403` response using `publicMessage`. Keep `internalReason` server-only. Store the
 `reporterId` beside accepted reports so an administrator can copy it from a report into the block
 table. Check the block before persisting attachments to avoid unnecessary storage and processing.
+
+## Conversation reply attachments
+
+`POST /releases/opennow/bug-reports/{reportId}/comments` accepts the existing JSON
+reply format or `multipart/form-data`. Both formats require the reporter's installation
+ID (the `X-Bug-Report-Reporter-Id` header or `reporterId` field) and `termsAccepted=true`.
+Multipart requests use repeated `files` parts, up to 5 files of 10 MiB each. `comment`
+is optional when files are present; the API supplies “Attached files.” for that message.
+Text replies retain their 3,000-character limit.
+
+The Android composer allows 4 selected files (20 MiB combined, 10 MiB each), with an
+optional fifth attachment containing current sanitized debug logs captured at send time.
+It retains the draft and selected files after an upload failure, and clears them after
+success. File selection uses Android's document picker and supports logs, images,
+videos, and other files.
+
+Successful replies return HTTP 201 and the updated conversation under `data`.
+Each comment includes `files` metadata (`id`, `name`, `contentType`, `size`, and
+`downloadAvailable`). The report's aggregate `files` list also includes follow-up
+attachments with `commentId`, so existing admin file downloads can find them. Android
+shows those files under their message rather than under the original report.
+
+TempAPI retains files only after the comment is stored, and cleans up rejected uploads.
+Existing ownership, deletion, closed-conversation, reporter-ban, terms, and reply-rate
+checks still apply. Parsed follow-up diagnostics are retained for admin AI reanalysis;
+public replies return file metadata without those extra diagnostic summaries.

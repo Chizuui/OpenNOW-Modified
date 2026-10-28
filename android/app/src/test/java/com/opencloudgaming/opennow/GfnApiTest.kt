@@ -742,6 +742,37 @@ class GfnApiTest {
     }
 
     @Test
+    fun choosingNativeTouchFromWebsiteModeUsesNativeHeadersAndClaimPayload() {
+        val settings = StreamSettings(browserClientMode = true).forStreamInputMode(StreamInputMode.NativeTouch)
+        val base = "https://np-ams-06.cloudmatchbeta.nvidiagrid.net"
+        val headers = cloudMatchHeaders(
+            token = "token",
+            clientId = "client",
+            deviceId = "device",
+            includeOrigin = true,
+            streamingBaseUrl = base,
+            appLaunchMode = GfnAppLaunchMode.TOUCH_FRIENDLY,
+            preferBrowserMode = settings.browserClientMode,
+        )
+        val requestData = buildMinimalClaimRequestBody(
+            appId = "101574611",
+            deviceId = "device",
+            settings = settings,
+            streamingBaseUrl = base,
+            appLaunchMode = GfnAppLaunchMode.TOUCH_FRIENDLY,
+        ).getValue("sessionRequestData").jsonObject
+
+        assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
+        assertEquals("NATIVE", headers["nv-client-type"])
+        assertEquals("ANDROID", headers["nv-device-os"])
+        assertEquals("TABLET", headers["nv-device-type"])
+        assertEquals("android", requestData.getValue("clientPlatformName").jsonPrimitive.content)
+        assertEquals(GfnAppLaunchMode.TOUCH_FRIENDLY, requestData.getValue("appLaunchMode").jsonPrimitive.int)
+        assertEquals(0, requestData.getValue("remoteControllersBitmap").jsonPrimitive.int)
+        assertTrue(requestData.getValue("availableSupportedControllers").jsonArray.isEmpty())
+    }
+
+    @Test
     fun websiteClientModeOverridesNativeTouchAndHighQualityIdentityForNvidia() {
         val settings = StreamSettings(resolution = "1376x640", aspectRatio = "19.5:9", browserClientMode = true)
         val base = "https://np-ams-06.cloudmatchbeta.nvidiagrid.net"

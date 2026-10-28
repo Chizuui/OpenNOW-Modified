@@ -6,6 +6,39 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StreamControlsShortcutRoutingTest {
+    @Test
+    fun backAsEscapeIsOptInAndOnlyOwnsGameplayBack() {
+        assertTrue(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = true, streamUiActive = false, clientAttached = true,
+        ))
+        assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = false, streamUiActive = false, clientAttached = true,
+        ))
+        assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = true, streamUiActive = true, clientAttached = true,
+        ))
+        assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = true, streamUiActive = false, clientAttached = false,
+        ))
+    }
+
+    @Test
+    fun backAsEscapePreservesControllerSelectMouseRightClickAndTvRemoteAliases() {
+        assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = true, streamUiActive = false, clientAttached = true,
+            controllerInputDevice = true,
+        ))
+        assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+            enabled = true, streamUiActive = false, clientAttached = true,
+            externalMouseInputDevice = true,
+        ))
+        for (key in listOf(KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_ESCAPE, KeyEvent.KEYCODE_ENTER)) {
+            assertFalse(NativeStreamInputRouter.shouldSendBackAsEscape(
+                enabled = true, streamUiActive = false, clientAttached = true, keyCode = key,
+            ))
+        }
+    }
+
     private val activationKeys = listOf(
         KeyEvent.KEYCODE_ENTER,
         KeyEvent.KEYCODE_NUMPAD_ENTER,

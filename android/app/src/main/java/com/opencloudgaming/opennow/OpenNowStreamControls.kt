@@ -572,29 +572,47 @@ internal fun StreamInputModeSwitchDialog(
 @Composable
 internal fun StreamLaunchInputModeDialog(
     keyboardMouseConnected: Boolean,
-    onNativeTouch: () -> Unit,
-    onController: () -> Unit,
+    websiteClientMode: Boolean,
+    onNativeTouch: (rememberForGame: Boolean) -> Unit,
+    onController: (rememberForGame: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var rememberForGame by rememberSaveable { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.stream_input_choose_at_launch_title)) },
         text = {
-            Text(
-                stringResource(
-                    if (keyboardMouseConnected) R.string.stream_input_choose_at_launch_body
-                    else R.string.stream_input_choose_at_launch_no_device_body,
-                ),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            val body = stringResource(
+                if (keyboardMouseConnected) R.string.stream_input_choose_at_launch_body
+                else R.string.stream_input_choose_at_launch_no_device_body,
             )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    if (websiteClientMode) "$body\n\n${stringResource(R.string.stream_input_native_touch_disables_website_mode)}"
+                    else body,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().toggleable(
+                        value = rememberForGame,
+                        role = Role.Checkbox,
+                        onValueChange = { rememberForGame = it },
+                    ).padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Checkbox(checked = rememberForGame, onCheckedChange = null)
+                    Text(stringResource(R.string.stream_input_remember_for_game))
+                }
+            }
         },
         confirmButton = {
-            TextButton(onClick = onNativeTouch) {
+            TextButton(onClick = { onNativeTouch(rememberForGame) }) {
                 Text(stringResource(R.string.stream_input_use_native_touch))
             }
         },
         dismissButton = {
-            TextButton(onClick = onController) {
+            TextButton(onClick = { onController(rememberForGame) }) {
                 Text(stringResource(
                     if (keyboardMouseConnected) R.string.stream_input_use_keyboard_mouse_controller
                     else R.string.stream_input_use_controller,
@@ -744,6 +762,9 @@ internal fun StreamControlsPanel(
     statusBarDragging: Boolean,
     receivedBitrateKbps: Int?,
     recordingPhase: StreamRecorderPhase?,
+    screenshotEnabled: Boolean,
+    screenshotBusy: Boolean,
+    onScreenshot: () -> Unit,
     touchLayoutEditing: Boolean,
     bugReportSubmission: BugReportSubmissionState,
     bugReportVersionCheck: AndroidBugReportVersionCheckState,
@@ -774,27 +795,14 @@ internal fun StreamControlsPanel(
     onTouchControlsToggle: () -> Unit,
     onMousePadToggle: () -> Unit,
     onMouseDirectClickToggle: () -> Unit,
-    onToggleTouchControllerStyle: () -> Unit,
-    onTouchButtonLabelsToggle: () -> Unit,
-    onJoystickModeToggle: () -> Unit,
-    onTouchAimModeToggle: () -> Unit,
-    onJoystickDeadZoneChange: (Float) -> Unit,
     onSharpeningToggle: () -> Unit,
     onSharpeningAmountChange: (Float) -> Unit,
     onMaxBitrateChange: (Int) -> Unit,
     onStretchToFitToggle: () -> Unit,
-    onTouchScaleChange: (Float) -> Unit,
-    onButtonScaleChange: (Float) -> Unit,
-    onStickScaleChange: (Float) -> Unit,
-    onOpacityChange: (Float) -> Unit,
     onMouseSensitivityChange: (Float) -> Unit,
+    onTouchMouseSensitivityChange: (Float) -> Unit,
     onMouseScrollSensitivityChange: (Int) -> Unit,
     onPhysicalStickDeadZoneChange: (Float) -> Unit,
-    onTouchEdgePaddingChange: (Float) -> Unit,
-    onTouchBottomPaddingChange: (Float) -> Unit,
-    onTouchLeftOffsetChange: (Float) -> Unit,
-    onTouchRightOffsetChange: (Float) -> Unit,
-    onTouchLayoutReset: () -> Unit,
     onTouchSettingsChange: (AndroidTouchSettings) -> Unit,
     onTouchPresetsChange: (List<TouchControlPreset>) -> Unit,
     onBugReportSubmit: (String, String, String?, AndroidBugReportDetails, List<AndroidBugReportAttachment>) -> Unit,
@@ -808,6 +816,7 @@ internal fun StreamControlsPanel(
     val doneFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     var page by remember { mutableStateOf(StreamControlsPage.Main) }
+    val compactHeight = LocalConfiguration.current.screenHeightDp < 480
     var expandedPanel by rememberSaveable { mutableStateOf(false) }
     var advancedControlsVisible by rememberSaveable { mutableStateOf(false) }
     val activity = LocalContext.current as? MainActivity
@@ -825,7 +834,7 @@ internal fun StreamControlsPanel(
     }
     Surface(
         modifier = Modifier
-            .then(if (expandedPanel) Modifier.fillMaxSize() else Modifier.padding(14.dp).fillMaxWidth(0.94f).fillMaxHeight(0.78f))
+            .then(if (expandedPanel) Modifier.fillMaxSize() else Modifier.padding(if (compactHeight) 6.dp else 14.dp).fillMaxWidth(0.96f).fillMaxHeight(if (compactHeight) 0.96f else 0.88f))
             .streamTouchPassthrough(PASSTHROUGH_ID_PANEL),
         shape = RoundedCornerShape(if (expandedPanel) 0.dp else OpenNowRadius.lg + 2.dp),
         color = if (expandedPanel) MaterialTheme.colorScheme.background else OpenNowPalette.PanelOverVideo,
@@ -838,7 +847,9 @@ internal fun StreamControlsPanel(
             LocalControlRowStyle provides if (expandedPanel) {
                 ControlRowStyle.settings().copy(focusable = true, showFocusRing = true)
             } else {
-                ControlRowStyle.stream()
+                ControlRowStyle.stream().let { style ->
+                    if (compactHeight) style.copy(verticalPadding = 6.dp, horizontalPadding = 12.dp) else style
+                }
             },
             LocalControlSectionStyle provides if (expandedPanel) ControlSectionStyle.settings() else ControlSectionStyle.stream(),
         ) {
@@ -849,7 +860,7 @@ internal fun StreamControlsPanel(
         ) {
         // The header stays outside the scrolling area so every focused sub-page keeps navigation
         // and session actions visible while its settings scroll independently.
-        StreamPanelHeader(
+        if (page != StreamControlsPage.TouchControls) StreamPanelHeader(
             page = page,
             gameTitle = gameTitle,
             status = status,
@@ -866,12 +877,50 @@ internal fun StreamControlsPanel(
             transitionSpec = { streamPanelPageTransition(initialState, targetState, reduceMotion) },
             label = "stream-controls-page",
         ) { currentPage ->
+        if (currentPage == StreamControlsPage.TouchControls) {
+            OnScreenControlsSettings(
+                touch = settings.androidTouch,
+                stream = settings.stream,
+                onTouchMouseSensitivityChange = onTouchMouseSensitivityChange,
+                presets = settings.touchControlPresets,
+                gyroscopeAvailable = gyroscopeAvailable,
+                onChange = onTouchSettingsChange,
+                onPresetsChange = onTouchPresetsChange,
+                onBack = { page = StreamControlsPage.Main },
+                livePreview = true,
+                controlsVisible = touchControlsVisible,
+                onVisibilityChange = { onButtonTone(); onTouchControlsToggle() },
+                onModeChange = { onButtonTone(); onKeyboardModeToggle(it) },
+                onEditLayout = {
+                    onButtonTone()
+                    if (!touchLayoutEditing) onTouchLayoutEditingToggle()
+                    onClose()
+                },
+                onClose = onClose,
+                headerActions = {
+                    androidx.compose.material3.IconButton(onClick = { expandedPanel = !expandedPanel }) {
+                        Icon(
+                            if (expandedPanel) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                            stringResource(if (expandedPanel) R.string.stream_panel_collapse else R.string.stream_panel_expand),
+                        )
+                    }
+                },
+                additionalSettings = {
+                    ControlSwitchRow(
+                        label = stringResource(R.string.stream_panel_vibration),
+                        checked = settings.vibrationEnabled,
+                        onCheckedChange = { onButtonTone(); onVibrationToggle() },
+                    )
+                },
+                notice = { if (builtInGameTouchSupported) BuiltInGameTouchNotice(usingBuiltInTouch = nativeTouchActive) },
+            )
+        } else {
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .onPreviewKeyEvent { handleVerticalDpadFocusMove(it, focusManager) },
-            contentPadding = PaddingValues(OpenNowSpacing.md + 2.dp),
-            verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.md),
+            contentPadding = PaddingValues(if (compactHeight) 8.dp else 12.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
         ) {
             when (currentPage) {
                 StreamControlsPage.StatusBar -> statusBarPageItems(
@@ -888,358 +937,7 @@ internal fun StreamControlsPanel(
                     onKeyboardButtonToggle = onKeyboardButtonToggle,
                     onButtonTone = onButtonTone,
                 )
-                StreamControlsPage.TouchControls -> {
-                    if (builtInGameTouchSupported) {
-                        item {
-                            BuiltInGameTouchNotice(usingBuiltInTouch = nativeTouchActive)
-                        }
-                    }
-                    item {
-                        ControlSection(stringResource(R.string.stream_panel_section_touch_controller)) {
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_touch_controller),
-                                checked = touchControlsVisible,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onTouchControlsToggle()
-                                },
-                                value = when {
-                                    touchControlsVisible -> stringResource(R.string.common_visible)
-                                    nativeTouchActive -> stringResource(R.string.stream_touch_builtin_active)
-                                    else -> stringResource(R.string.common_hidden)
-                                },
-                            )
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_drag_edit),
-                                checked = touchLayoutEditing,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onTouchLayoutEditingToggle()
-                                },
-                                value = onOffLabel(touchLayoutEditing),
-                            )
-                            if (touchControlsVisible && !keyboardOverlayActive) {
-                                // Cycles rather than opens a menu: this row is used mid-session,
-                                // often one-handed, and each press shows its result immediately
-                                // behind the panel.
-                                ControlActionRow(
-                                    label = stringResource(R.string.stream_panel_touch_skin),
-                                    actionLabel = stringResource(R.string.common_next),
-                                    value = touchControllerStyleLabel(settings.androidTouch.touchControllerStyle),
-                                    onClick = {
-                                        onButtonTone()
-                                        onToggleTouchControllerStyle()
-                                    },
-                                )
-                                ControlActionRow(
-                                    label = stringResource(R.string.settings_touch_skin_tint),
-                                    actionLabel = stringResource(R.string.common_next),
-                                    value = touchSkinTintLabel(settings.androidTouch.touchSkinTint),
-                                    onClick = {
-                                        onButtonTone()
-                                        onTouchSettingsChange(
-                                            settings.androidTouch.copy(
-                                                touchSkinTint = nextTouchSkinTint(settings.androidTouch.touchSkinTint),
-                                            ),
-                                        )
-                                    },
-                                )
-                                ControlSwitchRow(
-                                    label = stringResource(R.string.settings_touch_button_labels),
-                                    checked = settings.androidTouch.touchButtonLabels,
-                                    onCheckedChange = {
-                                        onButtonTone()
-                                        onTouchButtonLabelsToggle()
-                                    },
-                                    value = onOffLabel(settings.androidTouch.touchButtonLabels),
-                                )
-                            }
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_keyboard_overlay),
-                                checked = keyboardOverlayActive,
-                                onCheckedChange = { enabled ->
-                                    onButtonTone()
-                                    onKeyboardModeToggle(enabled)
-                                },
-                                value = onOffLabel(keyboardOverlayActive),
-                                description = stringResource(R.string.stream_panel_keyboard_overlay_summary),
-                            )
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_panel_vibration),
-                                checked = settings.vibrationEnabled,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onVibrationToggle()
-                                },
-                                value = onOffLabel(settings.vibrationEnabled),
-                                description = stringResource(R.string.stream_panel_vibration_summary),
-                            )
-                        }
-                    }
-                    item {
-                        ControlSection(stringResource(R.string.stream_joysticks_title)) {
-                            val dynamic = settings.androidTouch.joystickMode == TouchJoystickMode.Dynamic
-                            val lockZone = !keyboardOverlayActive &&
-                                settings.androidTouch.aimMode == TouchAimMode.LockZone
-                            if (!keyboardOverlayActive) ControlSwitchRow(
-                                label = stringResource(R.string.stream_joysticks_aim_mode),
-                                checked = lockZone,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onTouchAimModeToggle()
-                                },
-                                value = stringResource(
-                                    if (lockZone) R.string.stream_joysticks_lock_zone else R.string.stream_joysticks_lock_joystick,
-                                ),
-                            )
-                            ControlSwitchRow(
-                                label = stringResource(R.string.stream_joysticks_dynamic),
-                                checked = dynamic,
-                                onCheckedChange = {
-                                    onButtonTone()
-                                    onJoystickModeToggle()
-                                },
-                                value = stringResource(
-                                    if (dynamic) R.string.stream_joysticks_dynamic_on else R.string.stream_joysticks_dynamic_off,
-                                ),
-                            )
-                            if (lockZone) {
-                                TouchLayoutSlider(
-                                    R.string.stream_joysticks_aim_zone_scale,
-                                    settings.androidTouch.aimZoneScale,
-                                    0.5f,
-                                    1.5f,
-                                    TOUCH_SCALE_SLIDER_STEP,
-                                    onChange = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(aimZoneScale = value))
-                                    },
-                                )
-                                TouchLayoutSlider(
-                                    R.string.stream_joysticks_aim_zone_sensitivity,
-                                    settings.androidTouch.aimZoneSensitivity,
-                                    0.25f,
-                                    3f,
-                                    TOUCH_SCALE_SLIDER_STEP,
-                                    onChange = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(aimZoneSensitivity = value))
-                                    },
-                                )
-                            }
-                            TouchLayoutSlider(
-                                R.string.stream_joysticks_stick_size,
-                                settings.androidTouch.stickScale,
-                                0.65f,
-                                1.5f,
-                                TOUCH_SCALE_SLIDER_STEP,
-                                onStickScaleChange,
-                            )
-                            TouchLayoutSlider(
-                                R.string.stream_joysticks_dead_zone,
-                                settings.androidTouch.joystickDeadZone,
-                                0f,
-                                0.3f,
-                                JOYSTICK_DEAD_ZONE_STEP,
-                                onJoystickDeadZoneChange,
-                            )
-                            Text(
-                                stringResource(
-                                    if (lockZone) {
-                                        R.string.stream_joysticks_lock_zone_summary
-                                    } else {
-                                        R.string.stream_joysticks_explainer
-                                    },
-                                ),
-                                color = TextMuted,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    }
-                    item {
-                        if (!keyboardOverlayActive && !touchLayoutEditing) {
-                            TouchControlPresetEditor(settings.androidTouch, settings.touchControlPresets, onTouchSettingsChange, onTouchPresetsChange)
-                        }
-                        TouchButtonAppearanceEditor(settings.androidTouch, onTouchSettingsChange)
-                    }
-                    item {
-                        ControlSection(stringResource(R.string.settings_touch_visible_controls)) {
-                            Text(
-                                text = stringResource(R.string.settings_touch_visible_controls_desc),
-                                color = TextMuted,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            val groups = if (keyboardOverlayActive) listOf(TouchControlGroup.LeftStick) else TouchControlGroup.entries
-                            groups.forEach { group ->
-                                val visible = settings.androidTouch.isControlVisible(group)
-                                ControlSwitchRow(
-                                    label = stringResource(touchControlGroupLabelRes(group)),
-                                    checked = visible,
-                                    onCheckedChange = { enabled ->
-                                        onButtonTone()
-                                        onTouchSettingsChange(
-                                            settings.androidTouch.withControlVisible(group, enabled),
-                                        )
-                                    },
-                                    value = onOffLabel(visible),
-                                )
-                            }
-                        }
-                    }
-                    if (!keyboardOverlayActive) item {
-                        ControlSection(stringResource(R.string.settings_touch_extra_buttons)) {
-                            Text(
-                                text = stringResource(R.string.settings_touch_extra_buttons_desc),
-                                color = TextMuted,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            repeat(TOUCH_EXTRA_BUTTON_COUNT) { index ->
-                                val action = settings.androidTouch.extraButtonAction(index)
-                                ControlActionRow(
-                                    label = stringResource(R.string.settings_touch_extra_button, index + 1),
-                                    actionLabel = stringResource(R.string.common_next),
-                                    value = touchExtraButtonComboLabel(settings.androidTouch.extraButtonCombo(index)),
-                                    onClick = {
-                                        onButtonTone()
-                                        onTouchSettingsChange(
-                                            settings.androidTouch.withExtraButtonAction(
-                                                index,
-                                                nextTouchExtraButtonAction(action),
-                                            ),
-                                        )
-                                    },
-                                )
-                            }
-                            TouchExtraButtonComboEditor(settings.androidTouch, onTouchSettingsChange)
-                            TouchLayoutSlider(
-                                R.string.settings_touch_extra_button_size,
-                                settings.androidTouch.extraButtonScale,
-                                0.6f,
-                                1.6f,
-                                TOUCH_SCALE_SLIDER_STEP,
-                                onChange = { value ->
-                                    onTouchSettingsChange(settings.androidTouch.copy(extraButtonScale = value))
-                                },
-                            )
-                        }
-                    }
-                    item {
-                        ControlSection(stringResource(R.string.stream_panel_section_touch_layout)) {
-                            ControlActionRow(
-                                label = stringResource(R.string.stream_panel_reset_layout),
-                                actionLabel = stringResource(R.string.action_reset),
-                                onClick = {
-                                    onButtonTone()
-                                    onTouchLayoutReset()
-                                },
-                                value = stringResource(R.string.stream_panel_reset_layout_summary),
-                            )
-                            // These controls preview live so the player can position the overlay
-                            // against the game without leaving the stream.
-                            TouchLayoutSlider(R.string.stream_panel_layout_scale, settings.androidTouch.scale, 0.6f, 1.4f, TOUCH_SCALE_SLIDER_STEP, onTouchScaleChange)
-                            TouchLayoutSlider(R.string.stream_panel_button_size, settings.androidTouch.buttonScale, 0.65f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onButtonScaleChange)
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_face_size, settings.androidTouch.faceButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(faceButtonScale = value))
-                            })
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_dpad_size, settings.androidTouch.dpadScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(dpadScale = value))
-                            })
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_shoulders_size, settings.androidTouch.shoulderButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(shoulderButtonScale = value))
-                            })
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_center_size, settings.androidTouch.centerButtonScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(centerButtonScale = value))
-                            })
-                            TouchLayoutSlider(R.string.settings_touch_left_stick_size, settings.androidTouch.leftStickScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(leftStickScale = value))
-                            })
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_right_stick_size, settings.androidTouch.rightStickScale, 0.6f, 1.5f, TOUCH_SCALE_SLIDER_STEP, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(rightStickScale = value))
-                            })
-                            if (!keyboardOverlayActive) TouchLayoutSlider(R.string.settings_touch_stick_knob_size, settings.androidTouch.stickKnobScale, 0.28f, 0.72f, 0.02f, onChange = { value ->
-                                onTouchSettingsChange(settings.androidTouch.copy(stickKnobScale = value))
-                            })
-                            TouchLayoutSlider(R.string.stream_panel_opacity, settings.androidTouch.opacity, 0f, 1f, TOUCH_SCALE_SLIDER_STEP, onOpacityChange)
-                            TouchLayoutSlider(R.string.stream_panel_edge_padding, settings.androidTouch.edgePaddingDp, 0f, 72f, TOUCH_DP_SLIDER_STEP, onTouchEdgePaddingChange, unit = DP_UNIT)
-                            TouchLayoutSlider(R.string.stream_panel_bottom_padding, settings.androidTouch.bottomPaddingDp, 0f, 120f, TOUCH_DP_SLIDER_STEP, onTouchBottomPaddingChange, unit = DP_UNIT)
-                            if (!keyboardOverlayActive) {
-                                TouchLayoutSlider(R.string.stream_panel_left_position, settings.androidTouch.leftOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchLeftOffsetChange, unit = DP_UNIT)
-                                TouchLayoutSlider(R.string.stream_panel_right_position, settings.androidTouch.rightOffsetYDp, -160f, 160f, TOUCH_DP_SLIDER_STEP, onTouchRightOffsetChange, unit = DP_UNIT)
-                            }
-                        }
-                    }
-                    if (!keyboardOverlayActive) item {
-                        ControlSection(stringResource(R.string.stream_panel_section_motion_aiming)) {
-                            ControlSwitchRow(
-                                label = stringResource(R.string.settings_touch_gyro),
-                                checked = settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable,
-                                enabled = gyroscopeAvailable,
-                                onCheckedChange = { enabled ->
-                                    onButtonTone()
-                                    onTouchSettingsChange(settings.androidTouch.copy(gyroscopeEnabled = enabled))
-                                },
-                                value = if (gyroscopeAvailable) {
-                                    onOffLabel(settings.androidTouch.gyroscopeEnabled)
-                                } else {
-                                    stringResource(R.string.common_unavailable)
-                                },
-                                description = stringResource(
-                                    if (gyroscopeAvailable) R.string.settings_touch_gyro_desc
-                                    else R.string.settings_touch_gyro_unavailable,
-                                ),
-                            )
-                            if (settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable) {
-                                ControlSliderRow(
-                                    label = stringResource(R.string.settings_touch_gyro_sensitivity),
-                                    value = settings.androidTouch.gyroscopeSensitivity,
-                                    min = 0.25f,
-                                    max = 3f,
-                                    step = 0.05f,
-                                    onChange = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeSensitivity = value))
-                                    },
-                                    onChangePreview = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeSensitivity = value))
-                                    },
-                                )
-                                ControlSliderRow(
-                                    label = stringResource(R.string.settings_touch_gyro_smoothing),
-                                    value = settings.androidTouch.gyroscopeSmoothing,
-                                    min = 0f,
-                                    max = 0.9f,
-                                    step = 0.05f,
-                                    onChange = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeSmoothing = value))
-                                    },
-                                )
-                                ControlSliderRow(
-                                    label = stringResource(R.string.settings_touch_gyro_dead_zone),
-                                    value = settings.androidTouch.gyroscopeDeadZone,
-                                    min = 0f,
-                                    max = 0.2f,
-                                    step = 0.005f,
-                                    onChange = { value ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeDeadZone = value))
-                                    },
-                                )
-                                ControlSwitchRow(
-                                    label = stringResource(R.string.settings_touch_gyro_invert_horizontal),
-                                    checked = settings.androidTouch.gyroscopeInvertHorizontal,
-                                    onCheckedChange = { enabled ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeInvertHorizontal = enabled))
-                                    },
-                                    value = onOffLabel(settings.androidTouch.gyroscopeInvertHorizontal),
-                                )
-                                ControlSwitchRow(
-                                    label = stringResource(R.string.settings_touch_gyro_invert_vertical),
-                                    checked = settings.androidTouch.gyroscopeInvertVertical,
-                                    onCheckedChange = { enabled ->
-                                        onTouchSettingsChange(settings.androidTouch.copy(gyroscopeInvertVertical = enabled))
-                                    },
-                                    value = onOffLabel(settings.androidTouch.gyroscopeInvertVertical),
-                                )
-                            }
-                        }
-                    }
-                }
+                StreamControlsPage.TouchControls -> Unit // Rendered as its own scrollable screen above.
                 StreamControlsPage.MouseMode -> mouseModePageItems(
                     settings = settings,
                     controllerMouseEmulationEnabled = controllerMouseEmulationEnabled,
@@ -1268,42 +966,75 @@ internal fun StreamControlsPanel(
                 }
                 StreamControlsPage.Main -> {
             item {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
-                    val recordingBusy = recordingPhase == StreamRecorderPhase.Starting || recordingPhase == StreamRecorderPhase.Finalizing
-                    val recordingLabel = when (recordingPhase) {
-                        StreamRecorderPhase.Starting -> R.string.stream_record_starting
-                        StreamRecorderPhase.Finalizing -> R.string.stream_record_saving
-                        StreamRecorderPhase.Recording -> R.string.stream_record_stop
-                        else -> R.string.stream_record_start
+                Column(verticalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                        val recordingBusy = recordingPhase == StreamRecorderPhase.Starting || recordingPhase == StreamRecorderPhase.Finalizing
+                        val recordingLabel = when (recordingPhase) {
+                            StreamRecorderPhase.Starting -> R.string.stream_record_starting
+                            StreamRecorderPhase.Finalizing -> R.string.stream_record_saving
+                            StreamRecorderPhase.Recording -> R.string.stream_record_stop
+                            else -> R.string.stream_record_start
+                        }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onRecordingToggle() },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            enabled = !recordingBusy,
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(recordingLabel), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onScreenshot() },
+                            enabled = screenshotEnabled,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(
+                                stringResource(if (screenshotBusy) R.string.stream_screenshot_saving else R.string.stream_screenshot),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onRecordingToggle() },
-                        enabled = !recordingBusy,
-                        modifier = Modifier.weight(1f),
-                    ) { Text(stringResource(recordingLabel), maxLines = 1, overflow = TextOverflow.Ellipsis) }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onKeyboardOpen() },
-                        modifier = Modifier.weight(1f),
-                    ) { Text(stringResource(R.string.stream_panel_keyboard), maxLines = 1) }
-                    OutlinedButton(
-                        onClick = { onButtonTone(); onExit() },
-                        modifier = Modifier.weight(1f),
-                        border = BorderStroke(1.dp, OpenNowPalette.AccentSwitchRed),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = OpenNowPalette.AccentSwitchRed.copy(alpha = 0.10f),
-                            contentColor = OpenNowPalette.AccentSwitchRed,
-                        ),
-                    ) { Text(stringResource(R.string.stream_panel_exit), maxLines = 1) }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onKeyboardOpen() },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(R.string.stream_panel_keyboard), maxLines = 1) }
+                        OutlinedButton(
+                            onClick = { onButtonTone(); onExit() },
+                            modifier = Modifier.weight(1f),
+                            border = BorderStroke(1.dp, OpenNowPalette.AccentSwitchRed),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = OpenNowPalette.AccentSwitchRed.copy(alpha = 0.10f),
+                                contentColor = OpenNowPalette.AccentSwitchRed,
+                            ),
+                        ) { Text(stringResource(R.string.stream_panel_exit), maxLines = 1) }
+                    }
                 }
             }
-            item {
-                ControlActionRow(
-                    label = if (advancedControlsVisible) stringResource(R.string.stream_panel_less_controls)
-                        else stringResource(R.string.stream_panel_more_controls),
-                    actionLabel = if (advancedControlsVisible) stringResource(R.string.action_close)
-                        else stringResource(R.string.action_open),
-                    onClick = { advancedControlsVisible = !advancedControlsVisible },
-                )
+            if (!tvProfile) item {
+                ControlNavigationRow(
+                        label = stringResource(R.string.controls_title),
+                        onClick = {
+                            onButtonTone()
+                            page = StreamControlsPage.TouchControls
+                        },
+                        value = when {
+                            touchControlsVisible -> stringResource(if (keyboardOverlayActive) R.string.controls_keyboard else R.string.controls_gamepad)
+                            nativeTouchActive -> stringResource(R.string.stream_touch_builtin_active)
+                            else -> stringResource(R.string.common_hidden)
+                        },
+                    )
+            }
+            if (compactHeight) item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.weight(1f)) {
+                        StreamAudioRow(audioMuted) { onButtonTone(); onAudioToggle() }
+                    }
+                    Box(Modifier.weight(1f)) {
+                        StreamStatusBarRow(settings, statsVisible) { onButtonTone(); page = StreamControlsPage.StatusBar }
+                    }
+                }
             }
             if (showSessionTimer) {
                 item {
@@ -1314,7 +1045,7 @@ internal fun StreamControlsPanel(
                     )
                 }
             }
-            item {
+            if (!compactHeight || advancedControlsVisible) item {
                 ControlSection(stringResource(R.string.stream_panel_section_display)) {
                     if (advancedControlsVisible) {
                         ControlSwitchRow(
@@ -1327,31 +1058,10 @@ internal fun StreamControlsPanel(
                             value = onOffLabel(settings.stretchStreamToFit),
                         )
                     }
-                    ControlSwitchRow(
-                        label = stringResource(R.string.stream_panel_audio),
-                        checked = !audioMuted,
-                        onCheckedChange = {
-                            onButtonTone()
-                            onAudioToggle()
-                        },
-                        value = if (audioMuted) stringResource(R.string.stream_panel_audio_muted) else onOffLabel(true),
-                    )
-                    ControlNavigationRow(
-                        label = stringResource(R.string.stream_panel_status_bar),
-                        onClick = {
-                            onButtonTone()
-                            page = StreamControlsPage.StatusBar
-                        },
-                        value = if (!statsVisible) {
-                            onOffLabel(false)
-                        } else {
-                            stringResource(
-                                R.string.stream_panel_status_bar_summary,
-                                settings.streamStatsStyle.label,
-                                settings.streamStatsMetrics.enabledCount(),
-                            )
-                        },
-                    )
+                    if (!compactHeight) {
+                        StreamAudioRow(audioMuted) { onButtonTone(); onAudioToggle() }
+                        StreamStatusBarRow(settings, statsVisible) { onButtonTone(); page = StreamControlsPage.StatusBar }
+                    }
                     if (advancedControlsVisible) {
                         ControlSwitchRow(
                             label = stringResource(R.string.stream_panel_sharpening),
@@ -1392,7 +1102,7 @@ internal fun StreamControlsPanel(
             }
             item {
                 ControlSection(stringResource(R.string.stream_panel_section_input)) {
-                    ControlSliderRow(
+                    if (advancedControlsVisible) ControlSliderRow(
                         label = stringResource(R.string.settings_physical_stick_dead_zone),
                         value = settings.physicalInput.stickDeadZone * 100f,
                         min = 0f,
@@ -1469,6 +1179,7 @@ internal fun StreamControlsPanel(
                                 value = onOffLabel(settings.androidTouch.mousePad),
                             )
                             if (settings.androidTouch.mousePad) {
+                                TouchMouseSensitivitySlider(settings.stream, onTouchMouseSensitivityChange)
                                 ControlSwitchRow(
                                     label = stringResource(R.string.stream_mouse_with_touch_controller),
                                     checked = settings.androidTouch.mouseWithTouchController,
@@ -1517,20 +1228,6 @@ internal fun StreamControlsPanel(
                             }
                         }
                     }
-                    if (!tvProfile) {
-                        ControlNavigationRow(
-                            label = stringResource(R.string.stream_panel_touch_controller),
-                            onClick = {
-                                onButtonTone()
-                                page = StreamControlsPage.TouchControls
-                            },
-                            value = when {
-                                touchControlsVisible -> stringResource(R.string.common_visible)
-                                nativeTouchActive -> stringResource(R.string.stream_touch_builtin_active)
-                                else -> stringResource(R.string.common_hidden)
-                            },
-                        )
-                    }
                     // Mouse mode (Left stick): shown for all profiles — works with both physical
                     // gamepad and touch controller.
                     ControlNavigationRow(
@@ -1548,6 +1245,15 @@ internal fun StreamControlsPanel(
                 }
             }
             item {
+                ControlActionRow(
+                    label = if (advancedControlsVisible) stringResource(R.string.stream_panel_less_controls)
+                        else stringResource(R.string.stream_panel_more_controls),
+                    actionLabel = if (advancedControlsVisible) stringResource(R.string.action_close)
+                        else stringResource(R.string.action_open),
+                    onClick = { advancedControlsVisible = !advancedControlsVisible },
+                )
+            }
+            item {
                 ControlSection(stringResource(R.string.stream_panel_section_support)) {
                     ControlNavigationRow(
                         label = stringResource(R.string.bug_report_feedback_open),
@@ -1561,7 +1267,8 @@ internal fun StreamControlsPanel(
             }
                 } // StreamControlsPage.Main
             } // when (currentPage)
-        } // LazyColumn
+        }
+        } // Non-touch page
         } // AnimatedContent
         } // Column
         } // CompositionLocalProvider
@@ -1857,8 +1564,8 @@ private fun StreamPanelHeader(
             .padding(
                 start = OpenNowSpacing.md + 2.dp,
                 end = OpenNowSpacing.md + 2.dp,
-                top = OpenNowSpacing.md + 2.dp,
-                bottom = OpenNowSpacing.sm,
+                top = 4.dp,
+                bottom = 4.dp,
             ),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm),
@@ -1956,6 +1663,7 @@ private fun StreamPanelHeaderButton(
         onClick = onClick,
         enabled = enabled,
         modifier = modifier.onFocusChanged { focused = it.isFocused },
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = androidx.compose.material3.LocalContentColor.current),
         border = BorderStroke(
             width = if (focused) 2.dp else 1.dp,
             color = if (focused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
@@ -3100,40 +2808,40 @@ private fun StreamPanelKeyButton(label: String, modifier: Modifier = Modifier, o
     }
 }
 
-/**
- * A touch-layout slider. Unlike the settings sliders these preview on every drag frame, because
- * the overlay they are adjusting is on screen underneath the panel and watching it move is the
- * point of the control.
- */
-@Composable
-private fun TouchLayoutSlider(
-    @StringRes labelRes: Int,
-    value: Float,
-    min: Float,
-    max: Float,
-    step: Float,
-    onChange: (Float) -> Unit,
-    unit: String? = null,
-) {
-    ControlSliderRow(
-        label = stringResource(labelRes),
-        value = value,
-        min = min,
-        max = max,
-        step = step,
-        onChange = onChange,
-        onChangePreview = onChange,
-        unit = unit,
-    )
-}
-
 /** "On" / "Off", so the same boolean reads the same way everywhere. */
 @Composable
 internal fun onOffLabel(enabled: Boolean): String =
     stringResource(if (enabled) R.string.common_on else R.string.common_off)
 
 private const val SHARPENING_SLIDER_STEP = 0.05f
-private const val TOUCH_SCALE_SLIDER_STEP = 0.05f
-private const val TOUCH_DP_SLIDER_STEP = 2f
-private const val JOYSTICK_DEAD_ZONE_STEP = 0.01f
-private const val DP_UNIT = "dp"
+
+@Composable
+private fun StreamAudioRow(audioMuted: Boolean, onToggle: () -> Unit) {
+    ControlSwitchRow(
+        label = stringResource(R.string.stream_panel_audio),
+        checked = !audioMuted,
+        onCheckedChange = {
+            onToggle()
+        },
+        value = if (audioMuted) stringResource(R.string.stream_panel_audio_muted) else onOffLabel(true),
+    )
+}
+
+@Composable
+private fun StreamStatusBarRow(settings: AppSettings, statsVisible: Boolean, onOpen: () -> Unit) {
+    ControlNavigationRow(
+        label = stringResource(R.string.stream_panel_status_bar),
+        onClick = {
+            onOpen()
+        },
+        value = if (!statsVisible) {
+            onOffLabel(false)
+        } else {
+            stringResource(
+                R.string.stream_panel_status_bar_summary,
+                settings.streamStatsStyle.label,
+                settings.streamStatsMetrics.enabledCount(),
+            )
+        },
+    )
+}

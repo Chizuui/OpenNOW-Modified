@@ -9,8 +9,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -26,7 +24,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -49,12 +46,13 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.SportsEsports
+import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Tv
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import com.opencloudgaming.opennow.SettingsOutlinedButton as OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -87,15 +85,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import com.opencloudgaming.opennow.ui.controls.ControlActionRow
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
-import com.opencloudgaming.opennow.ui.theme.OpenNowMotion
 import com.opencloudgaming.opennow.ui.theme.OpenNowPalette
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -212,6 +209,7 @@ private enum class SettingsCategory(
     General(R.string.settings_category_general, R.string.settings_category_general_summary, Icons.Outlined.Tune),
     Stream(R.string.settings_category_stream, R.string.settings_category_stream_summary, Icons.Outlined.Monitor),
     Recording(R.string.settings_category_recording, R.string.settings_category_recording_summary, Icons.Outlined.Movie),
+    OnScreenControls(R.string.controls_title, R.string.controls_summary, Icons.Outlined.TouchApp),
     Input(R.string.settings_category_input, R.string.settings_category_input_summary, Icons.Outlined.SportsEsports),
     Interface(R.string.settings_category_interface, R.string.settings_category_interface_summary, Icons.Outlined.Palette),
     Account(R.string.settings_category_account, R.string.settings_category_account_summary, Icons.Outlined.Person),
@@ -309,6 +307,7 @@ internal fun SettingsScreen(
     backRequestToken: Int,
     onSearchQueryChange: (String) -> Unit,
     onDetailRouteChange: (Boolean) -> Unit,
+    spacePresentation: Boolean = false,
 ) {
     var showSessionProxyWarning by remember { mutableStateOf(false) }
     var selectedCategory by remember { mutableStateOf<SettingsCategory?>(null) }
@@ -321,6 +320,7 @@ internal fun SettingsScreen(
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     val controllerFamily = rememberPhysicalControllerFamily(enabled = true)
+    val touchSettingsContext = LocalContext.current
     val gamingHandheld = remember { isGamingHandheldDevice() }
     val controllerNavigationEnabled = shouldEnableSettingsControllerNavigation(
         tvProfile = tvProfile,
@@ -397,7 +397,7 @@ internal fun SettingsScreen(
         if (detailOpen && !tvProfile) {
             detailListState.scrollToItem(0)
         }
-        if (detailOpen && controllerNavigationEnabled) {
+        if (detailOpen && controllerNavigationEnabled && !spacePresentation) {
             delay(90)
             runCatching { detailFocusRequester.requestFocus() }
         }
@@ -430,7 +430,31 @@ internal fun SettingsScreen(
                 },
             )
         }
-        if (tvProfile) {
+        if (selectedCategory == SettingsCategory.OnScreenControls) {
+            OnScreenControlsSettings(
+                touch = state.settings.androidTouch,
+                stream = state.settings.stream,
+                onTouchMouseSensitivityChange = { value ->
+                    viewModel.updateStreamSettings { it.copy(touchMouseSensitivity = value) }
+                },
+                presets = state.settings.touchControlPresets,
+                gyroscopeAvailable = remember { hasMobileGyroscope(touchSettingsContext) },
+                onChange = { viewModel.updateSettings(state.settings.copy(androidTouch = it)) },
+                onPresetsChange = { viewModel.updateSettings(state.settings.copy(touchControlPresets = it)) },
+                onBack = { selectedCategory = null },
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else if (spacePresentation) {
+            SpaceSettingsLayout(
+                state = state,
+                viewModel = viewModel,
+                selectedCategory = selectedCategory ?: SettingsCategory.General,
+                categories = categories,
+                detailFocusRequester = detailFocusRequester,
+                onSelectCategory = { onSearchQueryChange(""); selectedCategory = it },
+                showSessionProxyWarning = { showSessionProxyWarning = true },
+            )
+        } else if (tvProfile) {
             SwipeToRefreshContainer(
                 refreshing = state.settingsRefreshing,
                 onRefresh = viewModel::refreshSettings,
@@ -463,6 +487,7 @@ internal fun SettingsScreen(
                     SettingsRouteContent(
                         targetState = selectedCategory,
                         reduceMotion = reduceMotion,
+                        depth = ::settingsRouteDepth,
                     ) { category ->
                         SettingsBody(
                             state = state,
@@ -517,6 +542,7 @@ internal fun SettingsScreen(
                         SettingsRouteContent(
                             targetState = selectedCategory,
                             reduceMotion = reduceMotion,
+                            depth = ::settingsRouteDepth,
                         ) { category ->
                             SettingsBody(
                                 state = state,
@@ -542,58 +568,30 @@ internal fun SettingsScreen(
     }
 }
 
-/**
- * Slides only the incoming Settings route using layout placement.
- *
- * The outgoing route is discarded immediately, so two control-heavy Settings trees are never
- * measured or drawn together. Unlike the former alpha/translation implementation, this does not
- * create a page-sized RenderNode animation layer.
- */
+/** Console settings keep the section rail visible beside the live controls. */
 @Composable
-private fun SettingsRouteContent(
-    targetState: SettingsCategory?,
-    reduceMotion: Boolean,
-    content: @Composable (SettingsCategory?) -> Unit,
+private fun SpaceSettingsLayout(
+    state: OpenNowUiState,
+    viewModel: OpenNowViewModel,
+    selectedCategory: SettingsCategory,
+    categories: List<SettingsCategory>,
+    detailFocusRequester: FocusRequester,
+    onSelectCategory: (SettingsCategory) -> Unit,
+    showSessionProxyWarning: () -> Unit,
 ) {
-    var initialized by remember { mutableStateOf(false) }
-    var previousDepth by remember { mutableStateOf(settingsRouteDepth(targetState)) }
-    var direction by remember { mutableStateOf(1f) }
-    val animateEntrance = initialized && !reduceMotion
-    val progress = remember(targetState, reduceMotion) {
-        Animatable(if (animateEntrance) 0f else 1f)
+    val sections = categories.map { category ->
+        SpaceSettingsSection(category.name, stringResource(category.titleRes), stringResource(category.summaryRes), category.icon)
     }
-    val slideDistancePx = with(LocalDensity.current) { 28.dp.toPx() }
-
-    LaunchedEffect(targetState, reduceMotion) {
-        val nextDepth = settingsRouteDepth(targetState)
-        direction = if (nextDepth < previousDepth) -1f else 1f
-        previousDepth = nextDepth
-        if (!initialized) {
-            initialized = true
-        } else if (!reduceMotion) {
-            progress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(
-                    durationMillis = OpenNowMotion.DurationStandard,
-                    easing = OpenNowMotion.EasingEmphasizedDecel,
-                ),
-            )
+    SpaceSettingsFrame(sections, selectedCategory.name,
+        onSelect = { id -> onSelectCategory(SettingsCategory.valueOf(id)) }) {
+        Column(Modifier.fillMaxWidth().focusRequester(detailFocusRequester).focusGroup(),
+            verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            SettingsContent(state, viewModel, searchQuery = "", selectedCategory = selectedCategory,
+                onSelectCategory = onSelectCategory, showSessionProxyWarning = showSessionProxyWarning)
         }
     }
-
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .offset {
-                IntOffset(
-                    x = (direction * slideDistancePx * (1f - progress.value)).roundToInt(),
-                    y = 0,
-                )
-            },
-    ) {
-        content(targetState)
-    }
 }
+
 
 @Composable
 private fun SettingsBody(
@@ -636,7 +634,8 @@ private fun SettingsBody(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 SettingsDetailHeader(
-                    category = selectedCategory,
+                    title = stringResource(selectedCategory.titleRes),
+                    summary = stringResource(selectedCategory.summaryRes),
                     tvProfile = tvProfile,
                     controllerFamily = controllerFamily,
                     onBack = onBack,
@@ -679,23 +678,21 @@ private fun SettingsContent(
         ChangelogSettingsContent(changelogs)
         return
     }
-    val gyroscopeAvailable = remember(context) { hasMobileGyroscope(context) }
     val deviceHasBattery = rememberDeviceHasBattery()
     val fallbackMembershipTier = state.authSession?.user?.membershipTier
     var pendingMicrophoneMode by remember { mutableStateOf<MicrophoneMode?>(null) }
     var showStreamMenuShortcutDialog by remember { mutableStateOf(false) }
     var showBugReportDialog by rememberSaveable { mutableStateOf(false) }
-    var showAdvancedControllerSettings by rememberSaveable { mutableStateOf(false) }
     val recordingFolderName by produceState<String?>(null, context, settings.recordingDirectoryUri) {
         value = settings.recordingDirectoryUri?.let { folder ->
-            withContext(Dispatchers.IO) { RecordingDestination.folderName(context, folder) }
+            withContext(Dispatchers.IO) { StreamCaptureDestination.folderName(context, folder) }
         }
     }
     val recordingFolderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
         if (uri != null) {
-            if (RecordingDestination.rememberFolder(context, uri)) {
+            if (StreamCaptureDestination.rememberFolder(context, uri)) {
                 viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = uri.toString()))
             } else {
                 Toast.makeText(context, R.string.stream_record_folder_permission_failed, Toast.LENGTH_LONG).show()
@@ -1142,7 +1139,7 @@ private fun SettingsContent(
                     )
                 }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Recording, searchQuery, stringResource(R.string.settings_section_recording_output), "recording", "recordings", "video", "mp4", "bitrate", "fps", "sharpness", "nitidez", "gravação", "upscale") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Recording, searchQuery, stringResource(R.string.settings_section_recording_output), "recording", "recordings", "video", "mp4", "bitrate", "fps", "sharpness", "nitidez", "gravação", "upscale", "microphone", "camera", "narration") {
                 ControlActionRow(
                     label = stringResource(R.string.settings_recording_folder),
                     actionLabel = stringResource(R.string.settings_recording_folder_choose),
@@ -1152,13 +1149,23 @@ private fun SettingsContent(
                         } else {
                             R.string.settings_recording_folder_selected
                         }),
-                    onClick = { recordingFolderLauncher.launch(null) },
+                    onClick = { StreamCaptureDestination.launchFolderPicker(context, recordingFolderLauncher) },
                 )
                 Text(
                     stringResource(R.string.settings_recording_next_session_hint),
                     color = SettingsTextMuted,
                     style = MaterialTheme.typography.bodySmall,
                 )
+                SettingSwitch(
+                    label = stringResource(R.string.settings_recording_microphone),
+                    checked = settings.stream.recordingMicrophoneEnabled,
+                    description = stringResource(R.string.settings_recording_microphone_desc),
+                ) { enabled -> viewModel.updateRecordingSettings { it.copy(recordingMicrophoneEnabled = enabled) } }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_recording_camera),
+                    checked = settings.stream.recordingCameraEnabled,
+                    description = stringResource(R.string.settings_recording_camera_desc),
+                ) { enabled -> viewModel.updateRecordingSettings { it.copy(recordingCameraEnabled = enabled) } }
                 SettingSwitch(
                     label = stringResource(R.string.settings_recording_auto_bitrate),
                     checked = settings.stream.recordingBitrateMbps == 0,
@@ -1208,7 +1215,7 @@ private fun SettingsContent(
                     ) { amount -> viewModel.updateRecordingSettings { it.copy(recordingSharpeningAmount = amount) } }
                 }
             }
-        CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste") {
+        CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_audio_keyboard), "input", "microphone", "mic", "voice", "audio", "keyboard", "shortcut", "layout", "language", "clipboard", "paste", "back", "esc", "escape") {
                 SettingSwitch(
                     label = stringResource(R.string.settings_low_latency_game_audio),
                     checked = settings.lowLatencyGameAudio,
@@ -1243,6 +1250,13 @@ private fun SettingsContent(
                 }
                 ChoiceOptionRow(stringResource(R.string.settings_keyboard_layout), keyboardLayoutOptions, settings.stream.keyboardLayout) {
                     viewModel.updateStreamSettings { s -> s.copy(keyboardLayout = it) }
+                }
+                SettingSwitch(
+                    label = stringResource(R.string.settings_back_as_escape),
+                    checked = settings.androidBackAsEscape,
+                    description = stringResource(R.string.settings_back_as_escape_description),
+                ) { enabled ->
+                    viewModel.updateSettings(settings.copy(androidBackAsEscape = enabled))
                 }
                 ControlActionRow(
                     label = stringResource(R.string.stream_menu_shortcut),
@@ -1435,6 +1449,9 @@ private fun SettingsContent(
                 }
                 SettingSwitch(stringResource(R.string.stream_panel_finger_mouse), settings.androidTouch.mousePad) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mousePad = enabled))) }
                 if (settings.androidTouch.mousePad) {
+                    TouchMouseSensitivitySlider(settings.stream) { value ->
+                        viewModel.updateStreamSettings { it.copy(touchMouseSensitivity = value) }
+                    }
                     Column(Modifier.padding(start = 24.dp)) {
                         SettingSwitch(stringResource(R.string.stream_mouse_with_touch_controller), settings.androidTouch.mouseWithTouchController) { enabled ->
                             viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(mouseWithTouchController = enabled)))
@@ -1450,7 +1467,12 @@ private fun SettingsContent(
                     }
                 }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_controller_touch), "input", "rumble", "touch", "controller", "style", "skin", "theme", "colour", "color", "labels", "layout", "scale", "size", "opacity", "edge", "padding", "offset", "horizontal", "vertical", "controls", "visible", "hide", "programmable", "extra", "accessibility", "guide", "home", "stick", "joystick", "analog", "dynamic", "dead zone", "button") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Input, searchQuery, stringResource(R.string.settings_section_controller_touch), "input", "rumble", "touch", "keyboard", "mouse", "wasd", "on-screen", "controller", "style", "skin", "theme", "colour", "color", "labels", "layout", "scale", "size", "opacity", "edge", "padding", "offset", "horizontal", "vertical", "controls", "visible", "hide", "programmable", "extra", "accessibility", "guide", "home", "stick", "joystick", "analog", "dynamic", "dead zone", "button") {
+                ControlNavigationRow(
+                    label = stringResource(R.string.controls_title),
+                    value = stringResource(R.string.controls_summary),
+                    onClick = { onSelectCategory(SettingsCategory.OnScreenControls) },
+                )
                 if (settings.androidPhysicalControllerPromptDismissed) {
                     ControlActionRow(
                         label = stringResource(R.string.settings_show_controller_prompt_again),
@@ -1491,235 +1513,12 @@ private fun SettingsContent(
                         )
                     }
                 }
-                SettingSwitch(stringResource(R.string.stream_touch_controls_title), settings.androidTouch.enabled) { enabled -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(enabled = enabled))) }
-                val touchStyleOptions = TouchControllerStyle.entries.map { style ->
-                    SettingsChoiceOption(style.name, touchControllerStyleLabel(style))
-                }
-                ChoiceOptionRow(
-                    stringResource(R.string.settings_touch_skin),
-                    touchStyleOptions,
-                    settings.androidTouch.touchControllerStyle.name,
-                    description = stringResource(R.string.settings_touch_skin_desc),
-                ) { styleName ->
-                    val style = TouchControllerStyle.valueOf(styleName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(touchControllerStyle = style)))
-                }
-                // The skins differ by shape now, which a list of names cannot show.
-                TouchControllerSkinPreview(
-                    style = settings.androidTouch.touchControllerStyle,
-                    tint = settings.androidTouch.touchSkinTint,
-                    opacity = settings.androidTouch.opacity,
-                    showLabels = settings.androidTouch.touchButtonLabels,
-                    modifier = Modifier.padding(vertical = 8.dp),
-                )
-                SettingSwitch(
-                    label = stringResource(R.string.settings_advanced_controller_customization),
-                    checked = showAdvancedControllerSettings,
-                    description = stringResource(R.string.settings_advanced_controller_customization_desc),
-                ) { showAdvancedControllerSettings = it }
-                if (showAdvancedControllerSettings || searchQuery.isNotBlank()) {
-                val touchTintOptions = TOUCH_SKIN_TINTS.map { SettingsChoiceOption(it.id, it.label) }
-                ChoiceOptionRow(
-                    stringResource(R.string.settings_touch_skin_tint),
-                    touchTintOptions,
-                    touchSkinTintId(settings.androidTouch.touchSkinTint),
-                    description = stringResource(R.string.settings_touch_skin_tint_desc),
-                ) { tintId ->
-                    viewModel.updateSettings(
-                        settings.copy(
-                            androidTouch = settings.androidTouch.copy(touchSkinTint = touchSkinTintForId(tintId)),
-                        ),
-                    )
-                }
-                SettingSwitch(
-                    label = stringResource(R.string.settings_touch_button_labels),
-                    checked = settings.androidTouch.touchButtonLabels,
-                ) { enabled ->
-                    viewModel.updateSettings(
-                        settings.copy(androidTouch = settings.androidTouch.copy(touchButtonLabels = enabled)),
-                    )
-                }
-                TouchControlPresetEditor(
-                    touch = settings.androidTouch,
-                    presets = settings.touchControlPresets,
-                    onTouchChange = { viewModel.updateSettings(settings.copy(androidTouch = it)) },
-                    onPresetsChange = { viewModel.updateSettings(settings.copy(touchControlPresets = it)) },
-                )
-                TouchButtonAppearanceEditor(settings.androidTouch) { touch ->
-                    viewModel.updateSettings(settings.copy(androidTouch = touch))
-                }
-                Text(
-                    text = stringResource(R.string.settings_touch_visible_controls),
-                    color = SettingsText,
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    text = stringResource(R.string.settings_touch_visible_controls_desc),
-                    color = SettingsTextMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TouchControlGroup.entries.forEach { group ->
-                    SettingSwitch(
-                        label = stringResource(touchControlGroupLabelRes(group)),
-                        checked = settings.androidTouch.isControlVisible(group),
-                    ) { visible ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.withControlVisible(group, visible)),
-                        )
-                    }
-                }
-                Text(
-                    text = stringResource(R.string.settings_touch_extra_buttons),
-                    color = SettingsText,
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    text = stringResource(R.string.settings_touch_extra_buttons_desc),
-                    color = SettingsTextMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                val extraButtonOptions = TouchExtraButtonAction.entries.map { action ->
-                    SettingsChoiceOption(action.name, touchExtraButtonActionLabel(action))
-                }
-                repeat(TOUCH_EXTRA_BUTTON_COUNT) { index ->
-                    val customCombo = extraButtonComboKey(index) in settings.androidTouch.extraButtonCombos
-                    val customValue = "custom-combo-$index"
-                    val options = if (customCombo) {
-                        listOf(
-                            SettingsChoiceOption(
-                                customValue,
-                                stringResource(
-                                    R.string.touch_extra_combo_custom_value,
-                                    touchExtraButtonComboLabel(settings.androidTouch.extraButtonCombo(index)),
-                                ),
-                            ),
-                        ) + extraButtonOptions
-                    } else {
-                        extraButtonOptions
-                    }
-                    ChoiceOptionRow(
-                        label = stringResource(R.string.settings_touch_extra_button, index + 1),
-                        options = options,
-                        selectedValue = if (customCombo) customValue else settings.androidTouch.extraButtonAction(index).name,
-                    ) { actionName ->
-                        if (actionName == customValue) return@ChoiceOptionRow
-                        val action = TouchExtraButtonAction.valueOf(actionName)
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.withExtraButtonAction(index, action)),
-                        )
-                    }
-                }
-                TouchExtraButtonComboEditor(settings.androidTouch) { touch ->
-                    viewModel.updateSettings(settings.copy(androidTouch = touch))
-                }
-                NumberSlider(
-                    stringResource(R.string.settings_touch_extra_button_size),
-                    settings.androidTouch.extraButtonScale,
-                    0.6f,
-                    1.6f,
-                    0.05f,
-                ) { value ->
-                    viewModel.updateSettings(
-                        settings.copy(androidTouch = settings.androidTouch.copy(extraButtonScale = value)),
-                    )
-                }
-                val touchAimOptions = listOf(
-                    SettingsChoiceOption(TouchAimMode.LockJoystick.name, stringResource(R.string.stream_joysticks_lock_joystick)),
-                    SettingsChoiceOption(TouchAimMode.LockZone.name, stringResource(R.string.stream_joysticks_lock_zone)),
-                )
-                ChoiceOptionRow(stringResource(R.string.stream_joysticks_aim_mode), touchAimOptions, settings.androidTouch.aimMode.name) { modeName ->
-                    val mode = TouchAimMode.valueOf(modeName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(aimMode = mode)))
-                }
-                if (settings.androidTouch.aimMode == TouchAimMode.LockZone) {
-                    NumberSlider(
-                        stringResource(R.string.stream_joysticks_aim_zone_scale),
-                        settings.androidTouch.aimZoneScale,
-                        0.5f,
-                        1.5f,
-                        0.05f,
-                    ) { value ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.copy(aimZoneScale = value)),
-                        )
-                    }
-                    NumberSlider(
-                        stringResource(R.string.stream_joysticks_aim_zone_sensitivity),
-                        settings.androidTouch.aimZoneSensitivity,
-                        0.25f,
-                        3f,
-                        0.05f,
-                    ) { value ->
-                        viewModel.updateSettings(
-                            settings.copy(androidTouch = settings.androidTouch.copy(aimZoneSensitivity = value)),
-                        )
-                    }
-                }
-                val joystickModeOptions = listOf(
-                    SettingsChoiceOption(TouchJoystickMode.Fixed.name, stringResource(R.string.stream_panel_joystick_fixed)),
-                    SettingsChoiceOption(TouchJoystickMode.Dynamic.name, stringResource(R.string.stream_panel_joystick_dynamic)),
-                )
-                ChoiceOptionRow("Touch joystick", joystickModeOptions, settings.androidTouch.joystickMode.name) { modeName ->
-                    val mode = TouchJoystickMode.valueOf(modeName)
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(joystickMode = mode)))
-                }
-                NumberSlider("Joystick dead zone", settings.androidTouch.joystickDeadZone, 0f, 0.3f, 0.01f) { value ->
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(joystickDeadZone = value)))
-                }
-                SettingSwitch(
-                    label = stringResource(R.string.settings_touch_gyro),
-                    checked = settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable,
-                    enabled = gyroscopeAvailable,
-                    description = stringResource(
-                        if (gyroscopeAvailable) R.string.settings_touch_gyro_desc
-                        else R.string.settings_touch_gyro_unavailable,
-                    ),
-                ) { enabled ->
-                    viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeEnabled = enabled)))
-                }
-                if (settings.androidTouch.gyroscopeEnabled && gyroscopeAvailable) {
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_sensitivity), settings.androidTouch.gyroscopeSensitivity, 0.25f, 3f, 0.05f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeSensitivity = value)))
-                    }
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_dead_zone), settings.androidTouch.gyroscopeDeadZone, 0f, 0.2f, 0.005f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeDeadZone = value)))
-                    }
-                    NumberSlider(stringResource(R.string.settings_touch_gyro_smoothing), settings.androidTouch.gyroscopeSmoothing, 0f, 0.9f, 0.05f) { value ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeSmoothing = value)))
-                    }
-                    SettingSwitch(
-                        stringResource(R.string.settings_touch_gyro_invert_horizontal),
-                        settings.androidTouch.gyroscopeInvertHorizontal,
-                    ) { enabled ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeInvertHorizontal = enabled)))
-                    }
-                    SettingSwitch(
-                        stringResource(R.string.settings_touch_gyro_invert_vertical),
-                        settings.androidTouch.gyroscopeInvertVertical,
-                    ) { enabled ->
-                        viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(gyroscopeInvertVertical = enabled)))
-                    }
-                }
-                NumberSlider("Touch layout scale", settings.androidTouch.scale, 0.6f, 1.4f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(scale = value))) }
-                NumberSlider("Touch button size", settings.androidTouch.buttonScale, 0.65f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(buttonScale = value))) }
-                NumberSlider("Touch stick size", settings.androidTouch.stickScale, 0.65f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(stickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_face_size), settings.androidTouch.faceButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(faceButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_dpad_size), settings.androidTouch.dpadScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(dpadScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_shoulders_size), settings.androidTouch.shoulderButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(shoulderButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_center_size), settings.androidTouch.centerButtonScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(centerButtonScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_left_stick_size), settings.androidTouch.leftStickScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftStickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_right_stick_size), settings.androidTouch.rightStickScale, 0.6f, 1.5f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightStickScale = value))) }
-                NumberSlider(stringResource(R.string.settings_touch_stick_knob_size), settings.androidTouch.stickKnobScale, 0.28f, 0.72f, 0.02f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(stickKnobScale = value))) }
-                NumberSlider("Touch opacity", settings.androidTouch.opacity, 0f, 1f, 0.05f) { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(opacity = value))) }
-                NumberSlider("Touch edge padding", settings.androidTouch.edgePaddingDp, 0f, 72f, 1f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(edgePaddingDp = value))) }
-                NumberSlider("Touch bottom padding", settings.androidTouch.bottomPaddingDp, 0f, 120f, 1f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(bottomPaddingDp = value))) }
-                NumberSlider("Left controls horizontal offset", settings.androidTouch.leftOffsetXDp, -220f, 220f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftOffsetXDp = value))) }
-                NumberSlider("Left controls vertical offset", settings.androidTouch.leftOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(leftOffsetYDp = value))) }
-                NumberSlider("Right controls horizontal offset", settings.androidTouch.rightOffsetXDp, -220f, 220f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetXDp = value))) }
-                NumberSlider("Right controls vertical offset", settings.androidTouch.rightOffsetYDp, -160f, 160f, 2f, unit = "dp") { value -> viewModel.updateSettings(settings.copy(androidTouch = settings.androidTouch.copy(rightOffsetYDp = value))) }
-                }
             }
-    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "navigation", "sidebar", "opacity", "transparency", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
+    CategorySettingsSection(selectedCategory, SettingsCategory.Interface, searchQuery, stringResource(R.string.settings_section_appearance), "interface", "ui", "appearance", "space", "experimental", "console", "controller", "landscape", "dynamic color", "system colors", "accent", "expressive", "border", "effects", "bonanza", "cinema", "catalog", "background", "navigation", "sidebar", "opacity", "transparency", "wallpaper", "image", "custom", "tv", "safe area", "screen padding", "overscan", "useless mascot", "screensaver", "inactivity") {
+                SpaceUiSettingsToggle(
+                    checked = settings.experimentalSpaceUi,
+                    onCheckedChange = viewModel::setSpaceUiEnabled,
+                )
                 val accentOptions = selectableUiAccents().map { it to uiAccentLabel(it) }
                 SettingSwitch(stringResource(R.string.settings_dynamic_color), settings.dynamicColor) { viewModel.updateSettings(settings.copy(dynamicColor = it)) }
                 SettingSwitch(
@@ -1781,9 +1580,9 @@ private fun SettingsContent(
                     viewModel.updateSettings(settings.copy(absoluteCinemaEverywhere = enabled))
                 }
                 SettingSwitch(
-                    label = stringResource(R.string.settings_useless_mascot),
+                    label = stringResource(R.string.screensaver_name),
                     checked = settings.uselessMascotEnabled,
-                    description = stringResource(R.string.settings_useless_mascot_desc),
+                    description = stringResource(R.string.screensaver_description),
                 ) { enabled ->
                     viewModel.updateSettings(settings.copy(uselessMascotEnabled = enabled))
                 }
@@ -1980,11 +1779,13 @@ private fun SettingsContent(
                 )
             }
     CategorySettingsSection(selectedCategory, SettingsCategory.Advanced, searchQuery, stringResource(R.string.settings_experimental_streaming), "experimental", "stream", "network", "dynamic", "adjustment", "nvst", "l4s", "session", "launch", "failure", "battery", "optimization", "background", "allow", "run") {
-                Text(
-                    stringResource(R.string.settings_experimental_streaming_warning),
-                    color = SettingsTextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                )
+                if (!LocalSpaceUiPresentation.current) {
+                    Text(
+                        stringResource(R.string.settings_experimental_streaming_warning),
+                        color = SettingsTextMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
                 SettingSwitch(
                     label = "NVST transport (Experimental)",
                     checked = settings.stream.experimentalNvst,
@@ -2060,7 +1861,7 @@ private fun SettingsContent(
                 ThanksPanel()
             }
     if (settings.developerOptionsUnlocked) {
-        CategorySettingsSection(selectedCategory, SettingsCategory.Developer, searchQuery, stringResource(R.string.settings_category_developer), "developer", "developer options", "debug", "reset", "wipe", "diagnostics", "runtime", "environment", "flows", "onboarding", "cache") {
+        CategorySettingsSection(selectedCategory, SettingsCategory.Developer, searchQuery, stringResource(R.string.settings_category_developer), "developer", "developer options", "demo", "mask", "screenshots", "debug", "reset", "wipe", "diagnostics", "runtime", "environment", "flows", "onboarding", "cache") {
                     DeveloperOptionsPanel(state = state, viewModel = viewModel)
                 }
     }
@@ -2346,139 +2147,6 @@ private fun SettingsCategoryRow(category: SettingsCategory, onClick: () -> Unit)
             cornerRadius = 14.dp,
             cinemaEffectEnabled = LocalAbsoluteCinemaEffects.current,
         )
-    }
-}
-
-@Composable
-private fun SettingsDetailHeader(
-    category: SettingsCategory,
-    tvProfile: Boolean,
-    controllerFamily: AndroidControllerFamily?,
-    onBack: () -> Unit,
-) {
-    val controllerNavigationEnabled = LocalSettingsControllerNavigationEnabled.current
-    val showHardwareBackHint = tvProfile || controllerNavigationEnabled
-    var backFocused by remember { mutableStateOf(false) }
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        if (showHardwareBackHint) {
-            Surface(
-                modifier = Modifier
-                    .onFocusChanged { backFocused = it.isFocused || it.hasFocus }
-                    .border(
-                        width = if (backFocused) 3.dp else 1.dp,
-                        color = cinemaBorderColor(
-                            LocalAbsoluteCinemaEffects.current,
-                            LocalActiveSelectionColor.current,
-                        ),
-                        shape = RoundedCornerShape(999.dp),
-                    )
-                    .clickable(onClick = onBack),
-                shape = RoundedCornerShape(999.dp),
-                color = if (backFocused) MaterialTheme.colorScheme.primary.copy(alpha = 0.24f) else Color.Transparent,
-            ) {
-                Row(
-                    // The badge touches the capsule edge so its white ring and the focused outer
-                    // ring read as one continuous controller affordance instead of two outlines
-                    // separated by a dark crescent.
-                    modifier = Modifier.padding(end = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                ) {
-                    val backBadgeColor = when (controllerFamily) {
-                        null, AndroidControllerFamily.Google -> Color.White
-                        AndroidControllerFamily.Xbox -> Color(0xFFFFC107)
-                        AndroidControllerFamily.PlayStation -> Color(0xFFE94B5F)
-                        AndroidControllerFamily.Nintendo -> Color(0xFFE60012)
-                        AndroidControllerFamily.Generic -> MaterialTheme.colorScheme.primary
-                    }
-                    Surface(
-                        modifier = Modifier
-                            .size(38.dp)
-                            .border(
-                                2.dp,
-                                cinemaBorderColor(
-                                    LocalAbsoluteCinemaEffects.current,
-                                    LocalActiveSelectionColor.current,
-                                ),
-                                CircleShape,
-                            ),
-                        shape = CircleShape,
-                        color = backBadgeColor,
-                    ) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            when (controllerFamily) {
-                                null, AndroidControllerFamily.Google -> Icon(
-                                    painter = painterResource(R.drawable.ic_arrow_back),
-                                    contentDescription = stringResource(R.string.cd_remote_back),
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(17.dp),
-                                )
-                                AndroidControllerFamily.PlayStation -> Text(
-                                    "○",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Black,
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                                AndroidControllerFamily.Xbox,
-                                AndroidControllerFamily.Nintendo,
-                                AndroidControllerFamily.Generic,
-                                -> Text(
-                                    "B",
-                                    color = if (controllerFamily == AndroidControllerFamily.Xbox) Color.Black else Color.White,
-                                    fontWeight = FontWeight.Black,
-                                    style = MaterialTheme.typography.labelLarge,
-                                )
-                            }
-                        }
-                    }
-                    Text(
-                        stringResource(R.string.remote_back_label),
-                        color = SettingsText,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(end = 7.dp),
-                    )
-                }
-            }
-        } else {
-            Surface(
-                modifier = Modifier
-                    .size(42.dp)
-                    .border(1.dp, SettingsTextMuted.copy(alpha = 0.5f), CircleShape)
-                    .clickable(onClick = onBack),
-                shape = CircleShape,
-                color = Color.Transparent,
-            ) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_arrow_back),
-                        contentDescription = stringResource(R.string.action_back),
-                        tint = SettingsText,
-                        modifier = Modifier.size(21.dp),
-                    )
-                }
-            }
-        }
-        Column(Modifier.fillMaxWidth()) {
-            Text(
-                stringResource(category.titleRes),
-                color = SettingsText,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                stringResource(category.summaryRes),
-                color = SettingsTextMuted,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
     }
 }
 

@@ -23,6 +23,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.RepeatMode
@@ -125,6 +126,8 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.key
 import androidx.compose.runtime.setValue
@@ -168,6 +171,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -575,13 +579,13 @@ internal fun LibraryScreen(
         )
     }
     val touchFilterLabel = stringResource(R.string.catalog_filter_touch_controls)
-    val filterOptions = remember(orderedGames, touchFilterLabel) {
-        libraryStoreFilterOptions(orderedGames, touchFilterLabel)
+    val filterOptions = remember(orderedGames, touchFilterLabel, state.settings.demoMode) {
+        libraryStoreFilterOptions(orderedGames, touchFilterLabel, state.settings.demoMode)
     }
-    val games = remember(orderedGames, state.librarySearch, state.libraryFilterIds) {
+    val games = remember(orderedGames, state.librarySearch, state.libraryFilterIds, state.settings.demoMode) {
         val searchTerms = searchTermsFor(state.librarySearch)
         orderedGames.filter { game ->
-            gameMatchesSearch(game, searchTerms) && gameMatchesLibraryFilters(game, state.libraryFilterIds)
+            gameMatchesSearch(game, searchTerms) && gameMatchesLibraryFilters(game, state.libraryFilterIds, state.settings.demoMode)
         }
     }
     val gridState = rememberLazyGridState()
@@ -842,10 +846,11 @@ internal fun LibraryFilterControls(
 internal fun libraryStoreFilterOptions(
     games: List<GameInfo>,
     touchFilterLabel: String = "Touch controls",
+    demoMode: Boolean = false,
 ): List<CatalogFilterOption> {
     val labelsById = linkedMapOf<String, String>()
     games.forEach { game ->
-        libraryStoreFilterIds(game).forEach { (id, label) ->
+        libraryStoreFilterIds(game, demoMode).forEach { (id, label) ->
             // Map.putIfAbsent is API 24; this module ships to 23 without core library desugaring.
             if (id !in labelsById) labelsById[id] = label
         }
@@ -877,20 +882,20 @@ internal fun libraryStoreFilterOptions(
     return touchOption + storeOptions
 }
 
-internal fun gameMatchesLibraryFilters(game: GameInfo, selectedIds: List<String>): Boolean {
+internal fun gameMatchesLibraryFilters(game: GameInfo, selectedIds: List<String>, demoMode: Boolean = false): Boolean {
     if (selectedIds.isEmpty()) return true
     if (CATALOG_FILTER_TOUCHSCREEN in selectedIds && !catalogClaimsTouchSupport(game)) return false
     val selectedStoreIds = selectedIds.filter { it.startsWith(LIBRARY_STORE_FILTER_PREFIX) }
     if (selectedStoreIds.isEmpty()) return true
-    val gameFilterIds = libraryStoreFilterIds(game).map { it.first }.toSet()
+    val gameFilterIds = libraryStoreFilterIds(game, demoMode).map { it.first }.toSet()
     return selectedStoreIds.any { it in gameFilterIds }
 }
 
 internal fun filterCatalogGamesForLocalControls(games: List<GameInfo>, selectedIds: List<String>): List<GameInfo> =
     if (CATALOG_FILTER_TOUCHSCREEN in selectedIds) games.filter(::catalogClaimsTouchSupport) else games
 
-private fun libraryStoreFilterIds(game: GameInfo): List<Pair<String, String>> {
-    val labels = libraryStoreDisplayNames(game)
+private fun libraryStoreFilterIds(game: GameInfo, demoMode: Boolean): List<Pair<String, String>> {
+    val labels = presentedOwnedStores(game, demoMode)
     return labels
         .mapNotNull { label ->
             val normalized = normalizeGameStore(label)
@@ -1740,7 +1745,7 @@ private fun StoreGameGrid(
                         }
                     }
                     if (showDiscoverySections) {
-                        item(span = { GridItemSpan(maxLineSpan) }) {
+                        item(key = "store-start-rails", span = { GridItemSpan(maxLineSpan) }) {
                             StoreStartRails(
                                 games = games,
                                 newlyAddedGames = state.newlyAddedGames,
@@ -2080,7 +2085,8 @@ private fun StoreComingNextCarousel(
     if (games.isEmpty()) return
     val context = LocalContext.current
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    var page by remember(games) { mutableIntStateOf(0) }
+    val gameIds = games.map(GameInfo::id)
+    var page by rememberSaveable(gameIds) { mutableIntStateOf(0) }
     var focused by remember { mutableStateOf(false) }
     val enhancedControllerFocus = shouldShowEnhancedControllerFocus(
         focused = focused,
@@ -2089,21 +2095,29 @@ private fun StoreComingNextCarousel(
     )
     val selectedGameId = LocalSelectedCatalogGameId.current
     val reduceMotion = LocalReduceMotion.current
-    val storeScrolling = LocalCatalogScrolling.current
     val haptics = LocalOpenNowHaptics.current
-    val carouselProgress = remember { Animatable(0f) }
+    // Lazy-grid items leave composition offscreen. Save both the page and its exact progress so
+    // returning to the hero resumes the same countdown rather than starting a new one.
+    val carouselProgress = rememberSaveable(
+        gameIds,
+        page,
+        saver = Saver<Animatable<Float, AnimationVector1D>, Float>(
+            save = { it.value },
+            restore = { Animatable(it) },
+        ),
+    ) { Animatable(0f) }
+    var heroVisible by remember { mutableStateOf(false) }
     var carouselDragPx by remember { mutableFloatStateOf(0f) }
     val swipeThresholdPx = with(LocalDensity.current) { 48.dp.toPx() }
     val carouselDragState = rememberDraggableState { delta -> carouselDragPx += delta }
-    LaunchedEffect(games, page, focused, reduceMotion, storeScrolling, collapsed) {
-        // Never auto-advance under the reader's hands: not while focused, and not at all when the
-        // user has asked for reduced motion. Vertical Store motion also gets the full frame budget.
-        carouselProgress.snapTo(0f)
-        if (!collapsed && shouldAnimateStoreHero(games.size, focused, reduceMotion, storeScrolling)) {
+    LaunchedEffect(carouselProgress, focused, reduceMotion, heroVisible, collapsed) {
+        // Cancelling the animation freezes its current value. Only a page/feed change resets it;
+        // ordinary scrolling keeps the timer running until the hero actually leaves the viewport.
+        if (!collapsed && shouldAnimateStoreHero(games.size, focused, reduceMotion, heroVisible)) {
             carouselProgress.animateTo(
                 targetValue = 1f,
                 animationSpec = tween(
-                    durationMillis = HERO_CAROUSEL_ADVANCE_MS.toInt(),
+                    durationMillis = (HERO_CAROUSEL_ADVANCE_MS * (1f - carouselProgress.value)).toInt(),
                     easing = LinearEasing,
                 ),
             )
@@ -2160,7 +2174,13 @@ private fun StoreComingNextCarousel(
                 }
             },
         )
-        AnimatedVisibility(visible = !collapsed) {
+        AnimatedVisibility(
+            visible = !collapsed,
+            modifier = Modifier.onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                heroVisible = bounds.width > 0f && bounds.height > 0f
+            },
+        ) {
             AnimatedContent(
                 targetState = page,
                 transitionSpec = {
@@ -2362,8 +2382,8 @@ internal fun shouldAnimateStoreHero(
     pageCount: Int,
     focused: Boolean,
     reduceMotion: Boolean,
-    storeScrolling: Boolean,
-): Boolean = pageCount > 1 && !focused && !reduceMotion && !storeScrolling
+    heroVisible: Boolean,
+): Boolean = pageCount > 1 && !focused && !reduceMotion && heroVisible
 
 @Composable
 private fun HeroCarouselProgress(
@@ -3292,24 +3312,6 @@ internal fun catalogControllerActionMode(
 internal fun shouldShowCatalogFavoriteIcon(settings: AppSettings): Boolean =
     settings.showFavoriteIconOnGameCards
 
-@Composable
-private fun PremiumMembershipMarker(modifier: Modifier = Modifier) {
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(100.dp),
-        color = Color.Black.copy(alpha = 0.78f),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.7f)),
-    ) {
-        Text(
-            text = stringResource(R.string.catalog_premium_marker),
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
-            color = Color.White,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
 /** Titles may be captioned on touch handhelds; controller-first layouts suppress them upstream. */
 internal fun shouldShowCatalogCardTitles(tvProfile: Boolean, enabled: Boolean): Boolean =
     enabled && !tvProfile
@@ -3454,6 +3456,9 @@ internal fun GameDetailsSheet(
     onRemove: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
+    val requestLaunch = rememberGameDetailsLaunchActions(
+        game, defaultVariantId, onPlay, onChooseStore, onPlayOnTv, onDismiss,
+    )
     val transitionRegistry = LocalGameDetailsTransitionRegistry.current
     val transitionOrigin = transitionRegistry?.originFor(game.id)
     val cardTransitionOrigin = transitionOrigin
@@ -3657,11 +3662,9 @@ internal fun GameDetailsSheet(
                         game = game,
                         favorite = favorite,
                         defaultVariantId = defaultVariantId,
-                        onPlay = onPlay,
-                        onChooseStore = onChooseStore,
+                        onLaunch = requestLaunch,
                         onFavorite = onFavorite,
                         connectedTvName = connectedTvName,
-                        onPlayOnTv = onPlayOnTv,
                         removeLabel = removeLabel,
                         removeConfirmationText = removeConfirmationText,
                         removeEnabled = removeEnabled,
@@ -3677,11 +3680,9 @@ internal fun GameDetailsSheet(
                         game = game,
                         favorite = favorite,
                         defaultVariantId = defaultVariantId,
-                        onPlay = onPlay,
-                        onChooseStore = onChooseStore,
+                        onLaunch = requestLaunch,
                         onFavorite = onFavorite,
                         connectedTvName = connectedTvName,
-                        onPlayOnTv = onPlayOnTv,
                         removeLabel = removeLabel,
                         removeConfirmationText = removeConfirmationText,
                         removeEnabled = removeEnabled,
@@ -3695,6 +3696,7 @@ internal fun GameDetailsSheet(
             }
         }
     }
+
 }
 
 /** How far the sheet must be dragged down before letting go dismisses it. */
@@ -3726,11 +3728,9 @@ private fun GameDetailsLandscapeContent(
     game: GameInfo,
     favorite: Boolean,
     defaultVariantId: String?,
-    onPlay: (GameInfo) -> Unit,
-    onChooseStore: (GameInfo) -> Unit,
+    onLaunch: (GameDetailsLaunchAction) -> Unit,
     onFavorite: (String) -> Unit,
     connectedTvName: String?,
-    onPlayOnTv: (GameInfo) -> Unit,
     removeLabel: String?,
     removeConfirmationText: String?,
     removeEnabled: Boolean,
@@ -3744,10 +3744,7 @@ private fun GameDetailsLandscapeContent(
     val description = gameDescriptionForDetails(game)
     val context = LocalContext.current
     val upgradeRequired = game.requiresMembershipUpgrade()
-    val primaryAction = {
-        onDismiss()
-        playOrUpgrade(game, context, onPlay)
-    }
+    val primaryAction = { onLaunch(GameDetailsLaunchAction.Play) }
     val sideScrollState = rememberScrollState()
     val detailsSpacing = if (shortHeight) 8.dp else 10.dp
     var gameFocused by remember(game.id) { mutableStateOf(false) }
@@ -3822,8 +3819,7 @@ private fun GameDetailsLandscapeContent(
                         connectedTvName?.takeUnless { upgradeRequired }?.let {
                             OutlinedButton(
                                 onClick = {
-                                    onDismiss()
-                                    onPlayOnTv(game)
+                                    onLaunch(GameDetailsLaunchAction.PlayOnTv)
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
@@ -3833,8 +3829,7 @@ private fun GameDetailsLandscapeContent(
                         LongPressPlayButton(
                             onClick = primaryAction,
                             onLongClick = if (upgradeRequired) null else ({
-                                onDismiss()
-                                onChooseStore(game)
+                                onLaunch(GameDetailsLaunchAction.ChooseStore)
                             }),
                             upgradeRequired = upgradeRequired,
                             modifier = Modifier
@@ -3917,8 +3912,7 @@ private fun GameDetailsLandscapeContent(
                     LongPressPlayButton(
                         onClick = primaryAction,
                         onLongClick = if (upgradeRequired) null else ({
-                            onDismiss()
-                            onChooseStore(game)
+                            onLaunch(GameDetailsLaunchAction.ChooseStore)
                         }),
                         upgradeRequired = upgradeRequired,
                         modifier = Modifier.weight(1f),
@@ -3927,8 +3921,7 @@ private fun GameDetailsLandscapeContent(
                     connectedTvName?.takeUnless { upgradeRequired }?.let {
                         OutlinedButton(
                             onClick = {
-                                onDismiss()
-                                onPlayOnTv(game)
+                                onLaunch(GameDetailsLaunchAction.PlayOnTv)
                             },
                             modifier = Modifier.weight(1f).height(48.dp),
                         ) {
@@ -3947,6 +3940,7 @@ private fun GameDetailsCompactInfoContent(
     defaultVariantId: String?,
     description: String?,
 ) {
+    GameAvailabilityBanner(game.availability(defaultVariantId), compact = true)
     OwnershipStatusRow(game = game, compact = true)
     MembershipUpgradeNotice(game)
     GameGenreChips(game = game, compact = true)
@@ -3970,11 +3964,9 @@ private fun GameDetailsScrollableContent(
     game: GameInfo,
     favorite: Boolean,
     defaultVariantId: String?,
-    onPlay: (GameInfo) -> Unit,
-    onChooseStore: (GameInfo) -> Unit,
+    onLaunch: (GameDetailsLaunchAction) -> Unit,
     onFavorite: (String) -> Unit,
     connectedTvName: String?,
-    onPlayOnTv: (GameInfo) -> Unit,
     removeLabel: String?,
     removeConfirmationText: String?,
     removeEnabled: Boolean,
@@ -3985,10 +3977,7 @@ private fun GameDetailsScrollableContent(
 ) {
     val context = LocalContext.current
     val upgradeRequired = game.requiresMembershipUpgrade()
-    val primaryAction = {
-        onDismiss()
-        playOrUpgrade(game, context, onPlay)
-    }
+    val primaryAction = { onLaunch(GameDetailsLaunchAction.Play) }
     var gameFocused by remember(game.id) { mutableStateOf(false) }
     val gameImageInteraction = remember(game.id) { MutableInteractionSource() }
     val gameImageHovered by gameImageInteraction.collectIsHoveredAsState()
@@ -4058,6 +4047,7 @@ private fun GameDetailsScrollableContent(
             item {
                 Column(Modifier.padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     val description = gameDescriptionForDetails(game)
+                    GameAvailabilityBanner(game.availability(defaultVariantId), compact = false)
                     OwnershipStatusRow(game = game, compact = false)
                     MembershipUpgradeNotice(game)
                     GameGenreChips(game = game, compact = false)
@@ -4120,8 +4110,7 @@ private fun GameDetailsScrollableContent(
                 LongPressPlayButton(
                     onClick = primaryAction,
                     onLongClick = if (upgradeRequired) null else ({
-                        onDismiss()
-                        onChooseStore(game)
+                        onLaunch(GameDetailsLaunchAction.ChooseStore)
                     }),
                     upgradeRequired = upgradeRequired,
                     modifier = Modifier.weight(1f),
@@ -4130,8 +4119,7 @@ private fun GameDetailsScrollableContent(
                 connectedTvName?.takeUnless { upgradeRequired }?.let { tvName ->
                     IconButton(
                         onClick = {
-                            onDismiss()
-                            onPlayOnTv(game)
+                            onLaunch(GameDetailsLaunchAction.PlayOnTv)
                         },
                         modifier = Modifier.size(48.dp),
                     ) {
@@ -4148,11 +4136,12 @@ private fun GameDetailsScrollableContent(
 }
 
 @Composable
-private fun LaunchOptionsList(
+internal fun LaunchOptionsList(
     game: GameInfo,
     defaultVariantId: String?,
     compact: Boolean,
 ) {
+    val space = LocalSpaceUiPresentation.current
     val variants = launchableGameVariants(game.variants)
     if (variants.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp)) {
@@ -4165,9 +4154,9 @@ private fun LaunchOptionsList(
         variants.take(if (compact) 3 else variants.size).forEach { variant ->
             val isDefault = variant.id == defaultVariantId
             Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(if (compact) 12.dp else 14.dp),
-                color = if (isDefault) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else PanelAlt,
+                modifier = Modifier.fillMaxWidth().then(if (space) Modifier.spaceReadableBlock(contentPadding = 0.dp) else Modifier),
+                shape = RoundedCornerShape(if (space) 4.dp else if (compact) 12.dp else 14.dp),
+                color = if (isDefault) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else if (space) SpaceWhite.copy(alpha = .035f) else PanelAlt,
                 contentColor = TextPrimary,
             ) {
                 Row(
@@ -4320,9 +4309,11 @@ internal fun gameDetailsPlayFocusScale(focused: Boolean): Float = if (focused) 1
 
 internal fun gameDetailsPlayFocusBorderWidthDp(focused: Boolean): Float = if (focused) 4f else 0f
 
+@Composable
 private fun variantDetailsText(variant: GameVariant): String =
     listOfNotNull(
-        variant.libraryStatus?.takeIf { it.isNotBlank() }?.let(::formatGameMetadataLabel),
+        if (LocalDemoMode.current) stringResource(R.string.catalog_owned)
+        else variant.libraryStatus?.takeIf { it.isNotBlank() }?.let(::formatGameMetadataLabel),
         variant.supportedControls.takeIf { it.isNotEmpty() }?.joinToString(", ") { formatGameMetadataLabel(it) },
     ).joinToString(" - ")
 
@@ -4624,10 +4615,13 @@ private fun GameTitleBlock(game: GameInfo, compact: Boolean) {
 }
 
 @Composable
-private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
-    val ownedStores = ownedStoreLabels(game)
+internal fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
+    val space = LocalSpaceUiPresentation.current
+    val demoMode = LocalDemoMode.current
+    val gameOwned = demoMode || isGameInLibrary(game)
+    val ownedStores = presentedOwnedStores(game, demoMode)
     val availableStores = (availableStoreLabels(game) + ownedStores).distinctBy(::normalizeGameStore)
-    val shape = RoundedCornerShape(if (compact) 12.dp else 14.dp)
+    val shape = RoundedCornerShape(if (space) 4.dp else if (compact) 12.dp else 14.dp)
     if (ownedStores.isNotEmpty() && availableStores.size > 1) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             availableStores.forEach { store ->
@@ -4657,9 +4651,9 @@ private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
     }
     if (ownedStores.isEmpty()) {
         Surface(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = if (space) Modifier.testTag("space-ownership-badge") else Modifier.fillMaxWidth(),
             shape = shape,
-            color = if (isGameInLibrary(game)) PanelAlt else Color(0xff4a1216),
+            color = if (gameOwned) PanelAlt else Color(0xff4a1216),
             tonalElevation = 0.dp,
         ) {
             Row(
@@ -4668,11 +4662,11 @@ private fun OwnershipStatusRow(game: GameInfo, compact: Boolean) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    if (isGameInLibrary(game)) stringResource(R.string.catalog_owned) else stringResource(R.string.catalog_not_owned),
-                    color = if (isGameInLibrary(game)) TextPrimary else OpenNowPalette.OnErrorContainer,
+                    if (gameOwned) stringResource(R.string.catalog_owned) else stringResource(R.string.catalog_not_owned),
+                    color = if (gameOwned) TextPrimary else OpenNowPalette.OnErrorContainer,
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.weight(1f),
+                    modifier = if (space) Modifier else Modifier.weight(1f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -4716,7 +4710,7 @@ private const val GFN_MEMBERSHIP_MANAGE_URL = "https://www.nvidia.com/en-us/acco
 internal fun GameInfo.requiresMembershipUpgrade(): Boolean =
     playabilityState == "UNPLAYABLE_DUE_TO_UPGRADE"
 
-private fun playOrUpgrade(game: GameInfo, context: Context, onPlay: (GameInfo) -> Unit) {
+internal fun playOrUpgrade(game: GameInfo, context: Context, onPlay: (GameInfo) -> Unit) {
     if (game.requiresMembershipUpgrade()) openMembershipUpgrade(context) else onPlay(game)
 }
 
@@ -4729,7 +4723,7 @@ private fun openMembershipUpgrade(context: Context) {
 }
 
 @Composable
-private fun MembershipUpgradeNotice(game: GameInfo) {
+internal fun MembershipUpgradeNotice(game: GameInfo) {
     if (!game.requiresMembershipUpgrade()) return
     Text(
         text = stringResource(R.string.catalog_membership_upgrade_required),
@@ -4738,17 +4732,6 @@ private fun MembershipUpgradeNotice(game: GameInfo) {
         style = MaterialTheme.typography.bodyMedium,
     )
 }
-
-private fun ownedStoreLabels(game: GameInfo): List<String> =
-    libraryStoreDisplayNames(game)
-
-private fun availableStoreLabels(game: GameInfo): List<String> =
-    displayStoresForVariants(game.variants)
-        .filterNot { it.equals("Unknown", ignoreCase = true) || it.equals("None", ignoreCase = true) }
-        .ifEmpty { game.availableStores.flatMap { gameStoreDisplayName(it).split(" / ") } }
-        .map(String::trim)
-        .filter { it.isNotBlank() && !it.equals("none", ignoreCase = true) && !it.equals("Unknown", ignoreCase = true) }
-        .distinctBy(::normalizeGameStore)
 
 @Composable
 private fun GameGenreChips(game: GameInfo, compact: Boolean) {
@@ -4772,7 +4755,7 @@ private fun GameGenreChips(game: GameInfo, compact: Boolean) {
 }
 
 @Composable
-private fun GameLastPlayed(game: GameInfo) {
+internal fun GameLastPlayed(game: GameInfo) {
     val played = remember(game.lastPlayed, game.variants) { latestGameLastPlayed(game) } ?: return
     var nowMs by remember(played) { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(played) {
@@ -5098,7 +5081,7 @@ private fun GameDescriptionDisclosure(
     }
 }
 
-private fun formatGameMetadataLabel(raw: String): String {
+internal fun formatGameMetadataLabel(raw: String): String {
     val compact = raw.trim()
         .removePrefix("GFN_")
         .removePrefix("GAME_")
@@ -5123,15 +5106,6 @@ private fun formatGameMetadataLabel(raw: String): String {
     }
 }
 
-private fun isNoisyGameTag(label: String): Boolean {
-    val normalized = label.trim().lowercase(Locale.US)
-    return normalized.isBlank() ||
-        normalized == "unknown" ||
-        normalized == "gfn" ||
-        normalized == "nvidia" ||
-        normalized.contains("sku based tag") ||
-        normalized.contains("catalog")
-}
 
 @Composable
 private fun CompactDetailRows(game: GameInfo) {
@@ -5146,7 +5120,7 @@ private fun CompactDetailRows(game: GameInfo) {
 }
 
 @Composable
-private fun DetailRows(game: GameInfo) {
+internal fun DetailRows(game: GameInfo) {
     val rows = gameDetailRows(game)
     if (rows.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -5156,125 +5130,19 @@ private fun DetailRows(game: GameInfo) {
     }
 }
 
-private data class GameDetailRow(
-    val label: String,
-    val value: String,
-    val copyValue: String = value,
-    val actionUrl: String? = null,
-)
-
-internal data class GameStoreDetail(
-    val label: String,
-    val url: String?,
-)
-
-internal fun validExternalStoreUrl(rawUrl: String?): String? {
-    val value = rawUrl?.trim()?.takeIf { it.isNotBlank() } ?: return null
-    val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return null
-    return value.takeIf {
-        uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
-    }
-}
-
-internal fun gameStoreDetails(game: GameInfo): List<GameStoreDetail> {
-    val variantDetails = launchableGameVariants(game.variants)
-        .map { variant ->
-            GameStoreDetail(
-                label = gameStoreDisplayName(variant.store),
-                url = validExternalStoreUrl(variant.storeUrl),
-            )
-        }
-        .filter { it.label.isNotBlank() && !it.label.equals("Unknown", ignoreCase = true) && !it.label.equals("None", ignoreCase = true) }
-        .distinctBy { normalizeGameStore(it.label) }
-    if (variantDetails.none { it.url != null }) {
-        return game.availableStores
-            .map(::gameStoreDisplayName)
-            .filterNot { it.equals("Unknown", ignoreCase = true) || it.equals("None", ignoreCase = true) }
-            .distinctBy(::normalizeGameStore)
-            .takeIf { it.isNotEmpty() }
-            ?.let { stores -> listOf(GameStoreDetail(stores.joinToString(", "), null)) }
-            .orEmpty()
-    }
-
-    val variantStoreKeys = variantDetails.mapTo(mutableSetOf()) { normalizeGameStore(it.label) }
-    val fallbackDetails = game.availableStores
-        .map(::gameStoreDisplayName)
-        .filterNot { it.equals("Unknown", ignoreCase = true) || it.equals("None", ignoreCase = true) }
-        .filter { normalizeGameStore(it) !in variantStoreKeys }
-        .distinctBy(::normalizeGameStore)
-        .map { GameStoreDetail(it, null) }
-    return variantDetails + fallbackDetails
-}
-
-private fun gameDetailRows(game: GameInfo): List<GameDetailRow> = buildList {
-    addAll(
-        listOfNotNull(
-            game.playabilityState?.takeIf { it.isNotBlank() }?.let { GameDetailRow("Status", formatGameMetadataLabel(it)) },
-            game.publisherName?.takeIf { it.isNotBlank() }?.let { GameDetailRow("Publisher", it) },
-            supportedControlLabels(game).takeIf { it.isNotEmpty() }?.joinToString(", ")?.let { GameDetailRow("Controls", it) },
-            game.featureLabels
-                .map(::formatGameMetadataLabel)
-                .filterNot(::isNoisyGameTag)
-                .filterNot { feature -> game.genres.any { genre -> feature.equals(formatGameMetadataLabel(genre), ignoreCase = true) } }
-                .distinctBy { it.lowercase(Locale.US) }
-                .take(8)
-                .takeIf { it.isNotEmpty() }
-                ?.joinToString(", ")
-                ?.let { GameDetailRow("Features", it) },
-            game.membershipTierLabel?.takeIf { it.isNotBlank() }?.let { GameDetailRow("Membership", formatGameMetadataLabel(it)) },
-            game.contentRatings.takeIf { it.isNotEmpty() }?.joinToString(", ")?.let { GameDetailRow("Rating", it) },
-        ),
-    )
-    val stores = gameStoreDetails(game)
-    addAll(stores.map { store ->
-        GameDetailRow(
-            label = if (store.url == null && stores.size == 1) "Stores" else "Store",
-            value = store.label,
-            actionUrl = store.url,
-        )
-    })
-    gameAppIdForDetails(game)?.let { add(GameDetailRow("App ID", it)) }
-}
-
-internal fun supportedControlLabels(game: GameInfo): List<String> =
-    game.variants
-        .flatMap { it.supportedControls }
-        .map(::formatGameMetadataLabel)
-        .filter(String::isNotBlank)
-        .distinctBy { it.lowercase(Locale.US) }
-
-private fun gameAppIdForDetails(game: GameInfo): String? =
-    game.launchAppId?.takeIf { it.isNotBlank() }
-        ?: game.variants.firstNotNullOfOrNull { variant -> variant.id.takeIf { it.isNotBlank() && it.all(Char::isDigit) } }
-        ?: game.uuid?.takeIf { it.isNotBlank() }
-        ?: game.id.takeIf { it.isNotBlank() }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DetailRow(row: GameDetailRow, compact: Boolean) {
-    val clipboard = LocalClipboardManager.current
-    val context = LocalContext.current
-    val shape = RoundedCornerShape(if (compact) 10.dp else 12.dp)
+    val space = LocalSpaceUiPresentation.current
+    val shape = RoundedCornerShape(if (space) 4.dp else if (compact) 10.dp else 12.dp)
     Row(
         Modifier
             .fillMaxWidth()
             .clip(shape)
-            .background(PanelAlt)
-            .combinedClickable(
-                role = if (row.actionUrl != null) Role.Button else null,
-                onClick = {
-                    val url = row.actionUrl ?: return@combinedClickable
-                    runCatching {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                    }.onFailure {
-                        Toast.makeText(context, context.getString(R.string.error_open_store_page), Toast.LENGTH_SHORT).show()
-                    }
-                },
-                onLongClick = {
-                    clipboard.setText(AnnotatedString(row.copyValue))
-                    Toast.makeText(context, "${row.label} copied", Toast.LENGTH_SHORT).show()
-                },
-            )
+            .background(if (space) SpaceWhite.copy(alpha = .035f) else PanelAlt)
+            .then(if (space) Modifier.testTag("space-hub-detail-${row.label}").spaceReadableBlock(focusable = false, contentPadding = 0.dp) else Modifier)
+            .gameDetailInteractions(row)
             .padding(horizontal = if (compact) 10.dp else 12.dp, vertical = if (compact) 7.dp else 10.dp),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(if (compact) 10.dp else 12.dp),
@@ -5315,7 +5183,7 @@ private fun DetailRow(row: GameDetailRow, compact: Boolean) {
             color = TextPrimary,
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.weight(1f),
-            maxLines = if (compact) 1 else 2,
+            maxLines = if (space) Int.MAX_VALUE else if (compact) 1 else 2,
             overflow = TextOverflow.Ellipsis,
         )
         if (row.actionUrl != null) {
@@ -5421,8 +5289,8 @@ internal fun StoreLaunchSelector(
                                 .fillMaxHeight(if (landscape) 0.86f else 0.64f)
                         },
                     ),
-                colors = CardDefaults.cardColors(containerColor = Panel, contentColor = TextPrimary),
-                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(containerColor = if (LocalSpaceUiPresentation.current) SpaceInk else Panel, contentColor = TextPrimary),
+                shape = RoundedCornerShape(if (LocalSpaceUiPresentation.current) 8.dp else 22.dp),
             ) {
                 if (phoneLandscape) {
                     Row(
@@ -5583,6 +5451,11 @@ private fun StoreLaunchOptionsColumn(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            if (LocalSpaceUiPresentation.current) {
+                SpaceControl(stringResource(R.string.action_cancel), Modifier.weight(1f), minHeight = 52.dp, onClick = onDismiss)
+                SpaceControl(stringResource(R.string.action_continue), Modifier.weight(1f).focusRequester(continueFocusRequester),
+                    filled = true, enabled = selectedVariant != null, onClick = { selectedVariant?.let(onContinue) })
+            } else {
             OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) {
                 Text(stringResource(R.string.action_cancel))
             }
@@ -5598,6 +5471,7 @@ private fun StoreLaunchOptionsColumn(
             ) {
                 Text(stringResource(R.string.action_continue), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
+            }
         }
     }
 }
@@ -5610,6 +5484,19 @@ private fun StoreLaunchVariantRow(
     onClick: () -> Unit,
 ) {
     val badge = launcherBadgeForStoreKey(splitGameStoreKeys(variant.store).firstOrNull())
+    if (LocalSpaceUiPresentation.current) {
+        SpaceControl(gameStoreDisplayName(variant.store), Modifier.fillMaxWidth(), active = selected,
+            rectangular = true, minHeight = 64.dp, onClick = onClick) {
+            ConnectorStoreIcon(badge)
+            Column(Modifier.weight(1f).padding(start = 12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(gameStoreDisplayName(variant.store), color = SpaceWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val details = variantDetailsText(variant)
+                if (details.isNotBlank()) Text(details, color = SpaceMuted, style = MaterialTheme.typography.bodySmall)
+            }
+            if (selected) Text(stringResource(R.string.store_selector_selected), color = SpaceWhite, style = MaterialTheme.typography.labelMedium)
+        }
+        return
+    }
     var focused by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(14.dp)
     Box(Modifier.fillMaxWidth()) {

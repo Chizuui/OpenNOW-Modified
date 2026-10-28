@@ -12,7 +12,7 @@ import android.media.audiofx.NoiseSuppressor
 import androidx.core.content.ContextCompat
 
 /** Capture owns AudioRecord and effects on one worker. Never opens a recorder while muted. */
-internal class NvstMicrophoneCapture(
+internal class MicrophonePcmCapture(
     private val context: Context,
     private val deviceId: String,
     private val ready: () -> Boolean,
@@ -25,7 +25,7 @@ internal class NvstMicrophoneCapture(
             if (field != value) { generation.incrementAndGet(); field = value }
         }
     @Volatile private var closed = false
-    private val worker = Thread(::capture, "OpenNOW-NVST-microphone")
+    private val worker = Thread(::capture, "OpenNOW-microphone")
 
     fun start() = worker.start()
     fun stop() { closed = true; enabled = false }

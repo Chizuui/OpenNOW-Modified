@@ -240,10 +240,12 @@ fn run(
         bundle: Some(transport),
         video: None,
     };
-    receivers.video = Some(
-        spawn_nvst_mjolnir_receiver(video_socket, config, sender, events_sender)
-            .map_err(|e| e.to_string())?,
-    );
+    if config.mjolnir_udp_port().is_some() {
+        receivers.video = Some(
+            spawn_nvst_mjolnir_receiver(video_socket, config, sender, events_sender)
+                .map_err(|e| e.to_string())?,
+        );
+    }
     if state.stopped.load(Ordering::Acquire) {
         return Ok(());
     }

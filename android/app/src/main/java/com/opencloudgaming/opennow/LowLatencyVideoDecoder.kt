@@ -102,6 +102,16 @@ class LowLatencyVideoDecoder(
                         bufferProgress.outputReleased(render)
                         retainBufferProgress()
                     }
+
+                    override fun outputFormat(codecName: String, format: MediaFormat) {
+                        // Negotiated hdr=false does not establish the actual decoder transfer,
+                        // range or standard. Retain output metadata for intermittent washed-out
+                        // startup reports, even if the recent-event ring has since rolled over.
+                        NativeInputDiagnostics.addRetained(
+                            "codec-output-format",
+                            "MediaCodec texture output decoder=$codecName hdrRequested=false format=$format",
+                        )
+                    }
                 },
             )
             factoryField.set(delegate, tunedFactory)

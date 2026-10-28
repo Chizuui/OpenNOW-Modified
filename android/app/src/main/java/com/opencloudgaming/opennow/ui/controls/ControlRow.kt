@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,6 +32,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
+import com.opencloudgaming.opennow.LocalSpaceUiPresentation
+import com.opencloudgaming.opennow.rememberSpaceInteraction
 import com.opencloudgaming.opennow.focusMoveHaptics
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
@@ -71,6 +74,7 @@ data class ControlRowStyle(
     val horizontalPadding: Dp,
     val verticalPadding: Dp,
     val contentGap: Dp,
+    val labelColor: Color,
     val labelStyle: TextStyle,
     val labelWeight: FontWeight?,
     val supportingStyle: TextStyle,
@@ -96,6 +100,7 @@ data class ControlRowStyle(
                 horizontalPadding = OpenNowSpacing.md,
                 verticalPadding = OpenNowSpacing.sm,
                 contentGap = 3.dp,
+                labelColor = MaterialTheme.colorScheme.onSurface,
                 labelStyle = MaterialTheme.typography.bodyLarge,
                 labelWeight = null,
                 supportingStyle = MaterialTheme.typography.bodySmall,
@@ -123,6 +128,7 @@ data class ControlRowStyle(
             horizontalPadding = OpenNowSpacing.md,
             verticalPadding = 10.dp,
             contentGap = 2.dp,
+            labelColor = OpenNowPalette.TextPrimary,
             labelStyle = MaterialTheme.typography.titleSmall,
             labelWeight = FontWeight.SemiBold,
             supportingStyle = MaterialTheme.typography.labelSmall,
@@ -161,7 +167,9 @@ internal fun ControlRow(
 ) {
     val focusManager = LocalFocusManager.current
     var focused by remember { mutableStateOf(false) }
-    val hoverInteraction = remember { MutableInteractionSource() }
+    val space = LocalSpaceUiPresentation.current
+    val motion = if (space) rememberSpaceInteraction(focused, enabled = enabled) else null
+    val hoverInteraction = motion?.source ?: remember { MutableInteractionSource() }
     val hovered by hoverInteraction.collectIsHoveredAsState()
     val showFocus = style.showFocusRing && focused
     val bonanzaActive = LocalAbsoluteCinemaEverywhere.current
@@ -173,23 +181,25 @@ internal fun ControlRow(
         Row(
             Modifier
                 .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .then(motion?.modifier ?: Modifier)
                 .hoverable(hoverInteraction, enabled = enabled)
                 .onFocusChanged { focused = style.focusable && (it.isFocused || it.hasFocus) }
                 .focusMoveHaptics()
                 .border(
-                    width = if (showFocus) style.borderFocusWidth else style.borderRestWidth,
-                    color = Color.Transparent,
+                    width = if (space) 1.dp else if (showFocus) style.borderFocusWidth else style.borderRestWidth,
+                    color = if (space) MaterialTheme.colorScheme.primary.copy(alpha = motion!!.emphasis * .65f) else Color.Transparent,
                     shape = style.shape,
                 )
                 .clip(style.shape)
-                .background(if (showFocus) style.containerFocused else style.containerRest)
+                .background(if (space) androidx.compose.ui.graphics.lerp(style.containerRest, style.containerFocused, motion!!.emphasis) else if (showFocus) style.containerFocused else style.containerRest)
                 .then(
-                    if (onClick != null) Modifier.clickable(enabled = enabled, onClick = onClick)
+                    if (onClick != null) Modifier.clickable(interactionSource = hoverInteraction, indication = if (space) null else androidx.compose.foundation.LocalIndication.current, enabled = enabled, onClick = onClick)
                     else Modifier,
                 )
                 .onPreviewKeyEvent { event ->
                     when {
-                        style.focusable && enabled && onClick != null && isTvActivateKey(event) -> {
+                        !space && style.focusable && enabled && onClick != null && isTvActivateKey(event) -> {
                             onClick()
                             true
                         }
@@ -197,13 +207,13 @@ internal fun ControlRow(
                         else -> false
                     }
                 }
-                .focusable(enabled = style.focusable)
+                .then(if (!space || onClick == null) Modifier.focusable(enabled = style.focusable) else Modifier)
                 .padding(horizontal = style.horizontalPadding, vertical = style.verticalPadding),
             verticalAlignment = verticalAlignment,
             content = content,
         )
         InteractionFocusFrame(
-            visible = focused || (hovered && bonanzaActive),
+            visible = !space && (focused || (hovered && bonanzaActive)),
             cornerRadius = SETTINGS_ROW_RADIUS,
             cinemaEffectEnabled = bonanzaActive,
         )
@@ -216,15 +226,15 @@ internal fun ControlRow(
  * on the `Slider` itself.
  */
 @Composable
-internal fun Modifier.controlRowContainer(style: ControlRowStyle, showFocus: Boolean): Modifier = this
+internal fun Modifier.controlRowContainer(style: ControlRowStyle, showFocus: Boolean, emphasis: Float? = null): Modifier = this
     .border(
         // The sibling InteractionFocusFrame is the single visible focus owner.
-        width = if (showFocus) style.borderFocusWidth else style.borderRestWidth,
-        color = Color.Transparent,
+        width = if (emphasis != null) 1.dp else if (showFocus) style.borderFocusWidth else style.borderRestWidth,
+        color = if (emphasis != null) MaterialTheme.colorScheme.primary.copy(alpha = emphasis * .65f) else Color.Transparent,
         shape = style.shape,
     )
     .clip(style.shape)
-    .background(if (showFocus) style.containerFocused else style.containerRest)
+    .background(if (emphasis != null) androidx.compose.ui.graphics.lerp(style.containerRest, style.containerFocused, emphasis) else if (showFocus) style.containerFocused else style.containerRest)
     .padding(horizontal = style.horizontalPadding, vertical = style.verticalPadding)
 
 /**
@@ -242,7 +252,7 @@ internal fun RowScope.ControlRowLabels(
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(style.contentGap)) {
         Text(
             label,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
+            color = style.labelColor.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
             style = style.labelStyle,
             fontWeight = style.labelWeight,
             maxLines = 2,

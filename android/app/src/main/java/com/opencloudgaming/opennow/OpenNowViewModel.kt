@@ -479,6 +479,12 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     private val openNowApplication = application as OpenNowApplication
     private val http: OkHttpClient = openNowApplication.httpClient
     private val settingsStore = SettingsStore(application)
+    private val spaceUiEnablement = SpaceUiEnablement(
+        hasConfirmed = settingsStore::hasConfirmedSpaceUiEnable,
+        rememberConfirmation = settingsStore::confirmSpaceUiEnable,
+        setEnabled = { enabled -> settingsStore.update { it.copy(experimentalSpaceUi = enabled) } },
+    )
+    internal val spaceUiEnableConfirmationPending = spaceUiEnablement.confirmationPending
     private val sessionTimerAnchorStore = SessionTimerAnchorStore(application)
     private val authStore = openNowApplication.authStore
     private val authRepository = openNowApplication.authRepository
@@ -487,6 +493,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
     private val catalogCacheStore = CatalogCacheStore(application)
     private val queuedGameStore = QueuedGameStore(application)
+    private val gameInputModeStore = GameInputModeStore(application)
     private val continuePlayingDismissalStore = ContinuePlayingDismissalStore(application)
     private val subscriptionRepository = GfnSubscriptionRepository(http)
     private val accountConnectorRepository = GfnAccountConnectorRepository(http)
@@ -539,6 +546,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     private val settingsDiagnosticTapTracker = RapidTapTracker()
     private val loginIconTapTracker = RapidTapTracker()
     private val streamSessionRecoveryTracker = StreamSessionRecoveryTracker()
+    private val nvstAttachmentResumeGate = NvstAttachmentResumeGate()
 
     private val initialAuthSession = authStore.activeSession()
     private val androidTvProfile = isAndroidTvProfile(application)
@@ -584,7 +592,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     private var launchJob: Job? = null
     private var activeSubscriptionJob: Job? = null
     private var pendingActiveSessionLaunch: PendingActiveSessionLaunch? = null
-    private var launchInputModeChoice: CompletableDeferred<StreamInputMode>? = null
+    private var launchInputModeChoice: CompletableDeferred<LaunchInputModeChoice>? = null
     private var loginJob: Job? = null
     private var androidUpdateJob: Job? = null
     private var androidUpdateAutoJob: Job? = null
@@ -1157,7 +1165,12 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun commentOnBugReport(reportId: String, comment: String) {
+    internal fun commentOnBugReport(
+        reportId: String,
+        comment: String,
+        files: List<AndroidBugReportAttachment>,
+        includeLogs: Boolean,
+    ) {
         if (state.value.bugReportThreads.postingReportId != null || state.value.bugReportThreads.changingReportId != null) return
         if (state.value.bugReportThreads.reports.any { it.id == reportId && androidBugReportThreadClosed(it.status) }) {
             _state.update {
@@ -1170,7 +1183,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
-        if (comment.isBlank()) return
+        if (comment.isBlank() && files.isEmpty() && !includeLogs) return
         _state.update {
             it.copy(
                 bugReportThreads = it.bugReportThreads.copy(
@@ -1182,11 +1195,15 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
         viewModelScope.launch {
             try {
+                val replyFiles = if (includeLogs) {
+                    files + bugReportLogAttachment()
+                } else files
                 val updated = postAndroidBugReportComment(
                     http = http,
                     reporterId = androidBugReportReporterId(authStore.stableDeviceId()),
                     reportId = reportId,
                     comment = comment,
+                    files = replyFiles,
                 )
                 _state.update { current ->
                     val reports = current.bugReportThreads.reports
@@ -1307,15 +1324,13 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             try {
                 val languageCheck = identifyAndroidBugReportLanguage(title, description)
-                val logFileName = debugLogFileName()
+                val logAttachment = bugReportLogAttachment()
+                val logFileName = logAttachment.fileName
                 val metadata = buildAndroidBugReportMetadata(
                     logFileName = logFileName,
                     knownIssueOverrideKey = knownIssueOverrideKey,
                     device = AndroidDeviceDiagnostics.snapshot(getApplication()),
                 )
-                val logBytes = withContext(Dispatchers.Default) {
-                    sanitizedDebugLogText().toByteArray(Charsets.UTF_8)
-                }
                 val receipt = uploadAndroidBugReport(
                     http = http,
                     report = AndroidBugReport(
@@ -1327,13 +1342,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                         appLanguageSelectionTag = appLocale.bugReportLanguageTag.orEmpty(),
                         languageCheck = languageCheck,
                         metadata = metadata,
-                        files = listOf(
-                            AndroidBugReportAttachment(
-                                fileName = logFileName,
-                                contentType = "text/plain; charset=utf-8",
-                                bytes = logBytes,
-                            ),
-                        ) + additionalFiles.take(ANDROID_BUG_REPORT_MAX_FILES - 1),
+                        files = listOf(logAttachment) + additionalFiles.take(ANDROID_BUG_REPORT_MAX_FILES - 1),
                         details = details,
                     ),
                 )
@@ -2209,6 +2218,14 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun setSpaceUiEnabled(enabled: Boolean) {
+        spaceUiEnablement.request(enabled)
+    }
+
+    internal fun confirmSpaceUiEnable() = spaceUiEnablement.confirm()
+
+    internal fun cancelSpaceUiEnable() = spaceUiEnablement.cancel()
+
     fun updateSettings(next: AppSettings) {
         settingsStore.replace(next)
     }
@@ -2816,7 +2833,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             }
             awaitDeviceCapabilityProbe()
             val requestedSettings = streamSettingsOverride ?: streamSettingsBeforeDeviceAdjustment()
-            val settings = requestedSettings.adjustedForDevice(state.value.codecReport)
+            var settings = requestedSettings.adjustedForDevice(state.value.codecReport)
             prepareSessionReport(
                 gameTitle = game.title,
                 selectedSettings = state.value.settings.stream,
@@ -2953,6 +2970,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     }
                     return@runCatching null
                 }
+                settings = prepareNewSessionInput(launchGame, settings)
                 _state.update { it.copy(launchPhase = "Creating session") }
                 val created = sessionRepository.createSession(
                     token = token,
@@ -3170,6 +3188,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     fun stopStream(origin: StreamStopOrigin) {
         val beforeStop = state.value
         streamSessionRecoveryTracker.reset()
+        nvstAttachmentResumeGate.reset()
         val completedSessionReport = finishSessionReport()
         val shouldShowCompletedSessionReport = beforeStop.settings.showSessionReportAfterStream
         recordDebugEvent(
@@ -3323,9 +3342,11 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     sessionReport = null,
                 )
             }
+            var settings = pending.settings
             runCatching {
                 val token = launchAuthToken(auth)
-                val appLaunchMode = appLaunchModeFor(pending.game, pending.settings)
+                settings = prepareNewSessionInput(pending.game, settings)
+                val appLaunchMode = appLaunchModeFor(pending.game, settings)
                 runCatching { sessionRepository.stopActiveSession(token, pending.activeSession, pending.settings) }
                     .onSuccess {
                         sessionTimerAnchorStore.clear(pending.activeSession.sessionId)
@@ -3339,24 +3360,24 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     appId = pending.launchAppId,
                     internalTitle = pending.game.title,
                     zone = "prod",
-                    settings = pending.settings,
+                    settings = settings,
                     accountLinked = pending.accountLinked,
                     appLaunchMode = appLaunchMode,
                 )
                 recordDebugEvent("queue", "Created replacement session ${created.debugSummary()}")
-                pollUntilReady(token, created, pending.settings)
+                pollUntilReady(token, created, settings)
             }.onSuccess { readySession ->
-                markSessionReadyForNativeStream(readySession, pending.settings)
+                markSessionReadyForNativeStream(readySession, settings)
             }.onFailure { error ->
                 if (error is CancellationException) return@onFailure
                 recordDebugEvent("launch", "Replace active session launch failed game=${pending.game.title} error=${error.debugMessage()}")
                 val returnPage = state.value.streamReturnPage ?: pending.returnPage
                 val normalizedError = normalizeLaunchError(error, pending.game.title)
-                val recovery = if (shouldOfferLowerSettingsRetry(error, pending.settings)) {
+                val recovery = if (shouldOfferLowerSettingsRetry(error, settings)) {
                     PendingLaunchRecovery(
                         game = pending.game,
                         streamingBaseUrlOverride = pending.baseUrl,
-                        lowerSettings = pending.settings.loweredSessionLaunchProfile(),
+                        lowerSettings = settings.loweredSessionLaunchProfile(),
                         errorMessage = normalizedError,
                     )
                 } else {
@@ -3900,7 +3921,8 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun recoverStreamSession(reason: String) {
+    fun recoverStreamSession(request: StreamSessionRecoveryRequest) {
+        val reason = request.reason
         if (launchJob?.isActive == true) {
             recordDebugEvent("recovery", "Ignored stream recovery while launch job is active reason=${reason.take(DEBUG_EVENT_MESSAGE_LIMIT)}")
             return
@@ -3917,10 +3939,16 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         val currentSettings = initial.activeStreamSettings ?: effectiveStreamSettings()
+        val resumeNvstAttachment = request.mode == StreamSessionRecoveryMode.ResumeNvstAttachment
+        if (resumeNvstAttachment && !nvstAttachmentResumeGate.tryAcquire(initialSession.sessionId)) {
+            recordDebugEvent("recovery", "NVST attachment resume budget exhausted session=${initialSession.shortDebugId()}")
+            markStreamError("$reason. NVST resume was rejected again. Your cloud session is retained; retry when ready.")
+            return
+        }
         val recoveryAttempt = streamSessionRecoveryTracker.nextAttempt(initialSession.sessionId)
         recordDebugEvent(
             "recovery",
-            "Recovery requested attempt=$recoveryAttempt reason=${reason.take(DEBUG_EVENT_MESSAGE_LIMIT)} " +
+            "Recovery requested attempt=$recoveryAttempt mode=${request.mode} reason=${reason.take(DEBUG_EVENT_MESSAGE_LIMIT)} " +
                 "session=${initialSession.debugSummary()} settings=${currentSettings.debugSummary()}",
         )
         launchJob = viewModelScope.launch {
@@ -4014,7 +4042,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     previousSessionId = previousSession.sessionId,
                     launchAppId = resolvedAppId?.toIntOrNull(),
                     settings = currentSettings,
-                )
+                )?.takeIf { !resumeNvstAttachment || it.sessionId == previousSession.sessionId }
                 if (readyCandidate?.sessionId == previousSession.sessionId && !readyCandidate.matchesStreamSettings(currentSettings)) {
                     recordDebugEvent(
                         "recovery",
@@ -4046,7 +4074,10 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                     token = token,
                     active = fallbackCandidate,
                     settings = currentSettings,
-                    recoveryMode = true,
+                    // Rejected, missing, or timed-out attachments need one ordinary resume
+                    // claim, even if GET still says ready. The gate survives client recreation.
+                    // Other recovery keeps its existing refresh-only behavior for ready sessions.
+                    recoveryMode = !resumeNvstAttachment,
                 )
             }.onSuccess { readySession ->
                 val anchoredSession = readySession.withSessionTimerAnchor()
@@ -4320,6 +4351,14 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     )
 
     suspend fun sanitizedDebugLogText(): String = withContext(Dispatchers.IO) { debugLogText() }
+
+    private suspend fun bugReportLogAttachment(): AndroidBugReportAttachment = withContext(Dispatchers.IO) {
+        AndroidBugReportAttachment(
+            fileName = debugLogFileName(),
+            contentType = "text/plain; charset=utf-8",
+            bytes = sanitizedDebugLogText().toByteArray(Charsets.UTF_8),
+        )
+    }
 
     fun debugLogFileName(): String {
         val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
@@ -4995,8 +5034,8 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         return if (nativeTouch) GfnAppLaunchMode.TOUCH_FRIENDLY else GfnAppLaunchMode.GAMEPAD_FRIENDLY
     }
 
-    fun chooseLaunchInputMode(mode: StreamInputMode) {
-        launchInputModeChoice?.complete(mode)
+    fun chooseLaunchInputMode(mode: StreamInputMode, rememberForGame: Boolean = false) {
+        launchInputModeChoice?.complete(LaunchInputModeChoice(mode, rememberForGame))
     }
 
     fun cancelLaunchInputModeChoice() {
@@ -5021,28 +5060,52 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun resolveStreamInputModeAtLaunch(game: GameInfo?, settings: StreamSettings): StreamInputMode {
+    /** Resolve a new host's input before creating it; resuming an existing host cannot add touch. */
+    private suspend fun prepareNewSessionInput(game: GameInfo?, settings: StreamSettings): StreamSettings {
+        val mode = resolveStreamInputModeAtLaunch(game, settings, allowWebsiteClientOverride = true)
+        val resolvedSettings = settings.forStreamInputMode(mode)
+        if (mode == StreamInputMode.NativeTouch &&
+            (settings.browserClientMode || settingsStore.settings.value.stream.browserClientMode)
+        ) {
+            updateStreamSettings { it.forStreamInputMode(mode) }
+            recordDebugEvent("input", "Website client mode disabled by native touch launch choice")
+        }
+        _state.update { it.copy(activeStreamSettings = resolvedSettings) }
+        return resolvedSettings
+    }
+
+    private suspend fun resolveStreamInputModeAtLaunch(
+        game: GameInfo?,
+        settings: StreamSettings,
+        allowWebsiteClientOverride: Boolean = false,
+    ): StreamInputMode {
         _state.value.streamInputModeAtLaunch?.let { return it }
+        val providerSettings = settings.forProviderInput(_state.value.authSession?.provider?.code)
         val nativeTouchAvailable = !androidTvProfile && shouldUseNativeTouch(
             _state.value.settings.androidTouch.effectiveNativeTouchMode(),
             game,
-            settings.forProviderInput(_state.value.authSession?.provider?.code),
+            if (allowWebsiteClientOverride) providerSettings.forStreamInputMode(StreamInputMode.NativeTouch)
+            else providerSettings,
         )
         val connection = connectedPhysicalKeyboardMouse()
         val mode = chooseStreamInputModeAtStart(
             nativeTouchAvailable = nativeTouchAvailable,
             keyboardMouseConnected = connection.connected,
+            rememberedMode = gameInputModeStore.load(game?.id),
             promptForChoice = shouldPromptForLaunchInputMode(
                 nativeTouchAvailable = nativeTouchAvailable,
                 catalogTouchSupported = game?.let(::catalogClaimsTouchSupport) == true,
                 keyboardMouseConnected = connection.connected,
+                websiteClientMode = allowWebsiteClientOverride && providerSettings.browserClientMode,
             ),
         ) {
-            val choice = CompletableDeferred<StreamInputMode>()
+            val choice = CompletableDeferred<LaunchInputModeChoice>()
             launchInputModeChoice = choice
             _state.update { it.copy(awaitingLaunchInputModeChoice = true) }
             try {
-                choice.await()
+                val selected = choice.await()
+                if (selected.rememberForGame) gameInputModeStore.save(game?.id, selected.mode)
+                selected.mode
             } finally {
                 if (launchInputModeChoice === choice) {
                     launchInputModeChoice = null

@@ -21,7 +21,6 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
-import android.view.WindowInsetsController
 import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -56,6 +55,10 @@ class MainActivity : ComponentActivity() {
     private var lastHatXKeyCode: Int? = null
     private var lastHatYKeyCode: Int? = null
     private var streamSystemUiActive = false
+    private var spaceUiSystemBarsHidden = false
+    private var spaceUiAppearanceActive = false
+    private var defaultLightStatusBars = false
+    private var defaultLightNavigationBars = false
     private var streamDisplayRefreshActive = false
     private var streamDisplayRefreshFps = 60
     private var streamSystemUiEnforcerJob: Job? = null
@@ -63,6 +66,7 @@ class MainActivity : ComponentActivity() {
     private var externalMousePointerCaptureRequestPending = false
     private var defaultRequestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
     private var phoneStreamOrientationLocked = false
+    private var spaceUiOrientationLocked = false
     private var streamPanelExpanded = false
     private var streamPictureInPictureReady = false
     private var streamPictureInPictureAspectRatio = Rational(16, 9)
@@ -87,6 +91,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        WindowCompat.getInsetsController(window, window.decorView).let {
+            defaultLightStatusBars = it.isAppearanceLightStatusBars
+            defaultLightNavigationBars = it.isAppearanceLightNavigationBars
+        }
         defaultRequestedOrientation = requestedOrientation
         volumeControlStream = AudioManager.STREAM_MUSIC
         val openNowApplication = application as OpenNowApplication
@@ -130,6 +138,7 @@ class MainActivity : ComponentActivity() {
                         inStream = state.page == AppPage.Stream,
                     ),
                 )
+                spaceUiOrientationLocked = state.settings.experimentalSpaceUi
                 applyPhoneStreamOrientationLock(
                     shouldLockPhoneStreamLandscape(state, resources.configuration.smallestScreenWidthDp),
                 )
@@ -139,6 +148,7 @@ class MainActivity : ComponentActivity() {
                         state.streamSession?.isReadyForStream() == true,
                     settings = state.activeStreamSettings ?: state.settings.stream,
                 )
+                updateSpaceUiSystemBars(state)
                 applyStreamSystemUi(streamActive)
                 applyStreamDisplayRefreshRate(streamActive, state.activeStreamSettings?.fps ?: state.settings.stream.fps)
             }
@@ -181,6 +191,30 @@ class MainActivity : ComponentActivity() {
         viewModel.handleExternalLaunchIntent(intent)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (startupDataReady) updateSpaceUiSystemBars(viewModel.state.value, newConfig)
+    }
+
+    private fun updateSpaceUiSystemBars(state: OpenNowUiState, config: Configuration = resources.configuration) {
+        val enabled = state.settings.experimentalSpaceUi && state.authSession != null && !shouldShowSetupFlow(state.settings)
+        if (spaceUiAppearanceActive != enabled) {
+            spaceUiAppearanceActive = enabled
+            WindowCompat.getInsetsController(window, window.decorView).let {
+                it.isAppearanceLightStatusBars = if (enabled) false else defaultLightStatusBars
+                it.isAppearanceLightNavigationBars = if (enabled) false else defaultLightNavigationBars
+            }
+        }
+        val hidden = shouldHideSpaceUiSystemBars(
+            enabled = enabled,
+            landscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE,
+            page = state.page,
+        )
+        if (spaceUiSystemBarsHidden == hidden) return
+        spaceUiSystemBarsHidden = hidden
+        applyStreamSystemBars(streamSystemUiActive)
+    }
+
     override fun onResume() {
         super.onResume()
         mascotActivity.updateResumed(true)
@@ -194,9 +228,11 @@ class MainActivity : ComponentActivity() {
         if (streamSystemUiActive) {
             applyStreamSystemUi(true, force = true)
             applyStreamDisplayRefreshRate(streamDisplayRefreshActive, streamDisplayRefreshFps, force = true)
+        } else if (spaceUiSystemBarsHidden) {
+            applyStreamSystemBars(active = false)
         }
-        if (phoneStreamOrientationLocked) {
-            applyPhoneStreamOrientationLock(true, force = true)
+        if (phoneStreamOrientationLocked || spaceUiOrientationLocked) {
+            applyPhoneStreamOrientationLock(phoneStreamOrientationLocked)
         }
     }
 
@@ -432,6 +468,8 @@ class MainActivity : ComponentActivity() {
             applyStreamSystemUi(true, force = true)
             applyStreamDisplayRefreshRate(streamDisplayRefreshActive, streamDisplayRefreshFps, force = true)
             requestExternalMousePointerCaptureIfNeeded()
+        } else if (spaceUiSystemBarsHidden) {
+            applyStreamSystemBars(active = false)
         }
     }
 
@@ -504,30 +542,8 @@ class MainActivity : ComponentActivity() {
 
     /** Reapplies only immersive bars; pointer-icon traversal and window flags are state changes. */
     private fun applyStreamSystemBars(active: Boolean) {
-        val immersive = active && !streamPanelExpanded
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            window.insetsController?.let { controller ->
-                if (immersive) {
-                    controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                } else {
-                    controller.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                }
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = if (immersive) {
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            } else {
-                0
-            }
-        }
+        val immersive = if (active) !streamPanelExpanded else spaceUiSystemBarsHidden
+        applyOpenNowSystemBars(window, immersive)
     }
 
     private fun updateStreamPictureInPicture(ready: Boolean, settings: StreamSettings) {
@@ -587,25 +603,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun applyPhoneStreamOrientationLock(active: Boolean, force: Boolean = false) {
-        if (!force && phoneStreamOrientationLocked == active && !streamPanelExpanded) return
+    private fun applyPhoneStreamOrientationLock(active: Boolean) {
         phoneStreamOrientationLocked = active
-        val nextOrientation = if (streamPanelExpanded) {
-            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-        } else if (active) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            defaultRequestedOrientation
-        }
-        if (requestedOrientation != nextOrientation) {
-            requestedOrientation = nextOrientation
-        }
+        val nextOrientation = openNowRequestedOrientation(defaultRequestedOrientation, active,
+            streamPanelExpanded, spaceUiOrientationLocked)
+        if (requestedOrientation != nextOrientation) requestedOrientation = nextOrientation
     }
 
     internal fun setStreamPanelExpanded(expanded: Boolean) {
         if (streamPanelExpanded == expanded) return
         streamPanelExpanded = expanded
-        applyPhoneStreamOrientationLock(phoneStreamOrientationLocked, force = true)
+        applyPhoneStreamOrientationLock(phoneStreamOrientationLocked)
         applyStreamSystemBars(streamSystemUiActive)
     }
 

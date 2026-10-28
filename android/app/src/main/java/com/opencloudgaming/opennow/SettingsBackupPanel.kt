@@ -7,9 +7,9 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import com.opencloudgaming.opennow.SettingsButton as Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import com.opencloudgaming.opennow.SettingsOutlinedButton as OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -111,18 +111,18 @@ internal fun SettingsBackupPanel(viewModel: OpenNowViewModel) {
             color = SettingsTextMuted,
             style = MaterialTheme.typography.bodySmall,
         )
-        OutlinedButton(
+        SettingsActionButton(label = stringResource(R.string.settings_backup_create),
             onClick = {
                 exportSnapshot = viewModel.state.value.settings
                 saveLauncher.launch("OpenNOW-settings.json")
             },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
-        ) { Text(stringResource(R.string.settings_backup_create)) }
-        OutlinedButton(
+        )
+        SettingsActionButton(label = stringResource(R.string.settings_backup_restore),
             onClick = { openLauncher.launch(arrayOf("*/*")) },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
-        ) { Text(stringResource(R.string.settings_backup_restore)) }
+        )
     }
 }

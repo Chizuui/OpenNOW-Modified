@@ -5,6 +5,15 @@ enum class StreamInputMode {
     KeyboardMouse,
 }
 
+internal data class LaunchInputModeChoice(
+    val mode: StreamInputMode,
+    val rememberForGame: Boolean,
+)
+
+/** Native touch must use the native identity in both the request and stream routing. */
+internal fun StreamSettings.forStreamInputMode(mode: StreamInputMode): StreamSettings =
+    if (mode == StreamInputMode.NativeTouch && browserClientMode) copy(browserClientMode = false) else this
+
 /** A saved keyboard overlay preference must not override the host's selected touch mode. */
 internal fun keyboardOverlayEnabledForStream(
     savedEnabled: Boolean,
@@ -40,20 +49,26 @@ internal fun streamInputModeAtStart(
     StreamInputMode.KeyboardMouse
 }
 
-/** Touch-capable games need a host input choice even when no physical device is connected. */
+/** Ask before provisioning touch or overriding website mode, even without a physical device. */
 internal fun shouldPromptForLaunchInputMode(
     nativeTouchAvailable: Boolean,
     catalogTouchSupported: Boolean,
     keyboardMouseConnected: Boolean,
-): Boolean = nativeTouchAvailable && (catalogTouchSupported || keyboardMouseConnected)
+    websiteClientMode: Boolean = false,
+): Boolean = nativeTouchAvailable && (catalogTouchSupported || keyboardMouseConnected || websiteClientMode)
 
 /** Wait for a choice before CloudMatch provisions the session's input devices. */
 internal suspend fun chooseStreamInputModeAtStart(
     nativeTouchAvailable: Boolean,
     keyboardMouseConnected: Boolean,
     promptForChoice: Boolean,
+    rememberedMode: StreamInputMode? = null,
     choose: suspend () -> StreamInputMode,
-): StreamInputMode = if (promptForChoice) {
+): StreamInputMode = if (rememberedMode != null &&
+    (rememberedMode != StreamInputMode.NativeTouch || nativeTouchAvailable)
+) {
+    rememberedMode
+} else if (promptForChoice) {
     choose()
 } else {
     streamInputModeAtStart(nativeTouchAvailable, keyboardMouseConnected)

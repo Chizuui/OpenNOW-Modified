@@ -93,6 +93,9 @@ import kotlin.math.roundToInt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -265,6 +268,7 @@ internal fun StreamScreen(
     val streamSettings = launchStreamSettings.copy(
         videoOutput = state.settings.stream.videoOutput,
         mouseSensitivity = state.settings.stream.mouseSensitivity,
+        touchMouseSensitivity = state.settings.stream.touchMouseSensitivity,
         mouseAcceleration = state.settings.stream.mouseAcceleration,
         streamSharpeningEnabled = launchStreamSettings.streamSharpeningEnabled && state.settings.stream.streamSharpeningEnabled,
         streamSharpeningAmount = state.settings.stream.streamSharpeningAmount,
@@ -366,7 +370,7 @@ internal fun StreamScreen(
     }
     BackHandler(enabled = streamReady) {
         NativeInputDiagnostics.addRetained("stream.controls.back", "stream controls back origin=android-back-dispatcher")
-        handleStreamBack()
+        NativeStreamInputRouter.dispatchSystemBack()
     }
     val client = remember {
         NativeStreamClient(
@@ -382,7 +386,7 @@ internal fun StreamScreen(
                 viewModel.markStreamError(it)
             },
             onSessionRecoveryRequired = {
-                streamState = it
+                streamState = it.reason
                 viewModel.recoverStreamSession(it)
             },
             onFirstVideoFrameRendered = {
@@ -398,14 +402,33 @@ internal fun StreamScreen(
         )
     }
 
+    val screenshotAction = rememberStreamScreenshotAction(
+        client = client,
+        sessionId = session?.sessionId,
+        streamReady = streamReady,
+        gameTitle = game?.title,
+        folder = state.settings.recordingDirectoryUri,
+        onFolderSelected = { folder ->
+            viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = folder))
+        },
+    )
     val recordingPhase by client.recordingPhase.collectAsStateWithLifecycle()
+    val recordingLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(client, recordingLifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) client.stopPersonalRecordingInBackground()
+        }
+        recordingLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { recordingLifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val currentRecordingSessionId by rememberUpdatedState(session?.sessionId)
     val currentRecordingStreamReady by rememberUpdatedState(streamReady)
     var pendingRecordingSessionId by remember(session?.sessionId) { mutableStateOf<String?>(null) }
     var pendingRecordingFileName by remember(session?.sessionId) { mutableStateOf<String?>(null) }
+    var pendingRecordingSettings by remember(session?.sessionId) { mutableStateOf<StreamSettings?>(null) }
     var recordingOutputPending by remember(session?.sessionId) { mutableStateOf(false) }
     val recordingScope = rememberCoroutineScope()
-    fun startRecordingInFolder(folder: String, requestedSessionId: String, fileName: String) {
+    fun startRecordingInFolder(folder: String, requestedSessionId: String, fileName: String, options: StreamSettings) {
         if (recordingOutputPending) return
         recordingOutputPending = true
         recordingScope.launch {
@@ -413,10 +436,11 @@ internal fun StreamScreen(
             var started = false
             try {
                 val uri = withContext(Dispatchers.IO) {
-                    RecordingDestination.createFile(context, folder, fileName).also { createdUri = it }
+                    StreamCaptureDestination.createFile(context, folder, fileName).also { createdUri = it }
                 }
-                val sameActiveSession = requestedSessionId == currentRecordingSessionId && currentRecordingStreamReady
-                started = sameActiveSession && client.startStreamRecording(uri)
+                val sameActiveSession = requestedSessionId == currentRecordingSessionId && currentRecordingStreamReady &&
+                    recordingLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                started = sameActiveSession && client.startStreamRecording(uri, options)
                 if (sameActiveSession && !started && client.recordingError.value.isNullOrBlank()) {
                     Toast.makeText(context, R.string.stream_record_unavailable, Toast.LENGTH_LONG).show()
                 }
@@ -437,7 +461,10 @@ internal fun StreamScreen(
     LaunchedEffect(client) {
         client.recordingError.collect { error ->
             if (!error.isNullOrBlank()) {
-                Toast.makeText(context, context.getString(R.string.stream_record_failed), Toast.LENGTH_LONG).show()
+                val message = if (client.recordingPhase.value == StreamRecorderPhase.Interrupted) {
+                    R.string.stream_record_inputs_interrupted
+                } else R.string.stream_record_failed
+                Toast.makeText(context, context.getString(message), Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -446,23 +473,69 @@ internal fun StreamScreen(
     ) { uri ->
         val requestedSessionId = pendingRecordingSessionId
         val fileName = pendingRecordingFileName
+        val options = pendingRecordingSettings
         pendingRecordingSessionId = null
         pendingRecordingFileName = null
-        if (uri != null && requestedSessionId != null && fileName != null) {
-            if (RecordingDestination.rememberFolder(context, uri)) {
+        pendingRecordingSettings = null
+        if (uri != null && requestedSessionId != null && fileName != null && options != null) {
+            if (StreamCaptureDestination.rememberFolder(context, uri)) {
                 viewModel.updateSettings(state.settings.copy(recordingDirectoryUri = uri.toString()))
-                startRecordingInFolder(uri.toString(), requestedSessionId, fileName)
+                startRecordingInFolder(uri.toString(), requestedSessionId, fileName, options)
             } else {
                 Toast.makeText(context, R.string.stream_record_folder_permission_failed, Toast.LENGTH_LONG).show()
             }
         }
     }
 
+    fun continueRecordingStart() {
+        val requestedSessionId = pendingRecordingSessionId ?: return
+        val fileName = pendingRecordingFileName ?: return
+        val options = pendingRecordingSettings ?: return
+        if (requestedSessionId != currentRecordingSessionId || !currentRecordingStreamReady) {
+            pendingRecordingSessionId = null
+            pendingRecordingFileName = null
+            pendingRecordingSettings = null
+            return
+        }
+        val folder = state.settings.recordingDirectoryUri
+        if (folder == null) {
+            if (!StreamCaptureDestination.launchFolderPicker(context, recordingFolderLauncher)) {
+                pendingRecordingSessionId = null
+                pendingRecordingFileName = null
+                pendingRecordingSettings = null
+            }
+        } else {
+            pendingRecordingSessionId = null
+            pendingRecordingFileName = null
+            pendingRecordingSettings = null
+            startRecordingInFolder(folder, requestedSessionId, fileName, options)
+        }
+    }
+    val recordingPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        val options = pendingRecordingSettings
+        val allowed = options != null &&
+            (!options.recordingMicrophoneEnabled || ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) &&
+            (!options.recordingCameraEnabled || ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+        if (allowed) continueRecordingStart()
+        else {
+            pendingRecordingSessionId = null
+            pendingRecordingFileName = null
+            pendingRecordingSettings = null
+            Toast.makeText(context, R.string.stream_record_inputs_permission_denied, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    val latestStreamUiState by rememberUpdatedState(state)
     DisposableEffect(Unit) {
         val decor = activity?.window?.decorView
         NativeStreamInputRouter.attach(client)
         NativeStreamInputRouter.setAndroidTvProfile(tvProfile)
         onDispose {
+            NativeInputDiagnostics.addRetained("stream.screen.dispose",
+                "stream screen disposed page=${latestStreamUiState.page} status=${latestStreamUiState.streamStatus} " +
+                    "changingConfigurations=${activity?.isChangingConfigurations} finishing=${activity?.isFinishing}")
             if (Build.VERSION.SDK_INT >= 26) {
                 decor?.let(AndroidPointerCapture::release)
             }
@@ -472,6 +545,7 @@ internal fun StreamScreen(
             NativeStreamInputRouter.setSystemBackHandler(null)
             NativeStreamInputRouter.setAndroidTvProfile(false)
             NativeStreamInputRouter.setStreamMenuShortcut(DEFAULT_ANDROID_STREAM_MENU_SHORTCUT)
+            NativeStreamInputRouter.setBackAsEscape(false)
             NativeStreamInputRouter.setStreamUiActive(false)
             NativeStreamInputRouter.setTouchControllerVisible(false)
             client.setVirtualControllerVisible(false)
@@ -503,6 +577,10 @@ internal fun StreamScreen(
 
     LaunchedEffect(state.settings.streamMenuShortcut) {
         NativeStreamInputRouter.setStreamMenuShortcut(state.settings.streamMenuShortcut)
+    }
+
+    LaunchedEffect(streamReady, state.settings.androidBackAsEscape) {
+        NativeStreamInputRouter.setBackAsEscape(streamReady && state.settings.androidBackAsEscape)
     }
 
     // StreamScreen owns the effective controller/mouse modes even when TouchOverlay is absent.
@@ -1140,6 +1218,9 @@ internal fun StreamScreen(
                     statusBarDragging = statusBarDragging,
                     receivedBitrateKbps = streamStats.bitrateKbps,
                     recordingPhase = recordingPhase,
+                    screenshotEnabled = streamReady && !screenshotAction.busy && !recordingOutputPending && pendingRecordingSessionId == null,
+                    screenshotBusy = screenshotAction.busy,
+                    onScreenshot = screenshotAction.capture,
                     touchLayoutEditing = touchLayoutEditing,
                     bugReportSubmission = state.bugReportSubmission,
                     bugReportVersionCheck = state.bugReportVersionCheck,
@@ -1227,23 +1308,24 @@ internal fun StreamScreen(
                             StreamRecorderPhase.Recording -> client.stopStreamRecording()
                             StreamRecorderPhase.Starting, StreamRecorderPhase.Finalizing -> Unit
                             else -> {
-                                if (recordingOutputPending || pendingRecordingSessionId != null) {
+                                if (screenshotAction.busy || recordingOutputPending || pendingRecordingSessionId != null) {
                                     Unit
                                 } else if (client.canStartStreamRecording()) {
-                                    val safeTitle = game?.title
-                                        ?.replace(Regex("[^\\p{L}\\p{N}._-]+"), "_")
-                                        ?.take(48)
-                                        .orEmpty()
-                                        .ifBlank { "Game" }
                                     session?.sessionId?.let { activeSessionId ->
-                                        val fileName = "OpenNOW_${safeTitle}_${System.currentTimeMillis()}.mp4"
-                                        val folder = state.settings.recordingDirectoryUri
-                                        if (folder != null) {
-                                            startRecordingInFolder(folder, activeSessionId, fileName)
+                                        val fileName = streamCaptureFileName(game?.title, "mp4")
+                                        val options = state.settings.stream
+                                        if (options.recordingCameraEnabled && !context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
+                                            Toast.makeText(context, R.string.stream_record_camera_unavailable, Toast.LENGTH_LONG).show()
                                         } else {
                                             pendingRecordingSessionId = activeSessionId
                                             pendingRecordingFileName = fileName
-                                            recordingFolderLauncher.launch(null)
+                                            pendingRecordingSettings = options
+                                            val permissions = buildList {
+                                                if (options.recordingMicrophoneEnabled) add(Manifest.permission.RECORD_AUDIO)
+                                                if (options.recordingCameraEnabled) add(Manifest.permission.CAMERA)
+                                            }.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
+                                            if (permissions.isEmpty()) continueRecordingStart()
+                                            else recordingPermissionLauncher.launch(permissions.toTypedArray())
                                         }
                                     }
                                 } else {
@@ -1373,57 +1455,6 @@ internal fun StreamScreen(
                             ),
                         )
                     },
-                    onToggleTouchControllerStyle = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(
-                                    touchControllerStyle = nextTouchControllerStyle(
-                                        state.settings.androidTouch.touchControllerStyle,
-                                    ),
-                                ),
-                            ),
-                        )
-                    },
-                    onTouchButtonLabelsToggle = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(
-                                    touchButtonLabels = !state.settings.androidTouch.touchButtonLabels,
-                                ),
-                            ),
-                        )
-                    },
-                    onJoystickModeToggle = {
-                        val nextMode = if (state.settings.androidTouch.joystickMode == TouchJoystickMode.Fixed) {
-                            TouchJoystickMode.Dynamic
-                        } else {
-                            TouchJoystickMode.Fixed
-                        }
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(joystickMode = nextMode),
-                            ),
-                        )
-                    },
-                    onTouchAimModeToggle = {
-                        val nextMode = if (state.settings.androidTouch.aimMode == TouchAimMode.LockJoystick) {
-                            TouchAimMode.LockZone
-                        } else {
-                            TouchAimMode.LockJoystick
-                        }
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(aimMode = nextMode),
-                            ),
-                        )
-                    },
-                    onJoystickDeadZoneChange = { value ->
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.copy(joystickDeadZone = value),
-                            ),
-                        )
-                    },
                     onSharpeningToggle = {
                         viewModel.updateStreamSettings { settings ->
                             settings.copy(streamSharpeningEnabled = !settings.streamSharpeningEnabled)
@@ -1450,20 +1481,11 @@ internal fun StreamScreen(
                         // strand the allocated cloud session on a stale signaling endpoint.
                         client.updateBitrateLimit(value * 1000)
                     },
-                    onTouchScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(scale = value)))
-                    },
-                    onButtonScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(buttonScale = value)))
-                    },
-                    onStickScaleChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(stickScale = value)))
-                    },
-                    onOpacityChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(opacity = value)))
-                    },
                     onMouseSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseSensitivity = value) }
+                    },
+                    onTouchMouseSensitivityChange = { value ->
+                        viewModel.updateStreamSettings { s -> s.copy(touchMouseSensitivity = value) }
                     },
                     onMouseScrollSensitivityChange = { value ->
                         viewModel.updateStreamSettings { s -> s.copy(mouseScrollSensitivity = value) }
@@ -1472,25 +1494,6 @@ internal fun StreamScreen(
                         val physicalInput = state.settings.physicalInput.copy(stickDeadZone = value)
                         client.updatePhysicalInputSettings(physicalInput)
                         viewModel.updateSettings(state.settings.copy(physicalInput = physicalInput))
-                    },
-                    onTouchEdgePaddingChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(edgePaddingDp = value)))
-                    },
-                    onTouchBottomPaddingChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(bottomPaddingDp = value)))
-                    },
-                    onTouchLeftOffsetChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(leftOffsetYDp = value)))
-                    },
-                    onTouchRightOffsetChange = { value ->
-                        viewModel.updateSettings(state.settings.copy(androidTouch = state.settings.androidTouch.copy(rightOffsetYDp = value)))
-                    },
-                    onTouchLayoutReset = {
-                        viewModel.updateSettings(
-                            state.settings.copy(
-                                androidTouch = state.settings.androidTouch.withResetOffsets()
-                            )
-                        )
                     },
                     onTouchPresetsChange = { presets ->
                         viewModel.updateSettings(state.settings.copy(touchControlPresets = presets))
@@ -1805,6 +1808,7 @@ private fun StreamVideoSurface(
     }
     LaunchedEffect(
         settings.mouseSensitivity,
+        settings.touchMouseSensitivity,
         settings.mouseScrollSensitivity,
         settings.mouseAcceleration,
         settings.streamSharpeningEnabled,

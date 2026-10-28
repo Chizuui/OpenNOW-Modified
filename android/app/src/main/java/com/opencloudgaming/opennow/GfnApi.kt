@@ -3349,7 +3349,8 @@ class GfnSessionRepository(
             val s = raw.asObject() ?: return@mapNotNull null
             val status = s.int("status") ?: return@mapNotNull null
             if (status !in setOf(1, 2, 3)) return@mapNotNull null
-            val connIp = streamingServerIpFromSession(s)
+            val connections = resolveGfnSessionConnections(s)
+            val connIp = connections?.serverIp
             val controlIp = s.obj("sessionControlInfo")?.string("ip")
             val monitor = activeSessionMonitorSettings(s)
             ActiveSessionInfo(
@@ -3361,14 +3362,7 @@ class GfnSessionRepository(
                 seatSetupStep = s.obj("seatSetupInfo")?.int("seatSetupStep"),
                 streamingBaseUrl = base,
                 serverIp = connIp ?: controlIp,
-                signalingUrl = s.arr("connectionInfo")
-                    ?.mapNotNull { it.asObject() }
-                    ?.firstOrNull { it.int("usage") == 14 }
-                    ?.let { connection ->
-                        val serverIp = connIp ?: controlIp
-                        serverIp?.let { buildSignalingUrl(connection.string("resourcePath") ?: "/nvst/", it).first }
-                    }
-                    ?: (connIp ?: controlIp)?.let { "wss://$it:443/nvst/" },
+                signalingUrl = connections?.signalingUrl,
                 resolution = monitor?.let { "${it.int("widthInPixels") ?: 0}x${it.int("heightInPixels") ?: 0}" },
                 fps = monitor?.int("framesPerSecond"),
                 settingsSignature = activeSessionSettingsSignature(s),
@@ -3685,6 +3679,7 @@ class GfnSessionRepository(
             gpuType = session.string("gpuType"),
             iceServers = normalizeIceServers(payload),
             mediaConnectionInfo = signaling?.mediaConnectionInfo,
+            bundleConnectionInfo = signaling?.bundleConnectionInfo,
             rtspsEndpoints = nvstRtspEndpoints(session.arr("connectionInfo")),
             negotiatedStreamProfile = extractNegotiatedStreamProfile(session),
             monitorSnapshot = extractSessionMonitorSnapshot(session),
@@ -3828,74 +3823,15 @@ class GfnSessionRepository(
         }
     }
 
-    private data class SignalingResolution(
-        val serverIp: String,
-        val signalingServer: String,
-        val signalingUrl: String,
-        val mediaConnectionInfo: MediaConnectionInfo?,
-    )
-
-    private fun resolveSignaling(payload: JsonObject): SignalingResolution {
-        val session = payload.obj("session") ?: error("Missing session")
-        val connections = session.arr("connectionInfo")?.mapNotNull { it.asObject() }.orEmpty()
-        val serverIp = streamingServerIp(payload) ?: error("CloudMatch response did not include a signaling host")
-        val signalingConnection = connections.firstOrNull { it.int("usage") == 14 && it.string("ip") != null } ?: connections.firstOrNull { it.string("ip") != null }
-        val resourcePath = signalingConnection?.string("resourcePath") ?: "/nvst/"
-        val (url, host) = buildSignalingUrl(resourcePath, serverIp)
-        val effectiveHost = host ?: serverIp
-        return SignalingResolution(
-            serverIp = serverIp,
-            signalingServer = if (effectiveHost.contains(":")) effectiveHost else "$effectiveHost:443",
-            signalingUrl = url,
-            mediaConnectionInfo = resolveMediaConnectionInfo(connections, serverIp),
-        )
-    }
-
-    private fun resolveMediaConnectionInfo(connections: List<JsonObject>, serverIp: String): MediaConnectionInfo? {
-        fun extractIp(conn: JsonObject): String? = conn.string("ip")?.let(::usableSessionHost) ?: conn.string("resourcePath")?.let(::extractHostFromUrl)
-        fun extractPort(conn: JsonObject): Int = conn.int("port") ?: conn.string("resourcePath")?.let { Uri.parse(it.replace("rtsps://", "https://").replace("rtsp://", "http://")).port } ?: 0
-        listOf(2, 17).forEach { usage ->
-            connections.firstOrNull { it.int("usage") == usage }?.let {
-                val ip = extractIp(it)
-                val port = extractPort(it)
-                if (ip != null && port > 0) return MediaConnectionInfo(ip, port)
-            }
-        }
-        webRtcMediaFallbackConnections(connections).forEach {
-            val port = extractPort(it)
-            if (port > 0) return MediaConnectionInfo(extractIp(it) ?: serverIp, port)
-        }
-        return null
-    }
-
-    private fun streamingServerIp(payload: JsonObject): String? {
-        val session = payload.obj("session") ?: return null
-        return streamingServerIpFromSession(session)
-    }
-
-    private fun streamingServerIpFromSession(session: JsonObject): String? {
-        val conn = session.arr("connectionInfo")?.mapNotNull { it.asObject() }?.firstOrNull { it.int("usage") == 14 }
-        conn?.string("ip")?.let(::usableSessionHost)?.let { return it }
-        conn?.string("resourcePath")?.let(::extractHostFromUrl)?.let { return it }
-        return session.obj("sessionControlInfo")?.string("ip")?.let(::usableSessionHost)
-    }
-
-    private fun buildSignalingUrl(raw: String, serverIp: String): Pair<String, String?> =
-        when {
-            raw.startsWith("rtsps://") || raw.startsWith("rtsp://") -> {
-                val host = raw.substringAfter("://").substringBefore(":").substringBefore("/")
-                usableSessionHost(host)?.let { "wss://$it/nvst/" to it } ?: ("wss://$serverIp:443/nvst/" to null)
-            }
-            raw.startsWith("wss://") -> extractHostFromUrl(raw)?.let { raw to it } ?: ("wss://$serverIp:443/nvst/" to null)
-            raw.startsWith("/") -> "wss://$serverIp:443$raw" to null
-            else -> "wss://$serverIp:443/nvst/" to null
+    private fun streamingServerIp(payload: JsonObject): String? =
+        payload.obj("session")?.let { session ->
+            resolveGfnSessionConnections(session)?.serverIp
+                ?: session.obj("sessionControlInfo")?.string("ip")?.let(::usableSessionHost)
         }
 
-    private fun extractHostFromUrl(raw: String): String? {
-        val after = listOf("rtsps://", "rtsp://", "wss://", "https://").firstOrNull { raw.startsWith(it) }?.let { raw.removePrefix(it) } ?: return null
-        val host = after.substringBefore(":").substringBefore("/")
-        return usableSessionHost(host)
-    }
+    private fun resolveSignaling(payload: JsonObject): GfnSessionConnections =
+        resolveGfnSessionConnections(payload.obj("session") ?: error("Missing session"))
+            ?: error("CloudMatch response did not include a signaling host")
 
     private fun isZoneHostname(value: String): Boolean =
         value.contains("cloudmatchbeta.nvidiagrid.net") || value.contains("cloudmatch.nvidiagrid.net")

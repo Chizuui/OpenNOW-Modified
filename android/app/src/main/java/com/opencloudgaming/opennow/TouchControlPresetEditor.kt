@@ -1,5 +1,6 @@
 package com.opencloudgaming.opennow
 
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -33,9 +34,7 @@ internal fun TouchControlPresetEditor(
     val applied = stringResource(R.string.touch_preset_applied)
     val saved = stringResource(R.string.touch_preset_saved)
     val deleted = stringResource(R.string.touch_preset_deleted)
-    OutlinedButton(onClick = { open = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(stringResource(R.string.touch_presets_themes))
-    }
+    ControlNavigationRow(stringResource(R.string.touch_presets_themes), onClick = { open = true })
     if (!open) return
     AlertDialog(
         onDismissRequest = { open = false },

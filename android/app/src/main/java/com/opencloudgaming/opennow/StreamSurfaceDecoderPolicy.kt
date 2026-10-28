@@ -48,8 +48,12 @@ internal fun sdrSurfaceDecoderConfiguration(
     }
 }
 
-internal fun hdrSurfaceDecoder(fps: Int, surface: () -> DecoderSurfaceTarget?): MediaCodecSurfaceVideoDecoder =
-    MediaCodecSurfaceVideoDecoder(fps, surface, hdr = true) { width, height, rate ->
+internal fun hdrSurfaceDecoder(
+    fps: Int,
+    surface: () -> DecoderSurfaceTarget?,
+    presentationMode: SurfacePresentationMode = SurfacePresentationMode.MediaCadence,
+): MediaCodecSurfaceVideoDecoder =
+    MediaCodecSurfaceVideoDecoder(fps, surface, hdr = true, presentationMode = presentationMode) { width, height, rate ->
         StreamHdr.decoderName(width, height, rate)?.let { name ->
             SurfaceDecoderConfiguration(name, StreamHdr.format(width, height, rate))
         }

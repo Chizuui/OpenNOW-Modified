@@ -1,5 +1,7 @@
 package com.opencloudgaming.opennow
 
+import okio.Buffer
+import okhttp3.MultipartBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -63,4 +65,67 @@ class BugReportThreadsTest {
         assertEquals("INVALID_RESPONSE", (error as AndroidBugReportUploadException).serverCode)
         assertTrue(parseAndroidBugReportThreads("{\"data\":{\"reports\":[{}]}}").isEmpty())
     }
+    @Test
+    fun uploadsReplyFilesAndLogsAsMultipartWithReporterAndTerms() {
+        val reporter = androidBugReportReporterId("thread-upload-test")
+        val request = buildAndroidBugReportCommentRequest(
+            reporterId = reporter,
+            reportId = "report/with space",
+            comment = "  New reproduction  ",
+            files = listOf(
+                AndroidBugReportAttachment("new.log", "text/plain", "sanitized log".toByteArray()),
+                AndroidBugReportAttachment("capture.png", "image/png", byteArrayOf(1, 2, 3)),
+            ),
+            endpoint = "https://example.com/reports",
+        )
+        assertEquals("https://example.com/reports/report%2Fwith%20space/comments", request.url.toString())
+        assertEquals(reporter, request.header("X-Bug-Report-Reporter-Id"))
+        val body = request.body as MultipartBody
+        assertEquals(6, body.parts.size)
+        val output = Buffer()
+        body.writeTo(output)
+        val multipart = output.readUtf8()
+        assertTrue(multipart.contains("name=\"comment\"\r\n\r\nNew reproduction"))
+        assertTrue(multipart.contains("name=\"termsAccepted\"\r\n\r\ntrue"))
+        assertTrue(multipart.contains("name=\"reporterId\"\r\n\r\n$reporter"))
+        assertTrue(multipart.contains("name=\"files\"; filename=\"new.log\""))
+        assertTrue(multipart.contains("sanitized log"))
+        assertTrue(multipart.contains("name=\"files\"; filename=\"capture.png\""))
+    }
+
+    @Test
+    fun acceptsAttachmentOnlyRepliesAndKeepsTextOnlyRepliesCompatible() {
+        val reporter = androidBugReportReporterId("thread-upload-test")
+        val file = AndroidBugReportAttachment("new.log", "text/plain", byteArrayOf(1))
+        assertTrue(buildAndroidBugReportCommentRequest(reporter, "report", "", listOf(file)).body is MultipartBody)
+        val textRequest = buildAndroidBugReportCommentRequest(reporter, "report", "More detail")
+        assertEquals("application/json; charset=utf-8", textRequest.body?.contentType().toString())
+        val output = Buffer()
+        textRequest.body!!.writeTo(output)
+        assertTrue(output.readUtf8().contains("\"comment\":\"More detail\""))
+        assertTrue(runCatching { buildAndroidBugReportCommentRequest(reporter, "report", "  ") }.exceptionOrNull() is IllegalArgumentException)
+    }
+
+    @Test
+    fun rejectsTooManyOrOversizedReplyAttachmentsBeforeSending() {
+        val reporter = androidBugReportReporterId("thread-upload-test")
+        val file = AndroidBugReportAttachment("new.log", "text/plain", byteArrayOf(1))
+        assertTrue(runCatching {
+            buildAndroidBugReportCommentRequest(reporter, "report", "Files", List(6) { file })
+        }.exceptionOrNull() is IllegalArgumentException)
+        assertTrue(runCatching {
+            buildAndroidBugReportCommentRequest(reporter, "report", "Files", listOf(file.copy(bytes = ByteArray(10 * 1024 * 1024 + 1))))
+        }.exceptionOrNull() is IllegalArgumentException)
+    }
+
+    @Test
+    fun parsesReplyAttachmentsUnderTheirMessageWithoutDuplicatingOriginalFiles() {
+        val report = parseAndroidBugReportThreadResponse(
+            """{"data":{"id":"report","files":[{"name":"original.log"},{"name":"new.log","commentId":"reply"}],
+                "comments":[{"id":"reply","authorRole":"reporter","body":"","files":[{"name":"new.log"}]}]}}""",
+        )!!
+        assertEquals(listOf("original.log"), report.files)
+        assertEquals(listOf("new.log"), report.comments.single().files)
+    }
+
 }

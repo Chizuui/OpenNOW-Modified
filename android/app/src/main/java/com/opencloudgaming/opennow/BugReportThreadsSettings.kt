@@ -1,7 +1,10 @@
 package com.opencloudgaming.opennow
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,6 +29,8 @@ import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Forum
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -43,12 +48,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -59,6 +67,10 @@ import com.opencloudgaming.opennow.ui.theme.OpenNowRadius
 import com.opencloudgaming.opennow.ui.theme.OpenNowSpacing
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -75,7 +87,7 @@ internal fun BugReportThreadsSettings(
     state: AndroidBugReportThreadsState,
     onRefresh: () -> Unit,
     onNewReport: () -> Unit,
-    onComment: (reportId: String, comment: String) -> Unit,
+    onComment: (reportId: String, comment: String, files: List<AndroidBugReportAttachment>, includeLogs: Boolean) -> Unit,
     onClose: (reportId: String) -> Unit,
     onDelete: (reportId: String) -> Unit,
 ) {
@@ -100,7 +112,7 @@ internal fun BugReportThreadsSettings(
             commentError = state.error.takeIf { state.errorReportId == selectedReport.id },
             actionError = state.actionError.takeIf { state.actionErrorReportId == selectedReport.id },
             onBack = { selectedReportId = null },
-            onComment = { comment -> onComment(selectedReport.id, comment) },
+            onComment = { comment, files, includeLogs -> onComment(selectedReport.id, comment, files, includeLogs) },
             onClose = { onClose(selectedReport.id) },
             onDelete = { onDelete(selectedReport.id) },
         )
@@ -321,11 +333,13 @@ private fun BugReportThreadDetail(
     commentError: String?,
     actionError: String?,
     onBack: () -> Unit,
-    onComment: (String) -> Unit,
+    onComment: (String, List<AndroidBugReportAttachment>, Boolean) -> Unit,
     onClose: () -> Unit,
     onDelete: () -> Unit,
 ) {
     var reply by rememberSaveable(report.id) { mutableStateOf("") }
+    var attachments by remember(report.id) { mutableStateOf<List<AndroidBugReportAttachment>>(emptyList()) }
+    var includeLogs by rememberSaveable(report.id) { mutableStateOf(false) }
     var waitingForReplyResult by rememberSaveable(report.id) { mutableStateOf(false) }
     var confirmingAction by rememberSaveable(report.id) { mutableStateOf<String?>(null) }
     val status = bugReportStatusPresentation(report.status)
@@ -335,6 +349,8 @@ private fun BugReportThreadDetail(
         if (waitingForReplyResult && !posting) {
             if (commentError == null) {
                 reply = ""
+                attachments = emptyList()
+                includeLogs = false
             }
             waitingForReplyResult = false
         }
@@ -478,6 +494,7 @@ private fun BugReportThreadDetail(
                             else -> stringResource(R.string.bug_report_inbox_release_team)
                         },
                         body = comment.body,
+                        files = comment.files,
                         own = comment.authorRole == "reporter",
                         createdAt = comment.createdAt,
                     )
@@ -492,10 +509,14 @@ private fun BugReportThreadDetail(
                 reply = reply,
                 posting = posting || changing,
                 error = commentError,
+                attachments = attachments,
+                includeLogs = includeLogs,
+                onAttachmentsChange = { attachments = it },
+                onIncludeLogsChange = { includeLogs = it },
                 onReplyChange = { if (it.length <= 3_000) reply = it },
                 onSend = {
                     waitingForReplyResult = true
-                    onComment(reply)
+                    onComment(reply, attachments, includeLogs)
                 },
             )
         }
@@ -566,8 +587,42 @@ private fun ReplyComposer(
     posting: Boolean,
     error: String?,
     onReplyChange: (String) -> Unit,
+    attachments: List<AndroidBugReportAttachment>,
+    includeLogs: Boolean,
+    onAttachmentsChange: (List<AndroidBugReportAttachment>) -> Unit,
+    onIncludeLogsChange: (Boolean) -> Unit,
     onSend: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var readingFiles by remember { mutableStateOf(false) }
+    var attachmentError by remember { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) scope.launch {
+            readingFiles = true
+            attachmentError = null
+            try {
+                val selected = withContext(Dispatchers.IO) {
+                    require(attachments.size + uris.size <= 4) { "Attach up to 4 files at a time" }
+                    var totalBytes = attachments.sumOf { it.bytes.size.toLong() }
+                    uris.map { uri ->
+                        readBugReportAttachment(context.contentResolver, uri).also {
+                            totalBytes += it.bytes.size
+                            require(totalBytes <= 20L * 1024 * 1024) { "Attached files must be 20 MiB or less in total" }
+                        }
+                    }
+                }
+                onAttachmentsChange(attachments + selected)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                attachmentError = error.message ?: "Could not attach those files"
+            } finally {
+                readingFiles = false
+            }
+        }
+    }
+    val busy = posting || readingFiles
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(OpenNowRadius.md),
@@ -591,16 +646,55 @@ private fun ReplyComposer(
                 supportingText = { Text("${reply.length} / 3000") },
                 minLines = 3,
                 maxLines = 7,
-                enabled = !posting,
+                enabled = !busy,
                 isError = error != null,
             )
+            Text(
+                stringResource(R.string.bug_report_reply_attachment_note),
+                color = SettingsTextMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            OutlinedButton(
+                onClick = { picker.launch(arrayOf("*/*")) },
+                enabled = !busy && attachments.size < 4,
+            ) {
+                Icon(Icons.Rounded.Attachment, contentDescription = null, modifier = Modifier.size(18.dp))
+                Text(stringResource(R.string.bug_report_reply_add_files), Modifier.padding(start = OpenNowSpacing.sm))
+            }
+            if (readingFiles) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(OpenNowSpacing.sm)) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Text(stringResource(R.string.bug_report_reply_reading_files), style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            attachments.forEachIndexed { index, attachment ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(attachment.fileName, Modifier.weight(1f), color = SettingsText, style = MaterialTheme.typography.bodySmall)
+                    TextButton(
+                        enabled = !busy,
+                        onClick = {
+                            onAttachmentsChange(attachments.filterIndexed { fileIndex, _ -> fileIndex != index })
+                            attachmentError = null
+                        },
+                    ) { Text(stringResource(R.string.action_remove)) }
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().defaultMinSize(minHeight = 48.dp)
+                    .toggleable(value = includeLogs, enabled = !busy, role = Role.Checkbox, onValueChange = onIncludeLogsChange),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(checked = includeLogs, onCheckedChange = null, enabled = !busy)
+                Text(stringResource(R.string.bug_report_reply_include_logs), color = SettingsText, style = MaterialTheme.typography.bodyMedium)
+            }
+            attachmentError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             error?.let { message ->
                 Text(message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
             Button(
                 onClick = onSend,
                 modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 48.dp),
-                enabled = !posting && reply.isNotBlank(),
+                enabled = !busy && (reply.isNotBlank() || attachments.isNotEmpty() || includeLogs),
             ) {
                 if (posting) {
                     CircularProgressIndicator(
@@ -658,6 +752,7 @@ private fun ThreadMessage(
     body: String,
     own: Boolean,
     createdAt: Long? = null,
+    files: List<String> = emptyList(),
 ) {
     val timestamp = remember(createdAt) { createdAt?.let(::formatBugReportTimestamp) }
     Box(
@@ -695,7 +790,8 @@ private fun ThreadMessage(
                         Text(it, color = SettingsTextMuted, style = MaterialTheme.typography.labelSmall)
                     }
                 }
-                Text(body, color = SettingsText, style = MaterialTheme.typography.bodyMedium)
+                if (body.isNotBlank()) Text(body, color = SettingsText, style = MaterialTheme.typography.bodyMedium)
+                files.forEach { AttachmentChip(it) }
             }
         }
     }

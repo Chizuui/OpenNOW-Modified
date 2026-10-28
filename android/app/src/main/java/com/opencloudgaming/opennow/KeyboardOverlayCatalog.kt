@@ -228,7 +228,7 @@ internal fun AndroidTouchSettings.withKeyboardButtonAdded(button: KeyboardOverla
     if (normalizeKeyboardOverlayButtons(listOf(button)).isEmpty() || keyboardButtons.any { it.id == button.id }) return this
     val normalizedButtons = normalizeKeyboardOverlayButtons(keyboardButtons)
     if (normalizedButtons.size >= MAX_KEYBOARD_OVERLAY_BUTTONS) return this
-    val nextSlot = (normalizedButtons.maxOfOrNull(KeyboardOverlayButton::layoutIndex) ?: 6) + 1
+    val nextSlot = maxOf(6, normalizedButtons.maxOfOrNull(KeyboardOverlayButton::layoutIndex) ?: 6) + 1
     return copy(keyboardButtons = normalizedButtons + button.copy(layoutIndex = nextSlot))
 }
 
@@ -262,4 +262,32 @@ internal fun keyboardButtonDefaultOffset(index: Int, spacingDp: Float, migratedG
     val y = -row * spacingDp
     val migration = if (index < 7) migratedGroupOffset else TouchOffset()
     return TouchOffset(x + migration.x, y + migration.y)
+}
+
+/** Keep saved positions reachable; unpositioned custom keys start at the viewport center. */
+internal fun keyboardButtonViewportOffset(
+    index: Int,
+    spacingDp: Float,
+    buttonSizeDp: Float,
+    viewportWidthDp: Float,
+    viewportHeightDp: Float,
+    migratedGroupOffset: TouchOffset = TouchOffset(),
+    storedOffset: TouchOffset? = null,
+): TouchOffset {
+    if (index < 0 || !spacingDp.isFinite() || spacingDp <= 0f ||
+        !buttonSizeDp.isFinite() || buttonSizeDp <= 0f ||
+        !viewportWidthDp.isFinite() || !viewportHeightDp.isFinite()
+    ) return TouchOffset()
+    val availableX = (viewportWidthDp - buttonSizeDp).coerceAtLeast(0f)
+    val availableY = (viewportHeightDp - buttonSizeDp).coerceAtLeast(0f)
+    val offset = storedOffset ?: if (index < 7) {
+        keyboardButtonDefaultOffset(index, spacingDp, migratedGroupOffset)
+    } else {
+        // Deliberately allow overlap so adding more keys never pushes them off screen.
+        TouchOffset(-availableX / 2f, -availableY / 2f)
+    }
+    return TouchOffset(
+        offset.x.coerceIn(-availableX, 0f),
+        offset.y.coerceIn(-availableY, 0f),
+    )
 }

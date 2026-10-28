@@ -1249,7 +1249,7 @@ internal class TouchMouseState {
             dx = dx,
             dy = dy,
             eventTimeMs = eventTimeMs,
-            sensitivity = client.settings.mouseSensitivity,
+            sensitivity = client.settings.effectiveTouchMouseSensitivity(),
             acceleration = client.settings.mouseAcceleration,
             force = force,
         ) ?: return

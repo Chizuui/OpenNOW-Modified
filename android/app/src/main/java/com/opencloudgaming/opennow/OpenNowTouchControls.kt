@@ -1,6 +1,5 @@
 package com.opencloudgaming.opennow
 
-import android.content.res.Configuration
 import android.view.KeyEvent
 import androidx.compose.foundation.Canvas
 import androidx.compose.animation.core.animateOffsetAsState
@@ -31,7 +30,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Slider
 import androidx.compose.material3.MaterialTheme
@@ -42,7 +40,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.AlertDialog
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
@@ -74,12 +71,10 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.window.DialogProperties
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -205,6 +200,8 @@ internal fun TouchOverlay(
                             joystickMode = touch.joystickMode,
                             joystickDeadZone = touch.joystickDeadZone,
                             landscape = landscape,
+                            viewportWidth = maxWidth,
+                            viewportHeight = maxHeight,
                             layoutEditing = layoutEditing,
                             buttons = touch.keyboardButtons,
                             stickVisible = touch.isControlVisible(TouchControlGroup.LeftStick),
@@ -311,6 +308,8 @@ private fun BoxScope.KeyboardTouchControls(
     joystickMode: TouchJoystickMode,
     joystickDeadZone: Float,
     landscape: Boolean,
+    viewportWidth: Dp,
+    viewportHeight: Dp,
     layoutEditing: Boolean,
     buttons: List<KeyboardOverlayButton>,
     stickVisible: Boolean,
@@ -354,9 +353,14 @@ private fun BoxScope.KeyboardTouchControls(
         if (option != null) key(button.id) {
             val positionKey = button.positionKey()
             val layoutIndex = button.layoutIndex.takeIf { it >= 0 } ?: index
-            val offset = getStoredOffset(positionKey) ?: keyboardButtonDefaultOffset(
+            val footprint = buttonSize * (LocalTouchButtonAppearances.current[button.appearanceKey()]?.effectiveSizeScale() ?: 1f)
+            val offset = keyboardButtonViewportOffset(
                 index = layoutIndex,
-                spacingDp = buttonSize.value + gap.value,
+                storedOffset = getStoredOffset(positionKey),
+                spacingDp = maxOf(buttonSize, footprint).value + gap.value,
+                buttonSizeDp = footprint.value,
+                viewportWidthDp = viewportWidth.value,
+                viewportHeightDp = viewportHeight.value,
                 migratedGroupOffset = if (layoutIndex < 7) getLocalOffset("keyboard_buttons") else TouchOffset(),
             )
             TouchControlGroup(
@@ -412,21 +416,20 @@ internal fun TouchStickSizeDialog(
     onDismiss: () -> Unit,
 ) {
     var draft by rememberSaveable { mutableStateOf(scale) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.settings_touch_left_stick_size)) },
-        text = {
-            Column {
-                Text("${(draft * 100).roundToInt()}%")
-                Slider(value = draft, onValueChange = { draft = it }, valueRange = 0.6f..1.5f)
-                TextButton(onClick = onRemove) { Text(stringResource(R.string.keyboard_overlay_remove_button)) }
-            }
-        },
-        confirmButton = {
+    TouchEditorDialog(
+        title = stringResource(R.string.settings_touch_left_stick_size),
+        onDismiss = onDismiss,
+        actions = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_cancel)) }
             TextButton(onClick = { onSave(draft); onDismiss() }) { Text(stringResource(R.string.touch_editor_save)) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_cancel)) } },
-    )
+    ) {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
+            Text("${(draft * 100).roundToInt()}%")
+            Slider(value = draft, onValueChange = { draft = it }, valueRange = 0.6f..1.5f)
+            TextButton(onClick = onRemove) { Text(stringResource(R.string.keyboard_overlay_remove_button)) }
+        }
+    }
 }
 
 @Composable
@@ -472,12 +475,10 @@ private fun KeyboardCatalogButton(
 }
 
 @Composable
-private fun KeyboardButtonPickerDialog(
+internal fun KeyboardButtonPickerDialog(
     onDismiss: () -> Unit,
     onSelect: (String) -> Unit,
 ) {
-    val configuration = LocalConfiguration.current
-    val landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     var query by rememberSaveable { mutableStateOf("") }
     var selectedCategory by rememberSaveable { mutableStateOf<KeyboardButtonCategory?>(null) }
     val filteredOptions = remember(query, selectedCategory) {
@@ -488,24 +489,24 @@ private fun KeyboardButtonPickerDialog(
                     option.capLabel.lowercase().contains(normalizedQuery) || option.id.contains(normalizedQuery))
         }
     }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        modifier = if (landscape) Modifier.fillMaxWidth(0.94f).widthIn(max = 960.dp) else Modifier,
-        properties = DialogProperties(usePlatformDefaultWidth = !landscape),
-        title = { Text(stringResource(R.string.keyboard_overlay_picker_title)) },
-        text = {
+    TouchEditorDialog(
+        onDismiss = onDismiss,
+        wideLayout = true,
+        title = stringResource(R.string.keyboard_overlay_picker_title),
+        actions = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_close)) } },
+        content = {
             val categoryChoices: List<KeyboardButtonCategory?> = listOf(null) + KeyboardButtonCategory.entries
             val categoryLabel: @Composable (KeyboardButtonCategory?) -> String = { category ->
                 stringResource(category?.let(::keyboardButtonCategoryLabelRes) ?: R.string.keyboard_overlay_category_all)
             }
-            val pickerHeight = (configuration.screenHeightDp * if (landscape) 0.58f else 0.62f).dp
-            val filterWidth = (configuration.screenWidthDp * 0.28f).coerceIn(160f, 220f).dp
-            if (landscape) {
+            val pickerHeight = maxHeight.coerceAtMost(480.dp)
+            val filterWidth = (maxWidth * 0.34f).coerceIn(140.dp, 220.dp)
+            if (maxWidth >= 440.dp || (maxWidth >= 320.dp && maxHeight < 240.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth().height(pickerHeight),
                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    Column(Modifier.width(filterWidth).fillMaxHeight()) {
+                    Column(Modifier.width(filterWidth).fillMaxHeight().verticalScroll(rememberScrollState())) {
                         OutlinedTextField(
                             value = query,
                             onValueChange = { query = it },
@@ -513,7 +514,7 @@ private fun KeyboardButtonPickerDialog(
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                        Column {
                             categoryChoices.forEach { category ->
                                 FilterChip(
                                     selected = selectedCategory == category,
@@ -553,7 +554,6 @@ private fun KeyboardButtonPickerDialog(
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_close)) } },
     )
 }
 

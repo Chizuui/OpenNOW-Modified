@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -25,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalFocusManager
@@ -32,6 +34,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.opencloudgaming.opennow.LocalSpaceUiPresentation
+import com.opencloudgaming.opennow.rememberSpaceInteraction
 import com.opencloudgaming.opennow.R
 import com.opencloudgaming.opennow.InteractionFocusFrame
 import com.opencloudgaming.opennow.LocalAbsoluteCinemaEverywhere
@@ -104,6 +108,7 @@ internal fun ControlNavigationRow(
     enabled: Boolean = true,
     indentLevel: Int = 0,
     style: ControlRowStyle = controlRowStyle(),
+    leadingIcon: ImageVector? = null,
 ) {
     ControlRow(
         modifier = modifier,
@@ -112,6 +117,12 @@ internal fun ControlNavigationRow(
         indentLevel = indentLevel,
         style = style,
     ) {
+        if (leadingIcon != null) {
+            Icon(leadingIcon, contentDescription = null,
+                tint = style.labelColor.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
+                modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+        }
         ControlRowLabels(label, value, expandedDescription = null, enabled = enabled, style = style)
         Icon(
             painter = painterResource(R.drawable.ic_chevron_right),
@@ -179,7 +190,9 @@ internal fun ControlSliderRow(
     var descriptionExpanded by remember(label) { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
     var focused by remember { mutableStateOf(false) }
-    val hoverInteraction = remember { MutableInteractionSource() }
+    val space = LocalSpaceUiPresentation.current
+    val motion = if (space) rememberSpaceInteraction(focused) else null
+    val hoverInteraction = motion?.source ?: remember { MutableInteractionSource() }
     val hovered by hoverInteraction.collectIsHoveredAsState()
     val showFocus = style.showFocusRing && focused
     val bonanzaActive = LocalAbsoluteCinemaEverywhere.current
@@ -188,8 +201,9 @@ internal fun ControlSliderRow(
         Column(
             Modifier
                 .fillMaxWidth()
+                .then(motion?.modifier ?: Modifier)
                 .hoverable(hoverInteraction)
-                .controlRowContainer(style = style, showFocus = showFocus),
+                .controlRowContainer(style = style, showFocus = showFocus, emphasis = motion?.emphasis),
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -241,6 +255,7 @@ internal fun ControlSliderRow(
                             onChange(local)
                         }
                     },
+                interactionSource = hoverInteraction,
                 value = local,
                 onValueChange = {
                     local = quantize(it)
@@ -261,7 +276,7 @@ internal fun ControlSliderRow(
             }
         }
         InteractionFocusFrame(
-            visible = focused || (hovered && bonanzaActive),
+            visible = !space && (focused || (hovered && bonanzaActive)),
             cornerRadius = 14.dp,
             cinemaEffectEnabled = bonanzaActive,
         )

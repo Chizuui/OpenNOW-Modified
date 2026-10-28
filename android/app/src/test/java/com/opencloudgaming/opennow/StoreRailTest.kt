@@ -213,11 +213,12 @@ class StoreRailTest {
     }
 
     @Test
-    fun storeHeroAnimationStopsWhileTheStoreIsMoving() {
-        assertTrue(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = false, storeScrolling = false))
-        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = false, storeScrolling = true))
-        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = true, reduceMotion = false, storeScrolling = false))
-        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = true, storeScrolling = false))
+    fun storeHeroAnimationRunsWhileVisibleAndPausesOffscreen() {
+        assertTrue(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = false, heroVisible = true))
+        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = false, heroVisible = false))
+        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = true, reduceMotion = false, heroVisible = true))
+        assertFalse(shouldAnimateStoreHero(pageCount = 6, focused = false, reduceMotion = true, heroVisible = true))
+        assertFalse(shouldAnimateStoreHero(pageCount = 1, focused = false, reduceMotion = false, heroVisible = true))
     }
 
     @Test

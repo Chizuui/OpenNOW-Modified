@@ -12,6 +12,40 @@ import kotlin.random.Random
 
 class MascotMotionTest {
     @Test
+    fun companionStartsAcrossScreenMovingOppositeAtHalfSpeed() {
+        val logo = MascotMotion(100f, 60f, 240f, -180f)
+        val companion = createMascotCompanionMotion(logo, 500f, 300f)
+
+        assertEquals(355f, companion.x, 0f)
+        assertEquals(195f, companion.y, 0f)
+        assertEquals(-120f, companion.vx, 0f)
+        assertEquals(90f, companion.vy, 0f)
+        assertFalse(companion.advance(500f, 300f, 0.02f))
+        assertEquals(352.6f, companion.x, 0.001f)
+        assertEquals(196.8f, companion.y, 0.001f)
+    }
+
+    @Test
+    fun companionStaysSlowerAfterRepeatedBouncesAndResizes() {
+        val logo = MascotMotion(0f, 0f, 240f, 180f)
+        val companion = createMascotCompanionMotion(logo, 200f, 200f)
+        val random = Random(42)
+        var bounces = 0
+        repeat(4_000) { index ->
+            val width = if (index % 300 < 10) 30f else 200f
+            val height = if (index % 300 < 10) 20f else 200f
+            if (companion.advance(width, height, if (index % 100 == 0) 20f else 0.05f, random)) bounces++
+            val speed = hypot(companion.vx, companion.vy)
+            assertTrue(speed >= MASCOT_MIN_SPEED_DP_PER_SECOND * MASCOT_COMPANION_SPEED_SCALE - 0.001f)
+            assertTrue(speed <= MASCOT_MAX_SPEED_DP_PER_SECOND * MASCOT_COMPANION_SPEED_SCALE + 0.001f)
+            assertTrue(speed < MASCOT_MIN_SPEED_DP_PER_SECOND)
+            assertTrue(companion.x in mascotMinX(width)..mascotMaxX(width))
+            assertTrue(companion.y in 0f..(height - MASCOT_SIZE_DP).coerceAtLeast(0f))
+        }
+        assertTrue(bounces > 20)
+    }
+
+    @Test
     fun eachEdgeAndCornerReflectsInward() {
         val random = Random(42)
         val minX = mascotMinX(200f)

@@ -602,8 +602,8 @@
     <string name="settings_session_proxy_warning_breakage">A bad or blocked proxy can break launch, queue progress, active session resume, or session cleanup.</string>
     <string name="settings_session_proxy_warning_trust">Only use a proxy you trust. The proxy operator may be able to observe request timing, destination hosts, and sensitive session traffic metadata.</string>
     <string name="settings_session_proxy_warning_enable">Enable proxy</string>
-    <string name="settings_experimental_streaming">Experimental streaming</string>
-    <string name="settings_experimental_streaming_warning">May cause session launch failures.</string>
+    <string name="settings_experimental_streaming">Experiments</string>
+    <string name="settings_experimental_streaming_warning">Like living on the edge?</string>
     <string name="settings_dynamic_network_adjustment">Adjust for network conditions</string>
     <string name="settings_network_adjustment_fixed">Fixed resolution and FPS</string>
     <string name="settings_network_adjustment_custom">Custom (Experimental)</string>

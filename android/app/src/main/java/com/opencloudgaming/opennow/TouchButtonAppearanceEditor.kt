@@ -1,7 +1,7 @@
 package com.opencloudgaming.opennow
 
-import android.content.res.Configuration
 import androidx.annotation.StringRes
+import com.opencloudgaming.opennow.ui.controls.ControlNavigationRow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -15,12 +15,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.window.DialogProperties
 import kotlin.math.roundToInt
 
 internal enum class TouchButtonIcon(val vector: ImageVector, @StringRes val labelRes: Int) {
@@ -88,9 +86,7 @@ private fun touchButtonName(key: String, touch: AndroidTouchSettings): String = 
 internal fun TouchButtonAppearanceEditor(touch: AndroidTouchSettings, onChange: (AndroidTouchSettings) -> Unit) {
     var open by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf<String?>(null) }
-    OutlinedButton(onClick = { selected = null; open = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(stringResource(R.string.touch_customize_buttons))
-    }
+    ControlNavigationRow(stringResource(R.string.touch_customize_buttons), onClick = { selected = null; open = true })
     if (!open) return
     val button = selected
     if (button == null) {
@@ -134,9 +130,6 @@ internal fun TouchButtonAppearanceDialog(
     var shape by rememberSaveable(button) { mutableStateOf(saved.shape) }
     var sizeScale by rememberSaveable(button) { mutableStateOf(saved.sizeScale) }
     var toggle by rememberSaveable(button) { mutableStateOf(saved.toggle) }
-    val configuration = LocalConfiguration.current
-    val wideColumns = wideLayout && configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-    val iconColumns = if (wideColumns && configuration.screenWidthDp >= 760) 4 else 3
     val appearanceOptions: @Composable () -> Unit = {
         CompositionLocalProvider(
             LocalTouchSkin provides touchSkinColors(touch.touchControllerStyle, 1f, touchSkinAccent(touch)),
@@ -187,7 +180,7 @@ internal fun TouchButtonAppearanceDialog(
         }
         Text(stringResource(R.string.touch_button_toggle_hint), style = MaterialTheme.typography.bodySmall)
     }
-    val iconOptions: @Composable () -> Unit = {
+    val iconOptions: @Composable (Int) -> Unit = { iconColumns ->
         Text(stringResource(R.string.touch_custom_icon), style = MaterialTheme.typography.titleSmall)
         FilterChip(selected = icon == null, onClick = { icon = null },
             label = { Text(stringResource(R.string.touch_icon_text)) })
@@ -217,47 +210,46 @@ internal fun TouchButtonAppearanceDialog(
             Text(stringResource(R.string.touch_editor_reset))
         }
     }
-    AlertDialog(
-        onDismissRequest = { onDismiss() },
-        modifier = if (wideLayout) Modifier.fillMaxWidth(0.94f).widthIn(max = 960.dp) else Modifier,
-        properties = DialogProperties(usePlatformDefaultWidth = !wideLayout),
-        title = { Text(touchButtonName(button, touch)) },
-        text = {
-            if (wideColumns) {
-                Row(
-                    Modifier.fillMaxWidth().height((configuration.screenHeightDp * 0.55f).dp),
-                    horizontalArrangement = Arrangement.spacedBy(20.dp),
-                ) {
-                    Column(
-                        Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) { appearanceOptions() }
-                    Column(
-                        Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) { iconOptions() }
-                }
-            } else {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .then(if (wideLayout) Modifier.heightIn(max = (configuration.screenHeightDp * 0.55f).dp) else Modifier)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    appearanceOptions()
-                    iconOptions()
-                }
-            }
-        },
-        confirmButton = {
+    TouchEditorDialog(
+        title = touchButtonName(button, touch),
+        onDismiss = onDismiss,
+        wideLayout = wideLayout,
+        actions = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.touch_editor_cancel)) }
             TextButton(onClick = {
                 onChange(touch.withButtonAppearance(button, TouchButtonAppearance(label, icon, shape, toggle, sizeScale)))
                 onDismiss()
             }) { Text(stringResource(R.string.touch_editor_save)) }
         },
-        dismissButton = { TextButton(onClick = { onDismiss() }) { Text(stringResource(R.string.touch_editor_cancel)) } },
-    )
+    ) {
+        val wideColumns = wideLayout && maxWidth >= 440.dp
+        val paneWidth = if (wideColumns) (maxWidth - 16.dp) / 2 else maxWidth
+        val iconColumns = (paneWidth / 88.dp).toInt().coerceIn(2, 4)
+        val contentHeight = maxHeight.coerceAtMost(480.dp)
+        if (wideColumns) {
+            Row(
+                Modifier.fillMaxWidth().height(contentHeight),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Column(
+                    Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) { appearanceOptions() }
+                Column(
+                    Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) { iconOptions(iconColumns) }
+            }
+        } else {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = contentHeight).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                appearanceOptions()
+                iconOptions(iconColumns)
+            }
+        }
+    }
 }
 
 @Composable

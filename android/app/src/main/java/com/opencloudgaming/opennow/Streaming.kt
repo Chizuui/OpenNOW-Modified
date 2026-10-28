@@ -241,12 +241,13 @@ class NativeStreamClient(
     private val lowLatencyGameAudio: Boolean,
     private val onState: (String) -> Unit,
     private val onError: (String) -> Unit,
-    private val onSessionRecoveryRequired: (String) -> Unit = {},
+    private val onSessionRecoveryRequired: (StreamSessionRecoveryRequest) -> Unit = {},
     private val onFirstVideoFrameRendered: () -> Unit = {},
     private val onStats: (StreamRuntimeStats) -> Unit = {},
     private val onControllerMouseAssistChanged: (Boolean) -> Unit = {},
 ) {
     private val appContext = context.applicationContext
+    private val wifiPerformance = StreamWifiPerformanceLock(appContext)
     private val initialAndroidTvProfile = isAndroidTvProfile(appContext)
     private val eglBase: EglBase = EglBase.create()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -268,6 +269,13 @@ class NativeStreamClient(
             .setUseLowLatency(shouldUseLowLatencyStreamAudio(Build.VERSION.SDK_INT, lowLatencyGameAudio))
             .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
             .setUseStereoInput(false)
+            .setSamplesReadyCallback { samples ->
+                if (samples.audioFormat == android.media.AudioFormat.ENCODING_PCM_16BIT) {
+                    streamRecorder?.takeIf { it.usesSharedMicrophone }?.queueMicrophoneAudio(
+                        ByteBuffer.wrap(samples.data), samples.sampleRate, samples.channelCount,
+                    )
+                }
+            }
             .setUseStereoOutput(true)
             .setUseHardwareAcousticEchoCanceler(true)
             .setUseHardwareNoiseSuppressor(true)
@@ -293,12 +301,14 @@ class NativeStreamClient(
                 object : JavaAudioDeviceModule.AudioRecordErrorCallback {
                     override fun onWebRtcAudioRecordInitError(errorMessage: String?) {
                         recordStreamDiagnostic("microphone capture init failed error=${errorMessage.orEmpty()}")
+                        streamRecorder?.onSharedMicrophoneError(errorMessage.orEmpty())
                     }
 
                     override fun onWebRtcAudioRecordStartError(
                         errorCode: JavaAudioDeviceModule.AudioRecordStartErrorCode?,
                         errorMessage: String?,
                     ) {
+                        streamRecorder?.onSharedMicrophoneError(errorMessage.orEmpty())
                         recordStreamDiagnostic(
                             "microphone capture start failed code=${errorCode?.name.orEmpty()} error=${errorMessage.orEmpty()}",
                         )
@@ -306,6 +316,7 @@ class NativeStreamClient(
 
                     override fun onWebRtcAudioRecordError(errorMessage: String?) {
                         recordStreamDiagnostic("microphone capture runtime failed error=${errorMessage.orEmpty()}")
+                        streamRecorder?.onSharedMicrophoneError(errorMessage.orEmpty())
                     }
                 },
             )
@@ -363,8 +374,11 @@ class NativeStreamClient(
     private var hapticsAdvertised: Boolean? = null
     private var lastHapticsAdvertisementAtMs = 0L
     private var videoTrack: VideoTrack? = null
+    // Audio-track JNI and sink ownership stay on nativeLifecycleExecutor, including recording.
     private var audioTrack: AudioTrack? = null
-    @Volatile private var recordingAudioTrack: AudioTrack? = null
+    private var recordingAudioTrack: AudioTrack? = null
+    // Do not share the monitor held by microphone JNI and runtime stats with UI recording actions.
+    private val recordingLock = Any()
     @Volatile private var streamRecorder: AndroidStreamRecorder? = null
     @Volatile private var streamRecorderForShutdown: AndroidStreamRecorder? = null
     internal val recordingPhase = MutableStateFlow<StreamRecorderPhase?>(null)
@@ -453,6 +467,9 @@ class NativeStreamClient(
     private val controllerSlots = linkedMapOf<Int, Int>()
     private val controllerFamiliesBySlot = mutableMapOf<Int, AndroidControllerFamily>()
     private val controllerAxisAvailability = mutableMapOf<Int, AndroidGamepadAxisAvailability>()
+    private var controllerCapabilitiesJob: Job? = null
+    private var controllerCapabilitiesSampleAtMs = Long.MIN_VALUE
+    private var controllerCapabilitiesDeviceIds = emptyList<Int>()
     private val physicalGamepadStates = Array(GAMEPAD_MAX_CONTROLLERS) { PhysicalGamepadState() }
     private val activePhysicalGamepadState get() = physicalGamepadStates[activeControllerId]
     private var physicalButtons: Int
@@ -845,6 +862,7 @@ class NativeStreamClient(
     fun updateRendererSettings(settings: StreamSettings) {
         val updatedSettings = this.settings.copy(
             mouseSensitivity = settings.mouseSensitivity,
+            touchMouseSensitivity = settings.touchMouseSensitivity,
             mouseAcceleration = settings.mouseAcceleration,
             streamSharpeningEnabled = settings.streamSharpeningEnabled,
             streamSharpeningAmount = settings.streamSharpeningAmount,
@@ -1059,6 +1077,7 @@ class NativeStreamClient(
 
     fun release() {
         if (released) return
+        recordStreamDiagnostic("client release tv=$androidTvProfile")
         released = true
         if (androidTvProfile) {
             val activeRenderer = renderer
@@ -1147,6 +1166,10 @@ class NativeStreamClient(
         controllerSlots.clear()
         controllerFamiliesBySlot.clear()
         controllerAxisAvailability.clear()
+        controllerCapabilitiesJob?.cancel()
+        controllerCapabilitiesJob = null
+        controllerCapabilitiesSampleAtMs = Long.MIN_VALUE
+        controllerCapabilitiesDeviceIds = emptyList()
         mousePositionValid = false
         mouseSuppressNextAbsoluteDelta = false
         externalMouseMotionAccumulator.reset()
@@ -1174,20 +1197,21 @@ class NativeStreamClient(
     fun dispatchKey(event: KeyEvent): Boolean {
         // Before the WebRTC input channel opens, leave keyboard events available to Android and
         // Compose. Consuming them here makes queue/desktop UI look completely unresponsive.
-        if (!hasReadyInputChannel()) return false
-        if (event.isGamepadEvent()) {
-            val receivedAtMs = SystemClock.uptimeMillis()
+        val inputReady = hasReadyInputChannel()
+        val controllerInput = event.isControllerInputDevice()
+        val receivedAtMs = SystemClock.uptimeMillis()
+        if (!inputReady) {
+            if (controllerInput) recordControllerKey(event, receivedAtMs, ready = false, routed = false, handled = false)
+            return false
+        }
+        if (NativeStreamInputRouter.shouldRouteKeyAsGamepad(controllerInput, event.keyCode)) {
             val handled = dispatchGamepadKey(event)
-            if (event.repeatCount == 0) {
-                NativeInputDiagnostics.retainCounted(
-                    key = "controller.key.${event.action}",
-                ) {
-                    "physical gamepad key device=${event.deviceId} key=${event.keyCode} action=${event.action} " +
-                        "deliveryDelayMs=${(receivedAtMs - event.eventTime).coerceAtLeast(0L)} " +
-                        "dispatchMs=${SystemClock.uptimeMillis() - receivedAtMs} handled=$handled"
-                }
-            }
+            recordControllerKey(event, receivedAtMs, ready = true, routed = true, handled = handled)
             if (handled) return true
+        } else if (controllerInput) {
+            // Numbered/unknown buttons can miss the gamepad router entirely. Preserve their
+            // scan codes too; otherwise the very buttons requiring a compatibility fix vanish.
+            recordControllerKey(event, receivedAtMs, ready = true, routed = false, handled = false)
         }
         val hardwareKeyboard = event.isHardwareKeyboardSource()
         val remappedKeyCode = if (hardwareKeyboard) physicalInputSettings.keyboardKeyCode(event.keyCode) else event.keyCode
@@ -1300,7 +1324,14 @@ class NativeStreamClient(
 
     fun dispatchMotion(event: MotionEvent): Boolean {
         // Mouse/controller events must fall through to native UI until cloud input is ready.
-        if (!hasReadyInputChannel()) return false
+        if (!hasReadyInputChannel()) {
+            if (event.isGamepadMotionEvent()) {
+                NativeInputDiagnostics.controllerSample("controller.motion-not-ready.${event.deviceId}") {
+                    "physical gamepad motion inputId=${event.deviceId} inputReady=false " + inputChannelStateSummary()
+                }
+            }
+            return false
+        }
         if (event.isGamepadMotionEvent()) {
             return dispatchJoystick(event)
         }
@@ -2385,6 +2416,9 @@ class NativeStreamClient(
         flushAccumulatedMouseMove(gyroscopeMouseMotionAccumulator, eventTimeMs)
     }
 
+    internal suspend fun captureStreamScreenshot(): android.graphics.Bitmap =
+        checkNotNull(renderer) { "No active video renderer" }.captureScreenshot()
+
     internal fun canStartStreamRecording(): Boolean {
         val activeRenderer = renderer
         val unavailableReason = when {
@@ -2397,8 +2431,7 @@ class NativeStreamClient(
         return unavailableReason == null
     }
 
-    @Synchronized
-    internal fun startStreamRecording(outputUri: Uri): Boolean {
+    internal fun startStreamRecording(outputUri: Uri, recordingSettings: StreamSettings = settings): Boolean = synchronized(recordingLock) {
         if (streamRecorder != null) return false
         if (recordingPhase.value in setOf(StreamRecorderPhase.Starting, StreamRecorderPhase.Recording, StreamRecorderPhase.Finalizing)) return false
         val activeRenderer = renderer ?: return false
@@ -2407,7 +2440,7 @@ class NativeStreamClient(
         recordingError.value = null
         streamRecorderForShutdown = null
         val sourceFps = settings.fps.coerceAtLeast(1)
-        val recordingFps = (settings.recordingFps.takeIf { it > 0 } ?: sourceFps.coerceAtMost(60))
+        val recordingFps = (recordingSettings.recordingFps.takeIf { it > 0 } ?: sourceFps.coerceAtMost(60))
             .coerceAtMost(sourceFps).coerceIn(1, 60)
         val recorder = try {
             AndroidStreamRecorder(
@@ -2417,21 +2450,28 @@ class NativeStreamClient(
                 width = width,
                 height = height,
                 fps = recordingFps,
-                bitrateMbps = settings.recordingBitrateMbps,
+                bitrateMbps = recordingSettings.recordingBitrateMbps,
                 sharpnessAmount = streamSharpnessShaderStrength(
-                    settings.recordingSharpeningEnabled,
-                    settings.recordingSharpeningAmount,
+                    recordingSettings.recordingSharpeningEnabled,
+                    recordingSettings.recordingSharpeningAmount,
                 ),
+                includeMicrophone = recordingSettings.recordingMicrophoneEnabled,
+                includeCamera = recordingSettings.recordingCameraEnabled,
+                usesSharedMicrophone = recordingSettings.recordingMicrophoneEnabled && settings.microphoneMode != MicrophoneMode.Disabled,
+                microphoneDeviceId = settings.microphoneDeviceId,
             ) { phase, error ->
                 if (phase == StreamRecorderPhase.Recording && error != null) {
                     recordStreamDiagnostic("stream recorder notice: $error")
-                } else synchronized(this) {
+                } else synchronized(recordingLock) {
                     recordingPhase.value = phase
-                    recordingError.value = error.takeIf { phase == StreamRecorderPhase.Failed }
-                    if (phase == StreamRecorderPhase.Finished || phase == StreamRecorderPhase.Failed) {
+                    recordingError.value = error.takeIf { phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted }
+                    if (phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted) {
+                        recordStreamDiagnostic("stream recorder stopped phase=$phase error=${error.orEmpty()}")
+                    }
+                    if (phase == StreamRecorderPhase.Finished || phase == StreamRecorderPhase.Failed || phase == StreamRecorderPhase.Interrupted) {
                         streamRecorder = null
                         if (renderer === activeRenderer) activeRenderer.setRecordingSink(null)
-                        detachRecordingAudioSink()
+                        requestRecordingAudioSinkUpdate()
                     }
                 }
             }
@@ -2447,32 +2487,48 @@ class NativeStreamClient(
         }
         if (recordingPhase.value == StreamRecorderPhase.Failed) return false
         activeRenderer.setRecordingSink(recorder)
-        attachRecordingAudioSink()
+        requestRecordingAudioSinkUpdate()
         return true
     }
 
-    @Synchronized
-    internal fun stopStreamRecording() {
+    internal fun stopPersonalRecordingInBackground() = synchronized(recordingLock) {
+        if (streamRecorder?.recordsPersonalInputs == true) stopStreamRecording()
+    }
+
+    internal fun stopStreamRecording() = synchronized(recordingLock) {
         val recorder = streamRecorder ?: return
         streamRecorderForShutdown = recorder
         streamRecorder = null
         renderer?.setRecordingSink(null)
-        detachRecordingAudioSink()
+        requestRecordingAudioSinkUpdate()
         recordingPhase.value = StreamRecorderPhase.Finalizing
         recorder.stop()
     }
 
-    @Synchronized
-    private fun attachRecordingAudioSink() {
-        val track = audioTrack ?: return
-        if (recordingAudioTrack === track) return
-        detachRecordingAudioSink()
-        track.addSink(recordingAudioSink)
-        recordingAudioTrack = track
-        track.setEnabled(!audioMuted || streamRecorder != null)
+    private fun requestRecordingAudioSinkUpdate() {
+        val generation = transportGeneration
+        enqueueNativeLifecycleOperation("recording-audio-sink-update") {
+            if (activePeerConnection(generation) == null) return@enqueueNativeLifecycleOperation
+            updateRecordingAudioSink()
+        }
     }
 
-    @Synchronized
+    /** Runs on nativeLifecycleExecutor; never take the client monitor around blocking JNI. */
+    private fun updateRecordingAudioSink() {
+        // Read the current recorder here so a queued start cannot reattach after recording stops.
+        val track = audioTrack
+        val desiredTrack = track.takeIf { streamRecorder != null }
+        if (recordingAudioTrack !== desiredTrack) {
+            detachRecordingAudioSink()
+            if (desiredTrack != null) {
+                desiredTrack.addSink(recordingAudioSink)
+                recordingAudioTrack = desiredTrack
+            }
+        }
+        track?.setEnabled(!audioMuted || streamRecorder != null)
+    }
+
+    /** Runs on nativeLifecycleExecutor, before the owning peer can be disposed. */
     private fun detachRecordingAudioSink() {
         val track = recordingAudioTrack ?: return
         recordingAudioTrack = null
@@ -2481,15 +2537,13 @@ class NativeStreamClient(
         track.setEnabled(!audioMuted || streamRecorder != null)
     }
 
-    @Synchronized
     private fun attachAudio(track: AudioTrack) {
         val previousTrack = audioTrack
         if (previousTrack !== track) {
             detachRecordingAudioSink()
             audioTrack = track
         }
-        track.setEnabled(!audioMuted || streamRecorder != null)
-        if (streamRecorder != null) attachRecordingAudioSink()
+        updateRecordingAudioSink()
     }
 
     private fun sendAccumulatedMouseMove(
@@ -2533,6 +2587,7 @@ class NativeStreamClient(
     }
 
     private fun startTransport(session: SessionInfo, settings: StreamSettings, generation: Int) {
+        wifiPerformance.acquire()
         inputDropLogged = false
         lastIceState = null
         lastStatsSample = null
@@ -2573,6 +2628,9 @@ class NativeStreamClient(
                             ptsNs = SystemClock.elapsedRealtimeNanos(),
                         )
                     },
+                    recordingMicrophone = { samples ->
+                        streamRecorder?.takeIf { it.usesSharedMicrophone }?.queueMicrophoneAudio(samples)
+                    },
                     event = { kind, detail -> scope.launch {
                         if (generation == transportGeneration) when (kind) {
                             "connected" -> emitState("Waiting for NVST video")
@@ -2595,11 +2653,18 @@ class NativeStreamClient(
                                 startGamepadKeepalive()
                             }
                             "input-unavailable" -> inputHandshakeReady = false
-                            "microphone-error" -> recordStreamDiagnostic("NVST microphone failed: $detail")
+                            "microphone-error" -> {
+                                recordStreamDiagnostic("NVST microphone failed: $detail")
+                                streamRecorder?.onSharedMicrophoneError(detail)
+                            }
                             "error" -> {
                                 lastNvstError = detail
                                 recordStreamDiagnostic("NVST attachment failed: $detail")
-                                scheduleTransportReconnect("NVST attachment failed", SIGNALING_RECONNECT_DELAY_MS, generation)
+                                if (nvstAttachmentRequiresResume(detail)) {
+                                    requestSessionRecovery(detail, StreamSessionRecoveryMode.ResumeNvstAttachment)
+                                } else {
+                                    scheduleTransportReconnect("NVST attachment failed", SIGNALING_RECONNECT_DELAY_MS, generation)
+                                }
                             }
                         }
                     } },
@@ -2633,11 +2698,12 @@ class NativeStreamClient(
     }
 
     private fun closeTransport(clearInputState: Boolean, cancelRecovery: Boolean = true) {
+        wifiPerformance.release()
         val closingNvst = nvstTransport
         closingNvst?.stop()
         nvstTransport = null
-        if (peerConnection != null || signaling != null || reliableInput != null || partiallyReliableInput != null) {
-            recordStreamDiagnostic("transport close clearInput=$clearInputState cancelRecovery=$cancelRecovery lastIce=${lastIceState?.name ?: "none"}")
+        if (closingNvst != null || peerConnection != null || signaling != null || reliableInput != null || partiallyReliableInput != null) {
+            recordStreamDiagnostic("transport close clearInput=$clearInputState cancelRecovery=$cancelRecovery nvst=${closingNvst != null} lastIce=${lastIceState?.name ?: "none"}")
         }
         if (cancelRecovery) {
             iceRecoveryJob?.cancel()
@@ -3379,9 +3445,14 @@ class NativeStreamClient(
         if (consumeReconnectAttempt && reconnectAttempts >= MAX_TRANSPORT_RECONNECT_ATTEMPTS) {
             recordStreamDiagnostic("reconnect limit reached reason=$reason attempts=$reconnectAttempts")
             if (currentSettings.experimentalNvst) {
-                // A successful CloudMatch ready poll does not prove media recovered. Reclaiming
-                // here recreates this client and resets the retry budget indefinitely.
-                failStream("${lastNvstError ?: reason}. NVST could not reconnect after $MAX_TRANSPORT_RECONNECT_ATTEMPTS retries. Your cloud session is still running; retry when ready.")
+                val error = lastNvstError ?: reason
+                if (nvstAttachmentRequiresResume(error, retriesExhausted = true)) {
+                    // The ViewModel owns the per-session claim budget across client recreation.
+                    // A ready GET alone cannot refresh the failed RTSPS attachment.
+                    requestSessionRecovery(error, StreamSessionRecoveryMode.ResumeNvstAttachment)
+                } else {
+                    failStream("$error. NVST could not reconnect after $MAX_TRANSPORT_RECONNECT_ATTEMPTS retries. Your cloud session is still running; retry when ready.")
+                }
             } else {
                 requestSessionRecovery("$reason. Stream reconnect failed after $MAX_TRANSPORT_RECONNECT_ATTEMPTS attempts.")
             }
@@ -3420,14 +3491,17 @@ class NativeStreamClient(
         }
     }
 
-    private fun requestSessionRecovery(message: String) {
+    private fun requestSessionRecovery(
+        message: String,
+        mode: StreamSessionRecoveryMode = StreamSessionRecoveryMode.RefreshSession,
+    ) {
         if (sessionRecoveryRequested) return
         sessionRecoveryRequested = true
         transportGeneration += 1
         closeTransport(clearInputState = false)
-        recordStreamDiagnostic("session recovery requested message=$message")
+        recordStreamDiagnostic("session recovery requested mode=$mode message=$message")
         emitState("Recovering cloud session")
-        emitSessionRecoveryRequired(message)
+        emitSessionRecoveryRequired(StreamSessionRecoveryRequest(message, mode))
     }
 
     private fun failStream(message: String, generation: Int? = null) {
@@ -3446,8 +3520,8 @@ class NativeStreamClient(
         scope.launch { onError(message) }
     }
 
-    private fun emitSessionRecoveryRequired(message: String) {
-        scope.launch { onSessionRecoveryRequired(message) }
+    private fun emitSessionRecoveryRequired(request: StreamSessionRecoveryRequest) {
+        scope.launch { onSessionRecoveryRequired(request) }
     }
 
     private fun PeerConnection.IceConnectionState.toIceStatusLabel(): String = "ICE_${name}"
@@ -4141,6 +4215,24 @@ class NativeStreamClient(
             setControllerMouseAssistActive(false)
         }
         val sent = sendBurstLimitedGamepadState(controllerId = controllerId, trackPhysicalStickRelease = true)
+        // Include neutral samples: logging only activity hides stuck axes and failed releases.
+        // All string building and extra axis reads are behind the sampling gate.
+        val neutralOutput = lastLeftStickX == 0 && lastLeftStickY == 0 && lastRightStickX == 0 &&
+            lastRightStickY == 0 && lastLeftTrigger == 0 && lastRightTrigger == 0 &&
+            (physicalButtons or physicalHatButtons) == 0
+        NativeInputDiagnostics.controllerSample(
+            "controller.motion.$controllerId.${if (neutralOutput) "neutral" else "active"}", history = true,
+        ) {
+            "physical gamepad motion inputId=${event.deviceId} slot=$controllerId " +
+                "eventTimeMs=${event.eventTime} source=0x${event.source.toString(16)} " +
+                "raw=[${ControllerInputDiagnostics.axes(event)}] " +
+                "resolvedLeft=${axes.leftSource} resolvedRight=${axes.rightSource} hatAsLeft=${axes.hatUsedAsLeftStick} " +
+                "analogTriggers=$hasAnalogL,$hasAnalogR triggerInput=$ltRaw,$rtRaw " +
+                "outputLeft=$lastLeftStickX,$lastLeftStickY outputRight=$lastRightStickX,$lastRightStickY " +
+                "outputTriggers=$lastLeftTrigger,$lastRightTrigger outputButtons=${physicalButtons or physicalHatButtons} " +
+                "mouseEmulation=$controllerMouseEmulationActive mouseAssist=$controllerMouseAssistActive " +
+                "settings=$physicalInputSettings sendAccepted=$sent ${inputChannelStateSummary()}"
+        }
         if (
             abs(leftX) > ANALOG_ACTIVITY_THRESHOLD ||
             abs(leftY) > ANALOG_ACTIVITY_THRESHOLD ||
@@ -4160,6 +4252,34 @@ class NativeStreamClient(
             }
         }
         return sent
+    }
+
+    private fun recordControllerKey(event: KeyEvent, receivedAtMs: Long, ready: Boolean, routed: Boolean, handled: Boolean) {
+        if (event.repeatCount != 0) return
+        NativeInputDiagnostics.controllerSample(
+            key = "controller.raw-key.${event.deviceId}.${event.keyCode}.${event.scanCode}.${event.action}.$ready.$routed.$handled",
+            history = true,
+        ) {
+            val baseMask = GamepadButtonMapping.maskForKeyCode(event.keyCode, controllerActivation = true)
+            val mappedMask = baseMask?.let(physicalInputSettings::buttonMask)
+            val trigger = when (event.keyCode) {
+                KeyEvent.KEYCODE_BUTTON_L2 -> "left"
+                KeyEvent.KEYCODE_BUTTON_R2 -> "right"
+                else -> "none"
+            }
+            // Unsupported keys may not assign a slot. Never attribute them to whichever
+            // other controller happened to send the previous event.
+            val slot = controllerSlots[event.deviceId] ?: -1
+            val physical = physicalGamepadStates.getOrNull(slot)
+            "physical gamepad key ${ControllerInputDiagnostics.key(event)} slot=$slot eventTimeMs=${event.eventTime} " +
+                "baseMask=$baseMask mappedMask=$mappedMask trigger=$trigger " +
+                "physicalButtons=${physical?.let { it.buttons or it.hatButtons }} " +
+                "physicalTriggers=${physical?.leftTrigger},${physical?.rightTrigger} " +
+                "inputReady=$ready gamepadRoute=$routed handled=$handled " +
+                "mouseEmulation=$controllerMouseEmulationActive mouseAssist=$controllerMouseAssistActive " +
+                "deliveryDelayMs=${(receivedAtMs - event.eventTime).coerceAtLeast(0L)} " +
+                "dispatchMs=${SystemClock.uptimeMillis() - receivedAtMs} ${inputChannelStateSummary()}"
+        }
     }
 
     private fun dispatchGamepadKey(event: KeyEvent): Boolean {
@@ -4805,6 +4925,7 @@ class NativeStreamClient(
                 }
             }
         }
+        sampleControllerCapabilities(connectedDevices)
         val activeControllerDisconnected = activeControllerId in removedControllerSlots.values
         val connected = connectedDevices.isNotEmpty()
         val connectionChanged = connected != physicalControllerConnected
@@ -4835,6 +4956,31 @@ class NativeStreamClient(
             (newlyAssignedSlots + removedControllerSlots.values).distinct().forEach(::sendCurrentGamepadState)
         }
         updateHapticsAdvertisement(force = connectionChanged)
+    }
+
+    private fun sampleControllerCapabilities(devices: List<InputDevice>) {
+        // hasKeys() can call the Android input service. Never query it on the input/UI thread
+        // or while holding the diagnostics lock. One bounded batch, with no pending backlog.
+        if (controllerCapabilitiesJob?.isActive == true) return
+        val selected = devices.take(GAMEPAD_MAX_CONTROLLERS)
+        val ids = selected.map { it.id }
+        val now = SystemClock.elapsedRealtime()
+        if (ids == controllerCapabilitiesDeviceIds && controllerCapabilitiesSampleAtMs != Long.MIN_VALUE &&
+            now - controllerCapabilitiesSampleAtMs in 0 until 30_000L) return
+        controllerCapabilitiesDeviceIds = ids
+        controllerCapabilitiesSampleAtMs = now
+        val slots = selected.map { controllerSlots[it.id] }
+        controllerCapabilitiesJob = scope.launch {
+            val descriptions = withContext(Dispatchers.IO) {
+                selected.mapIndexed { index, device ->
+                    runCatching { ControllerInputDiagnostics.capabilities(device, slots[index]) }
+                        .getOrElse { "controller capabilities inputId=${device.id} unavailable=${it.javaClass.simpleName}" }
+                }
+            }
+            descriptions.forEachIndexed { index, description ->
+                NativeInputDiagnostics.controllerSample("controller.capabilities.${ids[index]}") { description }
+            }
+        }
     }
 
     private fun schedulePrimeConnectedGamepadState(reason: String) {

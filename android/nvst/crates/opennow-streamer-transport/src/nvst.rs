@@ -36,7 +36,7 @@ use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig};
 
 use super::nvst_control::{
     DEFAULT_FRAME_TIME_US, QOS_REPORT_INTERVAL, QosReport, batch_control_records, frame_ack,
-    idr_request,
+    idr_request, nack_v2,
 };
 use super::nvst_input::{
     NvstInputChannelState, NvstInputChannels, NvstInputCodec, native_input_type_is_motion,
@@ -650,6 +650,7 @@ pub struct NvstVideoConfig {
     /// cloud model. When set, video RTP/SRTP arrives on this socket while the
     /// ICE/DTLS bundle socket only carries control/audio keepalive traffic.
     mjolnir_udp_port: Option<u16>,
+    unified_socket: bool,
     codec: NvstVideoCodec,
     audio_track: Option<NvstAudioTrack>,
     expected_payload_type: Option<u8>,
@@ -681,6 +682,7 @@ impl fmt::Debug for NvstVideoConfig {
             )
             .field("rtcp_on_sctp", &self.rtcp_on_sctp)
             .field("mjolnir_udp_port", &self.mjolnir_udp_port)
+            .field("unified_socket", &self.unified_socket)
             .field("codec", &self.codec)
             .field("audio_track", &self.audio_track)
             .field("expected_payload_type", &self.expected_payload_type)
@@ -932,6 +934,12 @@ impl NvstVideoConfig {
                 field: "mjolnirUdpPort",
             });
         }
+        let unified_socket = optional_bool(object, "unifiedSocket")?.unwrap_or(false);
+        if unified_socket && mjolnir_udp_port.is_some() {
+            return Err(NvstConfigError::OutOfRange {
+                field: "unifiedSocket",
+            });
+        }
         let stun_credentials = if ping_version == Some(6) || remote_dtls_fingerprint.is_some() {
             Some(NvstStunCredentials {
                 local_username_fragment: required_ice_credential(
@@ -991,6 +999,7 @@ impl NvstVideoConfig {
             remote_dtls_fingerprint,
             rtcp_on_sctp,
             mjolnir_udp_port,
+            unified_socket,
             codec,
             audio_track,
             expected_payload_type,
@@ -1043,6 +1052,10 @@ impl NvstVideoConfig {
 
     pub fn rtcp_on_sctp(&self) -> bool {
         self.rtcp_on_sctp
+    }
+
+    fn carries_mjolnir_video(&self) -> bool {
+        self.mjolnir_udp_port.is_some() || self.unified_socket
     }
 
     pub fn mjolnir_udp_port(&self) -> Option<u16> {
@@ -1189,6 +1202,20 @@ fn optional_u64(
                 field,
                 expected: "unsigned integer",
             }),
+    }
+}
+
+fn optional_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<bool>, NvstConfigError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(NvstConfigError::InvalidFieldType {
+            field,
+            expected: "boolean",
+        }),
     }
 }
 
@@ -4829,6 +4856,8 @@ fn run_nvst_webrtc_bundle(
     // control/audio keepalive traffic; the Mjolnir receiver owns the media
     // timeout, so the bundle must not raise a spurious media recovery.
     let owns_media_timeout = config.mjolnir_udp_port.is_none();
+    let unified_socket = config.unified_socket;
+    let mjolnir = config.carries_mjolnir_video();
     let physical_local = socket.local_addr().ok().map_or_else(
         || bundle_peer,
         |local| routed_host_addr(Some(bundle_peer), local),
@@ -5279,34 +5308,31 @@ fn run_nvst_webrtc_bundle(
             && now.duration_since(last_recovery_send) >= RTCP_RECOVERY_INTERVAL
             && let Some((media_ssrc, _)) = feedback.stream_snapshot()
         {
-            if rtcp_channel_open
-                && let Some(channel_id) = rtcp_channel
-                && let Some(mut channel) = rtc.channel(channel_id)
-            {
-                // Drain several independent due runs without letting a large loss
-                // burst monopolize this loop or starve input/control traffic.
-                // Keep the previous 64-packet total budget while allowing it
-                // to cover multiple small gaps in this four-millisecond poll.
+            let recovery_open = if mjolnir {
+                control_partial_open
+            } else {
+                rtcp_channel_open
+            };
+            if recovery_open && let Some(channels) = input_channels {
                 let mut packet_budget = MAX_NACK_PACKET_COUNT;
                 for _ in 0..MAX_NACK_BATCHES_PER_POLL {
-                    let Some((first_missing_index, last_missing_index)) =
-                        feedback.take_nack_up_to(now, packet_budget)
-                    else {
+                    let Some((first, last)) = feedback.take_nack_up_to(now, packet_budget) else {
                         break;
                     };
-                    packet_budget -= (last_missing_index - first_missing_index + 1) as usize;
-                    let nack = build_rtcp_nack(
-                        rtcp_sender_ssrc,
-                        media_ssrc,
-                        first_missing_index,
-                        last_missing_index,
-                    );
-                    if channel.write(true, &nack).unwrap_or(false) {
-                        eprintln!(
-                            "NVST rtcp1 NACK sent for mediaSsrc={media_ssrc} missing={first_missing_index}..={last_missing_index}"
-                        );
+                    packet_budget -= (last - first + 1) as usize;
+                    let admitted = if mjolnir {
+                        let missing: Vec<u16> = (first..=last).map(|index| index as u16).collect();
+                        nack_v2(0, &missing).is_some_and(|command| {
+                            channels.send_partial_control(&mut rtc, &command.encoded())
+                        })
                     } else {
-                        feedback.mark_nack_send_failed(first_missing_index, last_missing_index);
+                        let packet = build_rtcp_nack(rtcp_sender_ssrc, media_ssrc, first, last);
+                        rtc.channel(channels.rtcp).is_some_and(|mut channel| {
+                            channel.write(true, &packet).unwrap_or(false)
+                        })
+                    };
+                    if !admitted {
+                        feedback.mark_nack_send_failed(first, last);
                         break;
                     }
                 }
@@ -5320,7 +5346,7 @@ fn run_nvst_webrtc_bundle(
         let (try_pli, try_idr) = feedback.keyframe_request_routes(
             now,
             last_keyframe_attempt,
-            rtcp_channel_open,
+            !mjolnir && rtcp_channel_open,
             input_state.control_is_open(),
         );
         if try_pli || try_idr {
@@ -5744,6 +5770,31 @@ fn run_nvst_webrtc_bundle(
                             Instant::now(),
                         )
                     }) {
+                        continue;
+                    }
+                    if unified_socket
+                        && looks_like_rtp(&datagram[..length])
+                        && !audio_track.as_ref().is_some_and(|audio| {
+                            peek_rtp_payload_type(&datagram[..length])
+                                .zip(peek_rtp_ssrc(&datagram[..length]))
+                                .is_some_and(|(pt, ssrc)| matches_audio_track(audio, pt, ssrc))
+                        })
+                    {
+                        for event in
+                            receiver.process_datagram(source, &datagram[..length], Instant::now())
+                        {
+                            if !forward_receive_event(
+                                &media_consumer,
+                                &event_sender,
+                                transport_origin,
+                                &mut video_delivery_gap,
+                                event,
+                            ) {
+                                rtc.disconnect();
+                                forward_optional(&event_sender, receiver.stop());
+                                return;
+                            }
+                        }
                         continue;
                     }
                     if looks_like_rtp(&datagram[..length])
@@ -6384,6 +6435,84 @@ mod tests {
             frame(),
         ));
         assert!(media_receiver.recv().unwrap().contiguous);
+    }
+
+    fn unified_bundle_frame(unified_socket: bool) -> Option<u32> {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bundle = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bundle_address = bundle.local_addr().unwrap();
+        let mut remote = create_nvst_bundle_rtc(&server).unwrap();
+        let mut config = config();
+        config.client_udp_port = bundle_address.port();
+        config.mjolnir_udp_port = None;
+        config.unified_socket = unified_socket;
+        config.video_peer = server.local_addr().unwrap();
+        config.remote_dtls_fingerprint =
+            Some(nvst_local_bundle_identity(&mut remote).dtls_fingerprint);
+        config.stun_credentials = Some(stun_credentials());
+        let packet = protect_for_test(
+            &test_srtp(&config),
+            build_plaintext_rtp(
+                1,
+                FLAG_SOF | FLAG_EOF | FLAG_CONTAINS_PIC_DATA,
+                42,
+                &[0, 0, 1, 0x65],
+            ),
+            0,
+        );
+        let (media_consumer, media_receiver) = mpsc::sync_channel(1);
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let bundle_session = spawn_nvst_udp_receiver_with_socket(
+            config,
+            media_consumer,
+            event_sender,
+            Some(bundle),
+            None,
+        )
+        .unwrap();
+        server.send_to(&packet, bundle_address).unwrap();
+        let frame = media_receiver
+            .recv_timeout(Duration::from_millis(500))
+            .ok()
+            .and_then(|frame| frame.frame_index);
+        bundle_session.stop();
+        frame
+    }
+
+    #[test]
+    fn unified_socket_bundle_demuxes_raw_mjolnir_video() {
+        assert_eq!(unified_bundle_frame(true), Some(42));
+        assert_eq!(unified_bundle_frame(false), None);
+    }
+
+    #[test]
+    fn unified_socket_handoff_rejects_a_dedicated_video_socket() {
+        let mut handoff = legacy_handoff();
+        handoff["unifiedSocket"] = json!(true);
+        handoff["mjolnirUdpPort"] = json!(49005);
+        assert!(matches!(
+            NvstVideoConfig::from_legacy_handoff(&handoff, None),
+            Err(NvstConfigError::OutOfRange {
+                field: "unifiedSocket"
+            })
+        ));
+        handoff["mjolnirUdpPort"] = Value::Null;
+        let config = NvstVideoConfig::from_legacy_handoff(&handoff, None).unwrap();
+        assert!(config.unified_socket);
+        assert_eq!(config.mjolnir_udp_port(), None);
+        assert!(config.carries_mjolnir_video());
+        handoff["unifiedSocket"] = json!(false);
+        let bundle_only = NvstVideoConfig::from_legacy_handoff(&handoff, None).unwrap();
+        assert!(!bundle_only.carries_mjolnir_video());
+        handoff["unifiedSocket"] = json!(true);
+        handoff["unifiedSocket"] = json!("yes");
+        assert!(matches!(
+            NvstVideoConfig::from_legacy_handoff(&handoff, None),
+            Err(NvstConfigError::InvalidFieldType {
+                field: "unifiedSocket",
+                ..
+            })
+        ));
     }
 
     fn legacy_handoff() -> Value {

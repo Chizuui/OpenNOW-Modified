@@ -5,6 +5,32 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SurfacePresentationClockTest {
+    @Test fun webRtcPacedFramesDoNotGainAnotherFrameOfPresentationDelay() {
+        for (fps in listOf(30, 60, 120, 240, 360)) {
+            val clock = SurfacePresentationClock(fps, SurfacePresentationMode.Immediate)
+            val interval = 1_000_000_000L / fps
+            val now = 40_000_000_000_000L
+            val media = 100_000_000_000L
+            assertEquals(now, clock.next(media, now))
+            assertEquals(now + interval + 4_000_000,
+                clock.next(media + interval, now + interval + 4_000_000))
+            assertEquals(now + 2 * interval - 4_000_000,
+                clock.next(media + 2 * interval, now + 2 * interval - 4_000_000))
+        }
+    }
+
+    @Test fun webRtcCatchupPauseAndResetNeverBuildAnotherPresentationQueue() {
+        val clock = SurfacePresentationClock(60, SurfacePresentationMode.Immediate)
+        val interval = 1_000_000_000L / 60
+        for (frame in 0..100) {
+            val now = 1000L + frame * 100_000L
+            assertEquals(now, clock.next(frame * interval, now))
+        }
+        assertEquals(1_000_000_000L, clock.next(0, 1_000_000_000L))
+        clock.reset()
+        assertEquals(2_000_000_000L, clock.next(100, 2_000_000_000L))
+    }
+
     @Test fun callbackJitterDoesNotChangeMediaCadence() {
         val clock = SurfacePresentationClock(60)
         val interval = 1_000_000_000L / 60

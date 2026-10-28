@@ -13,6 +13,7 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -28,6 +29,7 @@ data class AndroidBugReportComment(
     val kind: String,
     val body: String,
     val createdAt: Long,
+    val files: List<String> = emptyList(),
 )
 
 @Immutable
@@ -142,35 +144,56 @@ internal suspend fun fetchAndroidBugReportThreads(
     }
 }
 
+internal fun buildAndroidBugReportCommentRequest(
+    reporterId: String,
+    reportId: String,
+    comment: String,
+    files: List<AndroidBugReportAttachment> = emptyList(),
+    endpoint: String = ANDROID_BUG_REPORT_ENDPOINT,
+): Request {
+    require(reporterId.matches(Regex("^br1_[0-9a-f]{64}$"))) { "Bug report installation ID is invalid" }
+    val cleanReportId = reportId.trim()
+    require(cleanReportId.isNotBlank() && cleanReportId.length <= 160) { "Bug report ID is unavailable" }
+    val cleanComment = comment.trim()
+    require(cleanComment.isNotBlank() || files.isNotEmpty()) { "Write a reply or attach files first" }
+    require(cleanComment.length <= 3_000) { "Comments must be 3000 characters or fewer" }
+    val url = endpoint.toHttpUrl().newBuilder()
+        .addPathSegment(cleanReportId)
+        .addPathSegment("comments")
+        .build()
+    val requestBody = if (files.isEmpty()) {
+        buildJsonObject {
+            put("reporterId", reporterId)
+            put("comment", cleanComment)
+            put("termsAccepted", true)
+            put("termsVersion", ANDROID_BUG_REPORT_TERMS_VERSION)
+        }.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+    } else {
+        MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("reporterId", reporterId)
+            .addFormDataPart("comment", cleanComment)
+            .addFormDataPart("termsAccepted", "true")
+            .addFormDataPart("termsVersion", ANDROID_BUG_REPORT_TERMS_VERSION)
+            .addBugReportAttachments(files)
+            .build()
+    }
+    return Request.Builder()
+        .url(url)
+        .header("Accept", "application/json")
+        .header(ANDROID_BUG_REPORT_REPORTER_HEADER, reporterId)
+        .post(requestBody)
+        .build()
+}
+
 internal suspend fun postAndroidBugReportComment(
     http: OkHttpClient,
     reporterId: String,
     reportId: String,
     comment: String,
     endpoint: String = ANDROID_BUG_REPORT_ENDPOINT,
+    files: List<AndroidBugReportAttachment> = emptyList(),
 ): AndroidBugReportThread = withContext(Dispatchers.IO) {
-    require(reporterId.matches(Regex("^br1_[0-9a-f]{64}$"))) { "Bug report installation ID is invalid" }
-    val cleanReportId = reportId.trim().take(160)
-    require(cleanReportId.isNotBlank()) { "Bug report ID is unavailable" }
-    val cleanComment = comment.trim()
-    require(cleanComment.isNotBlank()) { "Write a comment first" }
-    require(cleanComment.length <= 3_000) { "Comments must be 3000 characters or fewer" }
-    val url = endpoint.toHttpUrl().newBuilder()
-        .addPathSegment(cleanReportId)
-        .addPathSegment("comments")
-        .build()
-    val payload = buildJsonObject {
-        put("reporterId", reporterId)
-        put("comment", cleanComment)
-        put("termsAccepted", true)
-        put("termsVersion", ANDROID_BUG_REPORT_TERMS_VERSION)
-    }.toString()
-    val request = Request.Builder()
-        .url(url)
-        .header("Accept", "application/json")
-        .header(ANDROID_BUG_REPORT_REPORTER_HEADER, reporterId)
-        .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-        .build()
+    val request = buildAndroidBugReportCommentRequest(reporterId, reportId, comment, files, endpoint)
     http.newCall(request).execute().use { response ->
         val body = response.body.string().take(MAX_BUG_REPORT_THREAD_RESPONSE_CHARS)
         if (!response.isSuccessful) {
@@ -228,19 +251,24 @@ private fun parseAndroidBugReportThread(json: JsonObject): AndroidBugReportThrea
         frequency = json.serverText("frequency").orEmpty().ifBlank { "not_sure" }.take(40),
         impact = json.serverText("impact").orEmpty().ifBlank { "normal" }.take(40),
         files = json["files"]?.jsonArray.orEmpty().mapNotNull { element ->
-            runCatching { element.jsonObject.serverText("name")?.take(180) }.getOrNull()
+            runCatching { element.jsonObject.takeIf { it.serverText("commentId").isNullOrBlank() }?.serverText("name")?.take(180) }.getOrNull()
         },
         createdAt = createdAt,
         updatedAt = json.serverLong("updatedAt") ?: createdAt,
         comments = json["comments"]?.jsonArray.orEmpty().mapNotNull { element ->
             val comment = runCatching { element.jsonObject }.getOrNull() ?: return@mapNotNull null
             val commentId = comment.serverText("id")?.takeIf(String::isNotBlank) ?: return@mapNotNull null
-            val commentBody = comment.serverText("body")?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val commentFiles = comment["files"]?.jsonArray.orEmpty().mapNotNull { file ->
+                runCatching { file.jsonObject.serverText("name")?.take(180) }.getOrNull()
+            }
+            val commentBody = comment.serverText("body").orEmpty()
+            if (commentBody.isBlank() && commentFiles.isEmpty()) return@mapNotNull null
             AndroidBugReportComment(
                 id = commentId.take(160),
                 authorRole = comment.serverText("authorRole").orEmpty().ifBlank { "admin" }.take(20),
                 kind = comment.serverText("kind").orEmpty().ifBlank { "comment" }.take(20),
                 body = commentBody.take(3_000),
+                files = commentFiles,
                 createdAt = comment.serverLong("createdAt") ?: 0L,
             )
         },

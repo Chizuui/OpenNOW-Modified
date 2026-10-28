@@ -146,6 +146,23 @@ internal class InputDiagnosticsBuffer(
         }
     }
 
+    /** Count every observation, but build details/history only after both sampling gates pass. */
+    fun retainSampled(
+        key: String,
+        minimumIntervalMs: Long,
+        history: Boolean,
+        allowDetail: () -> Boolean,
+        message: () -> String,
+    ) {
+        val now = elapsedRealtime()
+        if (detailDue(key, now, minimumIntervalMs) && allowDetail()) {
+            val entry = InputDiagnosticEntry(now, message().take(4_096))
+            retainLine(key, entry)
+            if (history) addRecentLine(entry)
+        }
+        countEvent(key, now)
+    }
+
     fun capture(): InputDiagnosticsSnapshot = InputDiagnosticsSnapshot(
         retainedLines.map { (key, entry) ->
             key to entry.copy(count = retainedCounts[key], lastSeenMs = lastSeenAtMs[key] ?: entry.elapsedMs)
@@ -180,6 +197,40 @@ internal class InputDiagnosticsBuffer(
     }
 }
 
+/** Reserved capacity prevents mouse/transport noise from erasing controller mapping evidence. */
+internal class ControllerDiagnosticsBuffer(private val now: () -> Long) {
+    private val samples = InputDiagnosticsBuffer(64, 128, now)
+    private var windowStart = Long.MIN_VALUE
+    private var formattedInWindow = 0
+    private var rateLimitedDetails = 0L
+
+    fun sample(key: String, intervalMs: Long = 1_000L, history: Boolean = false, message: () -> String) {
+        samples.retainSampled(key, intervalMs, history, allowDetail = {
+            val time = now()
+            if (windowStart == Long.MIN_VALUE || time < windowStart || time - windowStart >= 1_000L) {
+                windowStart = time
+                formattedInWindow = 0
+            }
+            if (formattedInWindow < 32) {
+                formattedInWindow++
+                true
+            } else {
+                rateLimitedDetails++
+                false
+            }
+        }, message = message)
+    }
+
+    fun capture(): InputDiagnosticsSnapshot {
+        val snapshot = samples.capture()
+        return snapshot.copy(retained = snapshot.retained + ("controller.capture" to InputDiagnosticEntry(
+            now(),
+            "sampleIntervalMs=1000 maxDetailsPerSecond=32 retainedLimit=128 historyLimit=64 " +
+                "rateLimitedDetails=$rateLimitedDetails history=sampled counts=observationsForRetainedKeys",
+        )))
+    }
+}
+
 object NativeInputDiagnostics {
     private const val MAX_RECENT_LINES = 240
     private const val MAX_RETAINED_LINES = 48
@@ -190,6 +241,17 @@ object NativeInputDiagnostics {
         maxRetainedLines = MAX_RETAINED_LINES,
         elapsedRealtime = SystemClock::elapsedRealtime,
     )
+    private val controllers = ControllerDiagnosticsBuffer(SystemClock::elapsedRealtime)
+
+    @Synchronized
+    internal fun controllerSample(
+        key: String,
+        intervalMs: Long = 1_000L,
+        history: Boolean = false,
+        message: () -> String,
+    ) {
+        controllers.sample(key, intervalMs, history, message)
+    }
 
     fun add(message: String) {
         synchronized(this) { buffer.add(message) }
@@ -226,7 +288,14 @@ object NativeInputDiagnostics {
         buffer.retainCounted("touch-route.$key", message)
     }
 
-    internal fun capture(): InputDiagnosticsSnapshot = synchronized(this) { buffer.capture() }
+    internal fun capture(): InputDiagnosticsSnapshot = synchronized(this) {
+        val general = buffer.capture()
+        val controller = controllers.capture()
+        InputDiagnosticsSnapshot(
+            general.retained + controller.retained,
+            (general.recent + controller.recent).sortedBy { it.elapsedMs },
+        )
+    }
 
     fun snapshot(): String {
         val anchor = DiagnosticTimeAnchor(System.currentTimeMillis(), SystemClock.elapsedRealtime())
