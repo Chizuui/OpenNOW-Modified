@@ -515,13 +515,15 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
     onRetry: () -> Unit, onLaunch: (String?) -> Unit, onSettingsChange: (AppSettings) -> Unit,
     modifier: Modifier = Modifier) {
     BackHandler(onBack = onDismiss)
-    var queueTimeMs by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(state.printedWasteQueue) {
+    val queue = state.printedWasteQueue
+    var queueTimeMs by remember(queue) { mutableStateOf(queue?.nowEpochMs() ?: 0L) }
+    LaunchedEffect(queue) {
+        if (queue == null) return@LaunchedEffect
         while (true) {
-            val now = System.currentTimeMillis()
+            val now = queue.nowEpochMs()
             queueTimeMs = now
             // Wake at the next zone's expiry, so an open selector cannot keep a dead choice.
-            val nextExpiry = state.printedWasteQueue.values
+            val nextExpiry = queue.zones.values
                 .filter { isPrintedWasteQueueFresh(it.LastUpdated, now) }
                 .minOfOrNull { (it.LastUpdated + PRINTEDWASTE_MAX_QUEUE_AGE_SECONDS + 1) * 1000 }
                 ?: break
@@ -529,7 +531,7 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
         }
     }
     val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings, state.regions, queueTimeMs) {
-        state.printedWasteQueue
+        queue?.zones.orEmpty()
             .mapNotNull { (zoneId, zone) ->
                 val routingUrl = selectablePrintedWasteRegionalUrl(zoneId, zone, state.printedWasteMapping, state.regions, queueTimeMs)
                     ?: return@mapNotNull null
@@ -579,7 +581,7 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
             ) {
                 dismissHigherPingWarning = false
                 pendingHigherPingLaunch = zone
-            } else if (isPrintedWasteQueueFresh(zone.zone.LastUpdated)) {
+            } else if (queue != null && isPrintedWasteQueueFresh(zone.zone.LastUpdated, queue.nowEpochMs())) {
                 onLaunch(zone.routingUrl)
             } else {
                 onRetry()
@@ -727,7 +729,7 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
                         }
                         dismissHigherPingWarning = false
                         pendingHigherPingLaunch = null
-                        if (isPrintedWasteQueueFresh(zone.zone.LastUpdated)) onLaunch(zone.routingUrl) else onRetry()
+                        if (queue != null && isPrintedWasteQueueFresh(zone.zone.LastUpdated, queue.nowEpochMs())) onLaunch(zone.routingUrl) else onRetry()
                     },
                 ) {
                     Text(stringResource(R.string.action_ok))

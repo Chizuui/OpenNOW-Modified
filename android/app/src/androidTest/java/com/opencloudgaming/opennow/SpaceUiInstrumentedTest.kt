@@ -686,13 +686,20 @@ class SpaceUiInstrumentedTest {
         val game = games.first().copy(variants = listOf(GameVariant("steam", "STEAM"), GameVariant("epic", "EPIC")))
         var storePicker by mutableStateOf(true)
         var launched: String? = null
+        // The selector and launch callback must also work when the device clock is behind.
+        val queueServerTimeMs = System.currentTimeMillis() + 3_600_000L
+        val queue = PrintedWasteQueueSnapshot(
+            zones = mapOf("NP-LAX-03" to PrintedWasteZone(12, LastUpdated = queueServerTimeMs / 1000, Region = "US Southwest")),
+            receivedEpochMs = queueServerTimeMs,
+            receivedElapsedMs = android.os.SystemClock.elapsedRealtime(),
+        )
         compose.setContent {
             SpaceUiTheme {
                 if (storePicker) StoreLaunchSelector(game, null,
                     onLaunch = { _, variant -> launched = variant.id }, onSetDefaultStore = { _, _ -> },
                     onDismiss = { storePicker = false })
                 else PrintedWasteSelectorContent(OpenNowUiState(
-                    printedWasteQueue = mapOf("NP-LAX-03" to PrintedWasteZone(12, LastUpdated = System.currentTimeMillis() / 1000, Region = "US Southwest")),
+                    printedWasteQueue = queue,
                     printedWasteMapping = mapOf("NP-LAX-03" to PrintedWasteServerMappingEntry("Southern California", "US Southwest", is5080Server = true)),
                     regions = listOf(StreamRegion("Southern California", "https://us-california-south.cloudmatchbeta.nvidiagrid.net/"))), game,
                     onDismiss = {}, onRetry = {}, onLaunch = { launched = it }, onSettingsChange = {})

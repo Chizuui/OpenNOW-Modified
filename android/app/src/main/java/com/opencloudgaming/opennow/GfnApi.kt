@@ -139,12 +139,6 @@ private val NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = false,
 )
 
-private fun isNvidiaCloudMatchHost(host: String): Boolean =
-    host == "cloudmatchbeta.nvidiagrid.net" ||
-        host.endsWith(".cloudmatchbeta.nvidiagrid.net") ||
-        host == "cloudmatch.nvidiagrid.net" ||
-        host.endsWith(".cloudmatch.nvidiagrid.net")
-
 private val NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     platformName = "windows",
     persistGameSettings = true,
@@ -898,11 +892,24 @@ internal fun isAppStoreEnumSerializationError(error: Throwable): Boolean {
 }
 
 private suspend fun OkHttpClient.awaitText(request: Request): Pair<Int, String> =
+    awaitTextResponse(request).let { it.code to it.text }
+
+private data class HttpTextResponse(
+    val code: Int,
+    val text: String,
+    val headers: Headers,
+    val receivedWallTimeMs: Long,
+    val receivedElapsedMs: Long,
+)
+
+private suspend fun OkHttpClient.awaitTextResponse(request: Request): HttpTextResponse =
     withContext(Dispatchers.IO) {
         val requestBody = OpenNowHttpDiagnostics.captureRequestBody(request)
         val startedAtMs = SystemClock.elapsedRealtime()
         try {
             newCall(request).execute().use { response ->
+                val receivedWallTimeMs = System.currentTimeMillis()
+                val receivedElapsedMs = SystemClock.elapsedRealtime()
                 val text = response.body?.string().orEmpty()
                 OpenNowHttpDiagnostics.record(
                     request = request,
@@ -912,7 +919,7 @@ private suspend fun OkHttpClient.awaitText(request: Request): Pair<Int, String> 
                     responseHeaders = response.headers,
                     elapsedMs = SystemClock.elapsedRealtime() - startedAtMs,
                 )
-                response.code to text
+                HttpTextResponse(response.code, text, response.headers, receivedWallTimeMs, receivedElapsedMs)
             }
         } catch (error: Throwable) {
             OpenNowHttpDiagnostics.record(
@@ -2996,18 +3003,19 @@ class GfnAccountConnectorRepository(
 class PrintedWasteRepository(
     private val http: OkHttpClient = defaultHttpClient(),
 ) {
-    suspend fun fetchQueue(): Map<String, PrintedWasteZone> {
+    suspend fun fetchQueue(): PrintedWasteQueueSnapshot {
         val request = Request.Builder()
             .url(PRINTEDWASTE_QUEUE_URL)
             .header("User-Agent", "opennow-android")
             .header("Accept", "application/json")
             .build()
-        val (code, text) = http.awaitText(request)
+        val response = http.awaitTextResponse(request)
+        val (code, text) = response
         check(code in 200..299) { "PrintedWaste queue returned HTTP $code" }
         val payload = OpenNowJson.parseToJsonElement(text).jsonObject
         check(payload.boolean("status") == true) { "PrintedWaste queue returned status:false" }
         val data = payload.obj("data") ?: error("PrintedWaste queue missing data")
-        return data.mapNotNull { (zoneId, raw) ->
+        val zones = data.mapNotNull { (zoneId, raw) ->
             val zone = raw.asObject() ?: return@mapNotNull null
             val queue = zone.int("QueuePosition") ?: return@mapNotNull null
             val region = zone.string("Region")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -3020,6 +3028,7 @@ class PrintedWasteRepository(
         }.toMap().also {
             check(it.isNotEmpty()) { "PrintedWaste queue returned no usable zones" }
         }
+        return printedWasteQueueSnapshot(zones, response.headers, response.receivedWallTimeMs, response.receivedElapsedMs)
     }
 
     suspend fun fetchServerMapping(): Map<String, PrintedWasteServerMappingEntry> {
@@ -3237,7 +3246,7 @@ class GfnSessionRepository(
             val s = raw.asObject() ?: return@mapNotNull null
             val status = s.int("status") ?: return@mapNotNull null
             if (status !in setOf(1, 2, 3)) return@mapNotNull null
-            val connections = resolveGfnSessionConnections(s)
+            val connections = resolveGfnSessionConnections(s, base)
             val connIp = connections?.serverIp
             val controlIp = s.obj("sessionControlInfo")?.string("ip")
             val monitor = activeSessionMonitorSettings(s)
@@ -3542,7 +3551,7 @@ class GfnSessionRepository(
         }
         val session = payload.obj("session") ?: error("CloudMatch response missing session")
         val sessionStatus = session.int("status") ?: 0
-        val signaling = runCatching { resolveSignaling(payload) }.getOrElse { error ->
+        val signaling = runCatching { resolveSignaling(payload, base) }.getOrElse { error ->
             if (sessionStatus in READY_SESSION_STATUSES) {
                 throw error
             }
@@ -3718,8 +3727,8 @@ class GfnSessionRepository(
                 ?: session.obj("sessionControlInfo")?.string("ip")?.let(::usableSessionHost)
         }
 
-    private fun resolveSignaling(payload: JsonObject): GfnSessionConnections =
-        resolveGfnSessionConnections(payload.obj("session") ?: error("Missing session"))
+    private fun resolveSignaling(payload: JsonObject, streamingBaseUrl: String): GfnSessionConnections =
+        resolveGfnSessionConnections(payload.obj("session") ?: error("Missing session"), streamingBaseUrl)
             ?: error("CloudMatch response did not include a signaling host")
 
     private fun isZoneHostname(value: String): Boolean =
