@@ -315,7 +315,7 @@ data class OpenNowUiState(
     val pendingBatteryOptimizationLaunch: PendingBatteryOptimizationLaunch? = null,
     val pendingLaunchRecovery: PendingLaunchRecovery? = null,
     val pendingPrintedWasteGame: GameInfo? = null,
-    val printedWasteQueue: Map<String, PrintedWasteZone> = emptyMap(),
+    val printedWasteQueue: PrintedWasteQueueSnapshot? = null,
     val printedWasteMapping: Map<String, PrintedWasteServerMappingEntry> = emptyMap(),
     val printedWastePings: Map<String, Long?> = emptyMap(),
     val printedWasteLoading: Boolean = false,
@@ -3576,9 +3576,11 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     fun launchWithPrintedWaste(zoneUrl: String?) {
         val snapshot = state.value
         val game = snapshot.pendingPrintedWasteGame ?: return
-        if (zoneUrl != null && snapshot.printedWasteQueue.none { (zoneId, zone) ->
-                selectablePrintedWasteRegionalUrl(zoneId, zone, snapshot.printedWasteMapping, snapshot.regions) == zoneUrl
-            }) {
+        val queue = snapshot.printedWasteQueue
+        val queueTimeMs = queue?.nowEpochMs() ?: 0L
+        if (zoneUrl != null && (queue == null || queue.zones.none { (zoneId, zone) ->
+                selectablePrintedWasteRegionalUrl(zoneId, zone, snapshot.printedWasteMapping, snapshot.regions, queueTimeMs) == zoneUrl
+            })) {
             recordDebugEvent("queue", "PrintedWaste selection rejected: route has no fresh queue data")
             refreshPrintedWasteQueues()
             return
@@ -4897,7 +4899,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 pendingPrintedWasteGame = game,
                 printedWasteLoading = true,
                 printedWasteError = null,
-                printedWasteQueue = emptyMap(),
+                printedWasteQueue = null,
                 printedWasteMapping = emptyMap(),
                 printedWastePings = emptyMap(),
             )
@@ -4929,9 +4931,10 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 val mappingData = mapping.await()
                 val advertisedRegions = providerRegions.await()
                 check(advertisedRegions.isNotEmpty()) { "GeForce NOW regional routes are unavailable" }
-                val regionsToPing = queueData
+                val queueTimeMs = queueData.nowEpochMs()
+                val regionsToPing = queueData.zones
                     .mapNotNull { (zoneId, zone) ->
-                        selectablePrintedWasteRegionalUrl(zoneId, zone, mappingData, advertisedRegions)
+                        selectablePrintedWasteRegionalUrl(zoneId, zone, mappingData, advertisedRegions, queueTimeMs)
                     }
                     .distinct()
                     .map { StreamRegion(name = it, url = it) }
@@ -4940,14 +4943,15 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             }
         }.onSuccess { (queue, mapping, regionAndPings) ->
             val (advertisedRegions, pings) = regionAndPings
-            val usableZones = queue
+            val queueTimeMs = queue.nowEpochMs()
+            val usableZones = queue.zones
                 .filter { (zoneId, zone) ->
-                    selectablePrintedWasteRegionalUrl(zoneId, zone, mapping, advertisedRegions) != null
+                    selectablePrintedWasteRegionalUrl(zoneId, zone, mapping, advertisedRegions, queueTimeMs) != null
                 }
                 .keys
             val bestZone = usableZones
                 .mapNotNull { zoneId ->
-                    val zone = queue[zoneId] ?: return@mapNotNull null
+                    val zone = queue.zones[zoneId] ?: return@mapNotNull null
                     val url = printedWasteRegionalUrl(zoneId, mapping, advertisedRegions) ?: return@mapNotNull null
                     Triple(zoneId, zone.QueuePosition, pings[url])
                 }
@@ -4959,7 +4963,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 )
             recordDebugEvent(
                 "queue",
-                "PrintedWaste queue loaded zones=${queue.size} usable=${usableZones.size} best=${bestZone?.first.orEmpty()} bestQueue=${bestZone?.second ?: 0} bestPing=${bestZone?.third ?: -1}",
+                "PrintedWaste queue loaded zones=${queue.zones.size} usable=${usableZones.size} best=${bestZone?.first.orEmpty()} bestQueue=${bestZone?.second ?: 0} bestPing=${bestZone?.third ?: -1}",
             )
             _state.update {
                 it.copy(

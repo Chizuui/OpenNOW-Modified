@@ -17,7 +17,10 @@ private fun JsonObject.connectionValue(key: String): String? =
     (get(key) as? JsonPrimitive)?.contentOrNull
 
 /** Match dev's WebRTC endpoint ordering, independently of the native RTSPS/media routes. */
-internal fun resolveGfnSessionConnections(session: JsonObject): GfnSessionConnections? {
+internal fun resolveGfnSessionConnections(
+    session: JsonObject,
+    streamingBaseUrl: String? = null,
+): GfnSessionConnections? {
     val connections = (session["connectionInfo"] as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
     fun JsonObject.usage() = connectionValue("usage")?.toIntOrNull()
     val candidates = connections.filter {
@@ -44,9 +47,32 @@ internal fun resolveGfnSessionConnections(session: JsonObject): GfnSessionConnec
         mediaConnectionInfo = selectedMedia,
         // BUNDLE (17) can have a different NAT mapping from VIDEO (2) on alliance seats.
         bundleConnectionInfo = media(listOf(17), requireIp = true),
-        // Native WSS carries RTSP control, not the WebRTC JSON offer protocol.
-        nativeTransportRequired = connection.isRtspSessionConnection(),
+        nativeTransportRequired = sessionNativeTransportRequired(session, connection, streamingBaseUrl),
     )
+}
+
+private fun sessionNativeTransportRequired(
+    session: JsonObject,
+    connection: JsonObject,
+    streamingBaseUrl: String?,
+): Boolean {
+    if (isAllianceCloudMatchBase(streamingBaseUrl)) {
+        val request = session["sessionRequestData"] as? JsonObject
+        // Match dev's reported_native_session/reported_webrtc_session. Partners can
+        // return RTSPS descriptors for a WebRTC allocation; those are converted to
+        // WSS 443 above and do not imply an RTSP control protocol on that service.
+        // Explicit native allocation always wins over stale WebRTC metadata.
+        if (request?.connectionValue("secureRTSPSupported") == "true" ||
+            request?.connectionValue("streamerVersion") == "14") return true
+        val metadata = request?.get("metaData") as? JsonArray
+        if (metadata.orEmpty().any { raw ->
+                val entry = raw as? JsonObject
+                entry?.connectionValue("key") == "GSStreamerType" &&
+                    entry.connectionValue("value") == "WebRTC"
+            }) return false
+    }
+    // Preserve NVIDIA and legacy sessions' endpoint-based transport selection.
+    return connection.isRtspSessionConnection()
 }
 
 private fun sessionMediaConnection(connection: JsonObject): MediaConnectionInfo? {

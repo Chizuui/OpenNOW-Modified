@@ -5,6 +5,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GfnSessionConnectionsTest {
+    private val yesBase = "https://my-yes.yes.geforcenow.nvidiagrid.net/"
+
+    // Shape from the YES incident: native-looking control descriptors coexist with
+    // an explicitly reported WebRTC allocation and separate VIDEO/BUNDLE mappings.
+    private fun partnerSession(requestData: String, status: Int = 2, enhancedStreamMode: Int = 0) =
+        OpenNowJson.parseToJsonElement("""{
+            "status":$status,"enhancedStreamMode":$enhancedStreamMode,
+            "sessionRequestData":$requestData,
+            "connectionInfo":[
+                {"usage":14,"appLevelProtocol":6,"port":322,"resourcePath":"rtsps://seat.yes.example:322"},
+                {"usage":14,"appLevelProtocol":6,"port":48322,"resourcePath":"rtsps://seat.yes.example:48322"},
+                {"usage":2,"protocol":2,"ip":"203.0.113.20","port":13334},
+                {"usage":17,"protocol":2,"ip":"203.0.113.20","port":18342}
+            ]
+        }""").jsonObject
+
+    private val webRtcRequest = """{"secureRTSPSupported":false,"streamerVersion":"1",
+        "metaData":[{"key":"GSStreamerType","value":"WebRTC"}]}"""
+
     private fun resolve(raw: String) = resolveGfnSessionConnections(
         buildJsonObject { put("connectionInfo", OpenNowJson.parseToJsonElement(raw)) },
     )
@@ -112,6 +131,66 @@ class GfnSessionConnectionsTest {
         assertFalse(session.copy(nativeTransportRequired = false).usesNvstTransport(settings))
         assertTrue(session.copy(nativeTransportRequired = false).usesNvstTransport(settings.copy(experimentalNvst = true)))
         assertNotEquals(session.nativeStreamTransportIdentity(), session.copy(nativeTransportRequired = false).nativeStreamTransportIdentity())
+    }
+
+    @Test fun yesWebRtcAllocationUsesWebRtcEvenWithRtspDescriptorsAndEnhancedModeZero() {
+        for ((status, mode) in listOf(1 to 1, 2 to 0, 3 to 0)) {
+            val result = resolveGfnSessionConnections(partnerSession(webRtcRequest, status, mode), yesBase)!!
+            assertFalse(result.nativeTransportRequired)
+            assertEquals("wss://seat.yes.example/nvst/", result.signalingUrl)
+            assertEquals("seat.yes.example:443", result.signalingServer)
+            assertEquals(MediaConnectionInfo("203.0.113.20", 13334), result.mediaConnectionInfo)
+            assertEquals(MediaConnectionInfo("203.0.113.20", 18342), result.bundleConnectionInfo)
+            assertEquals(
+                "wss://seat.yes.example/nvst/sign_in?peer_id=peer&version=2&peer_role=1&pairing_id=seat",
+                buildGfnSignInUrl(result.signalingUrl, result.signalingServer, "peer", "seat", reconnect = false),
+            )
+            val session = SessionInfo("seat", status, streamingBaseUrl = yesBase,
+                serverIp = result.serverIp, signalingServer = result.signalingServer,
+                signalingUrl = result.signalingUrl, nativeTransportRequired = result.nativeTransportRequired,
+                rtspsEndpoints = nvstRtspEndpoints(partnerSession(webRtcRequest)["connectionInfo"] as JsonArray))
+            assertFalse(session.usesNvstTransport(StreamSettings()))
+            assertEquals(2, session.rtspsEndpoints.size)
+        }
+    }
+
+    @Test fun partnerNativeAllocationWinsOverWebRtcMetadataAndEndpointShape() {
+        for (request in listOf(
+            """{"secureRTSPSupported":true,"streamerVersion":"14"}""",
+            """{"secureRTSPSupported":false,"streamerVersion":14,"metaData":[{"key":"GSStreamerType","value":"WebRTC"}]}""",
+            """{"secureRTSPSupported":true,"metaData":[{"key":"GSStreamerType","value":"WebRTC"}]}""",
+        )) {
+            val session = partnerSession(request)
+            assertTrue(resolveGfnSessionConnections(session, yesBase)!!.nativeTransportRequired)
+            val webSocketSession = JsonObject(session + ("connectionInfo" to OpenNowJson.parseToJsonElement(
+                """[{"usage":14,"appLevelProtocol":4,"resourcePath":"wss://seat.yes.example/nvst/"}]""")))
+            assertTrue(resolveGfnSessionConnections(webSocketSession, yesBase)!!.nativeTransportRequired)
+        }
+    }
+
+    @Test fun partnerSessionsWithoutReportedTransportKeepEndpointFallback() {
+        for (request in listOf("{}", """{"secureRTSPSupported":false}""",
+            """{"metaData":[null,1,{}, {"key":"Other","value":"WebRTC"}]}""")) {
+            assertTrue(resolveGfnSessionConnections(partnerSession(request), yesBase)!!.nativeTransportRequired)
+        }
+        val session = partnerSession("""{"metaData":[{"key":"GSStreamerType","value":"WebRTC"}]}""")
+        assertFalse(resolveGfnSessionConnections(session, yesBase)!!.nativeTransportRequired)
+    }
+
+    @Test fun nvidiaAndUnknownProviderContextsPreserveEndpointBasedTransportSelection() {
+        for (base in listOf(null, "", "invalid", "https://cloudmatchbeta.nvidiagrid.net",
+            "https://prod.cloudmatchbeta.nvidiagrid.net", "https://np-sjc-01.cloudmatchbeta.nvidiagrid.net",
+            "https://cloudmatch.nvidiagrid.net", "https://np-sjc-01.cloudmatch.nvidiagrid.net",
+            "https://203.0.113.10", "https://[2001:db8::10]", "https://localhost")) {
+            val session = partnerSession(webRtcRequest)
+            assertTrue("base=$base", resolveGfnSessionConnections(session, base)!!.nativeTransportRequired)
+            val webSocketSession = JsonObject(session + ("connectionInfo" to OpenNowJson.parseToJsonElement(
+                """[{"usage":14,"appLevelProtocol":4,"ip":"203.0.113.10","port":49003,"resourcePath":"/nvst/"}]""")))
+            val result = resolveGfnSessionConnections(webSocketSession, base)!!
+            assertFalse("base=$base", result.nativeTransportRequired)
+            assertEquals("wss://203.0.113.10/nvst/", result.signalingUrl)
+            assertEquals(MediaConnectionInfo("203.0.113.10", 49003), result.mediaConnectionInfo)
+        }
     }
 
 }
