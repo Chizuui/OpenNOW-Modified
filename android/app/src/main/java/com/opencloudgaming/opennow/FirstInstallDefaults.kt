@@ -85,6 +85,7 @@ private fun commonFirstInstallSettings(): AppSettings = AppSettings(
     androidTouch = AndroidTouchSettings(
         enabled = true,
         mousePad = true,
+        mouseWithTouchController = true,
         keyboardModeEnabled = false,
         touchControllerStyle = TouchControllerStyle.V1, // V1, V2, Neon, Frost, Contrast, Retro, Arcade.
         opacity = 0.82f, // 0..1.

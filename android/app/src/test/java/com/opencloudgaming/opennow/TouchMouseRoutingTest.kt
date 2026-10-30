@@ -13,17 +13,17 @@ class TouchMouseRoutingTest {
         nativeTouch: Boolean = false,
     ) = touchMouseEnabledForStream(touch, ready, touchEnabled, nativeTouch, gamepadVisible)
 
-    @Test fun showingControllerBlocksBackgroundMouseAndHidingItRestoresMouse() {
+    @Test fun explicitOptOutBlocksBackgroundMouseOnlyWhileControllerIsVisible() {
         for (directClick in listOf(false, true)) {
-            val touch = AndroidTouchSettings(mouseDirectClick = directClick)
+            val touch = AndroidTouchSettings(mouseDirectClick = directClick, mouseWithTouchController = false)
             assertTrue(routes(touch, gamepadVisible = false))
             assertFalse(routes(touch, gamepadVisible = true))
             assertTrue(routes(touch, gamepadVisible = false))
         }
     }
 
-    @Test fun explicitOptInAllowsBothWithoutBypassingOtherInputGates() {
-        val touch = AndroidTouchSettings(mouseWithTouchController = true)
+    @Test fun defaultsAllowBothWithoutBypassingOtherInputGates() {
+        val touch = AndroidTouchSettings()
         assertTrue(routes(touch))
         assertFalse(routes(touch.copy(mousePad = false)))
         assertFalse(routes(touch, ready = false))
@@ -35,9 +35,9 @@ class TouchMouseRoutingTest {
         assertTrue(routes(AndroidTouchSettings(keyboardModeEnabled = true), gamepadVisible = false))
     }
 
-    @Test fun legacySettingsDefaultToProtectionAndExplicitChoicePersists() {
+    @Test fun legacySettingsAllowBackgroundMouseAndExplicitChoicePersists() {
         val legacy = OpenNowJson.decodeFromString<AppSettings>("""{"androidTouch":{"mousePad":true,"mouseDirectClick":true}}""")
-        assertFalse(routes(legacy.androidTouch))
+        assertTrue(routes(legacy.androidTouch))
         for (allowMouse in listOf(false, true)) {
             val settings = legacy.copy(androidTouch = legacy.androidTouch.copy(mouseWithTouchController = allowMouse))
             val restored = OpenNowJson.decodeFromString<AppSettings>(OpenNowJson.encodeToString(settings)).normalizedForAndroid()

@@ -421,7 +421,7 @@ data class AndroidTouchSettings(
     val enabled: Boolean = true,
     val mousePad: Boolean = true,
     /** Allow background fingers to send mouse input while the virtual gamepad is visible. */
-    val mouseWithTouchController: Boolean = false,
+    val mouseWithTouchController: Boolean = true,
     /** Replaces the virtual gamepad with a WASD stick and independently configurable keyboard/mouse buttons. */
     val keyboardModeEnabled: Boolean = false,
     /** Individually movable keyboard/mouse buttons; not limited by the gamepad's extra-button count. */
