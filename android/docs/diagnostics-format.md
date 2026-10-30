@@ -33,6 +33,7 @@ for call in current["api"]:
 | `device` | Model, manufacturer, Android release/SDK/security patch, hardware, ABIs, cores, RAM, screen pixels/density, form factor |
 | `deviceRuntime` | Battery, thermal state, network type, signal, Wi-Fi frequency/band |
 | `stream` | Game/state/error, provider and session endpoints, settings, storage region, latest media/input-independent runtime statistics |
+| `streamConnections` | Bounded signaling attempt history, handshake stages, packet counts and failures retained after stop |
 | `inputSettings` | Mouse lock and complete touch settings, including control positions |
 | `codecs` | Decoder/encoder names, availability, hardware flags, profiles and limits |
 | `cpuBuckets` | Ten-second groups retaining sample counts, average and peak CPU usage |
@@ -42,10 +43,17 @@ for call in current["api"]:
 | `sessionScore` | Active or completed score, metric contributions, downgrades and app recommendations |
 | `failureAssessment` | Versioned observations, possible explanations and JSON Pointer evidence links |
 | `processExitHistory` | Up to three prior main-process OS exit records, with reason and memory data when available |
+| `previousJavaCrash` | Optional last uncaught Java exception, including its original app version/build, timestamp, thread, stream UI context, and bounded sanitized stack trace |
 
 Fields may be absent or null when unavailable. CPU process percentage can exceed 100%; device
 capacity percentage divides it by the logical core count. Non-finite runtime measurements are
 treated as unavailable and omitted, never emitted as invalid JSON numbers.
+
+`previousJavaCrash` is saved synchronously by the uncaught-exception handler independently of
+periodic snapshots. It survives subsequent app launches until replaced by another Java crash,
+and Android's original handler still receives the exception. Compare its timestamp and build
+with the incident: it is historical evidence, not a crash in the exporting process. Native
+aborts, low-memory kills, and vendor process-manager kills cannot be captured by this handler.
 
 Times use `YYYY-MM-DDTHH:mm:ss.SSSZ`. Input/CPU wall times are reconstructed from the export's
 wall/monotonic clock anchor. Use `uptimeMs` for exact ordering if the device clock changed.
@@ -80,6 +88,23 @@ events whose detail strings were throttled.
   the readable section uses ten-second averages/peaks.
 
 ## Logging cost
+
+Signaling keeps the last 32 WebSocket connection attempts independently of the input and media
+sample rings. `streamConnections` reports total/evicted attempts and includes attempts still in
+progress. Each attempt records its host/port (without URL credentials, path or query), reconnect
+flag, monotonic duration, handshake HTTP/TLS result, DNS/TCP/TLS stage offsets, close code, received
+packet kinds, and queued/rejected send counts. `sendQueued` means the local WebSocket accepted a
+send, not that the server acknowledged it. Repeated network stages retain their latest offset.
+`lastReceiveAfterStartMs` locates the last received frame relative to the attempt's start. Missing
+stages can reflect connection reuse or failure before that stage; they are not zero durations.
+
+Packet kinds use fixed labels; payloads, SDP, peer IDs, DNS answers and socket addresses are not
+retained by this recorder. Exception class chains are bounded to five entries and omit exception
+messages. Offer timeouts, remote closures and connection errors retain their occurrence time and
+phase. Local teardown does not erase earlier failures or classify its late callbacks as failures.
+The readable report includes the same attempt history, even when no media samples were produced.
+It participates in existing periodic/transition history snapshots; it is not synchronously
+persisted on every packet and may lose recent events on process death.
 
 Input counters update every event, while repeated detail strings are built at most once per
 second per key. Send failure/recovery transitions bypass that interval. Logcat mirroring of
@@ -123,12 +148,13 @@ OPENNOW_UPDATE_DIAGNOSTIC_SCHEMA=1 ANDROID_HOME="$HOME/Library/Android/sdk" \
 
 | Field | Meaning |
 | --- | --- |
-| `reasonCode` | Stable identifier such as `provider_storage_unavailable`, `dns_resolution_failed`, `api_access_rejected`, `api_timeout`, `provider_http_failure`, `provider_application_failure`, `api_call_failed`, or `stream_error_reported` |
-| `category` | `api`, `stream`, `session_quality`, or `previous_process` |
+| `reasonCode` | Stable identifier such as `provider_storage_unavailable`, `dns_resolution_failed`, `api_access_rejected`, `api_timeout`, `provider_http_failure`, `provider_application_failure`, `api_call_failed`, `stream_error_reported`, `signaling_offer_timeout`, `signaling_connection_failed`, or `signaling_remote_closed` |
+| `category` | `api`, `stream`, `stream_connection`, `session_quality`, or `previous_process` |
 | `confidence` | `observed_failure` for a recorded error, `metric_based_hint` for report advice, `os_recorded_exit` for historical Android exit evidence; these do not establish current-session crash causality |
 | `possibleReason` | Human-readable explanation or recommendation title (full advice is at the evidence path) |
 | `evidencePaths` | JSON Pointers within this parser block, e.g. `/api/0` or `/sessionScore/report/recommendations/1` |
 | `timestamp`, `httpStatus`, `providerStatus`, `error` | Present when supplied by the evidence; the referenced API entry retains the condensed response |
+| `occurrences` | Number of retained connection issues grouped under this reason; each has an evidence pointer into `streamConnections.attempts` |
 
 `crashConclusion` is currently `not_established` for the running process. It identifies possible causes of launch/session trouble without
 mistaking an HTTP error, DNS failure or bad quality score for an app crash. Findings cover retained

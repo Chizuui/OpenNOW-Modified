@@ -10,6 +10,7 @@ internal data class GfnSessionConnections(
     val signalingUrl: String,
     val mediaConnectionInfo: MediaConnectionInfo?,
     val bundleConnectionInfo: MediaConnectionInfo?,
+    val nativeTransportRequired: Boolean,
 )
 
 private fun JsonObject.connectionValue(key: String): String? =
@@ -21,8 +22,8 @@ internal fun resolveGfnSessionConnections(session: JsonObject): GfnSessionConnec
     fun JsonObject.usage() = connectionValue("usage")?.toIntOrNull()
     val candidates = connections.filter {
         val resource = it.connectionValue("resourcePath").orEmpty()
-        resource.startsWith("wss://") || resource.startsWith("https://") ||
-            (it.usage() == 14 && !it.isRtspSessionConnection())
+        !it.isRtspSessionConnection() && (resource.startsWith("wss://") || resource.startsWith("https://") ||
+            it.usage() == 14)
     } + connections.filter { it.usage() == 14 } + connections.filter { it.usage() == 16 }
     val endpoint = candidates.firstNotNullOfOrNull { connection ->
         webRtcSignalingUrl(connection)?.let { connection to it }
@@ -43,6 +44,8 @@ internal fun resolveGfnSessionConnections(session: JsonObject): GfnSessionConnec
         mediaConnectionInfo = selectedMedia,
         // BUNDLE (17) can have a different NAT mapping from VIDEO (2) on alliance seats.
         bundleConnectionInfo = media(listOf(17), requireIp = true),
+        // Native WSS carries RTSP control, not the WebRTC JSON offer protocol.
+        nativeTransportRequired = connection.isRtspSessionConnection(),
     )
 }
 

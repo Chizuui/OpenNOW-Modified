@@ -2728,6 +2728,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         skipBatteryOptimizationPrompt: Boolean = false,
         streamSettingsOverride: StreamSettings? = null,
     ) {
+        if (state.value.streamStatus == "stopping") return
         if (launchJob?.isActive == true) {
             recordDebugEvent("launch", "Ignored play request while another launch is active game=${game.title}")
             return
@@ -3187,6 +3188,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
 
     fun stopStream(origin: StreamStopOrigin) {
         val beforeStop = state.value
+        if (beforeStop.streamStatus == "stopping") return
         streamSessionRecoveryTracker.reset()
         nvstAttachmentResumeGate.reset()
         val completedSessionReport = finishSessionReport()
@@ -3198,6 +3200,9 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         launchJob?.cancel()
         launchJob = null
         pendingActiveSessionLaunch = null
+        // Stop local retries before awaiting CloudMatch's DELETE response. The cloud session
+        // remains available to the request below, but is no longer eligible for attachment.
+        _state.update { it.copy(streamStatus = "stopping", launchPhase = "Ending session") }
         viewModelScope.launch {
             val auth = state.value.authSession
             val snapshot = state.value
@@ -3405,6 +3410,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun resumeActiveSession() {
+        if (state.value.streamStatus == "stopping") return
         if (launchJob?.isActive == true) {
             recordDebugEvent("queue", "Ignored resume request while another launch is active")
             return
@@ -3568,7 +3574,15 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun launchWithPrintedWaste(zoneUrl: String?) {
-        val game = state.value.pendingPrintedWasteGame ?: return
+        val snapshot = state.value
+        val game = snapshot.pendingPrintedWasteGame ?: return
+        if (zoneUrl != null && snapshot.printedWasteQueue.none { (zoneId, zone) ->
+                selectablePrintedWasteRegionalUrl(zoneId, zone, snapshot.printedWasteMapping, snapshot.regions) == zoneUrl
+            }) {
+            recordDebugEvent("queue", "PrintedWaste selection rejected: route has no fresh queue data")
+            refreshPrintedWasteQueues()
+            return
+        }
         recordDebugEvent("queue", "PrintedWaste selection game=${game.title} zone=${hostForDebug(zoneUrl)} auto=${zoneUrl == null}")
         launchJob?.cancel()
         launchJob = null
@@ -3756,6 +3770,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun markStreamConnected() {
+        if (state.value.streamStatus !in setOf("connecting", "streaming")) return
         ensureSessionReportAccumulator()
         if (state.value.streamStatus == "streaming") return
         recordDebugEvent("stream", "Native stream connected session=${state.value.streamSession?.shortDebugId().orEmpty()} game=${state.value.streamGame?.title.orEmpty()}")
@@ -3805,6 +3820,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun markStreamError(message: String) {
+        if (state.value.streamStatus == "stopping") return
         retainMeasuredStream(streamSessionReportAccumulator?.finish(System.currentTimeMillis()))
         recordDebugEvent("stream", "Native stream error message=${message.take(DEBUG_EVENT_MESSAGE_LIMIT)} session=${state.value.streamSession?.shortDebugId().orEmpty()}")
         _state.update { it.copy(error = message, streamStatus = "idle", activeStreamSettings = null, launchPhase = "") }
@@ -3818,7 +3834,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         ensureSessionReportAccumulator()
         val currentSettings = state.value.activeStreamSettings ?: effectiveStreamSettings()
         _state.update { current ->
-            if (current.streamSession == null || current.streamStatus == "idle") {
+            if (current.streamSession == null || current.streamStatus in setOf("idle", "stopping")) {
                 current
             } else {
                 current.copy(activeStreamSettings = fallbackSettings)
@@ -3922,6 +3938,7 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun recoverStreamSession(request: StreamSessionRecoveryRequest) {
+        if (state.value.streamStatus == "stopping") return
         val reason = request.reason
         if (launchJob?.isActive == true) {
             recordDebugEvent("recovery", "Ignored stream recovery while launch job is active reason=${reason.take(DEBUG_EVENT_MESSAGE_LIMIT)}")
@@ -4209,7 +4226,9 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
         val scoreData = diagnosticSessionScore(scoreReport,
             if (reportAccumulator != null) "active" else "completed", snapshot.settings.showSessionReportAfterStream)
         val exitHistory = AndroidProcessExitDiagnostics.snapshot(getApplication())
-        val assessment = diagnosticFailureAssessment(api, snapshot.error, scoreReport, exitHistory.records)
+        val streamConnections = StreamConnectionDiagnostics.snapshot()
+        val previousJavaCrash = openNowApplication.javaCrashDiagnostics.previousCrash()
+        val assessment = diagnosticFailureAssessment(api, snapshot.error, scoreReport, exitHistory.records, streamConnections)
         val parser = buildJsonObject {
             put("schemaVersion", 2)
             put("retention", buildJsonObject {
@@ -4223,7 +4242,9 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
             })
             put("sessionScore", scoreData)
             put("failureAssessment", assessment)
+            put("streamConnections", streamConnections)
             put("processExitHistory", OpenNowJson.encodeToJsonElement(exitHistory))
+            previousJavaCrash?.let { put("previousJavaCrash", it) }
             put("capturedAt", diagnosticTimestamp(now))
             put("capturedAtEpochMs", now)
             put("uptimeMs", anchor.elapsedMs)
@@ -4330,8 +4351,19 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 appendLine("${fields["reasonCode"]?.jsonPrimitive?.content}: ${fields["possibleReason"]?.jsonPrimitive?.content} | evidence=${fields["evidencePaths"]}")
             }
             appendLine()
+            previousJavaCrash?.let { crash ->
+                appendLine("[Retained Java crash — previous process]")
+                appendLine("timestamp=${crash["timestamp"]} version=${crash["version"]} build=${crash["build"]} thread=${crash["thread"]}")
+                appendLine(crash["streamContext"]?.jsonPrimitive?.contentOrNull)
+                appendLine(crash["stackTrace"]?.jsonPrimitive?.contentOrNull)
+                appendLine()
+            }
             appendLine("[Input state & events]")
             appendLine(input.format(anchor::formatElapsed))
+            appendLine()
+            appendLine("[Stream connection attempts — retained after stop]")
+            appendLine("sendQueued means accepted into the local WebSocket queue, not acknowledged by the server. Historical failures may precede a successful retry; compare incident timestamps.")
+            appendLine(formatStreamConnectionDiagnostics(streamConnections))
             appendLine()
             appendLine("[Timeline — ${events.size} events]")
             events.forEach { appendLine("${diagnosticTimestamp(it.timestampMs)} [${it.category}] ${it.message}") }
@@ -4898,22 +4930,19 @@ class OpenNowViewModel(application: Application) : AndroidViewModel(application)
                 val advertisedRegions = providerRegions.await()
                 check(advertisedRegions.isNotEmpty()) { "GeForce NOW regional routes are unavailable" }
                 val regionsToPing = queueData
-                    .filter { (zoneId, _) -> isStandardPrintedWasteZone(zoneId) && mappingData[zoneId]?.nuked != true }
-                    .mapNotNull { (zoneId, _) ->
-                        printedWasteRegionalUrl(zoneId, mappingData, advertisedRegions)
+                    .mapNotNull { (zoneId, zone) ->
+                        selectablePrintedWasteRegionalUrl(zoneId, zone, mappingData, advertisedRegions)
                     }
                     .distinct()
                     .map { StreamRegion(name = it, url = it) }
-                check(regionsToPing.isNotEmpty()) { "No selectable GeForce NOW region has an advertised route" }
                 val pings = printedWasteRepository.pingRegions(regionsToPing).associate { it.url to it.pingMs }
                 Triple(queueData, mappingData, advertisedRegions to pings)
             }
         }.onSuccess { (queue, mapping, regionAndPings) ->
             val (advertisedRegions, pings) = regionAndPings
             val usableZones = queue
-                .filter { (zoneId, _) ->
-                    isStandardPrintedWasteZone(zoneId) && mapping[zoneId]?.nuked != true &&
-                        printedWasteRegionalUrl(zoneId, mapping, advertisedRegions) != null
+                .filter { (zoneId, zone) ->
+                    selectablePrintedWasteRegionalUrl(zoneId, zone, mapping, advertisedRegions) != null
                 }
                 .keys
             val bestZone = usableZones

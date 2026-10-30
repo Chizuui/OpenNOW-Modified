@@ -83,6 +83,12 @@ private const val GFN_ANDROID_TOUCH_USER_AGENT =
 private const val GFN_ANDROID_TV_USER_AGENT =
     "GFN-PC/22.0 (Android-Generic-TV 14) PGC/3.8 (6.36.38319306) okhttp/4.12.0"
 private const val GFN_CLIENT_VERSION = "2.0.88.129"
+private const val GFN_ANDROID_NATIVE_APP_VERSION = "6.39.39022815"
+
+internal fun nativeAndroidCloudMatchUserAgent(androidRelease: String?): String {
+    val release = androidRelease?.filter { it in '0'..'9' || it in 'a'..'z' || it in 'A'..'Z' || it in ".-_" }?.take(40)?.takeIf(String::isNotEmpty) ?: "14"
+    return "GFN-PC/22.0 (Android $release) PGC/3.8 ($GFN_ANDROID_NATIVE_APP_VERSION) okhttp/4.12.0"
+}
 private const val GFN_BROWSER_USER_AGENT =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
 private const val GFN_BROWSER_CLIENT_VERSION = GFN_CLIENT_VERSION
@@ -170,12 +176,20 @@ private val NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = true,
 )
 
-// Portal-sized gamepad sessions require the native Android mode matrix as well, while
-// keeping controller provisioning independent from the selected resolution.
-private val NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY = NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY.copy(
+// Preserve alliance Portal requests; their client identity is provider-owned.
+private val ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY = NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY.copy(
     platformName = "android",
     deviceType = "PHONE",
     userAgent = GFN_USER_AGENT,
+)
+
+// Match the official Android session platform independently of its HTTP User-Agent:
+// the platform is Android-Generic-Touch even when the UA names ordinary Android.
+private val NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY = NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY.copy(
+    platformName = "Android-Generic-Touch",
+    deviceType = "PHONE",
+    clientVersion = GFN_ANDROID_NATIVE_APP_VERSION,
+    userAgent = nativeAndroidCloudMatchUserAgent(Build.VERSION.RELEASE),
 )
 
 // Default high-quality allocation for Android TVs other than an explicitly detected SHIELD.
@@ -230,7 +244,11 @@ private fun cloudMatchClientIdentity(
         return NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY
     }
     if (appLaunchMode != null && preferNativeAndroidMode) {
-        return if (isAndroidTv) NVIDIA_NATIVE_TV_CLOUD_MATCH_IDENTITY else NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
+        return when {
+            isAndroidTv -> NVIDIA_NATIVE_TV_CLOUD_MATCH_IDENTITY
+            streamingBaseUrl.isNullOrBlank() || host?.let(::isNvidiaCloudMatchHost) == true -> NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
+            else -> ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
+        }
     }
     val requestedNativeIdentity = when {
         appLaunchMode == null || !preferNativeDesktopMode -> null
@@ -533,12 +551,12 @@ private fun requestedStreamingFeatures(settings: StreamSettings, profile: Stream
     }
 
 /** CloudMatch's native allocation must agree with the subsequent NVST RTSP handshake. */
-private fun JsonObjectBuilder.putStreamTransportRequest(settings: StreamSettings?) {
+private fun JsonObjectBuilder.putStreamTransportRequest(settings: StreamSettings?, nativeAndroidTransport: Boolean = false) {
     val nvst = settings?.experimentalNvst == true
     if (nvst) put("streamerVersion", "14") else put("streamerVersion", 1)
     put("sdkVersion", if (nvst) "2.0" else "1.0")
     put("enhancedStreamMode", if (nvst) 0 else 1)
-    put("secureRTSPSupported", nvst)
+    put("secureRTSPSupported", nvst || nativeAndroidTransport)
     if (nvst) {
         put("requestedAudioFormat", 0)
         put("transport", JsonNull)
@@ -576,9 +594,10 @@ private fun streamSessionMetadata(
     profile: StreamRequestProfile,
     physicalDisplayResolution: Pair<Int, Int>? = null,
     streamingBaseUrl: String? = null,
+    nativeAndroidTransport: Boolean = false,
 ): JsonArray = buildJsonArray {
     baseWebRtcSessionMetadata(streamingBaseUrl).forEach { entry ->
-        if (!settings.experimentalNvst || entry.jsonObject["key"]?.jsonPrimitive?.content != "GSStreamerType") add(entry)
+        if ((!settings.experimentalNvst && !nativeAndroidTransport) || entry.jsonObject["key"]?.jsonPrimitive?.content != "GSStreamerType") add(entry)
     }
     val requestedResolution = profile.width to profile.height
     val (physicalWidth, physicalHeight) = physicalDisplayResolution
@@ -692,7 +711,7 @@ internal fun buildMinimalClaimRequestBody(
                 controllerCapabilities.supportedControllerTypes.forEach { add(JsonPrimitive(it)) }
             }
             put("clientVersion", "30.0")
-            putStreamTransportRequest(settings)
+            putStreamTransportRequest(settings, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
             put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
@@ -704,7 +723,7 @@ internal fun buildMinimalClaimRequestBody(
             put(
                 "metaData",
                 if (settings != null && profile != null) {
-                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl)
+                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
                 } else {
                     baseWebRtcSessionMetadata(streamingBaseUrl)
                 },
@@ -1021,8 +1040,8 @@ internal fun cloudMatchHeaders(
         .add("nv-client-streamer", identity.streamer)
         .add("nv-client-type", identity.clientType)
         .add("nv-client-version", identity.clientVersion)
-        .add("nv-device-make", "UNKNOWN")
-        .add("nv-device-model", "UNKNOWN")
+        .add("nv-device-make", if (identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY) Build.BRAND.orEmpty().ifBlank { "UNKNOWN" } else "UNKNOWN")
+        .add("nv-device-model", if (identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY) Build.MODEL.orEmpty().ifBlank { "UNKNOWN" } else "UNKNOWN")
         .add("nv-device-os", identity.deviceOs)
         .add("nv-device-type", deviceType)
         .add("x-device-id", deviceId)
@@ -3600,14 +3619,14 @@ class GfnSessionRepository(
                 put("clientIdentification", "GFN-PC")
                 put("deviceHashId", deviceId)
                 put("clientVersion", "30.0")
-                putStreamTransportRequest(settings)
+                putStreamTransportRequest(settings, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
                 put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps, identity))
                 }
                 put("useOps", true)
                 put("audioMode", 2)
-                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl))
+                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY))
                 put("sdrHdrMode", if (profile.hdrEnabled) 1 else 0)
                 put("clientDisplayHdrCapabilities", if (profile.hdrEnabled) hdrCapabilitiesJson() else JsonNull)
                 put("surroundAudioInfo", 0)
@@ -3681,6 +3700,7 @@ class GfnSessionRepository(
             mediaConnectionInfo = signaling?.mediaConnectionInfo,
             bundleConnectionInfo = signaling?.bundleConnectionInfo,
             rtspsEndpoints = nvstRtspEndpoints(session.arr("connectionInfo")),
+            nativeTransportRequired = signaling?.nativeTransportRequired == true,
             negotiatedStreamProfile = extractNegotiatedStreamProfile(session),
             monitorSnapshot = extractSessionMonitorSnapshot(session),
             requestedStreamingFeatures = normalizeStreamingFeatures(session.obj("sessionRequestData")?.obj("requestedStreamingFeatures")),

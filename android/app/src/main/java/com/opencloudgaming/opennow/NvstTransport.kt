@@ -36,6 +36,10 @@ internal fun parseNvstNetworkMetrics(detail: String): NvstNetworkMetrics {
     )
 }
 
+/** Honor the server protocol without changing the user's persisted experimental preference. */
+internal fun SessionInfo.usesNvstTransport(settings: StreamSettings): Boolean =
+    settings.experimentalNvst || nativeTransportRequired
+
 internal const val NVST_OPT_IN_VERSION = 1
 
 /** Disable the 1.6.3 automatic opt-in once. Later explicit choices survive restarts. */

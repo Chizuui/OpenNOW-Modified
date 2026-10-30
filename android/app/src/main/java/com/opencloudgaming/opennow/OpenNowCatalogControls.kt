@@ -92,6 +92,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import coil3.compose.AsyncImage
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
@@ -514,11 +515,23 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
     onRetry: () -> Unit, onLaunch: (String?) -> Unit, onSettingsChange: (AppSettings) -> Unit,
     modifier: Modifier = Modifier) {
     BackHandler(onBack = onDismiss)
-    val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings, state.regions) {
+    var queueTimeMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(state.printedWasteQueue) {
+        while (true) {
+            val now = System.currentTimeMillis()
+            queueTimeMs = now
+            // Wake at the next zone's expiry, so an open selector cannot keep a dead choice.
+            val nextExpiry = state.printedWasteQueue.values
+                .filter { isPrintedWasteQueueFresh(it.LastUpdated, now) }
+                .minOfOrNull { (it.LastUpdated + PRINTEDWASTE_MAX_QUEUE_AGE_SECONDS + 1) * 1000 }
+                ?: break
+            delay((nextExpiry - now).coerceIn(1, 60_000))
+        }
+    }
+    val zones = remember(state.printedWasteQueue, state.printedWasteMapping, state.printedWastePings, state.regions, queueTimeMs) {
         state.printedWasteQueue
-            .filter { (zoneId, _) -> isStandardPrintedWasteZone(zoneId) && state.printedWasteMapping[zoneId]?.nuked != true }
             .mapNotNull { (zoneId, zone) ->
-                val routingUrl = printedWasteRegionalUrl(zoneId, state.printedWasteMapping, state.regions)
+                val routingUrl = selectablePrintedWasteRegionalUrl(zoneId, zone, state.printedWasteMapping, state.regions, queueTimeMs)
                     ?: return@mapNotNull null
                 PrintedWasteZoneOption(
                     zoneId = zoneId,
@@ -566,8 +579,10 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
             ) {
                 dismissHigherPingWarning = false
                 pendingHigherPingLaunch = zone
-            } else {
+            } else if (isPrintedWasteQueueFresh(zone.zone.LastUpdated)) {
                 onLaunch(zone.routingUrl)
+            } else {
+                onRetry()
             }
         }
     }
@@ -712,7 +727,7 @@ internal fun PrintedWasteSelectorContent(state: OpenNowUiState, game: GameInfo, 
                         }
                         dismissHigherPingWarning = false
                         pendingHigherPingLaunch = null
-                        onLaunch(zone.routingUrl)
+                        if (isPrintedWasteQueueFresh(zone.zone.LastUpdated)) onLaunch(zone.routingUrl) else onRetry()
                     },
                 ) {
                     Text(stringResource(R.string.action_ok))

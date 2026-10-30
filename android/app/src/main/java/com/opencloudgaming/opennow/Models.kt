@@ -421,7 +421,7 @@ data class AndroidTouchSettings(
     val enabled: Boolean = true,
     val mousePad: Boolean = true,
     /** Allow background fingers to send mouse input while the virtual gamepad is visible. */
-    val mouseWithTouchController: Boolean = false,
+    val mouseWithTouchController: Boolean = true,
     /** Replaces the virtual gamepad with a WASD stick and independently configurable keyboard/mouse buttons. */
     val keyboardModeEnabled: Boolean = false,
     /** Individually movable keyboard/mouse buttons; not limited by the gamepad's extra-button count. */
@@ -2046,6 +2046,8 @@ data class SessionInfo(
     val signalingServer: String,
     val signalingUrl: String,
     val rtspsEndpoints: List<String> = emptyList(),
+    /** Selected CloudMatch endpoint requires native RTSP rather than WebRTC offers. */
+    val nativeTransportRequired: Boolean = false,
     val gpuType: String? = null,
     val iceServers: List<IceServer> = emptyList(),
     val mediaConnectionInfo: MediaConnectionInfo? = null,
@@ -2072,6 +2074,7 @@ internal data class NativeStreamTransportIdentity(
     val signalingServer: String,
     val signalingUrl: String,
     val rtspsEndpoints: List<String>,
+    val nativeTransportRequired: Boolean,
     val iceServers: List<IceServer>,
     val mediaConnectionInfo: MediaConnectionInfo?,
     val bundleConnectionInfo: MediaConnectionInfo?,
@@ -2084,6 +2087,7 @@ internal fun SessionInfo.nativeStreamTransportIdentity(): NativeStreamTransportI
         signalingServer = signalingServer,
         signalingUrl = signalingUrl,
         rtspsEndpoints = rtspsEndpoints,
+        nativeTransportRequired = nativeTransportRequired,
         iceServers = iceServers,
         mediaConnectionInfo = mediaConnectionInfo,
         bundleConnectionInfo = bundleConnectionInfo,

@@ -16,6 +16,7 @@ class GfnSessionConnectionsTest {
             {"usage":2,"ip":"203.0.113.20","port":49005},
             {"usage":17,"ip":"203.0.113.21","port":13749}
         ]""")!!
+        assertFalse(result.nativeTransportRequired)
         assertEquals("wss://web.abya.example:8443/nvst/?version=1", result.signalingUrl)
         assertEquals("web.abya.example:8443", result.signalingServer)
         assertEquals("203.0.113.10", result.serverIp)
@@ -36,6 +37,7 @@ class GfnSessionConnectionsTest {
                 "resourcePath":"rtsps://seat.abya.example:48322/rtsp"}]""")!!
             assertEquals("wss://seat.abya.example/nvst/", result.signalingUrl)
             assertEquals("seat.abya.example:443", result.signalingServer)
+            assertTrue(result.nativeTransportRequired)
             assertNull(result.mediaConnectionInfo)
             assertNull(result.bundleConnectionInfo)
         }
@@ -87,6 +89,29 @@ class GfnSessionConnectionsTest {
     @Test fun legacySavedSessionsStillLoadWithoutBundleMapping() {
         val session = OpenNowJson.decodeFromString<SessionInfo>("""{"sessionId":"old","status":2,
             "serverIp":"203.0.113.10","signalingServer":"seat.example:443","signalingUrl":"wss://seat.example/nvst/"}""")
+        assertFalse(session.nativeTransportRequired)
         assertNull(session.bundleConnectionInfo)
     }
+
+    @Test fun nativeWebSocketDescriptorDoesNotHideRealWebRtcEndpoint() {
+        val result = resolve("""[
+            {"usage":14,"appLevelProtocol":6,"resourcePath":"wss://native.example/nvst/"},
+            {"usage":14,"appLevelProtocol":5,"resourcePath":"wss://webrtc.example/nvst/"}
+        ]""")!!
+        assertFalse(result.nativeTransportRequired)
+        assertEquals("wss://webrtc.example/nvst/", result.signalingUrl)
+    }
+
+    @Test fun nativeAllocationSelectsNvstWithoutPersistingExperimentalOptIn() {
+        val settings = StreamSettings(experimentalNvst = false)
+        val session = SessionInfo("id", 2, serverIp = "seat.example",
+            signalingServer = "seat.example:443", signalingUrl = "wss://seat.example/nvst/",
+            rtspsEndpoints = listOf("rtsps://seat.example:322"), nativeTransportRequired = true)
+        assertTrue(session.usesNvstTransport(settings))
+        assertFalse(settings.experimentalNvst)
+        assertFalse(session.copy(nativeTransportRequired = false).usesNvstTransport(settings))
+        assertTrue(session.copy(nativeTransportRequired = false).usesNvstTransport(settings.copy(experimentalNvst = true)))
+        assertNotEquals(session.nativeStreamTransportIdentity(), session.copy(nativeTransportRequired = false).nativeStreamTransportIdentity())
+    }
+
 }

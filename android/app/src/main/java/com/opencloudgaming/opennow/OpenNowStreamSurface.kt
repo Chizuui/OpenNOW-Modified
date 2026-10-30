@@ -147,6 +147,11 @@ internal fun StreamScreen(
     var controllerMouseAssistEnabled by remember(session?.sessionId) { mutableStateOf(false) }
     var controllerMouseEmulationEnabled by remember(session?.sessionId) { mutableStateOf(state.settings.controllerMouseEmulation) }
     val streamReady = state.isNativeStreamReady()
+    val crashDiagnostics = (context.applicationContext as OpenNowApplication).javaCrashDiagnostics
+    DisposableEffect(session?.sessionId, streamReady, streamState, streamGuideOpen, controlsOpen) {
+        crashDiagnostics.streamContext = "streamReady=$streamReady state=$streamState guide=$streamGuideOpen controls=$controlsOpen"
+        onDispose { crashDiagnostics.streamContext = "Stream UI transition or disposal" }
+    }
     val tvProfile = state.androidTvProfile
     LaunchedEffect(session?.sessionId) {
         videoTransportFallbackReason = null
@@ -400,6 +405,13 @@ internal fun StreamScreen(
                 controllerMouseAssistEnabled = it
             },
         )
+    }
+
+    LaunchedEffect(state.streamStatus) {
+        if (state.streamStatus == "stopping") {
+            client.stop()
+            onMicrophoneCaptureActiveChange(false)
+        }
     }
 
     val screenshotAction = rememberStreamScreenshotAction(
@@ -1574,6 +1586,9 @@ internal fun StreamScreen(
                         onKeepPlaying = { exitConfirmOpen = false },
                         onExit = {
                             exitConfirmOpen = false
+                            // Invalidate offer/reconnect jobs in the same UI event, before the
+                            // CloudMatch stop request can suspend waiting for its response.
+                            client.stop()
                             viewModel.stopStream(StreamStopOrigin.StreamExitConfirmation)
                         },
                     )

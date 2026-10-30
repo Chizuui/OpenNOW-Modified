@@ -31,9 +31,19 @@ class OpenNowApplication : Application(), SingletonImageLoader.Factory {
     internal val authRepository by lazy { GfnAuthRepository(this, authStore, httpClient) }
     internal val localTvConnector by lazy { LocalTvConnector() }
     internal val diagnosticHistoryStore by lazy { DiagnosticHistoryStore(filesDir) }
+    internal val javaCrashDiagnostics by lazy { JavaCrashDiagnostics(filesDir.resolve("diagnostic-history")) }
 
     override fun onCreate() {
         super.onCreate()
+        javaCrashDiagnostics.loadPrevious()
+        val androidCrashHandler = Thread.getDefaultUncaughtExceptionHandler()
+            ?: Thread.UncaughtExceptionHandler { _, _ ->
+                android.os.Process.killProcess(android.os.Process.myPid())
+                kotlin.system.exitProcess(10)
+            }
+        Thread.setDefaultUncaughtExceptionHandler(
+            javaCrashDiagnostics.handler(androidCrashHandler, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE),
+        )
         runCatching { diagnosticHistoryStore.beginAppRun() }
             .onFailure { error ->
                 Log.w(OPENNOW_DEBUG_LOG_TAG, "Could not rotate diagnostic history", error)

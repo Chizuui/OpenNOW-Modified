@@ -692,7 +692,7 @@ class SpaceUiInstrumentedTest {
                     onLaunch = { _, variant -> launched = variant.id }, onSetDefaultStore = { _, _ -> },
                     onDismiss = { storePicker = false })
                 else PrintedWasteSelectorContent(OpenNowUiState(
-                    printedWasteQueue = mapOf("NP-LAX-03" to PrintedWasteZone(12, Region = "US Southwest")),
+                    printedWasteQueue = mapOf("NP-LAX-03" to PrintedWasteZone(12, LastUpdated = System.currentTimeMillis() / 1000, Region = "US Southwest")),
                     printedWasteMapping = mapOf("NP-LAX-03" to PrintedWasteServerMappingEntry("Southern California", "US Southwest", is5080Server = true)),
                     regions = listOf(StreamRegion("Southern California", "https://us-california-south.cloudmatchbeta.nvidiagrid.net/"))), game,
                     onDismiss = {}, onRetry = {}, onLaunch = { launched = it }, onSettingsChange = {})

@@ -77,11 +77,23 @@ class DiagnosticSchemaTest {
             listOf("available", "phase", "showAfterStream", "scale", "algorithmVersion"))
         val finding = obj(mapOf("reasonCode" to str, "category" to str, "confidence" to str,
             "possibleReason" to str, "evidencePaths" to array(str), "timestamp" to str,
-            "httpStatus" to nullable(int), "providerStatus" to type("object"), "error" to str),
+            "httpStatus" to nullable(int), "providerStatus" to type("object"), "error" to str, "occurrences" to int),
             listOf("reasonCode", "category", "confidence", "possibleReason", "evidencePaths"))
         val inputDiagnostics = obj(mapOf("state" to buildJsonObject {
             put("type", "object"); put("additionalProperties", inputEntry)
         }, "events" to array(inputEntry)))
+        val connectionIssue = obj(mapOf("reasonCode" to str, "timestamp" to str, "phase" to str,
+            "handshakeStage" to str, "exceptionClasses" to array(str)),
+            listOf("reasonCode", "timestamp", "phase", "handshakeStage"))
+        val counts = buildJsonObject { put("type", "object"); put("additionalProperties", int) }
+        val connectionAttempt = obj(mapOf("attempt" to int, "endpoint" to str, "reconnect" to bool,
+            "startedAt" to str, "uptimeMs" to int, "elapsedMs" to int, "phase" to str,
+            "handshakeStage" to str, "handshakeStagesMs" to counts, "localCloseRequested" to bool,
+            "ended" to bool, "handshakeMs" to int, "lastReceiveAfterStartMs" to int,
+            "httpStatus" to int, "tlsVersion" to str, "closeCode" to int,
+            "received" to counts, "sendQueued" to counts, "sendRejected" to counts, "issues" to array(connectionIssue)),
+            listOf("attempt", "endpoint", "reconnect", "startedAt", "uptimeMs", "elapsedMs", "phase",
+                "handshakeStage", "handshakeStagesMs", "localCloseRequested", "ended", "received", "sendQueued", "sendRejected", "issues"))
         val properties = linkedMapOf(
             "schemaVersion" to buildJsonObject { put("const", 2) },
             "capturedAt" to str, "capturedAtEpochMs" to int, "uptimeMs" to int, "timezone" to constant("UTC"),
@@ -117,9 +129,17 @@ class DiagnosticSchemaTest {
                 "capturedChars" to int, "characterLimit" to int, "bodyCharacterLimit" to int, "truncatedBodies" to int)),
                 "stream" to obj(mapOf("sampleLimit" to int, "totalSamples" to int, "retainedSamples" to int, "evictedSamples" to int)))),
             "input" to inputDiagnostics,
+            "streamConnections" to obj(mapOf("attemptLimit" to int, "totalAttempts" to int,
+                "evictedAttempts" to int, "attempts" to array(connectionAttempt))),
             "events" to array(obj(mapOf("timestamp" to str, "category" to str, "message" to str))),
             "api" to array(api), "sessionScore" to score,
             "processExitHistory" to descriptor(DiagnosticProcessExitHistory.serializer().descriptor),
+            "previousJavaCrash" to obj(mapOf(
+                "scope" to constant("previous_process_uncaught_java_exception"),
+                "timestampEpochMs" to int, "timestamp" to str,
+                "version" to str, "build" to int, "thread" to str, "streamContext" to str,
+                "stackTrace" to buildJsonObject { put("type", "string"); put("maxLength", 32768) },
+            )),
             "failureAssessment" to obj(mapOf("rulesVersion" to int, "crashConclusion" to constant("not_established"),
                 "crashEvidence" to str, "scope" to constant("retained_run_records"), "limitations" to str, "findings" to array(finding))),
         )
@@ -127,7 +147,7 @@ class DiagnosticSchemaTest {
             put("\$schema", "https://json-schema.org/draft/2020-12/schema")
             put("title", "OpenNOW Android diagnostic parser format 2")
             put("anyOf", JsonArray(listOf(
-                obj(properties, properties.keys.filter { it != "codecs" && it != "lastCompletedStream" }),
+                obj(properties, properties.keys.filter { it !in setOf("codecs", "lastCompletedStream", "streamConnections", "previousJavaCrash") }),
                 obj(mapOf("schemaVersion" to buildJsonObject { put("const", 2) },
                     "incomplete" to buildJsonObject { put("const", true) },
                     "persistence" to obj(mapOf("truncated" to buildJsonObject { put("const", true) },
