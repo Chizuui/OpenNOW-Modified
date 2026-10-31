@@ -224,13 +224,20 @@ private fun cloudMatchClientIdentity(
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
     preferNativeAndroidMode: Boolean = false,
+    preferNvstTransport: Boolean = false,
 ): CloudMatchClientIdentity {
     // The opt-in applies only to NVIDIA. Alliance client identities are provider-owned.
     val host = streamingBaseUrl?.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
     if (preferBrowserMode && (streamingBaseUrl.isNullOrBlank() || host?.let(::isNvidiaCloudMatchHost) == true)) {
         return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     }
-    // Touch sessions use the desktop-native CloudMatch identity (NVIDIA-CLASSIC / NATIVE)
+    // NVIDIA's native client class allocates RTSP-only touch seats even when the request
+    // echoes GSStreamerType=WebRTC. Keep the client class aligned with the chosen transport.
+    if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY && !preferNvstTransport &&
+        (streamingBaseUrl.isNullOrBlank() || host?.let(::isNvidiaCloudMatchHost) == true)) {
+        return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
+    }
+    // NVST touch sessions use the desktop-native CloudMatch identity (NVIDIA-CLASSIC / NATIVE)
     // with Android os + TABLET device type, so the server allocates the full desktop
     // resolution matrix (including ultrawide 2560×1080) while still enabling the
     // native touch digitizer on the host.
@@ -264,6 +271,10 @@ private fun cloudMatchPlatformName(identity: CloudMatchClientIdentity, appLaunch
     } else {
         identity.platformName
     }
+
+/** Keep YES allocation aligned with its working native Android streaming path. */
+private fun CloudMatchClientIdentity.requiresNativeSessionTransport(streamingBaseUrl: String?): Boolean =
+    this == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY || requiresNativeAllianceCloudMatchTransport(streamingBaseUrl)
 
 internal fun isNvidiaShieldTvDevice(
     androidTvProfile: Boolean,
@@ -571,10 +582,10 @@ private fun cloudMatchLatencyMetadataHost(streamingBaseUrl: String?): String? {
     }
 }
 
-private fun baseWebRtcSessionMetadata(streamingBaseUrl: String? = null): JsonArray = buildJsonArray {
+private fun baseWebRtcSessionMetadata(streamingBaseUrl: String? = null, nativeTransport: Boolean = false): JsonArray = buildJsonArray {
     add(metadataEntry("SubSessionId", UUID.randomUUID().toString()))
     add(metadataEntry("wssignaling", "1"))
-    add(metadataEntry("GSStreamerType", "WebRTC"))
+    if (!nativeTransport) add(metadataEntry("GSStreamerType", "WebRTC"))
     add(metadataEntry("networkType", "Unknown"))
     cloudMatchLatencyMetadataHost(streamingBaseUrl)?.let { host ->
         add(metadataEntry("latency@$host", "3"))
@@ -688,6 +699,7 @@ internal fun buildMinimalClaimRequestBody(
         preferBrowserMode = settings?.browserClientMode == true,
         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings?.requiresNativeDesktopCloudMatchMode() == true,
         preferNativeAndroidMode = settings?.requiresNativeAndroidCloudMatchMode() == true,
+        preferNvstTransport = settings?.experimentalNvst == true,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
@@ -705,7 +717,7 @@ internal fun buildMinimalClaimRequestBody(
                 controllerCapabilities.supportedControllerTypes.forEach { add(JsonPrimitive(it)) }
             }
             put("clientVersion", "30.0")
-            putStreamTransportRequest(settings, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
+            putStreamTransportRequest(settings, identity.requiresNativeSessionTransport(streamingBaseUrl))
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
             put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
@@ -717,9 +729,9 @@ internal fun buildMinimalClaimRequestBody(
             put(
                 "metaData",
                 if (settings != null && profile != null) {
-                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
+                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl))
                 } else {
-                    baseWebRtcSessionMetadata(streamingBaseUrl)
+                    baseWebRtcSessionMetadata(streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl))
                 },
             )
             put("surroundAudioInfo", 0)
@@ -1015,6 +1027,7 @@ internal fun cloudMatchHeaders(
     isAndroidTv: Boolean = false,
     useDesktopNativeTvIdentity: Boolean = false,
     preferNativeAndroidMode: Boolean = false,
+    preferNvstTransport: Boolean = false,
 ): Headers {
     val identity = cloudMatchClientIdentity(
         streamingBaseUrl = streamingBaseUrl,
@@ -1022,18 +1035,21 @@ internal fun cloudMatchHeaders(
         preferBrowserMode = preferBrowserMode,
         preferNativeDesktopMode = preferNativeDesktopMode,
         preferNativeAndroidMode = preferNativeAndroidMode,
+        preferNvstTransport = preferNvstTransport,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
     val userAgent = when {
-        preferBrowserMode && identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.userAgent
+        (preferBrowserMode || appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) &&
+            identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.userAgent
         identity == NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY -> identity.userAgent
         isAndroidTv -> GFN_ANDROID_TV_USER_AGENT
         appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY -> GFN_ANDROID_TOUCH_USER_AGENT
         else -> identity.userAgent
     }
     val deviceType = when {
-        preferBrowserMode && identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.deviceType
+        (preferBrowserMode || appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) &&
+            identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.deviceType
         isAndroidTv -> "DESKTOP"
         appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY -> "TABLET"
         else -> identity.deviceType
@@ -3240,6 +3256,8 @@ class GfnSessionRepository(
     private val isAndroidTv: Boolean = false,
     private val useDesktopNativeTvIdentity: Boolean = isAndroidTv,
 ) {
+    private val sessionConnections = GfnSessionConnectionResolver()
+
     suspend fun createSession(
         token: String,
         streamingBaseUrl: String?,
@@ -3282,6 +3300,7 @@ class GfnSessionRepository(
                     preferBrowserMode = settings.browserClientMode,
                     preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                     preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+                    preferNvstTransport = settings.experimentalNvst,
                     isAndroidTv = isAndroidTv,
                     useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                 ),
@@ -3377,7 +3396,7 @@ class GfnSessionRepository(
             val s = raw.asObject() ?: return@mapNotNull null
             val status = s.int("status") ?: return@mapNotNull null
             if (status !in setOf(1, 2, 3)) return@mapNotNull null
-            val connections = resolveGfnSessionConnections(s, base)
+            val connections = sessionConnections.resolve(s)
             val connIp = connections?.serverIp
             val controlIp = s.obj("sessionControlInfo")?.string("ip")
             val monitor = activeSessionMonitorSettings(s)
@@ -3437,6 +3456,7 @@ class GfnSessionRepository(
         val validation = runCatching { OpenNowJson.parseToJsonElement(validationText).jsonObject }.getOrNull()
         sessionClaimResponseFailure(validationCode, validation?.obj("requestStatus")?.int("statusCode"))
             ?.let { throw IllegalStateException(it) }
+        validation?.obj("session")?.let { sessionConnections.resolve(it) }
         val status = validation?.obj("session")?.int("status")
         if (status != null && isTerminalSessionStatus(status)) {
             val latestSession = runCatching {
@@ -3468,6 +3488,7 @@ class GfnSessionRepository(
                         preferBrowserMode = settings.browserClientMode,
                         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                         preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+                        preferNvstTransport = settings.experimentalNvst,
                         isAndroidTv = isAndroidTv,
                         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                     ),
@@ -3611,6 +3632,7 @@ class GfnSessionRepository(
             preferBrowserMode = settings.browserClientMode,
             preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
             preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
+            preferNvstTransport = settings.experimentalNvst,
             isAndroidTv = isAndroidTv,
             useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
         )
@@ -3628,14 +3650,14 @@ class GfnSessionRepository(
                 put("clientIdentification", "GFN-PC")
                 put("deviceHashId", deviceId)
                 put("clientVersion", "30.0")
-                putStreamTransportRequest(settings, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY)
+                putStreamTransportRequest(settings, identity.requiresNativeSessionTransport(streamingBaseUrl))
                 put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps, identity))
                 }
                 put("useOps", true)
                 put("audioMode", 2)
-                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY))
+                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl)))
                 put("sdrHdrMode", if (profile.hdrEnabled) 1 else 0)
                 put("clientDisplayHdrCapabilities", if (profile.hdrEnabled) hdrCapabilitiesJson() else JsonNull)
                 put("surroundAudioInfo", 0)
@@ -3682,7 +3704,7 @@ class GfnSessionRepository(
         }
         val session = payload.obj("session") ?: error("CloudMatch response missing session")
         val sessionStatus = session.int("status") ?: 0
-        val signaling = runCatching { resolveSignaling(payload, base) }.getOrElse { error ->
+        val signaling = runCatching { resolveSignaling(payload) }.getOrElse { error ->
             if (sessionStatus in READY_SESSION_STATUSES) {
                 throw error
             }
@@ -3854,12 +3876,12 @@ class GfnSessionRepository(
 
     private fun streamingServerIp(payload: JsonObject): String? =
         payload.obj("session")?.let { session ->
-            resolveGfnSessionConnections(session)?.serverIp
+            sessionConnections.resolve(session)?.serverIp
                 ?: session.obj("sessionControlInfo")?.string("ip")?.let(::usableSessionHost)
         }
 
-    private fun resolveSignaling(payload: JsonObject, streamingBaseUrl: String): GfnSessionConnections =
-        resolveGfnSessionConnections(payload.obj("session") ?: error("Missing session"), streamingBaseUrl)
+    private fun resolveSignaling(payload: JsonObject): GfnSessionConnections =
+        sessionConnections.resolve(payload.obj("session") ?: error("Missing session"))
             ?: error("CloudMatch response did not include a signaling host")
 
     private fun isZoneHostname(value: String): Boolean =

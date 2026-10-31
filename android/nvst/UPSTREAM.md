@@ -12,6 +12,63 @@ RTSP disconnect (never send TEARDOWN on local stop or reconnect), keep the curso
 composited by the server, and retain Android's selected FPS up to 360. Android owns MediaCodec,
 audio playback, UI, and CloudMatch session termination.
 
+Transport selection and decoder startup correction (2026-10-31), compared with dev
+5b89338a3 (`opennow-core/src/cloudmatch.rs` and platform-linux `src/session.rs`):
+- The RMX3890 reports reach H.264/H.265 MediaCodec configuration, then a caught
+  IllegalStateException with zero queued video buffers; reconnects receive OPTIONS 400.
+  Their CloudMatch payloads explicitly report WebRTC despite RTSPS-shaped endpoints.
+  Android now honors reported allocation transport for NVIDIA as well as partners,
+  retaining that evidence in a bounded per-session cache across sparse poll/resume replies.
+  Explicit user NVST opt-in still selects NVST; missing allocation metadata keeps the
+  existing endpoint fallback. Request profiles and provider identities are unchanged.
+- The direct-Java texture decoder retries a rejected tuned instance once with a fresh,
+  untuned hardware decoder inside the same attachment, following dev's local decoder
+  recovery ownership. Codec, dimensions, FPS and persisted settings are preserved.
+- The pinned WebRTC 144.7559.14 releaseInternal skips codec release before running=true,
+  which is set only after configure/start succeeds. The codec wrapper now releases failed
+  startup exactly once on both tuned and untuned paths; failed cleanup prevents a retry.
+  Platform configure/start causes and bounded Java traces are retained before WebRTC
+  converts the error into a status code. WebRTC keeps ownership of its own fallback.
+- If local video initialization/decode still throws, Android reports a decoder failure
+  and stops locally, retaining the cloud session instead of re-opening RTSP or claiming
+  another attachment. Transport errors keep their existing bounded recovery policy.
+
+Regression tests cover NVIDIA's reported WebRTC allocation with NVST off, explicit NVST
+opt-in, sparse-response retention, startup fallback and codec cleanup. Live playback on
+the affected phone still needs verification; these changes do not rewrite NVST negotiation.
+
+Fortnite native-touch allocation correction (2026-10-31), compared with iOS b3894f2bb
+(`NativeStreamNVSTConfiguration.swift`): a Pixel 9a on Android 17 reproduced the remaining
+failure with NVST off. TOUCH_FRIENDLY sent NVIDIA-CLASSIC/NATIVE headers and an Android
+platform, but requested GSStreamerType=WebRTC. CloudMatch echoed that metadata while
+allocating only RTSPS descriptors; the WebSocket registered but never produced an offer.
+NVIDIA touch launches/resumes now use a browser client identity when NVST is off, and the
+native touch identity when NVST is on. Launch input mode 3, digitizer provisioning, requested
+geometry/FPS, saved transport preference and alliance identities are preserved.
+
+With the corrected APK installed, a fresh Fortnite native-touch/WebRTC session produced
+an offer, connected ICE and both input channels, rendered the Epic launcher at 58-60 FPS,
+and accepted touch input opening its remote settings panel. The free-tier host negotiated
+1366x768 despite the unchanged 1920x1200@60 request. Gameplay beyond Epic authentication
+was not tested; no account password was supplied during this check.
+
+A second fresh Fortnite launch with NVST explicitly enabled completed native negotiation,
+decoded H.264 at the requested 1920x1200, sustained 59-60 FPS, and accepted a native touch
+tap opening the same remote settings panel. The original NVST-off preference was restored
+after testing. These checks verify both transport choices and remote launcher touch input
+on the Pixel 9a, not gameplay beyond Epic authentication or the RMX3890 hardware decoder.
+
+WebRTC startup fallback extension (2026-10-31): the RMX3890 2.2.8 report now receives
+WebRTC offers, opens input channels and receives about 60 FPS, but c2.qti.avc.decoder
+repeatedly rejects MediaCodec.start with vendor low-latency tuning enabled. The untuned
+startup retry previously wrapped only direct-Java NVST. It now covers WebRTC too, preserves
+its untuned choice across WebRTC Release/InitDecode cycles, and remembers rejected tuning
+per hardware decoder for the factory lifetime. A failed release prevents another decoder
+from starting; initialization/cleanup exceptions become status codes at the JNI boundary.
+CodecException diagnostics now retain the platform diagnostic string, code, recoverability
+and transience. Lifecycle regression tests cover this correction; untuned playback on the
+affected RMX3890 still requires an updated build and device verification.
+
 To refresh, compare the two crates and src/nvst_rtsp.rs against native/opennow-streamer
 at the recorded upstream revision, retaining the Android lifecycle differences.
 
@@ -28,6 +85,24 @@ https://github.com/moonlight-stream/moonlight-common-c/blob/master/src/ControlSt
 Touch records and OC report layout reuse Android's existing input protocol. Mapping those records
 onto native RemoteInput and the native descriptor indices needs live GFN/device verification;
 unit tests cover framing, bounds, motor ordering, and Opus/RED round trips, not host acceptance.
+
+Alliance native startup correction (2026-10-30), compared with dev 5b89338a3:
+- YES CloudMatch identities now request secure RTSP and omit GSStreamerType=WebRTC
+  in both CREATE and RESUME. The YES logs reached WSS registration/heartbeats but never an
+  offer; the user confirmed the official Android app streams the same game. Existing reported
+  WebRTC allocations retain their WebRTC interpretation; this changes new YES native requests.
+  Other alliance providers retain their existing allocation defaults.
+- Partner negotiation uses dev's legacy bundle NATT username plus decimal bundle port, retains
+  a valid server-offered runtime key, and authenticates DTLS before finishing PLAY startup.
+- Partner ANNOUNCE emits the selected enableUnifiedSocket value once. The old Android template
+  appended a second hard-coded zero, contradicting the unified receiver on partner seats.
+- Kotlin supplies the partner flag from the named CloudMatch provider base. Missing, direct-IP,
+  and NVIDIA contexts do not enable these rules. NVIDIA request and RTSP negotiation behavior
+  stay on the existing path. Startup waits and retained pre-PLAY events have bounded budgets;
+  cancellation/failure closes only the local attachment and retains the cloud session.
+
+Rust negotiation/transport tests and Android request-profile tests cover these changes. Live YES
+startup and video still require verification with the updated build; the supplied logs predate it.
 
 Startup validation on Android (2026-09-07) found `invalid-media-peer` when Android's WebRTC
 fallback classified an RTSPS usage-14 control endpoint as the UDP bundle peer. RTSP connections
