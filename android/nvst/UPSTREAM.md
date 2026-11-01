@@ -189,3 +189,10 @@ Android already defaults to WebRTC, so no desktop compatibility-mode preference 
 provider identity policy was copied. Existing Android JNI/media/input ownership and
 attachment-only disconnect remain. Scripted SETUP and encrypted UDP loopback tests
 cover negotiation and media demux; ABYA/provider acceptance still needs a live session.
+
+YES native bundle peer correction (2026-11-01): exported YES logs show native NVST reaching SETUP
+and then never authenticating DTLS on the usage-17 mapping (before or after PLAY), while WebRTC on
+the same seat connects through the usage-2 mapping (the offer's single bundled port is rewritten to
+it). For `.yes.geforcenow.nvidiagrid.net` bases Kotlin therefore omits the usage-17 entry, so Rust's
+`bundle_endpoint` falls back to the usage-2 media mapping. Other alliance providers keep usage 17.
+DTLS authentication again completes before PLAY (dev ordering). Not verified live on a YES seat.

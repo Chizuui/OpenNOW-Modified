@@ -264,13 +264,12 @@ fn run(
         return Ok(());
     }
     let mut pending_events = VecDeque::new();
-    let _rtsp = prepared.finish().map_err(|e| e.message)?;
     if alliance_partner {
         event(
             env,
             callback,
             "stage",
-            "Alliance NVST PLAY sent; waiting for authenticated DTLS",
+            "Alliance NVST waiting for authenticated DTLS before PLAY",
         )
         .map_err(|e| e.to_string())?;
         nvst_rtsp::alliance::wait_authenticated_transport(|| {
@@ -282,7 +281,7 @@ fn run(
                     NvstReceiveEvent::TransportReady("dtls") => return Ok(true),
                     NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) =>
                         return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
-                            "Alliance NVST authentication timed out after PLAY; cloud session retained")),
+                            "Alliance NVST authentication timed out before PLAY; cloud session retained")),
                     other => {
                         if pending_events.len() >= 128 {
                             return Err(nvst_rtsp::NvstRtspError::new("nvst-startup-event-overflow",
@@ -295,6 +294,7 @@ fn run(
             Ok(false)
         }, Duration::from_secs(8)).map_err(|e| format!("{}: {}", e.code, e.message))?;
     }
+    let _rtsp = prepared.finish().map_err(|e| e.message)?;
     feedback.set_application_ready(true);
     event(env, callback, "connected", "NVST encrypted UDP").map_err(|e| e.to_string())?;
     let mut last_stats = Instant::now();

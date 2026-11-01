@@ -15,5 +15,14 @@ internal fun isAllianceCloudMatchBase(streamingBaseUrl: String?): Boolean {
         host.any(Char::isLetter)
 }
 
+/**
+ * YES seats only answer ICE/DTLS on the usage-2 mapping: the WebRTC offer is rewritten to it
+ * and connects, while the usage-17 mapping never authenticates for native NVST.
+ */
+internal fun isYesCloudMatchBase(streamingBaseUrl: String?): Boolean {
+    val host = streamingBaseUrl?.toHttpUrlOrNull()?.host ?: return false
+    return host == "yes.geforcenow.nvidiagrid.net" || host.endsWith(".yes.geforcenow.nvidiagrid.net")
+}
+
 /** YES seats work stably with WebRTC 3.0 signaling; NVST RTSP is optional via experimentalNvst. */
 internal fun requiresNativeAllianceCloudMatchTransport(streamingBaseUrl: String?): Boolean = false
