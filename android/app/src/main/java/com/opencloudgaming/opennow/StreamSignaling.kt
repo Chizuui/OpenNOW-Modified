@@ -59,7 +59,7 @@ internal fun buildGfnSignInUrl(
         "wss://$authorityAndPath/sign_in"
     }
     fun queryValue(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
-    val version = "3.0"
+    val version = if (reconnect) "3.0" else "2"
     return buildString {
         append(signInBase)
         append("?peer_id=")
@@ -294,7 +294,7 @@ class GfnSignalingClient(
         onEvent(SignalingEvent.Log("Sending peer info resolution=${width}x$height peer=$peerName"))
         sendJson(
             """
-            {"ackid":${nextAckId()},"peer_info":{"browser":"Chrome","browserVersion":"131.0.0.0","connected":true,"id":$peerId,"name":"$peerName","peer_role":1,"resolution":"${width}x$height","signalingVersion":"3.0","version":3}}
+            {"ackid":${nextAckId()},"peer_info":{"browser":"Chrome","browserVersion":"131","connected":true,"id":$peerId,"name":"$peerName","peerRole":0,"resolution":"${width}x$height","version":2}}
             """.trimIndent(),
             "peer_info",
         )

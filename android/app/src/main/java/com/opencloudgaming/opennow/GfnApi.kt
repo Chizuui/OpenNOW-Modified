@@ -228,9 +228,6 @@ private fun cloudMatchClientIdentity(
 ): CloudMatchClientIdentity {
     // Website client mode uses NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY (WebRTC platform="browser")
     val host = streamingBaseUrl?.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
-    // YES CloudMatch allocates RTSPS-only seats (no WebRTC offer) for the desktop/Android native
-    // identities, so WebRTC sessions must use the browser identity unless NVST was opted in.
-    if (!preferNvstTransport && isYesCloudMatchBase(streamingBaseUrl)) return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     // Native touch over NVST needs the native identity even when website mode is saved.
     if (preferBrowserMode && !(preferNvstTransport && appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY)) {
         return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY

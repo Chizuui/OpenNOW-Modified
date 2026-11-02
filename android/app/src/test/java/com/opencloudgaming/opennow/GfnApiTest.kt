@@ -665,7 +665,6 @@ class GfnApiTest {
             deviceId = "device",
             includeOrigin = true,
             streamingBaseUrl = "https://my-yes.yes.geforcenow.nvidiagrid.net",
-            preferNvstTransport = true,
         )
 
         assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
@@ -677,18 +676,6 @@ class GfnApiTest {
         assertEquals("https://play.geforcenow.com", headers["Origin"])
     }
 
-    @Test
-    fun yesWithoutNvstUsesBrowserIdentitySoCloudMatchAllocatesWebRtc() {
-        val headers = cloudMatchHeaders(
-            token = "token",
-            clientId = "client",
-            deviceId = "device",
-            includeOrigin = true,
-            streamingBaseUrl = "https://my-yes.yes.geforcenow.nvidiagrid.net",
-        )
-        assertEquals("WEBRTC", headers["nv-client-streamer"])
-        assertEquals("BROWSER", headers["nv-client-type"])
-    }
     @Test
     fun yesTransportProfileFollowsTheNvstChoice() {
         for (base in listOf("https://my-yes.yes.geforcenow.nvidiagrid.net", "https://prod.yes.geforcenow.nvidiagrid.net")) {
@@ -708,7 +695,12 @@ class GfnApiTest {
                 assertEquals(!nvst, data.getValue("metaData").jsonArray.any {
                     it.jsonObject["key"]?.jsonPrimitive?.contentOrNull == "GSStreamerType"
                 })
-                assertEquals(if (nvst) "windows" else "browser", data.getValue("clientPlatformName").jsonPrimitive.content)
+                val expectedPlatform = when {
+                    settings.browserClientMode -> "browser"
+                    settings.requiresNativeAndroidCloudMatchMode() -> "android"
+                    else -> "windows"
+                }
+                assertEquals(expectedPlatform, data.getValue("clientPlatformName").jsonPrimitive.content)
                 val monitor = data.getValue("clientRequestMonitorSettings").jsonArray.single().jsonObject
                 val (width, height) = streamResolutionPixels(settings)
                 assertEquals(width, monitor.getValue("widthInPixels").jsonPrimitive.int)
@@ -747,7 +739,7 @@ class GfnApiTest {
         )) {
             for (launchMode in listOf(GfnAppLaunchMode.GAMEPAD_FRIENDLY, GfnAppLaunchMode.TOUCH_FRIENDLY)) {
                 val nativeAndroid = nvidia && launchMode == GfnAppLaunchMode.GAMEPAD_FRIENDLY
-                val webRtcTouch = !nativeAndroid
+                val webRtcTouch = launchMode == GfnAppLaunchMode.TOUCH_FRIENDLY
                 val headers = cloudMatchHeaders(
                     token = "token",
                     clientId = "client",
@@ -1130,7 +1122,6 @@ class GfnApiTest {
             fps = 60,
             codec = VideoCodec.H264,
             colorQuality = ColorQuality.EightBit420,
-            experimentalNvst = true,
         )
 
         val sessionRequestData = buildMinimalClaimRequestBody(
