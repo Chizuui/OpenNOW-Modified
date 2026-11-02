@@ -264,21 +264,14 @@ fn run(
         return Ok(());
     }
     let mut pending_events = VecDeque::new();
-    // Partner rigs publish no video peer in SETUP and only start their streamer on PLAY, so a
-    // pre-PLAY DTLS wait never sees an inbound packet (logcat: inbound=0, SETUP peerless).
-    let _rtsp = prepared.finish().map_err(|e| e.message)?;
     if alliance_partner {
         event(
             env,
             callback,
             "stage",
-            "Alliance NVST PLAY complete; waiting for authenticated DTLS",
+            "Alliance NVST waiting for authenticated DTLS before PLAY",
         )
         .map_err(|e| e.to_string())?;
-        let control = state.control.lock().unwrap().clone();
-        // PLAY can block longer than the receiver's idle timeout. Idle reports raised before
-        // PLAY returned are stale: re-arm the receiver instead of failing the attachment.
-        let mut rearmed = 0;
         nvst_rtsp::alliance::wait_authenticated_transport(|| {
             if state.stopped.load(Ordering::Acquire) {
                 return Err(nvst_rtsp::NvstRtspError::new("nvst-cancelled", "NVST startup cancelled"));
@@ -286,13 +279,9 @@ fn run(
             while let Ok(notification) = events.try_recv() {
                 match notification {
                     NvstReceiveEvent::TransportReady("dtls") => return Ok(true),
-                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) => {
-                        if rearmed >= 2 || control.as_ref().is_none_or(|c| c.recover().is_err()) {
-                            return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
-                                "Alliance NVST authentication timed out after PLAY; cloud session retained"));
-                        }
-                        rearmed += 1;
-                    }
+                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) =>
+                        return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
+                            "Alliance NVST authentication timed out before PLAY; cloud session retained")),
                     other => {
                         if pending_events.len() >= 128 {
                             return Err(nvst_rtsp::NvstRtspError::new("nvst-startup-event-overflow",
@@ -303,8 +292,9 @@ fn run(
                 }
             }
             Ok(false)
-        }, Duration::from_secs(20)).map_err(|e| format!("{}: {}", e.code, e.message))?;
+        }, Duration::from_secs(8)).map_err(|e| format!("{}: {}", e.code, e.message))?;
     }
+    let _rtsp = prepared.finish().map_err(|e| e.message)?;
     feedback.set_application_ready(true);
     event(env, callback, "connected", "NVST encrypted UDP").map_err(|e| e.to_string())?;
     let mut last_stats = Instant::now();
