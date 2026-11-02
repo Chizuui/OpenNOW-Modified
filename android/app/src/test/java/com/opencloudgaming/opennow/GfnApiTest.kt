@@ -696,17 +696,13 @@ class GfnApiTest {
                 assertEquals(!nvst, data.getValue("metaData").jsonArray.any {
                     it.jsonObject["key"]?.jsonPrimitive?.contentOrNull == "GSStreamerType"
                 })
-                val expectedPlatform = when {
-                    settings.browserClientMode -> "browser"
-                    settings.requiresNativeAndroidCloudMatchMode() -> "android"
-                    !nvst -> "android"
-                    else -> "windows"
-                }
+                val expectedPlatform = if (nvst) "windows" else "browser"
                 assertEquals(expectedPlatform, data.getValue("clientPlatformName").jsonPrimitive.content)
                 val monitor = data.getValue("clientRequestMonitorSettings").jsonArray.single().jsonObject
-                val (width, height) = streamResolutionPixels(settings)
-                assertEquals(width, monitor.getValue("widthInPixels").jsonPrimitive.int)
-                assertEquals(height, monitor.getValue("heightInPixels").jsonPrimitive.int)
+                val (rawWidth, rawHeight) = streamResolutionPixels(settings)
+                val (expectedWidth, expectedHeight) = if (!nvst && rawWidth > 1920) 1920 to 1080 else rawWidth to rawHeight
+                assertEquals(expectedWidth, monitor.getValue("widthInPixels").jsonPrimitive.int)
+                assertEquals(expectedHeight, monitor.getValue("heightInPixels").jsonPrimitive.int)
             }
             val minimal = buildMinimalClaimRequestBody("123", "device", streamingBaseUrl = base)
                 .getValue("sessionRequestData").jsonObject
@@ -741,7 +737,7 @@ class GfnApiTest {
         )) {
             for (launchMode in listOf(GfnAppLaunchMode.GAMEPAD_FRIENDLY, GfnAppLaunchMode.TOUCH_FRIENDLY)) {
                 val nativeAndroid = nvidia && launchMode == GfnAppLaunchMode.GAMEPAD_FRIENDLY
-                val webRtcTouch = launchMode == GfnAppLaunchMode.TOUCH_FRIENDLY
+                val webRtcTouch = !nativeAndroid
                 val headers = cloudMatchHeaders(
                     token = "token",
                     clientId = "client",

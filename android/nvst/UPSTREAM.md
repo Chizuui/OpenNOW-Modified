@@ -197,13 +197,15 @@ it). For `.yes.geforcenow.nvidiagrid.net` bases Kotlin therefore omits the usage
 `bundle_endpoint` falls back to the usage-2 media mapping. Other alliance providers keep usage 17.
 DTLS authentication again completes before PLAY (dev ordering). Not verified live on a YES seat.
 
-YES WebRTC + Android native identity correction (2026-11-02):
-- On YES server `1.1054.0`, `ALLIANCE_CLOUD_MATCH_IDENTITY` (`clientPlatformName="windows"`,
-  `deviceOs="WINDOWS"`, `NVIDIA-CLASSIC`/`NATIVE`) allocates `2560x1080` in `monitorSettings`
-  but its streamer never produces a WebRTC offer (even with signaling v2).
-- In contrast, `ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY` (`clientPlatformName="android"`,
-  `deviceOs="ANDROID"`, `NVIDIA-CLASSIC`/`NATIVE`, `desktopMonitorDescriptor=true`) produced 4/4
-  WebRTC offers on YES server `1.1054.0` while keeping the native monitor descriptor (`dpi=100`,
-  `monitorId=0`) that previously unlocked `2560x1080` H.265 on YES (`20260727-111112`).
-- `cloudMatchClientIdentity` now selects `ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY` for YES
-  gamepad launches when `experimentalNvst=false` and `browserClientMode=false`.
+YES WebRTC + 1080p clamping correction (2026-11-02):
+- Live tests on YES server `1.1054.0` (`openow.txt` and `openow2.txt`) establish that BOTH
+  `ALLIANCE_CLOUD_MATCH_IDENTITY` (`clientPlatformName="windows"`, `NVIDIA-CLASSIC`/`NATIVE`) and
+  `ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY` (`clientPlatformName="android"`, `NVIDIA-CLASSIC`/`NATIVE`)
+  allocate `2560x1080` in `monitorSettings` yet never produce a WebRTC offer (`signaling_offer_timeout`).
+  Only `NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY` (`WEBRTC`/`BROWSER`/`platformName="browser"`) produces
+  WebRTC offers on YES server `1.1054.0`.
+- When `NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY` requests a resolution outside the browser monitor matrix
+  (such as `2560x1080`), YES falls back to `1680x720`. `StreamSettings.requestProfile` now clamps
+  out-of-matrix requests above `1920x1200` on YES browser sessions to `1920x1080` (`1920x1200` for
+  16:10) so the server provisions Full HD 1080p instead of dropping to 720p, matching the `dev`
+  branch's alliance WebRTC compatibility cap (#1098).

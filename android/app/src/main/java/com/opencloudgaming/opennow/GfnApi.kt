@@ -228,16 +228,15 @@ private fun cloudMatchClientIdentity(
 ): CloudMatchClientIdentity {
     // Website client mode uses NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY (WebRTC platform="browser")
     val host = streamingBaseUrl?.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
+    // YES server 1.1054.0 only produces WebRTC offers when allocated with the browser identity
+    // (WEBRTC / BROWSER / platformName="browser"); both WINDOWS and ANDROID native identities
+    // suppress WebRTC offers on YES.
+    if (!preferNvstTransport && isYesCloudMatchBase(streamingBaseUrl)) {
+        return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
+    }
     // Native touch over NVST needs the native identity even when website mode is saved.
     if (preferBrowserMode && !(preferNvstTransport && appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY)) {
         return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
-    }
-    // YES server 1.1054.0 no longer produces WebRTC offers for ALLIANCE_CLOUD_MATCH_IDENTITY
-    // (platformName="windows", deviceOs="WINDOWS"). ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
-    // (platformName="android", deviceOs="ANDROID", NVIDIA-CLASSIC/NATIVE) still allocates WebRTC
-    // offers on YES while keeping the native monitor descriptor.
-    if (!preferNvstTransport && appLaunchMode != GfnAppLaunchMode.TOUCH_FRIENDLY && isYesCloudMatchBase(streamingBaseUrl)) {
-        return ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
     }
     // For touch-friendly launches, use NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY (or browser mode)
     // so the server enables the touch digitizer for the game while streaming via WebRTC.
@@ -480,9 +479,41 @@ private data class StreamRequestProfile(
     val chroma: Int,
 )
 
-private fun StreamSettings.requestProfile(): StreamRequestProfile {
+private val YES_BROWSER_MONITOR_MATRIX = setOf(
+    1024 to 768,
+    1112 to 834,
+    1280 to 720,
+    1280 to 800,
+    1280 to 1024,
+    1366 to 768,
+    1376 to 640,
+    1440 to 900,
+    1600 to 900,
+    1600 to 1200,
+    1680 to 1050,
+    1920 to 1080,
+    1920 to 1200,
+)
+
+private fun StreamSettings.requestProfile(
+    identity: CloudMatchClientIdentity,
+    streamingBaseUrl: String?,
+): StreamRequestProfile {
     val compatible = withCodecColorCompatibility()
-    val (width, height) = streamResolutionPixels(compatible)
+    val rawPixels = streamResolutionPixels(compatible)
+    // On YES WebRTC (browser identity), requesting a resolution outside the browser matrix (such as
+    // 2560x1080 or 2560x1440) causes the server to fall back to 1680x720. Clamp the CloudMatch
+    // monitor request to 1920x1080 (or 1920x1200 for 16:10) so the host provisions 1080p instead.
+    val (width, height) = if (
+        identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY &&
+        isYesCloudMatchBase(streamingBaseUrl) &&
+        rawPixels !in YES_BROWSER_MONITOR_MATRIX &&
+        (rawPixels.first > 1920 || rawPixels.second > 1200)
+    ) {
+        if (compatible.aspectRatio.trim() == "16:10") 1920 to 1200 else 1920 to 1080
+    } else {
+        rawPixels
+    }
     val hdrEnabled = compatible.hdrEnabled
     return StreamRequestProfile(
         width = width,
@@ -703,7 +734,7 @@ internal fun buildMinimalClaimRequestBody(
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
-    val profile = settings?.requestProfile()
+    val profile = settings?.requestProfile(identity, streamingBaseUrl)
     val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings?.multiControllerEnabled == true)
     return buildJsonObject {
         put("action", 2)
@@ -3636,7 +3667,7 @@ class GfnSessionRepository(
             isAndroidTv = isAndroidTv,
             useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
         )
-        val profile = settings.requestProfile()
+        val profile = settings.requestProfile(identity, streamingBaseUrl)
         val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings.multiControllerEnabled)
         return buildJsonObject {
             putJsonObject("sessionRequestData") {
