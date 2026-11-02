@@ -699,10 +699,9 @@ class GfnApiTest {
                 val expectedPlatform = if (nvst) "windows" else "browser"
                 assertEquals(expectedPlatform, data.getValue("clientPlatformName").jsonPrimitive.content)
                 val monitor = data.getValue("clientRequestMonitorSettings").jsonArray.single().jsonObject
-                val (rawWidth, rawHeight) = streamResolutionPixels(settings)
-                val (expectedWidth, expectedHeight) = if (!nvst && rawWidth > 1920) 1920 to 1080 else rawWidth to rawHeight
-                assertEquals(expectedWidth, monitor.getValue("widthInPixels").jsonPrimitive.int)
-                assertEquals(expectedHeight, monitor.getValue("heightInPixels").jsonPrimitive.int)
+                val (width, height) = streamResolutionPixels(settings)
+                assertEquals(width, monitor.getValue("widthInPixels").jsonPrimitive.int)
+                assertEquals(height, monitor.getValue("heightInPixels").jsonPrimitive.int)
             }
             val minimal = buildMinimalClaimRequestBody("123", "device", streamingBaseUrl = base)
                 .getValue("sessionRequestData").jsonObject
@@ -775,7 +774,7 @@ class GfnApiTest {
                 assertEquals(1376, monitor.getValue("widthInPixels").jsonPrimitive.int)
                 assertEquals(640, monitor.getValue("heightInPixels").jsonPrimitive.int)
                 assertEquals(60, monitor.getValue("framesPerSecond").jsonPrimitive.int)
-                assertEquals(if (webRtcTouch) 0 else 100, monitor.getValue("dpi").jsonPrimitive.int)
+                assertEquals(if (webRtcTouch && nvidia) 0 else 100, monitor.getValue("dpi").jsonPrimitive.int)
                 assertEquals("1", data.getValue("streamerVersion").jsonPrimitive.content)
                 assertEquals("1.0", data.getValue("sdkVersion").jsonPrimitive.content)
                 assertEquals(1, data.getValue("enhancedStreamMode").jsonPrimitive.int)

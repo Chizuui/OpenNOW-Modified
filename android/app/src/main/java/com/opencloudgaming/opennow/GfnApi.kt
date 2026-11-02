@@ -479,41 +479,9 @@ private data class StreamRequestProfile(
     val chroma: Int,
 )
 
-private val YES_BROWSER_MONITOR_MATRIX = setOf(
-    1024 to 768,
-    1112 to 834,
-    1280 to 720,
-    1280 to 800,
-    1280 to 1024,
-    1366 to 768,
-    1376 to 640,
-    1440 to 900,
-    1600 to 900,
-    1600 to 1200,
-    1680 to 1050,
-    1920 to 1080,
-    1920 to 1200,
-)
-
-private fun StreamSettings.requestProfile(
-    identity: CloudMatchClientIdentity,
-    streamingBaseUrl: String?,
-): StreamRequestProfile {
+private fun StreamSettings.requestProfile(): StreamRequestProfile {
     val compatible = withCodecColorCompatibility()
-    val rawPixels = streamResolutionPixels(compatible)
-    // On YES WebRTC (browser identity), requesting a resolution outside the browser matrix (such as
-    // 2560x1080 or 2560x1440) causes the server to fall back to 1680x720. Clamp the CloudMatch
-    // monitor request to 1920x1080 (or 1920x1200 for 16:10) so the host provisions 1080p instead.
-    val (width, height) = if (
-        identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY &&
-        isYesCloudMatchBase(streamingBaseUrl) &&
-        rawPixels !in YES_BROWSER_MONITOR_MATRIX &&
-        (rawPixels.first > 1920 || rawPixels.second > 1200)
-    ) {
-        if (compatible.aspectRatio.trim() == "16:10") 1920 to 1200 else 1920 to 1080
-    } else {
-        rawPixels
-    }
+    val (width, height) = streamResolutionPixels(compatible)
     val hdrEnabled = compatible.hdrEnabled
     return StreamRequestProfile(
         width = width,
@@ -529,12 +497,14 @@ private fun monitorSettings(
     profile: StreamRequestProfile,
     fps: Int,
     identity: CloudMatchClientIdentity,
+    streamingBaseUrl: String? = null,
 ): JsonObject =
     buildJsonObject {
-        // For touch sessions we MUST emit the full desktop descriptor
-        // (monitorId=0, positionX=0, positionY=0, dpi=100) so the server
-        // allocates the full resolution matrix including ultrawide.
-        if (identity.desktopMonitorDescriptor) {
+        // For touch sessions and YES WebRTC sessions we emit the full desktop descriptor
+        // (monitorId=0, positionX=0, positionY=0, dpi=100) so the server can allocate
+        // the requested resolution matrix (including ultrawide 2560x1080).
+        val useDesktopDescriptor = identity.desktopMonitorDescriptor || isYesCloudMatchBase(streamingBaseUrl)
+        if (useDesktopDescriptor) {
             put("monitorId", 0)
             put("positionX", 0)
             put("positionY", 0)
@@ -545,9 +515,8 @@ private fun monitorSettings(
         put("sdrHdrMode", if (profile.hdrEnabled) 1 else 0)
         put("displayData", if (profile.hdrEnabled) hdrDisplayDataJson(profile.hdrDisplay) else JsonNull)
         put("hdr10PlusGamingData", JsonNull)
-        put("dpi", if (identity.desktopMonitorDescriptor) 100 else 0)
+        put("dpi", if (useDesktopDescriptor) 100 else 0)
     }
-
 private fun requestedStreamingFeatures(settings: StreamSettings, profile: StreamRequestProfile): JsonObject =
     buildJsonObject {
         put("reflex", settings.fps >= 120)
@@ -734,7 +703,7 @@ internal fun buildMinimalClaimRequestBody(
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
-    val profile = settings?.requestProfile(identity, streamingBaseUrl)
+    val profile = settings?.requestProfile()
     val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings?.multiControllerEnabled == true)
     return buildJsonObject {
         put("action", 2)
@@ -754,7 +723,7 @@ internal fun buildMinimalClaimRequestBody(
             put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
             if (settings != null && profile != null) {
                 putJsonArray("clientRequestMonitorSettings") {
-                    add(monitorSettings(profile, settings.fps, identity))
+                    add(monitorSettings(profile, settings.fps, identity, streamingBaseUrl))
                 }
             }
             put(
@@ -3667,7 +3636,7 @@ class GfnSessionRepository(
             isAndroidTv = isAndroidTv,
             useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
         )
-        val profile = settings.requestProfile(identity, streamingBaseUrl)
+        val profile = settings.requestProfile()
         val controllerCapabilities = gfnControllerCapabilities(appLaunchMode, settings.multiControllerEnabled)
         return buildJsonObject {
             putJsonObject("sessionRequestData") {
@@ -3684,7 +3653,7 @@ class GfnSessionRepository(
                 putStreamTransportRequest(settings, identity.requiresNativeSessionTransport(streamingBaseUrl))
                 put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
                 putJsonArray("clientRequestMonitorSettings") {
-                    add(monitorSettings(profile, settings.fps, identity))
+                    add(monitorSettings(profile, settings.fps, identity, streamingBaseUrl))
                 }
                 put("useOps", true)
                 put("audioMode", 2)
