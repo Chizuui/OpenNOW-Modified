@@ -196,3 +196,10 @@ the same seat connects through the usage-2 mapping (the offer's single bundled p
 it). For `.yes.geforcenow.nvidiagrid.net` bases Kotlin therefore omits the usage-17 entry, so Rust's
 `bundle_endpoint` falls back to the usage-2 media mapping. Other alliance providers keep usage 17.
 DTLS authentication again completes before PLAY (dev ordering). Not verified live on a YES seat.
+
+YES WebRTC allocation correction (2026-11-02): build 2.3.1 logs (browser=false, NVST off) connected
+signaling but never received an offer; every working YES WebRTC session had Website client mode
+(browser identity) on. The desktop-native alliance identity makes YES allocate RTSPS-only seats.
+YES now uses the browser identity unless NVST is opted in, in which case the alliance identity and
+native request profile apply. Native touch with NVST still uses the native identity over a saved
+Website mode. Not verified live.

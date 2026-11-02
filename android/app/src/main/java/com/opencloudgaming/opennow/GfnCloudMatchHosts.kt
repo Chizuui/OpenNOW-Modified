@@ -24,5 +24,6 @@ internal fun isYesCloudMatchBase(streamingBaseUrl: String?): Boolean {
     return host == "yes.geforcenow.nvidiagrid.net" || host.endsWith(".yes.geforcenow.nvidiagrid.net")
 }
 
-/** YES seats work stably with WebRTC 3.0 signaling; NVST RTSP is optional via experimentalNvst. */
-internal fun requiresNativeAllianceCloudMatchTransport(streamingBaseUrl: String?): Boolean = false
+/** YES allocates a native RTSPS-only seat for the alliance identity; WebRTC needs the browser identity. */
+internal fun requiresNativeAllianceCloudMatchTransport(streamingBaseUrl: String?): Boolean =
+    isYesCloudMatchBase(streamingBaseUrl)

@@ -247,6 +247,7 @@ class SdpToolsTest {
                 a=ice-pwd:testPassword
                 a=fingerprint:sha-256 11:22:33
             """.trimIndent(),
+            lockStreamProfile = true,
         )
 
         assertTrue(nvst.contains("a=video.clientViewportWd:1680"))
