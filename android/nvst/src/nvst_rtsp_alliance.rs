@@ -82,7 +82,7 @@ pub(crate) fn wait_authenticated_transport(
         if remaining.is_zero() {
             return Err(NvstRtspError::new(
                 "nvst-transport-ready-timeout",
-                "NVST transport did not authenticate before PLAY; cloud session retained",
+                "NVST transport did not authenticate within the startup budget; cloud session retained",
             ));
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));

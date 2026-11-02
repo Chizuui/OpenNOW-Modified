@@ -203,3 +203,10 @@ signaling but never received an offer; every working YES WebRTC session had Webs
 YES now uses the browser identity unless NVST is opted in, in which case the alliance identity and
 native request profile apply. Native touch with NVST still uses the native identity over a saved
 Website mode. Not verified live.
+
+YES PLAY ordering (2026-11-02, supersedes the 11-01 note above): logcat from a YES seat shows SETUP
+answering without a video peer (`video_peer_valid=false`), ANNOUNCE 200, then inbound=0 for the whole
+pre-PLAY wait even on the usage-2 mapping. Alliance PLAY is therefore sent before waiting for
+authenticated DTLS (non-alliance order is unchanged). PLAY can block ~17 s, longer than the 8 s
+receiver idle timeout, so startup re-arms the receiver (at most twice) on idle reports raised
+meanwhile and the DTLS wait budget is 20 s. Not verified live.
