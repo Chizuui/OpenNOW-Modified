@@ -665,6 +665,7 @@ class GfnApiTest {
             deviceId = "device",
             includeOrigin = true,
             streamingBaseUrl = "https://my-yes.yes.geforcenow.nvidiagrid.net",
+            preferNvstTransport = true,
         )
 
         assertEquals("NVIDIA-CLASSIC", headers["nv-client-streamer"])
@@ -698,6 +699,7 @@ class GfnApiTest {
                 val expectedPlatform = when {
                     settings.browserClientMode -> "browser"
                     settings.requiresNativeAndroidCloudMatchMode() -> "android"
+                    !nvst -> "android"
                     else -> "windows"
                 }
                 assertEquals(expectedPlatform, data.getValue("clientPlatformName").jsonPrimitive.content)
@@ -1122,6 +1124,7 @@ class GfnApiTest {
             fps = 60,
             codec = VideoCodec.H264,
             colorQuality = ColorQuality.EightBit420,
+            experimentalNvst = true,
         )
 
         val sessionRequestData = buildMinimalClaimRequestBody(

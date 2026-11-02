@@ -197,17 +197,13 @@ it). For `.yes.geforcenow.nvidiagrid.net` bases Kotlin therefore omits the usage
 `bundle_endpoint` falls back to the usage-2 media mapping. Other alliance providers keep usage 17.
 DTLS authentication again completes before PLAY (dev ordering). Not verified live on a YES seat.
 
-YES WebRTC + full-resolution allocation correction (2026-11-02):
-- Native NVST on YES fails with `inbound=0` and `PLAY 455` after 16 s regardless of whether PLAY is
-  sent before or after the DTLS wait, and regardless of usage-17 vs usage-2. The `dev` desktop
-  branch also defaults alliance accounts to WebRTC compatibility mode (#1098).
-- Historical YES logs (`20260727-094639` and `20260727-111112`) prove that YES allocates the full
-  desktop resolution matrix (including `2560x1080` H.265) over WebRTC when the CloudMatch request
-  uses the desktop-native alliance identity (`clientPlatformName="windows"`, `NVIDIA-CLASSIC`/`NATIVE`)
-  with `secureRTSPSupported=false` and `GSStreamerType="WebRTC"`, paired with WebRTC signaling `v2`
-  (`version=2` on fresh sign-in and `peerRole:0, version:2` in `peer_info`).
-- The `20261102-072238` offer timeout occurred because signaling `v3.0` (`peer_role:1, version:3`)
-  was sent on a `windows`/`NVIDIA-CLASSIC` session; the host rejected it with `peerRemoved`.
-- `requiresNativeAllianceCloudMatchTransport` now returns `false`, `cloudMatchClientIdentity`
-  retains `ALLIANCE_CLOUD_MATCH_IDENTITY` when `browserClientMode=false`, and `StreamSignaling.kt`
-  restores `version=2` / `peerRole:0` on fresh connections.
+YES WebRTC + Android native identity correction (2026-11-02):
+- On YES server `1.1054.0`, `ALLIANCE_CLOUD_MATCH_IDENTITY` (`clientPlatformName="windows"`,
+  `deviceOs="WINDOWS"`, `NVIDIA-CLASSIC`/`NATIVE`) allocates `2560x1080` in `monitorSettings`
+  but its streamer never produces a WebRTC offer (even with signaling v2).
+- In contrast, `ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY` (`clientPlatformName="android"`,
+  `deviceOs="ANDROID"`, `NVIDIA-CLASSIC`/`NATIVE`, `desktopMonitorDescriptor=true`) produced 4/4
+  WebRTC offers on YES server `1.1054.0` while keeping the native monitor descriptor (`dpi=100`,
+  `monitorId=0`) that previously unlocked `2560x1080` H.265 on YES (`20260727-111112`).
+- `cloudMatchClientIdentity` now selects `ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY` for YES
+  gamepad launches when `experimentalNvst=false` and `browserClientMode=false`.

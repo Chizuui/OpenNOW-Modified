@@ -232,6 +232,13 @@ private fun cloudMatchClientIdentity(
     if (preferBrowserMode && !(preferNvstTransport && appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY)) {
         return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     }
+    // YES server 1.1054.0 no longer produces WebRTC offers for ALLIANCE_CLOUD_MATCH_IDENTITY
+    // (platformName="windows", deviceOs="WINDOWS"). ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
+    // (platformName="android", deviceOs="ANDROID", NVIDIA-CLASSIC/NATIVE) still allocates WebRTC
+    // offers on YES while keeping the native monitor descriptor.
+    if (!preferNvstTransport && appLaunchMode != GfnAppLaunchMode.TOUCH_FRIENDLY && isYesCloudMatchBase(streamingBaseUrl)) {
+        return ALLIANCE_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY
+    }
     // For touch-friendly launches, use NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY (or browser mode)
     // so the server enables the touch digitizer for the game while streaming via WebRTC.
     if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) {
