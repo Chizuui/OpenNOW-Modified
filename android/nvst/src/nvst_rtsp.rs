@@ -117,6 +117,7 @@ impl RtspClient {
         headers: &[(&str, String)],
         client_port: u16,
         bundle_video_peer: Option<(String, u16)>,
+        unified_socket: bool,
     ) -> Result<VideoSetup, NvstRtspError> {
         self.setup_video_with_retry(
             control,
@@ -126,6 +127,7 @@ impl RtspClient {
             SETUP_PEER_RETRY_ROUNDS,
             SETUP_PEER_RETRY_DELAY,
             bundle_video_peer,
+            unified_socket,
         )
     }
 
@@ -139,13 +141,14 @@ impl RtspClient {
         max_peer_retries: u32,
         peer_retry_delay: Duration,
         bundle_video_peer: Option<(String, u16)>,
+        unified_socket: bool,
     ) -> Result<VideoSetup, NvstRtspError> {
         // A rig whose video streamer is still starting answers SETUP with 200
         // but no Transport peer yet. Re-sweep on a bounded pace then: the
         // official client negotiates through progress callbacks instead of
         // one fast burst. Pure rejections (400/404/459+) mean the forms are
         // wrong for this server, so those still fail immediately.
-        let candidates = video_setup_candidates(control, target);
+        let candidates = video_setup_candidates(control, target, unified_socket);
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         let mut headers = headers.to_vec();
         headers.push(("Transport", String::new()));
@@ -871,6 +874,7 @@ fn prepare_nvst_endpoint(
             mjolnir_port
         },
         bundle_video_peer,
+        described_unified_socket,
     )?;
     // SETUP returns the streamer's real bundle destination. A peerless 200 is
     // common on YES: the SDP still names the bundle UDP port on the seat host,
@@ -1554,9 +1558,20 @@ fn official_video_setup_control(control: &str) -> String {
     }
 }
 
-fn video_setup_candidates(control: &str, target: &str) -> Vec<String> {
-    let mut candidates = vec![official_video_setup_control(control)];
-    if candidates[0] != control {
+fn video_setup_candidates(control: &str, target: &str, unified_socket: bool) -> Vec<String> {
+    // Unified-socket rigs assign the single bundle peer to the control
+    // stream; video is carried on it after PLAY. Bifrost's signaling handler
+    // explicitly sets up a control stream for this mode.
+    let mut candidates = if unified_socket {
+        vec!["streamid=control".to_owned()]
+    } else {
+        Vec::new()
+    };
+    let video = official_video_setup_control(control);
+    if !candidates.contains(&video) {
+        candidates.push(video);
+    }
+    if !candidates.iter().any(|candidate| candidate == control) {
         candidates.push(control.to_owned());
     }
     for index in 0..candidates.len() {

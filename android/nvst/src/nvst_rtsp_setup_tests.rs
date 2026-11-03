@@ -101,6 +101,7 @@ fn scripted_setup_with_retry(
         max_peer_retries,
         peer_retry_delay,
         bundle_video_peer,
+        false,
     );
     drop(client);
     server.join().unwrap();
@@ -259,18 +260,18 @@ fn video_setup_stops_on_auth_session_and_server_errors() {
 #[test]
 fn video_setup_candidates_match_mac_order_without_duplicates() {
     assert_eq!(
-        video_setup_candidates("streamid=video/0", TARGET),
+        video_setup_candidates("streamid=video/0", TARGET, false),
         EMPTY_TRANSPORT_URIS
     );
     assert_eq!(
-        video_setup_candidates("streamid=video/0/0", TARGET),
+        video_setup_candidates("streamid=video/0/0", TARGET, false),
         vec![
             "streamid=video/0/0",
             "rtsps://seat.nvidiagrid.net:322/streamid=video/0/0",
         ]
     );
     assert_eq!(
-        video_setup_candidates("/streamid=video/0", TARGET),
+        video_setup_candidates("/streamid=video/0", TARGET, false),
         vec![
             "/streamid=video/0",
             "rtsps://seat.nvidiagrid.net:322/streamid=video/0",
@@ -280,8 +281,15 @@ fn video_setup_candidates_match_mac_order_without_duplicates() {
         "rtsp://seat.nvidiagrid.net:322/video",
         "rtsps://seat.nvidiagrid.net:322/video",
     ] {
-        assert_eq!(video_setup_candidates(absolute, TARGET), vec![absolute]);
+        assert_eq!(
+            video_setup_candidates(absolute, TARGET, false),
+            vec![absolute]
+        );
     }
+    assert_eq!(
+        video_setup_candidates("streamid=video/0", TARGET, true)[0],
+        "streamid=control"
+    );
 }
 
 #[test]
