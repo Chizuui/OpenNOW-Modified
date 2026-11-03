@@ -117,6 +117,7 @@ impl RtspClient {
         headers: &[(&str, String)],
         client_port: u16,
         source: Option<IpAddr>,
+        server_ip: Option<IpAddr>,
         bundle_video_peer: Option<(String, u16)>,
         unified_socket: bool,
     ) -> Result<VideoSetup, NvstRtspError> {
@@ -126,6 +127,7 @@ impl RtspClient {
             headers,
             client_port,
             source,
+            server_ip,
             SETUP_PEER_RETRY_ROUNDS,
             SETUP_PEER_RETRY_DELAY,
             bundle_video_peer,
@@ -141,6 +143,7 @@ impl RtspClient {
         headers: &[(&str, String)],
         client_port: u16,
         source: Option<IpAddr>,
+        server_ip: Option<IpAddr>,
         max_peer_retries: u32,
         peer_retry_delay: Duration,
         bundle_video_peer: Option<(String, u16)>,
@@ -165,6 +168,7 @@ impl RtspClient {
                 transport_index,
                 client_port,
                 source,
+                server_ip,
                 &deadline,
                 unified_socket,
             ) {
@@ -224,6 +228,7 @@ impl RtspClient {
         transport_index: usize,
         client_port: u16,
         source: Option<IpAddr>,
+        server_ip: Option<IpAddr>,
         deadline: &Instant,
         unified_socket: bool,
     ) -> Result<VideoSetup, SweepFailure> {
@@ -270,7 +275,7 @@ impl RtspClient {
                     })?;
                 let transport = header_value(&response, "transport");
                 let peer = transport
-                    .and_then(parse_video_peer)
+                    .and_then(|transport| parse_video_peer(transport, server_ip))
                     .filter(|(ip, _)| ip.parse::<IpAddr>().is_ok());
                 opennow_streamer_protocol::log::log_line(
                     "INFO",
@@ -782,17 +787,21 @@ fn try_signalling_endpoints<T>(
     Err(last_error)
 }
 
-fn local_udp_source(target: &str) -> Option<IpAddr> {
+fn remote_ip(target: &str) -> Option<IpAddr> {
     let host = target
         .strip_prefix("rtsps://")
         .or_else(|| target.strip_prefix("rtsp://"))
         .unwrap_or(target)
         .split('/')
         .next()?;
-    let remote = host.to_socket_addrs().ok()?.next()?;
+    host.to_socket_addrs().ok()?.next().map(|addr| addr.ip())
+}
+
+fn local_udp_source(target: &str) -> Option<IpAddr> {
+    let remote = remote_ip(target)?;
     let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(remote).ok()?;
+    socket.connect((remote, 9)).ok()?;
     Some(socket.local_addr().ok()?.ip())
 }
 
@@ -906,6 +915,7 @@ fn prepare_nvst_endpoint(
             mjolnir_port
         },
         local_udp_source(&target),
+        remote_ip(&target),
         bundle_video_peer,
         described_unified_socket,
     )?;
@@ -1613,7 +1623,7 @@ fn video_setup_candidates(control: &str, target: &str, unified_socket: bool) -> 
     candidates
 }
 
-fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
+fn parse_video_peer(transport: &str, fallback_ip: Option<IpAddr>) -> Option<(String, u16)> {
     let mut ip = None;
     let mut port = None;
     for part in transport.split([';', ',']) {
@@ -1622,7 +1632,9 @@ fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
         };
         if name.eq_ignore_ascii_case("source") {
             ip = Some(value.trim().to_owned());
-        } else if name.eq_ignore_ascii_case("X-GS-ServerPort") {
+        } else if name.eq_ignore_ascii_case("X-GS-ServerPort")
+            || name.eq_ignore_ascii_case("server_port")
+        {
             port = value
                 .trim()
                 .split('-')
@@ -1632,7 +1644,7 @@ fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
                 .filter(|port| *port != 0);
         }
     }
-    Some((ip?, port?))
+    Some((ip.or_else(|| fallback_ip.map(|ip| ip.to_string()))?, port?))
 }
 
 fn random_runtime_key() -> Result<(String, u32), NvstRtspError> {

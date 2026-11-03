@@ -107,6 +107,7 @@ fn scripted_setup_with_retry(
         ],
         49005,
         None,
+        None,
         max_peer_retries,
         peer_retry_delay,
         bundle_video_peer,
@@ -131,6 +132,26 @@ fn video_setup_keeps_the_official_first_attempt_and_its_metadata() {
     assert_eq!(
         header_value(&setup.response, "x-nv-ping-payload"),
         Some("00ff")
+    );
+}
+
+#[test]
+fn video_peer_accepts_standard_server_port_with_server_ip_fallback() {
+    let server = "192.0.2.10".parse::<IpAddr>().ok();
+    assert_eq!(
+        parse_video_peer("RTP/AVP/UDP;unicast;client_port=49005-49006;server_port=5004-5005", server),
+        Some(("192.0.2.10".to_owned(), 5004))
+    );
+    assert_eq!(
+        parse_video_peer(
+            "unicast;source=192.0.2.11;X-GS-ServerPort=5006-5007",
+            server
+        ),
+        Some(("192.0.2.11".to_owned(), 5006))
+    );
+    assert_eq!(
+        parse_video_peer("RTP/AVP/UDP;unicast;client_port=49005-49006", server),
+        None
     );
 }
 
