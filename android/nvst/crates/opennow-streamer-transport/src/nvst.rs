@@ -3762,28 +3762,6 @@ fn build_stun_binding_request(
     )
 }
 
-/// Official `NattHolePunch::SendPing` (pingVersion=6) encodes
-/// `SetStunCredentials(local, pingPayload, …, describePassword)` as
-/// USERNAME `pingPayload:localUfrag` and HMAC-SHA1 with the DESCRIBE password.
-/// WebRtcTransport ICE uses the V2 ufrag via [`build_stun_binding_request`].
-fn build_natt_hole_punch_request(
-    local_username_fragment: &str,
-    ping_payload: &[u8],
-    remote_password: &str,
-    transaction_id: &[u8; 12],
-) -> Vec<u8> {
-    let username = format!(
-        "{}:{local_username_fragment}",
-        String::from_utf8_lossy(ping_payload)
-    );
-    build_authenticated_stun_packet(
-        STUN_BINDING_REQUEST,
-        transaction_id,
-        remote_password.as_bytes(),
-        &[(STUN_ATTR_USERNAME, username.into_bytes())],
-    )
-}
-
 fn xor_mapped_address(source: SocketAddr, transaction_id: &[u8; 12]) -> Vec<u8> {
     let mut value = Vec::with_capacity(20);
     value.push(0);
@@ -5285,12 +5263,7 @@ fn run_nvst_webrtc_bundle(
             }
             let mut natt_tid = [0_u8; 12];
             let natt = if getrandom::fill(&mut natt_tid).is_ok() {
-                let natt = build_natt_hole_punch_request(
-                    &credentials.local_username_fragment,
-                    ping_payload,
-                    &credentials.remote_password,
-                    &natt_tid,
-                );
+                let natt = build_stun_binding_request(credentials, &natt_tid);
                 if let Err(error) = socket.send_to(&natt, bundle_peer) {
                     eprintln!("NVST NATT send failed: {error}");
                     forward_optional(&event_sender, receiver.stop());
@@ -6071,12 +6044,7 @@ fn run_nvst_udp_receiver(
                     forward_optional(&event_sender, receiver.stop());
                     return;
                 }
-                let ping = build_natt_hole_punch_request(
-                    &credentials.local_username_fragment,
-                    &receiver.config.ping_payload,
-                    &credentials.remote_password,
-                    &transaction_id,
-                );
+                let ping = build_stun_binding_request(credentials, &transaction_id);
                 if let Err(error) = socket.send_to(&ping, receiver.config.video_peer) {
                     log_udp_error("video-natt-send", local_port, &error);
                     eprintln!("NVST NATT send failed: {error}");
@@ -7046,32 +7014,6 @@ mod tests {
         );
         assert!(Candidate::host(logical_ice_addr(local, 1), "udp").is_ok());
         assert!(Candidate::host(logical_ice_addr(remote, 2), "udp").is_ok());
-    }
-
-    #[test]
-    fn natt_hole_punch_uses_setup_ping_payload_not_v2_ufrag() {
-        let credentials = stun_credentials();
-        let packet = build_natt_hole_punch_request(
-            &credentials.local_username_fragment,
-            b"srv1",
-            &credentials.remote_password,
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-        );
-        let (_, username) = find_stun_attribute(&packet, STUN_ATTR_USERNAME).expect("USERNAME");
-        assert_eq!(username, b"srv1:loc1");
-        assert_ne!(
-            username,
-            format!(
-                "{}:{}",
-                credentials.remote_username_fragment, credentials.local_username_fragment
-            )
-            .as_bytes()
-        );
-        assert!(valid_stun_fingerprint(&packet));
-        assert!(valid_stun_message_integrity(
-            &packet,
-            credentials.remote_password.as_bytes()
-        ));
     }
 
     #[test]
@@ -9140,11 +9082,10 @@ mod tests {
             ));
             let (_, username) = find_stun_attribute(packet, STUN_ATTR_USERNAME).unwrap();
             if source == video_address {
-                assert_eq!(username, b"setup-ping:loc1");
+                assert_eq!(username, b"remote01:loc1");
                 video_keepalives += 1;
             } else {
                 assert_eq!(source, bundle_address);
-                assert_ne!(username, b"setup-ping:loc1", "bundle must not claim video");
                 assert_eq!(username, b"remote01:loc1");
                 bundle_keepalives += 1;
             }
@@ -9220,14 +9161,14 @@ mod tests {
             .expect("SETUP identity probe");
         let (_, setup_username) =
             find_stun_attribute(&datagram[..setup_len], STUN_ATTR_USERNAME).expect("USERNAME");
-        assert_eq!(setup_username, b"setup-ping:loc1");
+        assert_eq!(setup_username, b"remote01:loc1");
 
         let (repeated_len, _) = server
             .recv_from(&mut datagram)
             .expect("repeated SETUP identity probe");
         let (_, repeated_username) =
             find_stun_attribute(&datagram[..repeated_len], STUN_ATTR_USERNAME).expect("USERNAME");
-        assert_eq!(repeated_username, b"setup-ping:loc1");
+        assert_eq!(repeated_username, b"remote01:loc1");
 
         session.stop();
     }
