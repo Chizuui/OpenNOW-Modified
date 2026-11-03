@@ -162,6 +162,7 @@ impl RtspClient {
                 transport_index,
                 client_port,
                 &deadline,
+                unified_socket,
             ) {
                 Ok(setup) => return Ok(setup),
                 Err(failure) => {
@@ -219,6 +220,7 @@ impl RtspClient {
         transport_index: usize,
         client_port: u16,
         deadline: &Instant,
+        unified_socket: bool,
     ) -> Result<VideoSetup, SweepFailure> {
         let mut last_status = 0;
         let mut peerless_200 = None;
@@ -285,10 +287,12 @@ impl RtspClient {
                         // commonly answered this way on YES; try the explicit
                         // client-port form before falling back to CloudMatch.
                         peerless_200.get_or_insert(Box::new(response));
-                        // The remaining URI spellings use the same form and
-                        // only risk poisoning the session. Move to the next
-                        // Transport form instead.
-                        break;
+                        // On unified rigs the control SETUP may also be
+                        // peerless; keep trying the video spellings. Other
+                        // rigs stop here to avoid poisoning the session.
+                        if !unified_socket {
+                            break;
+                        }
                     }
                     400 | 404 | 459 | 460 | 461 => {}
                     _ => {
