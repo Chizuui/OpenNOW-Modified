@@ -53,6 +53,21 @@ class NvstTransportTest {
         assertFalse(settings.experimentalNvst)
     }
 
+    @Test fun yesSeatsDropBundleMappingSoNativePeerUsesVideoMapping() {
+        val session = SessionInfo("seat", 2, serverIp = "203.0.113.10",
+            signalingServer = "seat.example:443", signalingUrl = "wss://seat.example/nvst/",
+            mediaConnectionInfo = MediaConnectionInfo("203.0.113.10", 12871),
+            bundleConnectionInfo = MediaConnectionInfo("203.0.113.10", 16681))
+        fun context(base: String) = OpenNowJson.parseToJsonElement(nvstSessionContext(
+            session.copy(streamingBaseUrl = base), StreamSettings())).jsonObject
+            .getValue("session").jsonObject
+        assertNull(context("https://my-yes.yes.geforcenow.nvidiagrid.net")["connectionInfo"])
+        assertEquals(12871, context("https://my-yes.yes.geforcenow.nvidiagrid.net")
+            .getValue("mediaConnectionInfo").jsonObject.getValue("port").jsonPrimitive.int)
+        assertEquals(16681, context("https://seat.abya.example")
+            .getValue("connectionInfo").jsonArray.single().jsonObject.getValue("port").jsonPrimitive.int)
+    }
+
     @Test fun newAndLegacyProfilesDefaultOff() {
         for (raw in listOf(null, "invalid", "{}", """{"stream":{"fps":120,"experimentalNvst":true}}""")) {
             val loaded = loadSettingsWithNvstDefault(raw)

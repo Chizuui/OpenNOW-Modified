@@ -91,7 +91,8 @@ internal fun nvstSessionContext(session: SessionInfo, settings: StreamSettings):
         put("serverIp", session.serverIp)
         if (isAllianceCloudMatchBase(session.streamingBaseUrl)) put("alliancePartner", true)
         session.mediaConnectionInfo?.let { put("mediaConnectionInfo", OpenNowJson.encodeToJsonElement(it)) }
-        session.bundleConnectionInfo?.let { bundle ->
+        // YES answers only the usage-2 media mapping; usage-17 never authenticates.
+        session.bundleConnectionInfo?.takeUnless { isYesCloudMatchBase(session.streamingBaseUrl) }?.let { bundle ->
             putJsonArray("connectionInfo") {
                 add(buildJsonObject {
                     put("ip", bundle.ip)
