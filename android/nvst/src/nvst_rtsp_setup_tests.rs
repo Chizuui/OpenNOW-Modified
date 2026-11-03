@@ -19,14 +19,22 @@ struct Reply {
 }
 
 fn client_port_rejections() -> Vec<Reply> {
-    EMPTY_TRANSPORT_URIS
+    [""]
         .iter()
-        .map(|uri| Reply {
+        .flat_map(|_| {
+            EMPTY_TRANSPORT_URIS.iter().map(|uri| Reply {
+                uri,
+                transport: "unicast;X-GS-ClientPort=49005-49006",
+                status: 400,
+                headers: "",
+            })
+        })
+        .chain(EMPTY_TRANSPORT_URIS.iter().map(|uri| Reply {
             uri,
-            transport: "unicast;X-GS-ClientPort=49005-49006",
+            transport: "RTP/AVP/UDP;unicast;client_port=49005-49006",
             status: 400,
             headers: "",
-        })
+        }))
         .collect()
 }
 
@@ -204,6 +212,12 @@ fn video_setup_never_invents_a_peer_when_success_omits_transport() {
         Reply {
             uri: EMPTY_TRANSPORT_URIS[0],
             transport: "unicast;X-GS-ClientPort=49005-49006",
+            status: 200,
+            headers: "",
+        },
+        Reply {
+            uri: EMPTY_TRANSPORT_URIS[0],
+            transport: "RTP/AVP/UDP;unicast;client_port=49005-49006",
             status: 200,
             headers: "",
         },
@@ -394,7 +408,11 @@ fn video_setup_peer_retry_stays_bounded_and_keeps_the_terminal_code() {
 fn video_setup_never_retries_pure_rejections() {
     // No 200 seen at all: the forms are wrong for this server, so fail fast
     // without burning retry rounds.
-    let replies: Vec<_> = ["", "unicast;X-GS-ClientPort=49005-49006"]
+    let replies: Vec<_> = [
+        "",
+        "unicast;X-GS-ClientPort=49005-49006",
+        "RTP/AVP/UDP;unicast;client_port=49005-49006",
+    ]
         .iter()
         .flat_map(|transport| {
             EMPTY_TRANSPORT_URIS.iter().map(move |uri| Reply {
@@ -425,7 +443,11 @@ fn video_setup_degraded_retry_round_keeps_missing_peer_code() {
     }];
     replies.extend(client_port_rejections());
     replies.extend(
-        ["", "unicast;X-GS-ClientPort=49005-49006"]
+        [
+            "",
+            "unicast;X-GS-ClientPort=49005-49006",
+            "RTP/AVP/UDP;unicast;client_port=49005-49006",
+        ]
             .iter()
             .flat_map(|transport| {
                 EMPTY_TRANSPORT_URIS.iter().map(move |uri| Reply {

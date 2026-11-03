@@ -207,8 +207,10 @@ Official NVST cadence and diagnostics (2026-11-03):
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
 - Live YES logs on 2026-11-03 still show `source=cloudmatch` and no inbound with standard
-  v6 ICE credentials. The streamer now receives PLAY before the DTLS wait, because the pre-PLAY
-  wait never produced a STUN reply. If this still fails, capture the official client's UDP tuple.
+  v6 ICE credentials. PLAY-first also failed: the server answered only after ~16.7 s, so the
+  receiver had already timed out. SETUP now also tries the standard
+  `RTP/AVP/UDP;unicast;client_port=...` form after the empty and X-GS forms. If it still returns
+  a peerless 200, capture the official client's UDP tuple.
 - Startup stages now report the chosen bundle/video peers and the first inbound datagram, without
   logging ICE credentials or payloads.
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified

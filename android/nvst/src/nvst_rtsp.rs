@@ -230,6 +230,10 @@ impl RtspClient {
                 "unicast;X-GS-ClientPort={client_port}-{}",
                 client_port.saturating_add(1)
             ),
+            format!(
+                "RTP/AVP/UDP;unicast;client_port={client_port}-{}",
+                client_port.saturating_add(1)
+            ),
         ] {
             let transport_form = if transport.is_empty() {
                 "empty"
@@ -322,7 +326,7 @@ impl RtspClient {
             error: NvstRtspError::new(
                 "nvst-rtsp-failed",
                 format!(
-                    "SETUP did not return a usable NVST video peer after {} URI forms and 2 Transport forms (last status {last_status})",
+                    "SETUP did not return a usable NVST video peer after {} URI forms and 3 Transport forms (last status {last_status})",
                     candidates.len(),
                 ),
             ),
