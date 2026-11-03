@@ -234,6 +234,19 @@ fn run(
             ),
         )
         .map_err(|e| e.to_string())?;
+        event(
+            env,
+            callback,
+            "stage",
+            &format!(
+                "Alliance NVST peers local={} bundle={} video={} source={}",
+                config.client_udp_port(),
+                config.bundle_peer(),
+                config.video_peer(),
+                prepared.handoff["bundleSource"].as_str().unwrap_or("unknown"),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
     }
     feedback.set_application_ready(false);
     *state.feedback.lock().unwrap() = Some(feedback.clone());
@@ -282,6 +295,9 @@ fn run(
                     NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) =>
                         return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
                             "Alliance NVST authentication timed out before PLAY; cloud session retained")),
+                    NvstReceiveEvent::Diagnostic(detail) => {
+                        let _ = event(env, callback, "stage", &detail);
+                    }
                     other => {
                         if pending_events.len() >= 128 {
                             return Err(nvst_rtsp::NvstRtspError::new("nvst-startup-event-overflow",
@@ -303,6 +319,9 @@ fn run(
     while !state.stopped.load(Ordering::Acquire) {
         for notification in pending_events.drain(..).chain(events.try_iter()).take(128) {
             match notification {
+                NvstReceiveEvent::Diagnostic(detail) => {
+                    event(env, callback, "stage", &detail).map_err(|e| e.to_string())?;
+                }
                 NvstReceiveEvent::RoundTripTime {
                     rtt,
                     duplicate_responses,

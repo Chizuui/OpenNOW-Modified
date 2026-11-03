@@ -1488,6 +1488,7 @@ pub enum NvstReceiveEvent {
     Dropped(NvstDropReason),
     RecoveryNeeded(NvstRecovery),
     Lifecycle(NvstReceiverState),
+    Diagnostic(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5308,6 +5309,11 @@ fn run_nvst_webrtc_bundle(
                 );
             }
             last_hole_punch = now;
+            if hole_punch_pings == 1 {
+                let _ = event_sender.send(NvstReceiveEvent::Diagnostic(format!(
+                    "Alliance NVST outbound first dest={bundle_peer}"
+                )));
+            }
         }
 
         if application_ready
@@ -5848,6 +5854,9 @@ fn run_nvst_webrtc_bundle(
                             length,
                             transport_origin,
                         );
+                        let _ = event_sender.send(NvstReceiveEvent::Diagnostic(format!(
+                            "Alliance NVST inbound first source={source} bytes={length}"
+                        )));
                     }
                     if inbound_datagrams == 1
                         || (verbose_diagnostics_enabled() && inbound_datagrams % 50 == 0)
