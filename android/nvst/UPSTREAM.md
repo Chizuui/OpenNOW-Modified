@@ -199,3 +199,12 @@ YES WebRTC + desktop monitor descriptor (2026-11-02):
 - `monitorSettings` now emits the full desktop monitor descriptor (`monitorId=0, positionX=0,
   positionY=0, dpi=100`) on YES even when using `NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY`, preserving
   the user's requested ultrawide resolution (`2560x1080`) without clamping.
+
+Official NVST cadence and diagnostics (2026-11-03):
+- Official GFN SDP advertises `general.pingIntervalBeforeConnectionMs:500` and
+  `general.pingIntervalAfterConnectionMs:500`. OpenNOW used 20 ms before connection and 100 ms
+  after; both now follow the advertised 500 ms cadence instead of flooding the alliance peer.
+- Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
+  RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
+- Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified
+  against a live YES seat.

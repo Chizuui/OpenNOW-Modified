@@ -128,8 +128,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PING_BYTES: usize = 512;
-const PING_INTERVAL_BEFORE_CONNECTION: Duration = Duration::from_millis(20);
-const PING_INTERVAL_AFTER_CONNECTION: Duration = Duration::from_millis(100);
+// GFN's own SDP advertises general.pingIntervalBeforeConnectionMs and
+// general.pingIntervalAfterConnectionMs as 500. The old 20 ms burst flooded the
+// alliance NATT peer and did not match any official client cadence.
+const PING_INTERVAL_BEFORE_CONNECTION: Duration = Duration::from_millis(500);
+const PING_INTERVAL_AFTER_CONNECTION: Duration = Duration::from_millis(500);
 const CURSOR_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_CURSOR_CAPTURE_ATTEMPTS: u8 = 8;
 const UDP_RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -4765,6 +4768,36 @@ fn looks_like_stun(datagram: &[u8]) -> bool {
     datagram.len() >= STUN_HEADER_LEN && datagram[4..8] == STUN_MAGIC_COOKIE.to_be_bytes()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpDatagramKind {
+    StunRequest,
+    StunSuccess,
+    StunOther,
+    Dtls,
+    Rtcp,
+    Rtp,
+    Other,
+}
+
+fn classify_udp_datagram(datagram: &[u8]) -> UdpDatagramKind {
+    if looks_like_stun(datagram) {
+        return match datagram.get(..2) {
+            Some([0, 1]) => UdpDatagramKind::StunRequest,
+            Some([1, 1]) => UdpDatagramKind::StunSuccess,
+            _ => UdpDatagramKind::StunOther,
+        };
+    }
+    if looks_like_dtls(datagram) {
+        UdpDatagramKind::Dtls
+    } else if looks_like_rtcp(datagram) {
+        UdpDatagramKind::Rtcp
+    } else if looks_like_rtp(datagram) {
+        UdpDatagramKind::Rtp
+    } else {
+        UdpDatagramKind::Other
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn synthesize_ice_binding_success(
     transaction_id: &[u8; 12],
@@ -4942,6 +4975,14 @@ fn run_nvst_webrtc_bundle(
     let mut video_delivery_gap = false;
     let mut datagram = vec![0_u8; 65_536];
     let mut inbound_datagrams = 0_u64;
+    let mut wrong_source_datagrams = 0_u64;
+    let mut inbound_stun_request = 0_u64;
+    let mut inbound_stun_success = 0_u64;
+    let mut inbound_stun_other = 0_u64;
+    let mut inbound_dtls = 0_u64;
+    let mut inbound_rtcp = 0_u64;
+    let mut inbound_rtp = 0_u64;
+    let mut inbound_other = 0_u64;
     let mut outbound_datagrams = 0_u64;
     let mut hole_punch_pings = 0_u64;
     let mut last_hole_punch = Instant::now() - PING_INTERVAL_BEFORE_CONNECTION;
@@ -5316,7 +5357,7 @@ fn run_nvst_webrtc_bundle(
                 "INFO",
                 "nvst-bundle",
                 &format!(
-                    "{} local_port={local_port} peer_port={} inbound={inbound_datagrams} outbound={outbound_datagrams} pings={hole_punch_pings} dtls_ready={dtls_ready} sctp_started={sctp_started} frame_ack={frame_acks_sent} pacing={frame_pacing_reports_sent} qos={qos_reports_sent}",
+                    "{} local_port={local_port} peer_port={} inbound={inbound_datagrams} wrong_source={wrong_source_datagrams} stun_req={inbound_stun_request} stun_ok={inbound_stun_success} stun_other={inbound_stun_other} dtls={inbound_dtls} rtcp={inbound_rtcp} rtp={inbound_rtp} other={inbound_other} outbound={outbound_datagrams} pings={hole_punch_pings} dtls_ready={dtls_ready} sctp_started={sctp_started} frame_ack={frame_acks_sent} pacing={frame_pacing_reports_sent} qos={qos_reports_sent}",
                     receiver.stats_line(control_stats_origin),
                     bundle_peer.port()
                 ),
@@ -5816,7 +5857,17 @@ fn run_nvst_webrtc_bundle(
                         );
                     }
                     if source != bundle_peer {
+                        wrong_source_datagrams = wrong_source_datagrams.saturating_add(1);
                         continue;
+                    }
+                    match classify_udp_datagram(&datagram[..length]) {
+                        UdpDatagramKind::StunRequest => inbound_stun_request += 1,
+                        UdpDatagramKind::StunSuccess => inbound_stun_success += 1,
+                        UdpDatagramKind::StunOther => inbound_stun_other += 1,
+                        UdpDatagramKind::Dtls => inbound_dtls += 1,
+                        UdpDatagramKind::Rtcp => inbound_rtcp += 1,
+                        UdpDatagramKind::Rtp => inbound_rtp += 1,
+                        UdpDatagramKind::Other => inbound_other += 1,
                     }
                     if datagram[..length] == *b"PING" {
                         if let Err(error) = socket.send_to(b"PONG", source) {
@@ -6216,6 +6267,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+
+    #[test]
+    fn bundle_udp_diagnostics_classify_stun_dtls_rtcp_rtp_and_other() {
+        let mut stun_request = vec![0; STUN_HEADER_LEN];
+        stun_request[..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+        stun_request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        assert_eq!(classify_udp_datagram(&stun_request), UdpDatagramKind::StunRequest);
+        stun_request[..2].copy_from_slice(&STUN_BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        assert_eq!(classify_udp_datagram(&stun_request), UdpDatagramKind::StunSuccess);
+
+        assert_eq!(classify_udp_datagram(&[22, 0xfe, 0xfd]), UdpDatagramKind::Dtls);
+        assert_eq!(classify_udp_datagram(&[0x80, 200, 0, 0]), UdpDatagramKind::Rtcp);
+        assert_eq!(classify_udp_datagram(&[0x80; RTP_FIXED_HEADER_LEN]), UdpDatagramKind::Rtp);
+        assert_eq!(classify_udp_datagram(b"PING"), UdpDatagramKind::Other);
+    }
     #[test]
     fn queued_input_is_nonblocking_ordered_and_bounded() {
         let (commands, receiver) = mpsc::channel();
@@ -9006,8 +9072,9 @@ mod tests {
     #[test]
     fn bundle_keepalives_do_not_claim_the_video_routing_identity() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Official ping cadence is 500 ms; allow a full interval before each probe.
         server
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let bundle = UdpSocket::bind("127.0.0.1:0").unwrap();
         let video = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -9022,7 +9089,7 @@ mod tests {
             Some(nvst_local_bundle_identity(&mut remote).dtls_fingerprint);
         config.stun_credentials = Some(stun_credentials());
         config.ping_payload = b"setup-ping".to_vec();
-        let packet = protect_for_test(
+        let video_packet = protect_for_test(
             &test_srtp(&config),
             build_plaintext_rtp(
                 1,
@@ -9047,8 +9114,10 @@ mod tests {
         let mut datagram = [0_u8; 2048];
         let mut bundle_keepalives = 0;
         let mut video_keepalives = 0;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while bundle_keepalives < 12 || video_keepalives < 3 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // One probe from each socket proves the routing identity; the media packet
+        // must arrive before the receiver's short test timeout.
+        while bundle_keepalives < 1 || video_keepalives < 1 {
             assert!(
                 Instant::now() < deadline,
                 "both socket roles must send probes"
@@ -9071,7 +9140,7 @@ mod tests {
                 bundle_keepalives += 1;
             }
         }
-        server.send_to(&packet, video_address).unwrap();
+        server.send_to(&video_packet, video_address).unwrap();
         let frame = media_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(frame.frame_index, Some(42));
         assert!(frame.keyframe);
@@ -9082,8 +9151,9 @@ mod tests {
     #[test]
     fn udp_receiver_repeats_the_negotiated_ping_before_media_arrives() {
         let server = UdpSocket::bind("127.0.0.1:0").expect("server socket");
+        // Official SDP advertises a 500 ms ping interval; allow more than one period.
         server
-            .set_read_timeout(Some(Duration::from_millis(250)))
+            .set_read_timeout(Some(Duration::from_millis(1_500)))
             .expect("server timeout");
         let client_reservation = UdpSocket::bind("127.0.0.1:0").expect("client reservation");
         let client_port = client_reservation
@@ -9119,8 +9189,9 @@ mod tests {
     #[test]
     fn mjolnir_receiver_sends_only_version_six_stun_with_the_setup_identity() {
         let server = UdpSocket::bind("127.0.0.1:0").expect("server socket");
+        // One official 500 ms ping interval plus scheduling headroom.
         server
-            .set_read_timeout(Some(Duration::from_millis(250)))
+            .set_read_timeout(Some(Duration::from_millis(1_500)))
             .expect("server timeout");
         let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
 
