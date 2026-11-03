@@ -1,6 +1,6 @@
 //! Partner compatibility selected by Kotlin's CloudMatch provider owner.
 //! NVIDIA keeps the existing negotiation; these rules follow dev 5b89338a3.
-use super::{NvstRtspError, SessionContext, resolve_remote_ufrag, sdp_attribute};
+use super::{NvstRtspError, SessionContext, sdp_attribute};
 
 pub(crate) fn enabled(context: &SessionContext) -> bool {
     context
@@ -9,30 +9,6 @@ pub(crate) fn enabled(context: &SessionContext) -> bool {
         .get("alliancePartner")
         .and_then(|v| v.as_bool())
         == Some(true)
-}
-
-pub(super) fn remote_ufrag(sdp: &str, payload: Option<&str>, ping_version: u8) -> Option<String> {
-    // The bundle's legacy username and V2 media username can differ on partner
-    // seats. NATT v6 uses the former plus the decimal server bundle port.
-    let described = sdp_attribute(sdp, "general.iceUsernameFragment")
-        .or_else(|| sdp_attribute(sdp, "general.iceUserNameFragmentV2"));
-    if ping_version == 6 {
-        if let (Some(ufrag), Some(port)) = (
-            described.as_deref(),
-            sdp_attribute(sdp, "general.serverBundlePort")
-                .and_then(|v| v.parse::<u16>().ok())
-                .filter(|p| *p != 0),
-        ) {
-            let username = format!("{ufrag}{port}");
-            if !ufrag.is_empty()
-                && username.len() <= 256
-                && ufrag.bytes().all(|b| b.is_ascii_graphic() && b != b':')
-            {
-                return Some(username);
-            }
-        }
-    }
-    resolve_remote_ufrag(payload, described.as_deref(), ping_version, None)
 }
 
 pub(super) fn runtime_key(sdp: &str) -> Option<(String, u32)> {
@@ -92,41 +68,6 @@ pub(crate) fn wait_authenticated_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bundle_authentication_uses_legacy_identity_and_nonadjacent_decimal_port() {
-        let sdp = "a=x-nv-general.iceUserNameFragmentV2:media\r\na=x-nv-general.iceUsernameFragment:bundle+/\r\na=x-nv-general.serverBundlePort:18342\r\n";
-        assert_eq!(
-            remote_ufrag(sdp, Some("00ff"), 6).as_deref(),
-            Some("bundle+/18342")
-        );
-        assert_eq!(remote_ufrag(sdp, Some("00ff"), 5).as_deref(), Some("0100"));
-        assert_eq!(
-            remote_ufrag(
-                "a=x-nv-general.iceUserNameFragmentV2:media\na=x-nv-general.serverBundlePort:48000",
-                None,
-                6
-            )
-            .as_deref(),
-            Some("media48000")
-        );
-    }
-
-    #[test]
-    fn absent_or_invalid_bundle_port_keeps_existing_video_payload_fallback() {
-        for port in ["0", "65536", "invalid"] {
-            assert_eq!(
-                remote_ufrag(
-                    &format!("a=x-nv-general.serverBundlePort:{port}"),
-                    Some("00ff"),
-                    6
-                )
-                .as_deref(),
-                Some("0100")
-            );
-        }
-        assert_eq!(remote_ufrag("", None, 6), None);
-    }
 
     #[test]
     fn valid_server_key_is_preserved_and_malformed_keys_are_not_used() {

@@ -206,10 +206,10 @@ Official NVST cadence and diagnostics (2026-11-03):
   after; both now follow the advertised 500 ms cadence instead of flooding the alliance peer.
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
-- Live YES logs on 2026-11-03 still show a peerless video SETUP. Unified-socket rigs assign the
-  single bundle peer to the control stream, so the first SETUP is now `streamid=control`
-  (matching Bifrost's control-stream setup for this mode), then the video forms. An empty
-  `Transport` 200 is retried with `X-GS-ClientPort` before falling back to CloudMatch.
+- Live YES logs on 2026-11-03 still show `source=cloudmatch` and no inbound. The STUN username
+  was built from the ping payload (incremented hex), but Bifrost's v6 validator expects the
+  DESCRIBE ICE ufrag; the handoff now uses `iceUserNameFragmentV2`/`iceUsernameFragment`
+  directly, with no port suffix or hex increment.
 - Startup stages now report the chosen bundle/video peers and the first inbound datagram, without
   logging ICE credentials or payloads.
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified

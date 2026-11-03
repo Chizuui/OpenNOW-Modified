@@ -953,19 +953,7 @@ fn prepare_nvst_endpoint(
             "SETUP selected ping version 6 without an X-Nv-Ping-Payload",
         ));
     }
-    let remote_ufrag = if alliance::enabled(context) {
-        alliance::remote_ufrag(&describe.body, setup_ping_payload.as_deref(), ping_version)
-    } else {
-        resolve_remote_ufrag(
-            setup_ping_payload.as_deref(),
-            remote_ufrag.as_deref(),
-            ping_version,
-            sdp_attribute(&describe.body, "general.serverBundlePort")
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|port| *port != 0),
-        )
-    }
-    .ok_or_else(|| {
+    let remote_ufrag = remote_ufrag.ok_or_else(|| {
         NvstRtspError::new(
             "missing-ice-credentials",
             "NVST negotiation did not provide a remote ICE username fragment",
@@ -1618,52 +1606,6 @@ fn parse_video_peer(transport: &str) -> Option<(String, u16)> {
     Some((ip?, port?))
 }
 
-fn increment_hex(value: &str) -> Option<String> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut bytes = value.as_bytes().to_vec();
-    let mut carry = true;
-    for byte in bytes.iter_mut().rev() {
-        if !carry {
-            break;
-        }
-        let digit = (*byte as char).to_digit(16)?;
-        if digit == 15 {
-            *byte = b'0';
-        } else {
-            *byte = char::from_digit(digit + 1, 16)?.to_ascii_lowercase() as u8;
-            carry = false;
-        }
-    }
-    if carry {
-        bytes.insert(0, b'1');
-    }
-    String::from_utf8(bytes).ok()
-}
-
-fn resolve_remote_ufrag(
-    ping_payload: Option<&str>,
-    described_ufrag: Option<&str>,
-    ping_version: u8,
-    server_bundle_port: Option<u16>,
-) -> Option<String> {
-    if let (Some(ufrag), Some(port)) = (described_ufrag, server_bundle_port) {
-        return Some(format!("{ufrag}{port}"));
-    }
-    // Compatibility for seats missing one of the DESCRIBE fields. The explicit
-    // decimal port above must win, including non-adjacent ports and carry.
-    if let Some(payload) = ping_payload {
-        if let Some(incremented) = increment_hex(payload) {
-            return Some(incremented);
-        }
-        if payload.eq_ignore_ascii_case("PING") || ping_version == 6 {
-            return Some(payload.to_owned());
-        }
-    }
-    described_ufrag.map(ToOwned::to_owned)
-}
-
 fn random_runtime_key() -> Result<(String, u32), NvstRtspError> {
     let mut key = [0_u8; 32];
     let mut id = [0_u8; 4];
@@ -1807,16 +1749,6 @@ mod tests {
                 .code,
             "missing-rtsps-endpoint"
         );
-    }
-
-    #[test]
-    fn bundle_identity_uses_described_decimal_port_not_hex_video_increment() {
-        for port in [47999, 48000, 50000] {
-            assert_eq!(
-                resolve_remote_ufrag(Some("abcd47998"), Some("server+/"), 6, Some(port)),
-                Some(format!("server+/{port}"))
-            );
-        }
     }
 
     #[test]
@@ -2151,21 +2083,6 @@ mod tests {
         assert!(!trusted_nvst_host("[::1]"));
         assert!(!trusted_nvst_host("fd00::1"));
         assert!(!trusted_nvst_host("seat.local"));
-    }
-
-    #[test]
-    fn ping_identity_increment_preserves_width_and_carry() {
-        assert_eq!(increment_hex("00ff").as_deref(), Some("0100"));
-        assert_eq!(increment_hex("ffff").as_deref(), Some("10000"));
-        assert_eq!(increment_hex("PING"), None);
-        assert_eq!(
-            resolve_remote_ufrag(Some("00ff"), Some("described"), 6, None).as_deref(),
-            Some("0100")
-        );
-        assert_eq!(
-            resolve_remote_ufrag(None, Some("described"), 5, None).as_deref(),
-            Some("described")
-        );
     }
 }
 
