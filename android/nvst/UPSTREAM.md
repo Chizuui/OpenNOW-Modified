@@ -206,11 +206,11 @@ Official NVST cadence and diagnostics (2026-11-03):
   after; both now follow the advertised 500 ms cadence instead of flooding the alliance peer.
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
-- Live YES logs on 2026-11-03 show `inbound=0` with both the usage-17 and usage-2 CloudMatch
-  mappings. SETUP already returns the streamer's real `Transport` peer; that peer must be the
-  bundle destination. CloudMatch mappings are now used only for a peerless 200 fallback.
-  Kotlin also omits usage-17 for `.yes.geforcenow.nvidiagrid.net`. DTLS-before-PLAY is restored,
-  and ANNOUNCE advertises the official 500 ms cadence.
+- Live YES logs on 2026-11-03 show `inbound=0` with both CloudMatch mappings and with a peerless
+  SETUP. YES's SETUP is peerless but DESCRIBE publishes `general.serverBundlePort`; that port on
+  the seat host is the bundle destination. Peer order is now SETUP `Transport` peer, then SDP
+  `serverBundlePort`, then CloudMatch mappings. DTLS-before-PLAY is restored, and ANNOUNCE
+  advertises the official 500 ms cadence.
 - Startup stages now report the chosen bundle/video peers and the first inbound datagram, without
   logging ICE credentials or payloads.
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified

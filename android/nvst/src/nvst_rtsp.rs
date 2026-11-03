@@ -819,6 +819,9 @@ fn prepare_nvst_endpoint(
     let described_ping_version = sdp_attribute(&describe.body, "general.pingVersion")
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(6);
+    let described_bundle_port = sdp_attribute(&describe.body, "general.serverBundlePort")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0);
     let remote_ufrag = sdp_attribute(&describe.body, "general.iceUserNameFragmentV2")
         .or_else(|| sdp_attribute(&describe.body, "general.iceUsernameFragment"));
     let remote_password = sdp_attribute(&describe.body, "general.icePasswordV2")
@@ -864,14 +867,30 @@ fn prepare_nvst_endpoint(
         },
         bundle_video_peer,
     )?;
-    // SETUP returns the streamer's real bundle destination. The CloudMatch
-    // usage mapping is only a fallback when the 200 response is peerless.
-    let (bundle_peer_ip, bundle_peer_port) = if bundle_fallback {
-        endpoint
-            .map(|endpoint| (endpoint.ip.to_owned(), endpoint.port))
-            .unwrap_or((video_peer_ip.clone(), u32::from(video_peer_port)))
+    // SETUP returns the streamer's real bundle destination. A peerless 200 is
+    // common on YES: the SDP still names the bundle UDP port on the seat host,
+    // which is authoritative; CloudMatch mappings are the last fallback.
+    let sdp_bundle_peer = described_bundle_port.and_then(|port| {
+        context
+            .session
+            .server_ip
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| (ip.to_string(), u32::from(port)))
+    });
+    let (bundle_peer_ip, bundle_peer_port, bundle_source) = if bundle_fallback {
+        sdp_bundle_peer
+            .map(|(ip, port)| (ip, port, "sdp"))
+            .or_else(|| {
+                endpoint.map(|endpoint| (endpoint.ip.to_owned(), endpoint.port, "cloudmatch"))
+            })
+            .unwrap_or((video_peer_ip.clone(), u32::from(video_peer_port), "setup"))
     } else {
-        (video_peer_ip.clone(), u32::from(video_peer_port))
+        (
+            video_peer_ip.clone(),
+            u32::from(video_peer_port),
+            "setup",
+        )
     };
     let bundle_peer_port = u16::try_from(bundle_peer_port)
         .ok()
@@ -986,7 +1005,7 @@ fn prepare_nvst_endpoint(
     });
     handoff["bundlePeerIp"] = json!(bundle_peer.ip().to_string());
     handoff["bundlePeerPort"] = json!(bundle_peer.port());
-    handoff["bundleSource"] = json!(if bundle_fallback { "cloudmatch" } else { "setup" });
+    handoff["bundleSource"] = json!(bundle_source);
     opennow_streamer_protocol::log::log_line(
         "INFO",
         "nvst-handoff",
