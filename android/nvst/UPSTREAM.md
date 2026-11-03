@@ -206,10 +206,9 @@ Official NVST cadence and diagnostics (2026-11-03):
   after; both now follow the advertised 500 ms cadence instead of flooding the alliance peer.
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
-- Live YES logs on 2026-11-03 still show `source=cloudmatch` and no inbound. Bifrost's v6
-  `NattHolePunch::SendPing` builds USERNAME as `remoteUfrag:localUfrag` (its setter stores the
-  two ICE fragments), not from `X-Nv-Ping-Payload`. The bundle and Mjolnir probes now send the
-  same standard ICE Binding request as WebRtcTransport, with the DESCRIBE ICE ufrag.
+- Live YES logs on 2026-11-03 still show `source=cloudmatch` and no inbound with standard
+  v6 ICE credentials. The streamer now receives PLAY before the DTLS wait, because the pre-PLAY
+  wait never produced a STUN reply. If this still fails, capture the official client's UDP tuple.
 - Startup stages now report the chosen bundle/video peers and the first inbound datagram, without
   logging ICE credentials or payloads.
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified
