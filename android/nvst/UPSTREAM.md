@@ -206,5 +206,8 @@ Official NVST cadence and diagnostics (2026-11-03):
   after; both now follow the advertised 500 ms cadence instead of flooding the alliance peer.
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
+- Live YES logs on 2026-11-03 show the pre-PLAY DTLS wait always sees `inbound=0`; the partner
+  streamer only starts after PLAY. ANNOUNCE now uses the official 500 ms cadence, and PLAY is sent
+  before the 20 s DTLS wait (stale idle-timeout reports are re-armed up to twice).
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified
   against a live YES seat.

@@ -264,14 +264,21 @@ fn run(
         return Ok(());
     }
     let mut pending_events = VecDeque::new();
-    if alliance_partner {
+    // Partner rigs publish no usable video peer in SETUP and only start their
+    // streamer after PLAY. Waiting for DTLS first deadlocks (logcat: inbound=0).
+    let _rtsp = if alliance_partner {
+        let rtsp = prepared.finish().map_err(|e| e.message)?;
         event(
             env,
             callback,
             "stage",
-            "Alliance NVST waiting for authenticated DTLS before PLAY",
+            "Alliance NVST PLAY complete; waiting for authenticated DTLS",
         )
         .map_err(|e| e.to_string())?;
+        let control = state.control.lock().unwrap().clone();
+        // PLAY can block longer than the receiver's idle timeout; stale timeout
+        // reports are re-armed instead of aborting the attachment immediately.
+        let mut rearmed = 0;
         nvst_rtsp::alliance::wait_authenticated_transport(|| {
             if state.stopped.load(Ordering::Acquire) {
                 return Err(nvst_rtsp::NvstRtspError::new("nvst-cancelled", "NVST startup cancelled"));
@@ -279,9 +286,13 @@ fn run(
             while let Ok(notification) = events.try_recv() {
                 match notification {
                     NvstReceiveEvent::TransportReady("dtls") => return Ok(true),
-                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) =>
-                        return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
-                            "Alliance NVST authentication timed out before PLAY; cloud session retained")),
+                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) => {
+                        if rearmed >= 2 || control.as_ref().is_none_or(|c| c.recover().is_err()) {
+                            return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
+                                "Alliance NVST authentication timed out after PLAY; cloud session retained"));
+                        }
+                        rearmed += 1;
+                    }
                     other => {
                         if pending_events.len() >= 128 {
                             return Err(nvst_rtsp::NvstRtspError::new("nvst-startup-event-overflow",
@@ -292,9 +303,11 @@ fn run(
                 }
             }
             Ok(false)
-        }, Duration::from_secs(8)).map_err(|e| format!("{}: {}", e.code, e.message))?;
-    }
-    let _rtsp = prepared.finish().map_err(|e| e.message)?;
+        }, Duration::from_secs(20)).map_err(|e| format!("{}: {}", e.code, e.message))?;
+        rtsp
+    } else {
+        prepared.finish().map_err(|e| e.message)?
+    };
     feedback.set_application_ready(true);
     event(env, callback, "connected", "NVST encrypted UDP").map_err(|e| e.to_string())?;
     let mut last_stats = Instant::now();

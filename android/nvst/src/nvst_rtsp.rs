@@ -1142,8 +1142,9 @@ fn build_announce(context: &SessionContext, params: AnnounceParams<'_>) -> Strin
         "a=x-nv-bwe.useOwdCongestionControl:1".to_owned(),
         "a=x-nv-general.rtspWebSocketPerConnection:1".to_owned(),
         "a=x-nv-general.enetControlChannel.mtuSize:1191".to_owned(),
-        "a=x-nv-general.pingIntervalBeforeConnectionMs:20".to_owned(),
-        "a=x-nv-general.pingIntervalAfterConnectionMs:100".to_owned(),
+        // Match GFN's advertised 500 ms cadence instead of flooding the peer.
+        "a=x-nv-general.pingIntervalBeforeConnectionMs:500".to_owned(),
+        "a=x-nv-general.pingIntervalAfterConnectionMs:500".to_owned(),
         "a=x-nv-runtime.audioSrtp:0".to_owned(),
         "a=x-nv-runtime.micSrtp:0".to_owned(),
         "a=x-nv-runtime.mouseCursorCapture:3".to_owned(),
