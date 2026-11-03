@@ -18,6 +18,18 @@ struct Reply {
     headers: &'static str,
 }
 
+fn client_port_rejections() -> Vec<Reply> {
+    EMPTY_TRANSPORT_URIS
+        .iter()
+        .map(|uri| Reply {
+            uri,
+            transport: "unicast;X-GS-ClientPort=49005-49006",
+            status: 400,
+            headers: "",
+        })
+        .collect()
+}
+
 fn scripted_setup(replies: Vec<Reply>) -> Result<VideoSetup, NvstRtspError> {
     scripted_setup_with_retry(replies, 0, Duration::ZERO, None)
 }
@@ -113,17 +125,18 @@ fn video_setup_keeps_the_official_first_attempt_and_its_metadata() {
 }
 
 #[test]
-fn video_setup_stops_at_first_peerless_success_to_protect_announce() {
-    // Live alliance rigs accept the first SETUP but poison the session once
-    // further forms are tried (later rounds degrade to pure 400s and ANNOUNCE
-    // is then rejected), while a single SETUP followed by ANNOUNCE succeeds.
-    // The scripted server holds exactly one reply: any extra request fails it.
-    let error = match scripted_setup(vec![Reply {
+fn video_setup_retries_client_port_after_a_peerless_success() {
+    // An empty Transport is answered with 200 but no peer on YES. The next
+    // form advertises the reserved client ports; a rejection there still keeps
+    // the peerless response for the CloudMatch fallback.
+    let mut replies = vec![Reply {
         uri: EMPTY_TRANSPORT_URIS[0],
         transport: "",
         status: 200,
         headers: "",
-    }]) {
+    }];
+    replies.extend(client_port_rejections());
+    let error = match scripted_setup(replies) {
         Ok(_) => panic!("a peerless 200 must not yield a peer"),
         Err(error) => error,
     };
@@ -179,14 +192,21 @@ fn video_setup_tries_client_udp_transport_after_all_empty_transport_forms() {
 
 #[test]
 fn video_setup_never_invents_a_peer_when_success_omits_transport() {
-    // Single peerless 200: the sweep stops immediately (one scripted reply)
-    // instead of trying further forms that would poison strict sessions.
-    let error = match scripted_setup(vec![Reply {
-        uri: EMPTY_TRANSPORT_URIS[0],
-        transport: "",
-        status: 200,
-        headers: "",
-    }]) {
+    // Both Transport forms are peerless: no peer is synthesized.
+    let error = match scripted_setup(vec![
+        Reply {
+            uri: EMPTY_TRANSPORT_URIS[0],
+            transport: "",
+            status: 200,
+            headers: "",
+        },
+        Reply {
+            uri: EMPTY_TRANSPORT_URIS[0],
+            transport: "unicast;X-GS-ClientPort=49005-49006",
+            status: 200,
+            headers: "",
+        },
+    ]) {
         Ok(_) => panic!("SETUP without a peer must not succeed"),
         Err(error) => error,
     };
@@ -196,20 +216,21 @@ fn video_setup_never_invents_a_peer_when_success_omits_transport() {
 
 #[test]
 fn video_setup_rejects_partial_and_invalid_transport_metadata() {
-    // Present-but-unusable Transport (missing/invalid source or ports) also
-    // stops the sweep: no live rig has ever yielded a peer on a later form
-    // after a peerless 200, while extra SETUPs poison strict sessions.
+    // Present-but-unusable Transport (missing/invalid source or ports) is
+    // treated as peerless; the client-port form is still tried.
     for headers in [
         "Transport: unicast;X-GS-ServerPort=5004\r\n",
         "Transport: unicast;source=192.0.2.10\r\n",
         "Transport: unicast;source=not-an-ip;X-GS-ServerPort=5004\r\n",
     ] {
-        let error = match scripted_setup(vec![Reply {
+        let mut replies = vec![Reply {
             uri: EMPTY_TRANSPORT_URIS[0],
             transport: "",
             status: 200,
             headers,
-        }]) {
+        }];
+        replies.extend(client_port_rejections());
+        let error = match scripted_setup(replies) {
             Ok(_) => panic!("unusable Transport must not yield a peer"),
             Err(error) => error,
         };
@@ -320,41 +341,39 @@ fn rtsp_request_deadline_bounds_a_partial_response() {
 
 #[test]
 fn video_setup_resweeps_when_successes_omit_a_peer_until_the_rig_is_ready() {
-    // Round 1 draws one peerless 200 and stops at it; round 2 re-sends the
-    // same form and the rig has a peer by then. Mirrors a late-starting
-    // encoder without spraying further forms that poison strict sessions.
-    let replies = vec![
-        Reply {
-            uri: EMPTY_TRANSPORT_URIS[0],
-            transport: "",
-            status: 200,
-            headers: "",
-        },
-        Reply {
-            uri: EMPTY_TRANSPORT_URIS[0],
-            transport: "",
-            status: 200,
-            headers: VALID_PEER,
-        },
-    ];
+    // Round 1 draws a peerless 200, then the client-port form is rejected;
+    // round 2 re-sends the empty form and the rig has a peer by then.
+    let mut replies = vec![Reply {
+        uri: EMPTY_TRANSPORT_URIS[0],
+        transport: "",
+        status: 200,
+        headers: "",
+    }];
+    replies.extend(client_port_rejections());
+    replies.push(Reply {
+        uri: EMPTY_TRANSPORT_URIS[0],
+        transport: "",
+        status: 200,
+        headers: VALID_PEER,
+    });
     let setup = scripted_setup_with_retry(replies, 3, Duration::ZERO, None).unwrap();
     assert_eq!(setup.peer, ("192.0.2.10".to_owned(), 5004));
 }
 
 #[test]
 fn video_setup_peer_retry_stays_bounded_and_keeps_the_terminal_code() {
-    // Every round draws one peerless 200 and stops there: retries exhaust,
-    // then the original missing-video-peer error (not a timeout, not a new
-    // code) is returned.
-    let replies = vec![
-        Reply {
+    // Every round draws a peerless 200 and a rejected client-port form:
+    // retries exhaust, then the original missing-video-peer error is returned.
+    let mut replies = Vec::new();
+    for _ in 0..3 {
+        replies.push(Reply {
             uri: EMPTY_TRANSPORT_URIS[0],
             transport: "",
             status: 200,
             headers: "",
-        };
-        3
-    ];
+        });
+        replies.extend(client_port_rejections());
+    }
     let error = match scripted_setup_with_retry(replies, 2, Duration::ZERO, None) {
         Ok(_) => panic!("SETUP without a peer must not succeed"),
         Err(error) => error,
@@ -387,17 +406,16 @@ fn video_setup_never_retries_pure_rejections() {
 
 #[test]
 fn video_setup_degraded_retry_round_keeps_missing_peer_code() {
-    // Round 1 draws a peerless 200 and stops, so a retry is scheduled; round
-    // 2 then degrades to pure 400s (repeat SETUPs rejected). The terminal code
-    // must stay missing-video-peer so callers can try the bundle peer instead
-    // of treating it as wrong forms. Round 2 sweeps all forms because it drew
-    // no 200 at all.
+    // Round 1 draws a peerless 200 plus a rejected client-port form, so a
+    // retry is scheduled; round 2 then degrades to pure 400s (repeat SETUPs
+    // rejected). The terminal code must stay missing-video-peer.
     let mut replies = vec![Reply {
         uri: EMPTY_TRANSPORT_URIS[0],
         transport: "",
         status: 200,
         headers: "",
     }];
+    replies.extend(client_port_rejections());
     replies.extend(
         ["", "unicast;X-GS-ClientPort=49005-49006"]
             .iter()
@@ -419,12 +437,13 @@ fn video_setup_degraded_retry_round_keeps_missing_peer_code() {
 
 #[test]
 fn video_setup_uses_bundle_peer_on_first_peerless_success_without_retry() {
-    let peerless = vec![Reply {
+    let mut peerless = vec![Reply {
         uri: EMPTY_TRANSPORT_URIS[0],
         transport: "",
         status: 200,
         headers: "Transport: \r\nX-Nv-Ping: 6\r\nX-Nv-Ping-Payload: 00ff\r\n",
     }];
+    peerless.extend(client_port_rejections());
     let setup = scripted_setup_with_retry(
         peerless,
         3,

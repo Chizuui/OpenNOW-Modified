@@ -207,10 +207,10 @@ Official NVST cadence and diagnostics (2026-11-03):
 - Bundle UDP diagnostics now classify inbound datagrams as STUN request/success/other, DTLS, RTCP,
   RTP, or other, and count wrong-source traffic. No payload, ICE credential, or token is logged.
 - Live YES logs on 2026-11-03 show `inbound=0` with both CloudMatch mappings and with a peerless
-  SETUP. YES's SETUP is peerless but DESCRIBE publishes `general.serverBundlePort`; that port on
-  the seat host is the bundle destination. Peer order is now SETUP `Transport` peer, then SDP
-  `serverBundlePort`, then CloudMatch mappings. DTLS-before-PLAY is restored, and ANNOUNCE
-  advertises the official 500 ms cadence.
+  SETUP. YES answers the empty `Transport` form with 200 but no peer; the client now retries the
+  explicit `X-GS-ClientPort` form before falling back, because an empty-form 200 does not mean the
+  rig has no peer. DTLS-before-PLAY is restored, and ANNOUNCE advertises the official 500 ms
+  cadence.
 - Startup stages now report the chosen bundle/video peers and the first inbound datagram, without
   logging ICE credentials or payloads.
 - Verified with 140 Rust tests, 1 ignored microbenchmark; release APK assembled. Still not verified

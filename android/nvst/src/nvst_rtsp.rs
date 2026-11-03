@@ -218,6 +218,7 @@ impl RtspClient {
         deadline: &Instant,
     ) -> Result<VideoSetup, SweepFailure> {
         let mut last_status = 0;
+        let mut peerless_200 = None;
         for transport in [
             String::new(),
             format!(
@@ -276,22 +277,15 @@ impl RtspClient {
                                 bundle_fallback: false,
                             });
                         }
-                        // 200 without a peer: stop sweeping immediately. Live
-                        // alliance rigs accept the first SETUP but poison the
-                        // session once further forms are tried (later rounds
-                        // degrade to pure 400s and ANNOUNCE is then rejected),
-                        // while a single SETUP followed by ANNOUNCE succeeds.
-                        // Every observed working session peers on its first
-                        // 200, so stopping here changes nothing for them.
-                        return Err(SweepFailure {
-                            error: NvstRtspError::new(
-                                "missing-video-peer",
-                                format!(
-                                    "SETUP stopped after a peerless 200 without a usable NVST video peer (last status {last_status})",
-                                ),
-                            ),
-                            peerless_200: Some(Box::new(response)),
-                        });
+                        // A peerless 200 means the server accepted the form but
+                        // did not assign a Transport peer. An empty Transport is
+                        // commonly answered this way on YES; try the explicit
+                        // client-port form before falling back to CloudMatch.
+                        peerless_200.get_or_insert(Box::new(response));
+                        // The remaining URI spellings use the same form and
+                        // only risk poisoning the session. Move to the next
+                        // Transport form instead.
+                        break;
                     }
                     400 | 404 | 459 | 460 | 461 => {}
                     _ => {
@@ -305,6 +299,17 @@ impl RtspClient {
                     }
                 }
             }
+        }
+        if let Some(response) = peerless_200 {
+            return Err(SweepFailure {
+                error: NvstRtspError::new(
+                    "missing-video-peer",
+                    format!(
+                        "SETUP returned a peerless 200 and no client-port Transport peer (last status {last_status})",
+                    ),
+                ),
+                peerless_200: Some(response),
+            });
         }
         Err(SweepFailure {
             error: NvstRtspError::new(
