@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -116,6 +116,7 @@ impl RtspClient {
         target: &str,
         headers: &[(&str, String)],
         client_port: u16,
+        source: Option<IpAddr>,
         bundle_video_peer: Option<(String, u16)>,
         unified_socket: bool,
     ) -> Result<VideoSetup, NvstRtspError> {
@@ -124,6 +125,7 @@ impl RtspClient {
             target,
             headers,
             client_port,
+            source,
             SETUP_PEER_RETRY_ROUNDS,
             SETUP_PEER_RETRY_DELAY,
             bundle_video_peer,
@@ -138,6 +140,7 @@ impl RtspClient {
         target: &str,
         headers: &[(&str, String)],
         client_port: u16,
+        source: Option<IpAddr>,
         max_peer_retries: u32,
         peer_retry_delay: Duration,
         bundle_video_peer: Option<(String, u16)>,
@@ -161,6 +164,7 @@ impl RtspClient {
                 &mut headers,
                 transport_index,
                 client_port,
+                source,
                 &deadline,
                 unified_socket,
             ) {
@@ -219,22 +223,28 @@ impl RtspClient {
         headers: &mut [(&str, String)],
         transport_index: usize,
         client_port: u16,
+        source: Option<IpAddr>,
         deadline: &Instant,
         unified_socket: bool,
     ) -> Result<VideoSetup, SweepFailure> {
         let mut last_status = 0;
         let mut peerless_200 = None;
-        for transport in [
+        let source_suffix = source.map(|ip| format!(";source={ip}")).unwrap_or_default();
+        let mut transports = vec![
+            format!(
+                "unicast;X-GS-ClientPort={client_port}-{}{source_suffix}",
+                client_port.saturating_add(1)
+            ),
+            format!(
+                "RTP/AVP/UDP;unicast;client_port={client_port}-{}{source_suffix}",
+                client_port.saturating_add(1)
+            ),
             String::new(),
-            format!(
-                "unicast;X-GS-ClientPort={client_port}-{}",
-                client_port.saturating_add(1)
-            ),
-            format!(
-                "RTP/AVP/UDP;unicast;client_port={client_port}-{}",
-                client_port.saturating_add(1)
-            ),
-        ] {
+        ];
+        if source.is_none() {
+            transports.rotate_right(1);
+        }
+        for transport in transports {
             let transport_form = if transport.is_empty() {
                 "empty"
             } else {
@@ -772,6 +782,20 @@ fn try_signalling_endpoints<T>(
     Err(last_error)
 }
 
+fn local_udp_source(target: &str) -> Option<IpAddr> {
+    let host = target
+        .strip_prefix("rtsps://")
+        .or_else(|| target.strip_prefix("rtsp://"))
+        .unwrap_or(target)
+        .split('/')
+        .next()?;
+    let remote = host.to_socket_addrs().ok()?.next()?;
+    let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(remote).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
 fn prepare_nvst_endpoint(
     context: &SessionContext,
     bundle: &mut ReservedNvstBundle,
@@ -881,6 +905,7 @@ fn prepare_nvst_endpoint(
         } else {
             mjolnir_port
         },
+        local_udp_source(&target),
         bundle_video_peer,
         described_unified_socket,
     )?;

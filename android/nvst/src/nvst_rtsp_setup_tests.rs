@@ -106,6 +106,7 @@ fn scripted_setup_with_retry(
             ("x-nv-ping", "6".to_owned()),
         ],
         49005,
+        None,
         max_peer_retries,
         peer_retry_delay,
         bundle_video_peer,
