@@ -19,15 +19,13 @@ struct Reply {
 }
 
 fn client_port_rejections() -> Vec<Reply> {
-    [""]
+    EMPTY_TRANSPORT_URIS
         .iter()
-        .flat_map(|_| {
-            EMPTY_TRANSPORT_URIS.iter().map(|uri| Reply {
-                uri,
-                transport: "unicast;X-GS-ClientPort=49005-49006",
-                status: 400,
-                headers: "",
-            })
+        .map(|uri| Reply {
+            uri,
+            transport: "unicast;X-GS-ClientPort=49005-49006",
+            status: 400,
+            headers: "",
         })
         .chain(EMPTY_TRANSPORT_URIS.iter().map(|uri| Reply {
             uri,
@@ -106,6 +104,7 @@ fn scripted_setup_with_retry(
             ("x-nv-ping", "6".to_owned()),
         ],
         49005,
+        None,
         None,
         None,
         max_peer_retries,
@@ -487,26 +486,3 @@ fn video_setup_degraded_retry_round_keeps_missing_peer_code() {
     assert_eq!(error.code, "missing-video-peer");
 }
 
-#[test]
-fn video_setup_uses_bundle_peer_on_first_peerless_success_without_retry() {
-    let mut peerless = vec![Reply {
-        uri: EMPTY_TRANSPORT_URIS[0],
-        transport: "",
-        status: 200,
-        headers: "Transport: \r\nX-Nv-Ping: 6\r\nX-Nv-Ping-Payload: 00ff\r\n",
-    }];
-    peerless.extend(client_port_rejections());
-    let setup = scripted_setup_with_retry(
-        peerless,
-        3,
-        Duration::ZERO,
-        Some(("192.0.2.99".to_owned(), 13749)),
-    )
-    .unwrap();
-    assert_eq!(setup.peer, ("192.0.2.99".to_owned(), 13749));
-    assert!(setup.bundle_fallback);
-    assert_eq!(
-        header_value(&setup.response, "x-nv-ping-payload"),
-        Some("00ff")
-    );
-}

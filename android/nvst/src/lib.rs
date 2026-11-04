@@ -227,6 +227,13 @@ fn run(
             env,
             callback,
             "stage",
+            &format!("Alliance NVST setup forms {}", prepared.setup_trace),
+        )
+        .map_err(|e| e.to_string())?;
+        event(
+            env,
+            callback,
+            "stage",
             &format!(
                 "Alliance NVST SETUP complete unifiedSocket={} pingVersion={}",
                 prepared.handoff["unifiedSocket"].as_bool().unwrap_or(false),
@@ -262,7 +269,8 @@ fn run(
         Some(rtc),
     )
     .map_err(|e| e.to_string())?;
-    *state.control.lock().unwrap() = Some(transport.control());
+    let transport_control = transport.control();
+    *state.control.lock().unwrap() = Some(transport_control.clone());
     let mut receivers = Receivers {
         bundle: Some(transport),
         video: None,
@@ -276,13 +284,16 @@ fn run(
     if state.stopped.load(Ordering::Acquire) {
         return Ok(());
     }
+    let _rtsp = prepared.finish().map_err(|e| e.message)?;
+    feedback.set_application_ready(true);
+    event(env, callback, "connected", "NVST encrypted UDP").map_err(|e| e.to_string())?;
     let mut pending_events = VecDeque::new();
     if alliance_partner {
         event(
             env,
             callback,
             "stage",
-            "Alliance NVST waiting for authenticated DTLS before PLAY",
+            "Alliance NVST waiting for authenticated DTLS after PLAY",
         )
         .map_err(|e| e.to_string())?;
         nvst_rtsp::alliance::wait_authenticated_transport(|| {
@@ -292,9 +303,11 @@ fn run(
             while let Ok(notification) = events.try_recv() {
                 match notification {
                     NvstReceiveEvent::TransportReady("dtls") => return Ok(true),
-                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) =>
-                        return Err(nvst_rtsp::NvstRtspError::new("nvst-transport-ready-timeout",
-                            "Alliance NVST authentication timed out before PLAY; cloud session retained")),
+                    // The receiver's idle clock starts at spawn, before PLAY;
+                    // a timeout queued during PLAY says nothing about DTLS.
+                    NvstReceiveEvent::RecoveryNeeded(nvst::NvstRecovery::Timeout { .. }) => {
+                        let _ = transport_control.recover();
+                    }
                     NvstReceiveEvent::Diagnostic(detail) => {
                         let _ = event(env, callback, "stage", &detail);
                     }
@@ -310,9 +323,6 @@ fn run(
             Ok(false)
         }, Duration::from_secs(8)).map_err(|e| format!("{}: {}", e.code, e.message))?;
     }
-    let _rtsp = prepared.finish().map_err(|e| e.message)?;
-    feedback.set_application_ready(true);
-    event(env, callback, "connected", "NVST encrypted UDP").map_err(|e| e.to_string())?;
     let mut last_stats = Instant::now();
     let mut round_trip_ms = None;
     let mut duplicate_stun_responses = 0;

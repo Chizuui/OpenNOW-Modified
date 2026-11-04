@@ -4200,13 +4200,87 @@ impl ReservedNvstBundle {
         }
         Ok(address.to_string())
     }
-
     pub fn identity(&mut self) -> NvstBundleIdentity {
         nvst_local_bundle_identity(&mut self.rtc)
     }
 
     pub fn send_to(&self, payload: &[u8], host: &str, port: u16) -> std::io::Result<usize> {
         self.socket.send_to(payload, (host, port))
+    }
+
+    pub fn discover_mapped_addr(
+        &self,
+        server: SocketAddr,
+        timeout: Duration,
+    ) -> std::io::Result<SocketAddr> {
+        let bind = SocketAddr::new(
+            if server.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            },
+            0,
+        );
+        let probe = UdpSocket::bind(bind)?;
+        probe.connect(server)?;
+        probe.set_read_timeout(Some(timeout))?;
+
+        let mut transaction_id = [0_u8; 12];
+        getrandom::fill(&mut transaction_id)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut request = [0_u8; STUN_HEADER_LEN];
+        request[..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+        request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request[8..].copy_from_slice(&transaction_id);
+        probe.send(&request)?;
+
+        let mut packet = [0_u8; 2048];
+        let length = probe.recv(&mut packet)?;
+        let packet = &packet[..length];
+        if packet.len() < STUN_HEADER_LEN
+            || u16::from_be_bytes([packet[0], packet[1]]) != STUN_BINDING_SUCCESS_RESPONSE
+            || u32::from_be_bytes(packet[4..8].try_into().unwrap()) != STUN_MAGIC_COOKIE
+            || packet[8..20] != transaction_id
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid STUN binding response",
+            ));
+        }
+        let (_, value) = find_stun_attribute(packet, STUN_ATTR_XOR_MAPPED_ADDRESS).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing XOR-MAPPED-ADDRESS")
+        })?;
+        let family = *value.get(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid XOR-MAPPED-ADDRESS")
+        })?;
+        let port = u16::from_be_bytes(value.get(2..4).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid XOR-MAPPED-ADDRESS")
+        })?.try_into().unwrap()) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let ip = match family {
+            1 if value.len() == 8 => {
+                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+                IpAddr::V4(Ipv4Addr::from([
+                    value[4] ^ cookie[0], value[5] ^ cookie[1], value[6] ^ cookie[2], value[7] ^ cookie[3],
+                ]))
+            }
+            2 if value.len() == 20 => {
+                let mut mask = [0_u8; 16];
+                mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+                mask[4..].copy_from_slice(&transaction_id);
+                let mut octets = [0_u8; 16];
+                for (index, byte) in octets.iter_mut().enumerate() {
+                    *byte = value[4 + index] ^ mask[index];
+                }
+                IpAddr::V6(Ipv6Addr::from(octets))
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid XOR-MAPPED-ADDRESS family or length",
+                ));
+            }
+        };
+        Ok(SocketAddr::new(ip, port))
     }
 
     pub fn try_clone_socket(&self) -> std::io::Result<UdpSocket> {

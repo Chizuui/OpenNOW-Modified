@@ -91,14 +91,24 @@ internal fun nvstSessionContext(session: SessionInfo, settings: StreamSettings):
         put("serverIp", session.serverIp)
         if (isAllianceCloudMatchBase(session.streamingBaseUrl)) put("alliancePartner", true)
         session.mediaConnectionInfo?.let { put("mediaConnectionInfo", OpenNowJson.encodeToJsonElement(it)) }
-        // YES answers only the usage-2 media mapping; usage-17 never authenticates.
-        session.bundleConnectionInfo?.takeUnless { isYesCloudMatchBase(session.streamingBaseUrl) }?.let { bundle ->
+        // YES publishes usage-17 as a bare port (ip=null) for the DTLS bundle socket and
+        // usage-2 for the Mjolnir video socket. The official client keeps those on two
+        // separate sockets, so both mappings must reach native. A blank bundle IP means
+        // the seat host; the native side fills it from serverIp.
+        session.bundleConnectionInfo?.let { bundle ->
             putJsonArray("connectionInfo") {
                 add(buildJsonObject {
-                    put("ip", bundle.ip)
+                    put("ip", bundle.ip.takeIf { it.isNotBlank() } ?: session.serverIp)
                     put("port", bundle.port)
                     put("usage", 17)
                 })
+                session.mediaConnectionInfo?.let { media ->
+                    add(buildJsonObject {
+                        put("ip", media.ip)
+                        put("port", media.port)
+                        put("usage", 2)
+                    })
+                }
             }
         }
         put("rtspsEndpoints", JsonArray(session.rtspsEndpoints.map(::JsonPrimitive)))

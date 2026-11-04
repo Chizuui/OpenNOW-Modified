@@ -46,7 +46,7 @@ internal fun resolveGfnSessionConnections(
         signalingUrl = url.toString().replaceFirst("https://", "wss://"),
         mediaConnectionInfo = selectedMedia,
         // BUNDLE (17) can have a different NAT mapping from VIDEO (2) on alliance seats.
-        bundleConnectionInfo = media(listOf(17), requireIp = true),
+        bundleConnectionInfo = media(listOf(17)),
         nativeTransportRequired = reportedNativeTransport ?: connection.isRtspSessionConnection(),
     )
 }
