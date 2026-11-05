@@ -3327,6 +3327,8 @@ pub struct NvstVideoReceiver {
     packet_gap_recoveries: u64,
     timeout_origin: Instant,
     last_authenticated_packet: Option<Instant>,
+    /// Any datagram from the media peer, encrypted or not.
+    last_peer_datagram: Instant,
 }
 
 impl NvstVideoReceiver {
@@ -3360,6 +3362,7 @@ impl NvstVideoReceiver {
             packet_gap_recoveries: 0,
             timeout_origin: Instant::now(),
             last_authenticated_packet: None,
+            last_peer_datagram: Instant::now(),
         }
     }
 
@@ -3383,6 +3386,7 @@ impl NvstVideoReceiver {
         self.reset_media_state();
         self.last_authenticated_packet = None;
         self.timeout_origin = Instant::now();
+        self.last_peer_datagram = self.timeout_origin;
         self.state = NvstReceiverState::Running;
         Some(NvstReceiveEvent::Lifecycle(self.state))
     }
@@ -3394,6 +3398,7 @@ impl NvstVideoReceiver {
         self.reset_media_state();
         self.last_authenticated_packet = None;
         self.timeout_origin = Instant::now();
+        self.last_peer_datagram = self.timeout_origin;
         self.state = NvstReceiverState::Running;
         Some(NvstReceiveEvent::Lifecycle(self.state))
     }
@@ -3416,11 +3421,12 @@ impl NvstVideoReceiver {
         let last_packet = self
             .last_authenticated_packet
             .unwrap_or(self.timeout_origin);
-        let idle_for = now.saturating_duration_since(last_packet);
+        let idle_for = now.saturating_duration_since(last_packet.max(self.last_peer_datagram));
         if idle_for < self.config.timeout {
             return None;
         }
         self.reset_media_state();
+        self.last_peer_datagram = now;
         self.state = NvstReceiverState::RecoveryRequired;
         Some(NvstReceiveEvent::RecoveryNeeded(NvstRecovery::Timeout {
             idle_for,
@@ -3441,6 +3447,9 @@ impl NvstVideoReceiver {
                 },
             )];
         }
+        // A live peer keeps the flow alive even while it cannot be decrypted
+        // yet (late key, FEC-only tail). Only silence is a real idle timeout.
+        self.last_peer_datagram = now;
         match self.state {
             NvstReceiverState::Paused => {
                 return vec![NvstReceiveEvent::Dropped(NvstDropReason::Paused)];
@@ -5320,21 +5329,9 @@ fn run_nvst_webrtc_bundle(
         if now.duration_since(last_hole_punch) >= ping_interval
             && let Some(credentials) = stun_credentials.as_ref()
         {
-            let mut ice_bytes = 0_usize;
-            if !dtls_ready {
-                for _ in 0..3 {
-                    let mut ice_tid = [0_u8; 12];
-                    if getrandom::fill(&mut ice_tid).is_ok() {
-                        let ice = build_stun_binding_request(credentials, &ice_tid);
-                        ice_bytes = ice.len();
-                        if let Err(error) = socket.send_to(&ice, bundle_peer) {
-                            eprintln!("NVST ICE send failed: {error}");
-                            forward_optional(&event_sender, receiver.stop());
-                            return;
-                        }
-                    }
-                }
-            }
+            // The bundle port carries DTLS only. A live reference capture shows
+            // the first bundle datagram is a bare ClientHello on :12114 with no
+            // STUN at all; keepalive STUN belongs to the video/NATT socket.
             let mut natt_tid = [0_u8; 12];
             let natt = if getrandom::fill(&mut natt_tid).is_ok() {
                 let natt = build_stun_binding_request(credentials, &natt_tid);
@@ -5350,8 +5347,7 @@ fn run_nvst_webrtc_bundle(
             hole_punch_pings += 1;
             if hole_punch_pings == 1 || hole_punch_pings % 50 == 0 {
                 eprintln!(
-                    "NVST hole-punch ping={hole_punch_pings} dest={bundle_peer} iceBurst={} iceBytes={ice_bytes} nattBytes={} credentials=redacted",
-                    if dtls_ready { 0 } else { 3 },
+                    "NVST hole-punch ping={hole_punch_pings} dest={bundle_peer} nattBytes={} dtlsReady={dtls_ready} credentials=redacted",
                     natt.as_ref().map_or(0, Vec::len),
                 );
             }
