@@ -70,11 +70,27 @@ struct SweepFailure {
     trace: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BundleEndpoint<'a> {
     ip: &'a str,
     port: u32,
     source: &'static str,
+}
+
+/// CloudMatch connection usages, in the order YES partners publish them.
+fn connection_usage_map(context: &SessionContext) -> String {
+    let mut usages: Vec<String> = context
+        .session
+        .connection_info
+        .iter()
+        .flatten()
+        .map(|connection| format!("{}:{}/{}", connection.usage, connection.ip.as_deref().unwrap_or("-"), connection.port))
+        .collect();
+    usages.sort();
+    if let Some(mci) = context.extra.get("mediaConnectionInfo") {
+        usages.push(format!("mediaConnectionInfo={mci}"));
+    }
+    usages.join(" ")
 }
 
 /// Resolves the ICE/DTLS bundle peer: CloudMatch BUNDLE (usage 17).
@@ -1080,6 +1096,16 @@ fn prepare_nvst_endpoint(
     } else {
         opennow_streamer_protocol::log::log_line("INFO", "rtsps", "video_endpoint none");
     }
+    opennow_streamer_protocol::log::log_line(
+        "INFO",
+        "rtsps",
+        &format!(
+            "cloudmatch usages=[{}] sdpBundlePort={:?} sdpVideoPort={:?}",
+            connection_usage_map(context),
+            described_bundle_port,
+            sdp_attribute(&describe.body, "general.serverVideoPort"),
+        ),
+    );
     let bundle_video_peer = endpoint.and_then(|endpoint| {
         let port = u16::try_from(endpoint.port)
             .ok()

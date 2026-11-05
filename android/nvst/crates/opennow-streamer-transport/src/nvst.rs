@@ -5354,7 +5354,7 @@ fn run_nvst_webrtc_bundle(
             last_hole_punch = now;
             if hole_punch_pings == 1 {
                 let _ = event_sender.send(NvstReceiveEvent::Diagnostic(format!(
-                    "Alliance NVST outbound first dest={bundle_peer}"
+                    "Alliance NVST outbound first dest={bundle_peer} (DTLS bundle socket only)"
                 )));
             }
         }
