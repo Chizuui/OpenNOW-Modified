@@ -54,7 +54,7 @@ class StreamInputModeChoiceTest {
     }
 
     @Test
-    fun rememberedNativeTouchKeepsSavedWebsiteModeSetting() = runBlocking {
+    fun rememberedNativeTouchPreservesTheExplicitWebsiteModeChoice() = runBlocking {
         val mode = chooseStreamInputModeAtStart(
             nativeTouchAvailable = true,
             keyboardMouseConnected = true,
@@ -159,6 +159,7 @@ class StreamInputModeChoiceTest {
             answer.complete(mode)
             val resolved = launch.await()
             assertTrue(resolved.browserClientMode)
+            assertTrue(shouldUseNativeTouch(NativeTouchMode.Auto, game, resolved))
             assertEquals(settings.copy(browserClientMode = resolved.browserClientMode), resolved)
         }
     }

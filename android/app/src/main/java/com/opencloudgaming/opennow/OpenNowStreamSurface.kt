@@ -143,7 +143,7 @@ internal fun StreamScreen(
     var networkNotice by remember(session?.sessionId) { mutableStateOf<StreamNetworkWarning?>(null) }
     var networkNoticeSequence by remember(session?.sessionId) { mutableIntStateOf(0) }
     val networkWarningGate = remember(session?.sessionId) { StreamNetworkWarningGate() }
-    var videoTransportFallbackReason by remember { mutableStateOf<String?>(null) }
+    val videoTransportFallbackReason = state.streamVideoRecoveryReason
     var controllerMouseAssistEnabled by remember(session?.sessionId) { mutableStateOf(false) }
     var controllerMouseEmulationEnabled by remember(session?.sessionId) { mutableStateOf(state.settings.controllerMouseEmulation) }
     val streamReady = state.isNativeStreamReady()
@@ -153,9 +153,6 @@ internal fun StreamScreen(
         onDispose { crashDiagnostics.streamContext = "Stream UI transition or disposal" }
     }
     val tvProfile = state.androidTvProfile
-    LaunchedEffect(session?.sessionId) {
-        videoTransportFallbackReason = null
-    }
     val physicalControllerConnected = rememberPhysicalControllerConnected(enabled = streamReady)
     val physicalKeyboardMouse = rememberPhysicalKeyboardMouseConnection(enabled = streamReady)
     val physicalMouseConnected = physicalKeyboardMouse.mouseConnected
@@ -306,6 +303,7 @@ internal fun StreamScreen(
         inputModePromptOpen = null
         keyboardOpen = true
     }
+    val latestOpenStreamKeyboard by rememberUpdatedState(openStreamKeyboard)
     val dismissStreamGuide = {
         streamGuideOpen = false
         if (!state.settings.androidStreamGuideDismissed) {
@@ -553,6 +551,7 @@ internal fun StreamScreen(
             }
             NativeStreamInputRouter.clearUiTouchPassthroughBounds()
             NativeStreamInputRouter.clearStreamPanelTouchPassthroughBounds()
+            NativeStreamInputRouter.setControllerKeyboardHandler(null)
             NativeStreamInputRouter.setSystemMenuHandler(null)
             NativeStreamInputRouter.setSystemBackHandler(null)
             NativeStreamInputRouter.setAndroidTvProfile(false)
@@ -742,9 +741,14 @@ internal fun StreamScreen(
     // Gated on touchInputEnabled as well as the setting: finger touches already stop at
     // setTouchMouseEnabled during PiP, but external mouse and touchpad events reach direct click
     // through their own path and would otherwise be mapped against the tiny PiP window.
-    LaunchedEffect(state.settings.androidTouch.mouseDirectClick, touchInputEnabled) {
+    LaunchedEffect(
+        state.settings.androidTouch.mouseDirectClick,
+        state.settings.androidTouch.experimentalSlideDirectClick,
+        touchInputEnabled,
+    ) {
         NativeStreamInputRouter.setMouseDirectClick(
             state.settings.androidTouch.mouseDirectClick && touchInputEnabled,
+            experimentalSlideDirectClick = state.settings.androidTouch.experimentalSlideDirectClick,
         )
     }
     LaunchedEffect(
@@ -825,6 +829,12 @@ internal fun StreamScreen(
             )
         }
     }
+    DisposableEffect(client, controllerMouseEmulationEnabled, streamReady) {
+        NativeStreamInputRouter.setControllerKeyboardHandler(
+            if (streamReady && controllerMouseEmulationEnabled) ({ latestOpenStreamKeyboard() }) else null,
+        )
+        onDispose { NativeStreamInputRouter.setControllerKeyboardHandler(null) }
+    }
     LaunchedEffect(client, controllerMouseEmulationEnabled, streamReady) {
         if (streamReady) {
             client.setControllerMouseEmulationActive(controllerMouseEmulationEnabled)
@@ -840,6 +850,8 @@ internal fun StreamScreen(
         serverNegotiatedResolution = session?.monitorSnapshot?.returnedResolution
             ?: session?.negotiatedStreamProfile?.resolution,
         serverFinalSelectedResolution = session?.monitorSnapshot?.finalSelectedResolution,
+        resumedSession = state.resumedStreamSession,
+        recoveryReason = videoTransportFallbackReason,
     )
     LaunchedEffect(
         session?.sessionId,

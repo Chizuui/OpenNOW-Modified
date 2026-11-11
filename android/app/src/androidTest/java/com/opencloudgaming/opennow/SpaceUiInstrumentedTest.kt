@@ -16,6 +16,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.unit.dp
 import com.opencloudgaming.opennow.ui.theme.LocalReduceMotion
+import com.opencloudgaming.opennow.ui.theme.LocalReduceForegroundMotion
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.key
@@ -182,7 +183,7 @@ class SpaceUiInstrumentedTest {
             val manager = LocalInputModeManager.current
             SideEffect { inputModeManager = manager }
             MaterialTheme {
-                CompositionLocalProvider(LocalReduceMotion provides true) {
+                CompositionLocalProvider(LocalReduceMotion provides true, LocalReduceForegroundMotion provides true) {
                     SpaceUiScreen(OpenNowUiState(page = AppPage.Library, libraryGames = games),
                         onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {}, onResumeSession = {},
                         inputEnabled = true, settingsContent = {})
@@ -196,7 +197,8 @@ class SpaceUiInstrumentedTest {
         val fourth = compose.onNodeWithTag("space-game-art-4", useUnmergedTree = true).getUnclippedBoundsInRoot()
         val fifth = compose.onNodeWithTag("space-game-art-5", useUnmergedTree = true).getUnclippedBoundsInRoot()
         assertEquals("Library keeps the square Discover artwork", (first.right - first.left).value, (first.bottom - first.top).value, 1f)
-        assertEquals(first.top.value, fourth.top.value, 1f)
+        if (isPortrait()) assertTrue("Phone library cards need room for readable artwork", fourth.top > first.top)
+        else assertEquals(first.top.value, fourth.top.value, 1f)
         assertTrue("The fifth game starts the next row", fifth.top > first.top)
         assertEquals("Only the focus gutters separate adjacent cards", 24f, (second.left - first.right).value, 1f)
         val target = compose.onNodeWithTag("space-game-1").getUnclippedBoundsInRoot()
@@ -213,7 +215,7 @@ class SpaceUiInstrumentedTest {
             settings = AppSettings(showPremiumMarker = false)))
         val marker = InstrumentationRegistry.getInstrumentation().targetContext.getString(R.string.catalog_premium_marker)
         compose.setContent {
-            CompositionLocalProvider(LocalReduceMotion provides true) {
+            CompositionLocalProvider(LocalReduceMotion provides true, LocalReduceForegroundMotion provides true) {
                 SpaceUiTheme {
                     SpaceUiScreen(state, onNavigate = {}, onSelectGame = {}, onRefresh = {}, onSearchChange = {},
                         onResumeSession = {}, inputEnabled = true, settingsContent = {})
@@ -506,7 +508,7 @@ class SpaceUiInstrumentedTest {
         var position by mutableIntStateOf(12)
         var reduced by mutableStateOf(false)
         compose.setContent {
-            CompositionLocalProvider(LocalReduceMotion provides reduced) {
+            CompositionLocalProvider(LocalReduceMotion provides reduced, LocalReduceForegroundMotion provides reduced) {
                 SpaceLaunchScreen(OpenNowUiState(streamGame = games.first(), streamStatus = "queue"),
                     status = "Queue position: $position", queuePosition = position, onMinimize = {}, onCancel = {})
             }
@@ -544,6 +546,32 @@ class SpaceUiInstrumentedTest {
         compose.onNodeWithTag("space-queue-status").assertTextEquals("Queue position: 3")
     }
 
+    @Test fun lowPowerQueueSpinnerMovesAndExplicitReducedMotionStopsIt() {
+        compose.mainClock.autoAdvance = false
+        var explicitReduceMotion by mutableStateOf(false)
+        compose.setContent {
+            // The Chromecast's automatic low-power policy keeps decorative animation off.
+            CompositionLocalProvider(LocalReduceMotion provides true,
+                LocalReduceForegroundMotion provides explicitReduceMotion) {
+                SpaceLaunchScreen(OpenNowUiState(streamGame = games.first(), streamStatus = "queue"),
+                    status = "Queue position: 12", queuePosition = 12, onMinimize = {}, onCancel = {})
+            }
+        }
+        compose.waitUntil(5_000) { compose.activity.hasWindowFocus() }
+        compose.mainClock.advanceTimeBy(1_000)
+        val indicator = compose.onNodeWithTag("space-launch-progress", useUnmergedTree = true)
+        val before = indicator.captureToImage().asAndroidBitmap()
+        compose.mainClock.advanceTimeBy(250)
+        assertFalse("Low-power mode must keep the queue spinner moving",
+            before.sameAs(indicator.captureToImage().asAndroidBitmap()))
+        compose.runOnIdle { explicitReduceMotion = true }
+        compose.mainClock.advanceTimeBy(1_000)
+        val reduced = indicator.captureToImage().asAndroidBitmap()
+        compose.mainClock.advanceTimeBy(1_000)
+        assertTrue("The user's reduced-motion setting must still stop the spinner",
+            reduced.sameAs(indicator.captureToImage().asAndroidBitmap()))
+    }
+
     @Test fun minimizedQueueUsesTheTopRailAndKeepsRestoreAndCancelActions() {
         var restores = 0
         var cancels = 0
@@ -572,7 +600,7 @@ class SpaceUiInstrumentedTest {
         compose.mainClock.autoAdvance = false
         var progress by mutableFloatStateOf(0f)
         compose.setContent {
-            CompositionLocalProvider(LocalReduceMotion provides true) {
+            CompositionLocalProvider(LocalReduceMotion provides true, LocalReduceForegroundMotion provides true) {
                 SpaceLaunchScreen(OpenNowUiState(streamGame = games.first(), streamStatus = "connecting"),
                     status = "Setting up rig", connectingProgress = { progress }, onMinimize = {}, onCancel = {})
             }
@@ -721,6 +749,33 @@ class SpaceUiInstrumentedTest {
         capture("space-queue-picker")
         compose.onNodeWithContentDescription("Launch").performClick()
         compose.runOnIdle { assertEquals("https://us-california-south.cloudmatchbeta.nvidiagrid.net/", launched) }
+    }
+
+    @Test fun queuePickerShowsUnavailableServersAndCanLaunchWithDefault() {
+        var defaultLaunches = 0
+        compose.setContent {
+            SpaceUiTheme {
+                PrintedWasteSelectorContent(
+                    OpenNowUiState(
+                        printedWasteMapping = mapOf(
+                            "NP-LAX-03" to PrintedWasteServerMappingEntry("Southern California", "US Southwest"),
+                        ),
+                    ),
+                    games.first(),
+                    onDismiss = {},
+                    onRetry = {},
+                    onLaunch = { url ->
+                        assertEquals(null, url)
+                        defaultLaunches++
+                    },
+                    onSettingsChange = {},
+                )
+            }
+        }
+        compose.onNodeWithText("No queue data from PrintedWaste").assertIsDisplayed().assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Launch").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Default").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(1, defaultLaunches) }
     }
 
     @Test fun settingsActionsUseFullWidthConsoleRows() {

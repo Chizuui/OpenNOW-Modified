@@ -43,6 +43,13 @@ Run `python3 scripts/check_translations.py` from this folder to check every supp
 
 ## Runtime Notes
 
+Settings > Advanced > Experiments includes **Slide + Direct click (experimental)**.
+It defaults off. With Finger mouse and Direct click enabled, slides
+move the cursor relatively and two completed taps within 320 ms in the same area send one click at
+the second tap's screen position. Single taps, holds, and tap-then-slide gestures do not click.
+Two-finger scrolling is preserved; keyboard & mouse overlay buttons retain ownership of clicks.
+Native touch and physical mouse input keep their existing behavior.
+
 - UI is native Compose.
 - GFN auth, catalog, subscription, CloudMatch session creation/polling/claim/stop, signaling, and input packet behavior are implemented in Kotlin from the Electron project contracts.
 - Streaming uses Android WebRTC plus hardware MediaCodec probing. The bundled `opennow_native` JNI library exposes native runtime diagnostics and keeps the NDK/CMake path wired for media-sensitive code.
@@ -55,6 +62,10 @@ ported from dev commit `3002e5c67`. NVST defaults off for all distributions. On 
 launch, a persisted migration also switches off the previous automatic APK opt-in. Users can
 enable the experiment again afterward; that choice survives subsequent launches and upgrades.
 The choice applies when attaching a stream; changing settings does not replace a running transport.
+Resolution choices, server allocation metadata, and reconnects cannot enable NVST. With NVST off,
+the 1376x640 phone profile requests WebRTC on both CREATE and RESUME. If an existing session only
+supports native transport, OpenNOW reports the mismatch and retains the cloud session instead of
+attaching with NVST.
 
 The NVST runtime performs RTSP-over-WebSocket negotiation, authenticated SRTP UDP video with
 FEC/NACK recovery, Opus audio, and native SCTP keyboard/mouse/gamepad input. Android keeps its

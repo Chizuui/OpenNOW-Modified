@@ -140,6 +140,16 @@ private val NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = false,
 )
 
+// High-resolution WebRTC must advertise a desktop browser consistently. Mixing native
+// Windows headers with GSStreamerType=WebRTC can allocate an RTSP-only seat; the Android
+// mobile browser identity instead provisions the mobile resolution matrix.
+private val NVIDIA_DESKTOP_BROWSER_CLOUD_MATCH_IDENTITY = NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY.copy(
+    deviceOs = "WINDOWS",
+    deviceType = "DESKTOP",
+    userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    desktopMonitorDescriptor = true,
+)
+
 private val NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     platformName = "windows",
     persistGameSettings = true,
@@ -211,11 +221,9 @@ private val ALLIANCE_CLOUD_MATCH_IDENTITY = CloudMatchClientIdentity(
     desktopMonitorDescriptor = true,
 )
 
-// NVIDIA's Browser/WebRTC identity preserves the standard mobile allocation, but CloudMatch limits
-// its mode matrix and rejects HDR requests from that client class. Explicit gamepad launches that
-// need the high-quality mode matrix use the desktop-native identity on every Android TV. The
-// Android/native TV allocation has provisioned 1080p for requested higher-resolution profiles.
-// Generic follow-up requests stay on the browser identity so they cannot change an allocation.
+// SDR desktop WebRTC, native NVST/HDR, and mobile touch have separate identities.
+// Generic follow-up requests keep their existing identity; only CREATE/RESUME carry
+// the selected profile and can change the allocation's client class.
 private fun cloudMatchClientIdentity(
     streamingBaseUrl: String?,
     appLaunchMode: Int? = null,
@@ -225,9 +233,13 @@ private fun cloudMatchClientIdentity(
     useDesktopNativeTvIdentity: Boolean = false,
     preferNativeAndroidMode: Boolean = false,
     preferNvstTransport: Boolean = false,
+    preferDesktopWebRtcMode: Boolean = false,
 ): CloudMatchClientIdentity {
     // Website client mode uses NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY (WebRTC platform="browser")
     val host = streamingBaseUrl?.toHttpUrlOrNull()?.host?.lowercase(Locale.US)
+    val desktopWebRtc = preferDesktopWebRtcMode && !preferNvstTransport && !preferNativeAndroidMode && appLaunchMode != null &&
+        appLaunchMode != GfnAppLaunchMode.TOUCH_FRIENDLY &&
+        (streamingBaseUrl.isNullOrBlank() || host?.let(::isNvidiaCloudMatchHost) == true)
     // YES server 1.1054.0 only produces WebRTC offers when allocated with the browser identity
     // (WEBRTC / BROWSER / platformName="browser"); both WINDOWS and ANDROID native identities
     // suppress WebRTC offers on YES.
@@ -236,13 +248,14 @@ private fun cloudMatchClientIdentity(
     }
     // Native touch over NVST needs the native identity even when website mode is saved.
     if (preferBrowserMode && !(preferNvstTransport && appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY)) {
-        return NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
+        return if (desktopWebRtc) NVIDIA_DESKTOP_BROWSER_CLOUD_MATCH_IDENTITY else NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     }
     // For touch-friendly launches, use NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY (or browser mode)
     // so the server enables the touch digitizer for the game while streaming via WebRTC.
     if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) {
         return if (preferNvstTransport) NVIDIA_NATIVE_TOUCH_CLOUD_MATCH_IDENTITY else NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY
     }
+    if (desktopWebRtc) return NVIDIA_DESKTOP_BROWSER_CLOUD_MATCH_IDENTITY
     if (appLaunchMode != null && preferNativeAndroidMode) {
         return when {
             isAndroidTv -> NVIDIA_NATIVE_TV_CLOUD_MATCH_IDENTITY
@@ -270,10 +283,6 @@ private fun cloudMatchPlatformName(identity: CloudMatchClientIdentity, appLaunch
     } else {
         identity.platformName
     }
-
-/** Keep YES allocation aligned with its working native Android streaming path. */
-private fun CloudMatchClientIdentity.requiresNativeSessionTransport(streamingBaseUrl: String?): Boolean =
-    this != NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY && (this == NVIDIA_NATIVE_ANDROID_CLOUD_MATCH_IDENTITY || requiresNativeAllianceCloudMatchTransport(streamingBaseUrl))
 
 internal fun isNvidiaShieldTvDevice(
     androidTvProfile: Boolean,
@@ -556,12 +565,12 @@ private fun requestedStreamingFeatures(settings: StreamSettings, profile: Stream
     }
 
 /** CloudMatch's native allocation must agree with the subsequent NVST RTSP handshake. */
-private fun JsonObjectBuilder.putStreamTransportRequest(settings: StreamSettings?, nativeAndroidTransport: Boolean = false) {
+private fun JsonObjectBuilder.putStreamTransportRequest(settings: StreamSettings?) {
     val nvst = settings?.experimentalNvst == true
     if (nvst) put("streamerVersion", "14") else put("streamerVersion", 1)
     put("sdkVersion", if (nvst) "2.0" else "1.0")
     put("enhancedStreamMode", if (nvst) 0 else 1)
-    put("secureRTSPSupported", nvst || nativeAndroidTransport)
+    put("secureRTSPSupported", nvst)
     if (nvst) {
         put("requestedAudioFormat", 0)
         put("transport", JsonNull)
@@ -599,11 +608,8 @@ private fun streamSessionMetadata(
     profile: StreamRequestProfile,
     physicalDisplayResolution: Pair<Int, Int>? = null,
     streamingBaseUrl: String? = null,
-    nativeAndroidTransport: Boolean = false,
 ): JsonArray = buildJsonArray {
-    baseWebRtcSessionMetadata(streamingBaseUrl).forEach { entry ->
-        if ((!settings.experimentalNvst && !nativeAndroidTransport) || entry.jsonObject["key"]?.jsonPrimitive?.content != "GSStreamerType") add(entry)
-    }
+    baseWebRtcSessionMetadata(streamingBaseUrl, nativeTransport = settings.experimentalNvst).forEach(::add)
     val requestedResolution = profile.width to profile.height
     val (physicalWidth, physicalHeight) = physicalDisplayResolution
         ?.takeIf { (width, height) ->
@@ -700,6 +706,7 @@ internal fun buildMinimalClaimRequestBody(
         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings?.requiresNativeDesktopCloudMatchMode() == true,
         preferNativeAndroidMode = settings?.requiresNativeAndroidCloudMatchMode() == true,
         preferNvstTransport = settings?.experimentalNvst == true,
+        preferDesktopWebRtcMode = settings?.prefersDesktopWebRtcCloudMatchMode() == true,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
@@ -717,7 +724,7 @@ internal fun buildMinimalClaimRequestBody(
                 controllerCapabilities.supportedControllerTypes.forEach { add(JsonPrimitive(it)) }
             }
             put("clientVersion", "30.0")
-            putStreamTransportRequest(settings, identity.requiresNativeSessionTransport(streamingBaseUrl))
+            putStreamTransportRequest(settings)
             put("deviceHashId", deviceId)
             put("internalTitle", JsonNull)
             put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
@@ -729,9 +736,9 @@ internal fun buildMinimalClaimRequestBody(
             put(
                 "metaData",
                 if (settings != null && profile != null) {
-                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl))
+                    streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl)
                 } else {
-                    baseWebRtcSessionMetadata(streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl))
+                    baseWebRtcSessionMetadata(streamingBaseUrl)
                 },
             )
             put("surroundAudioInfo", 0)
@@ -981,18 +988,43 @@ private fun Headers.Builder.putDesktopLcars(
     accept: String = "application/json",
     includeUserAgent: Boolean = false,
     includeEmptyTokenAuthorization: Boolean = false,
+    clientVersion: String = GFN_CLIENT_VERSION,
+    deviceOs: String = "WINDOWS",
 ): Headers.Builder {
     add("Accept", accept)
     if (token != null || includeEmptyTokenAuthorization) add("Authorization", gfnJwtAuthorization(token.orEmpty()))
     add("nv-client-id", LCARS_CLIENT_ID)
     add("nv-client-type", clientType)
-    add("nv-client-version", GFN_CLIENT_VERSION)
+    add("nv-client-version", clientVersion)
     add("nv-client-streamer", clientStreamer)
-    add("nv-device-os", "WINDOWS")
+    add("nv-device-os", deviceOs)
     add("nv-device-type", "DESKTOP")
     if (includeUserAgent) add("User-Agent", GFN_USER_AGENT)
     return this
 }
+
+/** MES uses the desktop web client's membership profile independently of stream transport. */
+private fun subscriptionHeaders(token: String): Headers =
+    Headers.Builder()
+        .putDesktopLcars(
+            token = token,
+            clientType = "BROWSER",
+            clientStreamer = "WEBRTC",
+            accept = "application/json, text/plain, */*",
+            clientVersion = "2.0.89.154",
+            deviceOs = "MACOS",
+        )
+        .add("nv-browser-type", "CHROME")
+        .add("nv-device-make", "APPLE")
+        .add("nv-device-model", "UNKNOWN")
+        .add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+        .add("Accept-Language", "en-CA,en-GB;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("Origin", GFN_PLAY_ORIGIN)
+        .add("Cache-Control", "no-cache")
+        .add("Pragma", "no-cache")
+        .add("sw-notify-fetch", "true")
+        .add("x-sw-cachebypass", "true")
+        .build()
 
 private fun desktopGraphQlHeaders(token: String? = null): Headers =
     Headers.Builder()
@@ -1028,6 +1060,7 @@ internal fun cloudMatchHeaders(
     useDesktopNativeTvIdentity: Boolean = false,
     preferNativeAndroidMode: Boolean = false,
     preferNvstTransport: Boolean = false,
+    preferDesktopWebRtcMode: Boolean = false,
 ): Headers {
     val identity = cloudMatchClientIdentity(
         streamingBaseUrl = streamingBaseUrl,
@@ -1036,10 +1069,12 @@ internal fun cloudMatchHeaders(
         preferNativeDesktopMode = preferNativeDesktopMode,
         preferNativeAndroidMode = preferNativeAndroidMode,
         preferNvstTransport = preferNvstTransport,
+        preferDesktopWebRtcMode = preferDesktopWebRtcMode,
         isAndroidTv = isAndroidTv,
         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
     )
     val userAgent = when {
+        identity == NVIDIA_DESKTOP_BROWSER_CLOUD_MATCH_IDENTITY -> identity.userAgent
         (preferBrowserMode || appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) &&
             identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.userAgent
         identity == NVIDIA_NATIVE_CLOUD_MATCH_IDENTITY -> identity.userAgent
@@ -1048,6 +1083,7 @@ internal fun cloudMatchHeaders(
         else -> identity.userAgent
     }
     val deviceType = when {
+        identity == NVIDIA_DESKTOP_BROWSER_CLOUD_MATCH_IDENTITY -> identity.deviceType
         (preferBrowserMode || appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) &&
             identity == NVIDIA_BROWSER_CLOUD_MATCH_IDENTITY -> identity.deviceType
         isAndroidTv -> "DESKTOP"
@@ -1236,8 +1272,16 @@ class GfnAuthRepository(
             authStore.reload()
             val restored = authStore.activeSession() ?: return@withLock null
             var session = restored
+            var clientTokenFailure: Exception? = null
             if (session.tokens.clientToken.isNullOrBlank() || isNearExpiry(session.tokens.clientTokenExpiresAt, CLIENT_TOKEN_REFRESH_WINDOW_MS)) {
-                val withClientToken = runCatching { ensureClientToken(session.tokens) }.getOrElse { session.tokens }
+                val withClientToken = try {
+                    ensureClientToken(session.tokens)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    clientTokenFailure = error
+                    session.tokens
+                }
                 if (withClientToken != session.tokens) {
                     val updatedSession = session.copy(tokens = withClientToken)
                     if (!authStore.updateSessionIfUnchanged(session, updatedSession)) {
@@ -1252,6 +1296,7 @@ class GfnAuthRepository(
                     session = session,
                     forceRefresh = forceRefresh || throwOnRefreshFailure,
                     removeExpiredSessionOnFailure = removeExpiredSessionOnFailure,
+                    clientTokenFailure = clientTokenFailure,
                 )
             } else {
                 session
@@ -1489,9 +1534,11 @@ class GfnAuthRepository(
         session: AuthSession,
         forceRefresh: Boolean,
         removeExpiredSessionOnFailure: Boolean,
+        clientTokenFailure: Exception?,
     ): AuthSession {
         val tokens = session.tokens
         val refreshErrors = mutableListOf<String>()
+        val refreshFailures = mutableListOf<Exception>().apply { clientTokenFailure?.let(::add) }
 
         val serverUrl = session.chizuiServerUrl
         val jwtToken = session.chizuiJwtToken
@@ -1525,6 +1572,7 @@ class GfnAuthRepository(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
+                    refreshFailures += error
                     refreshErrors += "client_token(${authClientLabel(clientId)}): ${error.message ?: "Unknown refresh error"}"
                 }
             }
@@ -1539,16 +1587,17 @@ class GfnAuthRepository(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
+                    refreshFailures += error
                     refreshErrors += "refresh_token(${authClientLabel(clientId)}): ${error.message ?: "Unknown refresh error"}"
                 }
             }
         }
 
         val hasRefreshMechanism = !tokens.clientToken.isNullOrBlank() || !tokens.refreshToken.isNullOrBlank()
-        if (!hasRefreshMechanism) {
+        if (!hasRefreshMechanism && clientTokenFailure == null) {
             if (isExpired(tokens.expiresAt)) {
                 if (removeExpiredSessionOnFailure) {
-                    authStore.removeSession(session.user.userId)
+                    authStore.removeSessionIfUnchanged(session)
                 }
                 error("Saved session expired and has no refresh mechanism. Please log in again.")
             }
@@ -1556,11 +1605,14 @@ class GfnAuthRepository(
         }
 
         if (isExpired(tokens.expiresAt)) {
-            if (removeExpiredSessionOnFailure) {
-                authStore.removeSession(session.user.userId)
+            if (refreshCredentialsRejected(refreshFailures)) {
+                if (removeExpiredSessionOnFailure) authStore.removeSessionIfUnchanged(session)
+                error("Saved sign-in was rejected. Please log in again.")
             }
-            val detail = refreshErrors.takeIf { it.isNotEmpty() }?.joinToString(" | ")
-            error("Token refresh failed and the saved session expired. Please log in again.${detail?.let { " $it" }.orEmpty()}")
+            throw java.io.IOException(
+                "Could not refresh sign-in. Your saved account has been kept. Check your connection and try again.",
+                refreshFailures.lastOrNull(),
+            )
         }
 
         if (forceRefresh && refreshErrors.isNotEmpty()) {
@@ -1582,8 +1634,7 @@ class GfnAuthRepository(
             .post(body)
             .build()
         val (code, text) = http.awaitText(request)
-        check(code in 200..299) { "Client-token refresh failed ($code): ${text.take(400)}" }
-        return OpenNowJson.parseToJsonElement(text).jsonObject
+        return authRefreshResponse(code, text)
     }
 
     private suspend fun refreshAuthTokens(refresh: String, base: AuthTokens, authClientId: String): AuthTokens {
@@ -1598,8 +1649,7 @@ class GfnAuthRepository(
             .post(body)
             .build()
         val (code, text) = http.awaitText(request)
-        check(code in 200..299) { "Token refresh failed ($code): ${text.take(400)}" }
-        val root = OpenNowJson.parseToJsonElement(text).jsonObject
+        val root = authRefreshResponse(code, text)
         return AuthTokens(
             accessToken = requireNotNull(root.string("access_token")) { "Missing access token" },
             refreshToken = root.string("refresh_token") ?: refresh,
@@ -2035,7 +2085,8 @@ internal fun catalogScreenshotUrls(images: JsonObject?): List<String> =
         .orEmpty()
 
 internal fun catalogGameDescription(app: JsonObject): String? =
-    app.string("description") ?: app.string("shortDescription")
+    app.string("description")?.takeIf { it.isNotBlank() }
+        ?: app.string("shortDescription")?.takeIf { it.isNotBlank() }
 
 internal fun gameStoreFromVariant(variant: JsonObject, publisherNameFallback: String? = null): String {
     variant.string("appStore")?.trim()
@@ -2206,15 +2257,13 @@ internal fun catalogResultWithGfnThursdayGames(
 
 class GfnCatalogRepository(
     private val http: OkHttpClient = defaultHttpClient(),
+    private val serverInfoRepository: GfnServerInfoRepository = GfnServerInfoRepository(http),
     private val localeProvider: () -> String = { DEFAULT_LOCALE },
 ) {
-    private data class CachedVpcId(val value: String, val expiresAtElapsedMs: Long)
     private data class CachedCatalogDefinitions(val value: CatalogDefinitions, val expiresAtElapsedMs: Long)
     private data class CachedPublicGames(val value: List<GameInfo>, val expiresAtElapsedMs: Long)
 
     private val libraryRevision = AtomicLong()
-    private val vpcIdMutex = Mutex()
-    private val vpcIdCache = mutableMapOf<String, CachedVpcId>()
     private val catalogDefinitionsMutex = Mutex()
     private val catalogDefinitionsCache = mutableMapOf<String, CachedCatalogDefinitions>()
     private val publicGamesMutex = Mutex()
@@ -2522,44 +2571,10 @@ class GfnCatalogRepository(
         return meta.firstOrNull()?.let(::resolveNumericAppId)
     }
 
-    suspend fun getVpcId(token: String, providerStreamingBaseUrl: String): String {
-        val base = normalizeStreamingServiceUrl(providerStreamingBaseUrl) ?: DEFAULT_STREAMING_SERVICE_URL
-        val cacheKey = base.lowercase(Locale.US)
-        return vpcIdMutex.withLock {
-            val now = SystemClock.elapsedRealtime()
-            vpcIdCache[cacheKey]
-                ?.takeIf { it.expiresAtElapsedMs > now }
-                ?.value
-                ?.let { return@withLock it }
-
-            val resolved = runCatching {
-                val request = Request.Builder()
-                    .url("${base}v2/serverInfo")
-                    .headers(
-                        Headers.Builder()
-                            .putDesktopLcars(token, includeUserAgent = true, includeEmptyTokenAuthorization = true)
-                            .build(),
-                    )
-                    .build()
-                val (code, text) = http.awaitText(request)
-                if (code !in 200..299) {
-                    "GFN-PC"
-                } else {
-                    OpenNowJson.parseToJsonElement(text).jsonObject.obj("requestStatus")?.string("serverId") ?: "GFN-PC"
-                }
-            }.getOrDefault("GFN-PC")
-            // Catalog, library, and subscription refreshes start together. Share their
-            // server identity instead of issuing the same request several times. Do not
-            // cache the fallback so a transient network failure can recover immediately.
-            if (resolved != "GFN-PC") {
-                vpcIdCache[cacheKey] = CachedVpcId(resolved, now + VPC_ID_CACHE_TTL_MS)
-            }
-            resolved
-        }
-    }
+    suspend fun getVpcId(token: String, providerStreamingBaseUrl: String): String =
+        serverInfoRepository.get(token, providerStreamingBaseUrl).vpcId
 
     private companion object {
-        const val VPC_ID_CACHE_TTL_MS = 5 * 60 * 1_000L
         const val CATALOG_DEFINITIONS_CACHE_TTL_MS = 30 * 60 * 1_000L
         const val PUBLIC_GAMES_CACHE_TTL_MS = 6 * 60 * 60 * 1_000L
     }
@@ -2886,19 +2901,32 @@ class GfnCatalogRepository(
     )
 }
 
+internal fun buildSubscriptionRequest(token: String, userId: String, vpcId: String): Request =
+    Request.Builder()
+        .url(
+            MES_URL.toHttpUrl().newBuilder()
+                .addQueryParameter("serviceName", "gfn_pc")
+                .addQueryParameter("languageCode", "en_GB")
+                .addQueryParameter("vpcId", vpcId)
+                .addQueryParameter("userId", userId)
+                .build(),
+        )
+        .headers(subscriptionHeaders(token))
+        .build()
+
 class GfnSubscriptionRepository(
     private val http: OkHttpClient = defaultHttpClient(),
 ) {
     suspend fun fetchSubscription(token: String, userId: String, vpcId: String = "NP-AMS-08"): SubscriptionInfo {
-        val url = "$MES_URL?serviceName=gfn_pc&languageCode=en_US&vpcId=${encoded(vpcId)}&userId=${encoded(userId)}"
-        val request = Request.Builder()
-            .url(url)
-            .headers(Headers.Builder().putDesktopLcars(token).build())
-            .build()
+        val request = buildSubscriptionRequest(token, userId, vpcId)
         val (code, text) = http.awaitText(request)
         // Do not turn a failed entitlement request into a confirmed Free membership. The setup
         // flow must be able to distinguish "Free and playable" from "not verified".
         if (code !in 200..299) return SubscriptionInfo(membershipTier = "")
+        return parseSubscriptionResponse(text)
+    }
+
+    internal fun parseSubscriptionResponse(text: String): SubscriptionInfo {
         val data = OpenNowJson.parseToJsonElement(text).jsonObject
         val allotted = data.double("allottedTimeInMinutes") ?: 0.0
         val purchased = data.double("purchasedTimeInMinutes") ?: 0.0
@@ -2929,7 +2957,14 @@ class GfnSubscriptionRepository(
             remainingHours = remaining / 60.0,
             totalHours = total / 60.0,
             state = data.obj("currentSubscriptionState")?.string("state"),
-            isGamePlayAllowed = data.obj("currentSubscriptionState")?.boolean("isGamePlayAllowed"),
+            // Free memberships can omit currentSubscriptionState entirely. MES also exposes
+            // the authoritative entitlement through streamingSupport; a tier alone is insufficient.
+            isGamePlayAllowed = data.obj("currentSubscriptionState")?.boolean("isGamePlayAllowed")
+                ?: when (data.string("streamingSupport")) {
+                    "ENABLED" -> true
+                    "DISABLED" -> false
+                    else -> null
+                },
             isUnlimited = data.string("subType") == "UNLIMITED",
             storageAddon = storageAddon,
             entitledResolutions = resolutions,
@@ -3172,9 +3207,7 @@ class PrintedWasteRepository(
                 Region = region,
                 eta = zone.long("eta"),
             )
-        }.toMap().also {
-            check(it.isNotEmpty()) { "PrintedWaste queue returned no usable zones" }
-        }
+        }.toMap()
         return printedWasteQueueSnapshot(zones, response.headers, response.receivedWallTimeMs, response.receivedElapsedMs)
     }
 
@@ -3255,6 +3288,7 @@ class GfnSessionRepository(
     private val diagnosticsSink: (GfnSessionDiagnosticResponse) -> Unit = {},
     private val isAndroidTv: Boolean = false,
     private val useDesktopNativeTvIdentity: Boolean = isAndroidTv,
+    private val serverInfoRepository: GfnServerInfoRepository = GfnServerInfoRepository(http),
 ) {
     private val sessionConnections = GfnSessionConnectionResolver()
 
@@ -3301,6 +3335,7 @@ class GfnSessionRepository(
                     preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                     preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                     preferNvstTransport = settings.experimentalNvst,
+                    preferDesktopWebRtcMode = settings.prefersDesktopWebRtcCloudMatchMode(),
                     isAndroidTv = isAndroidTv,
                     useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                 ),
@@ -3371,7 +3406,7 @@ class GfnSessionRepository(
     }
 
     suspend fun getActiveSessions(token: String, streamingBaseUrl: String, settings: StreamSettings): List<ActiveSessionInfo> {
-        val base = streamingBaseUrl.trim().trimEnd('/')
+        val base = serverInfoRepository.streamingBaseUrl(token, streamingBaseUrl).trimEnd('/')
         val host = Uri.parse(base).host.orEmpty()
         val requestHttp = if (isZoneHostname(host)) sessionProxyHttpClient(settings, http) else http
         val request = Request.Builder()
@@ -3489,6 +3524,7 @@ class GfnSessionRepository(
                         preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
                         preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
                         preferNvstTransport = settings.experimentalNvst,
+                        preferDesktopWebRtcMode = settings.prefersDesktopWebRtcCloudMatchMode(),
                         isAndroidTv = isAndroidTv,
                         useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
                     ),
@@ -3633,6 +3669,7 @@ class GfnSessionRepository(
             preferNativeDesktopMode = if (appLaunchMode == GfnAppLaunchMode.TOUCH_FRIENDLY) false else settings.requiresNativeDesktopCloudMatchMode(),
             preferNativeAndroidMode = settings.requiresNativeAndroidCloudMatchMode(),
             preferNvstTransport = settings.experimentalNvst,
+            preferDesktopWebRtcMode = settings.prefersDesktopWebRtcCloudMatchMode(),
             isAndroidTv = isAndroidTv,
             useDesktopNativeTvIdentity = useDesktopNativeTvIdentity,
         )
@@ -3650,14 +3687,14 @@ class GfnSessionRepository(
                 put("clientIdentification", "GFN-PC")
                 put("deviceHashId", deviceId)
                 put("clientVersion", "30.0")
-                putStreamTransportRequest(settings, identity.requiresNativeSessionTransport(streamingBaseUrl))
+                putStreamTransportRequest(settings)
                 put("clientPlatformName", cloudMatchPlatformName(identity, appLaunchMode))
                 putJsonArray("clientRequestMonitorSettings") {
                     add(monitorSettings(profile, settings.fps, identity, streamingBaseUrl))
                 }
                 put("useOps", true)
                 put("audioMode", 2)
-                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl, identity.requiresNativeSessionTransport(streamingBaseUrl)))
+                put("metaData", streamSessionMetadata(settings, profile, physicalDisplayResolution, streamingBaseUrl))
                 put("sdrHdrMode", if (profile.hdrEnabled) 1 else 0)
                 put("clientDisplayHdrCapabilities", if (profile.hdrEnabled) hdrCapabilitiesJson() else JsonNull)
                 put("surroundAudioInfo", 0)
@@ -3888,8 +3925,8 @@ class GfnSessionRepository(
         value.contains("cloudmatchbeta.nvidiagrid.net") || value.contains("cloudmatch.nvidiagrid.net")
 
     private suspend fun resolveLaunchSessionBaseUrl(token: String, base: String): String {
-        if (!isProviderRootStreamingBase(base)) return base
-        val regions = fetchDynamicRegions(http, token, base).first
+        if (!isProviderRootStreamingBase(base)) return serverInfoRepository.streamingBaseUrl(token, base).trimEnd('/')
+        val regions = serverInfoRepository.regions(token, base)
         return providerLaunchBaseUrl(base, regions)
     }
 
@@ -3950,37 +3987,24 @@ internal fun providerLaunchBaseUrl(providerBase: String, regions: List<StreamReg
     return if (regionUrls.size == 1) regionUrls.first() else normalizedBase
 }
 
-suspend fun fetchDynamicRegions(
+internal suspend fun requestGfnServerInfo(
     http: OkHttpClient,
     token: String?,
-    streamingBaseUrl: String,
-): Pair<List<StreamRegion>, String?> {
-    val base = normalizeStreamingServiceUrl(streamingBaseUrl) ?: return emptyList<StreamRegion>() to null
-    return runCatching {
-        val request = Request.Builder()
-            .url("${base}v2/serverInfo")
-            .headers(
-                Headers.Builder()
-                    .putDesktopLcars(token, clientType = "BROWSER", clientStreamer = "WEBRTC")
-                    .build(),
-            )
-            .build()
-        val (code, text) = http.awaitText(request)
-        if (code !in 200..299) return@runCatching emptyList<StreamRegion>() to null
-        val data = OpenNowJson.parseToJsonElement(text).jsonObject
-        val vpcId = data.obj("requestStatus")?.string("serverId")
-        val regions = data.arr("metaData")?.mapNotNull {
-            val obj = it.asObject() ?: return@mapNotNull null
-            val key = obj.string("key") ?: return@mapNotNull null
-            val value = obj.string("value") ?: return@mapNotNull null
-            val regionUrl = normalizeStreamingServiceUrl(value) ?: return@mapNotNull null
-            if (key == "gfn-regions" || key.startsWith("gfn-")) null else StreamRegion(key, regionUrl)
-        }?.sortedBy { it.name }.orEmpty()
-        regions to vpcId
-    }.getOrElse { error ->
-        if (error is CancellationException) throw error
-        emptyList<StreamRegion>() to null
-    }
+    base: String,
+): GfnServerInfo {
+    val request = Request.Builder()
+        .url("${base}v2/serverInfo")
+        .headers(
+            Headers.Builder()
+                .putDesktopLcars(token, clientType = "BROWSER", clientStreamer = "WEBRTC")
+                .build(),
+        )
+        .build()
+    // Discovery includes bounded regional probes on cold-start failure. Share the HTTP pools,
+    // but bound each probe so an unreachable alternative cannot hold startup indefinitely.
+    val discoveryHttp = http.newBuilder().callTimeout(5, TimeUnit.SECONDS).build()
+    val (code, text) = discoveryHttp.awaitText(request)
+    return parseGfnServerInfo(code, text)
 }
 
 private val NON_ALNUM_RUN = Regex("[^a-z0-9]+")
